@@ -1,7 +1,8 @@
 # Native video inference and EmbeddingGemma 2
 
 Status: phase 1, the independent phase 2 decoder/preparation library, the phase 3
-scheduling subset, and stage 4 portable MJPEG/Metal preparation delivered,
+scheduling subset, stage 4 portable MJPEG/Metal preparation, independent
+efficiency/admission/source work and a pure Zig H.264 subset delivered,
 2026-10-08. Phase 2 model/API integration, phase 3 resident model execution, and
 the remaining stage 4 routes remain pending; full video embedding is not yet
 available. Tim's PR #1014 remains a separate dependency
@@ -209,7 +210,7 @@ existing MP4/WebM audio adapters, bounded immutable sources and packet leases,
 signed timeline mapping, a non-fragmented AVC MP4 index, and frame selection.
 Six synthetic MP4 fixtures pin FFprobe packet/timeline receipts; 77 sampling
 cases execute a hashed upstream method snapshot with NumPy 2.4.4. Runtime code
-has no FFmpeg or Python dependency. WebM video and generalized codec dependency
+has no FFmpeg or Python dependency. Generalized codec dependency
 plans remain later work; static-avc1 IDR planning is delivered in stage 3.
 
 Exit validation: the original and migrated MP4 audio suites each pass 68 tests,
@@ -306,10 +307,19 @@ failure are qualified. Separate-window versus shared-window jobs decode/prepare
 logical staging, not physical bus transfers or demonstrated embedding latency.
 See the [software-to-Metal contract](../../zig/lib/video/VIDEO.md#implemented-software-decode-to-metal).
 
-Remaining: NVDEC/device preparation with separately qualified CUDA model execution,
-and progressive 8-bit
-4:2:0 H.264 in pure Zig with a declared supported profile/tool subset. Broaden
-H.264, fragmented MP4, WebM video codecs, HEVC, VP9, and AV1 independently.
+The independent follow-up delivers resident Metal resize coefficients,
+synchronized decode/preparation benchmarks, atomic shared reservations, version-pinned
+remote range transport adapters, bounded read coalescing, fragmented MP4 indexing,
+WebM VP8/VP9/AV1 indexing and the first pure Zig H.264 subset. The software decoder
+qualifies progressive 8-bit 4:2:0 Baseline IDR pictures, CAVLC Intra16x16/I_PCM and
+explicitly disabled deblocking, with bit-exact independent NV12 oracles. It executes
+on Linux and WASI and supplies shared-window host patches. See the detailed
+[video contracts](../../zig/lib/video/VIDEO.md#implemented-independent-efficiency-and-portable-h264-work)
+and [media contracts](../../zig/lib/media/MEDIA.md#implemented-independent-container-and-source-extensions).
+
+Remaining: NVDEC/device preparation with separately qualified CUDA model execution;
+H.264 inter/Intra4x4/deblocking/CABAC and other tools; unknown-sized/live containers,
+WebM video decoders, HEVC, VP9 and AV1. Each route requires separate qualification.
 
 Exit: capability-specific decoder, processor, and model qualification for each
 advertised route; CPU-only builds retain no platform framework dependency.
@@ -341,7 +351,9 @@ Store dated benchmark receipts separately from these living contracts.
 ## Open decisions
 
 - Final content-part fields and capability advertisement after PR #1014 settles.
-- Exact first software H.264 profile/tool coverage and corpus/license selection.
+- Extension order beyond the qualified Baseline IDR/Intra16x16/I_PCM subset:
+  active deblocking, Intra4x4 and inter prediction, then CABAC/B-frames; each needs
+  broader independent corpora. CAVLC table provenance and BSD license are pinned.
 - Reference decoder RGB conversion policy, VFR sampling compatibility, and
   accepted cross-backend numerical/retrieval tolerances.
 - Admission estimates for opaque hardware decoder allocations, minimum surface

@@ -61,3 +61,16 @@ pub fn addImportCheck(b: *std.Build, root: std.Build.LazyPath, target: std.Build
     const tests = b.addTest(.{ .root_module = consumer });
     b.top_level_steps.get("check-video").?.step.dependOn(&tests.step);
 }
+
+pub fn addBenchmarks(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) void {
+    if (target.result.os.tag != .macos and target.result.os.tag != .linux) return;
+    const module = b.createModule(.{ .root_source_file = root.path(b, "video_benchmark_root.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    configure(b, module, root, target, null);
+    module.addCSourceFile(.{ .file = root.path(b, "src/backends/benchmark_rss.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+    if (target.result.os.tag == .macos) module.addCSourceFile(.{ .file = root.path(b, "src/backends/benchmark_device.m"), .flags = &.{ "-fobjc-arc", "-Wall", "-Wextra", "-Werror" } });
+    const executable = b.addExecutable(.{ .name = "video-benchmark", .root_module = module });
+    const run = b.addRunArtifact(executable);
+    if (b.option([]const u8, "benchmark-input", "MP4/MOV file for the video benchmark")) |path| run.addArg(path);
+    b.step("bench-video", "Measure completed decode/preparation latency, GPU time and memory").dependOn(&run.step);
+    b.step("check-video-benchmark", "Compile the native video benchmark").dependOn(&executable.step);
+}

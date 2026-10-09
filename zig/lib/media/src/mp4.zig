@@ -1,6 +1,6 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
-//! Bounded non-fragmented MP4/H.264 packet index. No codec decoding.
+//! Bounded static and fragmented MP4 packet indexes. No codec decoding.
 const std = @import("std");
 const iso = @import("isobmff.zig");
 const source = @import("source.zig");
@@ -49,7 +49,10 @@ pub const Packet = struct {
     sync: bool,
 };
 const Span = struct { start: u64, end: u64 };
+const Fragment = struct { offset: u64, size: usize };
+const Defaults = struct { description: u32 = 1, duration: u32 = 0, size: u32 = 0, flags: u32 = 0 };
 const Tables = struct {
+    defaults: ?Defaults = null,
     track: ?Track = null,
     sizes: []const u8 = &.{},
     stsc: []const u8 = &.{},
@@ -74,15 +77,21 @@ pub const Reader = struct {
     allocator: std.mem.Allocator,
     input: *source.Source,
     metadata: source.Lease,
+    index_reservation: @import("admission.zig").Token = .{},
     track: Track,
     packets: []Packet,
     limits: Limits,
 
     pub fn init(allocator: std.mem.Allocator, input: *source.Source, limits: Limits) !Reader {
+        var index_reservation = if (input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = limits.max_index_bytes }) else @import("admission.zig").Token{};
+        errdefer index_reservation.deinit();
         var metadata: ?source.Lease = null;
         errdefer if (metadata) |*lease| lease.deinit();
         var spans: std.ArrayList(Span) = .empty;
         defer spans.deinit(allocator);
+        var fragments: std.ArrayList(Fragment) = .empty;
+        defer fragments.deinit(allocator);
+        var fragment_bytes: u64 = 0;
         var cursor: u64 = 0;
         var boxes: usize = 0;
         while (cursor < input.length()) {
@@ -101,7 +110,11 @@ pub const Reader = struct {
                 header_size = 16;
             } else if (size == 0) size = input.length() - cursor;
             if (size < header_size or size > input.length() - cursor) return error.MalformedMedia;
-            if (typ == tag("moof")) return error.UnsupportedFragmentedMp4;
+            if (typ == tag("moof")) {
+                fragment_bytes = try std.math.add(u64, fragment_bytes, size - header_size);
+                if (fragment_bytes > limits.max_metadata_bytes or fragments.items.len >= 1024) return error.ResourceLimitExceeded;
+                try fragments.append(allocator, .{ .offset = cursor, .size = @intCast(size) });
+            }
             if (typ == tag("moov")) {
                 if (metadata != null) return error.MalformedMedia;
                 if (size - header_size > limits.max_metadata_bytes) return error.ResourceLimitExceeded;
@@ -118,12 +131,20 @@ pub const Reader = struct {
         var track = tables.track orelse return error.UnsupportedVideoCodec;
         track.edit = try parseEdit(tables.elst, parser.movie_scale, track.timescale);
         track.decode_preroll_ticks = try decodePreroll(tables.ctts);
-        const packets = try buildPackets(allocator, tables, track, spans.items, limits, input.control);
-        return .{ .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = packets, .limits = limits };
+        const packets = if (tables.defaults) |defaults| blk: {
+            if (tables.sizes.len < 12 or u32be(tables.sizes[8..12]) != 0) return error.UnsupportedHybridMp4;
+            const result = try buildFragments(allocator, input, &track, defaults, fragments.items, spans.items, limits);
+            break :blk result;
+        } else blk: {
+            if (fragments.items.len != 0) return error.MalformedMedia;
+            break :blk try buildPackets(allocator, tables, track, spans.items, limits, input.control);
+        };
+        return .{ .index_reservation = index_reservation, .allocator = allocator, .input = input, .metadata = metadata.?, .track = track, .packets = packets, .limits = limits };
     }
     pub fn deinit(self: *Reader) void {
         self.allocator.free(self.packets);
         self.metadata.deinit();
+        self.index_reservation.deinit();
         self.* = undefined;
     }
     pub fn readPacket(self: *Reader, index: usize) !source.Lease {
@@ -162,7 +183,7 @@ const Parser = struct {
         while (cursor < bytes.len) {
             const b = try self.box(bytes, cursor);
             if (b.typ == tag("mvhd")) self.movie_scale = try headerScale(b.payload);
-            if (b.typ == tag("mvex")) return error.UnsupportedFragmentedMp4;
+
             cursor = b.end;
         }
         if (self.movie_scale == 0) return error.MalformedMedia;
@@ -186,7 +207,29 @@ const Parser = struct {
             }
             cursor = b.end;
         }
-        return selected orelse error.UnsupportedVideoCodec;
+        var result = selected orelse return error.UnsupportedVideoCodec;
+        cursor = 0;
+        while (cursor < bytes.len) {
+            const b = try self.box(bytes, cursor);
+            if (b.typ == tag("mvex")) {
+                var nested: usize = 0;
+                while (nested < b.payload.len) {
+                    const child = try self.box(b.payload, nested);
+                    if (child.typ == tag("trex")) {
+                        const p = child.payload;
+                        if (p.len != 24 or u32be(p[0..4]) != 0) return error.MalformedMedia;
+                        if (u32be(p[4..8]) == result.id) {
+                            if (result.defaults != null) return error.MalformedMedia;
+                            result.defaults = .{ .description = u32be(p[8..12]), .duration = u32be(p[12..16]), .size = u32be(p[16..20]), .flags = u32be(p[20..24]) };
+                        }
+                    }
+                    nested = child.end;
+                }
+                if (result.defaults == null) return error.MalformedMedia;
+            }
+            cursor = b.end;
+        }
+        return result;
     }
     fn trackBoxes(self: *Parser, bytes: []const u8, t: *Tables, depth: u8) !void {
         if (depth > 4) return error.MalformedMedia;
@@ -503,4 +546,129 @@ fn u32be(bytes: []const u8) u32 {
 }
 fn u64be(bytes: []const u8) u64 {
     return std.mem.readInt(u64, bytes[0..8], .big);
+}
+
+fn fragmentField(bytes: []const u8, cursor: *usize) !u32 {
+    if (cursor.* > bytes.len or bytes.len - cursor.* < 4) return error.MalformedMedia;
+    const value = u32be(bytes[cursor.*..][0..4]);
+    cursor.* += 4;
+    return value;
+}
+fn buildFragments(allocator: std.mem.Allocator, input: *source.Source, track: *Track, defaults: Defaults, fragments: []const Fragment, spans: []const Span, limits: Limits) ![]Packet {
+    if (defaults.description != 1) return error.UnsupportedSampleDescription;
+    var packets: std.ArrayList(Packet) = .empty;
+    errdefer packets.deinit(allocator);
+    var box_count: usize = 0;
+    for (fragments) |fragment| {
+        try input.control.check();
+        var lease = try input.read(fragment.offset, fragment.size);
+        defer lease.deinit();
+        const root = try iso.readBox(lease.bytes, 0);
+        if (root.typ != tag("moof") or root.end != lease.bytes.len) return error.MalformedMedia;
+        var cursor: usize = 0;
+        while (cursor < root.payload.len) {
+            const box = try iso.readBox(root.payload, cursor);
+            cursor = box.end;
+            box_count += 1;
+            if (box_count > limits.max_boxes) return error.ResourceLimitExceeded;
+            if (box.typ != tag("traf")) continue;
+            var header: ?[]const u8 = null;
+            var decode_time: ?[]const u8 = null;
+            var nested: usize = 0;
+            while (nested < box.payload.len) {
+                const child = try iso.readBox(box.payload, nested);
+                nested = child.end;
+                box_count += 1;
+                if (box_count > limits.max_boxes) return error.ResourceLimitExceeded;
+                switch (child.typ) {
+                    tag("tfhd") => {
+                        if (header != null) return error.MalformedMedia;
+                        header = child.payload;
+                    },
+                    tag("tfdt") => {
+                        if (decode_time != null) return error.MalformedMedia;
+                        decode_time = child.payload;
+                    },
+                    tag("senc"), tag("saiz"), tag("saio") => return error.UnsupportedEncryptedMedia,
+                    else => {},
+                }
+            }
+            const h = header orelse return error.MalformedMedia;
+            if (h.len < 8 or h[0] != 0) return error.MalformedMedia;
+            if (u32be(h[4..8]) != track.id) continue;
+            const flags = u32be(h[0..4]) & 0xffffff;
+            if (flags & ~@as(u32, 0x02003b) != 0) return error.UnsupportedFragmentedMp4;
+            var hc: usize = 8;
+            var base = fragment.offset;
+            if (flags & 1 != 0) {
+                if (h.len - hc < 8) return error.MalformedMedia;
+                base = u64be(h[hc..][0..8]);
+                hc += 8;
+            } else if (flags & 0x020000 == 0) return error.UnsupportedFragmentedMp4;
+            var current = defaults;
+            if (flags & 2 != 0) current.description = try fragmentField(h, &hc);
+            if (current.description != 1) return error.UnsupportedSampleDescription;
+            if (flags & 8 != 0) current.duration = try fragmentField(h, &hc);
+            if (flags & 16 != 0) current.size = try fragmentField(h, &hc);
+            if (flags & 32 != 0) current.flags = try fragmentField(h, &hc);
+            if (hc != h.len) return error.MalformedMedia;
+            const dt = decode_time orelse return error.UnsupportedTimeline;
+            if (dt.len < 4 or dt[0] > 1 or dt.len != (if (dt[0] == 0) @as(usize, 8) else 12) or u32be(dt[0..4]) & 0xffffff != 0) return error.MalformedMedia;
+            var dts = std.math.cast(i64, if (dt[0] == 0) @as(u64, u32be(dt[4..8])) else u64be(dt[4..12])) orelse return error.TimestampOverflow;
+            if (packets.items.len != 0) {
+                const previous = packets.items[packets.items.len - 1];
+                if (dts < try std.math.add(i64, previous.media_dts, previous.duration)) return error.UnsupportedTimeline;
+            }
+            var data_offset: ?u64 = null;
+            nested = 0;
+            while (nested < box.payload.len) {
+                try input.control.check();
+                const child = try iso.readBox(box.payload, nested);
+                nested = child.end;
+                if (child.typ != tag("trun")) continue;
+                const p = child.payload;
+                if (p.len < 8 or p[0] > 1) return error.MalformedMedia;
+                const run_flags = u32be(p[0..4]) & 0xffffff;
+                if (run_flags & ~@as(u32, 0xf05) != 0 or (run_flags & 4 != 0 and run_flags & 0x400 != 0)) return error.MalformedMedia;
+                const count = u32be(p[4..8]);
+                const total = try std.math.add(usize, packets.items.len, count);
+                if (total > limits.max_samples or total > limits.max_index_bytes / @sizeOf(Packet)) return error.ResourceLimitExceeded;
+                var pc: usize = 8;
+                if (run_flags & 1 != 0) {
+                    const delta: i32 = @bitCast(try fragmentField(p, &pc));
+                    data_offset = std.math.cast(u64, @as(i128, base) + delta) orelse return error.MalformedMedia;
+                }
+                var first_flags = current.flags;
+                if (run_flags & 4 != 0) first_flags = try fragmentField(p, &pc);
+                var offset = data_offset orelse return error.UnsupportedFragmentedMp4;
+                try packets.ensureTotalCapacityPrecise(allocator, total);
+                for (0..count) |i| {
+                    try input.control.check();
+                    const duration = if (run_flags & 0x100 != 0) try fragmentField(p, &pc) else current.duration;
+                    const size = if (run_flags & 0x200 != 0) try fragmentField(p, &pc) else current.size;
+                    const sample_flags = if (run_flags & 0x400 != 0) try fragmentField(p, &pc) else if (i == 0) first_flags else current.flags;
+                    const raw_composition = if (run_flags & 0x800 != 0) try fragmentField(p, &pc) else 0;
+                    const composition: i64 = if (p[0] == 1) @as(i32, @bitCast(raw_composition)) else raw_composition;
+                    if (size == 0 or size > limits.max_packet_bytes or duration == 0) return error.ResourceLimitExceeded;
+                    const end = try std.math.add(u64, offset, size);
+                    var valid = false;
+                    for (spans) |span| if (offset >= span.start and end <= span.end) {
+                        valid = true;
+                        break;
+                    };
+                    if (!valid) return error.MalformedMedia;
+                    const pts = try std.math.add(i64, dts, composition);
+                    if (composition < 0) track.decode_preroll_ticks = @max(track.decode_preroll_ticks, std.math.cast(u32, -composition) orelse return error.TimestampOverflow);
+                    packets.appendAssumeCapacity(.{ .offset = offset, .size = size, .dts = dts, .media_dts = dts, .media_pts = pts, .pts = try track.edit.present(pts), .duration = duration, .sync = sample_flags & 0x10000 == 0 });
+                    dts = try std.math.add(i64, dts, duration);
+                    offset = end;
+                }
+                if (pc != p.len) return error.MalformedMedia;
+                data_offset = offset;
+            }
+        }
+    }
+    if (packets.items.len == 0) return error.EmptyVideoTrack;
+    for (packets.items) |*packet| packet.dts = try track.edit.present(try std.math.sub(i64, packet.media_dts, track.decode_preroll_ticks));
+    return packets.toOwnedSlice(allocator);
 }

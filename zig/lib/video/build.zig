@@ -6,5 +6,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     _ = support.addModule(b, b.path("."), target, optimize);
+    support.addBenchmarks(b, b.path("."), target, optimize);
     support.addTests(b, b.path("."), target, optimize);
 }

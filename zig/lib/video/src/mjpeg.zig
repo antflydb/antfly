@@ -29,54 +29,7 @@ pub const Frame = struct {
         self.* = undefined;
     }
 };
-/// Tracks live bytes across alloc/resize/remap/free; exceeding the cap fails
-/// before allocation and is distinguished from backing allocator exhaustion.
-const Budget = struct {
-    backing: std.mem.Allocator,
-    limit: usize,
-    live: usize = 0,
-    peak: usize = 0,
-    denied: bool = false,
-    fn allocator(self: *Budget) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
-    }
-    fn admit(self: *Budget, old: usize, new: usize) bool {
-        if (new > self.limit -| (self.live - old)) {
-            self.denied = true;
-            return false;
-        }
-        return true;
-    }
-    fn charge(self: *Budget, old: usize, new: usize) void {
-        self.live = self.live - old + new;
-        self.peak = @max(self.peak, self.live);
-    }
-    fn alloc(ctx: *anyopaque, len: usize, align_: std.mem.Alignment, ra: usize) ?[*]u8 {
-        const self: *Budget = @ptrCast(@alignCast(ctx));
-        if (!self.admit(0, len)) return null;
-        const bytes = self.backing.rawAlloc(len, align_, ra) orelse return null;
-        self.charge(0, len);
-        return bytes;
-    }
-    fn resize(ctx: *anyopaque, bytes: []u8, align_: std.mem.Alignment, len: usize, ra: usize) bool {
-        const self: *Budget = @ptrCast(@alignCast(ctx));
-        if (!self.admit(bytes.len, len) or !self.backing.rawResize(bytes, align_, len, ra)) return false;
-        self.charge(bytes.len, len);
-        return true;
-    }
-    fn remap(ctx: *anyopaque, bytes: []u8, align_: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
-        const self: *Budget = @ptrCast(@alignCast(ctx));
-        if (!self.admit(bytes.len, len)) return null;
-        const out = self.backing.rawRemap(bytes, align_, len, ra) orelse return null;
-        self.charge(bytes.len, len);
-        return out;
-    }
-    fn free(ctx: *anyopaque, bytes: []u8, align_: std.mem.Alignment, ra: usize) void {
-        const self: *Budget = @ptrCast(@alignCast(ctx));
-        self.backing.rawFree(bytes, align_, ra);
-        self.live -= bytes.len;
-    }
-};
+const Budget = @import("decode_budget.zig").Budget;
 pub fn decodeFrame(allocator: std.mem.Allocator, reader: *media.mp4.Reader, index: usize, options: Options) !Frame {
     try reader.input.control.check();
     if (reader.track.codec != .mjpeg) return error.UnsupportedVideoCodec;
@@ -107,6 +60,7 @@ pub fn decodeFrame(allocator: std.mem.Allocator, reader: *media.mp4.Reader, inde
     return .{ .allocator = allocator, .decode_index = index, .pts = packet.pts, .duration = packet.duration, .timescale = reader.track.timescale, .width = decoded.width, .height = decoded.height, .rgba = decoded.rgba, .decode_high_water = budget.peak };
 }
 pub const PreparedWindows = struct {
+    output_reservation: media.admission.Token = .{},
     allocator: std.mem.Allocator,
     plan: windows.Plan,
     /// Contiguous unique-picture patch arrays, window entries index this axis.
@@ -133,10 +87,12 @@ pub const PreparedWindows = struct {
         self.allocator.free(self.patches);
         self.allocator.free(self.color_info);
         self.plan.deinit();
+        self.output_reservation.deinit();
         self.* = undefined;
     }
 };
 pub const JobOptions = struct {
+    admission_pool: ?*media.admission.Pool = null,
     decode: Options = .{},
     windows: windows.Limits = .{},
     preparation: preparation.Options,
@@ -154,6 +110,12 @@ pub fn prepareWindows(allocator: std.mem.Allocator, reader: *media.mp4.Reader, r
     const count = std.math.mul(usize, g.values(), plan.unique_indexes.len) catch return error.ResourceLimitExceeded;
     const bytes = std.math.mul(usize, count, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
     if (bytes > options.max_output_bytes) return error.ResourceLimitExceeded;
+    // Reserve configured upper bounds before decoding. Keep output admission
+    // until result destruction; release transient capacity after GPU completion.
+    var output_reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .host_bytes = bytes }) else media.admission.Token{};
+    errdefer output_reservation.deinit();
+    var transient = if (options.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.add(u64, options.decode.max_decode_bytes, options.preparation.max_scratch_bytes) }) else media.admission.Token{};
+    defer transient.deinit();
     const color_info = try allocator.dupe(u8, reader.track.color_info);
     errdefer allocator.free(color_info);
     const patches = try allocator.alloc(f32, count);
@@ -169,5 +131,5 @@ pub fn prepareWindows(allocator: std.mem.Allocator, reader: *media.mp4.Reader, r
         peak = @max(peak, decoded.decode_high_water);
         payload_bytes += reader.packets[index].size;
     }
-    return .{ .allocator = allocator, .plan = plan, .patches = patches, .geometry = g, .decoded_packets = plan.unique_indexes.len, .payload_bytes = payload_bytes, .decode_high_water = peak, .display_matrix = reader.track.display_matrix, .pixel_aspect = reader.track.pixel_aspect, .color_info = color_info };
+    return .{ .output_reservation = output_reservation, .allocator = allocator, .plan = plan, .patches = patches, .geometry = g, .decoded_packets = plan.unique_indexes.len, .payload_bytes = payload_bytes, .decode_high_water = peak, .display_matrix = reader.track.display_matrix, .pixel_aspect = reader.track.pixel_aspect, .color_info = color_info };
 }

@@ -1,5 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+pub const software = @import("software.zig");
+pub const h264 = @import("h264.zig");
 pub const mjpeg_metal = @import("mjpeg_metal.zig");
 pub const mjpeg = @import("mjpeg.zig");
 pub const capabilities = @import("capabilities.zig");
@@ -12,6 +14,7 @@ pub const apple_jobs = @import("apple_jobs.zig");
 pub const sampling = @import("sampling.zig");
 test {
     _ = avc;
+    _ = @import("h264_test.zig");
     _ = @import("mjpeg_test.zig");
     _ = @import("mjpeg_metal_test.zig");
     _ = @import("scheduling_test.zig");

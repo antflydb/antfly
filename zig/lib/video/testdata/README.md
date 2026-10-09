@@ -81,3 +81,27 @@ logical staging caps, buffer/source lifetimes, cancellation/retry and allocation
 failure. Synthetic 160×96 RGBA patterns additionally compare every rotation and
 both centering modes within `2e-6`; alpha is ignored consistently. These are
 preparation/resource receipts, not model or physical bus-transfer benchmarks.
+
+## Qualified software H.264 fixtures
+
+`h264-intra*.mp4` use progressive 8-bit 4:2:0 Baseline IDR pictures, CAVLC,
+Intra16x16 prediction and explicitly disabled deblocking. The independent NV12
+oracles cover all luma/chroma prediction modes, low/high quantization, cropping
+and full range. `h264-pcm.mp4` adds I_PCM and emulation-prevention bytes.
+`h264-intra-filtered.mp4` is intentionally rejected because it enables deblocking.
+The receipt pins every fixture/output hash and records FFprobe packet metadata.
+Tests compare every decoded byte, exercise cancellation, bounded mutation and
+allocation failure, and verify overlapping windows decode each selection once.
+
+```sh
+python3 zig/lib/video/scripts/generate_h264_fixtures.py
+```
+
+Generation requires an offline x264 development installation, pkg-config, a C
+compiler and FFmpeg. The helper disables Intra4x4 through x264's analysis API;
+FFmpeg's `partitions=none` option alone does not disable that intra tool. No x264
+or FFmpeg code is linked into runtime decoding. CAVLC lookup tables have their
+own pinned generator and BSD notice in `../THIRD_PARTY_NOTICES.md`.
+
+Completed timing receipts and their measurement limits are in
+[benchmarks/README.md](benchmarks/README.md).

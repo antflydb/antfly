@@ -8,6 +8,7 @@ const mjpeg = @import("mjpeg.zig");
 const windows = @import("windows.zig");
 const preparation = @import("preparation.zig");
 pub const Options = struct {
+    admission_pool: ?*media.admission.Pool = null,
     decode: mjpeg.Options = .{},
     windows: windows.Limits = .{},
     preparation: preparation.Options,
@@ -19,6 +20,7 @@ pub const Options = struct {
 /// Move-only. Completed command inputs have released; outputs, display metadata
 /// and window mappings remain owned independently of Reader/Source/Metal.
 pub const PreparedWindows = struct {
+    output_reservation: media.admission.Token = .{},
     allocator: std.mem.Allocator,
     plan: windows.Plan,
     frames: []preparation.Prepared,
@@ -44,6 +46,7 @@ pub const PreparedWindows = struct {
         self.allocator.free(self.frames);
         self.allocator.free(self.color_info);
         self.plan.deinit();
+        self.output_reservation.deinit();
         self.* = undefined;
     }
 };
@@ -68,6 +71,7 @@ const Queue = struct {
 pub fn prepareWindows(allocator: std.mem.Allocator, io: std.Io, reader: *media.mp4.Reader, requested: []const windows.Window, metal: *preparation.Metal, options: Options) !PreparedWindows {
     if (@import("builtin").os.tag != .macos) return error.UnsupportedVideoBackend;
     try reader.input.control.check();
+    if (options.admission_pool) |pool| if (metal.cache_reservation.pool != pool) return error.UnadmittedMetalPreparer;
     if (reader.track.codec != .mjpeg) return error.UnsupportedVideoCodec;
     if (options.queue_depth == 0 or options.queue_depth > 8) return error.ResourceLimitExceeded;
     var plan = try windows.create(allocator, reader, requested, options.windows);
@@ -78,6 +82,12 @@ pub fn prepareWindows(allocator: std.mem.Allocator, io: std.Io, reader: *media.m
     const total_staging = std.math.mul(u64, input_bytes, plan.unique_indexes.len) catch return error.ResourceLimitExceeded;
     const output_bytes = std.math.mul(usize, try std.math.mul(usize, g.values(), @sizeOf(f32)), plan.unique_indexes.len) catch return error.ResourceLimitExceeded;
     if (input_bytes > options.max_inflight_staging_bytes or input_bytes > options.preparation.max_host_staging_bytes or total_staging > options.max_total_staging_bytes or output_bytes > options.max_output_bytes) return error.ResourceLimitExceeded;
+    // Reserve configured upper bounds before decoding. Keep output admission
+    // until result destruction; release transient capacity after GPU completion.
+    var output_reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = output_bytes }) else media.admission.Token{};
+    errdefer output_reservation.deinit();
+    var transient = if (options.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.add(u64, options.decode.max_decode_bytes, options.preparation.max_scratch_bytes), .device_bytes = try std.math.add(u64, try std.math.mul(u64, options.preparation.max_scratch_bytes, options.queue_depth), options.max_inflight_staging_bytes), .commands = options.queue_depth }) else media.admission.Token{};
+    defer transient.deinit();
     const color_info = try allocator.dupe(u8, reader.track.color_info);
     errdefer allocator.free(color_info);
     const slots = try allocator.alloc(?preparation.Prepared, plan.unique_indexes.len);
@@ -114,5 +124,5 @@ pub fn prepareWindows(allocator: std.mem.Allocator, io: std.Io, reader: *media.m
     const frames = try allocator.alloc(preparation.Prepared, slots.len);
     errdefer allocator.free(frames);
     for (frames, slots) |*frame, slot| frame.* = slot orelse return error.MissingDecodedFrame;
-    return .{ .allocator = allocator, .plan = plan, .frames = frames, .display_matrix = reader.track.display_matrix, .pixel_aspect = reader.track.pixel_aspect, .color_info = color_info, .output_bytes = output_bytes, .decoded_packets = frames.len, .payload_bytes = payload_bytes, .decode_high_water = decode_high_water, .rgba_staging_bytes = staging_bytes, .coefficient_staging_bytes = coefficient_bytes, .queue_high_water = high_water, .inflight_staging_high_water = staging_high_water };
+    return .{ .output_reservation = output_reservation, .allocator = allocator, .plan = plan, .frames = frames, .display_matrix = reader.track.display_matrix, .pixel_aspect = reader.track.pixel_aspect, .color_info = color_info, .output_bytes = output_bytes, .decoded_packets = frames.len, .payload_bytes = payload_bytes, .decode_high_water = decode_high_water, .rgba_staging_bytes = staging_bytes, .coefficient_staging_bytes = coefficient_bytes, .queue_high_water = high_water, .inflight_staging_high_water = staging_high_water };
 }

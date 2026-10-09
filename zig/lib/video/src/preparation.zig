@@ -7,8 +7,12 @@ const apple = @import("backends/apple.zig");
 const supported = @import("builtin").os.tag == .macos;
 extern fn av_preparer_create(*anyopaque, *?*anyopaque) i32;
 extern fn av_preparer_destroy(*anyopaque) void;
-extern fn av_prepare_submit(*anyopaque, *anyopaque, [*]const u32, [*]const u32, usize, [*]const i32, usize, [*]const u32, usize, [*]const i32, usize, *?*anyopaque) i32;
-extern fn av_prepare_rgba_submit(*anyopaque, [*]const u8, usize, [*]const u32, [*]const u32, usize, [*]const i32, usize, [*]const u32, usize, [*]const i32, usize, *?*anyopaque) i32;
+extern fn av_coefficients_create(*anyopaque, [*]const u32, usize, [*]const i32, usize, [*]const u32, usize, [*]const i32, usize, *?*anyopaque) i32;
+extern fn av_coefficients_destroy(*anyopaque) void;
+extern fn av_prepare_submit(*anyopaque, *anyopaque, [*]const u32, *anyopaque, *?*anyopaque) i32;
+extern fn av_prepare_rgba_submit(*anyopaque, [*]const u8, usize, [*]const u32, *anyopaque, *?*anyopaque) i32;
+extern fn av_prepared_gpu_seconds(*anyopaque) f64;
+extern fn av_preparer_device_bytes(*anyopaque) u64;
 extern fn av_prepared_poll(*anyopaque) c_int;
 extern fn av_prepared_buffer(*anyopaque) *anyopaque;
 extern fn av_prepared_copy(*anyopaque, [*]f32, usize) i32;
@@ -177,12 +181,14 @@ const Axis = struct {
     allocator: std.mem.Allocator,
     table: []u32,
     weights: []i32,
-    fn init(allocator: std.mem.Allocator, source: usize, target: usize, max_bytes: usize) !Axis {
+    fn bound(source: usize, target: usize) !usize {
         // Bound the coefficient builder before allocation. Each destination has
         // <= 4*ceil(scale)+2 taps, plus starts/offsets/float staging and packed table.
         const taps = try std.math.add(usize, try std.math.mul(usize, 4, std.math.divCeil(usize, source, target) catch return error.ResourceLimitExceeded), 2);
-        const bound = try std.math.mul(usize, target, try std.math.add(usize, try std.math.mul(usize, taps, 32), 64));
-        if (bound > max_bytes) return error.ResourceLimitExceeded;
+        return std.math.mul(usize, target, try std.math.add(usize, try std.math.mul(usize, taps, 32), 64));
+    }
+    fn init(allocator: std.mem.Allocator, source: usize, target: usize, max_bytes: usize) !Axis {
+        if (try bound(source, target) > max_bytes) return error.ResourceLimitExceeded;
         var axis = try image.buildPillowBicubicAxis(allocator, source, target);
         defer axis.deinit();
         const table = try allocator.alloc(u32, target * 3);
@@ -205,6 +211,14 @@ const Axis = struct {
 /// Owns a queue/pipelines on the caller's existing Metal device. Single-consumer.
 pub const Metal = struct {
     handle: *anyopaque,
+    /// One bounded resident geometry. Commands retain replaced buffers through
+    /// completion; this owner is single-consumer even across concurrent jobs.
+    coefficients: ?*anyopaque = null,
+    coefficient_key: [4]u32 = .{ 0, 0, 0, 0 },
+    coefficient_bytes: usize = 0,
+    coefficient_build_bound: usize = 0,
+    coefficient_limit: usize = 16 * 1024 * 1024,
+    cache_reservation: media.admission.Token = .{},
     pub fn init(device: *anyopaque) !Metal {
         if (!supported) return error.UnsupportedVideoBackend;
         var out: ?*anyopaque = null;
@@ -212,8 +226,55 @@ pub const Metal = struct {
         return .{ .handle = out.? };
     }
     pub fn deinit(self: *Metal) void {
-        if (supported) av_preparer_destroy(self.handle);
+        if (supported) {
+            if (self.coefficients) |resident| av_coefficients_destroy(resident);
+            av_preparer_destroy(self.handle);
+            self.cache_reservation.deinit();
+        }
         self.* = undefined;
+    }
+    /// Reserve a persistent coefficient budget on a shared pool. Call before
+    /// submitting work. Destruction fences the queue before returning capacity.
+    pub fn admit(self: *Metal, pool: *media.admission.Pool, max_coefficient_bytes: usize) !void {
+        if (!supported) return error.UnsupportedVideoBackend;
+        if (self.coefficients != null or self.cache_reservation.pool != null) return error.MetalPreparerAlreadyUsed;
+        self.cache_reservation = try pool.acquire(.{ .device_bytes = max_coefficient_bytes });
+        self.coefficient_limit = max_coefficient_bytes;
+    }
+    /// Device-wide allocated size, including other work using this device.
+    pub fn deviceAllocatedBytes(self: *const Metal) u64 {
+        if (!supported) return 0;
+        return av_preparer_device_bytes(self.handle);
+    }
+    /// Evict the resident geometry without invalidating submitted commands.
+    pub fn clearCoefficients(self: *Metal) void {
+        if (supported) if (self.coefficients) |resident| av_coefficients_destroy(resident);
+        self.coefficients = null;
+        self.coefficient_bytes = 0;
+        self.coefficient_build_bound = 0;
+    }
+    fn ensureCoefficients(self: *Metal, allocator: std.mem.Allocator, width: u32, height: u32, g: Geometry, options: Options, control: media.source.Control) !usize {
+        const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
+        const key: [4]u32 = .{ if (rotated) height else width, if (rotated) width else height, g.width, g.height };
+        if (self.coefficients != null and std.mem.eql(u32, &key, &self.coefficient_key)) {
+            if (self.coefficient_build_bound > options.max_scratch_bytes / 4) return error.ResourceLimitExceeded;
+            return 0;
+        }
+        var xaxis = try Axis.init(allocator, key[0], key[2], options.max_scratch_bytes / 4);
+        defer xaxis.deinit();
+        var yaxis = try Axis.init(allocator, key[1], key[3], options.max_scratch_bytes / 4);
+        defer yaxis.deinit();
+        try control.check();
+        const byte_count = (xaxis.table.len + xaxis.weights.len + yaxis.table.len + yaxis.weights.len) * 4;
+        if (byte_count > self.coefficient_limit) return error.ResourceLimitExceeded;
+        var resident: ?*anyopaque = null;
+        if (av_coefficients_create(self.handle, xaxis.table.ptr, xaxis.table.len, xaxis.weights.ptr, xaxis.weights.len, yaxis.table.ptr, yaxis.table.len, yaxis.weights.ptr, yaxis.weights.len, &resident) != 0) return error.MetalPreparationFailed;
+        if (self.coefficients) |old| av_coefficients_destroy(old);
+        self.coefficients = resident.?;
+        self.coefficient_key = key;
+        self.coefficient_bytes = byte_count;
+        self.coefficient_build_bound = @max(try Axis.bound(key[0], key[2]), try Axis.bound(key[1], key[3]));
+        return self.coefficient_bytes;
     }
     pub fn submit(self: *Metal, allocator: std.mem.Allocator, surface: *const apple.Surface, options: Options, control: media.source.Control) !Prepared {
         if (!supported) return error.UnsupportedVideoBackend;
@@ -221,16 +282,11 @@ pub const Metal = struct {
         var scope = image.work_control.Scope.enter(.{ .context = control.context, .check_fn = control.check_fn });
         defer scope.deinit();
         const g = try geometry(surface.width, surface.height, options);
-        const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
-        var xaxis = try Axis.init(allocator, if (rotated) surface.height else surface.width, g.width, options.max_scratch_bytes / 4);
-        defer xaxis.deinit();
-        var yaxis = try Axis.init(allocator, if (rotated) surface.width else surface.height, g.height, options.max_scratch_bytes / 4);
-        defer yaxis.deinit();
-        try control.check();
+        const uploaded = try self.ensureCoefficients(allocator, surface.width, surface.height, g, options, control);
         const params = [_]u32{ surface.width, surface.height, g.width, g.height, @backingInt(options.rotation), @backingInt(options.matrix), @intFromBool(surface.format == .nv12_full), @intFromBool(options.centered) };
         var out: ?*anyopaque = null;
-        if (av_prepare_submit(self.handle, surface.handle, &params, xaxis.table.ptr, xaxis.table.len, xaxis.weights.ptr, xaxis.weights.len, yaxis.table.ptr, yaxis.table.len, yaxis.weights.ptr, yaxis.weights.len, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .handle = out.?, .geometry = g, .coefficient_staging_bytes = (xaxis.table.len + xaxis.weights.len + yaxis.table.len + yaxis.weights.len) * 4 };
+        if (av_prepare_submit(self.handle, surface.handle, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
+        return .{ .handle = out.?, .geometry = g, .coefficient_staging_bytes = uploaded };
     }
     /// Copies tightly packed RGBA into owned Metal storage before returning.
     /// The producer may free its input immediately. Alpha/matrix are ignored
@@ -244,16 +300,11 @@ pub const Metal = struct {
         const size = std.math.mul(usize, try std.math.mul(usize, width, height), 4) catch return error.ResourceLimitExceeded;
         if (bytes.len != size) return error.InvalidVideoGeometry;
         if (size > options.max_host_staging_bytes) return error.ResourceLimitExceeded;
-        const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
-        var xaxis = try Axis.init(allocator, if (rotated) height else width, g.width, options.max_scratch_bytes / 4);
-        defer xaxis.deinit();
-        var yaxis = try Axis.init(allocator, if (rotated) width else height, g.height, options.max_scratch_bytes / 4);
-        defer yaxis.deinit();
-        try control.check();
+        const uploaded = try self.ensureCoefficients(allocator, width, height, g, options, control);
         const params = [_]u32{ width, height, g.width, g.height, @backingInt(options.rotation), 0, 0, @intFromBool(options.centered) };
         var out: ?*anyopaque = null;
-        if (av_prepare_rgba_submit(self.handle, bytes.ptr, bytes.len, &params, xaxis.table.ptr, xaxis.table.len, xaxis.weights.ptr, xaxis.weights.len, yaxis.table.ptr, yaxis.table.len, yaxis.weights.ptr, yaxis.weights.len, &out) != 0) return error.MetalPreparationFailed;
-        return .{ .handle = out.?, .geometry = g, .rgba_staging_bytes = bytes.len, .coefficient_staging_bytes = (xaxis.table.len + xaxis.weights.len + yaxis.table.len + yaxis.weights.len) * 4 };
+        if (av_prepare_rgba_submit(self.handle, bytes.ptr, bytes.len, &params, self.coefficients.?, &out) != 0) return error.MetalPreparationFailed;
+        return .{ .handle = out.?, .geometry = g, .rgba_staging_bytes = bytes.len, .coefficient_staging_bytes = uploaded };
     }
 };
 /// Owns input import/staging, GPU command, and patch buffer. Destroy fences in-flight
@@ -287,6 +338,14 @@ pub const Prepared = struct {
         if (!supported) return error.UnsupportedVideoBackend;
         if (av_prepared_poll(self.handle) != 1) return error.MetalPreparationNotReady;
         return av_prepared_buffer(self.handle);
+    }
+    /// Completed command execution duration, excluding queue wait and CPU setup.
+    /// Preserved after releaseSource. Some drivers report zero if unavailable.
+    pub fn gpuSeconds(self: *const Prepared) !f64 {
+        if (!supported) return error.UnsupportedVideoBackend;
+        const seconds = av_prepared_gpu_seconds(self.handle);
+        if (seconds < 0) return error.MetalPreparationNotReady;
+        return seconds;
     }
     /// Explicit oracle/debug readback. Model integration should use buffer().
     pub fn readback(self: *const Prepared, allocator: std.mem.Allocator) ![]f32 {

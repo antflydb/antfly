@@ -1,6 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 const std = @import("std");
+const admission = @import("admission.zig");
 
 /// Provider-defined cancellation/deadline check. Also passed into each read so
 /// a blocking provider can check the same original deadline while doing I/O.
@@ -34,6 +35,7 @@ pub const Source = struct {
     identity: []const u8,
     limits: Limits = .{},
     control: Control = .{},
+    admission_pool: ?*admission.Pool = null,
     retained_bytes: usize = 0,
     total_bytes: u64 = 0,
     reads: usize = 0,
@@ -50,13 +52,15 @@ pub const Source = struct {
         if (size > self.limits.max_read_bytes or size > self.limits.max_retained_bytes -| self.retained_bytes or
             size > self.limits.max_total_bytes -| self.total_bytes) return error.ResourceLimitExceeded;
         if (self.reads >= self.limits.max_reads) return error.ResourceLimitExceeded;
+        var reservation = if (self.admission_pool) |pool| try pool.acquire(.{ .host_bytes = size }) else admission.Token{};
+        errdefer reservation.deinit();
         self.retained_bytes += size;
         errdefer self.retained_bytes -= size;
         switch (self.storage) {
             .borrowed => |bytes| {
                 self.reads += 1;
                 self.total_bytes += size;
-                return .{ .bytes = bytes[@intCast(offset)..][0..size], .source = self };
+                return .{ .bytes = bytes[@intCast(offset)..][0..size], .source = self, .reservation = reservation };
             },
             .range => |range| {
                 const owned = try self.allocator.alloc(u8, size);
@@ -73,7 +77,7 @@ pub const Source = struct {
                     done += n;
                 }
                 try self.control.check();
-                return .{ .bytes = owned, .source = self, .owned = owned };
+                return .{ .bytes = owned, .source = self, .owned = owned, .reservation = reservation };
             },
         }
     }
@@ -84,11 +88,13 @@ pub const Lease = struct {
     bytes: []const u8,
     source: ?*Source,
     owned: ?[]u8 = null,
+    reservation: admission.Token = .{},
     pub fn deinit(self: *Lease) void {
         if (self.source) |s| {
             s.retained_bytes -= self.bytes.len;
             if (self.owned) |owned| s.allocator.free(owned);
         }
+        self.reservation.deinit();
         self.* = .{ .bytes = &.{}, .source = null };
     }
 };
@@ -194,4 +200,18 @@ test "file range adapter performs independent positional reads" {
     defer head.deinit();
     try std.testing.expectEqualStrings("efgh", tail.bytes);
     try std.testing.expectEqualStrings("abcd", head.bytes);
+}
+
+test "source shared lease admission is retained and denied without provider reads" {
+    var pool = admission.Pool{ .limits = .{ .host_bytes = 6 } };
+    var src = Source{ .allocator = std.testing.allocator, .identity = "shared-v1", .storage = .{ .borrowed = "abcdefgh" }, .admission_pool = &pool };
+    var first = try src.read(0, 4);
+    defer first.deinit();
+    const reads = src.reads;
+    try std.testing.expectError(error.SharedAdmissionExceeded, src.read(4, 4));
+    try std.testing.expectEqual(reads, src.reads);
+    first.deinit();
+    var retry = try src.read(4, 4);
+    retry.deinit();
+    try std.testing.expectEqual(admission.Resources{}, pool.snapshot());
 }

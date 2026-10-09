@@ -23,6 +23,7 @@
 @property(nonatomic) void *imported;
 @property(nonatomic, strong) id<MTLBuffer> rgba;
 @property(nonatomic) BOOL completed;
+@property(nonatomic) double gpuSeconds;
 @end
 @implementation AVPrepared
 - (void)dealloc { if (_command.status >= MTLCommandBufferStatusCommitted) [_command waitUntilCompleted]; av_metal_import_release(_imported); }
@@ -46,17 +47,48 @@ int32_t av_preparer_create(void *device, void **out) {
         *out = (__bridge_retained void *)p; return 0;
     }
 }
-void av_preparer_destroy(void *p) { if (p) { id object = (__bridge_transfer id)p; (void)object; } }
+void av_preparer_destroy(void *p) {
+    if (!p) return;
+    @autoreleasepool {
+        AVPreparer *owner = (__bridge_transfer AVPreparer *)p;
+        // Fence all earlier submissions before releasing shared cache admission.
+        id<MTLCommandBuffer> fence = [owner.queue commandBuffer];
+        [fence commit]; [fence waitUntilCompleted];
+    }
+}
 static id<MTLBuffer> upload(id<MTLDevice> device, const void *bytes, size_t length) {
     return [device newBufferWithBytes:bytes length:length options:MTLResourceStorageModeShared];
 }
-// Shared dispatch keeps resize/patch packing identical for both input formats.
-static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t rgba_size, const uint32_t *params,
-    const uint32_t *xaxis, size_t xsize, const int32_t *xweights, size_t xcount,
+@interface AVCoefficients : NSObject
+@property(nonatomic, strong) id<MTLBuffer> xb;
+@property(nonatomic, strong) id<MTLBuffer> xw;
+@property(nonatomic, strong) id<MTLBuffer> yb;
+@property(nonatomic, strong) id<MTLBuffer> yw;
+@end
+@implementation AVCoefficients
+@end
+int32_t av_coefficients_create(void *handle, const uint32_t *xaxis, size_t xsize, const int32_t *xweights, size_t xcount,
     const uint32_t *yaxis, size_t ysize, const int32_t *yweights, size_t ycount, void **out) {
     *out = NULL;
     @autoreleasepool {
         AVPreparer *p = (__bridge AVPreparer *)handle;
+        AVCoefficients *c = [AVCoefficients new];
+        c.xb = upload(p.device, xaxis, xsize * sizeof(uint32_t));
+        c.xw = upload(p.device, xweights, xcount * sizeof(int32_t));
+        c.yb = upload(p.device, yaxis, ysize * sizeof(uint32_t));
+        c.yw = upload(p.device, yweights, ycount * sizeof(int32_t));
+        if (!c.xb || !c.xw || !c.yb || !c.yw) return -1;
+        *out = (__bridge_retained void *)c; return 0;
+    }
+}
+void av_coefficients_destroy(void *p) { if (p) { id object = (__bridge_transfer id)p; (void)object; } }
+// Shared dispatch keeps resize/patch packing identical for both input formats.
+static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t rgba_size, const uint32_t *params,
+    void *coefficients, void **out) {
+    *out = NULL;
+    @autoreleasepool {
+        AVPreparer *p = (__bridge AVPreparer *)handle;
+        AVCoefficients *c = (__bridge AVCoefficients *)coefficients;
         AVPrepared *result = [AVPrepared new];
         id<MTLTexture> y = nil, uv = nil;
         if (rgba) {
@@ -74,35 +106,29 @@ static int32_t prepare(void *handle, void *surface, const uint8_t *rgba, size_t 
         size_t height = (params[4] & 1) ? params[0] : params[1];
         id<MTLBuffer> temp = [p.device newBufferWithLength:(size_t)params[2] * height * 3 options:MTLResourceStorageModePrivate];
         result.output = [p.device newBufferWithLength:(size_t)params[2] * params[3] * 3 * sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> xb = upload(p.device, xaxis, xsize * sizeof(uint32_t)), xw = upload(p.device, xweights, xcount * sizeof(int32_t));
-        id<MTLBuffer> yb = upload(p.device, yaxis, ysize * sizeof(uint32_t)), yw = upload(p.device, yweights, ycount * sizeof(int32_t));
         result.command = [p.queue commandBuffer];
-        if (!temp || !result.output || !xb || !xw || !yb || !yw || !result.command) return -1;
+        if (!temp || !result.output || !c.xb || !c.xw || !c.yb || !c.yw || !result.command) return -1;
         id<MTLComputeCommandEncoder> encoder = [result.command computeCommandEncoder];
         if (!encoder) return -1;
         [encoder setComputePipelineState:rgba ? p.horizontalRGBA : p.horizontal];
         if (rgba) [encoder setBuffer:result.rgba offset:0 atIndex:4];
         else { [encoder setTexture:y atIndex:0]; [encoder setTexture:uv atIndex:1]; }
         [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBytes:params length:32 atIndex:1];
-        [encoder setBuffer:xb offset:0 atIndex:2]; [encoder setBuffer:xw offset:0 atIndex:3];
+        [encoder setBuffer:c.xb offset:0 atIndex:2]; [encoder setBuffer:c.xw offset:0 atIndex:3];
         [encoder dispatchThreads:MTLSizeMake(params[2], height, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
         encoder = [result.command computeCommandEncoder]; if (!encoder) return -1;
         [encoder setComputePipelineState:p.vertical]; [encoder setBuffer:temp offset:0 atIndex:0]; [encoder setBuffer:result.output offset:0 atIndex:1];
-        [encoder setBytes:params length:32 atIndex:2]; [encoder setBuffer:yb offset:0 atIndex:3]; [encoder setBuffer:yw offset:0 atIndex:4];
+        [encoder setBytes:params length:32 atIndex:2]; [encoder setBuffer:c.yb offset:0 atIndex:3]; [encoder setBuffer:c.yw offset:0 atIndex:4];
         [encoder dispatchThreads:MTLSizeMake(params[2], params[3], 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)]; [encoder endEncoding];
         [result.command commit]; *out = (__bridge_retained void *)result; return 0;
     }
 }
-int32_t av_prepare_submit(void *handle, void *surface, const uint32_t *params,
-    const uint32_t *xaxis, size_t xsize, const int32_t *xweights, size_t xcount,
-    const uint32_t *yaxis, size_t ysize, const int32_t *yweights, size_t ycount, void **out) {
-    return prepare(handle, surface, NULL, 0, params, xaxis, xsize, xweights, xcount, yaxis, ysize, yweights, ycount, out);
+int32_t av_prepare_submit(void *handle, void *surface, const uint32_t *params, void *coefficients, void **out) {
+    return prepare(handle, surface, NULL, 0, params, coefficients, out);
 }
-int32_t av_prepare_rgba_submit(void *handle, const uint8_t *rgba, size_t size, const uint32_t *params,
-    const uint32_t *xaxis, size_t xsize, const int32_t *xweights, size_t xcount,
-    const uint32_t *yaxis, size_t ysize, const int32_t *yweights, size_t ycount, void **out) {
+int32_t av_prepare_rgba_submit(void *handle, const uint8_t *rgba, size_t size, const uint32_t *params, void *coefficients, void **out) {
     if (!rgba) { *out = NULL; return -1; }
-    return prepare(handle, NULL, rgba, size, params, xaxis, xsize, xweights, xcount, yaxis, ysize, yweights, ycount, out);
+    return prepare(handle, NULL, rgba, size, params, coefficients, out);
 }
 int av_prepared_poll(void *p) {
     AVPrepared *result = (__bridge AVPrepared *)p;
@@ -113,6 +139,7 @@ int av_prepared_poll(void *p) {
 int av_prepared_release_source(void *p) {
     if (av_prepared_poll(p) != 1) return -1;
     AVPrepared *result = (__bridge AVPrepared *)p;
+    result.gpuSeconds = result.command.GPUEndTime - result.command.GPUStartTime;
     result.completed = YES;
     av_metal_import_release(result.imported); result.imported = NULL;
     result.command = nil;
@@ -126,3 +153,10 @@ int32_t av_prepared_copy(void *p, float *out, size_t count) {
     memcpy(out, result.output.contents, count * sizeof(float)); return 0;
 }
 void av_prepared_destroy(void *p) { if (p) { id object = (__bridge_transfer id)p; (void)object; } }
+
+double av_prepared_gpu_seconds(void *p) {
+    AVPrepared *result = (__bridge AVPrepared *)p;
+    if (av_prepared_poll(p) != 1) return -1;
+    return result.completed ? result.gpuSeconds : result.command.GPUEndTime - result.command.GPUStartTime;
+}
+uint64_t av_preparer_device_bytes(void *p) { return ((__bridge AVPreparer *)p).device.currentAllocatedSize; }

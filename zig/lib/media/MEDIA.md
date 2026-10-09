@@ -1,7 +1,8 @@
 # Shared media containers and timelines
 
-Status: phase 1 implemented, 2026-10-08. Shared audio demux, bounded sources,
-timelines, and non-fragmented MP4/H.264 and MP4/MOV MJPEG indexes are available. The broader
+Status: shared audio demux, bounded sources/timelines, static and fragmented
+MP4 video indexes, WebM video indexing, remote range adapters and shared admission
+are implemented, 2026-10-08. The broader
 reader and seek contracts below remain planned unless listed as implemented.
 The initial design checkout is based on `origin/main` at
 `cdf572a7467d581f6f1b39bcf514878488555f11`. A remote refresh was unavailable.
@@ -46,7 +47,7 @@ The MP4/MOV index qualifies non-fragmented, self-contained files with one stable
 sample description (AVC or complete JPEG), `stsz`/`stz2`, `stco`/`co64`, `stsc`,
 `stts`, signed/unsigned
 `ctts`, `stss`, and leading empty edits followed by one rate-1 media edit. It
-rejects fragments, external data references, unsupported display geometry and
+rejects external data references, unsupported display geometry and
 edit arrangements, and resource-limit violations. `syncBefore` returns a
 container hint. `lib/video.decode_plan` now qualifies static-avc1 IDR samples
 before allowing nonzero starts, retains bounded probe leases, and groups selected
@@ -66,8 +67,9 @@ now stages decoded RGBA into a bounded Metal preparation queue on macOS, preserv
 the same owned window/PTS metadata. This remains video orchestration; media has
 no device or model dependency.
 
-WebM **video** indexing, sequential unknown-length providers, and object-store
-adapters are not implemented. The range callback is the integration boundary.
+WebM video indexing and version-pinned object-store transport adapters are now
+implemented below. Sequential unknown-length sources, live fragment ingestion,
+Cues-based seeking and general encrypted/dynamic-description support remain planned.
 
 Tests use six original synthetic MP4 fixtures with hashed FFprobe receipts,
 including B-frames, VFR, rotation, audio/video tracks, signed composition offsets,
@@ -93,6 +95,66 @@ lib/image → reusable image processing and MJPEG image decoding
 the object-store client. Container code is portable and available to CPU-only
 builds. A provider supplies file, object-store, or network reads through a small
 source interface.
+
+## Implemented independent container and source extensions
+
+`mp4.Reader` accepts empty initialization tables with `mvex/trex` and subsequent
+fragments in the same immutable, known-length source. The selected track retains
+one static sample description. Each selected `traf` requires `tfdt` and either
+`default-base-is-moof` or an explicit base offset; `trun` supplies the initial
+data offset, per-sample overrides, first-sample flags and signed/unsigned
+composition offsets. Durations, offsets, resource limits, monotonic decode
+intervals and containment inside `mdat` are checked. Negative composition offsets
+contribute to decode preroll. Hybrid static/fragment samples, implicit cross-track
+base addressing, encrypted fragments and missing decode times are rejected.
+Packet clocks, payload positions/sizes and sync hints match the independent
+fragmented FFprobe receipts, including signed B-frame composition offsets.
+The signed fixture records FFprobe's one-frame clock translation explicitly,
+so raw media clocks and source decode-preroll clocks are compared separately. Fragment payloads are leased one at a time; aggregate
+fragment metadata is bounded. This is file indexing, not a live segment service.
+The qualification follows the [W3C ISO BMFF fragment structure](https://www.w3.org/TR/mse-byte-stream-format-isobmff/).
+
+`webm.Reader` indexes the first supported VP8, VP9 or AV1 video track in a WebM
+Segment. It retains Tracks metadata, reads bounded element/block prefixes and
+skips full codec payloads during indexing. Packets retain signed nanosecond PTS,
+optional default/BlockDuration, keyframe hints, invisible/discardable flags and
+absolute codec-payload offsets. No decode timestamp is invented. Known-size
+Clusters, SimpleBlock and BlockGroup are supported; the Segment may have unknown
+size when the Source length is known. Laced video, content encodings, dynamic
+CodecState, interlacing, unknown-size Clusters and non-unit TrackTimestampScale
+are rejected. Index availability does not advertise a VP8/VP9/AV1 decoder.
+The [Matroska element definitions](https://www.matroska.org/technical/elements.html)
+are the container reference; the VP9 fixture independently matches FFprobe.
+
+`remote.ObjectRange` wraps a caller-owned authenticated transport. Requests carry
+an explicit strong HTTP ETag, non-null S3 version ID, or canonical GCS generation.
+The transport must issue Range with the matching If-Match/versionId/generation
+condition and return independently parsed response metadata. The adapter requires
+206, matching Content-Range start/length/total, and the pinned version before
+bytes are published. It rejects weak ETags, unversioned S3 `null` and malformed
+GCS generations. Transport/authentication, redirects, retries and credential
+management stay with the application; no network client or cloud SDK is added to
+media. Source.identity must also include object identity and its immutable version.
+
+`remote.ReadAhead` adds one fixed, forward read window (default 256 KiB), allowing
+nearby packet/header reads to share a provider request. Large reads progress through
+short reads without increasing cache capacity. Source leases copy independently
+and survive cache eviction. A failed/cancelled fill invalidates the whole window.
+Provider read count and wire bytes have separate limits from Source's logical
+reads/bytes. ObjectRange records received bytes and conservatively charges failed
+attempts; ReadAhead records provider bytes and cache hits. Prefetch may fetch nearby
+payload bytes that the parser itself skips. Configure the window before use; do not
+mutate provider identity/configuration while a reader is active.
+
+`admission.Pool` provides atomic, nonblocking host/device/command reservations
+across request-local owners. A denied reservation mutates no counters and performs
+no source read. Tokens are move-only and release after resources are destroyed.
+Source leases hold host reservations, ReadAhead holds its cache reservation, and
+MP4/WebM readers reserve their configured maximum index bytes until destruction.
+Limits are conservative upper bounds, rather than physical RSS accounting; pool
+limits/configuration must remain fixed while concurrent users run. Attach the same
+pool to every source/cache/job to cover shared pressure. Rejected work can be retried
+by the application's scheduler under the original cancellation deadline.
 
 ## Sources and packet lifetime
 
@@ -166,9 +228,9 @@ Validate offsets against the source and resolve sample-description changes.
 H.264 packet framing and configuration are explicit; hardware backends receive
 the framing they require without unnecessary whole-stream copies.
 
-First qualify seekable, non-fragmented MP4. Fragmented MP4 requires a separate
-`moof`/`traf`/`tfhd`/`tfdt`/`trun` implementation and qualification; reject it
-until supported. Similarly, encrypted tracks, unsupported edit mappings, and
+The qualified fragmented MP4 subset is implemented below through
+`moof`/`traf`/`tfhd`/`tfdt`/`trun`. Addressing and timeline forms outside that subset
+remain explicit rejections. Similarly, encrypted tracks, unsupported edit mappings, and
 unsupported dynamic descriptions cannot masquerade as ordinary packets.
 
 ### Matroska / WebM

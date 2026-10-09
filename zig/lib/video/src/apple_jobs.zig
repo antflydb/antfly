@@ -8,6 +8,7 @@ const apple = @import("backends/apple.zig");
 const preparation = @import("preparation.zig");
 const windows = @import("windows.zig");
 pub const Options = struct {
+    admission_pool: ?*media.admission.Pool = null,
     windows: windows.Limits = .{},
     decode: apple.Options = .{ .seek_mode = .verified_idr, .max_frames = 64 },
     preparation: preparation.Options,
@@ -20,6 +21,7 @@ pub const Options = struct {
 /// Move-only owned results. Buffers/PTS/window mappings outlive Reader/Source.
 /// One output per unique picture; window() returns indexes into frames.
 pub const PreparedWindows = struct {
+    output_reservation: media.admission.Token = .{},
     allocator: std.mem.Allocator,
     plan: windows.Plan,
     frames: []preparation.Prepared,
@@ -38,6 +40,7 @@ pub const PreparedWindows = struct {
         self.allocator.free(self.frames);
         self.decode.deinit();
         self.plan.deinit();
+        self.output_reservation.deinit();
         self.* = undefined;
     }
 };
@@ -88,6 +91,7 @@ const Queue = struct {
 pub fn prepareWindows(allocator: std.mem.Allocator, io: std.Io, reader: *media.mp4.Reader, requested: []const windows.Window, metal: *preparation.Metal, options: Options) !PreparedWindows {
     if (@import("builtin").os.tag != .macos) return error.UnsupportedVideoBackend;
     try reader.input.control.check();
+    if (options.admission_pool) |pool| if (metal.cache_reservation.pool != pool) return error.UnadmittedMetalPreparer;
     if (options.queue_depth == 0 or options.queue_depth > 8) return error.ResourceLimitExceeded;
     var plan = try windows.create(allocator, reader, requested, options.windows);
     errdefer plan.deinit();
@@ -95,6 +99,12 @@ pub fn prepareWindows(allocator: std.mem.Allocator, io: std.Io, reader: *media.m
     const per_frame = std.math.mul(usize, geometry.values(), @sizeOf(f32)) catch return error.ResourceLimitExceeded;
     const output_bytes = std.math.mul(usize, per_frame, plan.unique_indexes.len) catch return error.ResourceLimitExceeded;
     if (output_bytes > options.max_output_bytes or plan.unique_indexes.len > options.decode.max_frames) return error.ResourceLimitExceeded;
+    // Reserve configured upper bounds before decoding. Keep output admission
+    // until result destruction; release transient capacity after GPU completion.
+    var output_reservation = if (options.admission_pool) |pool| try pool.acquire(.{ .device_bytes = output_bytes }) else media.admission.Token{};
+    errdefer output_reservation.deinit();
+    var transient = if (options.admission_pool) |pool| try pool.acquire(.{ .host_bytes = options.preparation.max_scratch_bytes, .device_bytes = try std.math.add(u64, try std.math.add(u64, try std.math.mul(u64, options.preparation.max_scratch_bytes, options.queue_depth), options.max_inflight_surface_bytes), try apple.surfaceAdmissionBytes(reader.track.width, reader.track.height, plan.unique_indexes.len)), .commands = options.queue_depth }) else media.admission.Token{};
+    defer transient.deinit();
     const slots = try allocator.alloc(?preparation.Prepared, plan.unique_indexes.len);
     defer allocator.free(slots);
     @memset(slots, null);
@@ -107,5 +117,5 @@ pub fn prepareWindows(allocator: std.mem.Allocator, io: std.Io, reader: *media.m
     const frames = try allocator.alloc(preparation.Prepared, slots.len);
     errdefer allocator.free(frames);
     for (frames, slots) |*frame, slot| frame.* = slot orelse return error.MissingDecodedFrame;
-    return .{ .allocator = allocator, .plan = plan, .frames = frames, .decode = receipt, .queue_high_water = queue.high_water, .inflight_surface_high_water = queue.bytes_high_water, .output_bytes = output_bytes };
+    return .{ .output_reservation = output_reservation, .allocator = allocator, .plan = plan, .frames = frames, .decode = receipt, .queue_high_water = queue.high_water, .inflight_surface_high_water = queue.bytes_high_water, .output_bytes = output_bytes };
 }

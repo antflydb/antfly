@@ -261,6 +261,7 @@ const job_options = video.apple_jobs.Options{
     .queue_depth = 2,
 };
 fn jobsAlloc(allocator: std.mem.Allocator, metal: *video.preparation.Metal) !void {
+    metal.clearCoefficients();
     var src = source();
     var reader = try media.mp4.Reader.init(a, &src, .{});
     defer reader.deinit();

@@ -109,7 +109,7 @@ test "mp4 video malformed tables, metadata/index limits and fragment rejection r
     try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
     const fragment = [_]u8{ 0, 0, 0, 8, 'm', 'o', 'o', 'f' };
     var fragmented = input(&fragment);
-    try std.testing.expectError(error.UnsupportedFragmentedMp4, mp4.Reader.init(a, &fragmented, .{}));
+    try std.testing.expectError(error.MissingMovieMetadata, mp4.Reader.init(a, &fragmented, .{}));
     const changed = try a.dupe(u8, clips[0]);
     defer a.free(changed);
     const stts = std.mem.indexOf(u8, changed, "stts").?;
@@ -168,5 +168,67 @@ test "mp4 cancellation during table walk drains retained metadata and permits re
     src.control = .{};
     var reader = try mp4.Reader.init(a, &src, .{});
     reader.deinit();
+    try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
+}
+
+const fragmented_clip = @embedFile("../testdata/fragmented.mp4");
+fn fragmentedAllocation(allocator: std.mem.Allocator) !void {
+    var src = input(fragmented_clip);
+    src.allocator = allocator;
+    var reader = try mp4.Reader.init(allocator, &src, .{});
+    reader.deinit();
+    try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
+}
+test "fragmented mp4 packet offsets DTS PTS durations and sync match ffprobe" {
+    const Oracle = struct {
+        sha256: []const u8,
+        ffprobe_shift_ticks: i64 = 0,
+        packets: []const struct { pts: i64, dts: i64, duration: u32, size: []const u8, pos: []const u8, flags: []const u8 },
+    };
+    inline for (.{ .{ fragmented_clip, @embedFile("../testdata/fragmented-oracle.json") }, .{ @embedFile("../testdata/fragmented-bframes.mp4"), @embedFile("../testdata/fragmented-bframes-oracle.json") } }, 0..) |pair, case_index| {
+        const oracle = try std.json.parseFromSlice(Oracle, a, pair[1], .{ .ignore_unknown_fields = true });
+        defer oracle.deinit();
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(pair[0], &hash, .{});
+        try std.testing.expectEqualStrings(oracle.value.sha256, &std.fmt.bytesToHex(hash, .lower));
+        var src = input(pair[0]);
+        var reader = try mp4.Reader.init(a, &src, .{});
+        defer reader.deinit();
+        try std.testing.expectEqual(oracle.value.packets.len, reader.packets.len);
+        for (reader.packets, oracle.value.packets) |packet, expected| {
+            try std.testing.expectEqual(expected.dts, packet.media_dts);
+            try std.testing.expectEqual(expected.pts - oracle.value.ffprobe_shift_ticks, packet.media_pts);
+            try std.testing.expectEqual(expected.pts - oracle.value.ffprobe_shift_ticks, packet.pts);
+            try std.testing.expectEqual(expected.duration, packet.duration);
+            try std.testing.expectEqual(try std.fmt.parseInt(u64, expected.pos, 10), packet.offset);
+            try std.testing.expectEqual(try std.fmt.parseInt(u32, expected.size, 10), packet.size);
+            try std.testing.expectEqual(expected.flags[0] == 'K', packet.sync);
+        }
+        if (case_index == 1) {
+            // FFprobe translates signed-composition presentation and decode
+            // clocks by one frame; the generated first IDR's source PTS is zero.
+            const shift = oracle.value.ffprobe_shift_ticks;
+            try std.testing.expect(shift > 0);
+            try std.testing.expectEqual(@as(u32, @intCast(shift)), reader.track.decode_preroll_ticks);
+            for (reader.packets, oracle.value.packets) |packet, expected| try std.testing.expectEqual(expected.dts - shift, packet.dts);
+        }
+    }
+    try std.testing.checkAllAllocationFailures(a, fragmentedAllocation, .{});
+}
+test "fragmented mp4 bad offsets missing tfdt and admission failures release metadata" {
+    const bytes = try a.dupe(u8, fragmented_clip);
+    defer a.free(bytes);
+    const trun = std.mem.indexOf(u8, bytes, "trun").?;
+    @memset(bytes[trun + 12 ..][0..4], 0xff);
+    var bad = input(bytes);
+    try std.testing.expectError(error.MalformedMedia, mp4.Reader.init(a, &bad, .{}));
+    try std.testing.expectEqual(@as(usize, 0), bad.retained_bytes);
+    @memcpy(bytes, fragmented_clip);
+    const tfdt = std.mem.indexOf(u8, bytes, "tfdt").?;
+    @memcpy(bytes[tfdt..][0..4], "free");
+    try std.testing.expectError(error.UnsupportedTimeline, mp4.Reader.init(a, &bad, .{}));
+    try std.testing.expectEqual(@as(usize, 0), bad.retained_bytes);
+    var src = input(fragmented_clip);
+    try std.testing.expectError(error.ResourceLimitExceeded, mp4.Reader.init(a, &src, .{ .max_samples = 1 }));
     try std.testing.expectEqual(@as(usize, 0), src.retained_bytes);
 }

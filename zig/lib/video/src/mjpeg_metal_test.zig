@@ -38,7 +38,7 @@ test "video Metal RGBA preparation matches CPU for all rotations and centering m
             var result = try metal.submitRgba(a, bytes, 160, 96, options, .{});
             defer result.deinit();
             try std.testing.expectEqual(bytes.len, result.rgba_staging_bytes);
-            try std.testing.expect(result.coefficient_staging_bytes > 0);
+            if (!centered) try std.testing.expect(result.coefficient_staging_bytes > 0) else try std.testing.expectEqual(@as(usize, 0), result.coefficient_staging_bytes);
             try result.wait(std.testing.io, .{});
             try result.releaseSource();
             try result.releaseSource();
@@ -180,6 +180,7 @@ test "video RGBA admission and late MJPEG Metal cancellation release work and al
     try std.testing.expectEqual(@as(usize, 1), jobs.queue_high_water);
 }
 fn allocationCase(allocator: std.mem.Allocator, metal: *video.preparation.Metal) !void {
+    metal.clearCoefficients();
     var src = source();
     var reader = try media.mp4.Reader.init(a, &src, .{});
     defer reader.deinit();
@@ -209,4 +210,35 @@ test "video non-Apple targets fail closed for RGBA Metal and MJPEG Metal jobs" {
     var reader: media.mp4.Reader = undefined;
     try std.testing.expectError(error.UnsupportedVideoBackend, metal.submitRgba(a, &.{}, 0, 0, job_options.preparation, .{}));
     try std.testing.expectError(error.UnsupportedVideoBackend, video.mjpeg_metal.prepareWindows(a, std.testing.io, &reader, &clips, &metal, job_options));
+}
+
+test "video shared output admission denies another request until result destruction" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const device = av_test_device_create() orelse return error.MetalPreparationUnavailable;
+    defer av_test_device_destroy(device);
+    var metal = try video.preparation.Metal.init(device);
+    defer metal.deinit();
+    var src = source();
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 2 * 1024 * 1024, .device_bytes = 1024 * 1024, .commands = 2 } };
+    try metal.admit(&pool, 4096);
+    var options = job_options;
+    options.decode.max_decode_bytes = 1024 * 1024;
+    options.preparation.max_scratch_bytes = 256 * 1024;
+    options.max_inflight_staging_bytes = 24576;
+    options.admission_pool = &pool;
+    var first = try video.mjpeg_metal.prepareWindows(a, std.testing.io, &reader, &clips, &metal, options);
+    try std.testing.expectEqual(@as(u64, first.output_bytes + 4096), pool.snapshot().device_bytes);
+    // A caller retaining completed outputs consumes the same shared capacity.
+    pool.limits.device_bytes = first.output_bytes;
+    const reads = src.reads;
+    try std.testing.expectError(error.SharedAdmissionExceeded, video.mjpeg_metal.prepareWindows(a, std.testing.io, &reader, &clips, &metal, options));
+    try std.testing.expectEqual(reads, src.reads);
+    first.deinit();
+    try std.testing.expectEqual(media.admission.Resources{ .device_bytes = 4096 }, pool.snapshot());
+    pool.limits.device_bytes = 1024 * 1024;
+    var retry = try video.mjpeg_metal.prepareWindows(a, std.testing.io, &reader, &clips, &metal, options);
+    retry.deinit();
+    try std.testing.expectEqual(media.admission.Resources{ .device_bytes = 4096 }, pool.snapshot());
 }

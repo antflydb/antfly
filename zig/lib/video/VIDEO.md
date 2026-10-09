@@ -2,7 +2,9 @@
 
 Status: phase 1, the independent phase 2 decoder/preparation library, the
 independent phase 3 scheduling subset, phase 4 portable MJPEG lane, and
-software-decode-to-Metal preparation are implemented, 2026-10-08. EmbeddingGemma
+software-decode-to-Metal preparation, resident resize coefficients, shared
+admission, synchronized benchmarks and a pure Zig H.264 subset are implemented,
+2026-10-08. EmbeddingGemma
 2 model-token integration, HTTP/SDK video inputs, and resident vision/backbone
 execution remain pending. Tim's PR #1014 is kept separate as requested; its model
 code is not incorporated into this branch.
@@ -88,7 +90,8 @@ Selected-frame count, packet bytes/work, retained native plane bytes, source
 pixels, and preparation allocations have limits. Decoder picture-pool admission
 uses a conservative estimate; opaque OS decoder workspace is not charged through
 the Zig allocator. Queued imports and outputs have separate limits; atomic
-admission across concurrent model requests remains future work. `Surface.fromBorrowed` retains an existing
+admission across independent decode/preparation requests is implemented below;
+model workspace admission remains separate. `Surface.fromBorrowed` retains an existing
 CoreVideo pixel buffer without copying. `Surface.map` is an explicit host lease.
 
 `MetalCache` accepts the inference backend's existing `id<MTLDevice>` and imports
@@ -141,7 +144,7 @@ Native macOS decode/GPU tests require access to platform services. Hardware-only
 qualification skips when the platform cannot create the requested decoder;
 portable-target tests explicitly skip Apple routes and test unavailable errors.
 Linux has packet indexing, frame selection, CPU preparation and the pure Zig
-MJPEG lane below. Its native H.264 decoder and NVDEC/CUDA routes remain planned. Apple frameworks
+MJPEG and the qualified pure Zig H.264 subset below. NVDEC/CUDA remains planned. Apple frameworks
 and Objective-C sources are omitted from non-macOS builds.
 
 ## Implemented independent scheduling
@@ -213,7 +216,7 @@ of eight selections (six unique outputs), with CPU/Metal value comparisons,
 depth-one/two bounds, source teardown, late cancellation/retry, sink failures and
 allocation-failure campaigns. Portable planner tests execute on WASI; Linux
 compiles the planner, window reuse and CPU preparation without Apple dependencies.
-Native Linux H.264 decode and CUDA/NVDEC remain stage 4 work. Model-specific tokens,
+The Linux H.264 subset below is implemented; broader H.264 tools and CUDA/NVDEC remain stage 4 work. Model-specific tokens,
 resident vision/backbone/pooling and retrieval parity still depend on PR #1014.
 
 ## Implemented portable MJPEG lane
@@ -262,8 +265,8 @@ portable decode/preparation suite executes on WASI and compiles for Linux.
 
 This CPU route supplies host patches for a later model consumer. The Metal route
 below stages software-decoded pictures on the caller's device. Neither runs an
-embedding model. NVDEC/CUDA,
-pure Zig H.264 and resident model execution remain pending independently or behind
+embedding model. Broader H.264 tools, NVDEC/CUDA and resident model execution
+remain pending independently or behind
 PR #1014 as described in the implementation plan.
 
 ## Implemented software decode to Metal
@@ -325,7 +328,80 @@ For the original two-second fixture, preparing overlapping windows together give
 Depth two retains at most 24,576 staged RGBA bytes; completed unique patch outputs
 occupy 221,184 bytes. These are asserted logical work/resource counts, not latency
 or embedding benchmarks. Resident vision/projector/backbone/pooling still await
-PR #1014; software H.264 and NVIDIA NVDEC/CUDA remain independent follow-ups.
+PR #1014; broader H.264 tools and NVIDIA NVDEC/CUDA remain independent follow-ups.
+
+## Implemented independent efficiency and portable H.264 work
+
+`preparation.Metal` owns one resident coefficient geometry. The key is rotated
+source width/height plus target width/height; color matrix, range and centering
+remain command parameters because they do not change resize coefficients. A hit
+reuses the uploaded tables without CPU coefficient regeneration or upload;
+temporary CPU tables have already released.
+A geometry change replaces the resident entry; submitted commands retain the old
+buffers through completion. Cache hits still recheck the caller's scratch budget.
+`clearCoefficients` explicitly evicts the entry. The default coefficient cap is
+16 MiB; `Metal.admit(pool, cap)` reserves a persistent shared budget before use.
+Destroying the preparer fences its queue before releasing that reservation.
+`Prepared.coefficient_staging_bytes` now reports uploads for that submission:
+zero on a hit. `Prepared.gpuSeconds` preserves completed command execution time
+after input resources have released. No model or host readback is needed.
+
+CPU, MJPEG/Metal and VideoToolbox/Metal window options accept a shared
+`media.admission.Pool`. Outputs retain their reservations until result destruction;
+transient decoder/preparation memory and command capacity return after completion.
+Metal jobs require the preparer to have been admitted to the same pool. Reservations
+cover configured conservative scratch/decode/queue bounds, source/cache/index
+owners separately, and completed output bytes. They do not measure opaque driver
+workspace or deduplicate borrowed host aliases. Size limits for the intended
+geometry rather than relying on large defaults when configuring concurrency.
+Admission denial occurs before packet decoding and can be retried by the caller.
+Native worker tests qualify atomic contention; overlapping output lifetimes,
+late cancellation, allocation failures and retry qualify release ordering.
+
+`h264.decodeFrame` is a pure Zig decoder available on Linux, macOS and WASI.
+The declared first subset is progressive 8-bit 4:2:0 Baseline, one static SPS/PPS,
+one complete IDR I-slice per packet, CAVLC, Intra16x16 or I_PCM macroblocks, and
+explicitly disabled deblocking. Frame-number syntax, POC types 0/2, QP/chroma QP,
+all Intra16x16/chroma prediction modes, DC/AC inverse transforms, crop offsets,
+RBSP emulation prevention and full/video-range signaling are handled. Source
+clock/PTS comes from the indexed packet. Owned tightly packed NV12 pictures expose
+`Frame.host()` for portable preparation. Decode uses the same actual allocation
+budget tracker as MJPEG; geometry/packet/conservative work bounds are checked first,
+with cancellation during RBSP copying, macroblocks and output rows. Shared output
+admission remains held until Frame destruction.
+
+This is a qualified software subset, not general H.264 playback. Inter/P/B pictures,
+Intra4x4, CABAC, 8x8 transforms, active deblocking, scaling matrices, multiple slices,
+FMO/ASO, interlacing, higher bit depths/chroma, dynamic parameter sets and other
+profiles are rejected. Capability `portable_h264_decode` is true with the explicit
+`portable_h264_subset` descriptor; callers must preserve that descriptor.
+Independent x264/FFmpeg fixtures cover multiple quantizers, plane prediction,
+cropped 62x46 geometry and full range; a normative I_PCM fixture exercises byte
+alignment and emulation prevention. Supported pictures match FFmpeg NV12 exactly.
+Filtered and unsupported-profile inputs fail closed; allocation/cancellation
+campaigns and a 512-case packet mutation corpus release all leases.
+CAVLC codeword data is generated from pinned Cisco OpenH264 BSD-2-Clause tables;
+[third-party notices](THIRD_PARTY_NOTICES.md) include the revision and license.
+No OpenH264, x264 or FFmpeg runtime is linked.
+
+`software.prepareWindows` supplies owned host patches for both MJPEG and this H.264
+subset, reusing each selected picture across overlapping clips. Source, Reader and
+frame storage may be destroyed after return. Codec work is still separate from
+EmbeddingGemma 2 tokens and model execution.
+
+`zig build bench-video -Doptimize=ReleaseSafe` measures the checked-in MJPEG fixture.
+`-Dbenchmark-input=/absolute/path/video.mp4` uses positional file reads and sampled
+overlapping windows on an external static/fragmented MP4 or MOV. macOS selects
+VideoToolbox/Metal for AVC or software JPEG/Metal for MJPEG; Linux selects the pure
+Zig software route. One cold request and 20 warm requests report completed wall
+latency, GPU execution sum, selected pictures, decode live allocation peak, logical
+RGBA/coefficient uploads, device-wide allocated bytes and process peak RSS. The
+summary reports warm p50/p95 and selected frames/s. GPU time excludes queue wait;
+RSS is a process lifetime high-water mark, device allocated size includes other
+device activity, and driver decoder workspace has no allocator-level live peak.
+Wall timings include result cleanup and polling, so this is a decode/preparation
+benchmark rather than an embedding or concurrent-serving throughput claim.
+Dated raw receipts live under [testdata/benchmarks](testdata/benchmarks/README.md).
 
 ## Remaining module and API shape
 

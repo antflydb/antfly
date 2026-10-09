@@ -210,6 +210,13 @@ fn flush(capture: *Capture, sink: ?Sink) !void {
         }
     };
 }
+/// Conservative platform picture-pool estimate shared by request admission
+/// and session qualification. Opaque driver workspace remains unmeasured.
+pub fn surfaceAdmissionBytes(width: u32, height: u32, selections: usize) !u64 {
+    const row = std.mem.alignForward(u64, @as(u64, width) + 256, 256);
+    const per_frame = try std.math.mul(u64, row, (@as(u64, height) + 32) * 2);
+    return std.math.mul(u64, per_frame, try std.math.add(u64, selections, 24));
+}
 fn decode(allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []const usize, options: Options, sink: ?Sink) !Batch {
     if (!supported) return error.UnsupportedVideoBackend;
     try reader.input.control.check();
@@ -227,9 +234,7 @@ fn decode(allocator: std.mem.Allocator, reader: *media.mp4.Reader, indexes: []co
     defer plan.deinit();
     // Conservative bound includes native row alignment, all selected pictures,
     // and a fixed extra decoder pool (16 reference pictures + 8 outputs).
-    const row = std.mem.alignForward(u64, @as(u64, reader.track.width) + 256, 256);
-    const per_frame = row * (@as(u64, reader.track.height) + 32) * 2;
-    if (per_frame * (indexes.len + 24) > options.max_surface_bytes) return error.ResourceLimitExceeded;
+    if (try surfaceAdmissionBytes(reader.track.width, reader.track.height, indexes.len) > options.max_surface_bytes) return error.ResourceLimitExceeded;
     const slots = try allocator.alloc(?Frame, indexes.len);
     defer allocator.free(slots);
     @memset(slots, null);
