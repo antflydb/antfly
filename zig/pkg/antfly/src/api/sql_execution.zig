@@ -817,6 +817,15 @@ pub const Adapter = struct {
         if (self.cleanup_phase == null) self.cleanup_phase = @import("runnable_local_cleanup.zig").Cleanup.init(execution) catch null;
         const Callback = struct {
             const runtime = @import("antfly_runtime_abi");
+            fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                const execution = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+                // Activated cleanup has its own finite fence. Polling the
+                // expired foreground context must not cancel that obligation.
+                if (!execution.entry.?.cleanup_active) adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
             fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
                 const adapter: *Adapter = @ptrCast(@alignCast(raw));
                 if (adapter.runnable.?.entry.?.cleanup_active) {
@@ -875,7 +884,7 @@ pub const Adapter = struct {
                 return .ok;
             }
         };
-        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter, .reserve_cleanup = if (self.cleanup_phase != null) Callback.reserveCleanup else null, .activate_cleanup = if (self.cleanup_phase != null) Callback.activateCleanup else null, .reserve_child = Callback.reserveChild };
+        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter, .reserve_cleanup = if (self.cleanup_phase != null) Callback.reserveCleanup else null, .activate_cleanup = if (self.cleanup_phase != null) Callback.activateCleanup else null, .reserve_child = Callback.reserveChild, .check_lifetime = Callback.lifetime };
     }
 
     fn spillWaitEnd(ptr: *anyopaque) !void {

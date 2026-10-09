@@ -233,6 +233,35 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-runnable-child-abi-test", "Verify child reservation ABI prefixes and inherited authority")
         .dependOn(&b.addRunArtifact(runnable_child_abi_tests).step);
+    const runnable_lifetime_abi_tests = b.addTest(.{
+        .name = "runnable-lifetime-abi-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/runtime/src/runtime_runnable_abi.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .filters = &.{"runnable lifetime ABI"},
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-runnable-lifetime-abi-test", "Verify parked borrowed lifetime without acquiring CPU")
+        .dependOn(&b.addRunArtifact(runnable_lifetime_abi_tests).step);
+    const provider_lifetime_root = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/execution_control.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    provider_lifetime_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    provider_lifetime_root.addImport("antfly_platform", antfly_imports.platform);
+    const provider_lifetime_tests = b.addTest(.{
+        .name = "provider-lifetime-tests",
+        .root_module = provider_lifetime_root,
+        .filters = &.{"provider request lifetime polling"},
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-provider-lifetime-test", "Verify provider polling observes owner cancellation expiry and shutdown without CPU resumption")
+        .dependOn(&b.addRunArtifact(provider_lifetime_tests).step);
     const decision_budget_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/decision_recovery_budget.zig"),
         .target = target,

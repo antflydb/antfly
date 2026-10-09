@@ -15,7 +15,7 @@ pub const State = struct {
     cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
-        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild };
+        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .check_lifetime = checkLifetime };
     }
 };
 
@@ -125,6 +125,10 @@ fn activateChild(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
     return .ok;
 }
 
+fn checkLifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+    capsule(raw).execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
 fn checkpoint(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
     capsule(raw).execution.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
     return .ok;
@@ -929,4 +933,47 @@ test "runnable execution port child invalid prefix and overflowing ownership lea
     try std.testing.expectEqual(before.operations, owner.owner.scheduler.stats().operations);
     try std.testing.expectEqual(@as(usize, 0), capsule(parent.?).execution.entry.?.children);
     try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
+}
+
+test "runnable execution port checks parked lifetime without CPU grants or ownership retirement" {
+    const Signal = struct {
+        fn canceled(raw: ?*const anyopaque) callconv(.c) u8 {
+            return @intFromBool(@as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw.?))).load(.acquire));
+        }
+    };
+    for ([_]?anyerror{ null, error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |failure| {
+        TestClock.now_ns = 0;
+        var flag = std.atomic.Value(bool).init(false);
+        var state: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 2, .max_operations = 4 }), .native_now_ns = TestClock.now };
+        defer state.owner.deinit();
+        const port = state.port();
+        const io = std.testing.io;
+        const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+        var handle: ?*anyopaque = null;
+        const status = port.start(port.context, &.{ .io = &io_borrow, .native_deadline = 1, .has_deadline = 1, .deadline_ns = 10, .cancellation = .{ .context = &flag, .is_cancelled = Signal.canceled }, .class = @backingInt(abi.Class.query), .retained_bytes = 37, .out_handle = &handle });
+        try std.testing.expect(status.isOk());
+        defer port.finish(handle.?);
+        const borrowed = try abi.Borrowed.fromOwner(port, handle.?, 1, .query);
+        try std.testing.expect(port.park(handle.?, @backingInt(abi.Wait.resource)).isOk());
+        const before = state.owner.scheduler.stats();
+        if (failure == error.Canceled) flag.store(true, .release);
+        if (failure == error.DeadlineExceeded) TestClock.now_ns = 10;
+        if (failure == error.SchedulerClosed) state.owner.close();
+        if (failure) |expected| {
+            try std.testing.expectError(expected, port.checkLifetime(handle.?));
+            try std.testing.expectError(expected, borrowed.checkLifetime());
+        } else {
+            try port.checkLifetime(handle.?);
+            try borrowed.checkLifetime();
+            var health: ?*anyopaque = null;
+            try std.testing.expect(port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(abi.Class.control), .allow_wait = 0, .out_handle = &health }).isOk());
+            try port.checkLifetime(handle.?);
+            port.finish(health.?);
+        }
+        const after = state.owner.scheduler.stats();
+        try std.testing.expectEqual(@as(usize, 0), after.runnable_slots);
+        try std.testing.expectEqual(before.operations, after.operations);
+        try std.testing.expectEqual(before.retained_bytes, after.retained_bytes);
+        try std.testing.expectEqual(before.grants[0], after.grants[0]);
+    }
 }

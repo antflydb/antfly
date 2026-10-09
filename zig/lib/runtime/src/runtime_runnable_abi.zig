@@ -9,7 +9,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 9;
+pub const abi_version: u32 = 10;
 pub const Class = enum(c_int) { query, write, inference, background, control };
 pub const Wait = enum(c_int) { resource, output };
 
@@ -124,6 +124,16 @@ pub const Owner = extern struct {
     completion_remaining_ns: ?*const fn (*anyopaque, *u64) callconv(.c) errors.Status = null,
     reserve_child: ?*const fn (*anyopaque, *const ChildStart) callconv(.c) errors.Status = null,
     activate_child: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+    /// May run on a physical borrower while this capsule is parked. It checks
+    /// retained cancellation/deadline/shutdown state without acquiring CPU.
+    check_lifetime: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+
+    pub fn checkLifetime(self: Owner, handle: *anyopaque) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        const callback = self.check_lifetime orelse return error.UnsupportedOperation;
+        const status = callback(handle);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
 
     pub fn reserveCompletion(self: Owner, handle: *anyopaque, options: *const Completion) !void {
         if (!self.valid()) return error.UnsupportedVersion;
@@ -244,6 +254,16 @@ pub const Borrowed = extern struct {
     completion_remaining_ns: ?*const fn (*anyopaque, *u64) callconv(.c) errors.Status = null,
     reserve_child: ?*const fn (*anyopaque, *const ChildStart) callconv(.c) errors.Status = null,
     activate_child: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+    /// May run on a physical borrower while this capsule is parked. It checks
+    /// retained cancellation/deadline/shutdown state without acquiring CPU.
+    check_lifetime: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+
+    pub fn checkLifetime(self: Borrowed) !void {
+        try self.validate();
+        const callback = self.check_lifetime orelse return error.UnsupportedOperation;
+        const status = callback(self.context);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
 
     pub fn reserveChild(self: Borrowed, options: *const ChildStart) !void {
         try self.validate();
@@ -340,6 +360,7 @@ pub const Borrowed = extern struct {
             .completion_remaining_ns = owner.completion_remaining_ns,
             .reserve_child = owner.reserve_child,
             .activate_child = owner.activate_child,
+            .check_lifetime = owner.check_lifetime,
         };
         try borrow.validate();
         return borrow;
@@ -740,4 +761,39 @@ test "runnable child ABI rejects legacy prefixes before borrowing worker IO or c
     child_header.version = abi_version;
     child_header.struct_size = @sizeOf(Header);
     try std.testing.expectError(error.UnsupportedVersion, child.validate());
+}
+
+test "runnable lifetime ABI never substitutes CPU checkpoint for parked lifetime" {
+    const Fake = struct {
+        calls: usize = 0,
+        failure: ?anyerror = null,
+        fn lifetime(raw: *anyopaque) callconv(.c) errors.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return if (self.failure) |failure| errors.statusFromError(failure) else .ok;
+        }
+        fn checkpoint(_: *anyopaque) callconv(.c) errors.Status {
+            return errors.statusFromError(error.InvalidRunnableTransition);
+        }
+        fn phase(_: *anyopaque, _: c_int) callconv(.c) errors.Status {
+            return errors.statusFromError(error.InvalidRunnableTransition);
+        }
+    };
+    var fake: Fake = .{};
+    var borrow: Borrowed = .{ .context = &fake, .cpu_slots = 1, .parent_class = @backingInt(Class.query), .checkpoint = Fake.checkpoint, .park = Fake.phase, .enter = Fake.phase };
+    try std.testing.expectError(error.UnsupportedOperation, borrow.checkLifetime());
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    borrow.check_lifetime = Fake.lifetime;
+    try borrow.checkLifetime();
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |failure| {
+        fake.failure = failure;
+        try std.testing.expectError(failure, borrow.checkLifetime());
+    }
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
+    borrow.version -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, borrow.checkLifetime());
+    borrow.version = abi_version;
+    borrow.struct_size -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, borrow.checkLifetime());
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
 }

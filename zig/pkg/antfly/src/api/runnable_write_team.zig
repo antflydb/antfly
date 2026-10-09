@@ -25,11 +25,18 @@ fn initTeam(execution: *scheduler.Execution, allocator: std.mem.Allocator) !runt
             .park = unsupportedPhase,
             .enter = unsupportedPhase,
             .resize_team = resize,
+            .check_lifetime = lifetime,
         },
         // Protected terminal SQL work must leave the health reserve available.
         .maximum_slots = if (entry.class == .control) 1 else owner.config.slots - owner.config.control_slots,
         .allocator = allocator,
     };
+}
+
+fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+    const execution: *scheduler.Execution = @ptrCast(@alignCast(raw));
+    execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
 }
 
 fn unsupportedCheck(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
@@ -72,6 +79,7 @@ pub const Completion = struct {
         value.borrow.reserve_completion = reserve;
         value.borrow.activate_completion = activate;
         value.borrow.completion_remaining_ns = remaining;
+        value.borrow.check_lifetime = lifetime;
         value.borrow.checkpoint = check;
         value.borrow.park = park;
         value.borrow.enter = enter;
@@ -121,6 +129,10 @@ pub const Completion = struct {
     }
     fn resizeTeam(raw: *anyopaque, slots: usize) callconv(.c) runtime.error_abi.Status {
         return resize(from(raw).execution, slots);
+    }
+    fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+        from(raw).execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
     }
     fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
         const self = from(raw);

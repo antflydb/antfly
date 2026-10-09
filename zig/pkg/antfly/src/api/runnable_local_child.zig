@@ -39,7 +39,12 @@ const Receiver = struct {
             .enter = enter,
             .reserve_child = reserveNested,
             .activate_child = activate,
+            .check_lifetime = lifetime,
         };
+    }
+    fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+        from(raw).execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
     }
     fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
         from(raw).execution.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
