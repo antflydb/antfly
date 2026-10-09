@@ -61,7 +61,7 @@ pub const Manager = struct {
     buffer_bytes: usize = 4096,
     async_writes: bool = true,
     parallel_work: bool = true,
-    /// Sort jobs own independent CPU/IO scopes. Shared quota and directory
+    /// Private operator jobs own independent CPU/IO scopes. Shared quota and directory
     /// lifetime remain here; child file callbacks never access parent policy.
     cpu_scope: ?@import("parallel_scheduler.zig").ExecutionScope = null,
     wait: ?@import("execution_wait.zig").Boundary = null,
@@ -74,7 +74,7 @@ pub const Manager = struct {
     files: usize = 0,
     mutex: std.atomic.Mutex = .unlocked,
     allocation_mutex: std.atomic.Mutex = .unlocked,
-    /// All spill CPU children pass through this gate. Serial spill I/O must
+    /// Legacy unscoped spill children pass through this gate. Serial spill I/O must
     /// never imply permission to share a parent's runnable execution capsule.
     pub fn submit(self: *Manager, bytes: usize, comptime function: anytype, args: anytype) ?@import("parallel_scheduler.zig").Task(@TypeOf(@call(.auto, function, args))) {
         if (!self.parallel_work or self.wait != null) return null;
@@ -251,7 +251,7 @@ pub const Manager = struct {
     pub fn create(self: *Manager) !File {
         return self.createFor(null);
     }
-    fn createFor(self: *Manager, execution: ?*Runnable.Execution) !File {
+    pub fn createFor(self: *Manager, execution: ?*Runnable.Execution) !File {
         // Freestanding builds have no native spill directory. Keep bounded
         // in-memory SQL available and report its existing limit on overflow.
         if (comptime !native_spill_supported) return error.SqlProgramLimitExceeded;

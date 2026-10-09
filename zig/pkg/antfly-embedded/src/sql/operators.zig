@@ -489,7 +489,7 @@ pub const GroupResult = struct {
 /// Build-side ownership for a streaming hash join. Probe rows remain borrowed
 /// from one native page; only the build relation occupies retained memory.
 pub const HashJoin = struct {
-    pub const Limits = struct { rows: usize = 100000, bytes: usize = 8 * 1024 * 1024, spill: ?*@import("spill.zig").Manager = null };
+    pub const Limits = struct { rows: usize = 100000, bytes: usize = 8 * 1024 * 1024, spill: ?*@import("spill.zig").Manager = null, execution: ?*@import("../common/runnable_scheduler.zig").Execution = null };
     const Entry = struct { next: ?usize, width: usize, matched: bool = false };
     pub const Match = struct {
         index: usize,
@@ -519,6 +519,7 @@ pub const HashJoin = struct {
         first: ?Match = null,
 
         pub fn next(self: *Probe) !?Match {
+            if (self.owner.limits.execution) |execution| try execution.checkpoint();
             if (self.first) |match| {
                 self.first = null;
                 return match;
@@ -537,7 +538,12 @@ pub const HashJoin = struct {
                 if (equal) return .{ .index = index, .values = decoded.row.values, .keys = decoded.row.keys, .transient = true };
             };
             if (self.owner.disk != null) return null;
+            var visited: usize = 0;
             while (self.cursor) |index| {
+                if (self.owner.limits.execution) |execution| {
+                    if (visited % 64 == 0) try execution.checkpoint();
+                }
+                visited += 1;
                 const entry = &self.owner.entries.items[index];
                 self.cursor = entry.next;
                 self.owner.probes += 1;
@@ -571,9 +577,12 @@ pub const HashJoin = struct {
         const heads = try alloc.alloc(u64, slots);
         errdefer alloc.free(heads);
         @memset(heads, @import("spill.zig").none);
-        var file = try manager.create();
+        var file = try manager.createFor(self.limits.execution);
         errdefer file.close();
         for (self.entries.items, 0..) |_, ordinal| {
+            if (self.limits.execution) |execution| {
+                if (ordinal % 64 == 0) try execution.checkpoint();
+            }
             var arena = std.heap.ArenaAllocator.init(self.backing);
             defer arena.deinit();
             const values = try self.value_columns.rowWidth(arena.allocator(), ordinal, self.entries.items[ordinal].width);
@@ -630,6 +639,9 @@ pub const HashJoin = struct {
         return hasher.final();
     }
     pub fn add(self: *HashJoin, values: []const Datum, keys: []const Datum) !void {
+        if (self.limits.execution) |execution| {
+            if (self.row_count % 64 == 0) try execution.checkpoint();
+        }
         if (self.sealed or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         if (self.row_count >= self.limits.rows) return error.SqlProgramLimitExceeded;
         self.key_count = keys.len;
@@ -648,6 +660,7 @@ pub const HashJoin = struct {
         self.row_count += 1;
     }
     fn admitBatch(self: *HashJoin, a: Allocator, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum) !bool {
+        if (self.limits.execution) |execution| try execution.checkpoint();
         if (self.disk != null) return false;
         if (self.sealed or batch.len() != keys.len) return error.InvalidSqlBackendResponse;
         if (keys.len > self.limits.rows -| self.row_count) return error.SqlProgramLimitExceeded;
@@ -793,6 +806,9 @@ pub const HashJoin = struct {
             return null;
         }
         while (next.* < self.entries.items.len) {
+            if (self.limits.execution) |execution| {
+                if (next.* % 64 == 0) try execution.checkpoint();
+            }
             const index = next.*;
             next.* += 1;
             const entry = self.entries.items[index];

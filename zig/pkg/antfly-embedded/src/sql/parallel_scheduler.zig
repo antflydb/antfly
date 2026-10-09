@@ -20,8 +20,10 @@ const std = @import("std");
 const A = std.mem.Allocator;
 const Runnable = @import("../common/runnable_scheduler.zig");
 
-/// Coordinator-owned authority for pure CPU kernels over immutable input. This
-/// is not permission to share a backend, cursor, policy cache or spill manager.
+/// Coordinator-owned authority for CPU kernels over immutable input and private
+/// operator files with independent receivers. This does not permit sharing a
+/// mutable backend, cursor or policy cache; the manager only retains locked
+/// quotas/directory state and the statement allocation owner.
 /// Its allocator and original parent contexts outlive every physical join.
 pub const ExecutionScope = struct {
     execution: *Runnable.Execution,
