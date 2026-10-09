@@ -2573,6 +2573,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                 {"name": "amount_idx", "keys": [{"column": "amount", "nulls": "first"}]},
                 {"name": "amount_desc_idx", "keys": [{"column": "amount", "direction": "desc", "nulls": "last"}]},
                 {"name": "event_time_idx", "keys": [{"column": "event_time", "nulls": "first"}]},
+                {"name": "event_time_desc_idx", "keys": [{"column": "event_time", "direction": "desc", "nulls": "last"}]},
                 {"name": "big_integer_idx", "keys": [{"column": "big_integer"}]},
                 {"name": "time_text_idx", "keys": [{"column": "time_text"}]},
                 {"name": "category_idx", "keys": [{"column": "category"}]},
@@ -2790,18 +2791,19 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         # Almost the entire archive shares one timestamp. Complete public-ID
         # seeks must deliver pages without walking that 100,000-row tie group.
         tie_filter = {"range": {"event_time": {"gte": "1970-01-01T00:00:00.000000002Z"}}}
-        for id_desc in (False, True):
-            tie_order = [{"field": "event_time"}, {"field": "_id", "desc": id_desc}]
+        for primary_desc in (False, True):
+            # The public contract requires an ascending final _id tie-breaker.
+            tie_order = [{"field": "event_time", "desc": primary_desc}, {"field": "_id"}]
             first_tie = query(tie_filter, order_by=tie_order, limit=3, profile=True)
             first_ids = [hit["_id"] for hit in first_tie["hits"]["hits"]]
-            assert len(first_ids) == 3 and first_ids == sorted(first_ids, reverse=id_desc), first_tie
+            assert len(first_ids) == 3 and first_ids == sorted(first_ids), first_tie
             assert first_tie["profile"]["sort"]["candidate_source"] == "ordered_lake_index", first_tie
             assert first_tie["profile"]["sort"]["ordered_scanned_count"] <= 4, first_tie
             next_tie = query(tie_filter, order_by=tie_order, limit=3, profile=True,
                 search_after=first_tie["hits"]["hits"][-1]["_sort"], remote_snapshot=first_tie["remote_snapshot"])
             next_ids = [hit["_id"] for hit in next_tie["hits"]["hits"]]
             assert len(next_ids) == 3 and not set(first_ids) & set(next_ids), next_tie
-            assert first_ids + next_ids == sorted(first_ids + next_ids, reverse=id_desc), next_tie
+            assert first_ids + next_ids == sorted(first_ids + next_ids), next_tie
             assert next_tie["profile"]["sort"]["ordered_scanned_count"] <= 4, next_tie
             previous_tie = query(tie_filter, order_by=tie_order, limit=3, profile=True,
                 search_before=next_tie["hits"]["hits"][0]["_sort"], remote_snapshot=next_tie["remote_snapshot"])

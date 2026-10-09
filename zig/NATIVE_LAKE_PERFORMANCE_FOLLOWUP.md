@@ -468,9 +468,10 @@ When the relational index proves every nonconstant sort field, ordered text
 search uses this directory to visit participating files in public `lake1:` digest
 order and seeks physical rows within each file. The decoded-root cache computes
 snapshot-specific file digests once; changing their permutation requires no row
-reindexing. Public-ID ascending/descending and search-after/search-before use
-the complete tuple and exclusive physical coordinate boundary. The collector can
-stop within a tie group after its bounded winner window. Extra nonconstant keys,
+reindexing. Search-after/search-before use the complete tuple and exclusive
+physical coordinate boundary. The native cursor supports both public-ID traversal
+directions; the public API retains its ascending final `_id` tie-breaker. The
+collector can stop within a tie group after its bounded winner window. Extra nonconstant keys,
 legacy roots, and incompatible orderings retain the existing complete-tie fallback.
 Per-group and per-file arenas are reset independently; prefetch remains bounded
 by the requested window, 256 references, and the physical probe budget.
@@ -478,3 +479,15 @@ by the requested window, 256 references, and the physical probe budget.
 Representative cold/warm archive throughput benchmarks remain pending. Kernel
 and pagination counters establish avoided scoring/traversal, not an archive-scale
 latency or throughput claim.
+
+Validation on 2026-10-09: the Zig 0.17.0 optimized production build passed.
+The sparse suite passed all 60 tests after merging main's storage changes from
+#1027; the mounted and embedded API test binaries passed 108 and 116 tests with
+zero leaks. The real Parquet/PyIceberg suite passed all 26 cases in 84.47 seconds
+with `ANTFLY_E2E_FULL_LAKE=1` and normal filesystem disk safeguards. Its two-file,
+100,003-row fixture checks three-row pages through a 100,000-row timestamp tie
+in both primary-sort directions, including after/before cursors, with at most
+four scanned candidates per page. The public `_id` tie-breaker remains ascending;
+the fixture declares matching ascending and descending timestamp indexes.
+Regenerated Go SDK tests, license checks, both source-boundary audits, formatting
+and diff checks also pass. Archive-scale cold/warm throughput remains unmeasured.
