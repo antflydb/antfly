@@ -1127,9 +1127,10 @@ test "external lake stored highlights read authenticated native source without P
     const root = try corpus.loadRoot(ca, artifacts, declaration.artifact, .none, null);
     var writer = try corpus.loadWriter(a, artifacts, root, .none, null, null);
     defer writer.deinit();
-    // Exercise hydration in isolation: no server field besides this cache is
-    // read, and the source object is removed after publication construction.
+    // Exercise hydration in isolation with its cache and instrumentation;
+    // the source object is removed after publication construction.
     var server: server_api.ApiHttpServer = undefined;
+    server.lake_query_metrics = .{};
     server.lake_read_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
     defer server.lake_read_cache.deinit();
     var owner: Execution = .{ .server = &server, .table = .{ .id = 7, .physical_name = "lake", .schema_version = 1, .columns = &.{} }, .source = &source, .store = &store, .domain = root.domain, .declarations = &.{}, .context = .{}, .request = .{}, .schema_json = schema_json, .arena = ca, .use_stored_highlights = true };
@@ -1182,7 +1183,10 @@ test "external lake deferred search projection retains highlight fields until pu
 test "external lake hydration unions returned and highlight fields without unrelated columns" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
+    var server: server_api.ApiHttpServer = undefined;
+    server.lake_query_metrics = .{};
     var owner: Execution = undefined;
+    owner.server = &server;
     owner.arena = arena.allocator();
     owner.context = .{};
     owner.declarations = &.{};
