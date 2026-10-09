@@ -425,6 +425,10 @@ const Owner = struct {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (self.coordinator_context != null) return error.InvalidCoordinatorScanBinding;
         if (self.partition_source == null) {
+            // A previously unscheduled pull may still own speculative work and
+            // a page cursor. Join it under this call's resource wait before
+            // replacing the receiver, then retarget that retained page cursor.
+            try @import("execution_wait.zig").run(@import("spill.zig").childWait(execution), retireUnboundSpeculation, .{self});
             // Alias cursors borrow the statement's immutable snapshot; version
             // evidence, deletes and pending receivers must be cursor-local.
             const source = try self.alloc.create(serving.ServingSource);
@@ -440,11 +444,18 @@ const Owner = struct {
             self.partition_versions_owned = true;
             self.borrowed_prepared = source.prepared_deletes;
             self.stream.source = source;
+            if (self.stream.page_cursor) |*page| {
+                page.reader = reader.reader();
+                page.shared_reader = reader;
+            }
         }
         const reader = self.partition_source.?.scanner.shared_reader.?;
         self.coordinator_context = reader.context;
         self.coordinator_stream_context = self.stream.context;
         try bindExecution(raw, execution);
+    }
+    fn retireUnboundSpeculation(self: *Owner) !void {
+        self.stream.retireSpeculation();
     }
     fn releaseCoordinator(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
@@ -696,6 +707,8 @@ const TestLake = struct {
         delay_reads: bool = false,
         execution_owner: ?*@import("../common/runnable_scheduler.zig").Scheduler = null,
         expected_parked: usize = 2,
+        cancel_on_read: ?*std.atomic.Value(bool) = null,
+        deadline_on_read: ?*std.atomic.Value(u64) = null,
         parked_reads: std.atomic.Value(usize) = .init(0),
         control_reads: std.atomic.Value(usize) = .init(0),
         parked_stats: std.atomic.Value(usize) = .init(0),
@@ -753,6 +766,8 @@ const TestLake = struct {
                 _ = self.control_reads.fetchAdd(1, .monotonic);
             }
             const result = try base.getObject(bucket, key, options);
+            if (self.cancel_on_read) |signal| signal.store(true, .release);
+            if (self.deadline_on_read) |clock| clock.store(10, .release);
             self.lock();
             self.bytes += result.body.len;
             self.mutex.unlock();
@@ -1939,7 +1954,7 @@ test "lake SQL coordinator receivers cover streaming materialized count and repe
         if (std.mem.eql(u8, sql, "SELECT amount FROM events LIMIT 2")) {
             const stream = (try @import("read_stream.zig").Stream.open(a, fixture.backend(), &compiled, &.{}, .{})).?;
             defer stream.close();
-            const page = try stream.next(2);
+            var page = try stream.next(2);
             defer page.deinit();
             try std.testing.expectEqual(expected, page.output.rows.len);
         } else {
@@ -1955,4 +1970,82 @@ test "lake SQL coordinator receivers cover streaming materialized count and repe
         try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     }
+}
+
+test "lake SQL coordinator detaches canceled and expired owned payloads before exposing a page" {
+    const Runnable = @import("../common/runnable_scheduler.zig");
+    const Clock = struct {
+        var value: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return value.load(.acquire);
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |expired| {
+        var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+        try lake.populate(a, 1, &.{ 1, 2, 3 });
+        defer lake.deinit(a);
+        var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+        defer cache.deinit();
+        try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
+        const cursor = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 2 }, .{}, &lake.source);
+        defer cursor.close(cursor.ptr);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 64 * 1024 * 1024 });
+        var signal: std.atomic.Value(bool) = .init(false);
+        Clock.value.store(0, .release);
+        var execution: Runnable.Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &signal, .requested = Clock.requested } }, .query);
+        defer execution.finish();
+        lake.meter.execution_owner = &scheduler;
+        lake.meter.expected_parked = 1;
+        if (expired) lake.meter.deadline_on_read = &Clock.value else lake.meter.cancel_on_read = &signal;
+        try std.testing.expectError(if (expired) error.DeadlineExceeded else error.Canceled, cursor.nextFor(&execution, a, 2));
+        const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+        const reader = owner.partition_source.?.scanner.shared_reader.?;
+        try std.testing.expect(owner.coordinator_context == null);
+        try std.testing.expect(owner.stream.context.execution == null);
+        try std.testing.expect(reader.context.execution == null);
+        try std.testing.expect(reader.request_store.?.context.execution == null);
+        try std.testing.expect(lake.source.scanner.shared_reader.?.request_store == null);
+        try std.testing.expectEqual(@as(usize, 1), lake.meter.reads);
+        try std.testing.expectEqual(@as(usize, 1), lake.meter.parked_reads.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), lake.meter.control_reads.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "lake SQL coordinator can adopt a retained page cursor after an unscheduled pull" {
+    const a = std.testing.allocator;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    lake.page_rows = 1;
+    try lake.populate(a, 1, &.{ 1, 2, 3 });
+    defer lake.deinit(a);
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
+    const cursor = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1 }, .{}, &lake.source);
+    defer cursor.close(cursor.ptr);
+    const first = try cursor.next(cursor.ptr, a, 1);
+    defer first.deinit();
+    try std.testing.expectEqual(@as(i64, 1), first.rows[0].value.object.get("amount").?.integer);
+    const Runnable = @import("../common/runnable_scheduler.zig");
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 64 * 1024 * 1024 });
+    var execution: Runnable.Execution = .{};
+    try execution.start(&scheduler, .{ .io = std.testing.io }, .query);
+    defer execution.finish();
+    const next = try cursor.nextFor(&execution, a, 1);
+    defer next.deinit();
+    try std.testing.expectEqual(@as(i64, 2), next.rows[0].value.object.get("amount").?.integer);
+    const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+    const reader = owner.partition_source.?.scanner.shared_reader.?;
+    try std.testing.expect(owner.stream.page_cursor.?.reader.ctx == @as(*anyopaque, @ptrCast(reader)));
+    try std.testing.expect(owner.stream.page_cursor.?.shared_reader == reader);
+    try std.testing.expect(reader.context.execution == null);
+    try std.testing.expect(owner.stream.context.execution == null);
+    try execution.checkpoint();
+    try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
 }
