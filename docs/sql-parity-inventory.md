@@ -1785,9 +1785,30 @@ run additional namespace projection work. A native projection regression reads
 faults, identity/name changes and malformed reservation keys. Actual rewrite
 admission/cancellation fixtures check clock changes across restart, and artifact
 sealing retains both the clock and complete source fingerprint. This is source
-fencing, not source-stream activation: the active-restore target cursor, native
+fencing, not source-stream activation: source-stream integration, native
 candidate ownership derivation, admission/serving barriers and root publication
 remain unfinished. No original SQL parity case receives completion credit.
+The native active-restore cursor now projects one reserved target per source row
+and uses a fixed-width target ordinal within the active-job lexical bookmark.
+It caches one owned job projection, honors older cursors after an unadmitted
+lookahead crosses a job boundary, and never scans terminal job/receipt histories.
+Target projection checks exact active/name/identity reservation pointers, the
+absence of a public successor, current predecessor name/schema and catalog
+namespace hierarchy. Shared names retain an exact active dependency; old-only
+names are omitted from this reservation contribution. Predecessor comparison
+borrows row bytes only until the next read, retaining the cached plan's schema
+instead of allocating another schema-sized copy. Prepared pages own their names
+after the source and transaction close.
+Native regressions exercise 70 targets, a second active job, 1,000 malformed
+terminal-history records, 64-row paging, cross-job rewind and forged reservation
+pointers. Real replacement-restore admission/restart fixtures check both owners
+and exhaustive allocation failures with arena resize disabled for deterministic
+fault points. The final gate passes 168 native catalog and 22 linked storage
+tests with no failures or leaks. The cursor/projector are not yet wired into
+ordinary reconciliation: phase-aware replica ownership proof must distinguish
+public owners prepared before a restore contribution from complete entries
+after that contribution. Activation/serving barriers and original SQL parity
+credit remain unfinished.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,
