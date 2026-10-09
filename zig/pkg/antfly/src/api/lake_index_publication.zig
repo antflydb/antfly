@@ -232,7 +232,7 @@ test "external lake native publication builds scoped text artifacts and fences e
     defer fs_artifacts.deinit();
     var artifact_store = fs_artifacts.artifactStore();
     const store_identity: catalog.Digest = @splat(4);
-    const table: records.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = schema_json, .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]}}" };
+    const table: records.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = schema_json, .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":true},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]}}" };
     const pending_bytes = try begin(a, std.testing.io, table, &source, store_identity, .{}, 100, 20);
     defer a.free(pending_bytes);
     var pending = table;

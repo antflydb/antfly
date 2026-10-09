@@ -1891,6 +1891,7 @@ fn bitmapPopulation(bitmap: []const u8) usize {
 fn encodeOrdinalFixed(out: []u8, cell: Cell) !void {
     var pos: usize = 0;
     switch (cell.value) {
+        .datetime_ns => return error.InvalidRelationalRow,
         .u64_val => |value| writeU64(out, &pos, value),
         .i64_val => |value| writeU64(out, &pos, @bitCast(value)),
         .f64_val => |value| writeU64(out, &pos, @bitCast(value)),
@@ -1912,6 +1913,7 @@ fn appendOrdinalPayload(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), cell
     var fixed: [17]u8 = undefined;
     var pos: usize = 0;
     switch (cell.value) {
+        .datetime_ns => return error.InvalidRelationalRow,
         .u64_val => |value| writeU64(&fixed, &pos, value),
         .i64_val => |value| writeU64(&fixed, &pos, @bitCast(value)),
         .f64_val => |value| writeU64(&fixed, &pos, @bitCast(value)),
@@ -1947,6 +1949,7 @@ fn appendOrdinalPayload(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), cell
 
 fn decodeOrdinalPayload(payload: []const u8, value_type: typed_dv.ValueType) !typed_dv.TypedValue {
     return switch (value_type) {
+        .datetime_ns => return error.InvalidRelationalRow,
         .u64_val => if (payload.len == 8) .{ .u64_val = std.mem.readInt(u64, payload[0..8], .little) } else error.InvalidRelationalRow,
         .i64_val => if (payload.len == 8) .{ .i64_val = @bitCast(std.mem.readInt(u64, payload[0..8], .little)) } else error.InvalidRelationalRow,
         .f64_val => if (payload.len == 8) .{ .f64_val = @bitCast(std.mem.readInt(u64, payload[0..8], .little)) } else error.InvalidRelationalRow,
@@ -2034,6 +2037,7 @@ fn cellValueMatchesType(cell: Cell) bool {
     if (cell.is_json and cell.value_type != .bytes_val) return false;
     if (cell.is_null) return true;
     const matches = switch (cell.value_type) {
+        .datetime_ns => cell.value == .datetime_ns,
         .u64_val => cell.value == .u64_val,
         .i64_val => cell.value == .i64_val,
         .f64_val => cell.value == .f64_val,
@@ -2411,6 +2415,7 @@ fn writeU64(buf: []u8, pos: *usize, value: u64) void {
 
 fn zeroValue(value_type: typed_dv.ValueType) typed_dv.TypedValue {
     return switch (value_type) {
+        .datetime_ns => .{ .datetime_ns = 0 },
         .u64_val => .{ .u64_val = 0 },
         .i64_val => .{ .i64_val = 0 },
         .f64_val => .{ .f64_val = 0 },
@@ -2489,6 +2494,7 @@ fn appendValidatedCellValue(
         return;
     }
     switch (cell.value_type) {
+        .datetime_ns => return error.InvalidRelationalRow,
         .f64_val => try appendFmt(alloc, out, "{d}", .{cell.value.f64_val}),
         .u64_val => try appendFmt(alloc, out, "{d}", .{cell.value.u64_val}),
         .i64_val => try appendFmt(alloc, out, "{d}", .{cell.value.i64_val}),

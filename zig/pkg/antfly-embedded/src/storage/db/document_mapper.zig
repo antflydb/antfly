@@ -2956,12 +2956,7 @@ fn typedDocValueForMappedFieldAlloc(
             },
             else => null,
         },
-        .datetime => switch (value) {
-            .string => |text| if (runtime_schema.parseDateTimeToNs(text)) |timestamp_ns| .{ .u64_val = timestamp_ns } else null,
-            .integer => |timestamp_ns| if (timestamp_ns >= 0) .{ .u64_val = @intCast(timestamp_ns) } else null,
-            .number_string => |timestamp_ns| .{ .u64_val = std.fmt.parseUnsigned(u64, timestamp_ns, 10) catch return null },
-            else => null,
-        },
+        .datetime => if (if (value == .string) @import("../../datetime.zig").parseDateTimeToSignedNs(value.string) else @import("../../datetime.zig").rangeNanoseconds(value)) |ns| .{ .datetime_ns = ns } else null,
         .boolean => switch (value) {
             .bool => |boolean| .{ .bool_val = boolean },
             else => null,
@@ -2997,6 +2992,7 @@ fn jsonValueToFiniteF64(value: std.json.Value) ?f64 {
 
 fn typedValueType(value: typed_dv.TypedValue) typed_dv.ValueType {
     return switch (value) {
+        .datetime_ns => .datetime_ns,
         .u64_val => .u64_val,
         .i64_val => .i64_val,
         .f64_val => .f64_val,
@@ -4524,6 +4520,7 @@ fn relationalValueType(column_type: runtime_schema.RelationalColumnType) typed_d
 
 fn relationalZeroValue(value_type: typed_dv.ValueType) typed_dv.TypedValue {
     return switch (value_type) {
+        .datetime_ns => .{ .datetime_ns = 0 },
         .u64_val => .{ .u64_val = 0 },
         .i64_val => .{ .i64_val = 0 },
         .f64_val => .{ .f64_val = 0 },
@@ -5756,8 +5753,8 @@ test "document mapper accepts match-mapping-type dynamic template index_sort fie
 
     const section = (try reader.getSection("created_at", .typed_doc_values)) orelse return error.TestExpectedEqual;
     var values = try typed_dv.TypedDocValuesReader.init(alloc, section);
-    try std.testing.expectEqual(typed_dv.ValueType.u64_val, values.value_type);
-    try std.testing.expect((try values.getU64(0)).? > (try values.getU64(1)).?);
+    try std.testing.expectEqual(typed_dv.ValueType.datetime_ns, values.value_type);
+    try std.testing.expect((try values.getDateTimeNs(0)).? > (try values.getDateTimeNs(1)).?);
 }
 
 test "document mapper orders mixed numeric domains for index_sort field" {
@@ -6867,4 +6864,31 @@ test "relational dense vectors bypass JSON storage and hash logical values" {
     try std.testing.expect(cell.is_dense_vector);
     try std.testing.expect(!cell.is_json);
     try std.testing.expectEqual(@as(usize, 3 * @sizeOf(f32)), cell.value.bytes_val.len);
+}
+
+test "external lake mapped datetime projection sorts signed and wide instants" {
+    const a = std.testing.allocator;
+    const templates = [_]runtime_schema.DynamicTemplate{.{
+        .name = "dates",
+        .path_match = "created_at",
+        .match_mapping_type = "date",
+        .mapping = .{ .field_type = .datetime, .doc_values = true, .sortable = true, .analyzer = "keyword" },
+    }};
+    const fields = [_]runtime_schema.IndexSortField{ .{ .field = "created_at", .desc = false }, .{ .field = "_id", .desc = false } };
+    var result = try buildTextSegmentFromDocumentsWithMetadata(a, &.{
+        .{ .key = "future", .value = "{\"created_at\":\"9999-12-31T23:59:59.999999999Z\"}" },
+        .{ .key = "epoch", .value = "{\"created_at\":\"1970-01-01T00:00:00Z\"}" },
+        .{ .key = "old", .value = "{\"created_at\":\"1969-12-31T23:59:59.999999999Z\"}" },
+    }, .{}, .{ .dynamic_templates = &templates, .index_sort = &fields });
+    defer result.deinit(a);
+    var reader = try segment_mod.SegmentReader.init(a, result.segment.?);
+    defer reader.deinit();
+    try std.testing.expectEqualStrings("old", (try reader.storedDoc(0)).?.id);
+    try std.testing.expectEqualStrings("epoch", (try reader.storedDoc(1)).?.id);
+    try std.testing.expectEqualStrings("future", (try reader.storedDoc(2)).?.id);
+    var values = try typed_dv.TypedDocValuesReader.init(a, (try reader.getSection("created_at", .typed_doc_values)).?);
+    defer values.deinit();
+    try std.testing.expectEqual(@as(i128, -1), (try values.getDateTimeNs(0)).?);
+    try std.testing.expectEqual(@as(i128, 0), (try values.getDateTimeNs(1)).?);
+    try std.testing.expectEqual(@as(i128, 253402300799999999999), (try values.getDateTimeNs(2)).?);
 }

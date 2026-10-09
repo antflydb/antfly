@@ -100,6 +100,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     owner.files = metadata.files;
     owner.private_files = metadata.private_files;
     owner.private_digests = metadata.private_digests;
+    const publication_finished = @import("antfly_platform").time.monotonicNs();
     var effective = req;
     effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled };
     const has_vectors = effective.dense != null or effective.sparse != null or effective.dense_queries.len != 0 or effective.sparse_queries.len != 0;
@@ -131,6 +132,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
         else if (execution_req.dense) |dense| try Execution.searchDense(&owner, a, execution_req, dense) else if (execution_req.sparse) |sparse| try Execution.searchSparse(&owner, a, execution_req, sparse) else if (execution_req.full_text) |text| try Execution.searchText(&owner, a, execution_req, text) else try Execution.dispatchText(&owner, a, execution_req);
     };
     defer result.deinit();
+    const search_finished = @import("antfly_platform").time.monotonicNs();
     if (!owner.typed_delivery) try owner.attachHighlights(a, effective, &result);
     try context.ensureActive();
     var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = &snapshot_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| total_started) / std.time.ns_per_ms) };
@@ -147,7 +149,16 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
         try owner.attachHighlights(a, effective, &result);
     }
     meta.took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| total_started) / std.time.ns_per_ms);
-    return try local.api_query.encodeQueryResponsesWithDelivery(a, table.name, effective, meta, result, prepared_delivery);
+    const response = try local.api_query.encodeQueryResponsesWithDelivery(a, table.name, effective, meta, result, prepared_delivery);
+    const finished = @import("antfly_platform").time.monotonicNs();
+    server.lake_read_cache.recordQuery(.{
+        .total_ns = finished -| total_started,
+        .publication_ns = publication_finished -| total_started,
+        .search_ns = search_finished -| publication_finished,
+        .hydration_ns = owner.hydration_ns,
+        .delivery_ns = finished -| search_finished,
+    });
+    return response;
 }
 const Execution = struct {
     server: *server_api.ApiHttpServer,
@@ -166,6 +177,9 @@ const Execution = struct {
     predicate_exclusion_json: []const u8 = "",
     predicate_allow_partial: bool = true,
     delivery_request: ?types.SearchRequest = null,
+    hydration_ns: u64 = 0,
+    use_stored_highlights: bool = false,
+    text_stores_source: std.StringHashMapUnmanaged(bool) = .empty,
     highlight_pins: std.ArrayList(search.PinnedTextSource) = .empty,
     highlight_queries: ?[]const search.HighlightQuery = null,
     arena: A,
@@ -180,9 +194,41 @@ const Execution = struct {
     fn vectorRequest(self: *Execution, req: types.SearchRequest) types.SearchRequest {
         var result = req;
         if (self.vector_include != null or self.vector_exclude != null) {
-            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey };
+            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey, .select_ordinals = selectSparseOrdinals };
             result.filter_query_json = "";
             result.exclusion_query_json = "";
+        }
+        return result;
+    }
+    fn selectSparseOrdinals(raw: *anyopaque, a: A, lookup: types.SparseOrdinalLookup) !?local.encoding_roaring.RoaringBitmap {
+        const self: *Execution = @ptrCast(@alignCast(raw));
+        const include = if (self.vector_include) |*set| set else return null;
+        var result = local.encoding_roaring.RoaringBitmap.init(a);
+        errdefer result.deinit();
+        var files = include.files.iterator();
+        while (files.next()) |file| {
+            const digest = self.private_digests.get(file.key_ptr.*) orelse return error.ExternalLakeSnapshotMismatch;
+            var blocks = file.value_ptr.iterator();
+            while (blocks.next()) |block| {
+                try self.context.ensureActive();
+                var prefix: [80]u8 = undefined;
+                const bytes_prefix = try std.fmt.bufPrint(&prefix, "lake2:{s}:{x:0>8}:", .{ digest, block.key_ptr.group });
+                var selection = try block.value_ptr.clone(a);
+                defer selection.deinit();
+                if (self.vector_exclude) |*exclude| if (exclude.files.getPtr(file.key_ptr.*)) |excluded_blocks| if (excluded_blocks.getPtr(block.key_ptr.*)) |excluded| selection.andNotWith(excluded);
+                if (try lookup.block(lookup.ptr, a, bytes_prefix, block.key_ptr.high, &selection, &result)) continue;
+                var rows = selection.iterator();
+                var visited: usize = 0;
+                while (rows.next()) |low| {
+                    if (visited % 256 == 0) try self.context.ensureActive();
+                    visited += 1;
+                    const row = (@as(u64, block.key_ptr.high) << 32) | low;
+                    if (self.vector_exclude) |*exclude| if (exclude.contains(file.key_ptr.*, block.key_ptr.group, row)) continue;
+                    var key: [96]u8 = undefined;
+                    const bytes = try std.fmt.bufPrint(&key, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, block.key_ptr.group, row });
+                    if (try lookup.one(lookup.ptr, bytes)) |num| try result.add(num);
+                }
+            }
         }
         return result;
     }
@@ -253,10 +299,14 @@ const Execution = struct {
         const root = metadata.value.*;
         if (!std.mem.eql(u8, &root.domain, &self.domain)) return error.InvalidNativeLakeTextCorpus;
         if (!@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, selected.binding)) return error.InvalidNativeLakeTextCorpus;
+        const config = try std.json.parseFromSliceLeaky(std.json.Value, self.arena, root.config_json, .{});
+        const source_recipe = corpus.sourceRecipe(.{ .table_id = self.table.id, .name = self.table.physical_name, .schema_json = self.schema_json }, root.config_json, true);
+        const stores_source = try corpus.storesSource(config) and std.mem.eql(u8, &source_recipe, &root.recipe);
+        try self.text_stores_source.put(self.arena, selected.name, stores_source);
         var pin = try self.server.lake_text_corpora.acquire(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation);
         errdefer pin.deinit();
-        const identities = try @import("lake_index_text_predicate.zig").Identities.init(self.arena, root, pin.snapshot);
-        try self.text_identities.put(self.arena, @intFromPtr(pin.snapshot), identities);
+        const identities: *const @import("lake_index_text_predicate.zig").Identities = @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus));
+        try self.text_identities.put(self.arena, @intFromPtr(pin.snapshot), identities.*);
         return pin;
     }
     fn attachHighlights(self: *Execution, a: A, req: types.SearchRequest, result: *types.SearchResult) !void {
@@ -296,7 +346,9 @@ const Execution = struct {
             for (items) |bytes| if (bytes) |owned| a.free(owned);
             a.free(items);
         };
-        if (!self.typed_delivery and (!req.include_stored or (!req.include_all_fields and !req.defer_stored_projection))) {
+        if (self.use_stored_highlights) {
+            sources = try self.loadStoredHighlights(a, result.hits);
+        } else if (!self.typed_delivery and (!req.include_stored or (!req.include_all_fields and !req.defer_stored_projection))) {
             const keys = try a.alloc([]const u8, result.hits.len);
             defer a.free(keys);
             for (result.hits, keys) |hit, *key| key.* = hit.id;
@@ -304,6 +356,41 @@ const Execution = struct {
         }
         try search.attachHighlightsWithIndexQueries(a, options, self.highlight_queries.?, result.hits, sources);
         try self.context.ensureActive();
+    }
+    fn loadStoredHighlights(self: *Execution, a: A, hits: []const types.SearchHit) ![]?[]u8 {
+        const started = @import("antfly_platform").time.monotonicNs();
+        defer self.hydration_ns +|= @import("antfly_platform").time.monotonicNs() -| started;
+        if (self.highlight_pins.items.len != 1) return error.InvalidNativeLakeTextCorpus;
+        const pin = self.highlight_pins.items[0];
+        const identities = self.text_identities.get(@intFromPtr(pin.snapshot)) orelse return error.InvalidNativeLakeTextCorpus;
+        const result = try a.alloc(?[]u8, hits.len);
+        @memset(result, null);
+        errdefer {
+            for (result) |value| if (value) |bytes| a.free(bytes);
+            a.free(result);
+        }
+        var live: @import("lake_index_text_predicate.zig").LiveRowsCache = .{};
+        defer live.deinit(a);
+        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.server.lake_read_cache, .scope = self.store.identity, .context = self.context };
+        for (hits, result) |hit, *out| {
+            try self.context.ensureActive();
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            const sa = scratch.allocator();
+            const key = try publicKey(self, sa, hit.id);
+            const position = try @import("lake_index_native_state.zig").coordinates(key);
+            const file = self.files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
+            const row: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = position.group, .row_ordinal = position.row } };
+            const ordinal = (try identities.ordinal(a, &live, self.store.artifactStore(), cached, row)) orelse return error.InvalidNativeLakeTextCorpus;
+            const doc = (try pin.snapshot.storedDocDecompressed(a, ordinal)) orelse return error.InvalidNativeLakeTextCorpus;
+            errdefer a.free(doc.data);
+            const expected = try nativeKey(self, sa, key);
+            if (!std.mem.eql(u8, doc.id, expected)) return error.InvalidNativeLakeTextCorpus;
+            const value = try std.json.parseFromSliceLeaky(std.json.Value, sa, doc.data, .{ .parse_numbers = false });
+            if (value != .object) return error.InvalidNativeLakeTextCorpus;
+            out.* = doc.data;
+        }
+        return result;
     }
     fn hydrateDelivery(raw: *anyopaque, a: A, hits: []types.SearchHit) !void {
         const self: *Execution = @ptrCast(@alignCast(raw));
@@ -408,6 +495,19 @@ const Execution = struct {
         for (req.order_by) |order| try appendHydrationPath(self.arena, self.table, &fields, order.field);
         const options = req.highlight orelse return fields.items;
         if (req.full_text == null and req.full_text_queries.len == 0) return fields.items;
+        // Keep display columns on the shared Parquet projection, but do not
+        // fetch a potentially large body column solely for highlighting when
+        // the selected immutable text index explicitly retains that source.
+        if (req.full_text != null and req.full_text_queries.len == 0) {
+            if (try acquire(self, req.primary_text_index_name orelse req.index_name)) |source| {
+                var pin = source;
+                defer pin.deinit();
+                if (storedHighlightEligible(req, pin.selected_field, self.text_stores_source.get(pin.name) orelse false)) {
+                    self.use_stored_highlights = true;
+                    return fields.items;
+                }
+            }
+        }
         try appendHydrationPath(self.arena, self.table, &fields, "_type");
         if (options.fields.len != 0) {
             for (options.fields) |path| try appendHydrationPath(self.arena, self.table, &fields, path);
@@ -487,6 +587,99 @@ const Execution = struct {
         const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .allow_partial = self.predicate_allow_partial and !std.mem.eql(u8, json, self.predicate_exclusion_json), .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
         return resolver.resolve(a, json);
     }
+    const Ordered = struct {
+        a: A,
+        execution: *Execution,
+        predicate: @import("lake_index_sql_rows.zig").Predicate,
+        plan_arena: std.heap.ArenaAllocator,
+        identities: @import("lake_index_text_predicate.zig").Identities,
+        page: []const local.storage_rowsource_types.RowRef = &.{},
+        window: std.heap.ArenaAllocator,
+        position: usize = 0,
+        scanned: u64 = 0,
+        page_size: usize = 256,
+        bitmaps: @import("lake_index_text_predicate.zig").LiveRowsCache = .{},
+        fn scannedCount(raw: *anyopaque) u64 {
+            const self: *Ordered = @ptrCast(@alignCast(raw));
+            return self.scanned;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *Ordered = @ptrCast(@alignCast(raw));
+            self.predicate.deinit();
+            self.window.deinit();
+            self.bitmaps.deinit(self.a);
+            self.plan_arena.deinit();
+            self.a.destroy(self);
+        }
+        fn next(raw: *anyopaque, physical_budget: usize) !?u32 {
+            const self: *Ordered = @ptrCast(@alignCast(raw));
+            const start = self.scanned;
+            while (true) {
+                if (self.scanned - start >= physical_budget) return error.OrderedCandidateBudgetExceeded;
+                try self.execution.context.ensureActive();
+                if (self.position == self.page.len) {
+                    _ = self.window.reset(.retain_capacity);
+                    self.page = try self.predicate.next(self.window.allocator(), @min(self.page_size, physical_budget - @as(usize, @intCast(self.scanned - start))));
+                    self.position = 0;
+                    if (self.page.len == 0) return null;
+                }
+                const ref = self.page[self.position];
+                self.position += 1;
+                self.scanned += 1;
+                const execution = self.execution;
+                const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &execution.server.lake_read_cache, .scope = execution.store.identity, .context = execution.context };
+                if (try self.identities.ordinal(self.a, &self.bitmaps, execution.store.artifactStore(), cached, ref)) |number| return number;
+            }
+        }
+    };
+    fn openOrderedTextCandidates(raw: ?*anyopaque, a: A, req: types.SearchRequest, snapshot: *const local.index.IndexSnapshot) !?search.OrderedTextCandidates {
+        const self = from(raw);
+        if (req.order_by.len < 2 or !std.mem.eql(u8, req.order_by[req.order_by.len - 1].field, "_id")) return null;
+        const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
+        var arena = std.heap.ArenaAllocator.init(a);
+        var keep_arena = false;
+        defer if (!keep_arena) arena.deinit();
+        const ca = arena.allocator();
+        const orders = try ca.alloc(local.sql_catalog.Scan.Order, req.order_by.len - 1);
+        for (orders, req.order_by[0..orders.len]) |*order, field| {
+            const column = for (self.table.columns) |column| {
+                if (std.mem.eql(u8, column.name, field.field)) break column;
+            } else return null;
+            _ = column;
+            order.* = .{ .column = field.field, .descending = field.desc, .nulls_first = !field.desc };
+        }
+        const sql_rows = @import("lake_index_sql_rows.zig");
+        var conditions: std.ArrayList(local.sql_catalog.Condition) = .empty;
+        if (req.filter_query_json.len != 0) {
+            const parsed = try std.json.parseFromSlice(std.json.Value, ca, req.filter_query_json, .{});
+            const compiled = try local.storage_db_query_graph_exec.compilePatternFilter(ca, parsed.value);
+            var required: std.ArrayList(local.sql_catalog.Condition) = .empty;
+            try @import("lake_index_text_predicate.zig").requiredConditions(ca, compiled, &required, 0);
+            for (required.items) |condition| {
+                if (try sql_rows.compatibleSearchConditions(ca, self.table, &.{condition})) try conditions.append(ca, condition);
+            }
+        }
+        // Seek inclusively on the leading field. Public IDs break ties in the
+        // native collector, so an entire boundary tie group must remain visible.
+        if (req.search_after.len != 0 or req.search_before.len != 0) {
+            const bound = if (req.search_before.len != 0) req.search_before[0] else req.search_after[0];
+            if (bound == .null) return null;
+            const kind = (try self.table.column(orders[0].column)).type;
+            const normalized = local.sql_lake_values.comparisonValue(ca, bound, kind) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return null,
+            };
+            const condition: local.sql_catalog.Condition = .{ .column = orders[0].column, .op = if (orders[0].descending != (req.search_before.len != 0)) .lte else .gte, .value = normalized };
+            if (!try sql_rows.compatibleSearchConditions(ca, self.table, &.{condition})) return null;
+            try conditions.append(ca, condition);
+        }
+        var predicate = (try sql_rows.tryOpenOrderedPredicate(a, self.server, self.table, .{ .fields = &.{}, .conditions = conditions.items, .order = orders, .limit = 256, .row_goal = @as(u64, req.offset) + req.limit }, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc })) orelse return null;
+        errdefer predicate.deinit();
+        const owner = try a.create(Ordered);
+        owner.* = .{ .a = a, .execution = self, .predicate = predicate, .plan_arena = arena, .window = .init(a), .identities = identities, .page_size = if (predicate.complete_order) @min(256, @as(usize, req.offset) + req.limit + 1) else 256 };
+        keep_arena = true;
+        return .{ .ptr = owner, .next = Ordered.next, .scanned_count = Ordered.scannedCount, .complete_order = predicate.complete_order, .close = Ordered.close };
+    }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
         const self = from(raw);
         // The engine uses one callback for includes and excludes. Require an
@@ -502,7 +695,7 @@ const Execution = struct {
             self.predicate_exclusion_json = previous_exclusion;
             self.predicate_allow_partial = previous_allow_partial;
         }
-        return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquire, .resolve_indexed_filter = resolveIndexedFilter, .native_count_visibility_exact = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
+        return search.searchTextQuery(a, req, text, .{ .ctx = raw, .exact_doc_id_filters = true, .acquire_text_source = acquire, .resolve_indexed_filter = resolveIndexedFilter, .open_ordered_candidates = openOrderedTextCandidates, .native_count_visibility_exact = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .text_index_is_chunk_backed = chunkBacked, .search_match_all = matchAll, .project_stored_search = project, .load_stored = loadOne, .load_projected_documents = loadProjected, .postprocess = postprocess });
     }
     fn dispatchText(raw: ?*anyopaque, a: A, req: types.SearchRequest) !types.SearchResult {
         return search.searchText(a, req, .{ .ctx = raw, .func = searchText });
@@ -579,7 +772,7 @@ const Execution = struct {
         return shape.postprocessVectorSearchResult(a, req, result, false, .{ .ctx = raw, .is_visible = visible, .resolve_parent_id = parent, .load_parent_stored = parentStored, .load_stored = loadOne, .load_many_stored = loadMany, .load_projected_stored = loadProjectedOne, .load_many_projected_stored = loadProjected });
     }
     fn searchSparse(raw: ?*anyopaque, a: A, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
-        return search.searchSparse(a, from(raw).vectorRequest(req), sparse, .{ .ctx = raw, .exact_doc_id_filters = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .sparse_index = sparseIndex, .load_projected_document = requireProjected, .load_projected_documents = loadProjected, .postprocess = postprocessVector });
+        return search.searchSparse(a, from(raw).vectorRequest(req), sparse, .{ .score_spill = .{ .io = from(raw).context.io.?, .directory = "/tmp" }, .ctx = raw, .exact_doc_id_filters = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .sparse_index = sparseIndex, .load_projected_document = requireProjected, .load_projected_documents = loadProjected, .postprocess = postprocessVector });
     }
     fn cloneSet(_: ?*anyopaque, a: A, set: local.storage_db_query_graph_exec.NamedResultSet, stored: bool) !types.SearchResult {
         return local.storage_db_query_graph_exec.cloneNamedSetAsResult(a, set, stored);
@@ -609,6 +802,8 @@ const Execution = struct {
     }
     fn loadSelected(comptime T: type, raw: ?*anyopaque, a: A, keys: []const []const u8, selected_fields: ?[]const []const u8) ![]?T {
         const self = from(raw);
+        const hydration_started = @import("antfly_platform").time.monotonicNs();
+        defer self.hydration_ns +|= @import("antfly_platform").time.monotonicNs() -| hydration_started;
         try self.context.ensureActive();
         const result = try a.alloc(?T, keys.len);
         @memset(result, null);
@@ -837,6 +1032,15 @@ fn appendIndexHydration(a: A, table: local.sql_catalog.Table, fields: *std.Array
     return false;
 }
 
+fn storedHighlightEligible(req: types.SearchRequest, selected_field: ?[]const u8, stored: bool) bool {
+    const options = req.highlight orelse return false;
+    if (!stored or req.full_text == null or req.full_text_queries.len != 0 or req.dense != null or req.sparse != null or req.dense_queries.len != 0 or req.sparse_queries.len != 0) return false;
+    if (selected_field) |field| for (options.fields) |path| {
+        if (!std.mem.eql(u8, path, field)) return false;
+    };
+    return true;
+}
+
 fn projectionMayUse(pattern: []const u8, path: []const u8) bool {
     var patterns = std.mem.tokenizeScalar(u8, pattern, '.');
     var parts = std.mem.tokenizeScalar(u8, path, '.');
@@ -867,6 +1071,98 @@ test "external lake hydration projection narrows includes and retains exclusion 
     try std.testing.expect(!projectionMayUse("different.*", "nested.value"));
 }
 
+test "external lake stored highlight eligibility requires explicit source and complete field coverage" {
+    var req: types.SearchRequest = .{ .full_text = .{ .match = .{ .field = "body", .text = "needle" } }, .highlight = .{ .fields = &.{"body"} } };
+    try std.testing.expect(!storedHighlightEligible(req, "body", false));
+    try std.testing.expect(storedHighlightEligible(req, "body", true));
+    req.highlight.?.fields = &.{ "body", "label" };
+    try std.testing.expect(!storedHighlightEligible(req, "body", true));
+    try std.testing.expect(storedHighlightEligible(req, null, true));
+    req.highlight.?.fields = &.{};
+    try std.testing.expect(storedHighlightEligible(req, "body", true));
+    req.full_text = null;
+    try std.testing.expect(!storedHighlightEligible(req, "body", true));
+}
+
+test "external lake stored highlights read authenticated native source without Parquet hydration" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-stored-highlights");
+    defer directory.cleanup();
+    var fs = try local.storage_object_storage.FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{.{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &.{ "a needle in the haystack", "second needle" } }});
+    defer a.free(data);
+    var put = try client.putObject("antfly", "part.parquet", data, .{});
+    put.deinit(a);
+    const schema_json = try std.fmt.allocPrint(a,
+        \\{{"version":1,"storage_mode":"relational","default_type":"row","base_source":{{"kind":"external","table_id":"lake","format":"parquet","uri":"file://{s}","schema_fingerprint":"schema"}},"document_schemas":{{"row":{{"schema":{{"type":"object","properties":{{"body":{{"type":"string"}}}},"additionalProperties":false}}}}}}}}
+    , .{directory.path()});
+    defer a.free(schema_json);
+    var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, schema_json)).?;
+    defer binding.deinit(a);
+    var source = try local.serverless_query_lake_serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
+    defer source.deinit();
+    var store = try Store.openNative(a, null, null, false, .standalone, directory.path());
+    defer store.deinit();
+    var artifacts = store.artifactStore();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const publication = @import("lake_index_publication.zig");
+    var record: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "lake", .schema_json = schema_json, .indexes_json = "{\"text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":true}}" };
+    record.lake_index_catalog_json = try publication.begin(ca, std.testing.io, record, &source, store.identity, .{}, 100, 20);
+    const Clock = struct {
+        fn now(_: *const anyopaque) !u64 {
+            return 101;
+        }
+    };
+    var clock: u8 = 0;
+    record.lake_index_catalog_json = try publication.build(ca, &artifacts, record, &source, store.identity, .{ .io = std.testing.io }, .none, .{ .ptr = &clock, .now_ms = Clock.now });
+    var catalog = try local.metadata_lake_index_catalog.parse(a, record.lake_index_catalog_json);
+    defer catalog.deinit();
+    try @import("lake_index_directory.zig").hydrate(catalog.arena.allocator(), artifacts, &catalog.value.published.?, .none, null);
+    const declaration = catalog.value.published.?.declarations[0];
+    const root = try corpus.loadRoot(ca, artifacts, declaration.artifact, .none, null);
+    var writer = try corpus.loadWriter(a, artifacts, root, .none, null, null);
+    defer writer.deinit();
+    // Exercise hydration in isolation: no server field besides this cache is
+    // read, and the source object is removed after publication construction.
+    var server: server_api.ApiHttpServer = undefined;
+    server.lake_read_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer server.lake_read_cache.deinit();
+    var owner: Execution = .{ .server = &server, .table = .{ .id = 7, .physical_name = "lake", .schema_version = 1, .columns = &.{} }, .source = &source, .store = &store, .domain = root.domain, .declarations = &.{}, .context = .{}, .request = .{}, .schema_json = schema_json, .arena = ca, .use_stored_highlights = true };
+    defer owner.deinit();
+    const snapshot = writer.acquireSnapshot();
+    try owner.highlight_pins.append(ca, .{ .snapshot = snapshot, .name = "text", .text_analysis = .{}, .runtime_schema = null, .selected_field = "body" });
+    try owner.text_identities.put(ca, @intFromPtr(snapshot), try @import("lake_index_text_predicate.zig").Identities.init(ca, root, snapshot));
+    const file = source.inventory.files[0];
+    const id = try local.storage_rowsource_identity.allocId(ca, .{ .external = .{ .source_id = source.inventory.source_id, .snapshot_id = source.inventory.snapshot_id, .file_id = file.file_id, .row_group_ordinal = 0, .row_ordinal = 0 } });
+    try owner.files.put(ca, id[6..70], file.file_id);
+    const digest = std.fmt.bytesToHex(&root.file_groups[0].file.digest, .lower);
+    try owner.private_digests.put(ca, file.file_id, &digest);
+    try client.deleteObject("antfly", "part.parquet", .{});
+    var hits = [_]types.SearchHit{.{ .id = id, .score = 1 }};
+    const values = try owner.loadStoredHighlights(a, &hits);
+    defer {
+        for (values) |value| if (value) |bytes| a.free(bytes);
+        a.free(values);
+    }
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, values[0].?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("a needle in the haystack", parsed.value.object.get("body").?.string);
+    const query: types.TextQuery = .{ .match = .{ .field = "body", .text = "needle" } };
+    owner.highlight_queries = &.{.{ .query = query, .text_analysis = .{}, .runtime_schema = null, .selected_field = "body" }};
+    var result: types.SearchResult = .{ .alloc = a, .hits = &hits, .total_hits = 1, .graph_results = &.{} };
+    defer types.freeHighlights(a, hits[0].highlights);
+    try owner.attachHighlights(a, .{ .full_text = query, .highlight = .{ .fields = &.{"body"} }, .include_stored = false }, &result);
+    try std.testing.expectEqual(@as(usize, 1), hits[0].highlights.len);
+    try std.testing.expectEqual(@as(u64, 0), server.lake_read_cache.snapshot().provider_reads);
+    owner.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, owner.loadStoredHighlights(a, &hits));
+}
+
 test "external lake deferred search projection retains highlight fields until public encoding" {
     const a = std.testing.allocator;
     const raw = "{\"body\":\"a needle in the source\",\"label\":\"row\"}";
@@ -888,6 +1184,9 @@ test "external lake hydration unions returned and highlight fields without unrel
     defer arena.deinit();
     var owner: Execution = undefined;
     owner.arena = arena.allocator();
+    owner.context = .{};
+    owner.declarations = &.{};
+    owner.use_stored_highlights = false;
     owner.table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{
         .{ .name = "label", .path = "label", .type = .string },
         .{ .name = "body", .path = "body", .type = .string },

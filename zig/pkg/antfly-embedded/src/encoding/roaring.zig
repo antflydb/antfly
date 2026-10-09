@@ -424,7 +424,7 @@ fn andContainers(alloc: Allocator, self: *Container, other: *const Container) vo
     }
 }
 
-fn orContainers(alloc: Allocator, self: *Container, other: *const Container) void {
+fn orContainers(alloc: Allocator, self: *Container, other: *const Container) !void {
     switch (self.*) {
         .bitmap => |sb| switch (other.*) {
             .bitmap => |ob| bitmapOrSimd(sb, ob),
@@ -435,7 +435,7 @@ fn orContainers(alloc: Allocator, self: *Container, other: *const Container) voi
         .array => |*sa| switch (other.*) {
             .bitmap => |ob| {
                 // Convert self to bitmap, then OR
-                const bm = alloc.alloc(u64, bitmap_words) catch unreachable;
+                const bm = try alloc.alloc(u64, bitmap_words);
                 @memset(bm, 0);
                 for (sa.items) |v| bitmapSet(bm, v);
                 bitmapOrSimd(bm, ob);
@@ -446,12 +446,12 @@ fn orContainers(alloc: Allocator, self: *Container, other: *const Container) voi
                 for (oa.items) |v| {
                     const pos = arraySearchPos(sa.items, v);
                     if (pos >= sa.items.len or sa.items[pos] != v) {
-                        sa.insert(alloc, pos, v) catch unreachable;
+                        try sa.insert(alloc, pos, v);
                     }
                 }
                 // Check if should convert to bitmap
                 if (sa.items.len > array_max) {
-                    const bm = alloc.alloc(u64, bitmap_words) catch unreachable;
+                    const bm = try alloc.alloc(u64, bitmap_words);
                     @memset(bm, 0);
                     for (sa.items) |v| bitmapSet(bm, v);
                     sa.deinit(alloc);
@@ -517,17 +517,19 @@ pub const RoaringBitmap = struct {
     /// Cumulative cardinality: `cumulative_cards[i]` is the sum of
     /// cardinalities of `containers[0..i]` (so the value at the last index is
     /// the cardinality of all-but-last container). Precomputed by
-    /// `ensureRankCache` so `rank()` can find a target's container in
+    /// `prepareRead` so `rank()` can find a target's container in
     /// O(log K) and avoid recomputing per-container popcounts on every call.
     /// Invalidated by mutations (`add`, `remove`, etc.) and freed in
     /// `deinit`. `null` while the cache is unbuilt or stale.
     cumulative_cards: ?[]usize = null,
+    read_rank: ?*FrozenRankIndex = null,
 
     pub fn init(alloc: Allocator) RoaringBitmap {
         return .{ .alloc = alloc, .keys = .empty, .containers = .empty };
     }
 
     pub fn deinit(self: *RoaringBitmap) void {
+        self.clearReadRank();
         for (self.containers.items) |*c| c.deinit(self.alloc);
         self.keys.deinit(self.alloc);
         self.containers.deinit(self.alloc);
@@ -535,13 +537,15 @@ pub const RoaringBitmap = struct {
         self.* = undefined;
     }
 
-    /// Build the cumulative cardinality cache. Idempotent — does nothing if
-    /// already built. `fromBytes` builds it eagerly using the cardinalities
-    /// already in the wire format; this lazy variant exists for tests and
-    /// for future callers that want the rank fast path on a hand-built
-    /// bitmap. Mutations (add/remove) invalidate the cache so it has to be
-    /// re-built afterward.
-    fn ensureRankCache(self: *RoaringBitmap) !void {
+    /// Prepare immutable-read navigation, including per-word rank prefixes.
+    /// Idempotent; mutations invalidate both word and container metadata.
+    pub fn prepareRead(self: *RoaringBitmap) !void {
+        if (self.read_rank == null) {
+            const index = try self.alloc.create(FrozenRankIndex);
+            errdefer self.alloc.destroy(index);
+            index.* = try FrozenRankIndex.init(self.alloc, self.*);
+            self.read_rank = index;
+        }
         if (self.cumulative_cards != null) return;
         const cards = try self.alloc.alloc(usize, self.containers.items.len);
         var sum: usize = 0;
@@ -552,33 +556,42 @@ pub const RoaringBitmap = struct {
         self.cumulative_cards = cards;
     }
 
+    fn clearReadRank(self: *RoaringBitmap) void {
+        if (self.read_rank) |index| {
+            index.deinit();
+            self.alloc.destroy(index);
+            self.read_rank = null;
+        }
+    }
     fn invalidateRankCache(self: *RoaringBitmap) void {
+        self.clearReadRank();
         if (self.cumulative_cards) |c| {
             self.alloc.free(c);
             self.cumulative_cards = null;
         }
     }
 
-    fn findChunk(self: *const RoaringBitmap, key: u16) ?usize {
-        for (self.keys.items, 0..) |k, i| {
-            if (k == key) return i;
-            if (k > key) return null;
+    fn lowerChunk(self: *const RoaringBitmap, key: u16) usize {
+        var lo: usize = 0;
+        var hi = self.keys.items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.keys.items[mid] < key) lo = mid + 1 else hi = mid;
         }
-        return null;
+        return lo;
     }
-
+    fn findChunk(self: *const RoaringBitmap, key: u16) ?usize {
+        const index = self.lowerChunk(key);
+        return if (index < self.keys.items.len and self.keys.items[index] == key) index else null;
+    }
     fn getOrCreateChunk(self: *RoaringBitmap, key: u16) !*Container {
-        var idx: usize = self.keys.items.len;
-        for (self.keys.items, 0..) |k, i| {
-            if (k == key) return &self.containers.items[i];
-            if (k > key) {
-                idx = i;
-                break;
-            }
-        }
-        try self.keys.insert(self.alloc, idx, key);
-        try self.containers.insert(self.alloc, idx, Container{ .array = .empty });
-        return &self.containers.items[idx];
+        const index = self.lowerChunk(key);
+        if (index < self.keys.items.len and self.keys.items[index] == key) return &self.containers.items[index];
+        try self.keys.ensureUnusedCapacity(self.alloc, 1);
+        try self.containers.ensureUnusedCapacity(self.alloc, 1);
+        self.keys.insertAssumeCapacity(index, key);
+        self.containers.insertAssumeCapacity(index, .{ .array = .empty });
+        return &self.containers.items[index];
     }
 
     pub fn add(self: *RoaringBitmap, val: u32) !void {
@@ -681,6 +694,7 @@ pub const RoaringBitmap = struct {
     }
 
     pub fn cardinality(self: *const RoaringBitmap) usize {
+        if (self.read_rank) |index| return index.count;
         var total: usize = 0;
         for (self.containers.items) |*c| total += c.cardinality();
         return total;
@@ -697,6 +711,7 @@ pub const RoaringBitmap = struct {
     /// absent (build-time bitmaps mid-construction), falls back to a linear
     /// per-container walk that re-popcounts on demand.
     pub fn rank(self: *const RoaringBitmap, value: u32) usize {
+        if (self.read_rank) |index| return index.rank(value);
         const target_high: u16 = @intCast(value >> 16);
         const target_low: u16 = @truncate(value);
 
@@ -895,7 +910,7 @@ pub const RoaringBitmap = struct {
         // Build the cumulative cardinality cache while we're already walking
         // every container. The wire format carries per-container cardinality
         // up front, so this is zero extra IO and saves the lazy popcount-walk
-        // that `ensureRankCache` would otherwise do on first `rank()` call.
+        // that `prepareRead` would otherwise do on first `rank()` call.
         const cumulative = try alloc.alloc(usize, n);
         errdefer alloc.free(cumulative);
         var running: usize = 0;
@@ -971,17 +986,20 @@ pub const RoaringBitmap = struct {
         self.invalidateRankCache();
         for (other.keys.items, other.containers.items) |ok, *oc| {
             if (self.findChunk(ok)) |idx| {
-                orContainers(self.alloc, &self.containers.items[idx], oc);
+                try orContainers(self.alloc, &self.containers.items[idx], oc);
             } else {
-                const container = try cloneContainer(self.alloc, oc);
+                var container = try cloneContainer(self.alloc, oc);
+                errdefer container.deinit(self.alloc);
                 const insert_idx = blk: {
                     for (self.keys.items, 0..) |sk, i| {
                         if (sk > ok) break :blk i;
                     }
                     break :blk self.keys.items.len;
                 };
-                try self.keys.insert(self.alloc, insert_idx, ok);
-                try self.containers.insert(self.alloc, insert_idx, container);
+                try self.keys.ensureUnusedCapacity(self.alloc, 1);
+                try self.containers.ensureUnusedCapacity(self.alloc, 1);
+                self.keys.insertAssumeCapacity(insert_idx, ok);
+                self.containers.insertAssumeCapacity(insert_idx, container);
             }
         }
     }
@@ -1005,6 +1023,60 @@ pub const RoaringBitmap = struct {
                 oi += 1;
             }
         }
+    }
+
+    /// Count a half-open range without materializing or enumerating members.
+    pub fn rangeCardinality(self: *const RoaringBitmap, lower: u32, upper: u64) usize {
+        std.debug.assert(upper <= 0x1_0000_0000 and upper >= lower);
+        const end = if (upper == 0x1_0000_0000) self.cardinality() else self.rank(@intCast(upper));
+        return end - self.rank(lower);
+    }
+
+    /// Copy only intersecting containers, mask boundary words and rebase to zero.
+    /// Dense selections cost words/containers rather than selected documents.
+    pub fn sliceRebased(self: *const RoaringBitmap, alloc: Allocator, lower: u32, upper: u64) !RoaringBitmap {
+        std.debug.assert(upper <= 0x1_0000_0000 and upper >= lower);
+        var clipped = RoaringBitmap.init(alloc);
+        defer clipped.deinit();
+        const first_container = self.lowerChunk(@intCast(lower >> 16));
+        for (self.keys.items[first_container..], self.containers.items[first_container..]) |key, *container| {
+            const base = @as(u64, key) << 16;
+            if (base >= upper) break;
+            if (base + 65536 <= lower) continue;
+            const lo: u32 = @intCast(@max(base, lower) - base);
+            const hi: u32 = @intCast(@min(base + 65536, upper) - base);
+            if (lo == hi) continue;
+            var copy = try cloneContainer(alloc, container);
+            errdefer copy.deinit(alloc);
+            switch (copy) {
+                .array => |*array| {
+                    const begin = if (lo == 65536) array.items.len else arraySearchPos(array.items, @intCast(lo));
+                    const end = if (hi == 65536) array.items.len else arraySearchPos(array.items, @intCast(hi));
+                    std.mem.copyForwards(u16, array.items[0 .. end - begin], array.items[begin..end]);
+                    array.shrinkRetainingCapacity(end - begin);
+                },
+                .bitmap => |words| {
+                    for (words, 0..) |*word, i| {
+                        const start: u32 = @intCast(i * 64);
+                        if (start + 64 <= lo or start >= hi) {
+                            word.* = 0;
+                        } else {
+                            if (lo > start) word.* &= @as(u64, std.math.maxInt(u64)) << @as(u6, @intCast(lo - start));
+                            if (hi < start + 64) word.* &= @as(u64, std.math.maxInt(u64)) >> @as(u6, @intCast(start + 64 - hi));
+                        }
+                    }
+                },
+            }
+            if (copy.cardinality() == 0) {
+                copy.deinit(alloc);
+                continue;
+            }
+            try clipped.keys.ensureUnusedCapacity(alloc, 1);
+            try clipped.containers.ensureUnusedCapacity(alloc, 1);
+            clipped.keys.appendAssumeCapacity(key);
+            clipped.containers.appendAssumeCapacity(copy);
+        }
+        return clipped.addOffset(0 -% lower);
     }
 
     /// Returns a new bitmap with all values shifted by offset.
@@ -1037,9 +1109,11 @@ pub const RoaringBitmap = struct {
 
                     if (shifted.current) |current| {
                         try insertShiftedContainer(&result, shifted_key, current);
+                        shifted.current = null;
                     }
                     if (shifted.next) |next| {
                         try insertShiftedContainer(&result, shifted_key +% 1, next);
+                        shifted.next = null;
                     }
                 },
                 .bitmap => |b| {
@@ -1052,9 +1126,11 @@ pub const RoaringBitmap = struct {
 
                     if (shifted.current) |current| {
                         try insertShiftedContainer(&result, shifted_key, current);
+                        shifted.current = null;
                     }
                     if (shifted.next) |next| {
                         try insertShiftedContainer(&result, shifted_key +% 1, next);
+                        shifted.next = null;
                     }
                 },
             }
@@ -1128,11 +1204,13 @@ fn shiftBitmapContainer(alloc: Allocator, words: []const u64, low_offset: u16) !
     const bit_shift: u6 = @truncate(low_offset);
 
     const current_words = try alloc.alloc(u64, bitmap_words);
-    errdefer alloc.free(current_words);
+    var current_owned = true;
+    errdefer if (current_owned) alloc.free(current_words);
     @memset(current_words, 0);
 
     const next_words = try alloc.alloc(u64, bitmap_words);
-    errdefer alloc.free(next_words);
+    var next_owned = true;
+    errdefer if (next_owned) alloc.free(next_words);
     @memset(next_words, 0);
 
     for (words, 0..) |word, idx| {
@@ -1163,11 +1241,13 @@ fn shiftBitmapContainer(alloc: Allocator, words: []const u64, low_offset: u16) !
     }
 
     const current = try bitmapWordsToContainer(alloc, current_words);
+    current_owned = false;
     errdefer if (current) |*c| {
         var mc = c.*;
         mc.deinit(alloc);
     };
     const next = try bitmapWordsToContainer(alloc, next_words);
+    next_owned = false;
 
     return .{
         .current = current,
@@ -1208,8 +1288,8 @@ fn insertShiftedContainer(result: *RoaringBitmap, key: u16, container: Container
     const last_key = result.keys.items[last_idx];
     if (last_key == key) {
         var owned = container;
-        defer owned.deinit(result.alloc);
-        orContainers(result.alloc, &result.containers.items[last_idx], &owned);
+        try orContainers(result.alloc, &result.containers.items[last_idx], &owned);
+        owned.deinit(result.alloc);
         return;
     }
     if (last_key < key) {
@@ -1220,8 +1300,8 @@ fn insertShiftedContainer(result: *RoaringBitmap, key: u16, container: Container
 
     if (result.findChunk(key)) |idx| {
         var owned = container;
-        defer owned.deinit(result.alloc);
-        orContainers(result.alloc, &result.containers.items[idx], &owned);
+        try orContainers(result.alloc, &result.containers.items[idx], &owned);
+        owned.deinit(result.alloc);
         return;
     }
 
@@ -1231,8 +1311,10 @@ fn insertShiftedContainer(result: *RoaringBitmap, key: u16, container: Container
         }
         break :blk result.keys.items.len;
     };
-    try result.keys.insert(result.alloc, insert_idx, key);
-    try result.containers.insert(result.alloc, insert_idx, container);
+    try result.keys.ensureUnusedCapacity(result.alloc, 1);
+    try result.containers.ensureUnusedCapacity(result.alloc, 1);
+    result.keys.insertAssumeCapacity(insert_idx, key);
+    result.containers.insertAssumeCapacity(insert_idx, container);
 }
 
 // ============================================================================
@@ -1315,12 +1397,14 @@ pub const Iterator = struct {
         const containers = self.bitmap.containers.items;
         const keys = self.bitmap.keys.items;
 
-        // 1) Skip containers whose key < target_high entirely.
-        while (self.chunk_idx < containers.len and keys[self.chunk_idx] < target_high) {
-            self.chunk_idx += 1;
-            self.initChunk();
-        }
+        // Jump directly to the target container. Fresh lower-bound probes
+        // must not walk every preceding container in a broad selection.
         if (self.chunk_idx >= containers.len) return null;
+        if (keys[self.chunk_idx] < target_high) {
+            self.chunk_idx = self.bitmap.lowerChunk(target_high);
+            self.initChunk();
+            if (self.chunk_idx >= containers.len) return null;
+        }
 
         // 2) If we landed on a strictly-greater container, return its first
         // remaining value via the regular sequential path.
@@ -1786,7 +1870,7 @@ test "rank cache is invalidated on mutation" {
     defer bm.deinit();
     try bm.add(10);
     try bm.add(20);
-    try bm.ensureRankCache();
+    try bm.prepareRead();
     try std.testing.expect(bm.cumulative_cards != null);
 
     // Any mutation drops the cache; the next rank() falls back to the slow
@@ -1887,6 +1971,34 @@ pub const FrozenRankIndex = struct {
         }
         return entry.before + self.bitmap.containers.items[lo].rankBelow(low);
     }
+    /// Zero-based ordinal selection over the same immutable word prefixes.
+    pub fn select(self: *const @This(), ordinal: usize) ?u32 {
+        if (ordinal >= self.count) return null;
+        var lo: usize = 0;
+        var hi = self.entries.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const end = if (mid + 1 < self.entries.len) self.entries[mid + 1].before else self.count;
+            if (end <= ordinal) lo = mid + 1 else hi = mid;
+        }
+        const entry = self.entries[lo];
+        const within_rank = ordinal - entry.before;
+        const base = @as(u32, self.bitmap.keys.items[lo]) << 16;
+        if (entry.words) |words| {
+            var lower: usize = 0;
+            var upper = words.len;
+            while (lower < upper) {
+                const mid = lower + (upper - lower) / 2;
+                const end: usize = if (mid + 1 < words.len) words[mid + 1] else (if (lo + 1 < self.entries.len) self.entries[lo + 1].before else self.count) - entry.before;
+                if (end <= within_rank) lower = mid + 1 else upper = mid;
+            }
+            var bits = self.bitmap.containers.items[lo].bitmap[lower];
+            var skip = within_rank - words[lower];
+            while (skip != 0) : (skip -= 1) bits &= bits - 1;
+            return base | @as(u32, @intCast(lower * 64 + @ctz(bits)));
+        }
+        return base | self.bitmap.containers.items[lo].array.items[within_rank];
+    }
     pub fn retainedBytes(self: *const @This()) usize {
         var bytes = self.entries.len * @sizeOf(Entry);
         for (self.entries) |entry| if (entry.words) |words| {
@@ -1955,4 +2067,101 @@ test "external lake bitmap interval kernels preserve overlaps chunk boundaries a
     var decoded = try RoaringBitmap.fromBytes(std.testing.allocator, bytes);
     defer decoded.deinit();
     try std.testing.expect(bitmap.eql(&decoded));
+}
+
+test "range slices rebase sparse dense and u32 boundary selections" {
+    const a = std.testing.allocator;
+    var source = RoaringBitmap.init(a);
+    defer source.deinit();
+    try source.addRange(65000, 140000);
+    try source.add(7);
+    try source.add(std.math.maxInt(u32));
+    for ([_][2]u64{ .{ 0, 0 }, .{ 3, 10 }, .{ 65033, 131077 }, .{ 90000, 90031 }, .{ 0xfffffff0, 0x1_0000_0000 } }) |bounds| {
+        const lower: u32 = @intCast(bounds[0]);
+        var actual = try source.sliceRebased(a, lower, bounds[1]);
+        defer actual.deinit();
+        var expected = RoaringBitmap.init(a);
+        defer expected.deinit();
+        var it = source.iterator();
+        while (it.next()) |value| if (value >= lower and value < bounds[1]) {
+            try expected.add(value - lower);
+        };
+        try std.testing.expect(actual.eql(&expected));
+        try std.testing.expectEqual(expected.cardinality(), source.rangeCardinality(lower, bounds[1]));
+    }
+}
+
+test "range slice owns partial containers on every allocation failure" {
+    const a = std.testing.allocator;
+    var source = RoaringBitmap.init(a);
+    defer source.deinit();
+    try source.addRange(1, 170000);
+    try source.add(190000);
+    const Probe = struct {
+        fn run(failing: Allocator, bitmap: *const RoaringBitmap) !void {
+            var sliced = try bitmap.sliceRebased(failing, 65533, 190001);
+            defer sliced.deinit();
+            try std.testing.expectEqual(bitmap.rangeCardinality(65533, 190001), sliced.cardinality());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{&source});
+}
+
+test "external lake prepared bitmap navigation invalidates on mutations and survives OOM" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        fn run(allocator: Allocator) !void {
+            var bitmap = RoaringBitmap.init(allocator);
+            defer bitmap.deinit();
+            try bitmap.addRange(100, 150000);
+            try bitmap.prepareRead();
+            try std.testing.expectEqual(@as(usize, 149900), bitmap.rangeCardinality(0, 150000));
+            try bitmap.add(200000);
+            try std.testing.expect(bitmap.read_rank == null);
+            try bitmap.prepareRead();
+            try std.testing.expectEqual(@as(usize, 149901), bitmap.cardinality());
+            try bitmap.remove(101);
+            try std.testing.expect(bitmap.read_rank == null);
+            try std.testing.expectEqual(@as(usize, 1), bitmap.rangeCardinality(100, 102));
+        }
+    };
+    try Probe.run(a);
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{});
+}
+
+test "frozen rank select skips dense words holes and empty containers" {
+    const a = std.testing.allocator;
+    var bitmap = RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    try bitmap.addRange(0, 131072);
+    for (0..131072) |i| if (i % 3 == 0) try bitmap.remove(@intCast(i));
+    try bitmap.add(200000);
+    try bitmap.remove(200000); // Retain an empty container between live ones.
+    try bitmap.add(std.math.maxInt(u32));
+    try bitmap.prepareRead();
+    var iterator = bitmap.iterator();
+    var ordinal: usize = 0;
+    while (iterator.next()) |value| : (ordinal += 1) {
+        try std.testing.expectEqual(value, bitmap.read_rank.?.select(ordinal).?);
+        try std.testing.expectEqual(ordinal, bitmap.rank(value));
+    }
+    try std.testing.expect(bitmap.read_rank.?.select(ordinal) == null);
+}
+
+test "fresh bitmap seeks jump dense containers and never rewind exhausted iterators" {
+    var bitmap = RoaringBitmap.init(std.testing.allocator);
+    defer bitmap.deinit();
+    try bitmap.addRange(0, 50_000_000);
+    try bitmap.remove(49_123_456);
+    try bitmap.add(std.math.maxInt(u32));
+    for ([_]u32{ 0, 65_535, 65_536, 49_123_456, 49_999_999, 50_000_000, std.math.maxInt(u32) }) |lower| {
+        var fresh = bitmap.iterator();
+        const expected: u32 = if (lower >= 50_000_000) std.math.maxInt(u32) else if (lower == 49_123_456) lower + 1 else lower;
+        try std.testing.expectEqual(@as(?u32, expected), fresh.seekTo(lower));
+    }
+    var forward = bitmap.iterator();
+    try std.testing.expectEqual(@as(?u32, 49_999_999), forward.seekTo(49_999_999));
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), forward.seekTo(0));
+    try std.testing.expectEqual(@as(?u32, null), forward.seekTo(0));
+    try std.testing.expectEqual(@as(?u32, null), forward.seekTo(std.math.maxInt(u32)));
 }

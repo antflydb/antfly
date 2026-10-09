@@ -13989,6 +13989,8 @@ pub const SortProfile = struct {
     index_sort_coverage: ?[]const u8 = null,
     /// Candidate documents considered by sort execution.
     candidate_count: ?i64 = null,
+    /// Ordered lake entries traversed before native membership filtering.
+    ordered_scanned_count: ?i64 = null,
     /// Candidates rejected by cursor comparison.
     cursor_rejected_count: ?i64 = null,
     /// Hits selected for the returned page.
@@ -14022,6 +14024,7 @@ pub const SortProfile = struct {
         .{ "sort_lifecycle_state", "sort_lifecycle_state", true },
         .{ "index_sort_coverage", "index_sort_coverage", true },
         .{ "candidate_count", "candidate_count", true },
+        .{ "ordered_scanned_count", "ordered_scanned_count", true },
         .{ "cursor_rejected_count", "cursor_rejected_count", true },
         .{ "selected_count", "selected_count", true },
         .{ "total_us", "total_us", true },
@@ -14096,6 +14099,10 @@ pub const SortProfile = struct {
         }
         if (self.candidate_count) |value| {
             try jw.objectField("candidate_count");
+            try jw.write(value);
+        }
+        if (self.ordered_scanned_count) |value| {
+            try jw.objectField("ordered_scanned_count");
             try jw.write(value);
         }
         if (self.cursor_rejected_count) |value| {
