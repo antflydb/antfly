@@ -190,3 +190,21 @@ Runtime validation includes field-specific reference identities, long PicNum 31,
 callback slots for either field, actual dependency counts, signed presentation
 intervals, resource limits, mismatched/missing complements and cancellation or
 allocation failure after retaining a first field.
+
+
+`h264-paff-assembly-oracle.json` adds 15 buffered assembly vectors. Regenerate with
+`python3 scripts/generate_h264_paff_assembly.py`. CAVLC and bottom-first CABAC
+fields are fragmented into individual slice packets with intervening AUD packets;
+three pairs arrive in A-top/B-top/C-top/B-bottom/A-bottom/C-bottom order. Fragmented
+variants test overlapping pending workspaces. A P-field begins before an unrelated
+picture evicts its reference and finishes afterward, testing frozen prediction.
+Each variant covers 8-bit 4:2:0, 10-bit 4:2:2 and 14-bit 4:4:4 native output.
+
+The reordered packet streams are a qualified decoder assembly extension: H.264
+complementary fields normally occupy consecutive coded access units. FFmpeg checks
+canonical consecutive streams against independently known samples, not the
+extension's packet order. Native tests check the modified transport separately.
+Receipt member lists define exact packet membership; auxiliary packets use a distant
+PTS to catch accidental inclusion in output timing. Tests validate every member
+selection, callback slots, pending/slice/dependency limits, missing and duplicate
+fragments, cancellation, reference copy-on-write and exhaustive allocation failures.

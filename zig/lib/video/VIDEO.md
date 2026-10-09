@@ -385,9 +385,11 @@ Implemented tools include:
   field/frame motion scaling, parity-aware chroma motion, field scans, separate
   field POCs and mixed-boundary deblocking. Fields use views over woven storage.
 - PAFF complementary field pairs carried together in an indexed packet or as
-  complete fields in two consecutive packets, including bottom-first pairs. The
+  fields split across indexed packets, including bottom-first pairs. A bounded
+  assembly extension also accepts pairs separated by unrelated coded pictures. The
   first field is filtered and admitted before second-field prediction; completion
-  updates the same DPB allocation. Default field reference lists and reordering
+  updates the same DPB identity and copies storage only when a pending prediction
+  snapshot still retains it. Default field reference lists and reordering
   include previous and current-first-field references. Field MMCO 1–6 apply to
   individual fields, preserving an unaffected complement, resolving long-term
   index conflicts, enforcing the long-term index bound and resetting POC/frame
@@ -412,15 +414,34 @@ of Source/Reader/frame lifetime. Decode receipts count actual dependency packets
 payload bytes rather than only selected packets. The default dependency span is capped
 at 256 packets and the SPS reference count at 16 pictures.
 
-Selecting either standalone field packet produces the same completed woven
-picture. When selection ends at the first field, decode reads exactly one following
-packet to obtain its complement; dependency, packet, slice and allocation limits
-include that work. The default slice bound applies to the assembled picture,
-including both field packets. Pending samples and metadata reuse the reconstruction
-workspace. No incomplete field is published. Output PTS is the earlier field PTS,
-and duration spans both packet presentation intervals. Batch callbacks preserve
-all requested slots, including selections of both packets in one pair. Missing or
-mismatched complements fail and release partial references, leases and admission.
+Selecting any packet containing slices of a field produces the completed woven
+picture. The decoder tracks actual packet membership rather than a packet-index
+range, so intervening pictures cannot acquire another pair's callbacks or timing.
+It reads ahead until selected pairs complete, charging every traversed packet,
+including AUD/SEI/filler-only packets, to dependency and payload limits. Auxiliary
+packets do not contribute presentation intervals and cannot themselves be selected
+as pictures. PTS is the minimum member packet PTS; duration spans the member
+presentation intervals. All requested member slots receive the same woven picture.
+No incomplete field is published.
+
+`max_pending_pictures` defaults to 16 and accepts 1–16. Reconstruction slots are
+allocated lazily and reused; the slice bound applies across all fragments of both
+fields. An unfinished field retains its prediction DPB snapshot, including marking
+status and immutable samples, so intervening marking or eviction cannot alter its
+remaining slices. Shared backing uses copy-on-write on complementary completion.
+Workspaces, selection membership, retained DPB samples and snapshot state are charged
+to shared admission and `max_decode_bytes`. Missing complements, overlapping primary
+slices, ambiguous identities, cancellation and callback errors release all resources.
+An IDR reset may discard unselected unfinished pairs, but fails if a requested pair
+would be lost. Continuation IDR fragments are not seek points even if marked sync;
+field reset packets must begin with macroblock zero.
+
+H.264 defines complementary fields as consecutive coded access units. Buffering a
+pair across unrelated coded pictures is an explicitly qualified assembly extension,
+not a claim of conformant H.264 ordering. Pairing requires consistent frame number,
+field/reference status, IDR identity and validated slice headers. Transport must
+preserve unique pending picture identities. Repeated primary slices and conflicting headers fail
+explicitly rather than being resolved heuristically.
 
 Geometry/packet/reference workspace bounds are checked before reconstruction;
 `max_decode_bytes` also enforces the actual decode allocator high-water limit.
@@ -429,12 +450,12 @@ workspace estimate. Cancellation is checked during RBSP copying, macroblocks,
 filtering and output rows. Shared output admission remains held until Frame destruction;
 batch callback failure frees the output, decoded-picture buffer and packet leases.
 
-This remains a declared tool subset. Non-complementary or non-consecutive PAFF
-pairs, a field spread over multiple packets, separate colour planes, monochrome, unequal component depths, frame-number gaps, SP/SI, other
+This remains a declared tool subset. Non-complementary PAFF
+pairs, separate colour planes, monochrome, unequal component depths, frame-number gaps, SP/SI, other
 profiles, data partitions and dynamic parameter sets remain explicit rejections.
 MBAFF frame MMCO remains available. No deinterlacing policy is applied: interlaced
 output preserves woven samples. Capability `portable_h264_decode` is true with
-`static-avc1-profile-subset-multislice-8to14bit-420-422-444-mbaff-paff-pairs-field-packets-mmco`; callers
+`static-avc1-profile-subset-multislice-8to14bit-420-422-444-mbaff-paff-pairs-field-packets-mmco-buffered-assembly`; callers
 must preserve that qualification. No OpenH264, x264 or FFmpeg runtime is linked.
 
 Native-depth host preparation validates plane geometry and converts into the
@@ -468,6 +489,14 @@ FFmpeg matches independently known samples without frame-rate duplication.
 Tests also cover signed timestamps, missing/mismatched complements, bounded
 lookahead, duplicate callback slots, cancellation after the first field and
 exhaustive standalone-reference allocation failures.
+
+The buffered assembly qualification adds 15 generated vectors in
+[testdata/h264-paff-assembly-oracle.json](testdata/h264-paff-assembly-oracle.json):
+CAVLC/CABAC fragments with metadata gaps, bottom-first ordering, three interleaved
+pairs and frozen prediction after reference eviction at 8-bit 4:2:0, 10-bit 4:2:2
+and 14-bit 4:4:4. FFmpeg validates canonical consecutive field-pair streams against
+independently known samples; native tests separately validate the reordered packet
+extension, timestamps, slot membership, budgets and exhaustive allocation failures.
 
 The expanded fixture receipt is
 [testdata/h264-advanced-oracle.json](testdata/h264-advanced-oracle.json). Independent

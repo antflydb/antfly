@@ -68,7 +68,7 @@ the same owned window/PTS metadata. This remains video orchestration; media has
 no device or model dependency.
 
 The pure Zig H.264 lane now qualifies bounded multi-slice static `avc1`, mixed
-MBAFF, PAFF pairs carried together or as complete fields in consecutive packets,
+MBAFF, PAFF pairs carried together or as fields split across indexed packets,
 custom scaling matrices, POC type 1, FMO/ASO/redundant copies and native 8–14-bit 4:2:0/4:2:2/4:4:4
 samples under the profile/tool limits in [VIDEO.md](../video/VIDEO.md#implemented-independent-efficiency-and-portable-h264-work).
 Container indexing preserves codec bytes and sample timing; it does not infer
@@ -77,7 +77,11 @@ verifies both complementary fields before publishing a woven picture and admits
 the first field before second-field prediction. Output depth/chroma and plane
 strides are explicit; high-depth samples remain little-endian `u16` through decode.
 The decoder supports individual field MMCO 1–6; malformed marking, dynamic
-parameter sets and non-complementary/non-consecutive pairs fail explicitly. The Apple
+parameter sets and non-complementary pairs fail explicitly. A bounded decoder
+assembly extension buffers pairs across unrelated coded pictures, preserving
+packet membership and frozen prediction references under shared admission. This
+extension is qualified separately from H.264 consecutive-access-unit semantics;
+container indexing continues to expose packets without assembling pictures. The Apple
 hardware/Metal NV12 route retains its 8-bit 4:2:0 qualifier.
 
 Shared admission reservations can now resize atomically. Configuration parsing

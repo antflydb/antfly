@@ -5,6 +5,8 @@ const motion = @import("h264_motion.zig");
 const MarkCommand = struct { operation: u32, first: u32 = 0, second: u32 = 0 };
 fn PictureFor(comptime Sample: type) type {
     return struct {
+        owners: *usize,
+        pair_id: ?u32 = null,
         long_term: ?u32 = null,
         field_long: [2]?u32 = .{ null, null },
         planar: []Sample,
@@ -41,6 +43,7 @@ pub fn StateFor(comptime Sample: type) type {
         weights: @import("h264_weights.zig").Table = @splat(@splat(@splat(.{}))),
         weight_mode: enum { none, explicit, implicit } = .none,
         list_count: usize = 0,
+        current_pair: ?u32 = null,
         current_num: u32 = 0,
         current_poc: i32 = 0,
         current_field_poc: [2]i32 = .{ 0, 0 },
@@ -81,11 +84,28 @@ pub fn StateFor(comptime Sample: type) type {
                 self.command_count += 1;
             }
         }
+        fn release(allocator: std.mem.Allocator, picture: Picture) void {
+            std.debug.assert(picture.owners.* != 0);
+            picture.owners.* -= 1;
+            if (picture.owners.* == 0) {
+                allocator.free(picture.planar);
+                allocator.free(picture.meta);
+                for (picture.motions) |m| allocator.free(m);
+                allocator.destroy(picture.owners);
+            }
+        }
+        /// A field's prediction view retains the original DPB allocations even
+        /// if subsequent coded pictures evict or change their marking status.
+        pub fn clone(self: *const Self) Self {
+            const copy = self.*;
+            for (copy.pictures[0..copy.count]) |pic| pic.owners.* += 1;
+            return copy;
+        }
+        fn samePair(self: *const Self, pic: Picture) bool {
+            return if (self.current_pair) |id| pic.pair_id == id else pic.frame_num == self.current_num;
+        }
         fn remove(self: *Self, allocator: std.mem.Allocator, index: usize) void {
-            const picture = self.pictures[index];
-            allocator.free(picture.planar);
-            allocator.free(picture.meta);
-            for (picture.motions) |m| allocator.free(m);
+            release(allocator, self.pictures[index]);
             std.mem.copyForwards(Picture, self.pictures[index .. self.count - 1], self.pictures[index + 1 .. self.count]);
             self.count -= 1;
         }
@@ -96,11 +116,7 @@ pub fn StateFor(comptime Sample: type) type {
             }
         }
         pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            for (self.pictures[0..self.count]) |pic| {
-                allocator.free(pic.planar);
-                allocator.free(pic.meta);
-                for (pic.motions) |m| allocator.free(m);
-            }
+            for (self.pictures[0..self.count]) |pic| release(allocator, pic);
             self.count = 0;
         }
         pub fn order(self: *Self, frame_bits: usize) void {
@@ -333,7 +349,7 @@ pub fn StateFor(comptime Sample: type) type {
                 6 => {
                     if (self.max_field_long == null or command.first > self.max_field_long.?) return error.MalformedVideoPacket;
                     var preserve: ?u32 = null;
-                    for (self.pictures[0..self.count]) |pic| if (pic.frame_num == self.current_num and pic.fields[1 - self.field_parity] and !pic.fields[self.field_parity]) {
+                    for (self.pictures[0..self.count]) |pic| if (self.samePair(pic) and pic.fields[1 - self.field_parity] and !pic.fields[self.field_parity]) {
                         preserve = pic.id;
                     };
                     self.replaceFieldLong(allocator, command.first, preserve);
@@ -407,7 +423,7 @@ pub fn StateFor(comptime Sample: type) type {
             }
             var short_complement = false;
             if (self.field_picture) for (self.pictures[0..self.count]) |pic| {
-                if (pic.frame_num == self.current_num and pic.fields[1 - self.field_parity] and !pic.fields[self.field_parity] and pic.field_long[1 - self.field_parity] == null) short_complement = true;
+                if (self.samePair(pic) and pic.fields[1 - self.field_parity] and !pic.fields[self.field_parity] and pic.field_long[1 - self.field_parity] == null) short_complement = true;
             };
             if (!self.adaptive and !short_complement) {
                 var used: usize = 0;
@@ -435,7 +451,7 @@ pub fn StateFor(comptime Sample: type) type {
             }
             var complementary: ?usize = null;
             if (self.field_picture) for (self.pictures[0..self.count], 0..) |pic, i| {
-                if (pic.frame_num == self.current_num and pic.fields[1 - self.field_parity] and !pic.fields[self.field_parity]) {
+                if (self.samePair(pic) and pic.fields[1 - self.field_parity] and !pic.fields[self.field_parity]) {
                     complementary = i;
                     break;
                 }
@@ -445,9 +461,27 @@ pub fn StateFor(comptime Sample: type) type {
                 // field was available to the second field's reference list.
                 const pic = &self.pictures[slot];
                 if (pic.planar.len != planar.len or pic.meta.len != self.current_meta.len or pic.motions[0].len != motions[0].len or pic.motions[1].len != motions[1].len) return error.UnsupportedDynamicGeometry;
-                @memcpy(pic.planar, planar);
-                @memcpy(pic.meta, self.current_meta);
-                for (0..2) |list| @memcpy(pic.motions[list], motions[list]);
+                if (pic.owners.* == 1) {
+                    @memcpy(pic.planar, planar);
+                    @memcpy(pic.meta, self.current_meta);
+                    for (0..2) |list| @memcpy(pic.motions[list], motions[list]);
+                } else {
+                    const owned = try allocator.dupe(Sample, planar);
+                    errdefer allocator.free(owned);
+                    const owned_meta = try allocator.dupe(@import("h264_entropy.zig").Meta, self.current_meta);
+                    errdefer allocator.free(owned_meta);
+                    const motion0 = try allocator.dupe(motion.Motion, motions[0]);
+                    errdefer allocator.free(motion0);
+                    const motion1 = try allocator.dupe(motion.Motion, motions[1]);
+                    errdefer allocator.free(motion1);
+                    const owners = try allocator.create(usize);
+                    owners.* = 1;
+                    release(allocator, pic.*);
+                    pic.planar = owned;
+                    pic.meta = owned_meta;
+                    pic.motions = .{ motion0, motion1 };
+                    pic.owners = owners;
+                }
                 if (pic.field_long[1 - self.field_parity] != null and self.current_long != null and pic.field_long[1 - self.field_parity].? != self.current_long.?) return error.MalformedVideoPacket;
                 pic.fields[self.field_parity] = true;
                 pic.field_poc[self.field_parity] = self.current_field_poc[self.field_parity];
@@ -465,7 +499,9 @@ pub fn StateFor(comptime Sample: type) type {
             errdefer allocator.free(motion1);
             const owned_meta = try allocator.dupe(@import("h264_entropy.zig").Meta, self.current_meta);
             errdefer allocator.free(owned_meta);
-            self.pictures[self.count] = .{ .fields = self.current_fields, .meta = owned_meta, .paired = self.paired, .planar = owned, .motions = .{ motion0, motion1 }, .long_term = self.current_long, .field_long = .{ if (self.current_fields[0]) self.current_long else null, if (self.current_fields[1]) self.current_long else null }, .frame_num = self.current_num, .poc = self.current_poc, .field_poc = self.current_field_poc, .id = self.next_id, .list_ids = list_ids };
+            const owners = try allocator.create(usize);
+            owners.* = 1;
+            self.pictures[self.count] = .{ .owners = owners, .pair_id = self.current_pair, .fields = self.current_fields, .meta = owned_meta, .paired = self.paired, .planar = owned, .motions = .{ motion0, motion1 }, .long_term = self.current_long, .field_long = .{ if (self.current_fields[0]) self.current_long else null, if (self.current_fields[1]) self.current_long else null }, .frame_num = self.current_num, .poc = self.current_poc, .field_poc = self.current_field_poc, .id = self.next_id, .list_ids = list_ids };
             self.next_id += 1;
             self.count += 1;
         }

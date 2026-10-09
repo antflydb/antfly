@@ -1070,7 +1070,7 @@ test "video H264 PAFF standalone mismatched complement and cancellation release 
     const retained = src.retained_bytes;
     const original = reader.packets[1];
     reader.packets[1] = reader.packets[3];
-    try std.testing.expectError(error.MixedVideoPictures, video.h264.decodeFrame(a, &reader, 0, .{}));
+    try std.testing.expectError(error.MissingVideoReference, video.h264.decodeFrame(a, &reader, 0, .{}));
     try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
     try std.testing.expectEqual(retained, src.retained_bytes);
     reader.packets[1] = original;
@@ -1095,5 +1095,181 @@ test "video H264 PAFF standalone mismatched complement and cancellation release 
     try std.testing.expectEqual(@as(u32, 2), frame.duration);
     try std.testing.expectEqualSlices(u8, known[0 .. known.len / 3], frame.nv12);
     frame.deinit();
+    try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+}
+
+const paff_assembly_cases = .{
+    .{ "h264-paff-fragments-cavlc-8-1", @embedFile("../testdata/h264-paff-fragments-cavlc-8-1.mp4"), @embedFile("../testdata/h264-paff-fragments-cavlc-8-1.nv12") },
+    .{ "h264-paff-fragments-cabac-bottom-8-1", @embedFile("../testdata/h264-paff-fragments-cabac-bottom-8-1.mp4"), @embedFile("../testdata/h264-paff-fragments-cabac-bottom-8-1.nv12") },
+    .{ "h264-paff-interleaved-8-1", @embedFile("../testdata/h264-paff-interleaved-8-1.mp4"), @embedFile("../testdata/h264-paff-interleaved-8-1.nv12") },
+    .{ "h264-paff-interleaved-fragments-8-1", @embedFile("../testdata/h264-paff-interleaved-fragments-8-1.mp4"), @embedFile("../testdata/h264-paff-interleaved-fragments-8-1.nv12") },
+    .{ "h264-paff-frozen-prediction-8-1", @embedFile("../testdata/h264-paff-frozen-prediction-8-1.mp4"), @embedFile("../testdata/h264-paff-frozen-prediction-8-1.nv12") },
+    .{ "h264-paff-fragments-cavlc-10-2", @embedFile("../testdata/h264-paff-fragments-cavlc-10-2.mp4"), @embedFile("../testdata/h264-paff-fragments-cavlc-10-2.nv12") },
+    .{ "h264-paff-fragments-cabac-bottom-10-2", @embedFile("../testdata/h264-paff-fragments-cabac-bottom-10-2.mp4"), @embedFile("../testdata/h264-paff-fragments-cabac-bottom-10-2.nv12") },
+    .{ "h264-paff-interleaved-10-2", @embedFile("../testdata/h264-paff-interleaved-10-2.mp4"), @embedFile("../testdata/h264-paff-interleaved-10-2.nv12") },
+    .{ "h264-paff-interleaved-fragments-10-2", @embedFile("../testdata/h264-paff-interleaved-fragments-10-2.mp4"), @embedFile("../testdata/h264-paff-interleaved-fragments-10-2.nv12") },
+    .{ "h264-paff-frozen-prediction-10-2", @embedFile("../testdata/h264-paff-frozen-prediction-10-2.mp4"), @embedFile("../testdata/h264-paff-frozen-prediction-10-2.nv12") },
+    .{ "h264-paff-fragments-cavlc-14-3", @embedFile("../testdata/h264-paff-fragments-cavlc-14-3.mp4"), @embedFile("../testdata/h264-paff-fragments-cavlc-14-3.nv12") },
+    .{ "h264-paff-fragments-cabac-bottom-14-3", @embedFile("../testdata/h264-paff-fragments-cabac-bottom-14-3.mp4"), @embedFile("../testdata/h264-paff-fragments-cabac-bottom-14-3.nv12") },
+    .{ "h264-paff-interleaved-14-3", @embedFile("../testdata/h264-paff-interleaved-14-3.mp4"), @embedFile("../testdata/h264-paff-interleaved-14-3.nv12") },
+    .{ "h264-paff-interleaved-fragments-14-3", @embedFile("../testdata/h264-paff-interleaved-fragments-14-3.mp4"), @embedFile("../testdata/h264-paff-interleaved-fragments-14-3.nv12") },
+    .{ "h264-paff-frozen-prediction-14-3", @embedFile("../testdata/h264-paff-frozen-prediction-14-3.mp4"), @embedFile("../testdata/h264-paff-frozen-prediction-14-3.nv12") },
+};
+
+test "video H264 PAFF assembly interleaved and fragmented fields preserve samples and timestamps" {
+    const Receipt = struct { cases: []const struct { name: []const u8, members: []const []const usize, mp4_sha256: []const u8, nv12_sha256: []const u8 } };
+    const receipt = try std.json.parseFromSlice(Receipt, a, @embedFile("../testdata/h264-paff-assembly-oracle.json"), .{ .ignore_unknown_fields = true });
+    defer receipt.deinit();
+    try std.testing.expectEqual(paff_assembly_cases.len, receipt.value.cases.len);
+    inline for (paff_assembly_cases, 0..) |pair, case_index| {
+        const entry = receipt.value.cases[case_index];
+        try std.testing.expectEqualStrings(pair[0], entry.name);
+        inline for (.{ pair[1], pair[2] }, 0..) |bytes, file_index| {
+            var hash: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+            try std.testing.expectEqualStrings(if (file_index == 0) entry.mp4_sha256 else entry.nv12_sha256, &std.fmt.bytesToHex(hash, .lower));
+        }
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+        var src = media.source.Source{ .allocator = a, .admission_pool = &pool, .identity = pair[0], .storage = .{ .borrowed = pair[1] } };
+        var reader = try media.mp4.Reader.init(a, &src, .{ .max_index_bytes = 65536 });
+        defer reader.deinit();
+        const retained = pool.snapshot();
+        const size = pair[2].len / entry.members.len;
+        for (entry.members, 0..) |members, ordinal| {
+            for (members) |index| {
+                var frame = video.h264.decodeFrame(a, &reader, index, .{}) catch |err| {
+                    std.debug.print("PAFF assembly {s} packet {d}: {s}\n", .{ pair[0], index, @errorName(err) });
+                    return err;
+                };
+                defer frame.deinit();
+                try std.testing.expectEqualSlices(u8, pair[2][ordinal * size ..][0..size], frame.nv12);
+                try std.testing.expectEqual(@as(i64, @intCast(ordinal)), frame.pts);
+                try std.testing.expectEqual(@as(u32, 1), frame.duration);
+                try std.testing.expectEqual(@max(index, members[members.len - 1]) + 1, frame.decoded_packets);
+            }
+            try std.testing.expectEqual(retained, pool.snapshot());
+        }
+    }
+}
+
+test "video H264 PAFF assembly routes callbacks by membership and bounds pending work" {
+    const bytes = @embedFile("../testdata/h264-paff-interleaved-fragments-14-3.mp4");
+    const known = @embedFile("../testdata/h264-paff-interleaved-fragments-14-3.nv12");
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+    var src = media.source.Source{ .allocator = a, .admission_pool = &pool, .identity = "assembly-routing", .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &src, .{ .max_index_bytes = 65536 });
+    defer reader.deinit();
+    const retained = pool.snapshot();
+    const Collector = struct {
+        visited: [6]bool = @splat(false),
+        fn publish(context: *anyopaque, slot: usize, frame: *const video.h264.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const ordinal = ([_]usize{ 2, 0, 1, 0, 2, 1 })[slot];
+            const size = known.len / 3;
+            try std.testing.expectEqualSlices(u8, known[ordinal * size ..][0..size], frame.nv12);
+            try std.testing.expectEqual(@as(i64, @intCast(ordinal)), frame.pts);
+            try std.testing.expect(!self.visited[slot]);
+            self.visited[slot] = true;
+        }
+    };
+    var collector = Collector{};
+    const stats = try video.h264.decodeSelected(a, &reader, &.{ 8, 0, 4, 19, 23, 15 }, .{}, &collector, Collector.publish);
+    try std.testing.expectEqual(@as(usize, 24), stats.decoded_packets);
+    for (collector.visited) |visited| try std.testing.expect(visited);
+    try std.testing.expectEqual(retained, pool.snapshot());
+    try std.testing.expectError(error.ResourceLimitExceeded, video.h264.decodeFrame(a, &reader, 0, .{ .max_pending_pictures = 1 }));
+    try std.testing.expectError(error.ResourceLimitExceeded, video.h264.decodeFrame(a, &reader, 0, .{ .max_slices = 7 }));
+    try std.testing.expectError(error.ResourceLimitExceeded, video.h264.decodeFrame(a, &reader, 0, .{ .max_dependency_packets = 18 }));
+    try std.testing.expectError(error.ResourceLimitExceeded, video.h264.decodeFrame(a, &reader, 0, .{ .max_decode_bytes = 1 }));
+    try std.testing.expectEqual(retained, pool.snapshot());
+    const original = reader.packets;
+    reader.packets = original[0..19];
+    try std.testing.expectError(error.IncompleteVideoPicture, video.h264.decodeFrame(a, &reader, 0, .{}));
+    reader.packets = original;
+    const Failure = struct {
+        fn publish(_: *anyopaque, _: usize, _: *const video.h264.Frame) !void {
+            return error.CallbackFailed;
+        }
+    };
+    try std.testing.expectError(error.CallbackFailed, video.h264.decodeSelected(a, &reader, &.{ 0, 4 }, .{}, &collector, Failure.publish));
+    try std.testing.expectEqual(retained, pool.snapshot());
+}
+
+test "video H264 PAFF assembly allocation failures unwind snapshots and pending workspaces" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator, bytes: []const u8, index: usize) !void {
+            var src = media.source.Source{ .allocator = allocator, .identity = "assembly-failures", .storage = .{ .borrowed = bytes } };
+            var reader = try media.mp4.Reader.init(allocator, &src, .{});
+            defer reader.deinit();
+            var frame = try video.h264.decodeFrame(allocator, &reader, index, .{});
+            defer frame.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{ @as([]const u8, @embedFile("../testdata/h264-paff-interleaved-fragments-14-3.mp4")), @as(usize, 0) });
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{ @as([]const u8, @embedFile("../testdata/h264-paff-frozen-prediction-14-3.mp4")), @as(usize, 1) });
+}
+
+test "video H264 PAFF assembly snapshots survive complementary completion and eviction" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const State = @import("h264_references.zig").State;
+            const Motion = @import("h264_motion.zig").Motion;
+            const motions = [_]Motion{.{ .decoded = true }};
+            const pair = [2][]const Motion{ &motions, &motions };
+            var state = State{ .reference = true, .field_picture = true, .paired = true, .current_pair = 7, .current_fields = .{ true, false } };
+            defer state.deinit(allocator);
+            const first: [24]u8 = @splat(11);
+            const second: [24]u8 = @splat(22);
+            try state.commit(allocator, &first, pair, 1);
+            var snapshot = state.clone();
+            defer snapshot.deinit(allocator);
+            state.field_parity = 1;
+            state.current_fields = .{ false, true };
+            try state.commit(allocator, &second, pair, 1);
+            try std.testing.expectEqualSlices(u8, &first, snapshot.pictures[0].planar);
+            try std.testing.expectEqualSlices(u8, &second, state.pictures[0].planar);
+            try std.testing.expect(!snapshot.pictures[0].fields[1]);
+            state.current_pair = 8;
+            state.current_num = 1;
+            state.field_parity = 0;
+            state.current_fields = .{ true, false };
+            try state.commit(allocator, &second, pair, 1);
+            try std.testing.expectEqualSlices(u8, &first, snapshot.pictures[0].planar);
+            try std.testing.expectEqual(@as(?u32, 8), state.pictures[0].pair_id);
+        }
+    };
+    try Harness.run(a);
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+}
+
+test "video H264 PAFF assembly ignores auxiliary timing and rejects duplicate fragments" {
+    const bytes = @embedFile("../testdata/h264-paff-fragments-cavlc-8-1.mp4");
+    var src = media.source.Source{ .allocator = a, .identity = "assembly-fragments", .storage = .{ .borrowed = bytes } };
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    // Containers may flag every IDR fragment as sync; only its first slice is a reset.
+    for (reader.packets[0..7]) |*packet| packet.sync = true;
+    var frame = try video.h264.decodeFrame(a, &reader, 6, .{});
+    try std.testing.expectEqual(@as(i64, 0), frame.pts);
+    try std.testing.expectEqual(@as(u32, 1), frame.duration);
+    frame.deinit();
+    try std.testing.expectError(error.UnsupportedVideoProfile, video.h264.decodeFrame(a, &reader, 1, .{}));
+    const saved = reader.packets[2];
+    reader.packets[2] = reader.packets[0];
+    try std.testing.expectError(error.OverlappingVideoSlices, video.h264.decodeFrame(a, &reader, 0, .{}));
+    reader.packets[2] = saved;
+    const Cancel = struct {
+        input: *media.source.Source,
+        after_reads: usize,
+        fn check(ctx: ?*const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(ctx.?));
+            if (self.input.reads >= self.after_reads) return error.Cancelled;
+        }
+    };
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 32 * 1024 * 1024 } };
+    src.admission_pool = &pool;
+    const cancel = Cancel{ .input = &src, .after_reads = src.reads + 6 };
+    src.control = .{ .context = &cancel, .check_fn = Cancel.check };
+    try std.testing.expectError(error.Cancelled, video.h264.decodeFrame(a, &reader, 0, .{}));
     try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
 }

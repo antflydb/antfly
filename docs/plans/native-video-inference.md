@@ -353,9 +353,11 @@ Store dated benchmark receipts separately from these living contracts.
 - Final content-part fields and capability advertisement after PR #1014 settles.
 - Broader production-stream qualification beyond the implemented static H.264
   tool subset documented in `lib/video/VIDEO.md`. Multi-slice, CAVLC/CABAC I/P/B,
-  scaling matrices, native depth/chroma, MBAFF, consecutive standalone PAFF fields
-  and field MMCO 1–6 are implemented. Non-consecutive/non-complementary field
-  pairs and dynamic parameter sets remain outside the declared subset. CAVLC
+  scaling matrices, native depth/chroma, MBAFF, fragmented standalone PAFF fields
+  and field MMCO 1–6 are implemented. Bounded buffering across unrelated coded
+  pictures is a separately qualified assembly extension with frozen prediction
+  snapshots. Non-complementary field pairs and dynamic parameter sets remain
+  outside the declared subset. CAVLC
   table provenance and BSD license are pinned.
 - Reference decoder RGB conversion policy, VFR sampling compatibility, and
   accepted cross-backend numerical/retrieval tolerances.

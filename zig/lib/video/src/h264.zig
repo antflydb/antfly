@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 //! Portable static H.264 profile/tool subset: multi-slice I/P/B, CAVLC/CABAC,
-//! 8–14-bit 4:2:0/4:2:2/4:4:4, MBAFF and consecutive PAFF field packets.
+//! 8–14-bit 4:2:0/4:2:2/4:4:4, MBAFF and bounded buffered PAFF field assembly.
 //! Unsupported coding tools fail closed; no system codec or FFmpeg dependency.
 const std = @import("std");
 const layout = @import("h264_layout.zig");
@@ -14,6 +14,8 @@ pub const Options = struct {
     max_packet_bytes: usize = 16 * 1024 * 1024,
     max_decode_bytes: usize = 128 * 1024 * 1024,
     max_dependency_packets: usize = 256,
+    /// Lazy reconstruction slots for field pairs separated by other pictures.
+    max_pending_pictures: usize = 16,
     /// Per reconstructed picture, including both standalone PAFF field packets.
     max_slices: usize = 256,
 };
@@ -530,6 +532,7 @@ fn reorder(bits: *Bits, state: anytype, frame_bits: usize, active: usize) !void 
 }
 const PictureHeader = struct {
     frame_num: u32,
+    frame_offset: i32,
     poc: i32,
     idr: bool,
     reference: bool,
@@ -593,8 +596,11 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
         references.frame_offset = 0;
     }
     references.frame_bits = cfg.frame_bits;
-    if (references.previous_num > frame_num) references.frame_offset += @as(i32, 1) << @as(u5, @intCast(cfg.frame_bits));
-    references.previous_num = frame_num;
+    const frame_offset = if (header.*) |previous| previous.frame_offset else if (headers[1 - parity]) |other| other.frame_offset else blk: {
+        if (references.previous_num > frame_num) references.frame_offset = std.math.add(i32, references.frame_offset, @as(i32, 1) << @as(u5, @intCast(cfg.frame_bits))) catch return error.TimestampOverflow;
+        references.previous_num = frame_num;
+        break :blk references.frame_offset;
+    };
     references.current_num = frame_num;
     if (cfg.poc_bits) |poc_bits| {
         const lsb: i32 = @intCast(try bits.read(poc_bits));
@@ -615,7 +621,7 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
             references.current_poc = @min(msb + lsb, bottom_order);
         }
     } else if (cfg.poc_type == 1) {
-        var absolute: i64 = if (cfg.poc_cycle == 0) 0 else @as(i64, references.frame_offset) + frame_num;
+        var absolute: i64 = if (cfg.poc_cycle == 0) 0 else @as(i64, frame_offset) + frame_num;
         if (!reference and absolute > 0) absolute -= 1;
         var expected: i64 = 0;
         if (absolute > 0) {
@@ -632,7 +638,7 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
         references.current_poc = std.math.cast(i32, if (field_pic) (if (bottom) expected + cfg.poc_bottom + delta0 else top) else @min(top, bottom_poc)) orelse return error.TimestampOverflow;
         if (field_pic) references.current_field_poc[@intFromBool(bottom)] = references.current_poc else references.current_field_poc = .{ std.math.cast(i32, top) orelse return error.TimestampOverflow, std.math.cast(i32, bottom_poc) orelse return error.TimestampOverflow };
     } else {
-        references.current_poc = (references.frame_offset + @as(i32, @intCast(frame_num))) * 2 - @as(i32, @intFromBool(!references.reference));
+        references.current_poc = (frame_offset + @as(i32, @intCast(frame_num))) * 2 - @as(i32, @intFromBool(!references.reference));
         if (field_pic) references.current_field_poc[@intFromBool(bottom)] = references.current_poc else references.current_field_poc = @splat(references.current_poc);
     }
     if (header.*) |previous| if (previous.poc != references.current_poc) {
@@ -706,7 +712,7 @@ fn decodeSlice(allocator: std.mem.Allocator, nal: []const u8, cfg: Config, physi
         return error.MixedVideoPictures;
     };
     if (first_slice and group_map.len != 0) cfg.groups.build(group_map, cfg.coded_width / 16, group_cycle);
-    header.* = .{ .frame_num = frame_num, .poc = references.current_poc, .idr = idr, .reference = reference, .idr_id = idr_id, .group_cycle = group_cycle, .field_pic = field_pic, .bottom = bottom, .adaptive = references.adaptive, .current_long = references.current_long, .commands = references.commands, .command_count = references.command_count };
+    header.* = .{ .frame_num = frame_num, .frame_offset = frame_offset, .poc = references.current_poc, .idr = idr, .reference = reference, .idr_id = idr_id, .group_cycle = group_cycle, .field_pic = field_pic, .bottom = bottom, .adaptive = references.adaptive, .current_long = references.current_long, .commands = references.commands, .command_count = references.command_count };
     var syntax = try @import("h264_entropy.zig").Syntax.init(&bits, cfg.cabac, std.math.clamp(qp - depth_offset, 0, 51), slice_type, init_idc, metadata, counts, cfg.coded_width);
     syntax.slice_id = first_mb;
     syntax.constrained = cfg.constrained;
@@ -1079,7 +1085,25 @@ fn decodeBudget(budget: *@import("decode_budget.zig").Budget, reader: *media.mp4
 /// PAFF reset packets may contain an IDR first field and a non-IDR
 /// complementary second field. Hardware seeking keeps the stricter avc.isIdr.
 fn isDependencyReset(allocator: std.mem.Allocator, cfg: Config, bytes: []const u8, length_bytes: u3, input: *media.source.Source) !bool {
-    if (try @import("avc.zig").isIdr(bytes, length_bytes)) return true;
+    if (try @import("avc.zig").isIdr(bytes, length_bytes)) {
+        if (cfg.frame_only) return true;
+        var reservation = if (input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = bytes.len }) else media.admission.Token{};
+        defer reservation.deinit();
+        var cursor: usize = 0;
+        while (cursor < bytes.len) {
+            var size: usize = 0;
+            for (bytes[cursor..][0..length_bytes]) |byte| size = (size << 8) | byte;
+            cursor += length_bytes;
+            const nal = bytes[cursor..][0..size];
+            cursor += size;
+            if (nal[0] & 31 != 5) continue;
+            // A sync flag on a continuation fragment is not a seek point.
+            var bits = try Bits.initSlice(allocator, nal, input.control, cfg.cabac);
+            defer bits.deinit();
+            return try bits.ue() == 0;
+        }
+        return false;
+    }
     if (cfg.frame_only) return false;
     var reservation = if (input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = bytes.len }) else media.admission.Token{};
     defer reservation.deinit();
@@ -1112,6 +1136,54 @@ fn isDependencyReset(allocator: std.mem.Allocator, cfg: Config, bytes: []const u
         }
     }
     return first_parity != null and second;
+}
+/// Extend only while an assembled picture is incomplete; every traversed packet
+/// remains covered by dependency, payload, allocator and shared admission limits.
+fn extendAssembly(reader: *media.mp4.Reader, start: usize, current: usize, end: *usize, max_packet: *usize, peak: *usize, transient: *media.admission.Token, output_size: usize, config_bytes: u64, options: Options) !void {
+    if (current + 1 != end.*) return;
+    if (end.* >= reader.packets.len) return error.IncompleteVideoPicture;
+    if (end.* - start >= options.max_dependency_packets) return error.ResourceLimitExceeded;
+    const additional = reader.packets[end.*].size;
+    if (additional > options.max_packet_bytes) return error.ResourceLimitExceeded;
+    if (additional > max_packet.*) {
+        const growth = try std.math.mul(usize, additional - max_packet.*, 2);
+        peak.* = try std.math.add(usize, peak.*, growth);
+        if (peak.* > options.max_decode_bytes) return error.ResourceLimitExceeded;
+        try transient.resize(.{ .host_bytes = peak.* - output_size - config_bytes });
+        max_packet.* = additional;
+    }
+    end.* += 1;
+}
+const Prefix = struct { frame_num: u32, field: bool, parity: usize, reference: bool, idr: bool, idr_id: u32 };
+fn slicePrefix(allocator: std.mem.Allocator, cfg: Config, nal: []const u8, control: media.source.Control) !Prefix {
+    var bits = try Bits.initSlice(allocator, nal, control, cfg.cabac);
+    defer bits.deinit();
+    _ = try bits.ue();
+    _ = try bits.ue();
+    if (try bits.ue() != cfg.pps) return error.MalformedVideoPacket;
+    const frame_num = try bits.read(cfg.frame_bits);
+    const field = !cfg.frame_only and try bits.read(1) != 0;
+    const parity: usize = if (field) @intCast(try bits.read(1)) else 0;
+    const idr = nal[0] & 31 == 5;
+    return .{ .frame_num = frame_num, .field = field, .parity = parity, .reference = nal[0] & 0x60 != 0, .idr = idr, .idr_id = if (idr) try bits.ue() else 0 };
+}
+fn restoreMarking(references: anytype, workspace: anytype, header: PictureHeader, parity: usize, mbaff: bool) void {
+    references.current_pair = workspace.id;
+    references.reference = header.reference;
+    references.field_picture = header.field_pic;
+    references.field_parity = parity;
+    references.current_num = header.frame_num;
+    references.current_poc = header.poc;
+    if (header.field_pic) references.current_field_poc[parity] = header.poc;
+    references.current_fields = if (header.field_pic) .{ parity == 0, parity == 1 } else .{ true, true };
+    references.current_meta = workspace.metadata;
+    references.paired = mbaff or header.field_pic;
+    references.adaptive = header.adaptive;
+    references.current_long = header.current_long;
+    references.commands = header.commands;
+    references.command_count = header.command_count;
+    // Motion identities, rather than list positions, retain prediction identity.
+    references.list_count = 0;
 }
 fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *media.admission.Token, budget: *@import("decode_budget.zig").Budget, reader: *media.mp4.Reader, indexes: []const usize, options: Options, callback_context: ?*anyopaque, callback: ?SelectionCallback, index: usize, first_index: usize) !Frame {
     const allocator = budget.allocator();
@@ -1147,38 +1219,23 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
     const mode_size = coded_pixels / 16;
     const qp_size = coded_pixels / 256;
     const motion_size = coded_pixels / 16 * @sizeOf(@import("h264_motion.zig").Motion);
-    const reference_size = (planar_size + 2 * motion_size + qp_size * @sizeOf(@import("h264_entropy.zig").Meta)) * cfg.max_refs;
+    const reference_size = (planar_size + 2 * motion_size + qp_size * @sizeOf(@import("h264_entropy.zig").Meta) + @sizeOf(usize)) * cfg.max_refs;
     const group_size = if (cfg.groups.count > 1) qp_size else 0;
     const explicit_size = if (cfg.groups.explicit) |map| map.len else 0;
     const meta_size = group_size + explicit_size + qp_size * @sizeOf(@import("h264_entropy.zig").Meta);
-    var peak = try std.math.add(usize, try std.math.add(usize, planar_size + mode_size + qp_size + meta_size + 2 * motion_size + reference_size, output_size), try std.math.add(usize, count_size, try std.math.add(usize, try std.math.mul(usize, max_packet, 2), reader.track.avcc.len * 2)));
+    var peak = try std.math.add(usize, indexes.len, try std.math.add(usize, try std.math.add(usize, planar_size + mode_size + qp_size + meta_size + 2 * motion_size + reference_size, output_size), try std.math.add(usize, count_size, try std.math.add(usize, try std.math.mul(usize, max_packet, 2), reader.track.avcc.len * 2))));
     if (peak > options.max_decode_bytes) return error.ResourceLimitExceeded;
     var reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = output_size }) else media.admission.Token{};
     errdefer reservation.deinit();
     var transient = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = peak - output_size - config_reservation.resources.host_bytes }) else media.admission.Token{};
     defer transient.deinit();
-    const planar = try allocator.alloc(Sample, planar_size / @sizeOf(Sample));
-    defer allocator.free(planar);
-    @memset(planar, 0);
-    const count_bytes = try allocator.alloc(u8, count_size);
-    defer allocator.free(count_bytes);
-    @memset(count_bytes, 0);
-    const planes = [3][]Sample{ planar[0..coded_pixels], planar[coded_pixels..][0 .. coded_pixels / (sub_x * sub_y)], planar[coded_pixels + coded_pixels / (sub_x * sub_y) ..] };
-    const counts = [3][]u8{ count_bytes[0 .. coded_pixels / 16], count_bytes[coded_pixels / 16 ..][0 .. coded_pixels / (16 * sub_x * sub_y)], count_bytes[coded_pixels / 16 + coded_pixels / (16 * sub_x * sub_y) ..] };
-    const group_map = try allocator.alloc(u8, group_size);
-    defer allocator.free(group_map);
-    const metadata = try allocator.alloc(@import("h264_entropy.zig").Meta, qp_size);
-    defer allocator.free(metadata);
-    @memset(metadata, .{});
-    const qps = try allocator.alloc(u8, qp_size);
-    defer allocator.free(qps);
-    const modes = try allocator.alloc(u8, mode_size);
-    defer allocator.free(modes);
-    @memset(modes, 255);
-    const motions = try allocator.alloc(@import("h264_motion.zig").Motion, coded_pixels / 16);
-    defer allocator.free(motions);
-    const motions1 = try allocator.alloc(@import("h264_motion.zig").Motion, coded_pixels / 16);
-    defer allocator.free(motions1);
+    const Workspace = @import("h264_assembly.zig").Workspace(Sample, PictureHeader);
+    if (options.max_pending_pictures == 0 or options.max_pending_pictures > 16) return error.ResourceLimitExceeded;
+    const workspace_size = planar_size + count_size + mode_size + qp_size + qp_size * @sizeOf(@import("h264_entropy.zig").Meta) + 2 * motion_size + group_size + indexes.len;
+    const snapshot_size = reference_size + @sizeOf(Workspace.State);
+    var workspaces: [16]?Workspace = @splat(null);
+    defer for (&workspaces) |*slot| if (slot.*) |*workspace| workspace.deinit(allocator);
+    workspaces[0] = try Workspace.init(allocator, coded_pixels, sub_x * sub_y, group_size, indexes.len);
     var references = @import("h264_references.zig").StateFor(Sample){ .chroma_format = cfg.chroma_format };
     defer references.deinit(allocator);
     const output = try allocator.alloc(u8, output_size);
@@ -1186,10 +1243,7 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
     var decoded_packets: usize = 0;
     var field_macroblocks: usize = 0;
     var payload_bytes: u64 = 0;
-    var picture_header: [2]?PictureHeader = .{ null, null };
-    var committed_field: ?usize = null;
-    var picture_start = start;
-    var slices: usize = 0;
+    var next_picture_id: u32 = 0;
     var packet_index = start;
     var end = index + 1;
     while (packet_index < end) : (packet_index += 1) {
@@ -1198,19 +1252,8 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
         defer input_packet.deinit();
         if (reader.packets[packet_index].size > options.max_packet_bytes) return error.ResourceLimitExceeded;
         try @import("avc.zig").validatePacket(input_packet.bytes, reader.track.nal_length_bytes);
-        if (committed_field == null) {
-            picture_header = .{ null, null };
-            picture_start = packet_index;
-            slices = 0;
-            @memset(count_bytes, 0);
-            @memset(modes, 255);
-            @memset(metadata, .{});
-            @memset(motions, .{ .reference = -2 });
-            @memset(motions1, .{ .reference = -2 });
-        }
         var cursor: usize = 0;
-        var decoded = false;
-        references.current_fields = .{ true, true };
+        var packet_picture: ?u32 = null;
         while (cursor < input_packet.bytes.len) {
             try reader.input.control.check();
             var size: usize = 0;
@@ -1221,130 +1264,138 @@ fn decodeConfigured(comptime Sample: type, cfg: Config, config_reservation: *med
             switch (nal[0] & 31) {
                 1, 5 => {
                     if (nal[0] & 31 == 5 and nal[0] & 0x60 == 0) return error.MalformedVideoPacket;
-                    if (slices >= options.max_slices) return error.ResourceLimitExceeded;
-                    slices += 1;
-                    if (!cfg.frame_only and committed_field == null and (picture_header[0] != null or picture_header[1] != null)) {
-                        var peek = try Bits.initSlice(allocator, nal, reader.input.control, cfg.cabac);
-                        defer peek.deinit();
-                        _ = try peek.ue();
-                        _ = try peek.ue();
-                        _ = try peek.ue();
-                        _ = try peek.read(cfg.frame_bits);
-                        const is_field = try peek.read(1) != 0;
-                        const next_parity: usize = if (is_field) @intCast(try peek.read(1)) else 0;
-                        const previous_parity: usize = if (picture_header[0] != null) 0 else 1;
-                        if (is_field and next_parity != previous_parity) {
-                            const mw = cfg.coded_width / 16;
-                            for (metadata, 0..) |m, i| if (i / mw % 2 == previous_parity and m.kind == 255) return error.IncompleteVideoPicture;
-                            try @import("h264_deblock.zig").picture(planes, cfg.coded_width, qps, metadata, counts, .{ motions, motions1 }, .{ cfg.chroma_offset, cfg.chroma_offset1 }, cfg.bit_depth, cfg.chroma_format, true, reader.input.control);
-                            references.current_meta = metadata;
-                            references.paired = true;
-                            references.current_fields = .{ false, false };
-                            references.current_fields[previous_parity] = true;
-                            references.field_parity = previous_parity;
-                            try references.commit(allocator, planar, .{ motions, motions1 }, cfg.max_refs);
-                            // The first field is already filtered and may be referenced
-                            // by the second field; avoid filtering it a second time.
-                            for (metadata, 0..) |*m, i| if (i / mw % 2 == previous_parity) {
+                    const prefix = try slicePrefix(allocator, cfg, nal, reader.input.control);
+                    var found: ?usize = null;
+                    for (&workspaces, 0..) |*slot, i| if (slot.*) |*workspace| {
+                        if (!workspace.active) continue;
+                        const h = workspace.headers[0] orelse workspace.headers[1].?;
+                        if (h.frame_num == prefix.frame_num and h.field_pic == prefix.field and h.reference == prefix.reference and (!prefix.idr or h.idr and h.idr_id == prefix.idr_id)) {
+                            if (found != null) return error.MixedVideoPictures;
+                            found = i;
+                        }
+                    };
+                    if (found == null) {
+                        // A fresh IDR starts a new pairing generation. Requested
+                        // incomplete pictures cannot silently disappear at reset.
+                        if (prefix.idr) for (&workspaces) |*slot| if (slot.*) |*workspace| {
+                            if (workspace.active and workspace.wanted()) return error.IncompleteVideoPicture;
+                            if (workspace.snapshot != null) {
+                                workspace.releaseSnapshot(allocator);
+                                peak -= snapshot_size;
+                            }
+                            workspace.active = false;
+                        };
+                        try transient.resize(.{ .host_bytes = peak - output_size - config_reservation.resources.host_bytes });
+                        for (workspaces[0..options.max_pending_pictures], 0..) |slot, i| {
+                            if (slot == null or !slot.?.active) {
+                                found = i;
+                                break;
+                            }
+                        }
+                        const free = found orelse return error.ResourceLimitExceeded;
+                        if (workspaces[free] == null) {
+                            peak = try std.math.add(usize, peak, workspace_size);
+                            if (peak > options.max_decode_bytes) return error.ResourceLimitExceeded;
+                            try transient.resize(.{ .host_bytes = peak - output_size - config_reservation.resources.host_bytes });
+                            workspaces[free] = try Workspace.init(allocator, coded_pixels, sub_x * sub_y, group_size, indexes.len);
+                        }
+                        workspaces[free].?.reset(next_picture_id);
+                        next_picture_id += 1;
+                    }
+                    const workspace = &workspaces[found.?].?;
+                    if (packet_picture) |id| if (id != workspace.id) return error.MixedVideoPictures;
+                    packet_picture = workspace.id;
+                    if (workspace.slices >= options.max_slices) return error.ResourceLimitExceeded;
+                    workspace.slices += 1;
+                    for (indexes, 0..) |wanted, slot| if (wanted == packet_index) {
+                        workspace.selected[slot] = true;
+                    };
+                    const part = reader.packets[packet_index];
+                    const part_end = std.math.add(i64, part.pts, part.duration) catch return error.TimestampOverflow;
+                    const first_part = workspace.pts == null;
+                    workspace.pts = if (workspace.pts) |pts| @min(pts, part.pts) else part.pts;
+                    workspace.end = if (first_part) part_end else @max(workspace.end, part_end);
+                    const planes = [3][]Sample{ workspace.planar[0..coded_pixels], workspace.planar[coded_pixels..][0 .. coded_pixels / (sub_x * sub_y)], workspace.planar[coded_pixels + coded_pixels / (sub_x * sub_y) ..] };
+                    const counts = [3][]u8{ workspace.counts[0 .. coded_pixels / 16], workspace.counts[coded_pixels / 16 ..][0 .. coded_pixels / (16 * sub_x * sub_y)], workspace.counts[coded_pixels / 16 + coded_pixels / (16 * sub_x * sub_y) ..] };
+                    const prediction = workspace.snapshot orelse &references;
+                    prediction.current_pair = workspace.id;
+                    try decodeSlice(allocator, nal, cfg, planes, counts, workspace.modes, workspace.qps, workspace.metadata, workspace.motions[0], workspace.motions[1], prediction, &workspace.headers, workspace.groups, reader.input.control);
+                    const header = workspace.headers[prefix.parity].?;
+                    const covered = workspace.covers(prefix.field, prefix.parity, cfg.coded_width);
+                    if (covered and !workspace.committed[prefix.parity]) {
+                        if (workspace.snapshot != null) {
+                            workspace.releaseSnapshot(allocator);
+                            peak -= snapshot_size;
+                            try transient.resize(.{ .host_bytes = peak - output_size - config_reservation.resources.host_bytes });
+                        }
+                        try @import("h264_deblock.zig").picture(planes, cfg.coded_width, workspace.qps, workspace.metadata, counts, workspace.motions, .{ cfg.chroma_offset, cfg.chroma_offset1 }, cfg.bit_depth, cfg.chroma_format, cfg.mbaff or prefix.field, reader.input.control);
+                        restoreMarking(&references, workspace, header, prefix.parity, cfg.mbaff);
+                        try references.commit(allocator, workspace.planar, workspace.motions, cfg.max_refs);
+                        workspace.committed[prefix.parity] = true;
+                        if (prefix.field) {
+                            for (workspace.metadata, 0..) |*m, i| if (i / (cfg.coded_width / 16) % 2 == prefix.parity) {
                                 m.filter = 1;
                             };
-                            committed_field = previous_parity;
-                        }
+                            workspace.complete = workspace.committed[0] and workspace.committed[1];
+                        } else workspace.complete = true;
+                    } else if (prefix.field and !covered and workspace.snapshot == null) {
+                        peak = try std.math.add(usize, peak, snapshot_size);
+                        if (peak > options.max_decode_bytes) return error.ResourceLimitExceeded;
+                        try transient.resize(.{ .host_bytes = peak - output_size - config_reservation.resources.host_bytes });
+                        const snapshot = try allocator.create(Workspace.State);
+                        snapshot.* = references.clone();
+                        workspace.snapshot = snapshot;
                     }
-                    try decodeSlice(allocator, nal, cfg, planes, counts, modes, qps, metadata, motions, motions1, &references, &picture_header, group_map, reader.input.control);
-                    decoded = true;
                 },
                 6, 9, 12 => {},
                 else => return error.UnsupportedVideoProfile,
             }
         }
-        if (!decoded) return error.UnsupportedVideoProfile;
         decoded_packets += 1;
         payload_bytes += reader.packets[packet_index].size;
-        const first_header = picture_header[0] orelse picture_header[1].?;
-        const partial = first_header.field_pic and (picture_header[0] == null or picture_header[1] == null);
-        const parity: usize = @intFromBool(first_header.bottom);
-        const mw = cfg.coded_width / 16;
-        for (metadata, 0..) |m, i| {
-            if (partial and i / mw % 2 != parity) continue;
-            if (m.kind == 255) return error.IncompleteVideoPicture;
-        }
-        try @import("h264_deblock.zig").picture(planes, cfg.coded_width, qps, metadata, counts, .{ motions, motions1 }, .{ cfg.chroma_offset, cfg.chroma_offset1 }, cfg.bit_depth, cfg.chroma_format, cfg.mbaff or first_header.field_pic, reader.input.control);
-        references.current_meta = metadata;
-        references.paired = cfg.mbaff or first_header.field_pic;
-        references.current_fields = .{ true, true };
-        if (first_header.field_pic) {
-            const current_parity = if (partial) parity else 1 - committed_field.?;
-            references.field_parity = current_parity;
-            references.current_fields = .{ false, false };
-            references.current_fields[current_parity] = true;
-        }
-        try references.commit(allocator, planar, .{ motions, motions1 }, cfg.max_refs);
-        if (partial) {
-            if (committed_field != null) return error.IncompleteVideoPicture;
-            for (metadata, 0..) |*m, i| if (i / mw % 2 == parity) {
-                m.filter = 1;
-            };
-            committed_field = parity;
-            if (packet_index + 1 == end) {
-                if (end >= reader.packets.len) return error.IncompleteVideoPicture;
-                if (end - start >= options.max_dependency_packets) return error.ResourceLimitExceeded;
-                const additional = reader.packets[end].size;
-                if (additional > options.max_packet_bytes) return error.ResourceLimitExceeded;
-                if (additional > max_packet) {
-                    const growth = try std.math.mul(usize, additional - max_packet, 2);
-                    peak = try std.math.add(usize, peak, growth);
-                    if (peak > options.max_decode_bytes) return error.ResourceLimitExceeded;
-                    try transient.resize(.{ .host_bytes = peak - output_size - config_reservation.resources.host_bytes });
-                    max_packet = additional;
-                }
-                end += 1;
+        if (packet_picture == null) for (indexes) |wanted| if (wanted == packet_index) return error.UnsupportedVideoProfile;
+        for (&workspaces) |*slot| if (slot.*) |*workspace| {
+            if (!workspace.active) continue;
+            if (!workspace.complete) {
+                const h = workspace.headers[0] orelse workspace.headers[1].?;
+                if (!h.field_pic) return error.IncompleteVideoPicture;
+                if (workspace.wanted()) try extendAssembly(reader, start, packet_index, &end, &max_packet, &peak, &transient, output_size, config_reservation.resources.host_bytes, options);
+                continue;
             }
-            continue;
-        }
-        for (metadata) |m| field_macroblocks += @intFromBool(m.field);
-        committed_field = null;
-        var selected = false;
-        for (indexes) |wanted| if (wanted >= picture_start and wanted <= packet_index) {
-            selected = true;
-            break;
-        };
-        if (selected) {
-            output_packet = reader.packets[picture_start];
-            if (picture_start != packet_index) {
-                const last = reader.packets[packet_index];
-                const last_end = std.math.add(i64, last.pts, last.duration) catch return error.TimestampOverflow;
-                const first_end = std.math.add(i64, output_packet.pts, output_packet.duration) catch return error.TimestampOverflow;
-                const first_pts = @min(output_packet.pts, last.pts);
-                output_packet.duration = std.math.cast(u32, (std.math.sub(i64, @max(first_end, last_end), first_pts) catch return error.TimestampOverflow)) orelse return error.TimestampOverflow;
-                output_packet.pts = first_pts;
+            for (workspace.metadata) |m| field_macroblocks += @intFromBool(m.field);
+            const selected = workspace.wanted();
+            if (selected) {
+                output_packet.pts = workspace.pts.?;
+                output_packet.duration = std.math.cast(u32, std.math.sub(i64, workspace.end, output_packet.pts) catch return error.TimestampOverflow) orelse return error.TimestampOverflow;
             }
-        }
-        if (selected) {
-            for (0..cfg.height) |y| {
-                try reader.input.control.check();
-                for (0..cfg.width) |x| {
-                    const value = planes[0][(y + cfg.top) * cfg.coded_width + cfg.left + x];
-                    if (Sample == u8) output[y * cfg.width + x] = value else std.mem.writeInt(u16, output[(y * cfg.width + x) * 2 ..][0..2], value, .little);
-                }
-            }
-            for (0..cfg.height / sub_y) |y| {
-                try reader.input.control.check();
-                for (0..cfg.width / sub_x) |x| {
-                    for (0..2) |p| {
-                        const value = planes[p + 1][(y + cfg.top / sub_y) * (cfg.coded_width / sub_x) + x + cfg.left / sub_x];
-                        const offset = cfg.width * cfg.height + y * (cfg.width / sub_x) * 2 + x * 2 + p;
-                        if (Sample == u8) output[offset] = value else std.mem.writeInt(u16, output[offset * 2 ..][0..2], value, .little);
+            const planes = [3][]Sample{ workspace.planar[0..coded_pixels], workspace.planar[coded_pixels..][0 .. coded_pixels / (sub_x * sub_y)], workspace.planar[coded_pixels + coded_pixels / (sub_x * sub_y) ..] };
+            if (selected) {
+                for (0..cfg.height) |y| {
+                    try reader.input.control.check();
+                    for (0..cfg.width) |x| {
+                        const value = planes[0][(y + cfg.top) * cfg.coded_width + cfg.left + x];
+                        if (Sample == u8) output[y * cfg.width + x] = value else std.mem.writeInt(u16, output[(y * cfg.width + x) * 2 ..][0..2], value, .little);
                     }
                 }
+                for (0..cfg.height / sub_y) |y| {
+                    try reader.input.control.check();
+                    for (0..cfg.width / sub_x) |x| {
+                        for (0..2) |p| {
+                            const value = planes[p + 1][(y + cfg.top / sub_y) * (cfg.coded_width / sub_x) + x + cfg.left / sub_x];
+                            const offset = cfg.width * cfg.height + y * (cfg.width / sub_x) * 2 + x * 2 + p;
+                            if (Sample == u8) output[offset] = value else std.mem.writeInt(u16, output[offset * 2 ..][0..2], value, .little);
+                        }
+                    }
+                }
+                if (callback) |publish| {
+                    const metadata_frame = Frame{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .allocator = budget.backing, .nv12 = output, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
+                    for (workspace.selected, 0..) |wanted, request_slot| if (wanted) {
+                        try publish(callback_context.?, request_slot, &metadata_frame);
+                    };
+                }
             }
-            if (callback) |publish| {
-                const metadata_frame = Frame{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .allocator = budget.backing, .nv12 = output, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
-                for (indexes, 0..) |wanted, slot| if (wanted >= picture_start and wanted <= packet_index) {
-                    try publish(callback_context.?, slot, &metadata_frame);
-                };
-            }
-        }
+            workspace.active = false;
+        };
     }
     return .{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .reservation = reservation, .allocator = budget.backing, .nv12 = output, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
 }

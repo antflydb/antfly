@@ -8,6 +8,6 @@ pub const metal_rgba_preparation_compiled = metal_preparation_compiled;
 pub const portable_host_preparation = true;
 pub const portable_mjpeg_decode = true;
 pub const portable_h264_decode = true;
-pub const portable_h264_subset = "static-avc1-profile-subset-multislice-8to14bit-420-422-444-mbaff-paff-pairs-field-packets-mmco";
+pub const portable_h264_subset = "static-avc1-profile-subset-multislice-8to14bit-420-422-444-mbaff-paff-pairs-field-packets-mmco-buffered-assembly";
 pub const nvdec_decode = false;
 pub const cuda_preparation = false;

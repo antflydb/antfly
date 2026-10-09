@@ -341,6 +341,7 @@ def interlaced_pcm(
     idr_long=False,
     bottom_first=False,
     cabac=False,
+    slice_mbs=None,
 ):
     sx, sy = (1 if chroma == 3 else 2), (2 if chroma == 1 else 1)
     w, h = width // 16, height // 32
@@ -388,70 +389,80 @@ def interlaced_pcm(
     planes = [[0] * (width * height // (1 if p == 0 else sx * sy)) for p in range(3)]
     first_side = 1 if bottom_first else 0
     for parity in ((1, 0) if bottom_first else (0, 1)) if paff else (0,):
-        bits = Bits()
-        bits.ue(0)
-        bits.ue(2)
-        bits.ue(0)
-        bits.fixed(frame_num, 4)
-        bits.fixed(paff, 1)
-        if paff:
-            bits.fixed(parity, 1)
-        if idr_first and (not paff or parity == first_side):
+        size = w * h * (1 if paff else 2)
+        step = size if slice_mbs is None else slice_mbs
+        assert step > 0 and (paff or slice_mbs is None)
+        for first_address in range(0, size, step):
+            last_address = min(size, first_address + step)
+            bits = Bits()
+            bits.ue(first_address)
+            bits.ue(2)
             bits.ue(0)
-        if idr_first and (not paff or parity == first_side):
-            bits.fixed(0, 1)
-            bits.fixed(idr_long, 1)
-        else:
-            commands = marking[parity] if marking else []
-            bits.fixed(bool(commands), 1)
-            for operation, first, second in commands:
-                bits.ue(operation)
-                if operation in (1, 2, 3, 4, 6):
-                    bits.ue(first)
-                if operation == 3:
-                    bits.ue(second)
-            if commands:
+            bits.fixed(frame_num, 4)
+            bits.fixed(paff, 1)
+            if paff:
+                bits.fixed(parity, 1)
+            if idr_first and (not paff or parity == first_side):
                 bits.ue(0)
-        bits.se(0)
-        bits.ue(1)
-        if cabac:
-            assert paff
-            bits.align(1)
-        coder = Cabac(bits) if cabac else None
-        for address in range(w * h * (1 if paff else 2)):
-            pair = address if paff else address // 2
-            bottom = parity if paff else address % 2
-            field = paff or all_fields or (pair % 3 == 1)
-            if not paff and address % 2 == 0:
-                bits.fixed(field, 1)
-            if coder:
-                coder.bin(3 + (address % w != 0) + (address >= w), 1)
-                coder.terminate(1)
+            if idr_first and (not paff or parity == first_side):
+                bits.fixed(0, 1)
+                bits.fixed(idr_long, 1)
             else:
-                bits.ue(25)
-            bits.align()
-            for p in range(3):
-                px, py = (1, 1) if p == 0 else (sx, sy)
-                edge_x, edge_y = 16 // px, 16 // py
-                stride = width // px
-                for row in range(edge_y):
-                    physical_y = pair // w * 2 * edge_y + (
-                        row * 2 + bottom if field else row + bottom * edge_y
+                commands = marking[parity] if marking else []
+                bits.fixed(bool(commands), 1)
+                for operation, first, second in commands:
+                    bits.ue(operation)
+                    if operation in (1, 2, 3, 4, 6):
+                        bits.ue(first)
+                    if operation == 3:
+                        bits.ue(second)
+                if commands:
+                    bits.ue(0)
+            bits.se(0)
+            bits.ue(1)
+            if cabac:
+                assert paff
+                bits.align(1)
+            coder = Cabac(bits) if cabac else None
+            for address in range(first_address, last_address):
+                pair = address if paff else address // 2
+                bottom = parity if paff else address % 2
+                field = paff or all_fields or (pair % 3 == 1)
+                if not paff and address % 2 == 0:
+                    bits.fixed(field, 1)
+                if coder:
+                    coder.bin(
+                        3
+                        + (address % w != 0 and address - 1 >= first_address)
+                        + (address >= w and address - w >= first_address),
+                        1,
                     )
-                    for col in range(edge_x):
-                        x = pair % w * edge_x + col
-                        value = (physical_y * 41 + x * 19 + p * 53 + sample_offset) % (
-                            1 << depth
+                    coder.terminate(1)
+                else:
+                    bits.ue(25)
+                bits.align()
+                for p in range(3):
+                    px, py = (1, 1) if p == 0 else (sx, sy)
+                    edge_x, edge_y = 16 // px, 16 // py
+                    stride = width // px
+                    for row in range(edge_y):
+                        physical_y = pair // w * 2 * edge_y + (
+                            row * 2 + bottom if field else row + bottom * edge_y
                         )
-                        bits.fixed(value, depth)
-                        planes[p][physical_y * stride + x] = value
-            if coder:
-                coder.restart()
-                coder.terminate(address + 1 == w * h)
-        output += bits.nal(
-            0x65 if idr_first and (not paff or parity == first_side) else 0x41,
-            stop=not cabac,
-        )
+                        for col in range(edge_x):
+                            x = pair % w * edge_x + col
+                            value = (
+                                physical_y * 41 + x * 19 + p * 53 + sample_offset
+                            ) % (1 << depth)
+                            bits.fixed(value, depth)
+                            planes[p][physical_y * stride + x] = value
+                if coder:
+                    coder.restart()
+                    coder.terminate(address + 1 == last_address)
+            output += bits.nal(
+                0x65 if idr_first and (not paff or parity == first_side) else 0x41,
+                stop=not cabac,
+            )
     known = planes[0] + [v for pair in zip(planes[1], planes[2]) for v in pair]
     word = "H" if depth > 8 else "B"
     return output, struct.pack("<" + word * len(known), *known)
