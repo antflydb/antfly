@@ -15803,7 +15803,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         }
 
         var edge_worker = FakeWorker.iface(&state);
-        edge_worker.execution_deadline_ns = req.execution_deadline_ns;
+        edge_worker.execution_deadline_ns = edge_worker.budget().deadlineFrom(.init(req.execution_deadline_ns));
         edge_worker.cancellation = req.cancellation;
         edge_worker.runnable = req.execution_runnable;
         const topology_epoch = try table_catalog.topologyEpoch(std.testing.allocator, FakeCatalog.iface(), "docs");
