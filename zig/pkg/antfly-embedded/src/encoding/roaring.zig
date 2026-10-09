@@ -2021,24 +2021,45 @@ pub const FrozenRankIndex = struct {
         self.allocator.free(self.entries);
         self.* = undefined;
     }
+    pub const RankMembership = struct { below: usize, contains: bool };
+
     pub fn rank(self: *const @This(), value: u32) usize {
+        var hint: usize = 0;
+        return self.rankMembership(value, &hint).below;
+    }
+
+    /// Reuse container navigation for ordered postings, and compute membership
+    /// and rank from the same array search or bitmap word. The hint is also
+    /// valid for backwards seeks and may be reused with another frozen index.
+    pub fn rankMembership(self: *const @This(), value: u32, hint: *usize) RankMembership {
         const high: u16 = @intCast(value >> 16);
         const low: u16 = @truncate(value);
-        var lo: usize = 0;
-        var hi = self.entries.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (self.bitmap.keys.items[mid] < high) lo = mid + 1 else hi = mid;
+        var lo = @min(hint.*, self.entries.len);
+        if (lo > 0 and self.bitmap.keys.items[lo - 1] >= high) lo = 0;
+        if (lo < self.entries.len and self.bitmap.keys.items[lo] < high) {
+            lo += 1;
+            var hi = self.entries.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.bitmap.keys.items[mid] < high) lo = mid + 1 else hi = mid;
+            }
         }
-        if (lo == self.entries.len) return self.count;
+        hint.* = lo;
+        if (lo == self.entries.len) return .{ .below = self.count, .contains = false };
         const entry = self.entries[lo];
-        if (self.bitmap.keys.items[lo] != high) return entry.before;
+        if (self.bitmap.keys.items[lo] != high) return .{ .below = entry.before, .contains = false };
         if (entry.words) |words| {
             const bit: u6 = @truncate(low);
             const mask = (@as(u64, 1) << bit) - 1;
-            return entry.before + words[low / 64] + @as(usize, @popCount(self.bitmap.containers.items[lo].bitmap[low / 64] & mask));
+            const word = self.bitmap.containers.items[lo].bitmap[low / 64];
+            return .{
+                .below = entry.before + words[low / 64] + @as(usize, @popCount(word & mask)),
+                .contains = word & (@as(u64, 1) << bit) != 0,
+            };
         }
-        return entry.before + self.bitmap.containers.items[lo].rankBelow(low);
+        const items = self.bitmap.containers.items[lo].array.items;
+        const pos = arraySearchPos(items, low);
+        return .{ .below = entry.before + pos, .contains = pos < items.len and items[pos] == low };
     }
     /// Zero-based ordinal selection over the same immutable word prefixes.
     pub fn select(self: *const @This(), ordinal: usize) ?u32 {
@@ -2268,4 +2289,26 @@ test "word mask navigation intersects exclusions across sparse dense and u32 bou
     try std.testing.expectEqual(@as(u64, 0x1_0000_0000), exclude.nextAbsent(std.math.maxInt(u32)));
     try std.testing.expectEqual(@as(?u32, 139999), RoaringBitmap.nextMatching(139999, 140000, &.{&include}, &.{}));
     try std.testing.expectEqual(@as(u64, std.math.maxInt(u32)), RoaringBitmap.candidateLowerBound(140000, 0x1_0000_0000, &.{&include}, &.{}));
+}
+
+test "frozen rank membership cursor handles forward backwards and container gaps" {
+    const a = std.testing.allocator;
+    var bitmap = RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    for (0..10000) |i| try bitmap.add(@intCast(i * 3));
+    for ([_]u32{ 65535, 65536, 65540, 196610, 0xffffffff }) |doc| try bitmap.add(doc);
+    var index = try FrozenRankIndex.init(a, bitmap);
+    defer index.deinit();
+    var hint: usize = 0;
+    for (0..200001) |i| {
+        const doc: u32 = @intCast(i);
+        const result = index.rankMembership(doc, &hint);
+        try std.testing.expectEqual(bitmap.rank(doc), result.below);
+        try std.testing.expectEqual(bitmap.contains(doc), result.contains);
+    }
+    for ([_]u32{ 0xffffffff, 65536, 1, 65540, 196610, 0, 65535, 65534 }) |doc| {
+        const result = index.rankMembership(doc, &hint);
+        try std.testing.expectEqual(bitmap.rank(doc), result.below);
+        try std.testing.expectEqual(bitmap.contains(doc), result.contains);
+    }
 }
