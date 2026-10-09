@@ -139,6 +139,10 @@ pub const OpenOptions = struct {
     progress_wal_options: wal_mod.WalOptions = .{},
 };
 
+/// Success means the complete record is durably applied. A callback may return
+/// CatalogPublicationProofPending after bounded, restartable preparation only;
+/// the caller yields without acknowledging that record or advancing safe reads.
+/// Every other error remains fatal to this apply attempt.
 pub const ApplyFn = *const fn (ctx: *anyopaque, record: replication_record.RecordView) anyerror!void;
 
 pub const ApplyOptions = struct {
@@ -507,7 +511,10 @@ pub const Standby = struct {
         for (entries) |entry| {
             if (entry.record.lsn != expected_lsn) return error.MissingReceivedRecord;
             try self.validateRecord(entry.record);
-            try apply_fn(ctx, entry.record);
+            apply_fn(ctx, entry.record) catch |err| switch (err) {
+                error.CatalogPublicationProofPending => break,
+                else => return err,
+            };
 
             var next = self.progress_state;
             next.applied_lsn = entry.record.lsn;
@@ -1362,6 +1369,75 @@ test "storage.hot_standby standby does not advance applied lsn when apply fails"
         const progress = standby.currentProgress();
         try std.testing.expectEqual(@as(u64, 2), progress.applied_lsn);
         try std.testing.expectEqual(@as(u64, 2), progress.safe_read_lsn);
+    }
+}
+
+test "storage.hot_standby standby deferred publication preserves ordering progress and restart fences" {
+    const alloc = std.testing.allocator;
+    const identity = Identity{ .cluster_id = 10, .timeline_id = 1, .epoch = 1 };
+    const paths = try testPaths(alloc, "deferred-publication");
+    defer paths.deinit(alloc);
+    const Deferred = struct {
+        capture: ApplyCapture,
+        rounds: usize = 3,
+        corrupt: bool = false,
+        calls: usize = 0,
+
+        fn apply(ctx: *anyopaque, record: replication_record.RecordView) !void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (record.lsn == 2) {
+                if (self.corrupt) return error.CorruptPublication;
+                if (self.rounds != 0) {
+                    self.rounds -= 1;
+                    return error.CatalogPublicationProofPending;
+                }
+            }
+            try ApplyCapture.apply(&self.capture, record);
+        }
+    };
+    var deferred = Deferred{ .capture = .{ .alloc = alloc } };
+    defer deferred.capture.deinit();
+    {
+        var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+        defer standby.close();
+        for ([_][]const u8{ "one", "publication", "three" }, 1..) |payload, lsn| {
+            _ = try standby.receive(baseRecord(identity, lsn, payload));
+        }
+        try std.testing.expectEqual(@as(usize, 1), try standby.applyAvailable(&deferred, Deferred.apply));
+        try std.testing.expectEqual(@as(usize, 2), deferred.calls);
+        try std.testing.expectEqual(@as(usize, 0), try standby.applyAvailable(&deferred, Deferred.apply));
+        const progress = standby.currentProgress();
+        try std.testing.expectEqual(@as(u64, 3), progress.received_lsn);
+        try std.testing.expectEqual(@as(u64, 1), progress.applied_lsn);
+        try std.testing.expectEqual(@as(u64, 1), progress.safe_read_lsn);
+        try std.testing.expectError(error.PromotionRequiresForce, standby.promote(.{
+            .new_timeline_id = 2,
+            .new_epoch = 2,
+            .fencing_confirmed = true,
+        }));
+    }
+    {
+        var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+        defer standby.close();
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().safe_read_lsn);
+        try std.testing.expectEqual(@as(usize, 0), try standby.applyAvailable(&deferred, Deferred.apply));
+        try std.testing.expectEqual(@as(usize, 1), deferred.capture.payloads.items.len);
+        deferred.corrupt = true;
+        try std.testing.expectError(error.CorruptPublication, standby.applyAvailable(&deferred, Deferred.apply));
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().applied_lsn);
+        deferred.corrupt = false;
+        try std.testing.expectEqual(@as(usize, 2), try standby.applyAvailable(&deferred, Deferred.apply));
+        try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().safe_read_lsn);
+        try std.testing.expectEqual(@as(usize, 3), deferred.capture.payloads.items.len);
+        try std.testing.expectEqualStrings("publication", deferred.capture.payloads.items[1]);
+        try std.testing.expectEqualStrings("three", deferred.capture.payloads.items[2]);
+    }
+    {
+        var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+        defer standby.close();
+        try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().safe_read_lsn);
+        try std.testing.expectEqual(@as(usize, 0), try standby.applyAvailable(&deferred, Deferred.apply));
     }
 }
 

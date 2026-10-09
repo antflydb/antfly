@@ -2164,6 +2164,25 @@ v32 proposal and stale-admission checks pass with all 15 coordinator tests
 Automatic coordinator publication remains deliberately
 unwired until independently prepared standby generation adoption is integrated;
 public SQL namespace resolution and its parity cases also remain unfinished.
+Standby apply now treats only `CatalogPublicationProofPending` as a cooperative
+yield, retaining the unapplied record and its successors behind the durable
+applied/safe-read frontier. Unexpected corruption and ordinary apply failures
+still propagate. A real receive/progress-WAL regression exercises three deferred
+rounds, restart before completion, promotion refusal, subsequent hard failure,
+ordered resumption and a second reopen. The standby gate passes 58/58 build
+steps, including that regression among 444 hot-standby tests.
+A fixed-memory metadata point probe consumes at most one authenticated transport
+frame per call, owns its target keys and bounded captures, and skips unrelated
+large values without allocating a complete row. Captures are unavailable through
+its admission API until both the effect footer and descriptor digest verify.
+Three focused tests cover large skipped values, missing/empty/deleted captures,
+transport-buffer retirement, split headers/keys/values/footers, duplicate target
+keys, capture overflow, private-key exclusion, and inner/outer integrity faults.
+This probe is preflight machinery, not publication authority or a replacement
+for canonical replay validation. Its connection to independent standby candidate
+proof preparation and generation adoption remains unfinished; automatic root
+publication stays guarded. No original corpus disposition changes from these
+infrastructure tests.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,
