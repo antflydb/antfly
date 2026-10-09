@@ -956,9 +956,12 @@ test "runnable execution port checks parked lifetime without CPU grants or owner
         const borrowed = try abi.Borrowed.fromOwner(port, handle.?, 1, .query);
         try std.testing.expect(port.park(handle.?, @backingInt(abi.Wait.resource)).isOk());
         const before = owner_state.owner.scheduler.stats();
-        if (failure == error.Canceled) flag.store(true, .release);
-        if (failure == error.DeadlineExceeded) TestClock.now_ns = 10;
-        if (failure == error.SchedulerClosed) owner_state.owner.close();
+        if (failure) |expected| switch (expected) {
+            error.Canceled => flag.store(true, .release),
+            error.DeadlineExceeded => TestClock.now_ns = 10,
+            error.SchedulerClosed => owner_state.owner.close(),
+            else => unreachable,
+        };
         if (failure) |expected| {
             try std.testing.expectError(expected, port.checkLifetime(handle.?));
             try std.testing.expectError(expected, borrowed.checkLifetime());
