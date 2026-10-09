@@ -364,8 +364,8 @@ pub const ArtifactStore = struct {
         const expected_len = std.math.cast(usize, expected_byte_len) orelse
             return error.ArtifactTooLarge;
 
-        if (self.vtable.get_bounded_alloc_with_cancellation) |get_bounded| {
-            const payload = execution_wait.runOwned(context.wait, get_bounded, .{ self.ptr, result_alloc, artifact_id, expected_len, token }, discardPayload, .{result_alloc}) catch |err| {
+        if (self.vtable.get_bounded_alloc_with_cancellation != null) {
+            const payload = execution_wait.runOwned(context.wait, ArtifactStore.getBoundedAlloc, .{ self, result_alloc, artifact_id, expected_len, token }, discardPayload, .{result_alloc}) catch |err| {
                 try context.ensureActive();
                 return err;
             };
@@ -408,6 +408,10 @@ pub const ArtifactStore = struct {
         if (payload.len != expected_len) return error.ArtifactIntegrityMismatch;
         try validatePayloadSha256For(payload, expected_checksum, token, context);
         return payload;
+    }
+
+    fn getBoundedAlloc(self: *ArtifactStore, alloc: Allocator, id: []const u8, length: usize, cancellation: CancellationToken) ![]u8 {
+        return self.vtable.get_bounded_alloc_with_cancellation.?(self.ptr, alloc, id, length, cancellation);
     }
 
     pub fn getRangeAlloc(self: *ArtifactStore, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
