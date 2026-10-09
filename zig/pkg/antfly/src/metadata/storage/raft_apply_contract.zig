@@ -237,6 +237,23 @@ pub const SystemCatalogCommand = struct {
 
 pub const CatalogAdmission = struct { meta: system_catalog.Meta, placement_policy: system_catalog.PlacementPolicy = .{} };
 
+pub fn transitionMutatesRelationSource(command: anytype) bool {
+    return switch (command) {
+        .apply_system_catalog,
+        .apply_restore_staging,
+        .apply_fk_generation_publication,
+        .apply_fk_initial_create,
+        .upsert_table,
+        .compare_and_replace_table,
+        .remove_table,
+        .apply_table_topology,
+        .apply_extension_lifecycle,
+        .apply_extension_lifecycle_v2,
+        => true,
+        else => false,
+    };
+}
+
 const store_report_update = @import("../store_report_update.zig");
 pub const CatalogProjectionRequest = union(enum) {
     read_store: struct { store_id: u64, reports: bool },
@@ -254,6 +271,7 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_query_definition: []const u8,
     catalog_write_validation: []const u8,
     catalog_write_validation_revision: void,
+    relation_source_tracking: void,
     topology_activation: void,
     report_cursor: u64,
     read_control_stores: []const u64,

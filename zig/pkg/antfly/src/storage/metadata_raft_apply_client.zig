@@ -409,6 +409,9 @@ pub const RaftApplyStore = struct {
     pub fn topologyActivation(self: *RaftApplyStore, group_id: u64) !?topology_protocol.Activation {
         return self.catalogProjection(?topology_protocol.Activation, self.alloc, group_id, .{ .topology_activation = {} });
     }
+    pub fn relationSourceTrackingActive(self: *RaftApplyStore, group_id: u64) !bool {
+        return self.catalogProjection(bool, self.alloc, group_id, .relation_source_tracking);
+    }
     pub fn reportBaselineProgress(self: *RaftApplyStore, group_id: u64, request: @import("../metadata/store_report_baseline.zig").Request) !@import("../metadata/store_report_baseline.zig").Progress {
         return self.reportBaselineProgressForKey(group_id, try request.progressQuery());
     }

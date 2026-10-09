@@ -1575,10 +1575,38 @@ Native tests cover stale pages after
 renames, unchanged epochs during job progress, pinned MVCC reads, transaction
 abort, missing-clock effects, snapshot omission/downgrade and restart. Pure
 tests cover zero/malformed values, exhaustion, monotonic replay and no implicit
-adoption. Clock hashing is skipped for untracked table writers. The adoption
-coordinator and writer capability barrier are not activated by this machinery.
-Capability-gated source adoption, pending-generation reservation sources,
-Raft job commands, GC scheduling,
+adoption. Clock hashing is skipped for untracked table writers.
+Final candidate verification also rechecks its EOF boundary in the committing
+transaction, with one successor seek after the verified tail rather than a
+full generation scan. Fault tests inject a late entry into empty, nonempty and
+exact-page-size cuts and prove no ready seal is committed; adjacent generations
+remain independent. Read-budget assertions require one seek and at most one
+successor step for the final boundary check, independent of generation size.
+Bounded binary coordinator controls now adopt a tracked source and atomically
+start/replace its generation through the ordinary metadata Raft/standalone
+command boundary. Adoption requires durable decoder-v31 activation bound to
+the exact cluster incarnation and metadata membership. It is idempotent and
+does not publish a root or enable SQL serving. Start/replacement uses the actual
+transactional source epoch and retained job CAS, creating retirement intent in
+the same commit. Losing committed controls are no-ops checked before mutation;
+native tests preserve both neighboring commands across a stale proposal and
+verify the resulting job, clock and retirement after reopening the store.
+The same source-mutation classifier drives writer admission and native
+ownership journaling. Once tracking is adopted, even unchanged legacy table
+wire shapes require decoder-v31 readiness. Both single and batched proposal
+paths recheck the monotonic source floor, leader term and membership before
+append; lower-version activation cannot lower a tracked source's floor. A
+bounded tracking query crosses the storage-owner interface without importing
+physical storage into control-only consumers. The generated control catalog
+exports the pure relation contracts. Codec tests cover every truncated frame,
+trailing bytes, canonical generations and allocation failures; mixed-peer
+admission tests cover initial controls, ordinary tracked source writes and
+adoption between preparation and final validation.
+`zig build antfly-relation-coordinator-test system-catalog-relation-store-test`
+exercises these control/admission paths. Source adoption is not automatic;
+source/candidate/GC page-intent preparation, leader scheduling and end-to-end
+coordinator retries remain to be wired. Pending-generation reservation sources,
+Raft page commands, GC scheduling,
 capability barriers and atomic active-root publication still
 precede writer adoption and SQL point resolution. No original SQL case is
 credited for this protocol component.
@@ -1592,6 +1620,13 @@ remain required before unqualified index DDL is enabled. The registry must not
 become a second independently committed catalog, nor may a table scan replace
 the missing point-resolution path. No original case is credited for this
 component work; current counts are reported at the top of this inventory.
+
+The data-owner deterministic rejection enum includes PostgreSQL array-subscript
+failures alongside the shared SQL expression error contract. The focused
+`zig build antfly-sql-expression-apply-contract-test` gate exhaustively verifies
+exact round trips for that contract and excludes resource/corruption failures;
+these failures must not become indefinitely retried committed entries. This is
+runtime contract coverage, not additional original-case completion credit.
 
 ### Remaining query and mutation activation
 

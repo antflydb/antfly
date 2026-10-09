@@ -298,6 +298,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("system-catalog-relation-store-test", "Verify namespace and schema transaction rollback and restart")
         .dependOn(&addFilteredTestRunArtifact(b, relation_namespace_tests).step);
+    const relation_coordinator_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{"relational topology admission rejects lifecycle proposals before encoding"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-relation-coordinator-test", "Verify relation control and tracked-writer decoder admission")
+        .dependOn(&addFilteredTestRunArtifact(b, relation_coordinator_tests).step);
     const system_catalog_store_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes" },
@@ -417,6 +424,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         auth.addImport("antfly_platform", platform_mod);
         module.addImport("usermgr_storage", auth);
     }
+    const sql_expression_apply_tests = b.addTest(.{
+        .root_module = data_implementation_module,
+        .filters = &.{"SQL expression apply failures preserve exact semantic rejections"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-sql-expression-apply-contract-test", "Run deterministic SQL expression rejection classification")
+        .dependOn(&addFilteredTestRunArtifact(b, sql_expression_apply_tests).step);
+
     const raft_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/raft_runtime_test_root.zig"),
         .target = target,

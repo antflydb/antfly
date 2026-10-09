@@ -3249,6 +3249,7 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .apply_relation_reconciliation) return metadata_topology_protocol.relation_reconciliation_version;
     const object_engine = switch (command) {
         .upsert_table => |table| table.storage.engine == .object,
         .compare_and_replace_table => |cas| cas.expected.storage.engine == .object or cas.replacement.storage.engine == .object,
@@ -3353,29 +3354,63 @@ fn preflightRowPolicyTopologyCommand(service: anytype, command: metadata_storage
 /// Call before acquiring a catalog lock. Remote membership probes belong at
 /// workflow admission; the final proposal path below only consumes a proof.
 pub fn ensureCoordinatedDecoderWithContext(service: anytype, command: metadata_storage.TransitionCommand, request: api_operation.RequestContext) !void {
-    const required_version = transitionRequiredCoordinatedDecoderVersion(command);
+    try request.ensureActive();
+    const required_version = @max(transitionRequiredCoordinatedDecoderVersion(command), if (metadata_storage.raft_apply_store.apply_contract.transitionMutatesRelationSource(command)) try relationSourceDecoderFloor(service) else 0);
     if (required_version == 0) return;
     if (comptime !@hasDecl(@TypeOf(service.*), "ensureTableTopologyProtocolReadyWithContext"))
         return error.TableTopologyProtocolUpgradeRequired;
     _ = try service.ensureTableTopologyProtocolReadyWithContext(request, required_version);
 }
 
-fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metadata_storage.TransitionCommand) !?TableTopologyProtocolReadiness {
+fn relationSourceDecoderFloor(service: anytype) !u16 {
+    if (comptime @hasDecl(@TypeOf(service.*), "projectedStore")) {
+        if (service.projectedStore()) |store| {
+            if (comptime @hasDecl(@TypeOf(store.*), "relationSourceTrackingActive")) {
+                if (try store.relationSourceTrackingActive(service.metadata_group_id)) return metadata_topology_protocol.relation_reconciliation_version;
+            }
+        }
+    }
+    return 0;
+}
+
+const CoordinatedDecoderAdmission = struct {
+    readiness: ?TableTopologyProtocolReadiness = null,
+    source_mutation: bool,
+};
+fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metadata_storage.TransitionCommand) !CoordinatedDecoderAdmission {
     if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
         for (commands) |command| try preflightRowPolicyTopologyCommand(service, command);
     }
     var required_version: u16 = 0;
-    for (commands) |command| required_version = @max(required_version, transitionRequiredCoordinatedDecoderVersion(command));
-    if (required_version == 0) return null;
+    const has_source = for (commands) |command| {
+        if (metadata_storage.raft_apply_store.apply_contract.transitionMutatesRelationSource(command)) break true;
+    } else false;
+    const source_floor = if (has_source) try relationSourceDecoderFloor(service) else 0;
+    for (commands) |command| {
+        required_version = @max(required_version, transitionRequiredCoordinatedDecoderVersion(command));
+        if (metadata_storage.raft_apply_store.apply_contract.transitionMutatesRelationSource(command)) required_version = @max(required_version, source_floor);
+    }
+    if (required_version == 0) return .{ .source_mutation = has_source };
     if (comptime !@hasDecl(@TypeOf(service.*), "cachedCoordinatedDecoderReadiness"))
         return error.TableTopologyProtocolUpgradeRequired;
-    return try service.cachedCoordinatedDecoderReadiness(required_version);
+    return .{ .readiness = try service.cachedCoordinatedDecoderReadiness(required_version), .source_mutation = has_source };
+}
+
+fn validateRelationSourceDecoderFloor(service: anytype, expected: CoordinatedDecoderAdmission) !void {
+    if (!expected.source_mutation) return;
+    const floor = try relationSourceDecoderFloor(service);
+    if (floor == 0) return;
+    const proof = expected.readiness orelse return error.TableTopologyProtocolUpgradeRequired;
+    if (proof.required_version < floor) return error.TableTopologyProtocolUpgradeRequired;
 }
 
 /// Caller holds the runtime lock through this check and Raft append. A proof
 /// acquired before encoding cannot authorize a changed leader/membership.
-fn validateCoordinatedDecoderAdmissionLocked(service: anytype, expected: ?TableTopologyProtocolReadiness) !void {
-    const proof = expected orelse return;
+fn validateCoordinatedDecoderAdmissionLocked(service: anytype, expected: CoordinatedDecoderAdmission) !void {
+    // Tracking may have been adopted after off-lock admission. Recheck the
+    // monotonic floor under the same runtime lock as membership and append.
+    try validateRelationSourceDecoderFloor(service, expected);
+    const proof = expected.readiness orelse return;
     const is_http = @TypeOf(service.*) == MetadataHttpService;
     const host = if (is_http) service.raft.host.http_host.host else service.raft.host.host;
     const status = host.raftStatus(service.metadata_group_id) orelse return error.NotLeader;
@@ -5786,9 +5821,10 @@ pub const MetadataService = struct {
     pub fn ensureTableTopologyProtocolReadyWithContext(
         self: *MetadataService,
         request: api_operation.RequestContext,
-        required_version: u16,
+        minimum_version: u16,
     ) !TableTopologyProtocolReadiness {
         try request.ensureActive();
+        const required_version = @max(minimum_version, try relationSourceDecoderFloor(self));
         const incarnation = try self.metadataIncarnation();
         self.lockRuntime();
         defer self.unlockRuntime();
@@ -9776,12 +9812,13 @@ pub const MetadataHttpService = struct {
 
     // Proposal-time admission must not instantiate the network/activation path:
     // activation itself proposes a command, and callers may hold mutation locks.
-    fn ensureTableTopologyProtocolReadyMode(self: *MetadataHttpService, request: api_operation.RequestContext, required_version: u16, comptime cached_only: bool) !TableTopologyProtocolReadiness {
+    fn ensureTableTopologyProtocolReadyMode(self: *MetadataHttpService, request: api_operation.RequestContext, minimum_version: u16, comptime cached_only: bool) !TableTopologyProtocolReadiness {
         var zig017_return_error: ?anyerror = null;
         (request.ensureActive() catch |zig017_err| {
             zig017_return_error = zig017_err;
             return zig017_err;
         });
+        const required_version = @max(minimum_version, try relationSourceDecoderFloor(self));
         if (required_version == 0 or required_version > metadata_topology_protocol.current_version)
             return zig017_failure: {
                 zig017_return_error = error.TableTopologyProtocolUpgradeRequired;
@@ -12852,6 +12889,17 @@ test "relational topology admission rejects lifecycle proposals before encoding 
         probes: usize = 0,
         appended: usize = 0,
         cache: TableTopologyProtocolProbeCoordinator = .{},
+        metadata_group_id: u64 = 42,
+        source: Source = .{},
+        const Source = struct {
+            tracked: bool = false,
+            pub fn relationSourceTrackingActive(self: *@This(), _: u64) !bool {
+                return self.tracked;
+            }
+        };
+        pub fn projectedStore(self: *@This()) ?*Source {
+            return &self.source;
+        }
 
         pub fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
             return true;
@@ -12879,7 +12927,8 @@ test "relational topology admission rejects lifecycle proposals before encoding 
         fn propose(self: *@This(), commands: []const metadata_storage.TransitionCommand) !void {
             // Same final guard used by both real service proposal paths. An
             // entire batch is checked before any command is encoded/appended.
-            _ = try prepareCoordinatedDecoderAdmission(self, commands);
+            const decoder = try prepareCoordinatedDecoderAdmission(self, commands);
+            try validateRelationSourceDecoderFloor(self, decoder);
             var encoded = try prepareEncodedTransitionBatch(self, commands);
             defer encoded.deinit(self.alloc);
             self.appended += encoded.entries.len;
@@ -12916,7 +12965,7 @@ test "relational topology admission rejects lifecycle proposals before encoding 
         try std.testing.expectEqual(@as(usize, 1), service.appended);
         service.member_versions = &.{ required, required, required };
         try ensureCoordinatedDecoderWithContext(&service, command, .{});
-        try std.testing.expect((try prepareCoordinatedDecoderAdmission(&service, &.{command})) != null);
+        try std.testing.expect((try prepareCoordinatedDecoderAdmission(&service, &.{command})).readiness != null);
         service.cache.cached.?.readiness.term += 1;
         try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, service.propose(&.{command}));
         try std.testing.expectEqual(@as(usize, 1), service.appended);
@@ -13006,6 +13055,37 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     mixed.cache.cached.?.readiness.term += 1;
     try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, mixed.propose(&.{initial_create_command}));
     try std.testing.expectEqual(@as(usize, 4), mixed.appended);
+    const relation_bytes = try (@import("relation_reconciliation_command.zig").Command{ .adopt = .{
+        .version = metadata_topology_protocol.relation_reconciliation_version,
+        .incarnation = "0123456789abcdef0123456789abcdef".*,
+        .member_count = 3,
+        .membership_fingerprint = @splat(7),
+    } }).encodeAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(relation_bytes);
+    const relation_command: metadata_storage.TransitionCommand = .{ .apply_relation_reconciliation = relation_bytes };
+    var source_peers: Fake = .{ .member_versions = &.{ 31, 31, 30 } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&source_peers, relation_command, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, source_peers.propose(&.{ legacy, relation_command }));
+    try std.testing.expectEqual(@as(usize, 0), source_peers.appended);
+    source_peers.member_versions = &.{ 31, 31, 31 };
+    try ensureCoordinatedDecoderWithContext(&source_peers, relation_command, .{});
+    try source_peers.propose(&.{relation_command});
+    const before_adoption = try prepareCoordinatedDecoderAdmission(&source_peers, &.{legacy});
+    // After adoption, even the unchanged legacy table wire format must not
+    // bypass the writer capability floor. Final admission remains cached-only.
+    source_peers.source.tracked = true;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, validateRelationSourceDecoderFloor(&source_peers, before_adoption));
+    source_peers.cache.cached = null;
+    source_peers.member_versions = &.{ 31, 31, 30 };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&source_peers, legacy, .{}));
+    const probes = source_peers.probes;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, source_peers.propose(&.{legacy}));
+    try std.testing.expectEqual(probes, source_peers.probes);
+    try std.testing.expectEqual(@as(usize, 1), source_peers.appended);
+    source_peers.member_versions = &.{ 31, 31, 31 };
+    try ensureCoordinatedDecoderWithContext(&source_peers, legacy, .{});
+    try source_peers.propose(&.{legacy});
+    try std.testing.expectEqual(@as(usize, 2), source_peers.appended);
 }
 
 test "relational topology admission requires metadata decoder capability beyond framed status" {

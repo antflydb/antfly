@@ -801,6 +801,32 @@ pub const Page = struct {
             var writer: CandidateWriter(@typeInfo(@TypeOf(txn)).pointer.child) = .{ .base = store };
             try self.plan.apply(&writer);
         } else try self.plan.verifyPublished(&store);
+        if (self.after.phase == .ready) {
+            // Preparation observed EOF in a different pinned transaction.
+            // Recheck that boundary before sealing, including an empty final
+            // page after an exact page-size cut. Seek past the verified tail,
+            // not from the prefix, to avoid rereading the full generation.
+            var tail_buf: [max_cursor_bytes]u8 = undefined;
+            var tail_len: usize = self.before.cursor_len;
+            @memcpy(tail_buf[0..tail_len], self.before.cursor());
+            for (self.claims) |claim| {
+                var claim_buf: [max_cursor_bytes]u8 = undefined;
+                const physical = try candidateKey(&claim_buf, &self.before, claim.key);
+                if (std.mem.order(u8, tail_buf[0..tail_len], physical) == .lt) {
+                    @memcpy(tail_buf[0..physical.len], physical);
+                    tail_len = physical.len;
+                }
+            }
+            var prefix_buf: [max_cursor_bytes]u8 = undefined;
+            const prefix = try candidatePrefix(&prefix_buf, &self.before);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var remaining = try cursor.seekAtOrAfter(if (tail_len == 0) prefix else tail_buf[0..tail_len]);
+            if (remaining) |row| if (std.mem.eql(u8, row.key, tail_buf[0..tail_len])) {
+                remaining = try cursor.next();
+            };
+            if (remaining) |row| if (std.mem.startsWith(u8, row.key, prefix)) return error.InvalidCatalogRecord;
+        }
         const value = try self.after.encode();
         try txn.put(key, &value);
     }
@@ -1033,6 +1059,8 @@ test "relation reconciliation preparation unwinds allocation faults" {
 const TestTxn = struct {
     arena: std.heap.ArenaAllocator,
     values: std.StringHashMapUnmanaged([]const u8) = .empty,
+    cursor_seeks: usize = 0,
+    cursor_nexts: usize = 0,
     fn init() TestTxn {
         return .{ .arena = std.heap.ArenaAllocator.init(std.testing.allocator) };
     }
@@ -1062,9 +1090,11 @@ const TestTxn = struct {
         last: []const u8 = "",
         pub fn close(_: *@This()) void {}
         pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?CandidateRow {
+            self.txn.cursor_seeks += 1;
             return self.find(key, false);
         }
         pub fn next(self: *@This()) !?CandidateRow {
+            self.txn.cursor_nexts += 1;
             return self.find(self.last, true);
         }
         fn find(self: *@This(), key: []const u8, exclusive: bool) ?CandidateRow {
@@ -1081,6 +1111,71 @@ const TestTxn = struct {
         }
     };
 };
+
+test "relation reconciliation seals only a transactionally verified candidate tail" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 0, 1, max_tables_per_page }) |count| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const owned = arena.allocator();
+        var txn = TestTxn.init();
+        defer txn.deinit();
+        const initial = try State.init(41, @splat(3), test_epoch);
+        try start(&txn, &initial, test_epoch, null);
+        const claims = try owned.alloc(names.Claim, count);
+        for (claims, 0..) |*claim, i| claim.* = .{
+            .key = .{ .namespace_id = 5, .name = try std.fmt.allocPrint(owned, "row:{d:0>4}", .{i}) },
+            .owner = test_owner,
+        };
+        const row: SourceRow = .{ .key = "table:7", .table_id = 7, .claims = claims };
+        var source: TestSource = .{ .rows = if (count == 0) &.{} else &.{row} };
+        var build = try Page.prepareSource(a, initial, test_epoch, &source);
+        defer build.deinit();
+        try build.apply(&txn, test_epoch);
+        var verify = try Page.prepareSource(a, build.after, test_epoch, &source);
+        defer verify.deinit();
+        try verify.apply(&txn, test_epoch);
+        const candidates = try owned.alloc(CandidateRow, count);
+        for (claims, candidates) |claim, *candidate| {
+            var buf: [max_cursor_bytes]u8 = undefined;
+            const key = try candidateKey(&buf, &initial, claim.key);
+            candidate.* = .{ .key = try owned.dupe(u8, key), .value = try txn.get(key) };
+        }
+        var candidate_source: TestCandidates = .{ .rows = candidates };
+        var first_page = try Page.prepareCandidate(a, verify.after, test_epoch, &candidate_source);
+        defer first_page.deinit();
+        var final_page: ?Page = null;
+        defer if (final_page) |*page| page.deinit();
+        if (first_page.after.phase != .ready) {
+            try first_page.apply(&txn, test_epoch);
+            final_page = try Page.prepareCandidate(a, first_page.after, test_epoch, &candidate_source);
+            try std.testing.expectEqual(@as(usize, 0), final_page.?.claims.len);
+        }
+        const page = if (final_page) |*value| value else &first_page;
+        try std.testing.expectEqual(Phase.ready, page.after.phase);
+        var key_buf: [max_cursor_bytes]u8 = undefined;
+        const extra = try candidateKey(&key_buf, &initial, .{ .namespace_id = 5, .name = "late_extra" });
+        try txn.put(extra, &(try test_owner.encode()));
+        txn.cursor_seeks = 0;
+        txn.cursor_nexts = 0;
+        try std.testing.expectError(error.InvalidCatalogRecord, page.apply(&txn, test_epoch));
+        try std.testing.expectEqual(@as(usize, 1), txn.cursor_seeks);
+        try std.testing.expectEqual(@as(usize, if (count == 0) 0 else 1), txn.cursor_nexts);
+        var job_buf: [128]u8 = undefined;
+        try std.testing.expectEqualSlices(u8, &(try page.before.encode()), try txn.get(try jobKey(&job_buf, initial.group_id)));
+        try txn.delete(extra);
+        // Another generation must not be mistaken for a late candidate.
+        const future = try State.init(41, try nextJobId(&initial), test_epoch);
+        var future_buf: [max_cursor_bytes]u8 = undefined;
+        try txn.put(try candidateKey(&future_buf, &future, test_claims[0].key), &(try test_owner.encode()));
+        txn.cursor_seeks = 0;
+        txn.cursor_nexts = 0;
+        try page.apply(&txn, test_epoch);
+        try std.testing.expectEqual(@as(usize, 1), txn.cursor_seeks);
+        try std.testing.expectEqual(@as(usize, if (count == 0) 0 else 1), txn.cursor_nexts);
+        try std.testing.expectEqualSlices(u8, &(try page.after.encode()), try txn.get(try jobKey(&job_buf, initial.group_id)));
+    }
+}
 
 test "relation reconciliation fences replacement jobs and rejects reused candidates" {
     var txn = TestTxn.init();

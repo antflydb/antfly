@@ -54,7 +54,11 @@ const std = @import("std");
 /// Version 27 persists reduction ownership for exact contribution retention.
 /// Version 28 maintains immutable ownership counts and publication root sets.
 /// Version 29 admits seekable native text corpora and their durable GC frontier.
-pub const current_version: u16 = 30;
+/// Version 31 decodes bounded relation source-adoption and reconciliation-job
+/// controls. Serving/root activation and pending reservation sources remain
+/// separate capabilities, never implied by this decoder floor.
+pub const current_version: u16 = 31;
+pub const relation_reconciliation_version: u16 = 31;
 pub const object_table_engine_version: u16 = 30;
 pub const lake_index_catalog_version: u16 = 29;
 pub const durable_activation_version: u16 = 9;

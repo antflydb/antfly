@@ -1330,6 +1330,7 @@ const RaftTableApplyStateMachine = struct {
         GeneratedColumnRewriteRequired,
         InitialChildProvisionAlreadyCommitted,
         SqlFeatureNotSupported,
+        SqlArraySubscriptError,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
@@ -24116,6 +24117,17 @@ pub const DataServer = struct {
 // These tests inspect private apply/admission state and belong to the physical
 // implementation partition, not to both linked test inventories.
 const activation_admission_tests = if (@import("builtin").is_test and implementation_tests_only) struct {
+    test "SQL expression apply failures preserve exact semantic rejections" {
+        const Failure = RaftTableApplyStateMachine.ExpectedApplyFailure;
+        inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
+            const reason = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
+            const classified = Failure.fromError(reason) orelse return error.TestExpectedSemanticRejection;
+            try std.testing.expectEqual(reason, classified.toError());
+        }
+        inline for (.{ error.OutOfMemory, error.ResourceBudgetExceeded, error.Corrupted }) |reason|
+            try std.testing.expectEqual(@as(?Failure, null), Failure.fromError(reason));
+    }
+
     test "ordinary unpublished placement does not require a private initial FK owner snapshot" {
         const snapshot: antfly.metadata_api.AdminSnapshot = .{
             .status = undefined,

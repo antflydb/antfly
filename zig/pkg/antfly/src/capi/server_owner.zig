@@ -1796,6 +1796,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.queryTableDefinition(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .relation_source_tracking => {
+                    const value = handle.store.relationSourceTrackingActive(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, value);
+                },
                 .topology_activation => {
                     const value = handle.store.topologyActivation(group_id) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

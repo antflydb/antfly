@@ -28,6 +28,7 @@ const catalog_name_key_buffer_bytes = 2048;
 const system_catalog_storage = @import("../../system_catalog/storage.zig");
 const relation_names = @import("antfly_local_sources").system_catalog_relation_names;
 const relation_reconciliation = @import("antfly_local_sources").system_catalog_relation_reconciliation;
+const relation_control = @import("../relation_reconciliation_command.zig");
 const command_journal = @import("command_journal.zig");
 const sql_settings = @import("antfly_local_sources").system_catalog_settings;
 const sql_policies = @import("antfly_local_sources").system_catalog_policies;
@@ -676,6 +677,103 @@ test "system catalog relation namespace transaction source epoch fences schema c
     defer txn.abort();
     try std.testing.expect(expected.eql(try RaftApplyStore.relationSourceEpochTxn(&txn, group)));
     try verifyReconciliationGroupTxn(&txn, group);
+}
+
+test "system catalog relation namespace transaction coordinator controls fence capability epoch and stale Raft proposals" {
+    const a = std.testing.allocator;
+    const r = relation_reconciliation;
+    const group: u64 = 41;
+    const T = struct {
+        fn control(store: *RaftApplyStore, command: relation_control.Command) !void {
+            const bytes = try command.encodeAlloc(a);
+            defer a.free(bytes);
+            try store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = bytes });
+        }
+        fn activate(store: *RaftApplyStore, proof: topology_protocol.Activation) !void {
+            const bytes = try std.json.Stringify.valueAlloc(a, proof, .{});
+            defer a.free(bytes);
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = bytes });
+        }
+    };
+    const identity = "11111111111111111111111111111111".*;
+    const proof: topology_protocol.Activation = .{ .version = topology_protocol.relation_reconciliation_version, .incarnation = identity, .member_count = 3, .membership_fingerprint = @splat(7) };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/rec-controls", .{tmp.sub_path});
+    defer a.free(root);
+    var expected: r.State = undefined;
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = identity });
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, T.control(&store, .{ .adopt = proof }));
+        try std.testing.expect(!try store.relationSourceTrackingActive(group));
+        var legacy = proof;
+        legacy.version -= 1;
+        try T.activate(&store, legacy);
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, T.control(&store, .{ .adopt = proof }));
+        try T.activate(&store, proof);
+        var wrong = proof;
+        wrong.membership_fingerprint[0] ^= 1;
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, T.control(&store, .{ .adopt = wrong }));
+        wrong = proof;
+        wrong.incarnation = "22222222222222222222222222222222".*;
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, T.control(&store, .{ .adopt = wrong }));
+        try T.control(&store, .{ .adopt = proof });
+        try T.control(&store, .{ .adopt = proof });
+        try std.testing.expect(try store.relationSourceTrackingActive(group));
+        const epoch = blk: {
+            var txn = try store.store.beginReadTxn();
+            defer txn.abort();
+            break :blk try RaftApplyStore.relationSourceEpochTxn(&txn, group);
+        };
+        try std.testing.expectEqual(@as(u64, 1), epoch.revision);
+        try T.activate(&store, legacy);
+        try std.testing.expect((try store.topologyActivation(group)).?.satisfies(proof));
+        const initial = try r.State.init(group, try r.nextJobId(null), epoch);
+        try T.control(&store, .{ .start = .{ .next = initial } });
+        try std.testing.expectError(error.CatalogGenerationChanged, T.control(&store, .{ .start = .{ .next = initial } }));
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 7, .name = "items", .schema_json = "{}" } });
+        const stale = try r.State.init(group, try r.nextJobId(&initial), epoch);
+        try std.testing.expectError(error.CatalogGenerationChanged, T.control(&store, .{ .start = .{ .next = stale, .prior = initial } }));
+        {
+            var txn = try store.store.beginReadTxn();
+            defer txn.abort();
+            var buf: [128]u8 = undefined;
+            try std.testing.expectError(error.NotFound, txn.get(try r.retirementKey(&buf, r.Generation.of(&initial))));
+            expected = try r.State.init(group, try r.nextJobId(&initial), try RaftApplyStore.relationSourceEpochTxn(&txn, group));
+        }
+        try T.control(&store, .{ .start = .{ .next = expected, .prior = initial } });
+        const losing = try (relation_control.Command{ .start = .{ .next = stale, .prior = initial } }).encodeAlloc(a);
+        defer a.free(losing);
+        const wire = try encodeTransitionCommand(a, .{ .apply_relation_reconciliation = losing });
+        defer a.free(wire);
+        var decoded = (try decodeTransitionCommand(a, wire)).?;
+        defer decoded.deinit(a);
+        try std.testing.expectEqualStrings(losing, decoded.apply_relation_reconciliation);
+        const before = try encodeTransitionCommand(a, .{ .upsert_node = .{ .node_id = 10, .role = "data" } });
+        defer a.free(before);
+        const after = try encodeTransitionCommand(a, .{ .upsert_node = .{ .node_id = 11, .role = "data" } });
+        defer a.free(after);
+        var outcome = try MetadataReplayTest.apply(&store, group, &.{ .{ .term = 1, .index = 1, .data = before }, .{ .term = 1, .index = 2, .data = wire }, .{ .term = 1, .index = 3, .data = after } });
+        defer outcome.deinit();
+        try std.testing.expectEqual(@as(u64, 3), try store.durableAppliedIndex(group));
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        var buf: [160]u8 = undefined;
+        _ = try txn.get(try nodeKeyForGroup(&buf, group, 10));
+        _ = try txn.get(try nodeKeyForGroup(&buf, group, 11));
+        _ = try txn.get(try r.retirementKey(&buf, r.Generation.of(&initial)));
+        try std.testing.expectEqual(@as(u64, 2), try r.readSourceRevision(&txn, group));
+    }
+    var recovered = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer recovered.deinit();
+    var txn = try recovered.store.beginReadTxn();
+    defer txn.abort();
+    var buf: [128]u8 = undefined;
+    try std.testing.expect(std.meta.eql(expected, try r.State.decode(try txn.get(try r.jobKey(&buf, group)))));
+    try verifyReconciliationGroupTxn(&txn, group);
+    try std.testing.expect((try recovered.topologyActivation(group)).?.satisfies(proof));
 }
 
 test "system catalog relation namespace transaction replay verification skips unrelated before-image payloads" {
@@ -3826,6 +3924,7 @@ pub fn onlineMergeAdmissionDigest(alloc: std.mem.Allocator, record: metadata.Mer
 }
 
 pub const TransitionCommand = union(enum) {
+    apply_relation_reconciliation: []const u8,
     apply_restore_staging: []const u8,
     /// Versioned system catalog request, applied atomically with any table topology.
     activate_topology_protocol: []const u8,
@@ -3988,7 +4087,7 @@ pub const TransitionCommand = union(enum) {
 
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
-            .apply_restore_staging => |bytes| alloc.free(bytes),
+            .apply_restore_staging, .apply_relation_reconciliation => |bytes| alloc.free(bytes),
             .upsert_schema_progress_batch => |records| alloc.free(records),
             .publish_secret_collection, .activate_topology_protocol, .apply_system_catalog, .apply_sql_settings, .apply_sql_policies, .apply_sql_policy_publication, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_store_root_enrollment, .ack_initial_fk_retirement, .apply_store_report_update, .apply_store_report_baseline => |bytes| alloc.free(bytes),
             .upsert_node, .register_node => |*record| {
@@ -4113,6 +4212,7 @@ pub const TransitionCommand = union(enum) {
 
 pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
     switch (command) {
+        .apply_relation_reconciliation => |bytes| _ = try relation_control.Command.decode(bytes),
         .apply_restore_staging => |bytes| if (bytes.len == 0 or bytes.len > restore_staging.max_encoded_bytes) return error.InvalidRestoreStaging,
         .apply_fk_generation_publication => |bytes| if (bytes.len == 0 or bytes.len > fk_generation_publication.max_bytes) return error.InvalidGenerationPublication,
         .apply_fk_initial_create => |bytes| if (bytes.len == 0 or bytes.len > fk_generation_publication.max_bytes) return error.InvalidGenerationPublication,
@@ -14715,6 +14815,9 @@ pub const RaftApplyStore = struct {
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) MetadataSnapshotProjectionMask {
         const mask = switch (tag) {
+            .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
+                metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_root) |
+                metadataSnapshotProjectionBit(.topology_activation) | metadataSnapshotProjectionBit(.metadata_incarnation),
             .apply_restore_staging => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.restore_staging) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.range) | metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
             .publish_secret_collection => metadataSnapshotProjectionBit(.secret_collection),
@@ -15276,6 +15379,12 @@ pub const RaftApplyStore = struct {
             var command = (try decodeTransitionCommand(self.alloc, entry.data)) orelse continue;
             defer command.deinit(self.alloc);
             self.applyTransitionCommandTxn(txn, group_id, command) catch |err| {
+                if (command == .apply_relation_reconciliation) switch (err) {
+                    // All losing control preconditions are checked before
+                    // mutation. A committed stale coordinator is a no-op.
+                    error.CatalogGenerationChanged, error.CatalogSourceUntracked, error.TableTopologyProtocolUpgradeRequired => continue,
+                    else => {},
+                };
                 // Namespace admission has already restored this command's
                 // storage and buffered outcome. A losing committed proposal
                 // is a no-op, not a permanently failing metadata log entry.
@@ -15306,20 +15415,41 @@ pub const RaftApplyStore = struct {
     }
 
     fn relationCommand(command: TransitionCommand) bool {
-        return switch (command) {
-            .apply_system_catalog,
-            .apply_restore_staging,
-            .apply_fk_generation_publication,
-            .apply_fk_initial_create,
-            .upsert_table,
-            .compare_and_replace_table,
-            .remove_table,
-            .apply_table_topology,
-            .apply_extension_lifecycle,
-            .apply_extension_lifecycle_v2,
-            => true,
-            else => false,
-        };
+        return apply_contract.transitionMutatesRelationSource(command);
+    }
+    pub fn relationSourceTrackingActive(self: *RaftApplyStore, group_id: u64) !bool {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        return try relation_reconciliation.readSourceRevision(&txn, group_id) != 0;
+    }
+    fn applyRelationControlTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
+        const command = try relation_control.Command.decode(bytes);
+        var buf: [160]u8 = undefined;
+        const activation_bytes = (try stagingGet(txn, try topologyActivationKeyForGroup(&buf, group_id))) orelse return error.TableTopologyProtocolUpgradeRequired;
+        if (activation_bytes.len > 1024) return error.InvalidCatalogRecord;
+        var activation = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, activation_bytes, .{});
+        defer activation.deinit();
+        if (activation.value.version < topology_protocol.relation_reconciliation_version) return error.TableTopologyProtocolUpgradeRequired;
+        if (activation.value.version > topology_protocol.current_version or activation.value.member_count == 0 or std.mem.allEqual(u8, &activation.value.membership_fingerprint, 0)) return error.InvalidCatalogRecord;
+        const identity_bytes = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&buf, group_id))) orelse return error.TableTopologyProtocolUpgradeRequired;
+        const identity = (try decodeMetadataIncarnationRecord(identity_bytes)).incarnation;
+        if (!std.meta.eql(identity, activation.value.incarnation)) return error.TableTopologyProtocolUpgradeRequired;
+        switch (command) {
+            .adopt => |proof| {
+                if (!activation.value.satisfies(proof)) return error.TableTopologyProtocolUpgradeRequired;
+                if (try relation_reconciliation.readSourceRevision(txn, group_id) != 0) return;
+                try relation_reconciliation.advanceSource(txn, group_id);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = try relation_reconciliation.sourceKey(&buf, group_id) });
+            },
+            .start => |request| {
+                if (request.next.group_id != group_id) return error.InvalidRelationReconciliationCommand;
+                const epoch = try relationSourceEpochTxn(txn, group_id);
+                const prior = if (request.prior) |state| try state.encode() else null;
+                try relation_reconciliation.start(txn, &request.next, epoch, if (prior) |*value| value else null);
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = try relation_reconciliation.jobKey(&buf, group_id) });
+                if (request.prior) |*state| self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = try relation_reconciliation.retirementKey(&buf, relation_reconciliation.Generation.of(state)) });
+            },
+        }
     }
     // Writer adoption is separate from serving readiness. Only verified
     // migration/bootstrap may install this marker; it does not advertise
@@ -15618,8 +15748,10 @@ pub const RaftApplyStore = struct {
                 var key_buf: [160]u8 = undefined;
                 const incarnation_bytes = try txn.get(try metadataIncarnationKeyForGroup(&key_buf, group_id));
                 if (!std.meta.eql((try decodeMetadataIncarnationRecord(incarnation_bytes)).incarnation, activation.incarnation)) return;
+                if (try relation_reconciliation.readSourceRevision(txn, group_id) != 0 and activation.version < topology_protocol.relation_reconciliation_version) return;
                 try txn.put(try topologyActivationKeyForGroup(&key_buf, group_id), bytes);
             },
+            .apply_relation_reconciliation => |bytes| try self.applyRelationControlTxn(txn, group_id, bytes),
             .apply_system_catalog => |bytes| try self.applySystemCatalogTxn(txn, group_id, bytes),
             .apply_sql_settings => |bytes| try self.applySqlSettingsTxn(txn, group_id, bytes),
             .apply_sql_policies => |bytes| try self.applySqlPoliciesTxn(txn, group_id, bytes),
@@ -20324,6 +20456,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    apply_relation_reconciliation = 76,
     mutate_lake_index_lifecycle = 75,
     publish_secret_collection = 60,
     upsert_schema_progress_batch = 59,
@@ -20456,6 +20589,11 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
         .apply_store_report_update => |bytes| {
             if (bytes.len > max_store_report_update_bytes) return error.CatalogCommandTooLarge;
             try out.append(alloc, @backingInt(TransitionTag.apply_store_report_update));
+            try appendRequiredString(alloc, &out, bytes);
+        },
+        .apply_relation_reconciliation => |bytes| {
+            _ = try relation_control.Command.decode(bytes);
+            try out.append(alloc, @backingInt(TransitionTag.apply_relation_reconciliation));
             try appendRequiredString(alloc, &out, bytes);
         },
         .apply_system_catalog => |bytes| {
@@ -20879,6 +21017,14 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
             errdefer alloc.free(bytes);
             if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
             break :blk .{ .apply_store_report_update = bytes };
+        },
+        .apply_relation_reconciliation => blk: {
+            if (encoded.len > relation_control.max_encoded_bytes + 16) return error.CatalogCommandTooLarge;
+            const bytes = try readRequiredString(alloc, encoded, &pos);
+            errdefer alloc.free(bytes);
+            if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
+            _ = try relation_control.Command.decode(bytes);
+            break :blk .{ .apply_relation_reconciliation = bytes };
         },
         .apply_system_catalog => blk: {
             if (encoded.len > system_catalog.max_command_bytes + 16) return error.CatalogCommandTooLarge;
