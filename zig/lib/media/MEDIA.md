@@ -126,15 +126,37 @@ are rejected. Index availability does not advertise a VP8/VP9/AV1 decoder.
 The [Matroska element definitions](https://www.matroska.org/technical/elements.html)
 are the container reference; the VP9 fixture independently matches FFprobe.
 
-`remote.ObjectRange` wraps a caller-owned authenticated transport. Requests carry
-an explicit strong HTTP ETag, non-null S3 version ID, or canonical GCS generation.
-The transport must issue Range with the matching If-Match/versionId/generation
-condition and return independently parsed response metadata. The adapter requires
-206, matching Content-Range start/length/total, and the pinned version before
-bytes are published. It rejects weak ETags, unversioned S3 `null` and malformed
-GCS generations. Transport/authentication, redirects, retries and credential
-management stay with the application; no network client or cloud SDK is added to
-media. Source.identity must also include object identity and its immutable version.
+`remote.ObjectRange` remains the portable callback interface for range providers.
+The native `objectstore.Adapter(@import("objectstore"))` now supplies authenticated
+S3/GCS transport through the existing `lib/objectstore` clients, so applications
+need credentials/configuration rather than an HTTP/authentication callback. The
+optional adapter keeps HTTP/auth dependencies out of core media/portable consumers.
+Use `Adapter.borrow` for an application-managed client, `Adapter.createS3` for an
+owned S3 client, or `Adapter.createGcs` for an owned GCS JSON API client. S3 uses the
+existing SigV4 signer and dynamic credential-provider support; GCS uses configured
+bearer credentials or the existing cached Google-token manager. Existing objectstore
+configuration helpers may supply environment/provider configuration. Owned adapters
+are destroyed with `destroy`; borrowed clients and bucket/key/version strings must
+outlive readers and caches. An adapter is single-consumer; share the application's
+I/O runtime through client configuration and instantiate adapters per request.
+
+Requests carry an explicit strong HTTP ETag, non-null S3 version ID, or canonical
+GCS generation. The built-in clients issue Range with If-Match/versionId/generation,
+request no metadata probe and cap response bodies to the requested size. Actual wire
+status, parsed Content-Range and strong-validator metadata are preserved through
+`GetResult`. The adapter verifies 206, start/length/total and the pinned version
+before copying/publishing bytes. Weak/missing/changed ETags, wrong versions,
+unversioned S3 `null`, malformed GCS generations and full-object 200 responses are
+rejected. Both built-in transports disable redirects; credentials are not replayed
+to a redirected endpoint. Cancellation/deadlines propagate through the object client,
+and the original media cancellation error is preserved. Source.identity must also
+include object identity and its immutable version.
+
+`zig build test-media-objectstore` qualifies SigV4/bearer headers, version selectors,
+range/body limits, malformed response metadata, strong ETag matching, owned-client
+cleanup and actual localhost HTTP requests through both built-in clients. Cloud
+credential discovery is inherited from `lib/objectstore`; these tests do not use live
+cloud accounts. The optional integration is compiled separately from `test-media`.
 
 `remote.ReadAhead` adds one fixed, forward read window (default 256 KiB), allowing
 nearby packet/header reads to share a provider request. Large reads progress through

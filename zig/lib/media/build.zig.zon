@@ -5,6 +5,6 @@
     .fingerprint = 0xb5394ac5614e31f2,
     .version = "0.0.1",
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{},
-    .paths = .{ "build.zig", "build.zig.zon", "build_support.zig", "media_test_root.zig", "MEDIA.md", "src", "testdata", "scripts" },
+    .dependencies = .{ .objectstore = .{ .path = "../objectstore" } },
+    .paths = .{ "build.zig", "build.zig.zon", "build_support.zig", "media_test_root.zig", "objectstore_test_root.zig", "MEDIA.md", "src", "testdata", "scripts" },
 }

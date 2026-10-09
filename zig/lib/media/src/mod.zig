@@ -4,6 +4,7 @@ pub const isobmff = @import("isobmff.zig");
 pub const ebml = @import("ebml.zig");
 pub const mp4_audio = @import("mp4_audio.zig");
 pub const webm_audio = @import("webm_audio.zig");
+pub const objectstore = @import("objectstore.zig");
 pub const remote = @import("remote.zig");
 pub const admission = @import("admission.zig");
 pub const source = @import("source.zig");

@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <x264.h>
 int main(int argc, char **argv) {
-    if (argc != 8 && argc != 9) return 2;
+    if (argc != 8 && argc != 9 && argc != 10) return 2;
     FILE *in = fopen(argv[1], "rb"), *out = fopen(argv[2], "wb");
     if (!in || !out) return 3;
     int width = atoi(argv[3]), height = atoi(argv[4]), frames = atoi(argv[5]), qp = atoi(argv[6]);
@@ -16,9 +16,9 @@ int main(int argc, char **argv) {
     param.i_width = width; param.i_height = height; param.i_csp = X264_CSP_I420;
     param.i_fps_num = 4; param.i_fps_den = 1;
     param.i_threads = 1; param.i_keyint_max = 1; param.i_bframe = 0;
-    param.b_cabac = 0; param.b_deblocking_filter = argc == 9 ? atoi(argv[8]) : 0;
+    param.b_cabac = 0; param.b_deblocking_filter = argc >= 9 ? atoi(argv[8]) : 0;
     param.vui.b_fullrange = atoi(argv[7]);
-    param.analyse.intra = 0; param.analyse.inter = 0;
+    param.analyse.intra = argc == 10 && atoi(argv[9]) ? X264_ANALYSE_I4x4 : 0; param.analyse.inter = 0;
     param.analyse.b_transform_8x8 = 0; param.i_frame_reference = 1;
     param.rc.i_rc_method = X264_RC_CQP; param.rc.i_qp_constant = qp;
     param.b_repeat_headers = 1; param.b_annexb = 1;

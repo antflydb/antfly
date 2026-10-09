@@ -216,7 +216,7 @@ of eight selections (six unique outputs), with CPU/Metal value comparisons,
 depth-one/two bounds, source teardown, late cancellation/retry, sink failures and
 allocation-failure campaigns. Portable planner tests execute on WASI; Linux
 compiles the planner, window reuse and CPU preparation without Apple dependencies.
-The Linux H.264 subset below is implemented; broader H.264 tools and CUDA/NVDEC remain stage 4 work. Model-specific tokens,
+The Linux H.264 subset below is implemented; additional H.264 tools and CUDA/NVDEC remain stage 4 work. Model-specific tokens,
 resident vision/backbone/pooling and retrieval parity still depend on PR #1014.
 
 ## Implemented portable MJPEG lane
@@ -265,7 +265,7 @@ portable decode/preparation suite executes on WASI and compiles for Linux.
 
 This CPU route supplies host patches for a later model consumer. The Metal route
 below stages software-decoded pictures on the caller's device. Neither runs an
-embedding model. Broader H.264 tools, NVDEC/CUDA and resident model execution
+embedding model. Additional H.264 tools, NVDEC/CUDA and resident model execution
 remain pending independently or behind
 PR #1014 as described in the implementation plan.
 
@@ -328,7 +328,7 @@ For the original two-second fixture, preparing overlapping windows together give
 Depth two retains at most 24,576 staged RGBA bytes; completed unique patch outputs
 occupy 221,184 bytes. These are asserted logical work/resource counts, not latency
 or embedding benchmarks. Resident vision/projector/backbone/pooling still await
-PR #1014; broader H.264 tools and NVIDIA NVDEC/CUDA remain independent follow-ups.
+PR #1014; additional H.264 tools and NVIDIA NVDEC/CUDA remain independent follow-ups.
 
 ## Implemented independent efficiency and portable H.264 work
 
@@ -358,36 +358,63 @@ Admission denial occurs before packet decoding and can be retried by the caller.
 Native worker tests qualify atomic contention; overlapping output lifetimes,
 late cancellation, allocation failures and retry qualify release ordering.
 
-`h264.decodeFrame` is a pure Zig decoder available on Linux, macOS and WASI.
-The declared first subset is progressive 8-bit 4:2:0 Baseline, one static SPS/PPS,
-one complete IDR I-slice per packet, CAVLC, Intra16x16 or I_PCM macroblocks, and
-explicitly disabled deblocking. Frame-number syntax, POC types 0/2, QP/chroma QP,
-all Intra16x16/chroma prediction modes, DC/AC inverse transforms, crop offsets,
-RBSP emulation prevention and full/video-range signaling are handled. Source
-clock/PTS comes from the indexed packet. Owned tightly packed NV12 pictures expose
-`Frame.host()` for portable preparation. Decode uses the same actual allocation
-budget tracker as MJPEG; geometry/packet/conservative work bounds are checked first,
-with cancellation during RBSP copying, macroblocks and output rows. Shared output
-admission remains held until Frame destruction.
+`h264.decodeFrame` and `h264.decodeSelected` are pure Zig decoders available on
+Linux, macOS and WASI. The declared subset is progressive 8-bit 4:2:0
+Baseline/Main/High, one static SPS/PPS and one complete I/P/B slice per packet.
+Implemented tools include:
 
-This is a qualified software subset, not general H.264 playback. Inter/P/B pictures,
-Intra4x4, CABAC, 8x8 transforms, active deblocking, scaling matrices, multiple slices,
-FMO/ASO, interlacing, higher bit depths/chroma, dynamic parameter sets and other
-profiles are rejected. Capability `portable_h264_decode` is true with the explicit
-`portable_h264_subset` descriptor; callers must preserve that descriptor.
-Independent x264/FFmpeg fixtures cover multiple quantizers, plane prediction,
-cropped 62x46 geometry and full range; a normative I_PCM fixture exercises byte
-alignment and emulation prevention. Supported pictures match FFmpeg NV12 exactly.
-Filtered and unsupported-profile inputs fail closed; allocation/cancellation
-campaigns and a 512-case packet mutation corpus release all leases.
-CAVLC codeword data is generated from pinned Cisco OpenH264 BSD-2-Clause tables;
-[third-party notices](THIRD_PARTY_NOTICES.md) include the revision and license.
-No OpenH264, x264 or FFmpeg runtime is linked.
+- CAVLC and CABAC entropy decoding, including CABAC initialization contexts and
+  bounded zero-word padding. I_PCM is supported with CAVLC.
+- All Intra4x4/Intra8x8/Intra16x16 and chroma prediction modes, 4x4/8x8 integer
+  transforms and quantization, and in-loop luma/chroma deblocking.
+- P/B macroblock and sub-macroblock partitions, skip, spatial/temporal direct
+  prediction, quarter-pel luma and eighth-pel chroma interpolation with edge extension.
+- Explicit weighted prediction and implicit B-picture weighting; short/long-term
+  reference lists, list reordering, sliding-window marking and bounded MMCO commands.
+- Frame-number and POC type 0/2 wrap, crop offsets, emulation prevention and
+  full/video-range signaling. Output PTS/duration comes from the indexed packet.
 
-`software.prepareWindows` supplies owned host patches for both MJPEG and this H.264
-subset, reusing each selected picture across overlapping clips. Source, Reader and
-frame storage may be destroyed after return. Codec work is still separate from
-EmbeddingGemma 2 tokens and model execution.
+`decodeFrame` replays the dependency span from a verified IDR to the selected
+packet and returns owned tightly packed NV12 with `Frame.host()`. `decodeSelected`
+keeps one bounded decoded-picture buffer across the selected span, decodes each
+packet once, and publishes borrowed NV12 pictures during a callback. Callback slots
+retain the caller's selection order, including B-picture presentation order; the
+callback must copy/prepare the picture before returning and must not destroy it.
+`software.prepareWindows` uses this batch path to share reference reconstruction and
+selected pictures across overlapping clips. It returns owned host patches independent
+of Source/Reader/frame lifetime. Decode receipts count actual dependency packets and
+payload bytes rather than only selected packets. The default dependency span is capped
+at 256 packets and the SPS reference count at 16 pictures.
+
+Geometry/packet/reference workspace bounds are checked before reconstruction;
+`max_decode_bytes` also enforces the actual decode allocator high-water limit.
+Reference planes and both lists' motion metadata are included in the conservative
+workspace estimate. Cancellation is checked during RBSP copying, macroblocks,
+filtering and output rows. Shared output admission remains held until Frame destruction;
+batch callback failure frees the output, decoded-picture buffer and packet leases.
+
+This remains a declared tool subset, not a full H.264 conformance claim. Multiple
+slices, FMO/ASO, interlacing/MBAFF, scaling matrices, transform bypass, CABAC I_PCM,
+constrained intra prediction, redundant slices, POC type 1, differing chroma QP offsets,
+higher bit depths/chroma, dynamic parameter sets and other profiles fail closed.
+Capability `portable_h264_decode` is true with explicit descriptor
+`progressive-8bit-420-baseline-main-high-single-slice-ipb`; callers must preserve
+that qualification. No OpenH264, x264 or FFmpeg runtime is linked.
+
+Independent x264/FFmpeg vectors cover intra prediction, CAVLC/CABAC 8x8 transforms,
+filtered/cropped/low-QP pictures, P/B pictures, spatial and temporal direct prediction,
+fades with explicit P weights, implicit B weights, B-pyramid reference pictures and
+frame-number wrap. Qualified pictures match FFmpeg NV12 byte-for-byte; oracle hashes,
+encoder settings and presentation picture types are recorded in
+[testdata/h264-tools-oracle.json](testdata/h264-tools-oracle.json). Weight rounding,
+coincident-POC fallback, all six short/long-term marking operations, packet mutation,
+dependency limits, callback cancellation and
+exhaustive reference-allocation failures have portable tests. This is coding-tool
+qualification on generated vectors, not a broad production-stream corpus. CAVLC and
+CABAC constants come from pinned Cisco OpenH264 BSD-2-Clause tables; the revision and
+license are in [third-party notices](THIRD_PARTY_NOTICES.md).
+
+Codec work remains independent of EmbeddingGemma 2 tokens and model execution.
 
 `zig build bench-video -Doptimize=ReleaseSafe` measures the checked-in MJPEG fixture.
 `-Dbenchmark-input=/absolute/path/video.mp4` uses positional file reads and sampled
@@ -499,8 +526,9 @@ or backend must be explicit, admitted, and counted.
 An MJPEG lane can first reuse `lib/image` JPEG decoding to exercise the complete
 portable surface/inference path. It does not qualify H.264. Start H.264 with
 progressive 8-bit 4:2:0 and an explicitly documented profile/tool subset; baseline
-coverage will not cover typical CABAC/B-frame streams. Add broader H.264 tools
-only with independent vectors and real-stream qualification.
+coverage alone does not cover CABAC/B-frame streams. The implemented Main/High
+tool subset above adds those tools with independent vectors. Additional tools and
+production-stream qualification remain incremental work.
 
 The codec work includes NAL/configuration parsing, entropy decode, inverse
 quantization/transforms, intra/inter prediction, motion compensation, in-loop

@@ -125,6 +125,7 @@ pub const HttpMethod = enum {
 pub const HeaderPair = [2][]const u8;
 
 pub const TransportResponse = struct {
+    content_range: ?types.ContentRange = null,
     status: u16,
     body: []u8,
     etag: ?[]u8 = null,
@@ -170,6 +171,8 @@ const HttpxTransport = struct {
         // Small immutable objects still need room for provider error envelopes
         // so HTTP status mapping preserves missing, denied and transient errors.
         client_config.max_error_response_size = 4096;
+        client_config.redirect_policy = .noFollow();
+        client_config.cookies_enabled = false;
         return .{
             .alloc = alloc,
             .io_impl = io_impl,
@@ -226,6 +229,9 @@ const HttpxTransport = struct {
             response.headers.get("Location"),
         );
         errdefer result.deinit(alloc);
+        if (response.status.code == 206) {
+            if (response.headers.get("Content-Range")) |value| result.content_range = try types.ContentRange.parse(value);
+        }
         if (response.headers.get("x-goog-generation")) |generation| result.generation = try alloc.dupe(u8, generation);
         return result;
     }
@@ -719,11 +725,17 @@ pub const JsonApiClient = struct {
 
         const body = response.body;
         response.body = &.{};
+        const response_etag_strong = types.isStrongEtag(response.etag);
+        const response_status = response.status;
+        const response_range = response.content_range;
         response.deinit(alloc);
 
         return .{
             .body = body,
             .metadata = meta,
+            .response_status = response_status,
+            .response_etag_strong = response_etag_strong,
+            .response_range = response_range,
         };
     }
 

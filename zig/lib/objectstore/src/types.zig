@@ -239,6 +239,10 @@ pub const PutResult = struct {
 };
 
 pub const GetResult = struct {
+    /// Wire response metadata; local providers leave these null.
+    response_status: ?u16 = null,
+    response_etag_strong: bool = false,
+    response_range: ?ContentRange = null,
     body: []u8,
     metadata: ObjectMetadata,
 
@@ -351,4 +355,38 @@ test "object attributes own part metadata" {
         .etag = try alloc.dupe(u8, "part-etag"),
     };
     attrs.deinit(alloc);
+}
+
+/// A single, closed HTTP byte range. Wildcard totals and multipart ranges are
+/// unsuitable for immutable random access and deliberately rejected.
+pub const ContentRange = struct {
+    offset: u64,
+    length: u64,
+    total: u64,
+    pub fn parse(value: []const u8) !ContentRange {
+        if (!std.mem.startsWith(u8, value, "bytes ")) return error.InvalidContentRange;
+        const dash = std.mem.indexOfScalarPos(u8, value, 6, '-') orelse return error.InvalidContentRange;
+        const slash = std.mem.indexOfScalarPos(u8, value, dash + 1, '/') orelse return error.InvalidContentRange;
+        const offset = try decimal(value[6..dash]);
+        const end = try decimal(value[dash + 1 .. slash]);
+        const total = try decimal(value[slash + 1 ..]);
+        if (end < offset or end >= total) return error.InvalidContentRange;
+        return .{ .offset = offset, .length = end - offset + 1, .total = total };
+    }
+    fn decimal(value: []const u8) !u64 {
+        if (value.len == 0) return error.InvalidContentRange;
+        for (value) |byte| if (byte < '0' or byte > '9') return error.InvalidContentRange;
+        return std.fmt.parseInt(u64, value, 10) catch error.InvalidContentRange;
+    }
+};
+test "HTTP content range rejects open multipart malformed and overflow ranges" {
+    try std.testing.expectEqual(ContentRange{ .offset = 2, .length = 4, .total = 16 }, try ContentRange.parse("bytes 2-5/16"));
+    for ([_][]const u8{ "bytes 2-5/*", "bytes 2-1/16", "bytes 2-16/16", "bytes -2-5/16", "bytes 2-5/16,18-19/20", "bytes 2-5/18446744073709551616", "bytes +2-5/16", "bytes 0-0/0" }) |value| try std.testing.expectError(error.InvalidContentRange, ContentRange.parse(value));
+}
+
+pub fn isStrongEtag(value: ?[]const u8) bool {
+    const tag = value orelse return false;
+    if (tag.len < 2 or tag[0] != '"' or tag[tag.len - 1] != '"') return false;
+    for (tag[1 .. tag.len - 1]) |byte| if (byte < 0x21 or byte == 0x22 or byte == 0x7f) return false;
+    return true;
 }

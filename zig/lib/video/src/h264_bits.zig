@@ -11,6 +11,9 @@ pub const Bits = struct {
         return initControlled(allocator, nal, .{});
     }
     pub fn initControlled(allocator: std.mem.Allocator, nal: []const u8, control: @import("antfly_media").source.Control) !Bits {
+        return initSlice(allocator, nal, control, false);
+    }
+    pub fn initSlice(allocator: std.mem.Allocator, nal: []const u8, control: @import("antfly_media").source.Control, cabac: bool) !Bits {
         try control.check();
         if (nal.len < 2 or nal[0] & 128 != 0) return error.MalformedVideoPacket;
         var output: std.ArrayList(u8) = .empty;
@@ -30,9 +33,13 @@ pub const Bits = struct {
             output.appendAssumeCapacity(byte);
             zeros = if (byte == 0) zeros + 1 else 0;
         }
-        if (output.items.len == 0 or output.items[output.items.len - 1] == 0) return error.MalformedVideoPacket;
-        const trailing: usize = @ctz(output.items[output.items.len - 1]);
-        const end = output.items.len * 8 - trailing - 1;
+        var syntax_length = output.items.len;
+        if (cabac) while (syntax_length > 0 and output.items[syntax_length - 1] == 0) {
+            syntax_length -= 1;
+        };
+        if (syntax_length == 0 or output.items[syntax_length - 1] == 0 or (output.items.len - syntax_length) % 2 != 0) return error.MalformedVideoPacket;
+        const trailing: usize = @ctz(output.items[syntax_length - 1]);
+        const end = syntax_length * 8 - trailing - 1;
         return .{ .allocator = allocator, .bytes = try output.toOwnedSlice(allocator), .end = end };
     }
     pub fn deinit(self: *Bits) void {

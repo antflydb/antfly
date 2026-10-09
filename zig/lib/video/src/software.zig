@@ -39,16 +39,20 @@ pub fn prepareWindows(allocator: std.mem.Allocator, reader: *media.mp4.Reader, r
     errdefer allocator.free(color_info);
     const patches = try allocator.alloc(f32, values);
     errdefer allocator.free(patches);
-    var payload_bytes: u64 = 0;
-    var peak: usize = 0;
-    for (plan.unique_indexes, 0..) |index, slot| {
-        var frame = try h264.decodeFrame(allocator, reader, index, options.h264);
-        defer frame.deinit();
-        const prepared = try preparation.referenceHost(allocator, frame.host(), options.preparation, reader.input.control);
-        defer allocator.free(prepared);
-        @memcpy(patches[slot * g.values() ..][0..g.values()], prepared);
-        peak = @max(peak, frame.decode_high_water);
-        payload_bytes += reader.packets[index].size;
-    }
-    return .{ .output_reservation = reservation, .allocator = allocator, .plan = plan, .patches = patches, .geometry = g, .decoded_packets = plan.unique_indexes.len, .payload_bytes = payload_bytes, .decode_high_water = peak, .display_matrix = reader.track.display_matrix, .pixel_aspect = reader.track.pixel_aspect, .color_info = color_info };
+    const Capture = struct {
+        allocator: std.mem.Allocator,
+        patches: []f32,
+        options: preparation.Options,
+        control: media.source.Control,
+        frame_values: usize,
+        fn publish(context: *anyopaque, slot: usize, frame: *const h264.Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const prepared = try preparation.referenceHost(self.allocator, frame.host(), self.options, self.control);
+            defer self.allocator.free(prepared);
+            @memcpy(self.patches[slot * self.frame_values ..][0..self.frame_values], prepared);
+        }
+    };
+    var capture = Capture{ .allocator = allocator, .patches = patches, .options = options.preparation, .control = reader.input.control, .frame_values = g.values() };
+    const stats = try h264.decodeSelected(allocator, reader, plan.unique_indexes, options.h264, &capture, Capture.publish);
+    return .{ .output_reservation = reservation, .allocator = allocator, .plan = plan, .patches = patches, .geometry = g, .decoded_packets = stats.decoded_packets, .payload_bytes = stats.payload_bytes, .decode_high_water = stats.decode_high_water, .display_matrix = reader.track.display_matrix, .pixel_aspect = reader.track.pixel_aspect, .color_info = color_info };
 }

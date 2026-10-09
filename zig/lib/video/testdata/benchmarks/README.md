@@ -44,3 +44,13 @@ Fixture SHA-256:
 
 Repeat measurements on deployment hardware and representative resolution, codec
 and concurrency before sizing shared admission budgets.
+
+The additional `linux-arm64-h264-high-2026-10-08.jsonl` receipt measures the expanded
+pure Zig decoder against `h264-high-pyramid.mp4` (128×96, sixteen pictures), including
+CABAC, B-picture prediction, weighted references, in-loop filtering and batch
+preparation. Earlier H.264 receipts predate the expanded decoder and describe its
+initial intra-only implementation. The newer receipt reports completed CPU work
+and allocation peaks; its tiny synthetic input and Docker VM remain unsuitable for
+production capacity estimates.
+
+High-profile fixture SHA-256: `ff3779dc9357543752834e69f4bc3122efbc16f2a89a56efe2518423f88d2e99`.

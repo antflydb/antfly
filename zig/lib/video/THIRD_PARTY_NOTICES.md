@@ -1,9 +1,10 @@
 # Third-party notices
 
-## Cisco OpenH264 CAVLC tables
+## Cisco OpenH264 CAVLC and CABAC tables
 
-The native Zig H.264 decoder includes CAVLC codeword data generated from
+The native Zig H.264 decoder includes CAVLC codewords and CABAC context/arithmetic tables generated from
 [OpenH264 encoder_data_tables.cpp](https://github.com/cisco/openh264/blob/1a0073f0322c8b74cbcb75ca1bb1c3d19d75538d/codec/encoder/core/src/encoder_data_tables.cpp),
+and [OpenH264 common_tables.cpp](https://github.com/cisco/openh264/blob/1a0073f0322c8b74cbcb75ca1bb1c3d19d75538d/codec/common/src/common_tables.cpp),
 revision `1a0073f0322c8b74cbcb75ca1bb1c3d19d75538d`.
 No OpenH264 runtime is linked.
 

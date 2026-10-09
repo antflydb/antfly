@@ -8,6 +8,6 @@ pub const metal_rgba_preparation_compiled = metal_preparation_compiled;
 pub const portable_host_preparation = true;
 pub const portable_mjpeg_decode = true;
 pub const portable_h264_decode = true;
-pub const portable_h264_subset = "baseline-idr-intra16-cavlc-no-deblock";
+pub const portable_h264_subset = "progressive-8bit-420-baseline-main-high-single-slice-ipb";
 pub const nvdec_decode = false;
 pub const cuda_preparation = false;

@@ -138,6 +138,7 @@ pub const HttpMethod = enum {
 };
 
 pub const TransportResponse = struct {
+    content_range: ?types.ContentRange = null,
     status: u16,
     body: []u8,
     etag: ?[]u8 = null,
@@ -345,6 +346,9 @@ fn httpxRequest(
     errdefer result.deinit(alloc);
     if (response.headers.get("ETag")) |value| result.etag = try alloc.dupe(u8, value);
     if (response.headers.get("Content-Type")) |value| result.content_type = try alloc.dupe(u8, value);
+    if (response.status.code == 206) {
+        if (response.headers.get("Content-Range")) |value| result.content_range = try types.ContentRange.parse(value);
+    }
     result.content_length = if (response.headers.get("Content-Length")) |value| std.fmt.parseInt(u64, value, 10) catch null else null;
     if (response.headers.get("x-amz-version-id")) |value| result.version_id = try alloc.dupe(u8, value);
     result.checksum = try checksumFromHeaders(alloc, &response.headers);
@@ -1080,10 +1084,16 @@ pub const Client = struct {
 
         const out_body = response.body;
         response.body = &.{};
+        const response_etag_strong = types.isStrongEtag(response.etag);
+        const response_status = response.status;
+        const response_range = response.content_range;
         response.deinit(alloc);
         return .{
             .body = out_body,
             .metadata = meta,
+            .response_status = response_status,
+            .response_etag_strong = response_etag_strong,
+            .response_range = response_range,
         };
     }
 

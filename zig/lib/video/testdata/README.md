@@ -88,7 +88,7 @@ preparation/resource receipts, not model or physical bus-transfer benchmarks.
 Intra16x16 prediction and explicitly disabled deblocking. The independent NV12
 oracles cover all luma/chroma prediction modes, low/high quantization, cropping
 and full range. `h264-pcm.mp4` adds I_PCM and emulation-prevention bytes.
-`h264-intra-filtered.mp4` is intentionally rejected because it enables deblocking.
+`h264-intra-filtered.mp4` qualifies active in-loop deblocking.
 The receipt pins every fixture/output hash and records FFprobe packet metadata.
 Tests compare every decoded byte, exercise cancellation, bounded mutation and
 allocation failure, and verify overlapping windows decode each selection once.
@@ -105,3 +105,26 @@ own pinned generator and BSD notice in `../THIRD_PARTY_NOTICES.md`.
 
 Completed timing receipts and their measurement limits are in
 [benchmarks/README.md](benchmarks/README.md).
+
+### Broader H.264 tools
+
+`h264-intra4*.mp4`, `h264-main-*.mp4`, `h264-high-*.mp4`,
+`h264-baseline-p.mp4` and `h264-cavlc-b.mp4` are generated from FFmpeg's
+procedural `testsrc2`, with an additional procedural fade for explicit P weighting.
+They qualify CAVLC/CABAC, intra4/intra8, filtering, cropping, inter partitions,
+spatial/temporal direct, weighted prediction, B-pyramid reference marking and
+frame-number wrap. The tool receipt records encoder settings, tool versions,
+presentation-order picture types and hashes for every MP4 and FFmpeg-decoded NV12.
+These generated assets are contributed under the repository Apache-2.0 license.
+
+```sh
+python3 zig/lib/video/scripts/generate_h264_tools_fixtures.py
+```
+
+The CABAC table generator accepts pinned `codec/common/src/common_tables.cpp`
+from OpenH264 revision `1a0073f0322c8b74cbcb75ca1bb1c3d19d75538d`, verifies its
+SHA-256 and retains its BSD-2-Clause license:
+
+```sh
+python3 zig/lib/video/scripts/generate_h264_cabac_tables.py /path/to/common_tables.cpp
+```
