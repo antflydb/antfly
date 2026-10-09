@@ -120,7 +120,7 @@ pub const Stream = struct {
     fn lookaheadCanceled(raw: *const anyopaque) bool {
         const self: *const Stream = @ptrCast(@alignCast(raw));
         if (self.lookahead_cancelled.load(.acquire)) return true;
-        self.context.ensureActive() catch return true;
+        self.context.checkLifetime() catch return true;
         return false;
     }
     fn joinLookahead(self: *Stream, cancel: bool) void {
@@ -131,12 +131,25 @@ pub const Stream = struct {
             self.lookahead = null;
         }
     }
+    pub fn retireSpeculation(self: *Stream) void {
+        self.joinLookahead(true);
+        self.freeLookaheadDescriptors();
+        if (self.source.scanner.shared_reader) |reader| reader.drain(true);
+    }
+    fn discardWarm(_: std.mem.Allocator, _: void) void {}
+    fn warmGroupChild(self: *Stream, inventory: external.Inventory, ordinal: u32, names: []const []const u8, required: []const bool, execution: *@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
+        return self.warmGroupFor(inventory, ordinal, names, required, execution);
+    }
     fn warmGroup(self: *Stream, inventory: external.Inventory, ordinal: u32, names: []const []const u8, required: []const bool) anyerror!void {
+        return self.warmGroupFor(inventory, ordinal, names, required, null);
+    }
+    fn warmGroupFor(self: *Stream, inventory: external.Inventory, ordinal: u32, names: []const []const u8, required: []const bool, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
         const reader = self.source.scanner.shared_reader.?;
         var worker_reader: @import("lake_serving_cache.zig").Reader = .{ .cache = reader.cache, .base = reader.base, .scope = reader.scope, .context = reader.context };
         const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = lookaheadCanceled };
         worker_reader.context.cancellation = token;
         worker_reader.base.cancellation = token;
+        if (execution) |owner| worker_reader.bindExecution(owner);
         // Worker allocations never mutate a statement arena. Decoded buffers
         // belong to the bounded shared cache, and temporary work is admitted
         // by the same scheduler used by kernels, spill writes and prefetch.
@@ -180,7 +193,11 @@ pub const Stream = struct {
         self.lookahead_names = stable_names;
         self.lookahead_required = stable_required;
         self.lookahead_cancelled.store(false, .release);
-        self.lookahead = @import("../../sql/parallel_scheduler.zig").global().submitTransient(io, @min(self.limits.max_input_bytes, 2 * 1024 * 1024) +| @min(self.limits.max_decoded_bytes, 2 * 1024 * 1024), warmGroup, .{ self, plan.inventory, ordinal, stable_names, stable_required });
+        const bytes = @min(self.limits.max_input_bytes, 2 * 1024 * 1024) +| @min(self.limits.max_decoded_bytes, 2 * 1024 * 1024);
+        if (reader.context.execution) |execution| {
+            const scope = @import("../../sql/parallel_scheduler.zig").ExecutionScope{ .execution = execution, .allocator = std.heap.page_allocator, .io = io, .wait = reader.context.wait.? };
+            self.lookahead = scope.submit(bytes, std.heap.page_allocator, warmGroupChild, .{ self, plan.inventory, ordinal, stable_names, stable_required }, discardWarm) catch null;
+        } else self.lookahead = @import("../../sql/parallel_scheduler.zig").global().submitTransient(io, bytes, warmGroup, .{ self, plan.inventory, ordinal, stable_names, stable_required });
         if (self.lookahead != null) self.lookahead_started += 1 else self.freeLookaheadDescriptors();
     }
     fn freeLookaheadDescriptors(self: *Stream) void {

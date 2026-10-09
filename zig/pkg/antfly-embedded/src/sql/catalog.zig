@@ -247,9 +247,49 @@ pub const Cursor = struct {
     /// replaces mutable parent callbacks with this worker's independent CPU/IO
     /// receiver and closes the cursor before that receiver physically retires.
     bind_execution: ?*const fn (*anyopaque, *@import("../common/runnable_scheduler.zig").Execution) anyerror!void = null,
+    /// Temporary coordinator attachment. The provider owns independent mutable
+    /// receiver state, joins speculative work on release, and never retains a
+    /// request execution between pulls (a named portal may outlive that call).
+    coordinator_execution: ?struct {
+        bind: *const fn (*anyopaque, *@import("../common/runnable_scheduler.zig").Execution) anyerror!void,
+        release: *const fn (*anyopaque) void,
+    } = null,
     /// Exact snapshot count; null means the retained cursor must be scanned.
     /// Providers may use metadata only after accounting for filters/deletes.
     count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,
+    fn attach(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution) !bool {
+        const owner = execution orelse return false;
+        const capability = self.coordinator_execution orelse return false;
+        try capability.bind(self.ptr, owner);
+        return true;
+    }
+    fn detach(self: Cursor, attached: bool) void {
+        if (attached) self.coordinator_execution.?.release(self.ptr);
+    }
+    pub fn nextFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, limit: u32) !Page {
+        const attached = try self.attach(execution);
+        const result = self.next(self.ptr, alloc, limit);
+        self.detach(attached);
+        if (attached) execution.?.checkpoint() catch |err| {
+            if (result) |page| page.deinit() else |_| {}
+            return err;
+        };
+        return result;
+    }
+    pub fn columnsFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, limit: u32) !ColumnPage {
+        const attached = try self.attach(execution);
+        const result = self.next_columns.?(self.ptr, alloc, limit);
+        self.detach(attached);
+        if (attached) try execution.?.checkpoint();
+        return result;
+    }
+    pub fn countFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution) !?u64 {
+        const attached = try self.attach(execution);
+        const result = self.count_rows.?(self.ptr);
+        self.detach(attached);
+        if (attached) try execution.?.checkpoint();
+        return result;
+    }
 };
 
 pub const StatementScan = struct { table: Table, request: Scan };

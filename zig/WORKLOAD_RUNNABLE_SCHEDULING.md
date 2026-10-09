@@ -244,3 +244,29 @@ compiler and default build budget. Both exact artifacts pass again under two
 CPUs and 2 GiB without extra swap, with required counts/names, matching hashes,
 zero exits and no skips/leaks. Complete production qualification of this write
 slice remains pending; automatic defaults remain disabled.
+
+
+### Serial lake receiver ownership (under qualification)
+
+Coordinator reads now use a provider capability distinct from an exclusively
+owned scan child. Lake aliases clone mutable version evidence, delete state and
+reader receivers while borrowing the statement's pinned inventory. Streaming,
+materialized, COUNT and relation scan pulls attach the current execution only
+for that operation. Before returning, the provider physically joins speculative
+work and removes the borrowed execution; a retained portal cursor or column page
+therefore cannot keep a pointer to a previous Execute call. A final checkpoint
+checks the original result authority after joining. Row pages acquired before a
+failed final checkpoint are discarded by their owner.
+
+Row-group lookahead uses the request execution family with its own reader and
+physical wait boundary, while the legacy scheduler remains for unscheduled
+calls. Cancellation polling checks lifetime rather than a borrowed parent CPU
+checkpoint. Existing range prefetch and row-group lookahead both retire before
+a coordinator attachment is removed.
+
+Qualification includes interleaved alias row/column pulls using different call
+executions, lazy Iceberg metadata isolation, control progress while physical
+reads are parked, and actual streaming, COUNT and repeated-alias SQL paths.
+This does not yet qualify statement capture/provider opening or split planning
+under the root execution, index/artifact readers, or the broad overload and
+durability/default-sizing gates. Those remain full-design requirements.

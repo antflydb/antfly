@@ -1392,7 +1392,18 @@ pub const Adapter = struct {
                 .estimated_bytes = child.estimated_bytes,
                 .ordered_split_bytes = child.ordered_split_bytes,
                 .bind_execution = if (child.bind_execution != null) bindExecution else null,
+                .coordinator_execution = if (child.coordinator_execution != null) .{ .bind = bindCoordinator, .release = releaseCoordinator } else null,
             };
+        }
+        fn bindCoordinator(raw: *anyopaque, execution: *http_server.RunnableScheduler.Execution) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            try child.coordinator_execution.?.bind(child.ptr, execution);
+        }
+        fn releaseCoordinator(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            child.coordinator_execution.?.release(child.ptr);
         }
         fn bindExecution(raw: *anyopaque, execution: *http_server.RunnableScheduler.Execution) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));

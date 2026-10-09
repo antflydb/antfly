@@ -576,10 +576,13 @@ pub const Reader = struct {
     /// Bind only an exclusively owned reader before publishing it. The reader
     /// stays at this address until every required/speculative physical join.
     pub fn bindExecution(self: *Reader, execution: *@import("../../common/runnable_scheduler.zig").Execution) void {
+        self.bindContext(self.context.withExecution(execution));
+    }
+    pub fn bindContext(self: *Reader, context: Context) void {
         const Store = @import("lake_read_context.zig").Store;
         const provider = Store.provider(self.base.client);
         const allocator = self.base.client.allocator;
-        self.context = self.context.withExecution(execution);
+        self.context = context;
         self.request_store = .{ .base = provider, .context = self.context };
         self.base.client = self.request_store.?.client(allocator);
         // The store now suspends the exact physical get/stat/list call. A range

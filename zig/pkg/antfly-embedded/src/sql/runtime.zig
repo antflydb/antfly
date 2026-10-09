@@ -209,17 +209,17 @@ pub const Context = struct {
         }
         pub fn page(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
             try self.open(context, table, request);
-            if (self.cursor) |cursor| return cursor.next(cursor.ptr, alloc, request.limit);
+            if (self.cursor) |cursor| return cursor.nextFor(if (context.backend.cpu_scope) |scope| scope.execution else null, alloc, request.limit);
             return context.backend.vtable.scan(context.backend.ptr, alloc, table, request);
         }
         pub fn count(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan) !?u64 {
             try self.open(context, table, request);
-            if (self.cursor) |cursor| if (cursor.count_rows) |count_rows| return try count_rows(cursor.ptr);
+            if (self.cursor) |cursor| if (cursor.count_rows != null) return try cursor.countFor(if (context.backend.cpu_scope) |scope| scope.execution else null);
             return null;
         }
         pub fn columns(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.ColumnPage {
             try self.open(context, table, request);
-            if (self.cursor) |cursor| if (cursor.next_columns) |next| return try next(cursor.ptr, alloc, request.limit);
+            if (self.cursor) |cursor| if (cursor.next_columns != null) return try cursor.columnsFor(if (context.backend.cpu_scope) |scope| scope.execution else null, alloc, request.limit);
             return null;
         }
 

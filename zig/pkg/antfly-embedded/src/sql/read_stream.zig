@@ -1075,7 +1075,7 @@ pub const Stream = struct {
             const wanted: u32 = @intCast(@min(@min(capacity, @min(credit, self.context.limits.scan_rows -| self.visited)), @min(self.remaining, max_rows - pending.len()) +| self.skip));
             if (wanted == 0) return error.SqlProgramLimitExceeded;
             const cursor = self.cursor.?;
-            const page = try cursor.next_columns.?(cursor.ptr, a, wanted);
+            const page = try cursor.columnsFor(if (self.context.backend.cpu_scope) |scope| scope.execution else null, a, wanted);
             if (page.selection.len > wanted) return error.InvalidSqlBackendResponse;
             if (page.selection.len == 0) try self.admitEmptyPage() else try self.admitRows(page.selection.len);
             const before = pending.len();
@@ -1334,7 +1334,7 @@ pub const Stream = struct {
             var request = self.request;
             request.limit = wanted;
             request.after = self.after;
-            const page = if (self.cursor) |cursor| try cursor.next(cursor.ptr, native_scratch, wanted) else try self.context.backend.vtable.scan(self.context.backend.ptr, native_scratch, self.context.binding.table.?, request);
+            const page = if (self.cursor) |cursor| try cursor.nextFor(if (self.context.backend.cpu_scope) |scope| scope.execution else null, native_scratch, wanted) else try self.context.backend.vtable.scan(self.context.backend.ptr, native_scratch, self.context.binding.table.?, request);
             defer page.deinit();
             if (page.rows.len > wanted) return error.InvalidSqlBackendResponse;
             if (self.visited + page.rows.len > self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;

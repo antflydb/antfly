@@ -416,14 +416,14 @@ fn Engine(comptime Context: type) type {
                 if (self.cached_rows == null and self.node.operation == .scan) {
                     const scan = self.node.operation.scan;
                     const cursor = self.engine.cursors[scan.index];
-                    if (cursor.next_columns) |pull| {
+                    if (cursor.next_columns != null) {
                         if (self.eof) return .{ .rows = &.{} };
                         // Never advance a producer while a consumer borrows its page.
                         self.column_page = null;
                         _ = self.arena.reset(.free_all);
                         self.pages += 1;
                         if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
-                        const page = try pull(cursor.ptr, self.arena.allocator(), @intCast(maximum));
+                        const page = try cursor.columnsFor(if (self.engine.context.backend.cpu_scope) |scope| scope.execution else null, self.arena.allocator(), @intCast(maximum));
                         try page.validate();
                         if (page.selection.len > maximum or page.selection.len > self.engine.context.limits.scan_rows -| self.engine.visited) return error.SqlProgramLimitExceeded;
                         self.engine.visited += page.selection.len;
@@ -489,7 +489,7 @@ fn Engine(comptime Context: type) type {
                     },
                     .scan => |scan| blk: {
                         const cursor = self.engine.cursors[scan.index];
-                        if (cursor.next_columns) |pull| {
+                        if (cursor.next_columns != null) {
                             while (self.column_page == null or self.page_index == self.column_page.?.selection.len) {
                                 if (self.eof) break :blk null;
                                 self.column_page = null;
@@ -497,7 +497,7 @@ fn Engine(comptime Context: type) type {
                                 self.pages += 1;
                                 if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
                                 const wanted: u32 = @intCast(@min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16))));
-                                self.column_page = try pull(cursor.ptr, self.arena.allocator(), wanted);
+                                self.column_page = try cursor.columnsFor(if (self.engine.context.backend.cpu_scope) |scope| scope.execution else null, self.arena.allocator(), wanted);
                                 try self.column_page.?.validate();
                                 if (self.column_page.?.selection.len > wanted) return error.InvalidSqlBackendResponse;
                                 self.page_index = 0;
@@ -524,7 +524,7 @@ fn Engine(comptime Context: type) type {
                             _ = self.arena.reset(.free_all);
                             self.pages += 1;
                             if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
-                            self.page = try cursor.next(cursor.ptr, self.arena.allocator(), @intCast(@min(self.engine.context.limits.page_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16)))));
+                            self.page = try cursor.nextFor(if (self.engine.context.backend.cpu_scope) |scope| scope.execution else null, self.arena.allocator(), @intCast(@min(self.engine.context.limits.page_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16)))));
                             if (self.page.?.rows.len > self.engine.context.limits.page_rows) return error.InvalidSqlBackendResponse;
                             self.page_index = 0;
                             self.eof = self.page.?.after == null;
