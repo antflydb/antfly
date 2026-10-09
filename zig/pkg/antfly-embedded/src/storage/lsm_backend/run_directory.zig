@@ -592,6 +592,66 @@ pub const Directory = struct {
         }
     };
 
+    /// Visit the union of sorted point queries once. Ancestor start bounds and
+    /// subtree maximum ends prune gaps between sparse keys as well as the
+    /// outer range. Handles are borrowed from this pinned directory.
+    pub const SortedPointCursor = struct {
+        const Frame = struct { node: *const BoundsTree.Node, lower: ?*const Run };
+        stack: [2 * @bitSizeOf(usize)]Frame = undefined,
+        len: usize = 0,
+        namespace: ?[]const u8,
+        keys: []const []const u8,
+        visited: usize = 0,
+
+        fn lowerBound(self: *const @This(), ns: ?[]const u8, key: []const u8) usize {
+            var lo: usize = 0;
+            var hi = self.keys.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (compareBound(self.namespace, self.keys[mid], ns, key) == .lt) lo = mid + 1 else hi = mid;
+            }
+            return lo;
+        }
+
+        pub fn next(self: *@This(), budget: *usize) ?Handle {
+            while (self.len != 0 and budget.* != 0) {
+                budget.* -= 1;
+                self.visited += 1;
+                self.len -= 1;
+                const frame = self.stack[self.len];
+                const node = frame.node;
+                const largest = node.summary.largest.?;
+                const first = if (frame.lower) |lower| self.lowerBound(lower.smallest_namespace_name, lower.smallest_key) else 0;
+                if (first == self.keys.len or compareBound(self.namespace, self.keys[first], largest.largest_namespace_name, largest.largest_key) == .gt) continue;
+                const run = node.entry.run;
+                const key_index = self.lowerBound(run.smallest_namespace_name, run.smallest_key);
+                if (key_index != self.keys.len) if (node.right) |right| {
+                    self.stack[self.len] = .{ .node = right, .lower = run };
+                    self.len += 1;
+                };
+                if (node.left) |left| {
+                    self.stack[self.len] = .{ .node = left, .lower = frame.lower };
+                    self.len += 1;
+                }
+                if (key_index != self.keys.len and compareBound(self.namespace, self.keys[key_index], run.largest_namespace_name, run.largest_key) != .gt)
+                    return .{ .run = run, .revision = node.entry.payload.? };
+            }
+            return null;
+        }
+        pub fn done(self: *const @This()) bool {
+            return self.len == 0;
+        }
+    };
+
+    pub fn sortedPoints(self: *const Directory, namespace: ?[]const u8, keys: []const []const u8) SortedPointCursor {
+        var cursor = SortedPointCursor{ .namespace = namespace, .keys = keys };
+        if (keys.len != 0) if (self.bounds.root) |root| {
+            cursor.stack[0] = .{ .node = root, .lower = null };
+            cursor.len = 1;
+        };
+        return cursor;
+    }
+
     pub fn overlaps(self: *const Directory, lower_ns: ?[]const u8, lower: []const u8, upper_ns: ?[]const u8, upper: []const u8) OverlapCursor {
         var cursor = OverlapCursor{ .lower_ns = lower_ns, .lower = lower, .upper_ns = upper_ns, .upper = upper };
         if (self.bounds.root) |root| {
@@ -1141,4 +1201,94 @@ test "run directory path copies preserve pinned epochs through inserts removals 
     for (remaining) |*run| try candidate.remove(allocator, run);
     try std.testing.expectEqual(@as(usize, 0), candidate.count());
     try std.testing.expectEqual(baseline_pins, backend.pins);
+}
+
+test "directory sorted point union prunes sparse gaps and visits overlapping runs once" {
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
+        pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
+    };
+    const a = std.testing.allocator;
+    var fixture = Fixture{ .allocator = a };
+    const directory = try Directory.create(a);
+    defer directory.destroy(a);
+    var names: [1024][16]u8 = undefined;
+    for (&names, 0..) |*name, i| {
+        const key = try std.fmt.bufPrint(name, "key:{d:0>4}", .{i});
+        try directory.put(&fixture, .{ .id = i + 1, .level = 0, .size_bytes = 1, .path = @constCast("test.sst"), .smallest_namespace_name = @constCast("docs"), .smallest_key = @constCast(key), .largest_namespace_name = @constCast("docs"), .largest_key = @constCast(key), .entry_count = 1, .bloom_filter = null, .state = null });
+    }
+    const keys = [_][]const u8{ "key:0000", "key:1023" };
+    var cursor = directory.sortedPoints("docs", &keys);
+    var count: usize = 0;
+    while (!cursor.done()) {
+        var budget: usize = 1;
+        while (cursor.next(&budget)) |handle| {
+            try std.testing.expect(handle.run.id == 1 or handle.run.id == 1024);
+            count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expect(cursor.visited < 128);
+    std.debug.print("directory sorted sparse points: runs=1024 matches=2 visited={d}\n", .{cursor.visited});
+    const dense = [_][]const u8{ "key:0000", "key:0000", "key:0001", "key:0002" };
+    var dense_cursor = directory.sortedPoints("docs", &dense);
+    count = 0;
+    while (!dense_cursor.done()) {
+        var budget: usize = 1;
+        while (dense_cursor.next(&budget)) |_| count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
+    var absent = directory.sortedPoints("absent", &dense);
+    var budget: usize = 16384;
+    try std.testing.expect(absent.next(&budget) == null);
+    var empty = directory.sortedPoints("docs", &.{});
+    try std.testing.expect(empty.done());
+}
+
+test "directory sorted point union eliminates repeated overlapping candidate visits" {
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        pub fn retainRunSnapshotRef(_: *@This(), _: *Run) !void {}
+        pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
+    };
+    const a = std.testing.allocator;
+    var fixture = Fixture{ .allocator = a };
+    const directory = try Directory.create(a);
+    defer directory.destroy(a);
+    for (0..32) |i| try directory.put(&fixture, .{
+        .id = i + 1,
+        .level = 0,
+        .size_bytes = 1,
+        .path = @constCast("test.sst"),
+        .smallest_namespace_name = @constCast("docs"),
+        .smallest_key = @constCast("a"),
+        .largest_namespace_name = @constCast("docs"),
+        .largest_key = @constCast("z"),
+        .entry_count = 1,
+        .bloom_filter = null,
+        .state = null,
+    });
+    var keys: [32][]const u8 = undefined;
+    var names: [32][16]u8 = undefined;
+    for (&keys, &names, 0..) |*key, *name, i| key.* = try std.fmt.bufPrint(name, "key:{d:0>4}", .{i});
+    var old_visits: usize = 0;
+    for (keys) |key| {
+        var point = directory.overlaps("docs", key, "docs", key);
+        while (!point.done()) {
+            var budget: usize = 1;
+            while (point.next(&budget)) |_| {}
+        }
+        old_visits += point.visited;
+    }
+    var union_cursor = directory.sortedPoints("docs", &keys);
+    var count: usize = 0;
+    while (!union_cursor.done()) {
+        var budget: usize = 1;
+        while (union_cursor.next(&budget)) |_| count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 32), count);
+    try std.testing.expectEqual(@as(usize, 32), union_cursor.visited);
+    try std.testing.expectEqual(@as(usize, 1024), old_visits);
+    std.debug.print("directory overlapping points: keys=32 runs=32 node_visits={d}->{d}\n", .{ old_visits, union_cursor.visited });
 }
