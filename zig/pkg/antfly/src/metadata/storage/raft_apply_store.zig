@@ -6748,6 +6748,48 @@ test "system catalog restore reconciliation authenticates source phases and cano
     const ready = try reconcileRestoreNamesForTest(&store, a, initial);
     try std.testing.expectEqual(@as(u64, 140), ready.expected.rows);
     try std.testing.expectEqual(@as(u64, 210), ready.expected.claims);
+    const proof = try store.prepareRelationPublicationProof(a, ready);
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try std.testing.expect(try proof.matchesTxn(&txn));
+        var buf: [128]u8 = undefined;
+        try txn.put(try r.rootKey(&buf, group), &(try r.Generation.of(&ready).encode()));
+        try std.testing.expect(!try proof.matchesTxn(&txn));
+        var wrong_group = r.Generation.of(&ready);
+        wrong_group.group_id += 1;
+        try txn.put(try r.rootKey(&buf, group), &(try wrong_group.encode()));
+        try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.prepareRelationPublicationProofTxn(a, &txn, ready));
+    }
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        try r.advanceSource(&txn, group);
+        try std.testing.expect(!try proof.matchesTxn(&txn));
+        try std.testing.expectError(error.CatalogGenerationChanged, RaftApplyStore.prepareRelationPublicationProofTxn(a, &txn, ready));
+    }
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        var buf: [128]u8 = undefined;
+        var advanced: [8]u8 = undefined;
+        std.mem.writeInt(u64, &advanced, proof.applied_index + 1, .little);
+        try txn.put(try RaftApplyStore.keyForGroup(&buf, group), &advanced);
+        try std.testing.expect(!try proof.matchesTxn(&txn));
+    }
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        var forged = ready;
+        forged.expected.source_hash[0] ^= 1;
+        var buf: [128]u8 = undefined;
+        try txn.put(try r.jobKey(&buf, group), &(try forged.encode()));
+        // Structural consistency alone cannot authenticate a ready source
+        // seal. The complete native source pass must independently reject it.
+        try verifyReconciliationGroupTxn(&txn, group);
+        try std.testing.expect(!try proof.matchesTxn(&txn));
+        try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.prepareRelationPublicationProofTxn(a, &txn, forged));
+    }
     {
         var txn = try store.store.beginWriteTxn();
         defer txn.abort();
@@ -6762,6 +6804,7 @@ test "system catalog restore reconciliation authenticates source phases and cano
         forged.pending.?.publication_id[0] ^= 1;
         try txn.put(key, &(try forged.encode()));
         try std.testing.expectError(error.InvalidCatalogRecord, store.verifyReconciliationSourceOwnersTxn(&txn, group, &journal));
+        try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.prepareRelationPublicationProofTxn(a, &txn, ready));
     }
 }
 
@@ -6965,11 +7008,15 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         try std.testing.expect(std.mem.indexOf(u8, row, "schema_rewrite") != null);
     }
     try std.testing.expectEqual(.preparing_sources, (try store.loadRestoreStagingProgress(alloc, group, id)).?.state);
-    _ = try reconcileRestoreNamesForTest(&store, alloc, try relation_reconciliation.State.init(group, try relation_reconciliation.nextJobId(null), .{ .incarnation = @splat(1), .revision = 2 }));
+    const namespace_ready = try reconcileRestoreNamesForTest(&store, alloc, try relation_reconciliation.State.init(group, try relation_reconciliation.nextJobId(null), .{ .incarnation = @splat(1), .revision = 2 }));
     const namespace_source_cut = blk: {
         var read = try store.store.beginReadTxn();
         defer read.abort();
         const Probe = struct {
+            fn publication(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, state: relation_reconciliation.State) !void {
+                const proof = try RaftApplyStore.prepareRelationPublicationProofTxn(a, txn, state);
+                try std.testing.expect(try proof.matchesTxn(txn));
+            }
             fn prepare(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, metadata_group: u64) !void {
                 var prefix_buf: [160]u8 = undefined;
                 var names_source: RaftApplyStore.RelationRestoreSource = .{ .a = a, .txn = txn, .group_id = metadata_group, .raw = .{ .cursor = try txn.openCursor(), .prefix = try restore_staging.activePrefix(&prefix_buf, metadata_group) } };
@@ -6986,6 +7033,8 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         // Force its allocation fallback so every injected point is repeatable.
         var no_resize = std.testing.FailingAllocator.init(alloc, .{ .resize_fail_index = 0 });
         try std.testing.checkAllAllocationFailures(no_resize.allocator(), Probe.prepare, .{ &read, group });
+        try Probe.publication(alloc, &read, namespace_ready);
+        if (cancel and !compound) try std.testing.checkAllAllocationFailures(no_resize.allocator(), Probe.publication, .{ &read, namespace_ready });
         break :blk try RaftApplyStore.relationSourceCutTxn(alloc, &read, group, 2);
     };
     const artifacts = [_]restore_staging.SourceArtifact{.{ .target_group_id = 401, .source_namespace = source.fence.namespace, .format = .portable, .snapshot_path = "cut/source.afb2", .artifact_size_bytes = 100, .artifact_sha256 = @splat(7), .rewrite = .{ .program_digest = @splat(6), .retained_pin = source.pin(), .snapshot_certificate = @splat(7), .retained_epoch = 1, .retained_start = 8, .source_applied_index = 20, .source_scope = source } }};
@@ -16892,6 +16941,93 @@ pub const RaftApplyStore = struct {
         defer read.abort();
         return prepareRelationReconciliationPageTxn(a, &read, expected);
     }
+
+    /// Complete source/candidate proof prepared outside the serialized apply
+    /// section. This is not publication authority: the eventual publisher must
+    /// also fence protocol capability and every producer's writer lifecycle.
+    pub const RelationPublicationProof = struct {
+        state: relation_reconciliation.State,
+        applied_index: u64,
+        root: ?relation_reconciliation.Generation,
+
+        /// Call in the publishing write transaction. All intervening metadata
+        /// application invalidates this local proof, including another page or
+        /// root change with an otherwise unchanged semantic source epoch.
+        fn matchesTxn(self: *const @This(), txn: *docstore.DocStore.Txn) !bool {
+            const group = self.state.group_id;
+            if (try durableAppliedIndexTxn(txn, group) != self.applied_index) return false;
+            if (!(try relationSourceEpochTxn(txn, group)).eql(self.state.epoch)) return false;
+            var buf: [128]u8 = undefined;
+            const job = (try stagingGet(txn, try relation_reconciliation.jobKey(&buf, group))) orelse return false;
+            if (!std.mem.eql(u8, job, &(try self.state.encode()))) return false;
+            const root = if (try stagingGet(txn, try relation_reconciliation.rootKey(&buf, group))) |bytes| try relation_reconciliation.Generation.decode(bytes) else null;
+            return std.meta.eql(root, self.root);
+        }
+    };
+
+    pub fn prepareRelationPublicationProof(self: *RaftApplyStore, a: std.mem.Allocator, expected: relation_reconciliation.State) !RelationPublicationProof {
+        var read = try self.store.beginReadTxn();
+        defer read.abort();
+        return prepareRelationPublicationProofTxn(a, &read, expected);
+    }
+
+    fn prepareRelationPublicationProofTxn(a: std.mem.Allocator, read: *docstore.DocStore.Txn, expected: relation_reconciliation.State) !RelationPublicationProof {
+        const r = relation_reconciliation;
+        _ = try expected.encode();
+        if (expected.phase != .ready or expected.failure != .none) return error.InvalidCatalogRecord;
+        const observed = try PreparedRelationBatch.capture(read, expected.group_id);
+        if (!std.meta.eql(observed.job, @as(?r.State, expected)) or observed.epoch == null or !observed.epoch.?.eql(expected.epoch)) return error.CatalogGenerationChanged;
+        // Root ancestry and retirement protection are independent of the
+        // candidate's source seal and must not be vouched for by that seal.
+        _ = try r.Verifier(docstore.DocStore.Txn).init(read, expected.group_id);
+        var buffers: RelationSourceBuffers = undefined;
+        var source = try relationTableSource(a, read, expected.group_id, &buffers);
+        defer source.deinit();
+        var state = expected;
+        state.phase = .verifying_source;
+        var candidate: r.CandidateStore(docstore.DocStore.Txn) = .{ .txn = read, .state = &expected };
+        // Each temporary plan owns at most one ordinary page. The source keeps
+        // one restore-plan projection, not a whole-catalog/name map.
+        while (state.phase == .verifying_source) {
+            var page = try r.Page.prepareSource(a, state, expected.epoch, &source);
+            defer page.deinit();
+            page.plan.verifyContributions(&candidate) catch |err| switch (err) {
+                // Both cuts are pinned here: an owner mismatch is corruption,
+                // not a concurrent writer that a caller should simply retry.
+                error.CatalogGenerationChanged => return error.InvalidCatalogRecord,
+                else => return err,
+            };
+            state = page.after;
+        }
+        var buf: [r.max_cursor_bytes]u8 = undefined;
+        var entries: RelationCursor = .{ .cursor = try read.openCursor(), .prefix = try r.candidatePrefix(&buf, &expected) };
+        defer entries.cursor.close();
+        while (state.phase == .verifying_candidate) {
+            var page = try r.Page.prepareCandidate(a, state, expected.epoch, &entries);
+            defer page.deinit();
+            state = page.after;
+        }
+        if (!std.meta.eql(state, expected)) return error.InvalidCatalogRecord;
+        return .{ .state = expected, .applied_index = observed.applied_index, .root = observed.root };
+    }
+
+    const RelationSourceBuffers = struct {
+        tables: [relation_reconciliation.max_cursor_bytes]u8,
+        initial: [160]u8,
+        restore: [160]u8,
+    };
+    fn relationTableSource(a: std.mem.Allocator, read: *docstore.DocStore.Txn, group: u64, buffers: *RelationSourceBuffers) !RelationTableSource {
+        var source: RelationTableSource = .{
+            .a = a,
+            .txn = read,
+            .group_id = group,
+            .raw = .{ .cursor = try read.openCursor(), .prefix = try tablePrefixForGroup(&buffers.tables, group) },
+        };
+        errdefer source.deinit();
+        source.initial = .{ .cursor = try read.openCursor(), .prefix = try fk_generation_publication.initialWorkPrefixForGroup(&buffers.initial, group) };
+        source.restore = .{ .a = a, .txn = read, .group_id = group, .raw = .{ .cursor = try read.openCursor(), .prefix = try restore_staging.activePrefix(&buffers.restore, group) } };
+        return source;
+    }
     fn prepareRelationReconciliationPageTxn(a: std.mem.Allocator, read: *docstore.DocStore.Txn, expected: relation_reconciliation.State) !relation_reconciliation.Page {
         var buf: [relation_reconciliation.max_cursor_bytes]u8 = undefined;
         const bytes = (try stagingGet(read, try relation_reconciliation.jobKey(&buf, expected.group_id))) orelse return error.CatalogGenerationChanged;
@@ -16904,17 +17040,9 @@ pub const RaftApplyStore = struct {
             defer source.cursor.close();
             return relation_reconciliation.Page.prepareCandidate(a, expected, epoch, &source);
         }
-        var source: RelationTableSource = .{
-            .a = a,
-            .txn = read,
-            .group_id = expected.group_id,
-            .raw = .{ .cursor = try read.openCursor(), .prefix = try tablePrefixForGroup(&buf, expected.group_id) },
-        };
+        var buffers: RelationSourceBuffers = undefined;
+        var source = try relationTableSource(a, read, expected.group_id, &buffers);
         defer source.deinit();
-        var initial_buf: [160]u8 = undefined;
-        source.initial = .{ .cursor = try read.openCursor(), .prefix = try fk_generation_publication.initialWorkPrefixForGroup(&initial_buf, expected.group_id) };
-        var restore_buf: [160]u8 = undefined;
-        source.restore = .{ .a = a, .txn = read, .group_id = expected.group_id, .raw = .{ .cursor = try read.openCursor(), .prefix = try restore_staging.activePrefix(&restore_buf, expected.group_id) } };
         return relation_reconciliation.Page.prepareSource(a, expected, epoch, &source);
     }
 

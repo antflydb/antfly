@@ -1823,6 +1823,23 @@ The final gate passes 169 native catalog and 22 linked storage tests; inventory,
 source-catalog, formatting and whitespace checks pass. Writer adoption,
 activation/serving barriers, root publication and original SQL parity credit
 remain unfinished.
+A native publication-proof preparer now independently rechecks a ready
+generation against all three authoritative source ranges, then scans the
+candidate range for exact cardinality and owner fingerprints. It pins one
+metadata read transaction, retains one restore projection and one bounded page
+at a time, and performs no writes or apply-lock catalog scan. The owned result
+binds the exact job, source epoch, root and local applied-log position for an
+O(1) write-transaction recheck. Root ancestry/retirement protection is verified
+separately; a forged ready source seal cannot authenticate itself through
+structurally consistent candidate counts. Same-snapshot owner disagreements
+are corruption, not retryable generation races.
+Native tests cover 70 replacement targets, source/candidate forgery, wrong-group
+roots, every captured-cut fence, actual admitted restore after restart, and
+exhaustive allocation failures. The final native gate passes 169 catalog tests
+plus 22 linked tests; inventory, source-catalog, formatting and whitespace
+checks pass. This prepares independent evidence, not a new serving authority:
+the publisher/coordinator still must connect capability and producer-lifecycle
+barriers, writer adoption and atomic root publication. No SQL disposition changes.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,
