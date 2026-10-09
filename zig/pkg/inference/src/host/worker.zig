@@ -24,6 +24,7 @@ const host = @import("host.zig");
 const platform = @import("antfly_platform");
 const httpx = @import("httpx");
 const execution_control = @import("inference_server").execution_control;
+const Output = @import("worker_output_error.zig").Output;
 const ExecutionPhases = @import("worker_execution_phase.zig").For(execution_control, rpc);
 pub const EnvironmentEntry = struct { name: []const u8, value: []const u8 };
 
@@ -33,8 +34,9 @@ const ForwardControl = struct {
     deadline_ns: ?u64 = null,
     progress: bridge.ProgressView = .{},
     stream: http.StreamSink = .{},
-    stream_started: bool = false,
+    output: Output = .{},
     phase_handoff: bool = false,
+    output_waits_owned: bool = false,
     execution_phase: ExecutionPhases.Parent = .{},
 
     fn phase(raw: ?*anyopaque, value: rpc.Phase) !void {
@@ -47,6 +49,17 @@ const ForwardControl = struct {
 
     fn finishResourceWait(self: *@This()) !void {
         try self.execution_phase.finish();
+    }
+
+    fn beginOutputWait(raw: ?*anyopaque) callconv(.c) http.CallbackStatus {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        phase(raw, .resource_wait) catch |err| return self.output.record(err);
+        return .ok;
+    }
+    fn endOutputWait(raw: ?*anyopaque) callconv(.c) http.CallbackStatus {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        phase(raw, .runnable) catch |err| return self.output.record(err);
+        return .ok;
     }
 
     fn check(raw: ?*anyopaque) !void {
@@ -68,31 +81,23 @@ const ForwardControl = struct {
                 const headers = try self.alloc.alloc(http.HeaderView, value.headers.len);
                 defer self.alloc.free(headers);
                 for (value.headers, headers) |header, *header_view| header_view.* = .{ .name = .init(header.name), .value = .init(header.value) };
-                try callbackResult((self.stream.start orelse return error.StreamingUnavailable)(self.stream.context, value.status, .init(payload.body), .{ .ptr = headers.ptr, .len = headers.len }));
-                self.stream_started = true;
+                try self.output.start(self.stream, value.status, .init(payload.body), .{ .ptr = headers.ptr, .len = headers.len });
             },
             .stream_write => {
-                try callbackResult((self.stream.write orelse return error.StreamingUnavailable)(self.stream.context, .init(payload.body)));
+                try self.output.write(self.stream, .init(payload.body));
             },
-            .stream_close => try callbackResult((self.stream.close orelse return error.StreamingUnavailable)(self.stream.context)),
+            .stream_close => try self.output.close(self.stream),
         }
     }
 
     fn view(self: *@This()) rpc.Control {
-        return .{ .ptr = self, .check = check, .event = event, .phase = if (self.phase_handoff) phase else null, .fence_on_error = self.phase_handoff };
+        return .{ .ptr = self, .check = check, .event = event, .phase = if (self.phase_handoff) phase else null, .fence_on_error = self.phase_handoff, .event_owns_waits = self.output_waits_owned };
     }
 };
 
 fn callbackResult(status: http.CallbackStatus) !void {
-    return switch (status) {
-        .ok => {},
-        .canceled => error.Cancelled,
-        .timeout => error.Timeout,
-        .body_too_large => error.BodyTooLarge,
-        .body_capacity_exceeded => error.BodyCapacityExceeded,
-        .end_of_stream => error.EndOfStream,
-        .failed => error.InferenceTransportFailed,
-    };
+    const output: Output = .{};
+    try output.result(status);
 }
 
 pub const ProviderResult = union(enum) {
@@ -142,7 +147,15 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
     const alloc = arena.allocator();
     // Events can be numerous on a long stream: use a freeing allocator rather
     // than retaining every decoded frame in the request arena.
-    var control = ForwardControl{ .alloc = client.alloc, .cancellation = context.cancellation, .stream = context.stream };
+    const cpu_slots = try wire.admittedCpuSlots(context);
+    var control = ForwardControl{
+        .alloc = client.alloc,
+        .cancellation = context.cancellation,
+        .stream = context.stream,
+        .deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null,
+        .phase_handoff = context.runnable != null,
+    };
+    defer control.finishResourceWait() catch {};
     try ForwardControl.check(&control);
     var body = context.request.body;
     if (body.slice() == null) if (context.body_source.read_all) |read| {
@@ -162,9 +175,24 @@ pub fn invokeHttp(client: *Client, route: []const u8, context: *const bridge.Htt
         .headers = headers,
         .params = params,
         .has_body = body.slice() != null,
+        .deadline_ns = control.deadline_ns,
+        .admitted_cpu_slots = cpu_slots,
+        .phase_handoff = control.phase_handoff,
     }, .{});
+    if (control.phase_handoff) if (control.stream.set_execution_wait) |install| {
+        callbackResult(install(control.stream.context, &.{ .context = &control, .begin = ForwardControl.beginOutputWait, .end = ForwardControl.endOutputWait })) catch |err| {
+            // A rejecting sink may have copied part of the borrowed view.
+            // Clear it before this stack-owned parent control retires.
+            _ = install(control.stream.context, null);
+            return err;
+        };
+        control.output_waits_owned = true;
+    };
+    defer if (control.output_waits_owned) {
+        _ = control.stream.set_execution_wait.?(control.stream.context, null);
+    };
     const result = client.invoke(.http, data, body.slice() orelse "", control.view()) catch |err| {
-        if (control.stream_started) return err;
+        if (control.output.started) return err;
         if (err == error.BodyTooLarge) {
             var response = httpx.Response.init(client.alloc, 413);
             errdefer response.deinit();
@@ -712,6 +740,7 @@ const Child = struct {
             },
             .http => {
                 const incoming = try std.json.parseFromSliceLeaky(wire.Http, arena, envelope.options, .{});
+                try incoming.validate();
                 // Route identity, not an ordinal: replacing the executable
                 // must never redirect a request to a different handler.
                 const route_handle = found: {
@@ -739,6 +768,12 @@ const Child = struct {
                 var response_handle: ?*anyopaque = null;
                 var response: http.HttpResponseView = undefined;
                 defer if (response_handle) |handle| host.linkedInferenceDestroyHttpResponse(handle);
+                var child_phase = ChildPhase{ .request = request };
+                var phase_scope: ?execution_control.CheckpointScope = if (incoming.phase_handoff)
+                    execution_control.CheckpointScope.init(.{ .context = &child_phase, .check_fn = ChildPhase.check, .wait_begin_fn = ChildPhase.park, .wait_end_fn = ChildPhase.reenter })
+                else
+                    null;
+                defer if (phase_scope) |*scope| scope.deinit();
                 try host.linkedInferenceHandleHttp(&.{
                     .abi_version = bridge.abi_version,
                     .route_handle = route_handle,
@@ -747,7 +782,11 @@ const Child = struct {
                     .stream = .{ .context = request, .start = streamStart, .write = streamWrite, .close = streamClose },
                     .out_response_handle = &response_handle,
                     .out_response = &response,
+                    .deadline_ns = incoming.deadline_ns orelse 0,
+                    .has_deadline = @intFromBool(incoming.deadline_ns != null),
+                    .admitted_cpu_slots = incoming.admitted_cpu_slots,
                 });
+                if (child_phase.failure) |err| return err;
                 const output_headers = try arena.alloc(wire.Header, response.headers_len);
                 const source_headers = if (response.headers_ptr) |ptr| ptr[0..response.headers_len] else &.{};
                 for (source_headers, output_headers) |header, *out| out.* = .{ .name = header.name.slice(), .value = header.value.slice() };
@@ -779,6 +818,13 @@ const Child = struct {
         try request.event(.{ .metadata = data, .body = body });
     }
 
+    fn emitAcknowledged(request: *rpc.Request, event: wire.Event, body: []const u8) !void {
+        const alloc = request.endpoint.alloc;
+        const data = try std.json.Stringify.valueAlloc(alloc, event, .{});
+        defer alloc.free(data);
+        try request.eventAcknowledged(.{ .metadata = data, .body = body });
+    }
+
     fn progress(raw: ?*anyopaque, phase: u8, completed: u64, total: u64, model: bridge.String, backend: bridge.String) callconv(.c) void {
         const request: *rpc.Request = @ptrCast(@alignCast(raw.?));
         emit(request, .{ .kind = .progress, .phase = phase, .completed = completed, .total = total, .model = model.slice(), .backend = backend.slice() }) catch
@@ -792,17 +838,17 @@ const Child = struct {
         for (headers.slice(), values) |header, *value| value.* = .{ .name = header.name.slice(), .value = header.value.slice() };
         // The start event's body carries the content type; subsequent chunks
         // keep their existing envelope without an extra JSON field per event.
-        emitBody(request, .{ .kind = .stream_start, .status = status, .headers = values }, content_type.slice()) catch return .canceled;
+        emitAcknowledged(request, .{ .kind = .stream_start, .status = status, .headers = values }, content_type.slice()) catch return .canceled;
         return .ok;
     }
     fn streamWrite(raw: ?*anyopaque, bytes: http.Bytes) callconv(.c) http.CallbackStatus {
         const request: *rpc.Request = @ptrCast(@alignCast(raw.?));
-        emitBody(request, .{ .kind = .stream_write }, bytes.slice()) catch return .canceled;
+        emitAcknowledged(request, .{ .kind = .stream_write }, bytes.slice()) catch return .canceled;
         return .ok;
     }
     fn streamClose(raw: ?*anyopaque) callconv(.c) http.CallbackStatus {
         const request: *rpc.Request = @ptrCast(@alignCast(raw.?));
-        emit(request, .{ .kind = .stream_close }) catch return .canceled;
+        emitAcknowledged(request, .{ .kind = .stream_close }, "") catch return .canceled;
         return .ok;
     }
 
@@ -940,7 +986,7 @@ test "inference worker streaming events preserve content type and callback ABI" 
         const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, wire.Event{ .kind = .stream_start, .status = 202, .headers = &.{.{ .name = "X-Test-Policy", .value = "preserved" }} }, .{});
         defer std.testing.allocator.free(encoded);
         try ForwardControl.event(&control, .{ .metadata = encoded, .body = content_type });
-        try std.testing.expect(control.stream_started);
+        try std.testing.expect(control.output.started);
         try std.testing.expect(capture.saw_headers);
         try std.testing.expectEqual(@as(u16, 202), capture.status);
         try std.testing.expectEqualStrings(content_type, capture.bytes[0..capture.len]);

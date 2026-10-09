@@ -114,8 +114,16 @@ pub const Adapter = struct {
     identity: *?http_server.AuthenticatedIdentity,
     context: operation.RequestContext,
     runnable: ?*http_server.RunnableScheduler.Execution = null,
-    /// A scheduled ordinary write owns one worker through durable completion.
-    /// It must not fan out CPU children or borrow read-only suspension hooks.
+    /// Stable receivers for preauthorized physical read cleanup, retained by
+    /// this Adapter through every child join and the owning execution finish.
+    cleanup_phase: ?@import("runnable_local_cleanup.zig").Cleanup = null,
+    /// Write teams retain their grant through accepted durable completion;
+    /// they do not borrow read-only suspension hooks.
+    write_execution: ?*http_server.RunnableScheduler.Execution = null,
+    /// Ingress-owned stable receivers survive through the root owning finish.
+    write_completion: ?*@import("runnable_write_team.zig").Completion = null,
+    /// SQL preparation remains serial. Participant fanout separately reserves
+    /// its bounded team on the same retained execution.
     serial_execution: bool = false,
     read_guard: ?read_fence.Guard = null,
     database: []const u8 = "default",
@@ -180,6 +188,19 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
+        var write_team: ?@import("antfly_runtime_abi").runnable_abi.Team = null;
+        const previous_team = self.context.execution_team;
+        defer self.context.execution_team = previous_team;
+        const participates_in_commit = switch (compiled.statement) {
+            .insert, .update, .delete, .merge, .commit => true,
+            else => false,
+        };
+        if (previous_team == null and participates_in_commit) {
+            if (self.write_execution) |execution| {
+                write_team = try self.writeTeam(execution);
+                self.context.execution_team = &write_team.?;
+            }
+        }
         if (self.runnable != null and (compiled.statement == .select or compiled.statement == .explain)) try self.beginReadFence();
         defer self.endReadFence();
         const state_alloc = if (@import("sql_control.zig").isControl(compiled.statement)) self.server.controlAllocator() else self.server.alloc;
@@ -724,29 +745,73 @@ pub const Adapter = struct {
         return @import("sql_catalog.zig").execute(self.server, self.identity.*, self.context, self.database, self.namespace, alloc, input);
     }
 
+    fn activeCleanup(self: *Adapter) !?@import("antfly_runtime_abi").runnable_abi.Borrowed {
+        const execution = self.runnable orelse return null;
+        const entry = execution.entry orelse return null;
+        if (!entry.cleanup_active) return null;
+        const phase = if (self.cleanup_phase) |*value| value else return error.InvalidRunnableTransition;
+        return try phase.borrowed();
+    }
+
+    fn checkCleanupStatus(status: @import("antfly_runtime_abi").error_abi.Status) !void {
+        if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+    }
+
     fn spillWaitBegin(ptr: *anyopaque) !void {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
+        if (try self.activeCleanup()) |borrow| {
+            try checkCleanupStatus(borrow.checkpoint(borrow.context));
+            try checkCleanupStatus(borrow.park(borrow.context, @backingInt(@import("antfly_runtime_abi").runnable_abi.Wait.resource)));
+            return;
+        }
         try self.context.ensureActive();
         const execution = self.runnable orelse return error.InvalidRunnableTransition;
         try execution.park(.resource_blocked);
     }
 
-    fn providerRunnable(self: *Adapter) ?@import("antfly_runtime_abi").runnable_abi.Borrowed {
+    fn writeTeam(self: *Adapter, execution: *http_server.RunnableScheduler.Execution) !@import("antfly_runtime_abi").runnable_abi.Team {
+        if (self.write_completion) |completion| {
+            if (completion.execution != execution) return error.InvalidRunnableTransition;
+            return completion.team();
+        }
+        const entry = execution.entry orelse return error.InvalidRunnableTransition;
+        // Concurrent children cannot borrow a request arena. This stable
+        // process-owned partition enforces the API request byte limit.
+        const memory = self.server.request_memory orelse return error.ExecutionWaitUnsupported;
+        return @import("runnable_write_team.zig").init(execution, memory.allocator(entry.class == .control));
+    }
+
+    pub fn providerRunnable(self: *Adapter) ?@import("antfly_runtime_abi").runnable_abi.Borrowed {
         const execution = self.runnable orelse return null;
         const entry = execution.entry orelse return null;
+        if (self.cleanup_phase == null) self.cleanup_phase = @import("runnable_local_cleanup.zig").Cleanup.init(execution) catch null;
         const Callback = struct {
             const runtime = @import("antfly_runtime_abi");
             fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                if (adapter.runnable.?.entry.?.cleanup_active) {
+                    const borrow = adapter.cleanup_phase.?.borrowed() catch |err| return runtime.error_abi.statusFromError(err);
+                    return borrow.checkpoint(borrow.context);
+                }
                 checkpoint(raw) catch |err| return runtime.error_abi.statusFromError(err);
                 return .ok;
             }
             fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                if (adapter.runnable.?.entry.?.cleanup_active) {
+                    const borrow = adapter.cleanup_phase.?.borrowed() catch |err| return runtime.error_abi.statusFromError(err);
+                    return borrow.park(borrow.context, reason);
+                }
                 if (reason != @backingInt(runtime.runnable_abi.Wait.resource)) return runtime.error_abi.statusFromError(error.InvalidArgument);
                 spillWaitBegin(raw) catch |err| return runtime.error_abi.statusFromError(err);
                 return .ok;
             }
             fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
                 const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                if (adapter.runnable.?.entry.?.cleanup_active) {
+                    const borrow = adapter.cleanup_phase.?.borrowed() catch |err| return runtime.error_abi.statusFromError(err);
+                    return borrow.enter(borrow.context, class);
+                }
                 const next = std.enums.fromInt(@import("antfly_local_sources").common_request_admission.runnable_scheduler.Class, class) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
                 const current = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
                 current.enter(next) catch |err| return runtime.error_abi.statusFromError(err);
@@ -754,12 +819,27 @@ pub const Adapter = struct {
                 adapter.validateReadFence(false) catch |err| return runtime.error_abi.statusFromError(err);
                 return .ok;
             }
+            fn reserveCleanup(raw: *anyopaque, options: *const runtime.runnable_abi.Cleanup) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
+                adapter.cleanup_phase.?.reserveChecked(options) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn activateCleanup(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                adapter.cleanup_phase.?.execution.activateCleanup() catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
         };
-        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter };
+        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter, .reserve_cleanup = if (self.cleanup_phase != null) Callback.reserveCleanup else null, .activate_cleanup = if (self.cleanup_phase != null) Callback.activateCleanup else null };
     }
 
     fn spillWaitEnd(ptr: *anyopaque) !void {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
+        if (try self.activeCleanup()) |borrow| {
+            try checkCleanupStatus(borrow.enter(borrow.context, borrow.parent_class));
+            return;
+        }
         const execution = self.runnable orelse return error.InvalidRunnableTransition;
         const class = if (execution.entry) |*entry| entry.class else return error.InvalidRunnableTransition;
         try execution.enter(class);
@@ -769,6 +849,10 @@ pub const Adapter = struct {
 
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
+        if (try self.activeCleanup()) |borrow| {
+            try checkCleanupStatus(borrow.checkpoint(borrow.context));
+            return;
+        }
         try self.context.ensureActive();
         if (self.runnable) |execution| try execution.checkpoint();
         try self.validateReadFence(false);
@@ -1453,8 +1537,7 @@ pub const Adapter = struct {
                 try writes.append(alloc, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(alloc, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields });
             } else try deletes.append(alloc, mutation.key);
         }
-        var response = @import("public_table_http.zig").handleNativeTableBatch(alloc, table.physical_name, .{ .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .integrity_commands = if (guards) |value| value.commands else &.{}, .relational_integrity_generation_set = if (guards) |value| value.generation_set else null }, self.server.tableApi(self.context)) catch
-            return error.SqlMutationOutcomeUnknown;
+        var response = try self.completeNativeBatch(alloc, table.physical_name, .{ .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .writes = writes.items, .deletes = deletes.items, .predicates = predicates, .integrity_commands = if (guards) |value| value.commands else &.{}, .relational_integrity_generation_set = if (guards) |value| value.generation_set else null });
         defer response.deinit(alloc);
         self.outcome_transaction_id = mutationTransactionId(response.body);
         if (response.status == 200 or response.status == 201) return .committed;
@@ -1465,6 +1548,58 @@ pub const Adapter = struct {
         self.outcome_transaction_id = failure.transaction_id;
         return failure.err;
     }
+
+    fn completeNativeBatch(self: *Adapter, alloc: std.mem.Allocator, table_name: []const u8, batch: db_types.BatchRequest) !@import("public_table_http.zig").OwnedResponse {
+        try self.context.ensureActive();
+        if (self.context.execution_team) |team| {
+            if (team.state == .active) return error.InvalidRunnableTransition;
+            const execution_backend = self.server.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
+            const io = execution_backend.io() orelse return error.SqlWriteCapacityUnavailable;
+            const runtime = @import("antfly_runtime_abi");
+            const borrowed_io = runtime.native_abi.IoBorrow.init(&io);
+            var completion = NativeBatchCompletion{ .adapter = self, .alloc = alloc, .table_name = table_name, .batch = batch };
+            // Reserve the actual task and finite completion before the batch
+            // handler can enter native storage. Admission errors remain definite
+            // no-write outcomes, with no synchronous fallback.
+            var task = try @import("runnable_completion_task.zig").Task.reserve(team.allocator, io, team.borrow, &.{
+                .io = &borrowed_io,
+                .deadline_ns = @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds))) +| 30 * std.time.ns_per_s,
+            }, &completion, NativeBatchCompletion.run);
+            defer task.deinit();
+            try self.context.ensureActive();
+            task.runAndJoin() catch |err| {
+                // After entering the native handler, an allocation or task
+                // failure cannot prove that no durable write was accepted.
+                if (completion.entered) return error.SqlMutationOutcomeUnknown;
+                return err;
+            };
+            // The handler also consumes thread-local commit identity/error
+            // metadata in this child. Transfer its complete owned response only
+            // after the physical join, while the prepared inputs, allocator,
+            // request bridge, team and adapter remain alive.
+            return completion.response orelse error.InvalidRunnableTransition;
+        }
+        return @import("public_table_http.zig").handleNativeTableBatch(alloc, table_name, batch, self.server.tableApi(self.context)) catch
+            return error.SqlMutationOutcomeUnknown;
+    }
+
+    const NativeBatchCompletion = struct {
+        adapter: *Adapter,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        batch: db_types.BatchRequest,
+        entered: bool = false,
+        response: ?@import("public_table_http.zig").OwnedResponse = null,
+
+        fn run(raw: *anyopaque, _: @import("antfly_runtime_abi").runnable_abi.Borrowed, _: std.Io) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            // Completion never replaces the original proposal deadline or
+            // cancellation. Recheck that fence before native admission.
+            try self.adapter.context.ensureActive();
+            self.entered = true;
+            self.response = try @import("public_table_http.zig").handleNativeTableBatch(self.alloc, self.table_name, self.batch, self.adapter.server.tableApi(self.adapter.context));
+        }
+    };
 
     fn validateStaged(ptr: *anyopaque, alloc: std.mem.Allocator, previous: ?*const @import("transactions.zig").OwnedTransactionCommitRequest, candidate: *@import("transactions.zig").OwnedTransactionCommitRequest, statement: *const @import("transactions.zig").OwnedTransactionCommitRequest) !void {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
@@ -3432,4 +3567,185 @@ test "SQL mutation classification preserves wrapped definite conflicts and const
         .{ .status = 400, .body = "{malformed receipt", .expected = error.SqlMutationOutcomeUnknown },
     };
     for (cases) |case| try std.testing.expectEqual(case.expected, classifyMutationFailure(case.status, case.body).err);
+}
+
+test "SQL stateless completion reserves before native entry and owns ambiguous response metadata" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const background = @import("antfly_local_sources").storage_background_runtime;
+    const scheduler = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const runtime = @import("antfly_runtime_abi");
+    const distributed = @import("distributed_txn.zig");
+    const platform_time = @import("antfly_platform").time;
+    const public = @import("public_table_http.zig");
+    const Fake = struct {
+        expected: distributed.CommitControl = .{},
+        scheduling: *scheduler.Scheduler,
+        signal: *std.atomic.Value(bool),
+        scenario: usize,
+        calls: usize = 0,
+        records: [1]@import("antfly_local_sources").common_topology_records.TableRecord = .{.{ .table_id = 3, .name = "docs", .schema_json = "{\"version\":7}" }},
+        fn snapshot(raw: *anyopaque) !@import("../metadata/api.zig").AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .status = try status(raw), .tables = &self.records, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn freeSnapshot(_: *anyopaque, _: *@import("../metadata/api.zig").AdminSnapshot) void {}
+        var completion_now: std.atomic.Value(u64) = .init(0);
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = completion_now.load(.acquire) };
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_types.BatchRequest) !?void {
+            return error.UnexpectedSynchronousBatch;
+        }
+        fn commit(raw: *anyopaque, _: std.mem.Allocator, tables: []const distributed.TableCommitRequest, _: db_types.SyncLevel, cancellation: db_types.CancellationToken, control: distributed.CommitControl) !?distributed.CommitOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqualDeep(self.expected, control);
+            try std.testing.expectEqualDeep(self.expected.pre_decision.cancellation, cancellation);
+            try std.testing.expectEqualStrings("docs", tables[0].table_name);
+            try std.testing.expectEqualStrings("a", tables[0].writes[0].key);
+            try std.testing.expectEqualStrings("{\"id\":1}", tables[0].writes[0].value);
+            try std.testing.expectEqual(@as(?u32, 7), tables[0].schema_version);
+            const borrow = control.team.?.borrow;
+            const initial = borrow.checkpoint(borrow.context);
+            if (!initial.isOk()) return runtime.error_abi.errorFromStatus(initial);
+            self.calls += 1;
+            if (self.scenario == 2) {
+                self.signal.store(true, .release);
+                const parked = borrow.park(borrow.context, @backingInt(runtime.runnable_abi.Wait.resource));
+                if (!parked.isOk()) return runtime.error_abi.errorFromStatus(parked);
+                try std.testing.expectEqual(@as(usize, 0), self.scheduling.stats().runnable_slots);
+                var health: scheduler.Execution = .{};
+                try health.start(self.scheduling, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                health.finish();
+                self.scheduling.close();
+                const resumed = borrow.enter(borrow.context, @backingInt(runtime.runnable_abi.Class.write));
+                if (!resumed.isOk()) return runtime.error_abi.errorFromStatus(resumed);
+                const completed = borrow.checkpoint(borrow.context);
+                if (!completed.isOk()) return runtime.error_abi.errorFromStatus(completed);
+            }
+            if (self.scenario == 5) {
+                public.setLastAmbiguousBatchTxnId("00112233445566778899aabbccddeeff".*);
+                return error.CommitDecisionUnknown;
+            }
+            if (self.scenario == 6) {
+                completion_now.store(31 * std.time.ns_per_s, .release);
+                const expired = borrow.checkpoint(borrow.context);
+                if (!expired.isOk()) {
+                    public.setLastAmbiguousBatchTxnId("00112233445566778899aabbccddeeff".*);
+                    return error.CommitDecisionUnknown;
+                }
+                return error.ExpectedCompletionExpiry;
+            }
+            return .{ .committed = .{ .participant_count = 1 } };
+        }
+    };
+    for (0..8) |scenario| {
+        const alloc = std.testing.allocator;
+        var threaded = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(if (scenario == 4) 0 else 2) });
+        defer threaded.deinit();
+        Fake.completion_now.store(0, .release);
+        var io_vtable = threaded.io().vtable.*;
+        io_vtable.now = Fake.now;
+        const io: std.Io = .{ .userdata = threaded.io().userdata, .vtable = &io_vtable };
+        var backend = try background.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = io } });
+        defer backend.deinit();
+        var scheduling = try scheduler.Scheduler.init(.{ .slots = 3 });
+        var execution: scheduler.Execution = .{};
+        defer execution.finish();
+        var signal = std.atomic.Value(bool).init(false);
+        const original_deadline = platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+        try execution.start(&scheduling, .{ .io = std.testing.io, .deadline_ns = original_deadline, .native_now_ns = platform_time.monotonicNs, .cancellation = .{ .ptr = &signal, .requested = Fake.canceled } }, .write);
+        var memory: @import("../common/allocation_budget.zig").Shared = .{ .child = alloc, .limit = if (scenario == 0) 0 else 16384 };
+        var bridge = try @import("runnable_write_team.zig").Completion.init(&execution, memory.allocator());
+        var team = try bridge.team();
+        var fake = Fake{ .scheduling = &scheduling, .signal = &signal, .scenario = scenario };
+        var server = http_server.ApiHttpServer.init(alloc, .{ .backend_runtime = &backend }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, null, .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .commit_batch_with_control = Fake.commit } });
+        defer server.deinit();
+        var identity: ?http_server.AuthenticatedIdentity = null;
+        var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{ .execution_team = &team, .deadline_ns = original_deadline, .cancellation = .fromAtomic(&signal) } };
+        if (scenario == 7) adapter.context.deadline_ns = platform_time.monotonicNs() -| 1;
+        fake.expected = distributed.CommitControl.fromRequest(adapter.context);
+        if (scenario == 3) signal.store(true, .release);
+        const result = adapter.completeNativeBatch(alloc, "docs", .{ .schema_version = 7, .writes = &.{.{ .key = "a", .value = "{\"id\":1}" }} });
+        if (scenario == 0) {
+            try std.testing.expectError(error.OutOfMemory, result);
+        } else if (scenario == 3) {
+            try std.testing.expectError(error.Canceled, result);
+        } else if (scenario == 4) {
+            try std.testing.expectError(error.ConcurrencyUnavailable, result);
+        } else if (scenario == 7) {
+            try std.testing.expectError(error.DeadlineExceeded, result);
+        } else {
+            var response = try result;
+            defer response.deinit(alloc);
+            if (scenario == 5 or scenario == 6) {
+                try std.testing.expectEqual(@as(u16, 409), response.status);
+                const failure = classifyMutationFailure(response.status, response.body);
+                try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, failure.err);
+                try std.testing.expectEqualDeep(@as(?[32]u8, "00112233445566778899aabbccddeeff".*), failure.transaction_id);
+            } else try std.testing.expectEqual(@as(u16, 201), response.status);
+        }
+        try std.testing.expectEqual(@as(usize, if (scenario == 0 or scenario == 3 or scenario == 4 or scenario == 7) 0 else 1), fake.calls);
+        try std.testing.expectEqual(@as(usize, 0), memory.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 1), scheduling.stats().operations);
+    }
+}
+
+test "SQL read resume fences cleanup resource waits retain independent deadline and original class" {
+    const runtime = @import("antfly_runtime_abi");
+    const Clock = struct {
+        var current: u64 = 0;
+        fn now() u64 {
+            return current;
+        }
+    };
+    for ([_]http_server.RunnableScheduler.Class{ .query, .write }) |class| {
+        Clock.current = 0;
+        var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 3, .max_operations = 4, .max_bytes = 128, .control_bytes = 32 });
+        defer scheduler.close();
+        var execution: http_server.RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .retained_bytes = 17 }, class);
+        var canceled: std.atomic.Value(bool) = .init(false);
+        var adapter: Adapter = .{ .server = undefined, .identity = undefined, .context = .{ .cancellation = operation.CancellationToken.fromAtomic(&canceled) }, .runnable = &execution };
+        const borrow = adapter.providerRunnable().?;
+        const io = std.testing.io;
+        const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+        try Adapter.checkCleanupStatus(borrow.reserve_cleanup.?(borrow.context, &.{ .io = &io_borrow, .native_deadline = 1, .activation_budget = 1, .deadline_ns = 10 }));
+        // Both original request cancellation and original scheduler deadline
+        // expire before cleanup activation. Cleanup has its own finite budget.
+        canceled.store(true, .release);
+        adapter.context.deadline_ns = 0;
+        Clock.current = 1000;
+        try std.testing.expectError(error.Canceled, adapter.context.ensureActive());
+        try Adapter.checkCleanupStatus(borrow.activate_cleanup.?(borrow.context));
+        try std.testing.expectEqual(class, execution.entry.?.class);
+        try std.testing.expectEqual(@as(?u64, 1010), execution.entry.?.options.deadline_ns);
+        try Adapter.checkpoint(&adapter);
+        try Adapter.spillWaitBegin(&adapter);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+        var control: http_server.RunnableScheduler.Execution = .{};
+        try control.start(&scheduler, .{ .io = std.testing.io }, .control);
+        control.finish();
+        Clock.current = 1009;
+        try Adapter.spillWaitEnd(&adapter);
+        try std.testing.expectEqual(class, execution.entry.?.class);
+        try Adapter.checkpoint(&adapter);
+        try std.testing.expectEqual(@as(?u64, 1010), execution.entry.?.options.deadline_ns);
+        Clock.current = 1010;
+        try std.testing.expectError(error.DeadlineExceeded, Adapter.checkpoint(&adapter));
+        try std.testing.expectError(error.DeadlineExceeded, Adapter.spillWaitBegin(&adapter));
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
 }

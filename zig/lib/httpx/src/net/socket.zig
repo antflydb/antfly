@@ -671,9 +671,24 @@ pub const Socket = struct {
         };
         select.cancelDiscard();
         return switch (outcome) {
-            .operation => operation_result,
+            // Child cancellation is not an acknowledged cancellation of this
+            // caller. Only a cancellation point in the caller can establish
+            // the authority required by recv's recancel operation.
+            .operation => operation_result catch |err| {
+                if (err == error.Canceled) {
+                    try self.io.checkCancel();
+                    return error.RecvFailed;
+                }
+                return err;
+            },
             .timer => |result| blk: {
-                try result;
+                result catch |err| {
+                    if (err == error.Canceled) {
+                        try self.io.checkCancel();
+                        return error.RecvFailed;
+                    }
+                    return err;
+                };
                 break :blk error.Timeout;
             },
         };
@@ -714,9 +729,22 @@ pub const Socket = struct {
         };
         select.cancelDiscard();
         return switch (outcome) {
-            .operation => operation_result,
+            .operation => operation_result catch |err| {
+                if (err == error.Canceled) {
+                    try self.io.checkCancel();
+                    return error.SendFailed;
+                }
+                return err;
+            },
             .timer => |result| blk: {
-                try result;
+                result catch |err| {
+                    try control.check();
+                    if (err == error.Canceled) {
+                        try self.io.checkCancel();
+                        return error.SendFailed;
+                    }
+                    return err;
+                };
                 break :blk error.Timeout;
             },
         };

@@ -16,6 +16,7 @@
 //! Runtime document-store adapter over native `.aflite` document pages.
 
 const std = @import("std");
+const read_admission = @import("../../common/read_admission.zig");
 const antfly_platform = @import("antfly_platform");
 const platform_sync = antfly_platform.sync;
 const backend_adapter = @import("../backend_adapter.zig");
@@ -2266,6 +2267,10 @@ const RuntimeStore = struct {
         return Store.capabilities(self.store);
     }
 
+    pub fn beginReadWithAdmission(self: *@This(), _: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !Txn {
+        return try Txn.openReadWithAdmission(self.store, self.prefix, control);
+    }
+
     pub fn beginRead(self: *RuntimeStore) !Txn {
         return try Txn.openReadWithPrefix(self.store, self.prefix);
     }
@@ -2364,13 +2369,24 @@ pub const Txn = struct {
     }
 
     pub fn openReadWithPrefix(store: *Store, prefix: []const u8) !Txn {
+        return try openReadControlled(store, prefix, null);
+    }
+
+    pub fn openReadWithAdmission(store: *Store, prefix: []const u8, control: read_admission.Port) !Txn {
+        return try openReadControlled(store, prefix, control);
+    }
+
+    fn openReadControlled(store: *Store, prefix: []const u8, control: ?read_admission.Port) !Txn {
         try validatePrefix(prefix);
-        lockStore(store);
+        if (control) |budget| {
+            try @import("../../common/bounded_mutex.zig").lockAtomic(&store.mutex, budget);
+        } else lockStore(store);
         defer store.mutex.unlock();
         const checkpoint = store.file.activeCheckpoint();
         const pin = if (store.read_only) null else try store.allocator.create(ReadPin);
         errdefer if (pin) |owned| store.allocator.destroy(owned);
         if (pin) |owned| owned.* = .{ .sequence = checkpoint.commit_sequence, .pinned_at = std.Io.Clock.awake.now(store.file.runtime()) };
+        if (control) |budget| try budget.checkpoint();
         return .{
             .allocator = store.allocator,
             .store = store,
@@ -2619,6 +2635,14 @@ pub const Txn = struct {
         try writeReplayEntries(self.allocator, self, sequence, payload);
     }
 
+    pub fn openCursorWithAdmission(self: *Txn, control: read_admission.Port) !Cursor {
+        try control.checkpoint();
+        var cursor = try self.openCursor();
+        errdefer cursor.close();
+        try control.checkpoint();
+        return cursor;
+    }
+
     pub fn openCursor(self: *Txn) !Cursor {
         return .{
             .txn = self,
@@ -2733,6 +2757,7 @@ pub const KeyCursor = struct {
 pub const Cursor = struct {
     const Direction = enum { forward, backward };
 
+    admission: read_admission.Scope = .{},
     txn: *Txn,
     index_cursor: native.DocumentIndexCursor,
     records: native.RecordPageReader = .{},
@@ -2789,6 +2814,21 @@ pub const Cursor = struct {
                 .backward,
             );
         }
+    }
+
+    pub fn nextWithAdmission(self: *Cursor, control: read_admission.Port) !backend_adapter.Entry {
+        const guard = try self.admission.enter(control);
+        defer guard.deinit();
+        const result = try self.next();
+        try self.admission.checkpoint();
+        return result;
+    }
+    pub fn seekAtOrAfterWithAdmission(self: *Cursor, key: []const u8, control: read_admission.Port) !backend_adapter.Entry {
+        const guard = try self.admission.enter(control);
+        defer guard.deinit();
+        const result = try self.seekAtOrAfter(key);
+        try self.admission.checkpoint();
+        return result;
     }
 
     pub fn next(self: *Cursor) !backend_adapter.Entry {
@@ -2864,6 +2904,7 @@ pub const Cursor = struct {
         var overlay_index = initial_overlay_index;
 
         while (true) {
+            try self.admission.checkpoint();
             if (disk) |candidate| {
                 if (!self.keyInRange(candidate.key)) {
                     var out_of_range = candidate;
@@ -2923,6 +2964,7 @@ pub const Cursor = struct {
     }
 
     fn readValue(self: *Cursor, file: *native.NativeFile, indexed: native.DocumentIndexEntry) !?[]u8 {
+        try self.admission.checkpoint();
         if (self.load_values)
             return try self.records.documentValueAlloc(file, self.txn.allocator, self.txn.checkpoint, indexed);
         if (!try self.records.documentIsLive(file, self.txn.allocator, self.txn.checkpoint, indexed)) return null;
@@ -2963,6 +3005,7 @@ pub const Cursor = struct {
     }
 
     fn advanceDisk(self: *Cursor, direction: Direction) !?native.DocumentIndexEntry {
+        try self.admission.checkpoint();
         return switch (direction) {
             .forward => try self.index_cursor.next(),
             .backward => try self.index_cursor.prev(),
@@ -4994,4 +5037,101 @@ test "lite reclamation worker backs off failed publication fences" {
     defer store.mutex.unlock();
     try std.testing.expectEqual(reclamation.State.failed, store.maintenance_policy.status.state);
     try std.testing.expectEqualStrings("OutcomeUnknown", store.maintenance_policy.status.last_error.?);
+}
+
+test "lite snapshot admission preserves original cancellation while the backend lock is held" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "bounded-snapshot.aflite");
+    defer allocator.free(path);
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    const Budget = struct {
+        store: *Store,
+        cancel: bool = false,
+        release: bool = false,
+        waits: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.cancel) return error.Canceled;
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            self.waits += 1;
+            if (self.release) self.store.mutex.unlock() else self.cancel = true;
+        }
+    };
+    var budget = Budget{ .store = &store };
+    var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    const control = read_admission.Port.init(&payload);
+    try std.testing.expect(store.mutex.tryLock());
+    const result = Txn.openReadWithAdmission(&store, "", control);
+    try std.testing.expect(!store.mutex.tryLock());
+    store.mutex.unlock();
+    try std.testing.expectError(error.Canceled, result);
+    try std.testing.expectEqual(@as(usize, 1), budget.waits);
+    try std.testing.expect(store.read_generation == null);
+
+    budget = .{ .store = &store, .release = true };
+    try std.testing.expect(store.mutex.tryLock());
+    var read = try Txn.openReadWithAdmission(&store, "", control);
+    try std.testing.expectEqual(@as(usize, 1), budget.waits);
+    try std.testing.expect(store.mutex.tryLock());
+    store.mutex.unlock();
+    read.abort();
+    try std.testing.expectEqual(@as(usize, 0), store.read_generation.?.references);
+}
+
+test "lite routing cursor checks original admission and clears failed operation borrows" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "bounded-routing-cursor.aflite");
+    defer allocator.free(path);
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+    var write = try Txn.openWrite(&store);
+    try write.put("doc:a", "first");
+    try write.put("doc:b", "second");
+    try write.commit();
+    var read = try Txn.openRead(&store);
+    defer read.abort();
+    const Budget = struct {
+        fail_at: usize,
+        checks: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            self.checks += 1;
+            if (self.checks == self.fail_at) return error.GenerationPublicationChanged;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var completed = false;
+    for (1..128) |fail_at| {
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var budget = Budget{ .fail_at = fail_at };
+        var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+        const payload = adapter.payload();
+        const control = read_admission.Port.init(&payload);
+        const entry = cursor.seekAtOrAfterWithAdmission("doc:a", control) catch |err| {
+            try std.testing.expectEqual(error.GenerationPublicationChanged, err);
+            try std.testing.expect(cursor.admission.control == null);
+            continue;
+        };
+        try std.testing.expectEqualStrings("first", entry.value);
+        try std.testing.expect(cursor.admission.control == null);
+        budget.checks = 0;
+        const second = cursor.nextWithAdmission(control) catch |err| {
+            try std.testing.expectEqual(error.GenerationPublicationChanged, err);
+            try std.testing.expect(cursor.admission.control == null);
+            continue;
+        };
+        try std.testing.expectEqualStrings("second", second.value);
+        try std.testing.expect(cursor.admission.control == null);
+        completed = true;
+        break;
+    }
+    try std.testing.expect(completed);
 }

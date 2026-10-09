@@ -15,7 +15,7 @@ pub const State = struct {
     cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
-        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion };
+        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining };
     }
 };
 
@@ -30,6 +30,8 @@ const Capsule = struct {
     // stable capsule addresses until every consumer is joined and finish runs.
     completion_io: ?runtime.io_abi.Receiver = null,
     completion_clock_io: ?runtime.io_abi.Receiver = null,
+    cleanup_phase_io: ?runtime.io_abi.Receiver = null,
+    cleanup_phase_clock_io: ?runtime.io_abi.Receiver = null,
 
     fn cancelled(raw: *const anyopaque) bool {
         const self: *const Capsule = @ptrCast(@alignCast(raw));
@@ -126,10 +128,49 @@ fn reserveCompletionChecked(raw: *anyopaque, options: *const abi.Completion) !vo
         .allow_wait = true,
     });
 }
+fn completionRemaining(raw: *anyopaque, out: *u64) callconv(.c) runtime.error_abi.Status {
+    const value = capsule(raw);
+    if (value.cleanup) return runtime.error_abi.statusFromError(error.UnsupportedOperation);
+    out.* = value.execution.completionRemainingNs() catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
 fn activateCompletion(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
     const value = capsule(raw);
     if (value.cleanup) return runtime.error_abi.statusFromError(error.UnsupportedOperation);
     value.execution.activateCompletion() catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+fn reserveCleanup(raw: *anyopaque, options: *const abi.Cleanup) callconv(.c) runtime.error_abi.Status {
+    reserveCleanupChecked(raw, options) catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+fn reserveCleanupChecked(raw: *anyopaque, options: *const abi.Cleanup) !void {
+    try options.validate();
+    const value = capsule(raw);
+    if (value.cleanup) return error.UnsupportedOperation;
+    // Never replace an executor already retained by the execution.
+    if (value.cleanup_phase_io != null) return error.InvalidRunnableTransition;
+    const io = try options.io.receive();
+    const clock_io = if (options.clock_io) |borrow| try borrow.receive() else null;
+    value.cleanup_phase_io = io;
+    value.cleanup_phase_clock_io = clock_io;
+    errdefer {
+        value.cleanup_phase_io = null;
+        value.cleanup_phase_clock_io = null;
+    }
+    const policy = @import("antfly_local_sources").common_request_admission.bounded_admission.Options{
+        .io = value.cleanup_phase_io.?.io(),
+        .clock_io = if (value.cleanup_phase_clock_io) |*clock| clock.io() else null,
+        .native_now_ns = if (options.native_deadline != 0) value.state.native_now_ns else null,
+        .deadline_ns = if (options.activation_budget == 0) options.deadline_ns else null,
+        .allow_wait = true,
+    };
+    if (options.activation_budget != 0) try value.execution.reserveCleanupFor(policy, options.deadline_ns) else try value.execution.reserveCleanup(policy);
+}
+fn activateCleanup(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+    const value = capsule(raw);
+    if (value.cleanup) return runtime.error_abi.statusFromError(error.UnsupportedOperation);
+    value.execution.activateCleanup() catch |err| return runtime.error_abi.statusFromError(err);
     return .ok;
 }
 fn resizeTeam(raw: *anyopaque, slots: usize) callconv(.c) runtime.error_abi.Status {
@@ -663,7 +704,10 @@ test "runnable execution completion ABI retains one capsule through foreground c
     const child = try abi.Borrowed.fromOwner(port, handle.?, 1, .write);
     try child.reserveCompletion(&.{ .io = &borrow, .native_deadline = 1, .deadline_ns = 100 });
     try std.testing.expectError(error.InvalidRunnableTransition, child.reserveCompletion(&.{ .io = &borrow, .native_deadline = 1, .deadline_ns = 200 }));
+    try std.testing.expectError(error.ExecutionWaitUnsupported, child.completionRemainingNs());
     try port.activateCompletion(handle.?);
+    try std.testing.expectEqual(@as(u64, 100), try port.completionRemainingNs(handle.?));
+    try std.testing.expectEqual(@as(u64, 100), try child.completionRemainingNs());
     try std.testing.expectError(error.InvalidRunnableTransition, child.activateCompletion());
     cancelled = true;
     TestClock.now_ns = 11;
@@ -672,11 +716,14 @@ test "runnable execution completion ABI retains one capsule through foreground c
     try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.control), .allow_wait = 0, .out_handle = &health }).isOk());
     port.finish(health.?);
     owner.owner.close();
+    try std.testing.expectEqual(@as(u64, 89), try child.completionRemainingNs());
     try std.testing.expect(port.enter(handle.?, @backingInt(abi.Class.write)).isOk());
     try std.testing.expect(port.checkpoint(handle.?).isOk());
     try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
     try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
     try std.testing.expect(port.park(handle.?, @backingInt(abi.Wait.resource)).isOk());
+    TestClock.now_ns = 100;
+    try std.testing.expectError(error.DeadlineExceeded, port.completionRemainingNs(handle.?));
     TestClock.now_ns = 101;
     try std.testing.expectEqual(error.DeadlineExceeded, runtime.error_abi.errorFromStatus(port.enter(handle.?, @backingInt(abi.Class.write))));
     try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);

@@ -3884,6 +3884,10 @@ pub const ApiHttpServer = struct {
     sql_control_preparation: RequestAdmission = RequestAdmission.init(4),
     sql_control_admission: RequestAdmission = RequestAdmission.init(4),
     sql_control_workers: ?db_mod.background_runtime.BackendRuntime.WorkerLease = null,
+    sql_cleanup_workers: ?db_mod.background_runtime.BackendRuntime.WorkerLease = null,
+    sql_cleanup_reaper_workers: ?db_mod.background_runtime.BackendRuntime.WorkerLease = null,
+    sql_cleanup_runtime: ?*@import("runnable_cleanup_owner.zig").Runtime = null,
+    sql_cleanup_closing: bool = false,
     sql_workers_mutex: std.atomic.Mutex = .unlocked,
     sql_workers: ?db_mod.background_runtime.BackendRuntime.WorkerLease = null,
     sql_workers_closing: bool = false,
@@ -4027,6 +4031,10 @@ pub const ApiHttpServer = struct {
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
     ) ApiHttpServer {
+        if (cfg.runnable_policy != null or cfg.runnable_owner_handle != null) {
+            return initWithConfig(alloc, cfg, source, table_read_source, table_write_source) catch
+                @panic("API bounded runnable initialization failed");
+        }
         const request_alloc = if (builtin.is_test)
             alloc
         else
@@ -4049,6 +4057,10 @@ pub const ApiHttpServer = struct {
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
     ) ApiHttpServer {
+        if (cfg.runnable_policy != null or cfg.runnable_owner_handle != null) {
+            return initWithConfig(owner_alloc, cfg, source, table_read_source, table_write_source) catch
+                @panic("API bounded runnable initialization failed");
+        }
         return ApiHttpServer.initWithRequestAllocator(
             owner_alloc,
             platform.allocator.processAllocator(std.heap.smp_allocator),
@@ -4426,6 +4438,66 @@ pub const ApiHttpServer = struct {
                 return error.SqlWriteCapacityUnavailable;
         }
         return self.sql_workers.?.io();
+    }
+
+    /// Reserve a bounded independent executor before publishing a read owner.
+    /// Gated cleanup tasks may occupy every worker until their stream closes;
+    /// they must never consume foreground or protected control concurrency.
+    pub fn sqlCleanupIo(self: *ApiHttpServer) !std.Io {
+        const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
+        // A borrowed WorkerLease aliases general I/O. Its accounting alone
+        // cannot prove independent cleanup or preserve control progress.
+        if (runtime.borrowed_io != null or runtime.lane_limits.worker_capacity < 10)
+            return error.SqlWriteCapacityUnavailable;
+        _ = try self.sqlControlIo();
+        platform_sync.lockYielding(&self.sql_workers_mutex);
+        defer self.sql_workers_mutex.unlock();
+        if (self.sql_workers_closing or self.sql_cleanup_closing or self.sql_control_workers == null) return error.SqlWriteCapacityUnavailable;
+        if (self.sql_cleanup_workers == null) {
+            const retained_ceiling: usize = if (self.runnableScheduler()) |scheduler|
+                scheduler.config.max_operations
+            else if (self.cfg.query_max_concurrent_requests != 0)
+                self.cfg.query_max_concurrent_requests
+            else
+                return error.SqlWriteCapacityUnavailable;
+            const capacity = @min(retained_ceiling, runtime.lane_limits.worker_capacity / 4);
+            if (capacity == 0) return error.SqlWriteCapacityUnavailable;
+            self.sql_cleanup_workers = runtime.acquireWorkers(.{ .capacity = capacity }) catch
+                return error.SqlWriteCapacityUnavailable;
+        }
+        return self.sql_cleanup_workers.?.io();
+    }
+
+    /// Publish a stable cleanup owner only after both child and independent
+    /// reaper executors have actual reserved capacity. No control-lane alias.
+    pub fn sqlCleanupOwner(self: *ApiHttpServer) !*@import("runnable_cleanup_owner.zig").Runtime {
+        _ = try self.sqlCleanupIo();
+        const backend = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
+        platform_sync.lockYielding(&self.sql_workers_mutex);
+        defer self.sql_workers_mutex.unlock();
+        if (self.sql_workers_closing or self.sql_cleanup_closing) return error.SqlWriteCapacityUnavailable;
+        if (self.sql_cleanup_runtime) |active| return active;
+        if (self.sql_cleanup_reaper_workers == null) {
+            self.sql_cleanup_reaper_workers = backend.acquireWorkers(.{ .capacity = 1 }) catch return error.SqlWriteCapacityUnavailable;
+        }
+        const active = @import("runnable_cleanup_owner.zig").Runtime.create(self.alloc, self.sql_cleanup_reaper_workers.?.io(), self.sql_cleanup_workers.?.capacity) catch {
+            // Runtime.create physically retires its partial state before
+            // returning. No owner was published, so return this worker lease
+            // now rather than retaining capacity through a failed startup.
+            self.sql_cleanup_reaper_workers.?.release();
+            self.sql_cleanup_reaper_workers = null;
+            return error.SqlWriteCapacityUnavailable;
+        };
+        self.sql_cleanup_runtime = active;
+        return active;
+    }
+
+    pub fn sqlCleanupStats(self: *const ApiHttpServer) ?@import("runnable_cleanup_owner.zig").Registry.Snapshot {
+        const mutable = @constCast(self);
+        platform_sync.lockYielding(&mutable.sql_workers_mutex);
+        defer mutable.sql_workers_mutex.unlock();
+        const owner = mutable.sql_cleanup_runtime orelse return null;
+        return owner.registry.snapshot();
     }
 
     pub fn sqlQueryWaitingEnabled(self: *const ApiHttpServer) bool {
@@ -4845,6 +4917,11 @@ pub const ApiHttpServer = struct {
         self.query_admission.close();
         self.write_admission.close();
         self.inference_admission.close();
+        platform_sync.lockYielding(&self.sql_workers_mutex);
+        self.sql_cleanup_closing = true;
+        const cleanup_runtime = self.sql_cleanup_runtime;
+        self.sql_workers_mutex.unlock();
+        if (cleanup_runtime) |active| active.close();
         if (self.pgwire_listener) |listener| {
             listener.deinit();
             self.pgwire_listener = null;
@@ -4852,6 +4929,16 @@ pub const ApiHttpServer = struct {
         if (self.retained_read_runtime) |runtime| {
             runtime.deinit();
             self.retained_read_runtime = null;
+        }
+        if (self.sql_cleanup_runtime) |active| {
+            // Keep the owner observable while physical cleanup is pending.
+            // Join outside the publisher lock so diagnostics/control cannot
+            // be held behind a stalled cleanup child or retained failure.
+            active.join();
+            platform_sync.lockYielding(&self.sql_workers_mutex);
+            self.sql_cleanup_runtime = null;
+            active.destroyJoined();
+            self.sql_workers_mutex.unlock();
         }
         platform_sync.lockYielding(&self.sql_workers_mutex);
         self.sql_workers_closing = true;
@@ -4861,8 +4948,14 @@ pub const ApiHttpServer = struct {
         self.sql_control_workers = null;
         var sql_workers = self.sql_workers;
         self.sql_workers = null;
+        var cleanup_workers = self.sql_cleanup_workers;
+        self.sql_cleanup_workers = null;
+        var reaper_workers = self.sql_cleanup_reaper_workers;
+        self.sql_cleanup_reaper_workers = null;
         self.sql_workers_mutex.unlock();
         if (sql_workers) |*workers| workers.release();
+        if (cleanup_workers) |*workers| workers.release();
+        if (reaper_workers) |*workers| workers.release();
         if (control_workers) |*workers| workers.release();
         self.restore_jobs_closing.store(true, .release);
         self.signalRestoreRetryWakeup();
@@ -13685,7 +13778,7 @@ pub const ApiHttpServer = struct {
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
         const signed = try self.signRowPolicyMutationParticipants(arena_state.allocator(), tables, catalog_tables, request);
-        return source.commitBatchWithCancellation(alloc, signed, sync_level, request.cancellation);
+        return source.commitBatchWithControl(alloc, signed, sync_level, request.cancellation, distributed_txn.CommitControl.fromRequest(request));
     }
 
     fn commitPublicTableBatchWithIntegrity(
@@ -13700,7 +13793,7 @@ pub const ApiHttpServer = struct {
         std.debug.assert(retained_preparation.* == null);
         const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
         const selected = (try self.selectIntegritySnapshot(alloc, tables, request)) orelse {
-            return source.commitBatchWithCancellation(alloc, tables, sync_level, request.cancellation);
+            return source.commitBatchWithControl(alloc, tables, sync_level, request.cancellation, distributed_txn.CommitControl.fromRequest(request));
         };
         var snapshot = selected.snapshot;
         defer self.source.freeAdminSnapshot(&snapshot);
@@ -57197,4 +57290,33 @@ test "workload deadline bounds internal planning retrieval and administrative wa
     try std.testing.expectError(error.DeadlineExceeded, server.waitForTableVisibilityWithContext("docs", .present, expired));
     try std.testing.expectError(error.DeadlineExceeded, server.waitForProjectedTableCreateReadinessWithContext("docs", expired));
     try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+}
+
+test "runnable execution legacy API constructors retain bounded request owners" {
+    inline for (.{ ApiHttpServer.init, ApiHttpServer.initWithProcessRequestAllocator }) |initialize| {
+        var server = initialize(std.testing.allocator, .{
+            .request_memory_bytes = 1 << 20,
+            .retained_memory_bytes = 1 << 20,
+            .runnable_policy = .{ .slots = 4, .control_slots = 1 },
+        }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+        defer server.deinit();
+        const memory = server.request_memory orelse return error.TestUnexpectedResult;
+        try std.testing.expectError(error.OutOfMemory, server.alloc.alloc(u8, memory.foreground.stats().limit_bytes + 1));
+        var execution: RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        try server.startSqlRunnable(&execution, .{ .io = std.testing.io, .retained_bytes = 128 }, .write);
+        var team = try @import("runnable_write_team.zig").init(&execution, memory.allocator(false));
+        try team.reserve(2);
+        try std.testing.expectEqual(@as(usize, 2), team.childCapacity());
+        const before = memory.foreground.stats().used_bytes;
+        const child = try team.allocator.alloc(u8, 64);
+        try std.testing.expectEqual(before + 64 + ApiHttpServer.RequestMemory.overhead(.of(u8)), memory.foreground.stats().used_bytes);
+        team.allocator.free(child);
+        team.finish();
+        try std.testing.expectEqual(before, memory.foreground.stats().used_bytes);
+        try std.testing.expectEqual(@as(usize, 1), server.runnableSchedulingStats().operations);
+        try std.testing.expectEqual(@as(usize, 3), server.runnableSchedulingStats().runnable_slots);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), server.runnableSchedulingStats().operations);
+    }
 }

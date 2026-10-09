@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const read_admission = @import("../../common/read_admission.zig");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const bloom = @import("bloom");
@@ -110,6 +111,15 @@ const SourceBlockLease = union(enum) {
             .none => {},
             .owned => |*owned| owned.release(),
             .cached => |*handle| handle.release(),
+        }
+        self.* = .none;
+    }
+
+    fn releaseForAdmittedRead(self: *@This(), deferred: bool) void {
+        switch (self.*) {
+            .none => {},
+            .owned => |*owned| owned.release(),
+            .cached => |*handle| if (deferred) handle.releaseToCache() else handle.release(),
         }
         self.* = .none;
     }
@@ -492,6 +502,17 @@ pub fn lockBackend(comptime BackendType: type, backend: *BackendType) bool {
     return false;
 }
 
+pub fn lockBackendWithAdmission(comptime BackendType: type, backend: *BackendType, control: read_admission.Port) !bool {
+    try control.checkpoint();
+    if (@hasField(BackendType, "mu")) {
+        const started_ns = if (@hasDecl(BackendType, "recordBackendLockWait")) platform_time.monotonicNs() else 0;
+        try @import("../../common/bounded_mutex.zig").lockAtomic(&backend.mu, control);
+        if (@hasDecl(BackendType, "recordBackendLockWait")) backend.recordBackendLockWait(platform_time.monotonicNs() -| started_ns);
+        return true;
+    }
+    return false;
+}
+
 pub fn unlockBackend(comptime BackendType: type, backend: *BackendType, locked: bool) void {
     if (locked) {
         if (@hasDecl(BackendType, "unlockWithReclamation")) backend.unlockWithReclamation() else backend.mu.unlock();
@@ -549,6 +570,12 @@ pub fn BoundStore(comptime BackendType: type) type {
 
         pub fn beginRead(self: *@This()) !LocalReadTxn {
             return try LocalReadTxn.open(self.backend, self.namespace);
+        }
+
+        pub fn beginReadWithAdmission(self: *@This(), admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !LocalReadTxn {
+            var namespace = self.namespace;
+            namespace.block_cache_admission = admission;
+            return try LocalReadTxn.openWithAdmission(self.backend, namespace, control);
         }
 
         pub fn beginReadWithBlockCacheAdmission(
@@ -903,6 +930,9 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         const default_max_retained_mutable_source_entry_scratch: usize = 1 * 1024 * 1024;
         const min_retained_mutable_source_entry_scratch: usize = 4096;
 
+        admission: read_admission.Scope = .{},
+        // Ownership mode survives operation exit; no borrowed port survives.
+        defer_pin_returns: bool = false,
         allocator: Allocator,
         backend: *BackendType,
         mutable: *const MutableType,
@@ -1037,9 +1067,25 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             namespace: backend_types.Namespace,
             backend_locked: bool,
         ) !Self {
+            return initSequenceControlled(allocator, backend, mutable, immutable_memtables, sequence, l0_groups, namespace, backend_locked, null);
+        }
+
+        fn initSequenceControlled(
+            allocator: Allocator,
+            backend: *BackendType,
+            mutable: *const MutableType,
+            immutable_memtables: []const *const State,
+            sequence: RunSequence,
+            l0_groups: []const RunGroup,
+            namespace: backend_types.Namespace,
+            backend_locked: bool,
+            control: ?read_admission.Port,
+        ) !Self {
+            if (control) |budget| try budget.checkpoint();
             var source_count = 1 + immutable_memtables.len;
             var run_start: usize = 0;
             while (run_start < sequence.count()) {
+                if (control) |budget| try budget.checkpoint();
                 const end = sequence.end(run_start);
                 if (sequence.contains(run_start, end, namespace)) source_count += 1;
                 run_start = end;
@@ -1053,6 +1099,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                     }
                 }
             }
+            if (control) |budget| try budget.checkpoint();
             const storage = try allocCursorStorage(allocator, source_count);
             errdefer allocator.free(storage);
 
@@ -1080,6 +1127,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             run_start = 0;
             var source_index = 1 + immutable_memtables.len;
             while (run_start < sequence.count()) {
+                if (control) |budget| try budget.checkpoint();
                 const end = sequence.end(run_start);
                 if (sequence.contains(run_start, end, namespace)) {
                     run_spans[source_index] = .{ .start = run_start, .end = end, .current = run_start };
@@ -1088,6 +1136,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 run_start = end;
             }
 
+            if (control) |budget| try budget.checkpoint();
             return .{
                 .allocator = allocator,
                 .backend = backend,
@@ -1115,12 +1164,16 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             };
         }
 
+        fn returnCachePin(self: *@This(), handle: *cache_mod.Handle) void {
+            if (self.defer_pin_returns) handle.releaseToCache() else handle.release();
+        }
+
         pub fn close(self: *@This()) void {
             defer if (self.cursor_reservation) |*lease| lease.release();
             for (0..self.source_blocks.len) |source_index| self.clearSourceBlock(source_index);
             for (0..self.source_key_copies.len) |source_index| self.clearSourceKeyCopy(source_index);
             for (self.source_table_index_handles) |*maybe_handle| {
-                if (maybe_handle.*) |*handle| handle.release();
+                if (maybe_handle.*) |*handle| self.returnCachePin(handle);
                 maybe_handle.* = null;
             }
             self.clearVisibleEntryBytes();
@@ -1142,6 +1195,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn first(self: *@This()) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             try self.initForwardPositions("", true);
             const entry = try self.selectVisibleForward();
             self.current_key = if (entry) |e| e.key else null;
@@ -1163,6 +1217,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn last(self: *@This()) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             const entry = try self.findLast();
             if (entry) |e| {
                 try self.initForwardPositions(e.key, true);
@@ -1173,7 +1228,25 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             return entry;
         }
 
+        pub fn nextWithAdmission(self: *@This(), control: read_admission.Port) !?backend_adapter.Entry {
+            const guard = try self.admission.enter(control);
+            self.defer_pin_returns = true;
+            defer guard.deinit();
+            const result = try self.next();
+            try self.admission.checkpoint();
+            return result;
+        }
+        pub fn seekAtOrAfterWithAdmission(self: *@This(), key: []const u8, control: read_admission.Port) !?backend_adapter.Entry {
+            const guard = try self.admission.enter(control);
+            self.defer_pin_returns = true;
+            defer guard.deinit();
+            const result = try self.seekAtOrAfter(key);
+            try self.admission.checkpoint();
+            return result;
+        }
+
         pub fn next(self: *@This()) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             if (self.current_key == null) return null;
             try self.advanceForwardSources();
             const entry = try self.selectVisibleForward();
@@ -1182,6 +1255,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn prev(self: *@This()) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             const key = self.current_key orelse return null;
             const entry = try self.findAtOrBefore(key, false);
             if (entry) |e| {
@@ -1194,6 +1268,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             const restart = if (comptime builtin.is_test) self.test_full_forward_seek else false;
             if (!restart and self.current_key != null) {
                 const current = self.current_key.?;
@@ -1215,11 +1290,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         /// those sources retain their block, position, and heap membership.
         /// Stabilize the target because it may alias a source's borrowed key.
         fn skipForwardTo(self: *@This(), target: []const u8) !void {
+            try self.admission.checkpoint();
             if (self.source_heap_len == 0) return;
             if (std.mem.order(u8, self.source_entries[self.source_heap[0]].?.key, target) != .lt) return;
             const stable_target = try self.allocator.dupe(u8, target);
             defer self.allocator.free(stable_target);
             while (self.source_heap_len != 0) {
+                try self.admission.checkpoint();
                 const source = self.source_heap[0];
                 if (std.mem.order(u8, self.source_entries[source].?.key, stable_target) != .lt) break;
                 try self.setSourceAtOrAfter(source, stable_target, true);
@@ -1228,6 +1305,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn seekAtOrBefore(self: *@This(), key: []const u8) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             const entry = try self.findAtOrBefore(key, true);
             if (entry) |e| {
                 try self.initForwardPositions(e.key, true);
@@ -1239,19 +1317,23 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn initForwardPositions(self: *@This(), target: []const u8, inclusive: bool) !void {
+            try self.admission.checkpoint();
             // A public seek may reuse the previous entry's borrowed key. A
             // source switch can release its backing block before other spans
             // have sought, so stabilize nonempty seek keys across all sources.
             const stable_target = try self.allocator.dupe(u8, target);
             defer self.allocator.free(stable_target);
             for (0..self.positions.len) |source_index| {
+                try self.admission.checkpoint();
                 try self.setSourceAtOrAfter(source_index, stable_target, inclusive);
             }
             self.rebuildForwardHeap();
         }
 
         fn selectVisibleForward(self: *@This()) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             while (true) {
+                try self.admission.checkpoint();
                 const winner_source = self.bestVisibleForwardSource() orelse {
                     self.current_visible_source = null;
                     return null;
@@ -1282,10 +1364,11 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         pub fn retainCurrentValueForTxn(self: *@This(), held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle)) !bool {
+            try self.admission.checkpoint();
             const source_index = self.current_visible_source orelse return false;
             if (self.source_blocks[source_index].retainCached()) |retained_block| {
                 var retained = retained_block;
-                errdefer retained.release();
+                errdefer self.returnCachePin(&retained);
                 try held_blocks.append(self.backend.allocator, retained);
                 return true;
             }
@@ -1407,13 +1490,16 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn advanceForwardSources(self: *@This()) !void {
+            try self.admission.checkpoint();
             const key = self.current_key orelse return;
             try self.advanceForwardSourcesAtKey(key);
         }
 
         fn advanceForwardSourcesAtKey(self: *@This(), key: []const u8) !void {
+            try self.admission.checkpoint();
             const match_count = self.collectForwardHeapSourcesAtKey(key);
             for (self.advance_sources[0..match_count]) |source_index| {
+                try self.admission.checkpoint();
                 const idx = self.positions[source_index] orelse continue;
                 try self.advanceSource(source_index, idx);
                 self.updateForwardHeapSource(source_index);
@@ -1468,6 +1554,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn runForSource(self: *@This(), source_index: usize) !*Run {
+            try self.admission.checkpoint();
             const offset = self.runSourceOffset();
             if (source_index < offset) return error.RunStateUnavailable;
             const span = &self.run_spans[source_index];
@@ -1483,7 +1570,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const span = &self.run_spans[source_index];
             if (span.current == run_index) return;
             self.clearSourceBlock(source_index);
-            if (self.source_table_index_handles[source_index]) |*handle| handle.release();
+            if (self.source_table_index_handles[source_index]) |*handle| self.returnCachePin(handle);
             self.source_table_index_handles[source_index] = null;
             self.source_table_indices[source_index] = null;
             self.source_entries[source_index] = null;
@@ -1498,6 +1585,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn seekRunSpan(self: *@This(), source_index: usize, target: []const u8, inclusive: bool) !void {
+            try self.admission.checkpoint();
             const span = self.run_spans[source_index];
             var lo = span.start;
             var hi = span.end;
@@ -1512,6 +1600,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             self.positions[source_index] = null;
             self.source_entries[source_index] = null;
             while (lo < span.end) : (lo += 1) {
+                try self.admission.checkpoint();
                 if (self.runStartsPastUpper(self.sequence.at(lo))) break;
                 self.selectSpanRun(source_index, lo);
                 try self.setSingleRunAtOrAfter(source_index, target, inclusive);
@@ -1521,23 +1610,25 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn tableIndexForRunSource(self: *@This(), source_index: usize, run: *Run) !*const lsm_table_file.TableIndex {
+            try self.admission.checkpoint();
             if (self.source_table_indices[source_index]) |index| {
                 recordCursorTableIndexHit(self.backend);
                 return index;
             }
             const index = if (self.backend.options.cache != null) blk: {
-                var handle = try loadRunTableIndexHandle(self.backend, run);
-                errdefer handle.release();
+                var handle = try loadRunTableIndexHandleWithAdmission(self.backend, run, self.admission.control);
+                errdefer self.returnCachePin(&handle);
                 const retained_index = handle.runTableIndex();
                 self.source_table_index_handles[source_index] = handle;
                 break :blk retained_index;
-            } else try indexForRunNoCacheMaybeLocked(self.backend, run, self.backend_locked);
+            } else try indexForRunNoCacheMaybeLockedWithAdmission(self.backend, run, self.backend_locked, self.admission.control);
             self.source_table_indices[source_index] = index;
             recordCursorTableIndexMiss(self.backend);
             return index;
         }
 
         fn sourceEntryAt(self: *@This(), source_index: usize, idx: usize) !SourceEntry {
+            try self.admission.checkpoint();
             if (source_index == 0) {
                 if (comptime MutableType == ActiveMemTable) return try self.copyMutableSourceEntryAt(idx);
                 const entry = self.mutable_entry_cursor.at(self.mutable, idx);
@@ -1559,12 +1650,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 return try self.sourceEntryAtFromLocalIndex(source_index, run, index, idx);
             }
 
-            const table = try tableForRunMaybeLocked(self.backend, run, self.backend_locked);
+            const table = try tableForRunMaybeLockedWithAdmission(self.backend, run, self.backend_locked, self.admission.control);
             const entry = try table.entryAt(idx);
             return .{ .namespace_name = entry.namespace_name, .key = entry.key, .value = entry.value, .tombstone = entry.tombstone };
         }
 
         fn sourceLowerBound(self: *@This(), source_index: usize, target: []const u8, inclusive: bool) !?usize {
+            try self.admission.checkpoint();
             if (!self.keyBeforeUpper(target)) return null;
             if (source_index == 0) return nextStateIndex(self.mutable, self.namespace, target, inclusive);
             if (self.immutableForSource(source_index)) |state| return nextStateIndex(state, self.namespace, target, inclusive);
@@ -1578,9 +1670,10 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 return try self.sourceLowerBoundFromLocalIndex(source_index, run, index, target, inclusive);
             }
 
-            const table = try tableForRunMaybeLocked(self.backend, run, self.backend_locked);
+            const table = try tableForRunMaybeLockedWithAdmission(self.backend, run, self.backend_locked, self.admission.control);
             var idx = try table.lowerBound(self.namespace.name, target);
             while (idx < table.entryCount()) : (idx += 1) {
+                try self.admission.checkpoint();
                 const entry = try table.entryAt(idx);
                 if (compareNamespace(.{ .name = entry.namespace_name }, self.namespace) != .eq) return null;
                 if (!inclusive and std.mem.eql(u8, entry.key, target)) continue;
@@ -1590,6 +1683,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn setSourceAtOrAfter(self: *@This(), source_index: usize, target: []const u8, inclusive: bool) !void {
+            try self.admission.checkpoint();
             if (comptime builtin.is_test) self.test_seek_sources += 1;
             if (source_index == 0 and comptime MutableType == ActiveMemTable) {
                 try self.setMutableSourceAtOrAfter(target, inclusive);
@@ -1600,6 +1694,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn setSingleRunAtOrAfter(self: *@This(), source_index: usize, target: []const u8, inclusive: bool) !void {
+            try self.admission.checkpoint();
             if (source_index == 0 or self.immutableForSource(source_index) != null) {
                 self.positions[source_index] = try self.sourceLowerBound(source_index, target, inclusive);
                 self.source_entries[source_index] = if (self.positions[source_index]) |idx|
@@ -1642,7 +1737,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 return;
             }
 
-            const table = try tableForRunMaybeLocked(self.backend, run, self.backend_locked);
+            const table = try tableForRunMaybeLockedWithAdmission(self.backend, run, self.backend_locked, self.admission.control);
             if (try table.lowerBoundPosition(self.namespace.name, target, inclusive)) |positioned| {
                 self.positions[source_index] = positioned.index;
                 self.source_entries[source_index] = .{
@@ -1658,11 +1753,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn advanceSource(self: *@This(), source_index: usize, current: usize) !void {
+            try self.admission.checkpoint();
             try self.advanceSingleSource(source_index, current);
             if (source_index < self.runSourceOffset() or self.positions[source_index] != null) return;
             const span = self.run_spans[source_index];
             var next_run = span.current + 1;
             while (next_run < span.end) : (next_run += 1) {
+                try self.admission.checkpoint();
                 if (self.runStartsPastUpper(self.sequence.at(next_run))) break;
                 self.selectSpanRun(source_index, next_run);
                 try self.setSingleRunAtOrAfter(source_index, "", true);
@@ -1671,6 +1768,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn advanceSingleSource(self: *@This(), source_index: usize, current: usize) !void {
+            try self.admission.checkpoint();
             if (source_index == 0 and comptime MutableType == ActiveMemTable) {
                 try self.advanceMutableSource();
                 return;
@@ -1724,7 +1822,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 return;
             }
 
-            const table = try tableForRunMaybeLocked(self.backend, run, self.backend_locked);
+            const table = try tableForRunMaybeLockedWithAdmission(self.backend, run, self.backend_locked, self.admission.control);
             if (try table.nextPositionInNamespace(self.namespace.name, current)) |positioned| {
                 self.positions[source_index] = positioned.index;
                 self.source_entries[source_index] = .{
@@ -1740,6 +1838,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn nextSourceIndex(self: *@This(), source_index: usize, current: usize) !?usize {
+            try self.admission.checkpoint();
             if (source_index == 0) return nextIndexFrom(self.mutable, self.namespace, current);
             if (self.immutableForSource(source_index)) |state| return nextIndexFrom(state, self.namespace, current);
 
@@ -1750,9 +1849,10 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 return try self.nextSourceIndexFromLocalIndex(source_index, run, current);
             }
 
-            const table = try tableForRunMaybeLocked(self.backend, run, self.backend_locked);
+            const table = try tableForRunMaybeLockedWithAdmission(self.backend, run, self.backend_locked, self.admission.control);
             var idx = current + 1;
             while (idx < table.entryCount()) : (idx += 1) {
+                try self.admission.checkpoint();
                 const entry = try table.entryAt(idx);
                 const order = compareNamespace(.{ .name = entry.namespace_name }, self.namespace);
                 if (order == .eq) return idx;
@@ -1762,6 +1862,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn findAtOrBefore(self: *@This(), target: []const u8, inclusive: bool) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             var probe = target;
             var owned_probe: ?[]u8 = null;
             defer if (owned_probe) |bytes| self.allocator.free(bytes);
@@ -1771,6 +1872,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 include_probe = false;
             };
             while (true) {
+                try self.admission.checkpoint();
                 const maybe_candidate = blk: {
                     const stable_probe = try self.allocator.dupe(u8, probe);
                     defer self.allocator.free(stable_probe);
@@ -1778,7 +1880,11 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 };
                 const candidate = maybe_candidate orelse return null;
                 const stable_candidate = try self.allocator.dupe(u8, candidate);
-                if (try self.visibleEntryAtKey(stable_candidate)) |entry| {
+                const visible = self.visibleEntryAtKey(stable_candidate) catch |err| {
+                    self.allocator.free(stable_candidate);
+                    return err;
+                };
+                if (visible) |entry| {
                     self.allocator.free(stable_candidate);
                     return entry;
                 }
@@ -1790,13 +1896,16 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn findLast(self: *@This()) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             if (self.upper_bound) |upper| return try self.findAtOrBefore(upper, false);
             var best: ?[]const u8 = try self.mutableLastKeyStable();
             for (self.immutable_memtables) |state| {
+                try self.admission.checkpoint();
                 const concrete = mutableLastKey(state, self.namespace) orelse continue;
                 if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
             }
             for (self.runSourceOffset()..self.positions.len) |source_index| {
+                try self.admission.checkpoint();
                 const concrete = (try self.spanPrevKey(source_index, null, true)) orelse continue;
                 if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
             }
@@ -1807,12 +1916,15 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn prevCandidateKey(self: *@This(), target: []const u8, inclusive: bool) !?[]const u8 {
+            try self.admission.checkpoint();
             var best: ?[]const u8 = try self.mutablePrevStateKeyStable(target, inclusive);
             for (self.immutable_memtables) |state| {
+                try self.admission.checkpoint();
                 const concrete = prevStateKey(state, self.namespace, target, inclusive) orelse continue;
                 if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
             }
             for (self.runSourceOffset()..self.positions.len) |source_index| {
+                try self.admission.checkpoint();
                 const concrete = (try self.spanPrevKey(source_index, target, inclusive)) orelse continue;
                 if (best == null or std.mem.order(u8, concrete, best.?) == .gt) best = concrete;
             }
@@ -1820,6 +1932,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn spanPrevKey(self: *@This(), source_index: usize, target: ?[]const u8, inclusive: bool) !?[]const u8 {
+            try self.admission.checkpoint();
             const span = self.run_spans[source_index];
             var lo = span.start;
             var hi = span.end;
@@ -1835,6 +1948,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 if (order == .lt or (order == .eq and (target == null or inclusive))) lo = mid + 1 else hi = mid;
             }
             while (lo > span.start) {
+                try self.admission.checkpoint();
                 lo -= 1;
                 if (compareNamespace(.{ .name = self.sequence.at(lo).largest_namespace_name }, self.namespace) == .lt) break;
                 self.selectSpanRun(source_index, lo);
@@ -1851,6 +1965,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn visibleEntryAtKey(self: *@This(), key: []const u8) !?backend_adapter.Entry {
+            try self.admission.checkpoint();
             self.clearVisibleEntryBytes();
             if (comptime MutableType == ActiveMemTable) {
                 switch (try self.visibleMutableEntryAtKey(key)) {
@@ -1864,6 +1979,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 return entry.entry();
             }
             for (self.immutable_memtables) |state| {
+                try self.admission.checkpoint();
                 if (state.findIndex(self.namespace, key)) |idx| {
                     const entry = state.entryAt(idx);
                     if (entry.tombstone) return null;
@@ -1871,6 +1987,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 }
             }
             for (self.runSourceOffset()..self.positions.len) |source_index| {
+                try self.admission.checkpoint();
                 try self.seekRunSpan(source_index, key, true);
                 const entry = self.source_entries[source_index] orelse continue;
                 if (!std.mem.eql(u8, entry.key, key)) continue;
@@ -1890,6 +2007,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn mutableSourceEntryScratch(self: *@This(), needed: usize) ![]u8 {
+            try self.admission.checkpoint();
             const retained_cap = self.maxRetainedMutableSourceEntryScratch();
             var current_capacity: usize = 0;
             if (self.mutable_source_entry_bytes) |bytes| {
@@ -1940,6 +2058,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn copyMutableSourceEntryAt(self: *@This(), idx: usize) !SourceEntry {
+            try self.admission.checkpoint();
             const entry = self.mutable.entryAt(idx);
             const namespace_name = namespaceOf(entry).name;
             const namespace_len = if (namespace_name) |name| name.len else 0;
@@ -1966,6 +2085,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn setMutableSourceAtOrAfter(self: *@This(), target: []const u8, inclusive: bool) !void {
+            try self.admission.checkpoint();
             const locked = self.mutableSourceLock();
             defer self.mutableSourceUnlock(locked);
             const idx = nextStateIndex(self.mutable, self.namespace, target, inclusive) orelse {
@@ -1979,6 +2099,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn advanceMutableSource(self: *@This()) !void {
+            try self.admission.checkpoint();
             const current = self.source_entries[0] orelse {
                 self.positions[0] = null;
                 self.clearMutableSourceEntryBytes();
@@ -1997,6 +2118,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn copyKeyToVisibleBytes(self: *@This(), key: []const u8) ![]const u8 {
+            try self.admission.checkpoint();
             const bytes = try self.backend.allocator.dupe(u8, key);
             errdefer self.backend.allocator.free(bytes);
             self.visible_entry_bytes.setOwned(self.backend.allocator, bytes);
@@ -2004,6 +2126,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn mutableLastKeyStable(self: *@This()) !?[]const u8 {
+            try self.admission.checkpoint();
             if (comptime MutableType != ActiveMemTable) return mutableLastKey(self.mutable, self.namespace);
             const locked = self.mutableSourceLock();
             defer self.mutableSourceUnlock(locked);
@@ -2012,6 +2135,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn mutablePrevStateKeyStable(self: *@This(), target: []const u8, inclusive: bool) !?[]const u8 {
+            try self.admission.checkpoint();
             if (comptime MutableType != ActiveMemTable) return prevStateKey(self.mutable, self.namespace, target, inclusive);
             const locked = self.mutableSourceLock();
             defer self.mutableSourceUnlock(locked);
@@ -2020,6 +2144,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn visibleMutableEntryAtKey(self: *@This(), key: []const u8) !VisibleLookup {
+            try self.admission.checkpoint();
             const locked = self.mutableSourceLock();
             defer self.mutableSourceUnlock(locked);
             const idx = self.mutable.findIndex(self.namespace, key) orelse return .absent;
@@ -2037,7 +2162,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn clearSourceBlock(self: *@This(), source_index: usize) void {
-            self.source_blocks[source_index].release();
+            self.source_blocks[source_index].releaseForAdmittedRead(self.defer_pin_returns);
             self.source_block_indices[source_index] = null;
         }
 
@@ -2062,6 +2187,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn spillRunSource(self: *@This(), source_index: usize) !void {
+            try self.admission.checkpoint();
             if (!self.bounded_run_block_residency or !self.isPersistedRunSource(source_index)) return;
             const entry = self.source_entries[source_index] orelse {
                 self.resetRunSourceResidency(source_index);
@@ -2082,6 +2208,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         }
 
         fn makeRunSourceResident(self: *@This(), source_index: usize) !void {
+            try self.admission.checkpoint();
             if (!self.bounded_run_block_residency) return;
             if (self.resident_run_source == source_index) return;
 
@@ -2139,8 +2266,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             self.clearSourceBlock(source_index);
             self.backend.recordCursorBlockLoad();
             const bytes = if (self.backend.options.cache != null) blk: {
-                var handle = try loadRunTableBlockHandle(self.backend, run, index, window, self.namespace.retainDataBlocks());
-                errdefer handle.release();
+                var handle = try loadRunTableBlockHandleWithAdmission(self.backend, run, index, window, self.namespace.retainDataBlocks(), self.admission.control);
+                errdefer self.returnCachePin(&handle);
                 const block = handle.runTableBlock();
                 self.source_blocks[source_index] = .{ .cached = handle };
                 break :blk block;
@@ -2179,8 +2306,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             if (self.source_block_indices[source_index]) |loaded_index| {
                 if (loaded_index == next_window.relative_offset) return;
             }
-            var handle = try loadRunTableBlockHandle(self.backend, run, index, next_window, self.namespace.retainDataBlocks());
-            defer handle.release();
+            var handle = try loadRunTableBlockHandleWithAdmission(self.backend, run, index, next_window, self.namespace.retainDataBlocks(), self.admission.control);
+            defer self.returnCachePin(&handle);
             recordCursorBlockReadahead(self.backend);
         }
 
@@ -3467,17 +3594,27 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
         }
 
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
-            const locked = lockBackend(BackendType, backend);
+            return try openControlled(backend, namespace, null);
+        }
+
+        pub fn openWithAdmission(backend: *BackendType, namespace: backend_types.Namespace, control: read_admission.Port) !@This() {
+            return try openControlled(backend, namespace, control);
+        }
+
+        fn openControlled(backend: *BackendType, namespace: backend_types.Namespace, control: ?read_admission.Port) !@This() {
+            const locked = if (control) |budget| try lockBackendWithAdmission(BackendType, backend, budget) else lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             try retainReadReader(BackendType, backend, .bound_read_txn);
             errdefer releaseReadReader(BackendType, backend, .bound_read_txn);
+            if (control) |budget| try budget.checkpoint();
             if (@hasDecl(BackendType, "prepareReadSnapshot")) try backend.prepareReadSnapshot();
             const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
                 try backend.snapshotImmutableMemtables()
             else
                 &.{};
             errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
+            if (control) |budget| try budget.checkpoint();
             const mutable_snapshot = try snapshotReadMutable(BackendType, backend, .bound_read_txn);
             errdefer {
                 if (mutable_snapshot.owned) {
@@ -3488,9 +3625,11 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                     releaseMutableReadSnapshot(BackendType, backend, mutable_snapshot.state, false);
                 }
             }
+            if (control) |budget| try budget.checkpoint();
             var read_view = try RunReadView.pin(backend, metadata_allocator);
             errdefer read_view.release(backend);
             try read_view.prepareCursor(backend);
+            if (control) |budget| try budget.checkpoint();
             return .{
                 .allocator = backend.allocator,
                 .metadata_allocator = metadata_allocator,
@@ -3563,6 +3702,12 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             self.backend.recordGetManySortedLocality(keys);
             const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys, values);
             self.backend.recordGetManySortedResults(result.hits, result.misses);
+        }
+
+        pub fn openCursorWithAdmission(self: *@This(), control: read_admission.Port) !LocalCursor {
+            const cursor_alloc = runtimeScratchAllocator(self.allocator);
+            const sequence: LocalCursor.RunSequence = if (self.read_view.directory()) |directory| .{ .directory = directory } else .{ .runs = self.read_view.runs, .levels = self.read_view.levels };
+            return try LocalCursor.initSequenceControlled(cursor_alloc, self.backend, self.mutable_snapshot, self.immutable_memtables, sequence, if (sequence.directory != null) &.{} else self.read_view.l0_groups, self.namespace, false, control);
         }
 
         pub fn openCursor(self: *@This()) !LocalCursor {
@@ -6647,16 +6792,16 @@ fn requireTableBlocks(index: *const lsm_table_file.TableIndex) !void {
     if (index.entryCount() > 0 and index.blockCount() == 0) return error.InvalidTableFile;
 }
 
-fn decodeRunTableIndexWithStats(backend: anytype, allocator: Allocator, bytes: []const u8) !lsm_table_file.TableIndex {
+fn decodeRunTableIndexWithStats(backend: anytype, allocator: Allocator, bytes: []const u8, control: ?read_admission.Port) !lsm_table_file.TableIndex {
     const start_ns = backend.readStatsNowNs();
-    const decoded = lsm_table_file.decodeIndexAlloc(allocator, bytes);
+    const decoded = lsm_table_file.decodeIndexAllocWithAdmission(allocator, bytes, control);
     backend.recordTableIndexDecode(backend.readStatsElapsedNs(start_ns));
     return try decoded;
 }
 
-fn loadRunTableIndexWithStats(backend: anytype, allocator: Allocator, path: []const u8) !lsm_table_file.TableIndex {
+fn loadRunTableIndexWithStats(backend: anytype, allocator: Allocator, path: []const u8, control: ?read_admission.Port) !lsm_table_file.TableIndex {
     const start_ns = backend.readStatsNowNs();
-    const loaded = repository_mod.loadRunTableIndexAllocWithStorage(backend.storage.?, allocator, path);
+    const loaded = repository_mod.loadRunTableIndexAllocWithStorageAndAdmission(backend.storage.?, allocator, path, control);
     backend.recordTableIndexLoad(backend.readStatsElapsedNs(start_ns));
     return try loaded;
 }
@@ -6788,23 +6933,43 @@ fn getFromRunWithBlockCacheBatchState(
     return located;
 }
 
+fn checkedCacheHandle(handle: cache_mod.Handle, control: ?read_admission.Port) !cache_mod.Handle {
+    var owned = handle;
+    errdefer owned.releaseForAdmissionFailure();
+    if (control) |budget| try budget.checkpoint();
+    return owned;
+}
+
 fn loadRunTableIndexHandle(backend: anytype, run: *Run) !cache_mod.Handle {
+    return loadRunTableIndexHandleWithAdmission(backend, run, null);
+}
+
+fn loadRunTableIndexHandleWithAdmission(backend: anytype, run: *Run, control: ?read_admission.Port) !cache_mod.Handle {
     const cache = backend.options.cache orelse return error.RunStateUnavailable;
     const path = run.path orelse return error.RunStateUnavailable;
     const generation = backend.root_generation;
     while (true) {
-        if (cache.retainRunTableIndex(path, run.id, generation)) |retained| return retained;
-        try cache.beginLoad(path, run.id, generation, .run_table_index);
-        defer cache.finishLoad(path, run.id, generation, .run_table_index);
-        if (cache.retainRunTableIndex(path, run.id, generation)) |retained| return retained;
-        if (cache.retainRunTableRaw(path, run.id, generation)) |retained_raw| {
+        if (try cache.retainRunTableIndexWithAdmission(path, run.id, generation, control)) |retained| return checkedCacheHandle(retained, control);
+        var load_claim = try cache.beginLoadClaim(path, run.id, generation, .run_table_index, 0, 0, control);
+        defer load_claim.transferToCache();
+        if (control) |budget| try budget.checkpoint();
+        if (try cache.retainRunTableIndexWithAdmission(path, run.id, generation, control)) |retained| return checkedCacheHandle(retained, control);
+        if (try cache.retainRunTableRawWithAdmission(path, run.id, generation, control)) |retained_raw| {
             var raw_handle = retained_raw;
-            defer raw_handle.release();
-            const index = try decodeRunTableIndexWithStats(backend, cache.valueAllocator(), raw_handle.runTableRaw());
-            return try cache.putRunTableIndex(path, run.id, generation, index);
+            defer raw_handle.releaseWithAdmission(control);
+            const start_ns = backend.readStatsNowNs();
+            const result = cache.decodeRunTableIndexWithAdmission(path, raw_handle.runTableRaw(), control);
+            backend.recordTableIndexDecode(backend.readStatsElapsedNs(start_ns));
+            var decoded = try result;
+            defer decoded.deinit();
+            return checkedCacheHandle(try decoded.publish(run.id, generation, control), control);
         }
-        const index = try loadRunTableIndexWithStats(backend, cache.valueAllocator(), path);
-        return try cache.putRunTableIndex(path, run.id, generation, index);
+        const start_ns = backend.readStatsNowNs();
+        const result = cache.loadRunTableIndexWithAdmission(backend.storage.?, path, control);
+        backend.recordTableIndexLoad(backend.readStatsElapsedNs(start_ns));
+        var loaded = try result;
+        defer loaded.deinit();
+        return checkedCacheHandle(try loaded.publish(run.id, generation, control), control);
     }
 }
 
@@ -6828,6 +6993,11 @@ fn loadRunTableBlockHandle(
     );
 }
 
+fn loadRunTableBlockHandleWithAdmission(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, retain_block: bool, control: ?read_admission.Port) !cache_mod.Handle {
+    const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+    return loadRunTableBlockHandleAtOffsetControlled(backend, run, absolute_offset, window.physicalLen(), window.compression, window.len, window.checksum, retain_block, control);
+}
+
 fn loadRunTableBlockHandleAtOffset(
     backend: anytype,
     run: *Run,
@@ -6838,35 +7008,46 @@ fn loadRunTableBlockHandleAtOffset(
     checksum: u32,
     retain_block: bool,
 ) !cache_mod.Handle {
+    return loadRunTableBlockHandleAtOffsetControlled(backend, run, absolute_offset, physical_len, compression, logical_len, checksum, retain_block, null);
+}
+
+fn loadRunTableBlockHandleAtOffsetControlled(
+    backend: anytype,
+    run: *Run,
+    absolute_offset: u64,
+    physical_len: u32,
+    compression: lsm_table_file.BlockCompression,
+    logical_len: u32,
+    checksum: u32,
+    retain_block: bool,
+    control: ?read_admission.Port,
+) !cache_mod.Handle {
     const cache = backend.options.cache orelse return error.RunStateUnavailable;
     const path = run.path orelse return error.RunStateUnavailable;
     const generation = backend.root_generation;
     while (true) {
-        if (cache.retainRunTableBlock(path, run.id, generation, absolute_offset, physical_len)) |retained| {
+        if (control) |budget| try budget.checkpoint();
+        if (try cache.retainRunTableBlockWithAdmission(path, run.id, generation, absolute_offset, physical_len, control)) |retained| {
             backend.recordSharedBlockCacheHit();
-            return retained;
+            return checkedCacheHandle(retained, control);
         }
-        try cache.beginLoadWithBlock(path, run.id, generation, .run_table_block, absolute_offset, physical_len);
-        defer cache.finishLoadWithBlock(path, run.id, generation, .run_table_block, absolute_offset, physical_len);
-        if (cache.retainRunTableBlock(path, run.id, generation, absolute_offset, physical_len)) |retained| {
+        var load_claim = try cache.beginLoadClaim(path, run.id, generation, .run_table_block, absolute_offset, physical_len, control);
+        defer load_claim.transferToCache();
+        if (control) |budget| try budget.checkpoint();
+        if (try cache.retainRunTableBlockWithAdmission(path, run.id, generation, absolute_offset, physical_len, control)) |retained| {
             backend.recordSharedBlockCacheHit();
-            return retained;
+            return checkedCacheHandle(retained, control);
         }
         backend.recordSharedBlockCacheMiss();
-        const block = try loadRunTableDecodedBlockWithStats(
-            backend,
-            cache.valueAllocator(),
-            path,
-            absolute_offset,
-            physical_len,
-            compression,
-            logical_len,
-            checksum,
-        );
-        return if (retain_block)
-            try cache.putRunTableBlock(path, run.id, generation, absolute_offset, physical_len, block)
-        else
-            try cache.putTransientRunTableBlock(path, run.id, generation, absolute_offset, physical_len, block);
+        const Reader = struct {
+            backend: @TypeOf(backend),
+            pub fn readFileRangeAlloc(self: @This(), allocator: Allocator, block_path: []const u8, offset: u64, len: usize) ![]u8 {
+                return loadRunTableBlockWithStats(self.backend, allocator, block_path, offset, len);
+            }
+        };
+        var decoded = try cache.loadRunTableBlockWithAdmission(Reader{ .backend = backend }, path, absolute_offset, physical_len, compression, logical_len, checksum, control);
+        defer decoded.deinit();
+        return checkedCacheHandle(try decoded.publish(run.id, generation, retain_block, control), control);
     }
 }
 
@@ -6886,8 +7067,8 @@ fn loadRunTablePhysicalBlockHandleAtOffset(
             backend.recordSharedBlockCacheHit();
             return retained;
         }
-        try cache.beginLoadWithBlock(path, run.id, generation, .run_table_physical_block, absolute_offset, physical_len);
-        defer cache.finishLoadWithBlock(path, run.id, generation, .run_table_physical_block, absolute_offset, physical_len);
+        var load_claim = try cache.beginLoadClaim(path, run.id, generation, .run_table_physical_block, absolute_offset, physical_len, null);
+        defer load_claim.transferToCache();
         if (cache.retainRunTablePhysicalBlock(path, run.id, generation, absolute_offset, physical_len)) |retained| {
             backend.recordSharedBlockCacheHit();
             return retained;
@@ -7118,6 +7299,10 @@ fn stateForRun(backend: anytype, run: *Run) !*const State {
 }
 
 fn tableForRunLocked(backend: anytype, run: *Run) !*const lsm_table_file.BorrowedDecoded {
+    return tableForRunLockedWithAdmission(backend, run, null);
+}
+
+fn tableForRunLockedWithAdmission(backend: anytype, run: *Run, control: ?read_admission.Port) !*const lsm_table_file.BorrowedDecoded {
     const path = run.path orelse return error.RunStateUnavailable;
     if (run.cached_table_index) |index| {
         if (!(index < backend.run_table_cache.items.len and
@@ -7128,7 +7313,7 @@ fn tableForRunLocked(backend: anytype, run: *Run) !*const lsm_table_file.Borrowe
         }
     }
     if (run.cached_table_index == null) {
-        run.cached_table_index = try backend.getCachedRunTableIndex(path, run.id);
+        run.cached_table_index = try backend.getCachedRunTableIndexWithAdmission(path, run.id, control);
     }
     return backend.getCachedRunTableByIndex(run.cached_table_index.?);
 }
@@ -7144,7 +7329,21 @@ fn tableForRunMaybeLocked(backend: anytype, run: *Run, backend_locked: bool) !*c
     return try tableForRun(backend, run);
 }
 
+fn tableForRunMaybeLockedWithAdmission(backend: anytype, run: *Run, backend_locked: bool, control: ?read_admission.Port) !*const lsm_table_file.BorrowedDecoded {
+    const budget = control orelse return tableForRunMaybeLocked(backend, run, backend_locked);
+    try budget.checkpoint();
+    const locked = if (!backend_locked) try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget) else false;
+    defer unlockBackend(@TypeOf(backend.*), backend, locked);
+    const result = try tableForRunLockedWithAdmission(backend, run, budget);
+    try budget.checkpoint();
+    return result;
+}
+
 fn indexForRunNoCacheLocked(backend: anytype, run: *Run) !*const lsm_table_file.TableIndex {
+    return indexForRunNoCacheLockedWithAdmission(backend, run, null);
+}
+
+fn indexForRunNoCacheLockedWithAdmission(backend: anytype, run: *Run, control: ?read_admission.Port) !*const lsm_table_file.TableIndex {
     const path = run.path orelse return error.RunStateUnavailable;
     if (run.cached_index_index) |index| {
         if (!(index < backend.run_index_cache.items.len and
@@ -7155,7 +7354,7 @@ fn indexForRunNoCacheLocked(backend: anytype, run: *Run) !*const lsm_table_file.
         }
     }
     if (run.cached_index_index == null) {
-        run.cached_index_index = try backend.getCachedRunIndexIndex(path, run.id);
+        run.cached_index_index = try backend.getCachedRunIndexIndexWithAdmission(path, run.id, control);
     }
     return backend.getCachedRunIndexByIndex(run.cached_index_index.?);
 }
@@ -7169,6 +7368,16 @@ fn indexForRunNoCache(backend: anytype, run: *Run) !*const lsm_table_file.TableI
 fn indexForRunNoCacheMaybeLocked(backend: anytype, run: *Run, backend_locked: bool) !*const lsm_table_file.TableIndex {
     if (backend_locked) return try indexForRunNoCacheLocked(backend, run);
     return try indexForRunNoCache(backend, run);
+}
+
+fn indexForRunNoCacheMaybeLockedWithAdmission(backend: anytype, run: *Run, backend_locked: bool, control: ?read_admission.Port) !*const lsm_table_file.TableIndex {
+    const budget = control orelse return indexForRunNoCacheMaybeLocked(backend, run, backend_locked);
+    try budget.checkpoint();
+    const locked = if (!backend_locked) try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget) else false;
+    defer unlockBackend(@TypeOf(backend.*), backend, locked);
+    const result = try indexForRunNoCacheLockedWithAdmission(backend, run, budget);
+    try budget.checkpoint();
+    return result;
 }
 
 const OwnedTableEntry = struct {

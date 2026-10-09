@@ -17,7 +17,7 @@ const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
 const http = @import("antfly_runtime_abi").http_abi;
 
-pub const version: u32 = 8;
+pub const version: u32 = 10;
 // Only options are JSON metadata. The application payload is carried raw.
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
@@ -184,7 +184,7 @@ pub const Provider = struct {
     }
 };
 
-pub fn admittedCpuSlots(context: *const bridge.ProviderInvokeContext) !u32 {
+pub fn admittedCpuSlots(context: anytype) !u32 {
     if (context.runnable) |borrow| {
         try borrow.validate();
         if (context.admitted_cpu_slots != 0) return error.InvalidArgument;
@@ -335,6 +335,15 @@ pub const Http = struct {
     headers: []const Header,
     params: []const Header,
     has_body: bool,
+    deadline_ns: ?u64 = null,
+    admitted_cpu_slots: u32 = 0,
+    phase_handoff: bool = false,
+
+    pub fn validate(self: Http) !void {
+        if (self.admitted_cpu_slots > 65535 or
+            (self.phase_handoff and self.admitted_cpu_slots == 0))
+            return error.InvalidRunnableDemand;
+    }
 };
 pub const HttpResponse = struct { status: u16, headers: []const Header };
 pub const Reservation = struct { lease: usize = 0, amounts: bridge.AdmissionAmounts };
@@ -454,4 +463,33 @@ fn checkNumericRoundTrip(alloc: std.mem.Allocator) !void {
 
 test "inference worker typed numeric responses preserve ownership under allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkNumericRoundTrip, .{});
+}
+
+test "inference worker HTTP requires valid scalar demand for acknowledged phases" {
+    var input = Http{
+        .route = "/ai/v1/generate",
+        .method = .post,
+        .path = "/ai/v1/generate",
+        .query = null,
+        .headers = &.{},
+        .params = &.{},
+        .has_body = false,
+        .deadline_ns = 1234,
+        .phase_handoff = true,
+    };
+    try std.testing.expectError(error.InvalidRunnableDemand, input.validate());
+    input.admitted_cpu_slots = 2;
+    try input.validate();
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, input, .{});
+    defer std.testing.allocator.free(encoded);
+    const decoded = try std.json.parseFromSlice(Http, std.testing.allocator, encoded, .{});
+    defer decoded.deinit();
+    try decoded.value.validate();
+    try std.testing.expectEqual(@as(?u64, 1234), decoded.value.deadline_ns);
+    try std.testing.expectEqual(@as(u32, 2), decoded.value.admitted_cpu_slots);
+    try std.testing.expect(decoded.value.phase_handoff);
+    input.admitted_cpu_slots = 65536;
+    try std.testing.expectError(error.InvalidRunnableDemand, input.validate());
+    input.phase_handoff = false;
+    try std.testing.expectError(error.InvalidRunnableDemand, input.validate());
 }

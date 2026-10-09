@@ -9,7 +9,7 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 5;
+pub const abi_version: u32 = 8;
 pub const Class = enum(c_int) { query, write, inference, background, control };
 pub const Wait = enum(c_int) { resource, output };
 
@@ -64,6 +64,29 @@ pub const Completion = extern struct {
     }
 };
 
+/// Trusted physical cleanup fence, reserved before resource publication.
+/// It may activate after foreground expiry/close and conveys no write authority.
+pub const Cleanup = extern struct {
+    version: u32 = abi_version,
+    struct_size: u32 = @sizeOf(@This()),
+    io: *const native.IoBorrow,
+    clock_io: ?*const native.IoBorrow = null,
+    deadline_ns: u64,
+    native_deadline: u8 = 0,
+    /// When set, deadline_ns is a finite duration reserved before publication,
+    /// started once on cleanup activation in the selected owner clock.
+    activation_budget: u8 = 0,
+    reserved: [6]u8 = @splat(0),
+
+    pub fn validate(self: *const Cleanup) !void {
+        // Inspect the prefix before accessing fields from a foreign layout.
+        if (self.version != abi_version or self.struct_size != @sizeOf(Cleanup)) return error.UnsupportedVersion;
+        if (self.native_deadline > 1 or self.activation_budget > 1 or !std.mem.allEqual(u8, &self.reserved, 0)) return error.InvalidArgument;
+        if (self.native_deadline != 0 and self.clock_io != null) return error.InvalidArgument;
+        if (self.activation_budget != 0 and self.deadline_ns == 0) return error.InvalidArgument;
+    }
+};
+
 pub const Owner = extern struct {
     version: u32 = abi_version,
     struct_size: u32 = @sizeOf(@This()),
@@ -80,6 +103,11 @@ pub const Owner = extern struct {
     resize_team: ?*const fn (*anyopaque, usize) callconv(.c) errors.Status = null,
     reserve_completion: ?*const fn (*anyopaque, *const Completion) callconv(.c) errors.Status = null,
     activate_completion: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+    reserve_cleanup: ?*const fn (*anyopaque, *const Cleanup) callconv(.c) errors.Status = null,
+    activate_cleanup: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+    /// Remaining time in the already activated completion's original clock.
+    /// Observing this budget conveys no admission or fresh deadline authority.
+    completion_remaining_ns: ?*const fn (*anyopaque, *u64) callconv(.c) errors.Status = null,
 
     pub fn reserveCompletion(self: Owner, handle: *anyopaque, options: *const Completion) !void {
         if (!self.valid()) return error.UnsupportedVersion;
@@ -92,6 +120,31 @@ pub const Owner = extern struct {
     pub fn activateCompletion(self: Owner, handle: *anyopaque) !void {
         if (!self.valid()) return error.UnsupportedVersion;
         const callback = self.activate_completion orelse return error.UnsupportedOperation;
+        const status = callback(handle);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    pub fn completionRemainingNs(self: Owner, handle: *anyopaque) !u64 {
+        if (!self.valid()) return error.UnsupportedVersion;
+        const callback = self.completion_remaining_ns orelse return error.UnsupportedOperation;
+        var remaining: u64 = 0;
+        const status = callback(handle, &remaining);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+        if (remaining == 0) return error.DeadlineExceeded;
+        return remaining;
+    }
+
+    pub fn reserveCleanup(self: Owner, handle: *anyopaque, options: *const Cleanup) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        try options.validate();
+        const callback = self.reserve_cleanup orelse return error.UnsupportedOperation;
+        const status = callback(handle, options);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    pub fn activateCleanup(self: Owner, handle: *anyopaque) !void {
+        if (!self.valid()) return error.UnsupportedVersion;
+        const callback = self.activate_cleanup orelse return error.UnsupportedOperation;
         const status = callback(handle);
         if (!status.isOk()) return errors.errorFromStatus(status);
     }
@@ -154,6 +207,11 @@ pub const Borrowed = extern struct {
     resize_team: ?*const fn (*anyopaque, usize) callconv(.c) errors.Status = null,
     reserve_completion: ?*const fn (*anyopaque, *const Completion) callconv(.c) errors.Status = null,
     activate_completion: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+    reserve_cleanup: ?*const fn (*anyopaque, *const Cleanup) callconv(.c) errors.Status = null,
+    activate_cleanup: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
+    /// Remaining time in the already activated completion's original clock.
+    /// Observing this budget conveys no admission or fresh deadline authority.
+    completion_remaining_ns: ?*const fn (*anyopaque, *u64) callconv(.c) errors.Status = null,
 
     pub fn reserveCompletion(self: Borrowed, options: *const Completion) !void {
         try self.validate();
@@ -166,6 +224,31 @@ pub const Borrowed = extern struct {
     pub fn activateCompletion(self: Borrowed) !void {
         try self.validate();
         const callback = self.activate_completion orelse return error.UnsupportedOperation;
+        const status = callback(self.context);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    pub fn completionRemainingNs(self: Borrowed) !u64 {
+        try self.validate();
+        const callback = self.completion_remaining_ns orelse return error.UnsupportedOperation;
+        var remaining: u64 = 0;
+        const status = callback(self.context, &remaining);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+        if (remaining == 0) return error.DeadlineExceeded;
+        return remaining;
+    }
+
+    pub fn reserveCleanup(self: Borrowed, options: *const Cleanup) !void {
+        try self.validate();
+        try options.validate();
+        const callback = self.reserve_cleanup orelse return error.UnsupportedOperation;
+        const status = callback(self.context, options);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+
+    pub fn activateCleanup(self: Borrowed) !void {
+        try self.validate();
+        const callback = self.activate_cleanup orelse return error.UnsupportedOperation;
         const status = callback(self.context);
         if (!status.isOk()) return errors.errorFromStatus(status);
     }
@@ -206,6 +289,9 @@ pub const Borrowed = extern struct {
             .resize_team = owner.resize_team,
             .reserve_completion = owner.reserve_completion,
             .activate_completion = owner.activate_completion,
+            .reserve_cleanup = owner.reserve_cleanup,
+            .activate_cleanup = owner.activate_cleanup,
+            .completion_remaining_ns = owner.completion_remaining_ns,
         };
         try borrow.validate();
         return borrow;
@@ -492,4 +578,74 @@ test "completion ABI rejects old prefixes and malformed options before callbacks
     try std.testing.expectError(error.UnsupportedVersion, Owner.read(@ptrCast(&old)));
     try std.testing.expectError(error.UnsupportedVersion, Borrowed.read(@ptrCast(&old)));
     try std.testing.expectError(error.UnsupportedVersion, (@as(*const Completion, @ptrCast(&old))).validate());
+}
+
+test "completion ABI remaining budget rejects legacy headers and absent authority" {
+    const Fake = struct {
+        calls: usize = 0,
+        remaining: u64 = 17,
+        fn check(_: *anyopaque) callconv(.c) errors.Status {
+            return .ok;
+        }
+        fn transition(_: *anyopaque, _: c_int) callconv(.c) errors.Status {
+            return .ok;
+        }
+        fn budget(raw: *anyopaque, out: *u64) callconv(.c) errors.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            out.* = self.remaining;
+            return .ok;
+        }
+    };
+    var fake: Fake = .{};
+    var borrowed: Borrowed = .{ .context = &fake, .cpu_slots = 1, .parent_class = @backingInt(Class.write), .checkpoint = Fake.check, .park = Fake.transition, .enter = Fake.transition };
+    try std.testing.expectError(error.UnsupportedOperation, borrowed.completionRemainingNs());
+    borrowed.completion_remaining_ns = Fake.budget;
+    borrowed.version = 6;
+    try std.testing.expectError(error.UnsupportedVersion, borrowed.completionRemainingNs());
+    borrowed.version = abi_version;
+    borrowed.struct_size -= 1;
+    try std.testing.expectError(error.UnsupportedVersion, borrowed.completionRemainingNs());
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    borrowed.struct_size = @sizeOf(Borrowed);
+    try std.testing.expectEqual(@as(u64, 17), try borrowed.completionRemainingNs());
+    fake.remaining = 0;
+    try std.testing.expectError(error.DeadlineExceeded, borrowed.completionRemainingNs());
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+}
+
+test "completion ABI cleanup activation budget rejects legacy semantics before dispatch" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn check(_: *anyopaque) callconv(.c) errors.Status {
+            return .ok;
+        }
+        fn transition(_: *anyopaque, _: c_int) callconv(.c) errors.Status {
+            return .ok;
+        }
+        fn reserve(raw: *anyopaque, options: *const Cleanup) callconv(.c) errors.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(options.activation_budget == 1 and options.deadline_ns == 10);
+            self.calls += 1;
+            return .ok;
+        }
+    };
+    var fake: Fake = .{};
+    const borrowed: Borrowed = .{ .context = &fake, .cpu_slots = 1, .parent_class = @backingInt(Class.query), .checkpoint = Fake.check, .park = Fake.transition, .enter = Fake.transition, .reserve_cleanup = Fake.reserve };
+    var options: Cleanup = .{ .io = @ptrFromInt(8), .deadline_ns = 10, .activation_budget = 1 };
+    options.version = 7;
+    try std.testing.expectError(error.UnsupportedVersion, borrowed.reserveCleanup(&options));
+    options.version = abi_version;
+    options.activation_budget = 2;
+    try std.testing.expectError(error.InvalidArgument, borrowed.reserveCleanup(&options));
+    options.activation_budget = 1;
+    options.deadline_ns = 0;
+    try std.testing.expectError(error.InvalidArgument, borrowed.reserveCleanup(&options));
+    options.deadline_ns = 10;
+    options.reserved[0] = 1;
+    try std.testing.expectError(error.InvalidArgument, borrowed.reserveCleanup(&options));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    options.reserved = @splat(0);
+    try borrowed.reserveCleanup(&options);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
 }

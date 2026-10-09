@@ -48,6 +48,12 @@ pub const Store = struct {
     }
 };
 
+/// Deep copy into an arena; partial allocation is reclaimed by that arena.
+/// Used by both cursor spooling and stream request snapshots.
+pub fn cloneValue(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Value {
+    return clone(alloc, value, 0);
+}
+
 fn clone(alloc: std.mem.Allocator, value: std.json.Value, depth: usize) !std.json.Value {
     if (depth > 128) return error.ProgramLimitExceeded;
     return switch (value) {
@@ -82,5 +88,5 @@ test "pgwire cursor spool bounds bytes rows and preserves typed nulls" {
         defer std.testing.allocator.free(large);
         try std.testing.expectError(error.OutOfMemory, spool.append(.{ .columns = result.columns, .rows = &.{&.{.{ .string = large }}}, .command_tag = "SELECT" }, 3));
     }
-    try std.testing.expectEqual(@as(usize, 0), budget.used);
+    try std.testing.expectEqual(@as(usize, 0), budget.used.load(.acquire));
 }

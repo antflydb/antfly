@@ -27,10 +27,35 @@ pub const Identity = struct {
     release: *const fn (*anyopaque, std.mem.Allocator) void,
 };
 
+/// Borrowed during open_stream. Retain before returning a stream that keeps
+/// frontend allocator state; release only after its last physical use. A lease
+/// is move-only: copying an acquired lease does not acquire another reference.
+pub const RetainedLifetime = struct {
+    context: *anyopaque,
+    retain_fn: *const fn (*anyopaque) void,
+    release_fn: *const fn (*anyopaque) void,
+
+    pub fn retain(self: RetainedLifetime) Lease {
+        self.retain_fn(self.context);
+        return .{ .lifetime = self };
+    }
+
+    pub const Lease = struct {
+        lifetime: ?RetainedLifetime = null,
+
+        pub fn release(self: *Lease) void {
+            const lifetime = self.lifetime orelse return;
+            self.lifetime = null;
+            lifetime.release_fn(lifetime.context);
+        }
+    };
+};
+
 pub const Request = struct {
     /// Listener-owned flag only for draining an existing WITH HOLD cursor
     /// before COMMIT. It never admits a new statement or stream.
     completion_drain: bool = false,
+    retained_lifetime: ?RetainedLifetime = null,
     statement: []const u8,
     parameters: []const std.json.Value = &.{},
     parameter_types: []const Type = &.{},

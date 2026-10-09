@@ -1598,6 +1598,36 @@ pub fn metadataApplyStoreBindHotStandby(
     return .ok;
 }
 
+pub fn metadataApplyStoreTransactionRouting(
+    store_ptr: ?*anyopaque,
+    request: *const kernel_owner_abi.MetadataTransactionRoutingRequest,
+    out_json: *kernel_owner_abi.OwnedBytes,
+) callconv(.c) kernel_owner_abi.Status {
+    out_json.* = .{};
+    if (request.version != kernel_owner_abi.MetadataTransactionRoutingRequest.abi_version or request._reserved != 0) return .invalid_abi;
+    const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
+    const BudgetPort = @import("../storage/transaction_routing_budget_port.zig").Port;
+    const raw = request.control orelse return .invalid_argument;
+    if (@intFromPtr(raw) % @alignOf(BudgetPort) != 0) return .invalid_argument;
+    const control: *const BudgetPort = @ptrCast(@alignCast(raw));
+    control.validate() catch return .invalid_abi;
+    const alloc = @import("../storage/transaction_routing_memory_port.zig").receive(request.allocator) catch |err| return if (err == error.UnsupportedVersion) .invalid_abi else .invalid_argument;
+    const value = handle.store.captureTransactionRoutingProjection(alloc, request.group_id, control.*) catch |err| return storageOwnerStatusFromError(err);
+    defer handle.store.freeTables(alloc, value.tables);
+    defer handle.store.freeRanges(alloc, value.ranges);
+    defer handle.store.freeSplitTransitions(alloc, value.split_transitions);
+    defer handle.store.freeMergeTransitions(alloc, value.merge_transitions);
+    control.checkpoint() catch |err| return storageOwnerStatusFromError(err);
+    const encoded = @import("../storage/transaction_routing_memory_port.zig").encode(alloc, value) catch |err| return storageOwnerStatusFromError(err);
+    out_json.* = .{ .ptr = if (encoded.len == 0) null else encoded.ptr, .len = @intCast(encoded.len) };
+    control.checkpoint() catch |err| {
+        if (out_json.ptr) |bytes| alloc.free(bytes[0..@intCast(out_json.len)]);
+        out_json.* = .{};
+        return storageOwnerStatusFromError(err);
+    };
+    return .ok;
+}
+
 pub fn metadataApplyStoreProjection(
     store_ptr: ?*anyopaque,
     request: *const kernel_owner_abi.MetadataProjectionRequest,

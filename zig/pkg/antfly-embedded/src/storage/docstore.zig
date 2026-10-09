@@ -820,6 +820,17 @@ pub const DocStore = struct {
             return try self.openCursorAdapter();
         }
 
+        pub fn openCursorWithBudget(self: *Txn, budget: anytype) !CursorAdapter {
+            if (self.write != null or self.current_scan != null or self.probe != null) return error.ExecutionWaitUnsupported;
+            const admission = @import("../common/read_admission.zig");
+            var adapter = admission.Adapter(@TypeOf(budget)){ .budget = budget };
+            const payload = adapter.payload();
+            var physical = try self.read.?.openCursorWithAdmission(admission.Port.init(&payload));
+            errdefer physical.close();
+            // Wrapping transfers physical ownership only after allocation succeeds.
+            return try wrapPayloadCursor(self.alloc, physical, self.payload_session, false);
+        }
+
         fn openCursorAdapter(self: *Txn) !CursorAdapter {
             var cursor_adapter = try self.openPhysicalCursorAdapter();
             errdefer cursor_adapter.close();
@@ -1248,6 +1259,16 @@ pub const DocStore = struct {
         pub fn next(self: *@This()) !?backend_erased.Entry {
             return self.resolve(try self.physical.next());
         }
+        pub fn nextWithAdmission(self: *@This(), control: @import("../common/read_admission.zig").Port) !?backend_erased.Entry {
+            const result = try self.resolve(try self.physical.nextWithAdmission(control));
+            try control.checkpoint();
+            return result;
+        }
+        pub fn seekAtOrAfterWithAdmission(self: *@This(), key: []const u8, control: @import("../common/read_admission.zig").Port) !?backend_erased.Entry {
+            const result = try self.resolve(try self.physical.seekAtOrAfterWithAdmission(key, control));
+            try control.checkpoint();
+            return result;
+        }
         pub fn prev(self: *@This()) !?backend_erased.Entry {
             return self.resolve(try self.physical.prev());
         }
@@ -1336,6 +1357,26 @@ pub const DocStore = struct {
         var txn = try self.beginReadTxnUncheckedWithBlockCacheAdmission(admission);
         txn.portable_import_reader_owner = self;
         return txn;
+    }
+
+    /// Retain the original admission authority while acquiring the payload
+    /// policy and backend snapshot locks. Cursor and file I/O need separate support.
+    pub fn beginReadTxnWithBudget(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, budget: anytype) !Txn {
+        try budget.checkpoint();
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        try @import("../common/bounded_mutex.zig").lock(&self.payload_policy_mutex, payloadPolicyIo(), budget);
+        defer self.unlockPayloadPolicy();
+        const payload_session = try self.createPayloadSession();
+        errdefer if (payload_session) |session| session.release();
+        try budget.checkpoint();
+        const admission_mod = @import("../common/read_admission.zig");
+        var adapter = admission_mod.Adapter(@TypeOf(budget)){ .budget = budget };
+        const payload = adapter.payload();
+        var read = try self.runtime_store.beginReadWithAdmission(admission, admission_mod.Port.init(&payload));
+        errdefer read.abort();
+        try budget.checkpoint();
+        return .{ .payload_session = payload_session, .alloc = self.alloc, .read = read, .portable_import_reader_owner = self };
     }
 
     fn beginReadTxnUnchecked(self: *DocStore) !Txn {

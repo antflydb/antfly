@@ -41,6 +41,8 @@ const chunking_types = @import("antfly_chunking");
 pub const worker_module = @import("worker.zig");
 const worker_runtime = worker_module;
 
+const ExecutorAdmissionProvider = inference.server.ExecutorAdmissionProvider(@import("antfly_runtime_abi"));
+
 pub const LinkedInferenceState = struct {
     alloc: std.mem.Allocator,
     executor: @import("antfly_runtime_abi").io_abi.Receiver,
@@ -56,6 +58,7 @@ pub const LinkedInferenceState = struct {
     owned_ml_dir: ?[]u8,
     resource_budget_context: ?*LinkedResourceBudgetContext = null,
     runnable_owner: ?inference_bridge.runnable_abi.Lease = null,
+    executor_admission_provider: ?ExecutorAdmissionProvider = null,
     routes: std.ArrayListUnmanaged(*RouteState) = .empty,
     route_manifest: std.ArrayListUnmanaged(inference_bridge.RouteManifestEntry) = .empty,
     route_validator: httpx.Router,
@@ -925,8 +928,10 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
         return error.UnsupportedVersion;
     if (state.resource_budget_context != null)
         return error.ExternalResourceBudgetsAlreadyConfigured;
+    if (context.runnable_owner != null and state.node.request_surfaces_published)
+        return error.InvalidRunnableTransition;
     var runnable_lease = if (context.runnable_owner) |owner|
-        try inference_bridge.runnable_abi.Lease.init(owner.*)
+        try inference_bridge.runnable_abi.Lease.initFrom(owner)
     else
         null;
     errdefer if (runnable_lease) |*lease| lease.deinit();
@@ -954,6 +959,11 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
         std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
         return err;
     };
+    if (runnable_lease) |lease| {
+        state.executor_admission_provider = try ExecutorAdmissionProvider.init(state.alloc, lease.owner);
+        errdefer state.executor_admission_provider = null;
+        try state.node.configureExecutorAdmission(state.executor_admission_provider.?.admission());
+    }
     state.runnable_owner = runnable_lease;
 }
 
@@ -1026,8 +1036,12 @@ test "runnable execution worker budget scopes execution and discards failed outp
 }
 
 fn invokeBorrowedProvider(context: *const inference_bridge.ProviderInvokeContext, callback: *const fn (*const inference_bridge.ProviderInvokeContext) anyerror!void) !void {
+    return invokeBorrowedExecution(context, discardProviderResponse, callback);
+}
+
+fn invokeBorrowedExecution(context: anytype, comptime discard: anytype, callback: anytype) !void {
     const borrow = context.runnable orelse return error.InvalidRunnableTransition;
-    var transfer = try inference_bridge.runnable_abi.Transfer.init(borrow.*, .inference);
+    var transfer = try inference_bridge.runnable_abi.Transfer.initFrom(borrow, .inference);
     var scope = @import("inference_linalg").pool.WorkerScope.init(borrow.cpu_slots) catch |err| {
         try transfer.returnToParent();
         return err;
@@ -1065,7 +1079,7 @@ fn invokeBorrowedProvider(context: *const inference_bridge.ProviderInvokeContext
     const result = callback(context);
     checkpoint_scope.deinit();
     scope.deinit();
-    errdefer discardProviderResponse(context);
+    errdefer discard(context);
     // Authority and original-deadline failures take precedence over a newly
     // acquired provider response; owning cleanup cannot require another grant.
     if (phase.resume_error) |err| return err;
@@ -1241,6 +1255,27 @@ fn invokeProvider(context: *const inference_bridge.ProviderInvokeContext) !void 
     try execution_control.check();
 
     const response_json = switch (operation) {
+        .generate_json, .decide_json => blk: {
+            var parsed = try std.json.parseFromSlice(struct { body: []const u8 }, alloc, request_json, .{});
+            defer parsed.deinit();
+            var http_request = try httpx.Request.init(alloc, .POST, if (operation == .generate_json) "/ai/v1/generate" else "/ai/v1/decide");
+            defer http_request.deinit();
+            try http_request.headers.append("Content-Type", "application/json");
+            http_request.body = parsed.value.body;
+            var http_context = httpx.Context.init(alloc, call_io, &http_request);
+            defer http_context.deinit();
+            try inference.server.installHttpExecutionControl(&http_context, &execution_control);
+            var response = if (operation == .generate_json)
+                try state.node.generateContent(&http_context)
+            else
+                try state.node.decide(&http_context);
+            defer response.deinit();
+            try execution_control.check();
+            break :blk try std.json.Stringify.valueAlloc(alloc, .{
+                .status = response.status.code,
+                .body = response.body orelse "",
+            }, .{});
+        },
         .embed_dense_texts, .embed_dense_texts_with_context => blk: {
             var parsed = try std.json.parseFromSlice(ModelTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
@@ -2245,6 +2280,37 @@ fn localInferenceHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
 }
 
 pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleContext) !void {
+    const slots = try worker_runtime.wire.admittedCpuSlots(context);
+    if (context.has_deadline > 1) return error.InvalidArgument;
+    if (context.runnable != null)
+        return invokeBorrowedExecution(context, discardHttpResponse, handleHttp);
+    if (slots != 0) {
+        const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
+        if (route.owner.worker != null) return error.InvalidRunnableTransition;
+        var scope = try @import("inference_linalg").pool.WorkerScope.init(slots);
+        defer scope.deinit();
+        errdefer discardHttpResponse(context);
+        return handleHttp(context);
+    }
+    return handleHttp(context);
+}
+
+fn discardHttpResponse(context: *const inference_bridge.HttpHandleContext) void {
+    if (context.out_response_handle.*) |response| {
+        linkedInferenceDestroyHttpResponse(response);
+        context.out_response_handle.* = null;
+        context.out_response.* = std.mem.zeroes(@import("antfly_runtime_abi").http_abi.HttpResponseView);
+    }
+}
+
+fn checkHttpControls(context: *const inference_bridge.HttpHandleContext) !void {
+    if (context.cancellation.requested()) return error.Canceled;
+    if (context.has_deadline != 0 and platform_time.monotonicNs() >= context.deadline_ns)
+        return error.Timeout;
+}
+
+fn handleHttp(context: *const inference_bridge.HttpHandleContext) !void {
+    try checkHttpControls(context);
     const route: *RouteState = @ptrCast(@alignCast(context.route_handle));
     const state = route.owner;
     const alloc = state.alloc;
@@ -2275,10 +2341,17 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
         params[i] = .{ .name = param.name.slice(), .value = param.value.slice() };
     }
 
-    var http_context = httpx.Context.init(alloc, state.io, &http_request);
+    var serial_executor = borrowedProviderExecutor(alloc);
+    defer serial_executor.deinit();
+    const call_io = if (context.runnable != null or context.admitted_cpu_slots != 0)
+        serial_executor.io()
+    else
+        state.io;
+    var http_context = httpx.Context.init(alloc, call_io, &http_request);
     defer http_context.deinit();
     http_context.params = params;
     runtime_http_bridge.installInbound(&http_context, &context.cancellation, &context.body_source, &context.stream);
+    http_context.application_deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null;
     var response = if (state.worker) |worker| remote: {
         // Preserve admission-before-upload, including lazy streaming bodies.
         const admitted = request.method != .get;
@@ -2294,6 +2367,7 @@ pub fn linkedInferenceHandleHttp(context: *const inference_bridge.HttpHandleCont
         break :remote try worker_runtime.invokeHttp(worker, route.path, context);
     } else try route.handler.invoke(&http_context);
     errdefer response.deinit();
+    try checkHttpControls(context);
 
     const response_state = try alloc.create(HttpResponseState);
     errdefer alloc.destroy(response_state);
@@ -2364,6 +2438,7 @@ pub fn linkedInferenceDestroy(handle: *anyopaque) void {
     state.runtime_config.deinit();
     if (state.owned_models_dir) |path| alloc.free(path);
     if (state.owned_ml_dir) |path| alloc.free(path);
+    state.executor_admission_provider = null;
     if (state.runnable_owner) |*lease| lease.deinit();
     alloc.destroy(state);
 }

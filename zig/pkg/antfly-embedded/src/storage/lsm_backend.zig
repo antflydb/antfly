@@ -1361,6 +1361,7 @@ pub const Backend = struct {
 
         const Value = union(enum) {
             owned: lsm_table_file.BorrowedDecoded,
+            admitted_owned: cache_mod.Cache.DecodedTable,
             shared: SharedValue,
         };
 
@@ -1372,6 +1373,7 @@ pub const Backend = struct {
             allocator.free(self.path);
             switch (self.value) {
                 .owned => |*owned_table| owned_table.deinit(allocator),
+                .admitted_owned => |*owned_table| owned_table.deinit(),
                 .shared => |*shared| shared.deinit(),
             }
             self.* = undefined;
@@ -1380,6 +1382,7 @@ pub const Backend = struct {
         pub fn table(self: *const CachedRunTable) *const lsm_table_file.BorrowedDecoded {
             return switch (self.value) {
                 .owned => |*owned| owned,
+                .admitted_owned => |*owned| &owned.table,
                 .shared => |*shared| &shared.table,
             };
         }
@@ -6927,8 +6930,8 @@ pub const Backend = struct {
             const generation = self.root_generation;
             var handle = while (true) {
                 if (cache.retainRunState(path, run_id, generation)) |retained| break retained;
-                try cache.beginLoad(path, run_id, generation, .run_state);
-                defer cache.finishLoad(path, run_id, generation, .run_state);
+                var load_claim = try cache.beginLoadClaim(path, run_id, generation, .run_state, 0, 0, null);
+                defer load_claim.transferToCache();
                 if (cache.retainRunState(path, run_id, generation)) |retained| break retained;
                 const loaded = try repository_mod.loadRunStateAllocWithStorage(self.storage.?, cache.valueAllocator(), path);
                 break try cache.putRunState(path, run_id, generation, loaded);
@@ -6970,7 +6973,13 @@ pub const Backend = struct {
     }
 
     pub fn getCachedRunIndexIndex(self: *Backend, path: []const u8, run_id: u64) !usize {
+        return self.getCachedRunIndexIndexWithAdmission(path, run_id, null);
+    }
+
+    pub fn getCachedRunIndexIndexWithAdmission(self: *Backend, path: []const u8, run_id: u64, control: ?@import("../common/read_admission.zig").Port) !usize {
+        if (control) |budget| try budget.checkpoint();
         for (self.run_index_cache.items, 0..) |*cached, i| {
+            if (control) |budget| try budget.checkpoint();
             if (cached.run_id == run_id and std.mem.eql(u8, cached.path, path)) return i;
         }
 
@@ -6980,10 +6989,11 @@ pub const Backend = struct {
         const loaded = try self.allocator.create(lsm_table_file.TableIndex);
         errdefer self.allocator.destroy(loaded);
         const start_ns = self.readStatsNowNs();
-        const loaded_index = repository_mod.loadRunTableIndexAllocWithStorage(self.storage.?, self.allocator, path);
+        const loaded_index = repository_mod.loadRunTableIndexAllocWithStorageAndAdmission(self.storage.?, self.allocator, path, control);
         self.recordTableIndexLoad(self.readStatsElapsedNs(start_ns));
         loaded.* = try loaded_index;
         errdefer loaded.deinit(self.allocator);
+        if (control) |budget| try budget.checkpoint();
         try self.run_index_cache.append(self.allocator, .{
             .run_id = run_id,
             .path = cached_path,
@@ -6993,7 +7003,13 @@ pub const Backend = struct {
     }
 
     pub fn getCachedRunTableIndex(self: *Backend, path: []const u8, run_id: u64) !usize {
+        return self.getCachedRunTableIndexWithAdmission(path, run_id, null);
+    }
+
+    pub fn getCachedRunTableIndexWithAdmission(self: *Backend, path: []const u8, run_id: u64, control: ?@import("../common/read_admission.zig").Port) !usize {
+        if (control) |budget| try budget.checkpoint();
         for (self.run_table_cache.items, 0..) |*cached, i| {
+            if (control) |budget| try budget.checkpoint();
             if (cached.run_id == run_id and std.mem.eql(u8, cached.path, path)) return i;
         }
 
@@ -7003,49 +7019,64 @@ pub const Backend = struct {
         if (self.options.cache) |cache| {
             const generation = self.root_generation;
             var raw_handle = while (true) {
-                if (cache.retainRunTableRaw(path, run_id, generation)) |retained| break retained;
-                try cache.beginLoad(path, run_id, generation, .run_table_raw);
-                defer cache.finishLoad(path, run_id, generation, .run_table_raw);
-                if (cache.retainRunTableRaw(path, run_id, generation)) |retained| break retained;
+                if (try cache.retainRunTableRawWithAdmission(path, run_id, generation, control)) |retained| break retained;
+                var load_claim = try cache.beginLoadClaim(path, run_id, generation, .run_table_raw, 0, 0, control);
+                defer load_claim.transferToCache();
+                if (try cache.retainRunTableRawWithAdmission(path, run_id, generation, control)) |retained| break retained;
                 const max_read_bytes = repository_mod.maxRunFileReadBytes();
-                const raw = self.storage.?.readFileAlloc(cache.valueAllocator(), path, max_read_bytes) catch |err| {
+                break cache.readRunTableRawWithAdmission(self.storage.?, path, run_id, generation, max_read_bytes, control) catch |err| {
                     logStreamTooLongForPath(self.storage.?, path, max_read_bytes, "Backend.getCachedRunTableIndex.raw", err);
                     return err;
                 };
-                break try cache.putRunTableRaw(path, run_id, generation, raw);
             };
-            errdefer raw_handle.release();
+            errdefer if (control != null) raw_handle.releaseForAdmissionFailure() else raw_handle.release();
 
             var index_handle = while (true) {
-                if (cache.retainRunTableIndex(path, run_id, generation)) |retained| break retained;
-                try cache.beginLoad(path, run_id, generation, .run_table_index);
-                defer cache.finishLoad(path, run_id, generation, .run_table_index);
-                if (cache.retainRunTableIndex(path, run_id, generation)) |retained| break retained;
+                if (try cache.retainRunTableIndexWithAdmission(path, run_id, generation, control)) |retained| break retained;
+                var load_claim = try cache.beginLoadClaim(path, run_id, generation, .run_table_index, 0, 0, control);
+                defer load_claim.transferToCache();
+                if (try cache.retainRunTableIndexWithAdmission(path, run_id, generation, control)) |retained| break retained;
                 const start_ns = self.readStatsNowNs();
-                const decoded = lsm_table_file.decodeIndexAlloc(cache.valueAllocator(), raw_handle.runTableRaw());
+                const result = cache.decodeRunTableIndexWithAdmission(path, raw_handle.runTableRaw(), control);
                 self.recordTableIndexDecode(self.readStatsElapsedNs(start_ns));
-                const index = try decoded;
-                break try cache.putRunTableIndex(path, run_id, generation, index);
+                var decoded = try result;
+                defer decoded.deinit();
+                break try decoded.publish(run_id, generation, control);
             };
-            errdefer index_handle.release();
+            errdefer if (control != null) index_handle.releaseForAdmissionFailure() else index_handle.release();
 
             if (lsm_table_file.indexHasCompressedBlocks(index_handle.runTableIndex())) {
+                if (control) |budget| {
+                    var loaded = try cache.copyAndDecodeRunTableWithAdmission(self.allocator, raw_handle.runTableRaw(), budget);
+                    errdefer loaded.deinit();
+                    try budget.checkpoint();
+                    try self.run_table_cache.append(self.allocator, .{
+                        .run_id = run_id,
+                        .path = cached_path,
+                        .value = .{ .admitted_owned = loaded },
+                    });
+                    raw_handle.releaseWithAdmission(control);
+                    index_handle.releaseWithAdmission(control);
+                    return self.run_table_cache.items.len - 1;
+                }
                 const raw_copy = try self.allocator.dupe(u8, raw_handle.runTableRaw());
-                var loaded = lsm_table_file.decodeBorrowedOwnedAlloc(self.allocator, raw_copy) catch |err| {
+                var loaded = lsm_table_file.decodeBorrowedOwnedAllocWithAdmission(self.allocator, raw_copy, control) catch |err| {
                     self.allocator.free(raw_copy);
                     return err;
                 };
                 errdefer loaded.deinit(self.allocator);
+                if (control) |budget| try budget.checkpoint();
                 try self.run_table_cache.append(self.allocator, .{
                     .run_id = run_id,
                     .path = cached_path,
                     .value = .{ .owned = loaded },
                 });
-                raw_handle.release();
-                index_handle.release();
+                raw_handle.releaseWithAdmission(control);
+                index_handle.releaseWithAdmission(control);
                 return self.run_table_cache.items.len - 1;
             }
 
+            if (control) |budget| try budget.checkpoint();
             try self.run_table_cache.append(self.allocator, .{
                 .run_id = run_id,
                 .path = cached_path,
@@ -7058,8 +7089,9 @@ pub const Backend = struct {
             return self.run_table_cache.items.len - 1;
         }
 
-        var loaded = try repository_mod.loadRunTableBorrowedAllocWithStorage(self.storage.?, self.allocator, path);
+        var loaded = try repository_mod.loadRunTableBorrowedAllocWithStorageAndAdmission(self.storage.?, self.allocator, path, control);
         errdefer loaded.deinit(self.allocator);
+        if (control) |budget| try budget.checkpoint();
         try self.run_table_cache.append(self.allocator, .{
             .run_id = run_id,
             .path = cached_path,
@@ -25188,4 +25220,455 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "lsm routing cursor interrupts internal tombstone scans with original admission" {
+    const admission = @import("../common/read_admission.zig");
+    var backend = Backend.init(std.testing.allocator, .{ .wal_enabled = false, .flush_threshold = 10000 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    var key: [8]u8 = undefined;
+    for (0..64) |i| {
+        std.mem.writeInt(u64, &key, i, .big);
+        try write.put(&key, "value");
+    }
+    try write.commit();
+    var remove = try runtime.beginWrite();
+    for (0..63) |i| {
+        std.mem.writeInt(u64, &key, i, .big);
+        try remove.delete(&key);
+    }
+    try remove.commit();
+    const Budget = struct {
+        fail_at: usize,
+        checks: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            self.checks += 1;
+            if (self.checks == self.fail_at) return error.GenerationPublicationChanged;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var completed = false;
+    for (1..4096) |fail_at| {
+        var read = try runtime.beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var budget = Budget{ .fail_at = fail_at };
+        var adapter = admission.Adapter(*Budget){ .budget = &budget };
+        const payload = adapter.payload();
+        const control = admission.Port.init(&payload);
+        const found = cursor.seekAtOrAfterWithAdmission("", control) catch |err| {
+            try std.testing.expectEqual(error.GenerationPublicationChanged, err);
+            continue;
+        };
+        try std.testing.expect(found != null);
+        try std.testing.expectEqual(@as(u64, 63), std.mem.readInt(u64, found.?.key[0..8], .big));
+        try std.testing.expect(budget.checks > 32);
+        completed = true;
+        break;
+    }
+    try std.testing.expect(completed);
+}
+
+test "lsm routing cursor carries the original deadline into a held cache loader" {
+    const admission = @import("../common/read_admission.zig");
+    var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    var cache = Cache.init(std.testing.allocator, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/bounded-routing-cache", .{ .storage = memory.storage(), .cache = &cache, .wal_enabled = false, .flush_threshold = 1, .compact_threshold_runs = 10000 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    try write.put("doc:a", "value");
+    try write.commit();
+    try std.testing.expect(backend.runs.count() > 0);
+    const persisted_run = backend.runs.at(0);
+    const path = persisted_run.path orelse return error.TestExpectedPersistedRun;
+    var read = try runtime.beginRead();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    defer cursor.close();
+    cache.invalidatePath(path);
+    const generation = backend.root_generation;
+    try cache.beginLoad(path, persisted_run.id, generation, .run_table_index);
+    defer cache.finishLoad(path, persisted_run.id, generation, .run_table_index);
+    // Bound the test even if a regression reintroduces an unbudgeted wait.
+    const Rescue = struct {
+        fn run(done: *std.atomic.Value(bool), held: *Cache, held_path: []const u8, id: u64, gen: u64) void {
+            for (0..100) |_| {
+                if (done.load(.acquire)) return;
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch return;
+            }
+            held.finishLoad(held_path, id, gen, .run_table_index);
+        }
+    };
+    var done = std.atomic.Value(bool).init(false);
+    var rescue = try std.testing.io.concurrent(Rescue.run, .{ &done, &cache, path, persisted_run.id, generation });
+    defer {
+        done.store(true, .release);
+        rescue.await(std.testing.io);
+    }
+    const Budget = struct {
+        now_ns: u64 = 7 * std.time.ns_per_s,
+        deadline_ns: u64 = 8 * std.time.ns_per_s,
+        waits: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.now_ns >= self.deadline_ns) return error.CatalogRoutingSnapshotTimeout;
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            self.waits += 1;
+            self.now_ns = self.deadline_ns;
+        }
+    };
+    var budget = Budget{};
+    var adapter = admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    const result = cursor.seekAtOrAfterWithAdmission("doc:a", admission.Port.init(&payload));
+    done.store(true, .release);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, result);
+    try std.testing.expectEqual(@as(usize, 1), budget.waits);
+}
+
+test "lsm routing cursor cancels cold index decoding and resumes a clean loader" {
+    const admission = @import("../common/read_admission.zig");
+    var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    var cache = Cache.init(std.testing.allocator, 4 * 1024 * 1024);
+    defer cache.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/bounded-index-decode", .{
+        .storage = memory.storage(),
+        .cache = &cache,
+        .wal_enabled = false,
+        .flush_threshold = 1,
+        .compact_threshold_runs = 10000,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    var key: [8]u8 = undefined;
+    const value: [1024]u8 = @splat('v');
+    for (0..600) |i| {
+        std.mem.writeInt(u64, &key, i, .big);
+        try write.put(&key, &value);
+    }
+    try write.commit();
+    try std.testing.expect(backend.runs.count() > 0);
+    const path = backend.runs.at(0).path orelse return error.TestExpectedPersistedRun;
+    const Budget = struct {
+        checks: usize = 0,
+        fail_at: usize,
+        pub fn checkpoint(self: *@This()) !void {
+            self.checks += 1;
+            if (self.checks >= self.fail_at) return error.GenerationPublicationChanged;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var completed = false;
+    for (1..2048) |fail_at| {
+        cache.invalidatePath(path);
+        var read = try runtime.beginRead();
+        defer read.abort();
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var budget = Budget{ .fail_at = fail_at };
+        var adapter = admission.Adapter(*Budget){ .budget = &budget };
+        const payload = adapter.payload();
+        const result = cursor.seekAtOrAfterWithAdmission("", admission.Port.init(&payload));
+        // Every remaining registration must have transferred to a reserved
+        // cache owner; no request stack or failed foreground scope is retained.
+        for (cache.shards) |*shard| {
+            var pending = shard.pending_loads.iterator();
+            while (pending.next()) |item| {
+                var owned = false;
+                for (&shard.load_cleanup) |*slot| {
+                    if (slot.state.load(.acquire) == .pending and slot.identity == item.value_ptr.identity) owned = true;
+                }
+                try std.testing.expect(owned);
+            }
+        }
+        const CleanupBudget = struct {
+            checks: usize = 0,
+            pub fn checkpoint(self: *@This()) !void {
+                self.checks += 1;
+                if (self.checks > 64) return error.DeadlineExceeded;
+            }
+            pub fn waitForProgress(_: *@This()) !void {
+                return error.TestUnexpectedResult;
+            }
+        };
+        const foreground_checks = budget.checks;
+        var cleanup_budget = CleanupBudget{};
+        var cleanup_adapter = admission.Adapter(*CleanupBudget){ .budget = &cleanup_budget };
+        const cleanup_payload = cleanup_adapter.payload();
+        try cache.drainLoadCleanupWithAdmission(admission.Port.init(&cleanup_payload));
+        try std.testing.expectEqual(foreground_checks, budget.checks);
+        for (cache.shards) |*shard| try std.testing.expectEqual(@as(usize, 0), shard.pending_loads.count());
+        const found = result catch |err| {
+            try std.testing.expectEqual(error.GenerationPublicationChanged, err);
+            continue;
+        };
+        try std.testing.expect(found != null);
+        try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, found.?.key[0..8], .big));
+        try std.testing.expectEqualSlices(u8, &value, found.?.value);
+        try std.testing.expect(budget.checks > 30);
+        completed = true;
+        break;
+    }
+    try std.testing.expect(completed);
+}
+
+test "lsm backend loader ownership admits key bytes before storage and retries correct data" {
+    const resource_manager = @import("resource_manager.zig");
+    const admission = @import("../common/read_admission.zig");
+    var small = resource_manager.ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 1 },
+        .identity_allocator = std.testing.allocator,
+    });
+    defer small.deinit(std.testing.allocator);
+    var ample = resource_manager.ResourceManager.init(.{
+        .memory_budget = .{ .hard_limit_bytes = 1024 * 1024 },
+        .identity_allocator = std.testing.allocator,
+    });
+    defer ample.deinit(std.testing.allocator);
+    var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    var cache = Cache.init(std.testing.allocator, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/backend-owned-loaders", .{
+        .storage = memory.storage(),
+        .wal_enabled = false,
+        .flush_threshold = 1,
+        .compact_threshold_runs = 10000,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    try write.put("doc:a", "value");
+    try write.commit();
+    try std.testing.expect(backend.runs.count() > 0);
+    const run = backend.runs.at(0);
+    const path = run.path orelse return error.TestExpectedPersistedRun;
+    backend.options.cache = &cache;
+    cache.attachResourceManager(&small);
+    // A missing file would return a storage error if key admission were bypassed.
+    try std.testing.expectError(error.ResourceBudgetExceeded, backend.getCachedRunStateIndex("/missing-loader-state", 999));
+    try std.testing.expectError(error.ResourceBudgetExceeded, backend.getCachedRunTableIndex("/missing-loader-table", 999));
+    try std.testing.expectEqual(@as(usize, 0), backend.run_state_cache.items.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.run_table_cache.items.len);
+    try std.testing.expectEqual(@as(u64, 0), small.snapshot().memory.used_bytes);
+    cache.attachResourceManager(&ample);
+    const state_index = try backend.getCachedRunStateIndex(path, run.id);
+    const state = backend.getCachedRunStateByIndex(state_index);
+    try std.testing.expect(state.entries.items.len > 0);
+    _ = try backend.getCachedRunTableIndex(path, run.id);
+    // Physical loader exits transfer both keys and registry ownership. Every
+    // remaining registration must have an exact cache-owned cleanup identity.
+    var registrations: usize = 0;
+    for (cache.shards) |*shard| {
+        var iterator = shard.pending_loads.iterator();
+        while (iterator.next()) |item| {
+            registrations += 1;
+            var owned = false;
+            for (&shard.load_cleanup) |*slot| {
+                if (slot.state.load(.acquire) == .pending and slot.identity == item.value_ptr.identity) owned = true;
+            }
+            try std.testing.expect(owned);
+        }
+    }
+    try std.testing.expect(registrations > 0);
+    const Budget = struct {
+        pub fn checkpoint(_: *@This()) !void {}
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var budget = Budget{};
+    var adapter = admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    try cache.drainLoadCleanupWithAdmission(admission.Port.init(&payload));
+    for (cache.shards) |*shard| try std.testing.expectEqual(@as(usize, 0), shard.pending_loads.count());
+    var read = try runtime.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("value", try read.get("doc:a"));
+}
+
+test "lsm backend fallback reads interrupt internal decoding with original scope and retry" {
+    const admission = @import("../common/read_admission.zig");
+    for ([_]bool{ false, true }) |shared_cache| {
+        var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer memory.deinit();
+        var cache = Cache.init(std.testing.allocator, 4 * 1024 * 1024);
+        defer cache.deinit();
+        var backend = try Backend.open(std.testing.allocator, "/fallback-read-scope", .{
+            .storage = memory.storage(),
+            .wal_enabled = false,
+            .flush_threshold = 1,
+            .compact_threshold_runs = 10000,
+            .table_block_compression = .snappy_adaptive,
+        });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+        var write = try runtime.beginWrite();
+        var key: [8]u8 = undefined;
+        const value: [512]u8 = @splat('v');
+        for (0..600) |i| {
+            std.mem.writeInt(u64, &key, i, .big);
+            try write.put(&key, &value);
+        }
+        try write.commit();
+        const run = backend.runs.at(0);
+        const path = run.path orelse return error.TestExpectedPersistedRun;
+        backend.options.cache = if (shared_cache) &cache else null;
+        const Budget = struct {
+            checks: usize = 0,
+            fail_at: usize = std.math.maxInt(usize),
+            pub fn checkpoint(self: *@This()) !void {
+                self.checks += 1;
+                if (self.checks >= self.fail_at) return error.GenerationPublicationChanged;
+            }
+            pub fn waitForProgress(self: *@This()) !void {
+                try self.checkpoint();
+            }
+        };
+        for ([_]bool{ false, true }) |whole_table| {
+            var completed = false;
+            var late_failure = false;
+            for (1..512) |fail_at| {
+                var budget = Budget{ .fail_at = fail_at };
+                var adapter = admission.Adapter(*Budget){ .budget = &budget };
+                const payload = adapter.payload();
+                const control = admission.Port.init(&payload);
+                const result = if (whole_table)
+                    backend.getCachedRunTableIndexWithAdmission(path, run.id, control)
+                else
+                    backend.getCachedRunIndexIndexWithAdmission(path, run.id, control);
+                if (result) |index| {
+                    const count = if (whole_table) backend.getCachedRunTableByIndex(index).entryCount() else backend.getCachedRunIndexByIndex(index).entryCount();
+                    try std.testing.expect(count >= 600);
+                    try std.testing.expect(budget.checks > 8);
+                    completed = true;
+                    break;
+                } else |err| {
+                    try std.testing.expectEqual(error.GenerationPublicationChanged, err);
+                    if (fail_at > 8) late_failure = true;
+                    try std.testing.expectEqual(@as(usize, 0), if (whole_table) backend.run_table_cache.items.len else backend.run_index_cache.items.len);
+                    const original_checks = budget.checks;
+                    var cleanup = Budget{};
+                    var cleanup_adapter = admission.Adapter(*Budget){ .budget = &cleanup };
+                    const cleanup_payload = cleanup_adapter.payload();
+                    try cache.drainLoadCleanupWithAdmission(admission.Port.init(&cleanup_payload));
+                    try std.testing.expectEqual(original_checks, budget.checks);
+                    for (cache.shards) |*shard| try std.testing.expectEqual(@as(usize, 0), shard.pending_loads.count());
+                }
+            }
+            // Decoder checkpoint density can exceed the finite fault sweep.
+            // Keep every swept failure assertion, then prove the same physical
+            // source completes correctly through an independent healthy scope.
+            if (!completed) {
+                var fresh = Budget{};
+                var fresh_adapter = admission.Adapter(*Budget){ .budget = &fresh };
+                const fresh_payload = fresh_adapter.payload();
+                const fresh_control = admission.Port.init(&fresh_payload);
+                const index = if (whole_table)
+                    try backend.getCachedRunTableIndexWithAdmission(path, run.id, fresh_control)
+                else
+                    try backend.getCachedRunIndexIndexWithAdmission(path, run.id, fresh_control);
+                const count = if (whole_table) backend.getCachedRunTableByIndex(index).entryCount() else backend.getCachedRunIndexByIndex(index).entryCount();
+                try std.testing.expect(count >= 600);
+                try std.testing.expect(fresh.checks > 8);
+                completed = true;
+            }
+            try std.testing.expect(completed);
+            try std.testing.expect(late_failure);
+        }
+        var read = try runtime.beginRead();
+        defer read.abort();
+        std.mem.writeInt(u64, &key, 599, .big);
+        try std.testing.expectEqualStrings(&value, try read.get(&key));
+    }
+}
+
+test "lsm admitted successful cursor close transfers pins under held cache shards without borrowing expired scope" {
+    const admission = @import("../common/read_admission.zig");
+    var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+    defer memory.deinit();
+    var cache = Cache.init(std.testing.allocator, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try Backend.open(std.testing.allocator, "/controlled-cursor-close", .{
+        .storage = memory.storage(),
+        .cache = &cache,
+        .wal_enabled = false,
+        .flush_threshold = 1,
+        .compact_threshold_runs = 10000,
+    });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    try write.put("doc:a", "value");
+    try write.commit();
+    const Budget = struct {
+        checks: usize = 0,
+        expired: bool = false,
+        pub fn checkpoint(self: *@This()) !void {
+            self.checks += 1;
+            if (self.expired) return error.GenerationPublicationChanged;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var budget = Budget{};
+    var adapter = admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    var read = try runtime.beginRead();
+    defer read.abort();
+    var cursor = try read.openCursor();
+    var cursor_open = true;
+    defer if (cursor_open) cursor.close();
+    const found = try cursor.seekAtOrAfterWithAdmission("", admission.Port.init(&payload));
+    try std.testing.expect(found != null);
+    try std.testing.expectEqualStrings("doc:a", found.?.key);
+    try std.testing.expectEqualStrings("value", found.?.value);
+    const checks = budget.checks;
+    budget.expired = true;
+    const pending_before = cache.deferred_pin_releases.load(.acquire);
+    var held: usize = 0;
+    defer for (cache.shards[0..held]) |*shard| shard.mutex.unlock();
+    for (cache.shards) |*shard| {
+        try std.testing.expect(shard.mutex.tryLock());
+        held += 1;
+    }
+    cursor.close();
+    cursor_open = false;
+    for (cache.shards[0..held]) |*shard| shard.mutex.unlock();
+    held = 0;
+    try std.testing.expectEqual(checks, budget.checks);
+    try std.testing.expect(cache.deferred_pin_releases.load(.acquire) > pending_before);
+    // An independent admission collects the pins and can read the same data.
+    var fresh = Budget{};
+    var fresh_adapter = admission.Adapter(*Budget){ .budget = &fresh };
+    const fresh_payload = fresh_adapter.payload();
+    const fresh_port = admission.Port.init(&fresh_payload);
+    try cache.drainDeferredPinsWithAdmission(fresh_port);
+    try std.testing.expectEqual(@as(usize, 0), cache.deferred_pin_releases.load(.acquire));
+    try std.testing.expectEqual(checks, budget.checks);
+    var retry = try read.openCursor();
+    defer retry.close();
+    const again = try retry.seekAtOrAfterWithAdmission("", fresh_port);
+    try std.testing.expect(again != null);
+    try std.testing.expectEqualStrings("doc:a", again.?.key);
+    try std.testing.expectEqualStrings("value", again.?.value);
 }

@@ -91,6 +91,9 @@ pub const Server = struct {
         state.listener.deinit(state.config.io);
         std.debug.assert(state.active.load(.acquire) == 0);
         std.debug.assert(state.sessions.count() == 0);
+        if (state.foreground_memory) |*foreground| std.debug.assert(foreground.used.load(.acquire) == 0);
+        for (state.connection_slots) |*slot| std.debug.assert(!slot.in_use.load(.acquire));
+        state.memory.allocator().free(state.connection_slots);
         std.debug.assert(state.memory.used.load(.acquire) == 0);
         std.debug.assert(state.retained.used.load(.acquire) == 0);
         std.debug.assert(state.deadline_head == null);
@@ -110,7 +113,11 @@ const State = struct {
     next_pid: u32 = 0,
     sessions: std.AutoHashMapUnmanaged(i32, *protocol.Session) = .empty,
     memory: SharedBudget,
+    /// Ordinary data cannot consume the fixed pool or protected-frame reserve.
+    /// Its backing still charges every actual byte to the aggregate envelope.
+    foreground_memory: ?SharedBudget = null,
     retained: SharedBudget,
+    connection_slots: []ConnectionSlot = &.{},
     deadline_mutex: std.Io.Mutex = .init,
     deadline_wakeup: std.Io.Event = .unset,
     deadline_head: ?*DeadlineEntry = null,
@@ -123,7 +130,7 @@ const State = struct {
     };
 
     /// One deadline task for the listener, including unauthenticated sockets.
-    /// The list borrows stack entries only while their connection tasks live.
+    /// The list borrows stable connection owners until removed and joined.
     fn deadlines(self: *State) void {
         const io = self.config.io;
         while (true) {
@@ -172,6 +179,13 @@ const State = struct {
             link = &value.next;
         }
         unreachable;
+    }
+
+    fn claimConnectionSlot(self: *State) ?*ConnectionSlot {
+        for (self.connection_slots) |*slot| {
+            if (slot.in_use.cmpxchgStrong(false, true, .acquire, .monotonic) == null) return slot;
+        }
+        return null;
     }
 
     fn acceptLoop(self: *State) void {
@@ -256,14 +270,28 @@ pub fn start(alloc: std.mem.Allocator, config: Config) !Server {
         std.math.mul(usize, config.max_connections, config.limits.connection_bytes) catch return error.InvalidPgwireConfig
     else
         std.math.cast(usize, config.max_session_bytes) orelse return error.InvalidPgwireConfig;
-    if (session_bytes < config.limits.frame_bytes or
-        (config.protected_frame_allocator != null and config.limits.connection_bytes <= 32 << 10)) return error.InvalidPgwireConfig;
+    const slot_count = @as(usize, config.max_connections) + 4;
+    const slot_bytes = std.math.mul(usize, slot_count, @sizeOf(ConnectionSlot)) catch return error.InvalidPgwireConfig;
+    const protected_bytes: usize = if (config.protected_frame_allocator != null) 32 << 10 else 0;
+    const control_reserve = std.math.mul(usize, slot_count, protected_bytes) catch return error.InvalidPgwireConfig;
+    const fixed_reserve = std.math.add(usize, slot_bytes, control_reserve) catch return error.InvalidPgwireConfig;
+    const minimum_session_bytes = std.math.add(usize, fixed_reserve, config.limits.frame_bytes) catch return error.InvalidPgwireConfig;
+    if (session_bytes < minimum_session_bytes or
+        config.limits.connection_bytes <= protected_bytes or
+        config.limits.connection_bytes - protected_bytes < @sizeOf(ConnectionSlot)) return error.InvalidPgwireConfig;
     const retained_bytes = if (config.max_retained_bytes == 0)
         std.math.mul(usize, config.max_connections, config.limits.retained_bytes) catch return error.InvalidPgwireConfig
     else
         std.math.cast(usize, config.max_retained_bytes) orelse return error.InvalidPgwireConfig;
     self.* = .{ .alloc = alloc, .config = config, .retained = .{ .child = alloc, .limit = @min(retained_bytes, session_bytes) }, .listener = try address.listen(config.io, .{ .reuse_address = true }), .memory = .{ .child = alloc, .limit = session_bytes } };
     errdefer self.listener.deinit(config.io);
+    // Stable allocator/request/cancellation contexts and socket buffers are
+    // charged before accepts. Four preallocated handshake owners remain even
+    // when ordinary allocations fill the listener's aggregate memory ceiling.
+    self.connection_slots = try self.memory.allocator().alloc(ConnectionSlot, slot_count);
+    errdefer self.memory.allocator().free(self.connection_slots);
+    for (self.connection_slots) |*slot| slot.* = .{ .connection = undefined };
+    self.foreground_memory = .{ .child = self.memory.allocator(), .limit = session_bytes - fixed_reserve };
     errdefer self.tasks.cancel(config.io);
     try self.tasks.concurrent(config.io, State.deadlines, .{self});
     try self.tasks.concurrent(config.io, State.acceptLoop, .{self});
@@ -277,47 +305,83 @@ fn isLoopback(address: std.Io.net.IpAddress) bool {
     };
 }
 
+/// A slot's address never changes while live. Its startup charge includes
+/// allocator/cancel contexts and both socket buffers; no task-stack receiver
+/// escapes into a retained native reader. Teardown remains physically joined.
+const ConnectionSlot = struct {
+    in_use: std.atomic.Value(bool) = .init(false),
+    connection: Connection,
+};
+
+const Connection = struct {
+    slot: *ConnectionSlot,
+    budget: Budget,
+    frame_control: Budget,
+    frame_memory: @import("../common/allocation_budget.zig").Partitioned,
+    read_buffer: [8192]u8,
+    write_buffer: [8192]u8,
+    reader: std.Io.net.Stream.Reader,
+    writer: std.Io.net.Stream.Writer,
+    session: protocol.Session,
+    deadline_entry: State.DeadlineEntry,
+
+    fn init(self: *Connection, state: *State, slot: *ConnectionSlot, stream: std.Io.net.Stream) void {
+        const io = state.config.io;
+        const protected_bytes: usize = if (state.config.protected_frame_allocator != null) 32 << 10 else 0;
+        self.slot = slot;
+        // The slot is prepaid globally. Include its bytes in the connection
+        // ceiling too, without charging the same physical body twice.
+        const foreground = if (state.foreground_memory) |*memory| memory.allocator() else state.memory.allocator();
+        self.budget = .{ .child = foreground, .limit = state.config.limits.connection_bytes - protected_bytes, .used = .init(@sizeOf(ConnectionSlot)) };
+        self.frame_control = .{ .child = state.config.protected_frame_allocator orelse self.budget.allocator(), .limit = protected_bytes, .shared = &state.memory };
+        self.frame_memory = .{
+            .foreground = .{ .child = self.budget.allocator(), .limit = self.budget.limit },
+            .control = .{ .child = self.frame_control.allocator(), .limit = protected_bytes },
+        };
+        self.reader = stream.reader(io, &self.read_buffer);
+        self.writer = stream.writer(io, &self.write_buffer);
+        self.session = .{
+            .alloc = self.budget.allocator(),
+            .io = io,
+            .source = state.config.backend,
+            .reader = &self.reader.interface,
+            .writer = &self.writer.interface,
+            .limits = state.config.limits,
+            .frame_memory = if (protected_bytes != 0) &self.frame_memory else null,
+            .control_allocator = state.config.control_allocator,
+            .is_protected_control = state.config.is_protected_control,
+            .retained_shared = &state.retained,
+            .deadline_wakeup = &state.deadline_wakeup,
+            .hooks = .{ .context = state, .register = State.register, .unregister = State.unregister, .cancel = State.cancel },
+        };
+        self.session.setDeadline(self.session.limits.startup_timeout_ms);
+        self.deadline_entry = .{ .session = &self.session, .stream = stream };
+    }
+
+    fn deinit(self: *Connection) void {
+        self.session.deinit();
+        std.debug.assert(self.frame_memory.foreground.stats().used_bytes == 0);
+        std.debug.assert(self.frame_memory.control.stats().used_bytes == 0);
+        std.debug.assert(self.frame_control.used.load(.acquire) == 0);
+        std.debug.assert(self.budget.used.load(.acquire) == @sizeOf(ConnectionSlot));
+        // Physical slot memory remains charged until listener teardown. Only
+        // after every reader/arena has retired may another task reuse its address.
+        self.slot.in_use.store(false, .release);
+    }
+};
+
 fn serveConnection(state: *State, stream: std.Io.net.Stream) void {
     const io = state.config.io;
     defer _ = state.active.fetchSub(1, .release);
     defer stream.close(io);
-    const protected_bytes: usize = if (state.config.protected_frame_allocator != null) 32 << 10 else 0;
-    var budget = Budget{ .child = state.memory.allocator(), .limit = state.config.limits.connection_bytes - protected_bytes };
-    var frame_control = Budget{ .child = state.config.protected_frame_allocator orelse budget.allocator(), .limit = protected_bytes, .shared = &state.memory };
-    var frame_memory: @import("../common/allocation_budget.zig").Partitioned = .{
-        .foreground = .{ .child = budget.allocator(), .limit = budget.limit },
-        .control = .{ .child = frame_control.allocator(), .limit = protected_bytes },
-    };
-    defer {
-        std.debug.assert(frame_memory.foreground.stats().used_bytes == 0);
-        std.debug.assert(frame_memory.control.stats().used_bytes == 0);
-        std.debug.assert(frame_control.used == 0);
-    }
-    var read_buffer: [8192]u8 = undefined;
-    var write_buffer: [8192]u8 = undefined;
-    var reader = stream.reader(io, &read_buffer);
-    var writer = stream.writer(io, &write_buffer);
-    var session = protocol.Session{
-        .alloc = budget.allocator(),
-        .io = io,
-        .source = state.config.backend,
-        .reader = &reader.interface,
-        .writer = &writer.interface,
-        .limits = state.config.limits,
-        .frame_memory = if (protected_bytes != 0) &frame_memory else null,
-        .control_allocator = state.config.control_allocator,
-        .is_protected_control = state.config.is_protected_control,
-        .retained_shared = &state.retained,
-        .deadline_wakeup = &state.deadline_wakeup,
-        .hooks = .{ .context = state, .register = State.register, .unregister = State.unregister, .cancel = State.cancel },
-    };
-    defer session.deinit();
-    session.setDeadline(session.limits.startup_timeout_ms);
-    var deadline_entry: State.DeadlineEntry = .{ .session = &session, .stream = stream };
-    state.addDeadline(&deadline_entry);
-    defer state.removeDeadline(&deadline_entry);
-    defer session.cancel_requested.store(true, .release);
-    session.run() catch {};
+    const slot = state.claimConnectionSlot() orelse return;
+    const connection = &slot.connection;
+    connection.init(state, slot, stream);
+    defer connection.deinit();
+    state.addDeadline(&connection.deadline_entry);
+    defer state.removeDeadline(&connection.deadline_entry);
+    defer connection.session.cancel_requested.store(true, .release);
+    connection.session.run() catch {};
 }
 
 fn watchDeadline(session: *protocol.Session) std.Io.Cancelable!void {
@@ -428,7 +492,7 @@ test "pgwire idle sockets share one deadline owner and join under saturation" {
     const stats = listener.stats();
     try std.testing.expectEqual(@as(u32, 16), stats.connections);
     try std.testing.expectEqual(@as(u32, 1), stats.deadline_tasks);
-    try std.testing.expectEqual(@as(usize, 0), stats.session_bytes);
+    try std.testing.expectEqual(@sizeOf(ConnectionSlot) * (@as(usize, 16) + 4), stats.session_bytes);
     try std.testing.expectEqual(@as(usize, 0), stats.retained_bytes);
     // Shortening a live connection deadline must wake the one shared owner.
     const state = listener.state.?;
@@ -494,4 +558,153 @@ test "pgwire retained sockets survive a saturated shared outbound executor" {
     listener.deinit();
     var rebound = try address.listen(io, .{ .reuse_address = true });
     rebound.deinit(io);
+}
+
+test "pgwire connection owners retain allocator cancellation and IO addresses under aggregate saturation" {
+    const io = std.testing.io;
+    const bind_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try bind_address.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+    const peer = try listener.socket.address.connect(io, .{ .mode = .stream });
+    defer peer.close(io);
+    const stream = try listener.accept(io);
+    defer stream.close(io);
+    var state: State = .{
+        .alloc = std.testing.allocator,
+        .config = .{ .io = io, .backend = undefined },
+        .listener = undefined,
+        .memory = .{ .child = std.testing.allocator, .limit = 2 * @sizeOf(ConnectionSlot) + 32 },
+        .retained = .{ .child = std.testing.allocator, .limit = 128 },
+    };
+    state.connection_slots = try state.memory.allocator().alloc(ConnectionSlot, 2);
+    defer state.memory.allocator().free(state.connection_slots);
+    for (state.connection_slots) |*slot| slot.* = .{ .connection = undefined };
+    const prepaid = state.memory.used.load(.acquire);
+    try std.testing.expectEqual(2 * @sizeOf(ConnectionSlot), prepaid);
+    const pressure = try state.memory.allocator().alloc(u8, 32);
+    defer state.memory.allocator().free(pressure);
+    try std.testing.expectEqual(state.memory.limit, state.memory.used.load(.acquire));
+    const first = state.claimConnectionSlot() orelse return error.TestUnexpectedResult;
+    first.connection.init(&state, first, stream);
+    var first_live = true;
+    defer if (first_live) first.connection.deinit();
+    const second = state.claimConnectionSlot() orelse return error.TestUnexpectedResult;
+    second.connection.init(&state, second, stream);
+    defer second.connection.deinit();
+    try std.testing.expect(first != second);
+    try std.testing.expect(state.claimConnectionSlot() == null);
+    try std.testing.expect(first.connection.session.alloc.ptr == @as(*anyopaque, @ptrCast(&first.connection.budget)));
+    try std.testing.expect(first.connection.frame_memory.foreground.child.ptr == @as(*anyopaque, @ptrCast(&first.connection.budget)));
+    try std.testing.expect(first.connection.frame_memory.control.child.ptr == @as(*anyopaque, @ptrCast(&first.connection.frame_control)));
+    try std.testing.expect(first.connection.session.reader == &first.connection.reader.interface);
+    try std.testing.expect(first.connection.session.writer == &first.connection.writer.interface);
+    try std.testing.expect(first.connection.deadline_entry.session == &first.connection.session);
+    first.connection.session.cancel_requested.store(true, .release);
+    try std.testing.expect(first.connection.deadline_entry.session.cancel_requested.load(.acquire));
+    try std.testing.expectError(error.OutOfMemory, first.connection.budget.allocator().alloc(u8, 1));
+    // Slot reuse happens after physical session cleanup, without returning the
+    // prepaid listener charge or borrowing an earlier task-stack allocator.
+    first.connection.deinit();
+    first_live = false;
+    const reused = state.claimConnectionSlot() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(reused == first);
+    reused.connection.init(&state, reused, stream);
+    defer reused.connection.deinit();
+    try std.testing.expect(!reused.connection.session.cancel_requested.load(.acquire));
+    try std.testing.expectEqual(state.memory.limit, state.memory.used.load(.acquire));
+}
+
+test "pgwire startup rejects memory ceilings below its physical connection owner pool" {
+    try std.testing.expectError(error.InvalidPgwireConfig, start(std.testing.allocator, .{
+        .io = std.testing.io,
+        .backend = undefined,
+        .bind_port = 0,
+        .max_connections = 1,
+        .max_session_bytes = 5 * @sizeOf(ConnectionSlot),
+    }));
+}
+
+test "pgwire connection owner pool allocation failure retires startup socket and metadata" {
+    const io = std.testing.io;
+    const bind_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var initial = try bind_address.listen(io, .{ .reuse_address = true });
+    const address = initial.socket.address;
+    initial.deinit(io);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, start(failing.allocator(), .{
+        .io = io,
+        .backend = undefined,
+        .bind_port = address.getPort(),
+        .max_connections = 1,
+    }));
+    var rebound = try address.listen(io, .{ .reuse_address = true });
+    rebound.deinit(io);
+}
+
+test "pgwire aggregate ordinary saturation preserves every protected frame and handshake allowance" {
+    const io = std.testing.io;
+    const bind_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var transport = try bind_address.listen(io, .{ .reuse_address = true });
+    defer transport.deinit(io);
+    const peer = try transport.socket.address.connect(io, .{ .mode = .stream });
+    defer peer.close(io);
+    const stream = try transport.accept(io);
+    defer stream.close(io);
+    const owner_count = 5;
+    const protected_bytes = 32 << 10;
+    const ordinary_bytes = 4096;
+    const pool_bytes = owner_count * @sizeOf(ConnectionSlot);
+    var listener = try start(std.testing.allocator, .{
+        .io = io,
+        .backend = undefined,
+        .bind_port = 0,
+        .max_connections = 1,
+        .max_session_bytes = pool_bytes + owner_count * protected_bytes + ordinary_bytes,
+        .protected_frame_allocator = std.testing.allocator,
+        .limits = .{ .frame_bytes = ordinary_bytes, .connection_bytes = 1024 * 1024, .retained_bytes = 16 * 1024 },
+    });
+    defer listener.deinit();
+    const state = listener.state.?;
+    try std.testing.expectEqual(@as(usize, ordinary_bytes), state.foreground_memory.?.limit);
+    try std.testing.expectEqual(pool_bytes, state.memory.used.load(.acquire));
+    var slots: [owner_count]*ConnectionSlot = undefined;
+    var controls: [owner_count]?[]u8 = @splat(null);
+    var claimed: usize = 0;
+    defer {
+        for (slots[0..claimed], controls[0..claimed]) |slot, control| {
+            if (control) |bytes| slot.connection.frame_control.allocator().free(bytes);
+            slot.connection.deinit();
+        }
+    }
+    for (&slots) |*slot| {
+        slot.* = state.claimConnectionSlot() orelse return error.TestUnexpectedResult;
+        slot.*.connection.init(state, slot.*, stream);
+        claimed += 1;
+    }
+    const ordinary = try slots[0].connection.budget.allocator().alloc(u8, ordinary_bytes);
+    defer slots[0].connection.budget.allocator().free(ordinary);
+    for (slots) |slot| try std.testing.expectError(error.OutOfMemory, slot.connection.budget.allocator().alloc(u8, 1));
+    // All five configured owner allowances remain available simultaneously,
+    // despite an explicit aggregate limit below the per-connection ceilings.
+    for (slots, &controls) |slot, *bytes| bytes.* = try slot.connection.frame_control.allocator().alloc(u8, protected_bytes);
+    try std.testing.expectEqual(state.memory.limit, state.memory.used.load(.acquire));
+    try std.testing.expectEqual(@as(usize, ordinary_bytes), state.foreground_memory.?.used.load(.acquire));
+    slots[0].connection.frame_control.allocator().free(controls[0].?);
+    controls[0] = null;
+    // Returning protected credit does not authorize an ordinary allocation.
+    try std.testing.expectError(error.OutOfMemory, slots[0].connection.budget.allocator().alloc(u8, 1));
+    controls[0] = try slots[0].connection.frame_control.allocator().alloc(u8, protected_bytes);
+    try std.testing.expectEqual(state.memory.limit, state.memory.used.load(.acquire));
+}
+
+test "pgwire startup rejects aggregate limits that cannot retain protected frame headroom" {
+    try std.testing.expectError(error.InvalidPgwireConfig, start(std.testing.allocator, .{
+        .io = std.testing.io,
+        .backend = undefined,
+        .bind_port = 0,
+        .max_connections = 1,
+        .max_session_bytes = 5 * @sizeOf(ConnectionSlot) + 4096,
+        .protected_frame_allocator = std.testing.allocator,
+        .limits = .{ .frame_bytes = 4096, .connection_bytes = 1024 * 1024, .retained_bytes = 16 * 1024 },
+    }));
 }

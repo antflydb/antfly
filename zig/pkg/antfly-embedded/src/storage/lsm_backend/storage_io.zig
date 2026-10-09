@@ -1551,10 +1551,10 @@ else
         fn tryReserveDescriptors(self: *FdCache, io: std.Io, count: usize) bool {
             if (count == 0) return true;
             if (count > self.capacity - self.persistent_reserve) return false;
-            self.admission_mutex.lockUncancelable(io);
+            if (!self.admission_mutex.tryLock()) return false;
             defer self.admission_mutex.unlock(io);
             // Do not bypass a queued operation or retain a partial reservation.
-            if (self.admission_head != null or !self.makeCapacityAvailable(count)) return false;
+            if (self.admission_head != null or !self.makeCapacityAvailableWithoutWaiting(count)) return false;
             _ = self.admitted_descriptors.fetchAdd(count, .acq_rel);
             return true;
         }
@@ -1620,6 +1620,14 @@ else
         }
 
         fn makeCapacityAvailable(self: *FdCache, count: usize) bool {
+            return self.makeCapacityAvailableMode(count, false);
+        }
+
+        fn makeCapacityAvailableWithoutWaiting(self: *FdCache, count: usize) bool {
+            return self.makeCapacityAvailableMode(count, true);
+        }
+
+        fn makeCapacityAvailableMode(self: *FdCache, count: usize, try_only: bool) bool {
             // The reserve is startup headroom, not a permanent tax. Once
             // lifetime locks consume it, transient leases may use the freed
             // portion while retaining the two-descriptor peak needed by the
@@ -1637,7 +1645,9 @@ else
             const transient_capacity = self.capacity - held_headroom;
             if (count > transient_capacity) return false;
             const available_at = transient_capacity - count;
-            while (self.admitted_descriptors.load(.acquire) > available_at and self.evictOne()) {}
+            while (self.admitted_descriptors.load(.acquire) > available_at) {
+                if (!(if (try_only) self.tryEvictOne() else self.evictOne())) break;
+            }
             return self.admitted_descriptors.load(.acquire) <= available_at;
         }
 
@@ -1724,6 +1734,25 @@ else
                     current = entry.lru_next;
                 }
                 if (locked) shard.mutex.unlock();
+            }
+            return false;
+        }
+        // Optional read windows must not wait behind another storage owner.
+        // Scan the finite shard registry, skipping locks already held elsewhere.
+        fn tryEvictOne(self: *FdCache) bool {
+            const start = self.evict_cursor.fetchAdd(1, .monotonic);
+            for (0..self.shards.len) |offset| {
+                const shard = &self.shards[(start + offset) % self.shards.len];
+                if (!shard.mutex.tryLock()) continue;
+                defer shard.mutex.unlock();
+                var current = shard.lru_head;
+                while (current) |entry| {
+                    if (entry.ref_count == 0) {
+                        self.removeEntryLocked(shard, entry);
+                        return true;
+                    }
+                    current = entry.lru_next;
+                }
             }
             return false;
         }
@@ -5285,6 +5314,12 @@ test "weighted native fd admission preserves FIFO progress" {
     try io.sleep(.fromMilliseconds(10), .awake);
     try std.testing.expect(!large_acquired.load(.acquire));
     try std.testing.expect(!small_acquired.load(.acquire));
+    // Optional private-reader batches cannot steal the free slot from the
+    // older weighted waiter, even though one descriptor is available.
+    const optional_reserved = pool.fd_cache.tryReserveDescriptors(io, 1);
+    if (optional_reserved) pool.fd_cache.releaseDescriptors(io, 1);
+    try std.testing.expect(!optional_reserved);
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
 
     pool.fd_cache.releaseDescriptors(io, 1);
     held_descriptors -= 1;
@@ -5449,4 +5484,96 @@ test "native buffered atomic write sink retains invalidation state past storage 
     const written = try verifier.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("buffered lease", written);
+}
+
+test "native fd admission try skips held admission and eviction locks" {
+    if (!supports_posix_fd_cache or builtin.single_threaded) return error.SkipZigTest;
+    inline for (.{ false, true }) |hold_shards| {
+        var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
+        defer pool.deinit();
+        const cache = pool.fd_cache;
+        try cache.reserveDescriptors(std.testing.io, 2);
+        defer cache.releaseDescriptors(std.testing.io, 2);
+        if (hold_shards) {
+            for (cache.shards) |*shard| while (!shard.mutex.tryLock()) std.atomic.spinLoopHint();
+        } else cache.admission_mutex.lockUncancelable(std.testing.io);
+        const Rescue = struct {
+            cache: *FdCache,
+            done: std.atomic.Value(bool) = .init(false),
+            rescued: std.atomic.Value(bool) = .init(false),
+            fn run(self: *@This()) void {
+                for (0..100) |_| {
+                    if (self.done.load(.acquire)) break;
+                    std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+                }
+                if (!self.done.load(.acquire)) self.rescued.store(true, .release);
+                if (hold_shards) {
+                    for (self.cache.shards) |*shard| shard.mutex.unlock();
+                } else self.cache.admission_mutex.unlock(std.testing.io);
+            }
+        };
+        var rescue = Rescue{ .cache = cache };
+        var future = try std.testing.io.concurrent(Rescue.run, .{&rescue});
+        defer {
+            rescue.done.store(true, .release);
+            future.await(std.testing.io);
+        }
+        const reserved = cache.tryReserveDescriptors(std.testing.io, 1);
+        rescue.done.store(true, .release);
+        if (reserved) cache.releaseDescriptors(std.testing.io, 1);
+        try std.testing.expect(!reserved);
+        try std.testing.expect(!rescue.rescued.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 2), cache.admitted_descriptors.load(.acquire));
+    }
+}
+
+test "native fd admission try optional read window evicts idle entries and preserves capacity" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    var tmp = try TestDirectory.init("fd-try-window");
+    defer tmp.cleanup();
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+    defer native.deinit();
+    const path = tmp.path();
+    try native.storage().writeFileAbsolute(path, "value");
+    const first = try pool.fd_cache.retain(native.state.cache_namespace, std.testing.io, path);
+    pool.fd_cache.release(std.testing.io, first);
+    const second = try pool.fd_cache.retain(native.state.cache_namespace + 1, std.testing.io, path);
+    pool.fd_cache.release(std.testing.io, second);
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_cache_entries);
+    const readers = (try native.storage().tryBeginColdRandomReads(std.testing.allocator, &.{path})) orelse return error.TestExpectedOptionalReaders;
+    defer {
+        for (readers) |*reader| reader.deinit();
+        std.testing.allocator.free(readers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), readers.len);
+    try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+    try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_cache_entries);
+    const bytes = try readers[0].readRangeAlloc(std.testing.allocator, 0, 5);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("value", bytes);
+}
+
+test "native fd admission try optional read window allocation failure releases every permit" {
+    if (!supports_posix_fd_cache) return error.SkipZigTest;
+    var tmp = try TestDirectory.init("fd-try-window-oom");
+    defer tmp.cleanup();
+    var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
+    defer pool.deinit();
+    var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+    defer native.deinit();
+    try native.storage().writeFileAbsolute(tmp.path(), "value");
+    const Fixture = struct {
+        fn run(allocator: Allocator, storage: Storage, path: []const u8) !void {
+            const readers = (try storage.tryBeginColdRandomReads(allocator, &.{ path, path })) orelse return error.TestExpectedOptionalReaders;
+            defer {
+                for (readers) |*reader| reader.deinit();
+                allocator.free(readers);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{ native.storage(), tmp.path() });
+    try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+    try std.testing.expectEqual(@as(usize, 1), native.state.refs.load(.acquire));
 }

@@ -501,3 +501,203 @@ Empty contexts preserve legacy behavior; capable callbacks preserve context and
 exact cancellation/checkpoint errors. Shared completion deadlines across physical
 coordinator/storage waits, pre-seal task handoff and durable recovery transfer
 remain unfinished. This is callback proof, not default or physical wait proof.
+
+
+The pending physical-cache accounting proposal admits the LSM shard-array
+allocation against the private startup manager before allocator invocation. A
+movable reservation identity keeps that charge through cache teardown. Four
+focused metadata fixtures pass on native and pinned Nix/glibc Linux, including
+real two-ancestor attachment rejection/retry and allocator-observed ancestor
+charges at physical shard free; see
+[metadata parent receipts](receipts/2026-10-08/cache-metadata-parent-proposal/README.md).
+Process-parent installation happens after local allocation and can reject
+publication. This proves eventual parent accounting and physical-free ordering,
+not process-parent preauthorization before allocation. Dynamic maps, allocator
+overhead, transient decode allocations and retained read-cleanup tasks remain
+unbounded by this proof. The full production chain remains pending and defaults
+remain unqualified.
+
+
+A pending trusted scheduler cleanup phase now reserves a finite independent
+fence while foreground execution is running and retains the same operation,
+bytes and CPU partition. It can activate after foreground cancellation, denied
+reentry or owner close, then uses the existing fair queue and bounded wait.
+Failed cleanup reentry keeps physical ownership charged until explicit finish
+after joined cleanup or authoritative transfer. Unused durable completion can
+be reserved alongside cleanup; cleanup consumes that inactive authority and
+cannot replace an active durable completion. Native and pinned Nix/glibc each
+pass all 45 scheduler/admission tests, including five new lifecycle tests; see
+[read cleanup phase receipts](receipts/2026-10-08/read-cleanup-phase-proposal/README.md).
+This is a local scheduler primitive. ABI/task admission, real cache/load/pin
+cleanup callbacks, finite physical waits and fallback transfer remain unwired.
+It does not make production read cancellation or shutdown bounded yet.
+
+
+A pending cleanup task now reserves metadata and actual concurrent execution
+before physical resource publication. Its child activates the finite cleanup
+fence after foreground expiry/cancellation/close, and a protected parent join
+preserves original cancellation without forwarding it into cleanup. Runnable
+ABI version 6 adds checked cleanup reserve/activate callbacks and distinct
+capsule-owned executor/clock receivers. Three cleanup-task fixtures and the
+three existing completion-task fixtures pass on native and pinned Nix/glibc;
+see [cleanup task receipts](receipts/2026-10-08/read-cleanup-task-proposal/README.md).
+ABI readers reject old/truncated headers and absent capability before allocation.
+Task activation or fair reentry failure still requires caller-owned physical
+join or authoritative transfer before execution finish. Actual cache/load/pin
+integration, finite storage waits, SQL cleanup bridge forwarding and recovery
+transfer remain required. Full production/default qualification remains pending.
+
+
+A pending production loader change reserves one of 32 fixed cleanup slots per
+LSM cache shard before publishing an owned claim. All three physical loader
+paths transfer their joined registration/key ownership into that slot on exit,
+without a lock, heap allocation/free, budget callback or wake syscall. Cache
+startup accounting includes the inline slots through the actual shard size.
+New loads and independent admitted passes retire transferred identities; stale
+cleanup cannot remove a replacement claim. Overload rejects before publication.
+Legacy duplicate waiters use a bounded condition polling interval so transfer
+racing a wait does not require a wake syscall on the returning read.
+
+Native and pinned Nix/glibc pass 67 cache tests, 11 physical storage tests, four
+metadata tests and three cleanup-task tests; see
+[load cleanup transfer receipts](receipts/2026-10-08/load-cleanup-transfer-proposal/README.md).
+The cold-read fixture now proves cache ownership for every deferred registration,
+retirement under an independent scope without touching the failed foreground
+budget, and correct retry results. Cache teardown requires all active claims
+joined/transferred before freeing the charged shard owner. Slot count is bounded;
+variable key bytes and pending-map allocation overhead are not yet admitted as
+part of the complete process memory budget. Pin/decode/allocator/native-I/O
+cleanup, retained task integration and whole-node/default proof remain pending.
+
+
+The pending loader registry now stores at most 64 entries inline in each cache
+shard. It allocates no hash buckets or growth scratch; all table storage is
+covered by the actual fixed-shard startup reservation. Both legacy and owned
+loads reject a full registry before copying/publishing a new key. Native and
+pinned Nix/glibc focused gates pass 68 cache, 11 storage, four metadata and
+three cleanup-task tests; see
+[fixed pending registry receipts](receipts/2026-10-08/pending-registry-bound-proposal/README.md).
+The new fixture fills the registry with legacy loads, proves one allocation per
+key and zero registry allocations, checks both admission paths refuse overload
+before allocator invocation, and verifies removal/reuse without stale removal.
+Variable copied-key bytes still require admission; entry maps, allocator/native
+waits, pin cleanup and full node/default qualification remain incomplete.
+
+
+Managed owned loader claims now reserve both copied path payloads before
+allocation, using stable per-slot observer identities. Failed allocation leaves
+its credit in the cache; transferred cleanup frees physical keys before releasing
+capacity and retains busy parent debt under independent finite cleanup. Parent
+waits run outside pending registry locks. Managed cold admission drains all
+shards before requesting fresh key bytes, allowing completed keys elsewhere to
+return capacity. See [owned key admission receipts](receipts/2026-10-08/loader-key-admission-proposal/README.md).
+
+This admits requested owned-key payload bytes only. Legacy unowned keys,
+allocator and observer-ledger overhead, large string work, entry maps, pins,
+transient decode and native I/O still need complete ownership/admission. Manager
+replacement requires joined/transferred loader claims; quiescent teardown uses
+mandatory legacy accounting. Full production/default qualification remains
+pending; focused receipt versions identify their exact verification scope.
+
+
+The three legacy backend state/raw/index loader call sites now use owned
+claims and transfer joined cleanup on exit, admitting their managed key bytes
+before copies. Native and pinned Nix/glibc focused gates pass 72 cache, 12
+storage, four metadata and three cleanup-task tests; the new real storage
+fixture verifies rejection before missing-path reads, no publication on failure,
+correct persisted data after retry, and exact cleanup ownership followed by
+independent collection. See [backend loader receipts](receipts/2026-10-08/backend-loader-ownership-proposal/README.md).
+
+Backend methods still use null controls and legacy storage/decode paths. Whole
+table and nonshared index runtime fallbacks need original-scope propagation
+through those methods. Local path/handle allocations, pins, allocator/native-I/O
+work, complete cleanup/recovery and full production/default qualification remain
+incomplete. The legacy registry APIs remain for compatibility/tests.
+
+
+Whole-table and nonshared-index fallback reads now pass the original port into
+backend cache lookup, key admission, raw/index publication and decoding. Owned
+whole-table decoding checks metadata and compressed materialization at block
+boundaries. No request port is retained in local caches. Native and pinned
+Nix/glibc pass 72 cache, 13 storage, four metadata and three cleanup-task tests;
+the new 600-row compressed fixture sweeps sticky cancellation with and without
+shared caching, verifies no rejected local publication, independent collection
+and correct retry data. See [fallback read scope receipts](receipts/2026-10-08/backend-read-scope-proposal/README.md).
+
+Native I/O is still checked around existing calls. Individual decompression,
+large copies, allocator work, local cache memory, pin retirement and complete
+cleanup/recovery require further bounds. Full production/default qualification
+remains incomplete.
+
+
+The running predecessor full DataRuntime gate exposed an HA response invalid
+free: the fixture helper returned client-allocator-owned bytes but cleanup used
+the server Partitioned allocator. Thirteen mismatched fixture cleanups are
+corrected; all 15 direct helper response declarations now explicitly free with
+std.testing.allocator. See [HTTP fixture ownership receipts](receipts/2026-10-08/http-fixture-ownership-proposal/README.md).
+Source audit and formatting pass; the actual HA fixture runtime verification
+remains pending in the successor DataRuntime/full gates. Production allocator
+checks and control reservations remain intact. Full/default qualification is
+still unproven.
+
+
+Production failed-admission pin rollback now transfers physically retired byte
+accounting to an atomic cache-owned mailbox. The existing charge remains until
+an independent finite pass or nonwaiting reclaim adopts and reconciles it;
+failed retirement no longer acquires cache/child/parent accounting locks after
+physical freeing. PendingRelease can transfer completed accounting infallibly
+while refusing a token that still owns a live pin. Native and pinned Nix/glibc
+pass 75 cache, 13 storage, four metadata and three cleanup-task tests; see
+[retired pin transfer receipts](receipts/2026-10-08/retired-pin-transfer-proposal/README.md).
+
+The production fixture proves transfer with all accounting locks held, retained
+charge through expiry and independent exact parent release. Reclaim reports no
+capacity while parent is busy and preserves useful entries; two transferred
+charges reconcile exactly on retry. Physical shard locking/free, transient
+cleanup, live-pin transfer, full retained task adoption/recovery and default
+qualification remain incomplete. The HA allocator repair is still awaiting its
+actual full DataRuntime regression; source fixes are not a passing gate.
+
+
+Failed retained Handle admission now transfers the physical pin through fixed
+atomic counters, without locks, allocator calls, hashing, budget callbacks or
+wake syscalls. Charged entries remain alive under cache ownership. Independent
+finite collection advances a persistent cursor across at most 64 entries per
+shard acquisition, repairs it on removal and restores exact pending ownership
+if ledger admission fails before physical destruction. Fresh controlled lookup
+and growth can collect earlier transfers. Native and pinned Nix/glibc pass 79
+cache, 13 storage, four metadata and three cleanup-task tests; see
+[deferred pin receipts](receipts/2026-10-08/deferred-pin-cleanup-proposal/README.md).
+
+Held-lock/no-allocation handoff, cursor expiry/removal, in-progress publication
+and child-ledger failure/retry fixtures pass. Nonwaiting reclaim still needs to
+consume physical deferred pins so other memory owners can recover before a
+new cache lookup. Transient/success-path release, collector child-ledger/allocator
+work, retained task adoption/recovery, native I/O and whole-node/default proof
+remain incomplete. Parent debt reconciliation runs outside shard locks.
+
+
+The registered memory reclaimer now collects transferred physical pins before
+idle eviction, sharing the global 64-inspection/eight-retirement bounds. It
+tries every lock without waiting, restores exact pin ownership on child-ledger
+denial, and reports only parent-reconciled bytes. Busy parent debt stops further
+destruction. This closes the previous pressure-recovery gap before cache lookup.
+Native and pinned Nix/glibc pass 83 cache, 13 storage, four metadata and three
+cleanup-task tests; real sibling admission, held locks/no allocation, burst
+limits and cursor progress are covered in
+[deferred pin reclaim receipts](receipts/2026-10-08/deferred-pin-reclaim-proposal/README.md).
+
+Individual allocator/free/hash work, transient/success-path release, complete
+task/native-I/O/recovery ownership, whole-node memory/control/performance and
+default qualification remain incomplete. The actual HA fixture repair still
+requires its running DataRuntime/full qualification.
+
+Admitted LSM cursors remember a boolean ownership mode after each scoped operation exits, without retaining the operation port. Returning retained index/data pins on close, run switching, block replacement and prefetch cleanup transfers them atomically to the charged cache owner. Temporary raw/index handles in admitted decode paths do likewise. See `receipts/2026-10-08/cursor-pin-return-proposal`; transient destruction, cursor allocation/reservation cleanup and native I/O are still outside this guarantee.
+
+Controlled transient cache values now require the attached resource manager to admit their full estimated bytes, including policy bypasses and oversized entries. The last physical handle destroys them once and transfers still charged retirement debt without ledger waits. Controlled transient handles require the cache and manager to outlive their physical ownership. See `receipts/2026-10-08/transient-byte-admission-proposal`; input buffer allocation, native I/O, allocator destruction and reservation rollback are not yet fully bounded.
+
+Duplicate cache publication destroys the discarded physical entry and value before releasing its incoming reservation. Admitted publication transfers the charged retirement debt atomically, so held cache/child/parent ledger locks cannot block that retirement under the shard. Foreground pressure checks may still wait through the original scope after the shard is released. See `receipts/2026-10-08/duplicate-retirement-proposal`; this does not bound physical allocator destruction or allocation-error reservation rollback.
+
+Cache publication constructors own both input value and admitted reservation from entry, including the first checkpoint failure. Complete bytes are admitted before entry/path metadata allocation. Error guards unlock the shard and destroy descriptor/path/input before atomically transferring charged retirement debt; they never borrow the failed foreground scope or wait on its ledger locks. See `receipts/2026-10-08/publication-rollback-proposal`. Caller input allocation/native I/O and physical allocator deinit/free latency remain unqualified.
+
+Admitted transient handles now reserve one of 32 inline physical cleanup slots per shard before publication. Last return transfers the physical body with atomics, retaining byte charge and cache lifetime; it does not destroy it on the foreground task. A fresh scoped collector or nonwaiting pressure reclaimer owns destruction and debt transfer. The latter shares 64 inspections/eight retirements across transients and retained cache entries. See `receipts/2026-10-08/transient-cleanup-owner-proposal`; final focused native and pinned Nix/glibc Linux qualification both pass (91 cache, 14 storage, four metadata and three cleanup-task tests); the initial unavailable-engine failure remains preserved. Physical allocator destruction, prepublication input rollback and native input preadmission remain incomplete.

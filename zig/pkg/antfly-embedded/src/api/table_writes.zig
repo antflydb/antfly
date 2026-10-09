@@ -27,6 +27,7 @@ pub const backend_types = @import("../storage/backend_types.zig");
 pub const portable_backup = @import("../storage/portable_backup.zig");
 pub const table_catalog = @import("routing_budget.zig");
 pub const table_write_source = @import("table_write_source.zig");
+const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 pub const table_index_config = @import("table_index_config.zig");
 pub const tables_api = @import("tables.zig");
 pub const runtime_status = @import("runtime_status.zig");
@@ -117,8 +118,12 @@ pub const BoundTableWriteSource = struct {
                 .commit_transaction_with_cancellation = commitTransactionWithCancellation,
                 .commit_batch = commitBatch,
                 .commit_batch_with_cancellation = commitBatchWithCancellation,
+                .commit_batch_with_execution = commitBatchWithExecution,
+                .commit_batch_with_control = commitBatchWithControl,
                 .commit_transaction_with_id = commitTransactionWithId,
                 .commit_transaction_with_id_with_cancellation = commitTransactionWithIdAndCancellation,
+                .commit_transaction_with_id_with_execution = commitTransactionWithIdAndExecution,
+                .commit_transaction_with_id_with_control = commitTransactionWithIdAndControl,
                 .acknowledge_transaction_commit = acknowledgeTransactionCommit,
                 .batch = batch,
                 .begin_bulk_ingest = beginBulkIngest,
@@ -723,6 +728,20 @@ pub const BoundTableWriteSource = struct {
         sync_level: db_mod.types.SyncLevel,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        return commitBatchWithPreDecisionContext(ptr, alloc, tables, sync_level, cancellation, .{});
+    }
+
+    fn commitBatchWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+        pre_decision: distributed_txn.PreDecisionContext,
+    ) !?distributed_txn.CommitOutcome {
+        try ensurePreDecisionContextActive(pre_decision);
+        if (pre_decision.route_fence != null) return error.CatalogRouteFenceUnsupported;
+        if (pre_decision.restore_staging_scope != null or pre_decision.restore_staging_plan_id != null) return error.UnsupportedOperation;
         if (tables.len == 1 and tables[0].predicates.len == 0 and tables[0].relational_index_maintenance == null) {
             const table = tables[0];
             const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
@@ -735,6 +754,7 @@ pub const BoundTableWriteSource = struct {
                 .sync_level = sync_level,
             };
             try validateTableBatchAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+            try ensurePreDecisionContextActive(pre_decision);
             db.batchWithVisibilityCancellation(req, cancellation) catch |err| switch (err) {
                 error.IntentConflict, error.VersionConflict => return .{ .conflict = boundConflict(table, err) },
                 else => return err,
@@ -744,7 +764,7 @@ pub const BoundTableWriteSource = struct {
         const txn_source: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         const txn_io: ?Io = txn_source.db.backend_runtime.io();
         const txn_id = nextTxnId(txn_io);
-        return try commitBoundTransaction(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation);
+        return try commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, pre_decision);
     }
 
     pub fn commitTransactionWithId(
@@ -768,6 +788,64 @@ pub const BoundTableWriteSource = struct {
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
         return try commitBoundTransaction(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation);
+    }
+
+    fn commitBatchWithExecution(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+        team: *runnable_abi.Team,
+    ) !?distributed_txn.CommitOutcome {
+        // Bound storage has one coordinator participant and no child fanout.
+        // Validate the original execution fences before contacting storage.
+        try team.reserve(0);
+        defer team.finish();
+        return commitBatchWithCancellation(ptr, alloc, tables, sync_level, cancellation);
+    }
+
+    fn commitTransactionWithIdAndExecution(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+        team: *runnable_abi.Team,
+    ) !?distributed_txn.CommitOutcome {
+        try team.reserve(0);
+        defer team.finish();
+        return commitTransactionWithIdAndCancellation(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation);
+    }
+
+    fn commitBatchWithControl(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+        control: distributed_txn.CommitControl,
+    ) !?distributed_txn.CommitOutcome {
+        if (control.team) |team| try team.reserve(0);
+        defer if (control.team) |team| team.finish();
+        return commitBatchWithPreDecisionContext(ptr, alloc, tables, sync_level, cancellation, control.pre_decision);
+    }
+
+    fn commitTransactionWithIdAndControl(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        cancellation: db_mod.types.CancellationToken,
+        control: distributed_txn.CommitControl,
+    ) !?distributed_txn.CommitOutcome {
+        if (control.team) |team| try team.reserve(0);
+        defer if (control.team) |team| team.finish();
+        return commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation, control.pre_decision);
     }
 
     pub fn acknowledgeTransactionCommit(
@@ -795,6 +873,23 @@ pub const BoundTableWriteSource = struct {
         retain_terminal: bool,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
+        return commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, retain_terminal, cancellation, .{});
+    }
+
+    fn commitBoundTransactionWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        tables: []const distributed_txn.TableCommitRequest,
+        sync_level: db_mod.types.SyncLevel,
+        retain_terminal: bool,
+        cancellation: db_mod.types.CancellationToken,
+        pre_decision: distributed_txn.PreDecisionContext,
+    ) !?distributed_txn.CommitOutcome {
+        try ensurePreDecisionContextActive(pre_decision);
+        if (pre_decision.route_fence != null) return error.CatalogRouteFenceUnsupported;
+        if (pre_decision.restore_staging_scope != null or pre_decision.restore_staging_plan_id != null) return error.UnsupportedOperation;
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (tables.len != 1) return error.UnsupportedOperation;
         const table = tables[0];
@@ -809,6 +904,7 @@ pub const BoundTableWriteSource = struct {
         defer alloc.free(local_participant);
         const participants = [_][]const u8{local_participant};
 
+        try ensurePreDecisionContextActive(pre_decision);
         _ = db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
             txn_id,
             begin_timestamp,
@@ -864,7 +960,7 @@ pub const BoundTableWriteSource = struct {
             },
             else => return err,
         };
-        db.writeTransaction(txn_id, .{
+        prepareBoundTransactionWithPreDecisionContext(db, txn_id, .{
             .writes = table.writes,
             .deletes = table.deletes,
             .transforms = table.transforms,
@@ -880,7 +976,7 @@ pub const BoundTableWriteSource = struct {
             .restore_staging_scope = table.restore_staging_scope,
             .restore_staging_plan_id = table.restore_staging_plan_id,
             .relational_repair = table.relational_repair,
-        }) catch |err| {
+        }, pre_decision) catch |err| {
             // A begun local transaction must reach a terminal state on every
             // rejected write. In particular, graph transform validation is
             // performed by DB.writeTransaction after begin, so returning the
@@ -947,6 +1043,14 @@ pub const BoundTableWriteSource = struct {
             .coordinator_table_name = if (retain_terminal) table.table_name else null,
             .propagation_pending = propagation_pending,
         } };
+    }
+
+    fn prepareBoundTransactionWithPreDecisionContext(db: *db_mod.DB, txn_id: db_mod.types.TxnId, req: db_mod.types.TransactionIntentRequest, context: distributed_txn.PreDecisionContext) !void {
+        try ensurePreDecisionContextActive(context);
+        try db.writeTransaction(txn_id, req);
+        // Once preparation is accepted, caller rejection must still drive the
+        // transaction's independent durable abort and acknowledgement path.
+        try ensurePreDecisionContextActive(context);
     }
 
     pub fn createIndex(

@@ -4090,6 +4090,7 @@ pub const AntflyApiHandler = struct {
         return ctx.json(.{
             .query = self.api_server.queryAdmissionStats(),
             .memory = self.api_server.workloadMemoryStats(),
+            .cleanup = self.api_server.sqlCleanupStats(),
         });
     }
 
@@ -4116,7 +4117,7 @@ pub const AntflyApiHandler = struct {
                 policy.suspended orelse return textResponse(ctx, 400, "suspended required"),
             ) catch |err| return workloadPolicyError(ctx, err);
         }
-        return ctx.json(.{ .query = self.api_server.queryAdmissionStats(), .memory = self.api_server.workloadMemoryStats() });
+        return ctx.json(.{ .query = self.api_server.queryAdmissionStats(), .memory = self.api_server.workloadMemoryStats(), .cleanup = self.api_server.sqlCleanupStats() });
     }
 
     fn workloadPolicyError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
@@ -5904,6 +5905,18 @@ pub const AntflyApiHandler = struct {
             // may suspend via the adapter until write completion can detach.
             try self.adapter.server.startSqlRunnable(&runnable, try self.admissionOptions(), if (self.protected_control) .control else if (self.is_write) .write else .query);
             if ((!self.is_write or self.protected_control) and runnable.entry != null) self.adapter.runnable = &runnable;
+            var write_completion: ?@import("runnable_write_team.zig").Completion = null;
+            if (self.is_write) {
+                if (runnable.entry) |entry| {
+                    const memory = self.adapter.server.request_memory orelse return error.ExecutionWaitUnsupported;
+                    write_completion = try @import("runnable_write_team.zig").Completion.init(&runnable, memory.allocator(entry.class == .control));
+                    self.adapter.write_execution = &runnable;
+                    self.adapter.write_completion = &write_completion.?;
+                }
+            }
+            // Receivers stay in this scope through runnable.finish's defer.
+            defer self.adapter.write_completion = null;
+            defer self.adapter.write_execution = null;
             self.adapter.serial_execution = runnable.entry != null;
             defer self.adapter.serial_execution = false;
             defer self.adapter.runnable = null;
@@ -16501,6 +16514,76 @@ fn beginSqlQualificationSession(handler: *AntflyApiHandler) ![32]u8 {
     return id;
 }
 
+test "SQL protected executor cleanup workers retain control progress under full saturation" {
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .backend = .io_threaded,
+        .lane_limits = .{ .worker_capacity = 32 },
+    });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(alloc, .{
+        .backend_runtime = runtime.ptr(),
+        .query_max_concurrent_requests = 4,
+        .write_max_concurrent_requests = 1,
+        .sql_max_concurrent_preparations = 1,
+        .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 4096, .max_wait_ms = 100 },
+    }, source.iface(), null, null);
+    var api_closed = false;
+    defer if (!api_closed) api.deinit();
+    var occupied = try runtime.ptr().acquireWorkers(.{ .capacity = 25 });
+    defer occupied.release();
+    // Control reservation succeeds, then cleanup cannot fit. The failed
+    // cleanup reservation leaves only the separately owned control charge.
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, api.sqlCleanupIo());
+    try std.testing.expect(api.sql_cleanup_workers == null);
+    try std.testing.expectEqual(@as(usize, 30), runtime.ptr().laneStats().reserved_workers);
+    occupied.release();
+    try std.testing.expectEqual(@as(usize, 5), runtime.ptr().laneStats().reserved_workers);
+    const foreground = try api.sqlExecutionIo();
+    const cleanup_io = try api.sqlCleanupIo();
+    const control = try api.sqlControlIo();
+    try std.testing.expect(cleanup_io.userdata != foreground.userdata and cleanup_io.userdata != control.userdata);
+    try std.testing.expectEqual(@as(usize, 4), api.sql_cleanup_workers.?.capacity);
+    try std.testing.expectEqual(@as(usize, 20), runtime.ptr().laneStats().reserved_workers);
+    _ = try api.sqlCleanupIo();
+    try std.testing.expectEqual(@as(usize, 20), runtime.ptr().laneStats().reserved_workers);
+    const Blocked = struct {
+        fn run(gate: *std.Io.Event, io: std.Io) std.Io.Cancelable!void {
+            try gate.wait(io);
+        }
+        fn health(calls: *std.atomic.Value(usize)) void {
+            _ = calls.fetchAdd(1, .monotonic);
+        }
+    };
+    var cleanup_gate: std.Io.Event = .unset;
+    var foreground_gate: std.Io.Event = .unset;
+    var cleanup_jobs: std.Io.Group = .init;
+    var foreground_jobs: std.Io.Group = .init;
+    var jobs_live = true;
+    defer if (jobs_live) cleanup_jobs.cancel(cleanup_io);
+    defer if (jobs_live) foreground_jobs.cancel(foreground);
+    defer if (jobs_live) cleanup_gate.set(cleanup_io);
+    defer if (jobs_live) foreground_gate.set(foreground);
+    for (0..api.sql_cleanup_workers.?.capacity) |_| try cleanup_jobs.concurrent(cleanup_io, Blocked.run, .{ &cleanup_gate, cleanup_io });
+    for (0..api.sql_workers.?.capacity) |_| try foreground_jobs.concurrent(foreground, Blocked.run, .{ &foreground_gate, foreground });
+    try std.testing.expectError(error.ConcurrencyUnavailable, cleanup_jobs.concurrent(cleanup_io, Blocked.run, .{ &cleanup_gate, cleanup_io }));
+    try std.testing.expectError(error.ConcurrencyUnavailable, foreground_jobs.concurrent(foreground, Blocked.run, .{ &foreground_gate, foreground }));
+    var calls: std.atomic.Value(usize) = .init(0);
+    var health = try control.concurrent(Blocked.health, .{&calls});
+    health.await(control);
+    try std.testing.expectEqual(@as(usize, 1), calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 20), runtime.ptr().laneStats().reserved_workers);
+    cleanup_gate.set(cleanup_io);
+    foreground_gate.set(foreground);
+    try cleanup_jobs.await(cleanup_io);
+    try foreground_jobs.await(foreground);
+    jobs_live = false;
+    api.deinit();
+    api_closed = true;
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+}
+
 test "SQL protected executor preserves an explicitly disabled dedicated worker budget" {
     const alloc = std.testing.allocator;
     var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 0 } });
@@ -16508,6 +16591,7 @@ test "SQL protected executor preserves an explicitly disabled dedicated worker b
     var source = AuthStatusSource{};
     var api = ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr() }, source.iface(), null, null);
     defer api.deinit();
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, api.sqlCleanupIo());
     const foreground = try api.sqlExecutionIo();
     try std.testing.expect(foreground.userdata == runtime.ptr().io().?.userdata);
     const control = try api.sqlControlIo();
@@ -16613,4 +16697,249 @@ test "httpx workload policy requires admin and versioned bounded updates" {
     try std.testing.expect(transport.is_protected_body_request.?(.PUT, "/admin/v1/workload/query", request.body.?));
     try std.testing.expect(!transport.is_protected_body_request.?(.PUT, "/admin/v1/workload/query", "{\"expected_version\":3,\"sql\":\"SELECT 1\"}"));
     try std.testing.expect(http_server_mod.requiresAdminPermission("/admin/v1/workload/query"));
+}
+
+test "SQL protected executor cleanup owner reserves independent reaper and reclaims all worker capacity" {
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 32 } });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(alloc, .{
+        .backend_runtime = runtime.ptr(),
+        .admin_bearer_token = "cleanup-observer",
+        .query_max_concurrent_requests = 4,
+        .write_max_concurrent_requests = 1,
+        .sql_max_concurrent_preparations = 1,
+        .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 4096, .max_wait_ms = 100 },
+    }, source.iface(), null, null);
+    var closed = false;
+    defer if (!closed) api.deinit();
+    const cleanup_io = try api.sqlCleanupIo();
+    try std.testing.expect(api.sqlCleanupStats() == null);
+    try std.testing.expectEqual(@as(usize, 9), runtime.ptr().laneStats().reserved_workers);
+    var occupied = try runtime.ptr().acquireWorkers(.{ .capacity = 23 });
+    defer occupied.release();
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, api.sqlCleanupOwner());
+    try std.testing.expect(api.sql_cleanup_runtime == null and api.sql_cleanup_reaper_workers == null);
+    try std.testing.expectEqual(@as(usize, 32), runtime.ptr().laneStats().reserved_workers);
+    occupied.release();
+    // Force the stable Runtime allocation to fail after reaper admission.
+    // Retry must get its worker back without waiting for API shutdown.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    api.alloc = failing.allocator();
+    defer api.alloc = alloc;
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, api.sqlCleanupOwner());
+    api.alloc = alloc;
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expect(api.sql_cleanup_runtime == null and api.sql_cleanup_reaper_workers == null);
+    try std.testing.expectEqual(@as(usize, 9), runtime.ptr().laneStats().reserved_workers);
+    const active = try api.sqlCleanupOwner();
+    const stats = api.sqlCleanupStats().?;
+    try std.testing.expectEqual(@as(usize, 4), stats.capacity);
+    try std.testing.expectEqual(@as(usize, 0), stats.retained);
+    try std.testing.expect(!stats.closing);
+    const control_io = try api.sqlControlIo();
+    try std.testing.expect(active.io.userdata != cleanup_io.userdata and active.io.userdata != control_io.userdata);
+    try std.testing.expectEqual(@as(usize, 4), active.registry.limit);
+    try std.testing.expectEqual(@as(usize, 10), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expectEqual(active, try api.sqlCleanupOwner());
+    try std.testing.expectEqual(@as(usize, 10), runtime.ptr().laneStats().reserved_workers);
+    _ = try api.sqlExecutionIo();
+    try std.testing.expectEqual(@as(usize, 21), runtime.ptr().laneStats().reserved_workers);
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    var request = try httpx.Request.init(alloc, .GET, "http://localhost/admin/v1/workload/query");
+    defer request.deinit();
+    try request.headers.set("Authorization", "Bearer cleanup-observer");
+    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    var response = try handler.getWorkloadPolicy(&context);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    const body = try std.json.parseFromSlice(std.json.Value, alloc, response.body.?, .{});
+    defer body.deinit();
+    const cleanup_stats = body.value.object.get("cleanup").?.object;
+    try std.testing.expectEqual(@as(i64, 4), cleanup_stats.get("capacity").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), cleanup_stats.get("retained").?.integer);
+    api.deinit();
+    closed = true;
+    try std.testing.expect(api.sqlCleanupStats() == null);
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+}
+
+test "SQL protected executor cleanup diagnostics and control worker progress during blocked API shutdown" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const abi = @import("antfly_runtime_abi");
+    const owners = @import("runnable_owner_execution.zig");
+    const scheduler = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const allocation = @import("../common/allocation_budget.zig");
+    const Fixture = struct {
+        memory: *allocation.Shared,
+        owner: *owners.State,
+        handle: *anyopaque,
+        released: *std.atomic.Value(usize),
+        body: ?[]u8 = null,
+        refs: std.atomic.Value(usize) = .init(1),
+        ready: std.Io.Event = .unset,
+        go: std.Io.Event = .unset,
+        fn now() u64 {
+            return 0;
+        }
+        fn checked(status: abi.error_abi.Status) !void {
+            if (!status.isOk()) return abi.error_abi.errorFromStatus(status);
+        }
+        fn retain(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.refs.fetchAdd(1, .monotonic);
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            std.debug.assert(self.body == null);
+            const allocator = self.memory.allocator();
+            const port = self.owner.port();
+            const handle = self.handle;
+            const released = self.released;
+            allocator.destroy(self);
+            port.finish(handle);
+            _ = released.fetchAdd(1, .release);
+        }
+        fn cleanup(raw: *anyopaque, borrow: abi.runnable_abi.Borrowed, io: std.Io) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checked(borrow.park(borrow.context, @backingInt(abi.runnable_abi.Wait.resource)));
+            self.ready.set(io);
+            self.go.waitUncancelable(io);
+            try checked(borrow.enter(borrow.context, @backingInt(abi.runnable_abi.Class.query)));
+            try checked(borrow.checkpoint(borrow.context));
+            self.memory.allocator().free(self.body.?);
+            self.body = null;
+        }
+        fn retire(_: *anyopaque) !void {
+            return error.UnexpectedFailureRetirement;
+        }
+    };
+    const Shutdown = struct {
+        api: *ApiHttpServer,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.api.deinit();
+            self.done.store(true, .release);
+        }
+    };
+    const Observer = struct {
+        api: *ApiHttpServer,
+        io: std.Io,
+        control_io: std.Io,
+        done: std.Io.Event = .unset,
+        control_done: std.Io.Event = .unset,
+        fn control(self: *@This()) void {
+            self.control_done.set(self.control_io);
+        }
+        fn run(self: *@This()) !void {
+            defer self.done.set(self.io);
+            // This takes the actual publisher mutex. A mutex held across
+            // shutdown's physical join would stall this observer until timeout.
+            const stats = self.api.sqlCleanupStats() orelse return error.CleanupOwnerUnpublishedEarly;
+            try std.testing.expect(stats.closing);
+            try std.testing.expectEqual(@as(usize, 1), stats.retained);
+            var control_lease = try self.api.acquireSqlControl();
+            defer control_lease.release();
+            var control_future = try self.control_io.concurrent(@This().control, .{self});
+            defer control_future.await(self.control_io);
+            try self.control_done.waitTimeout(self.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            var handler: AntflyApiHandler = .{ .api_server = self.api };
+            var request = try httpx.Request.init(std.testing.allocator, .GET, "http://localhost/admin/v1/workload/query");
+            defer request.deinit();
+            try request.headers.set("Authorization", "Bearer shutdown-observer");
+            var context = httpx.Context.init(std.testing.allocator, self.io, &request);
+            defer context.deinit();
+            var response = try handler.getWorkloadPolicy(&context);
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            const body = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, response.body.?, .{});
+            defer body.deinit();
+            const cleanup_stats = body.value.object.get("cleanup").?.object;
+            try std.testing.expect(cleanup_stats.get("closing").?.bool);
+            try std.testing.expectEqual(@as(i64, 1), cleanup_stats.get("retained").?.integer);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var backend = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 32 } });
+    defer backend.deinit();
+    var observer_threads = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(1) });
+    defer observer_threads.deinit();
+    var shutdown_threads = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(1) });
+    defer shutdown_threads.deinit();
+    const observer_io = observer_threads.io();
+    const shutdown_io = shutdown_threads.io();
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(alloc, .{ .backend_runtime = backend.ptr(), .admin_bearer_token = "shutdown-observer", .query_max_concurrent_requests = 4, .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 4096, .max_wait_ms = 100 } }, source.iface(), null, null);
+    var api_closed = false;
+    defer if (!api_closed) api.deinit();
+    const cleanup_io = try api.sqlCleanupIo();
+    const active = try api.sqlCleanupOwner();
+    const control_io = try api.sqlControlIo();
+    try std.testing.expectEqual(@as(usize, 10), backend.ptr().laneStats().reserved_workers);
+    var owner: owners.State = .{ .owner_alloc = alloc, .owner = try scheduler.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = Fixture.now };
+    defer owner.owner.deinit();
+    var memory: allocation.Shared = .{ .child = std.heap.smp_allocator, .limit = 16384 };
+    var released: std.atomic.Value(usize) = .init(0);
+    const io_borrow = abi.native_abi.IoBorrow.init(&cleanup_io);
+    const port = owner.port();
+    var handle: ?*anyopaque = null;
+    try Fixture.checked(port.start(port.context, &.{ .io = &io_borrow, .class = @backingInt(abi.runnable_abi.Class.query), .has_deadline = 1, .native_deadline = 1, .deadline_ns = 10, .out_handle = &handle }));
+    const fixture = try memory.allocator().create(Fixture);
+    fixture.* = .{ .memory = &memory, .owner = &owner, .handle = handle.?, .released = &released };
+    const borrow = try abi.runnable_abi.Borrowed.fromOwner(port, handle.?, 1, .query);
+    var reservation = try active.registry.reserve(cleanup_io, borrow, &.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 100 }, fixture, .{ .retain = Fixture.retain, .release = Fixture.release, .cleanup = Fixture.cleanup, .retire = Fixture.retire });
+    fixture.body = try memory.allocator().alloc(u8, 64);
+    try reservation.publish();
+    try reservation.start();
+    try reservation.transfer();
+    Fixture.release(fixture);
+    try fixture.ready.waitTimeout(observer_io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    var shutdown: Shutdown = .{ .api = &api };
+    var shutdown_future = try shutdown_io.concurrent(Shutdown.run, .{&shutdown});
+    var physically_released = false;
+    var shutdown_joined = false;
+    defer {
+        if (!physically_released) fixture.go.set(cleanup_io);
+        if (!shutdown_joined) shutdown_future.await(shutdown_io);
+        api_closed = true;
+    }
+    const deadline = std.Io.Clock.awake.now(observer_io).addDuration(.fromSeconds(5));
+    while (!active.registry.snapshot().closing) {
+        if (std.Io.Clock.awake.now(observer_io).nanoseconds >= deadline.nanoseconds) return error.Timeout;
+        try observer_io.sleep(.fromMilliseconds(1), .awake);
+    }
+    var observer: Observer = .{ .api = &api, .io = observer_io, .control_io = control_io };
+    var observation = try observer_io.concurrent(Observer.run, .{&observer});
+    var observation_joined = false;
+    defer if (!observation_joined) {
+        // Unblock shutdown before joining a failed observer, so the old
+        // publisher-lock regression produces a bounded test failure.
+        if (!physically_released) {
+            fixture.go.set(cleanup_io);
+            physically_released = true;
+        }
+        _ = observation.await(observer_io) catch {};
+    };
+    try observer.done.waitTimeout(observer_io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try observation.await(observer_io);
+    observation_joined = true;
+    try std.testing.expect(!shutdown.done.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), released.load(.acquire));
+    try std.testing.expect(memory.stats().used_bytes > 0);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 10), backend.ptr().laneStats().reserved_workers);
+    fixture.go.set(cleanup_io);
+    physically_released = true;
+    shutdown_future.await(shutdown_io);
+    shutdown_joined = true;
+    api_closed = true;
+    try std.testing.expect(shutdown.done.load(.acquire));
+    try std.testing.expect(api.sqlCleanupStats() == null);
+    try std.testing.expectEqual(@as(usize, 1), released.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), memory.stats().used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), backend.ptr().laneStats().reserved_workers);
 }

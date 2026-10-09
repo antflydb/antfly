@@ -44,6 +44,7 @@ pub const Outbound = struct {
     writer: ?httpx.Context.StreamWriter = null,
     started: bool = false,
     write_control: httpx.socket.WriteControl = .{},
+    execution_wait: abi.ExecutionWait = .{},
 
     pub fn cancellation(self: *Outbound) abi.CancellationView {
         return .{
@@ -66,7 +67,43 @@ pub const Outbound = struct {
             .start = start,
             .write = write,
             .close = close,
+            .set_execution_wait = setExecutionWait,
         };
+    }
+
+    fn setExecutionWait(raw: ?*anyopaque, view: ?*const abi.ExecutionWait) callconv(.c) abi.CallbackStatus {
+        const self: *Outbound = @ptrCast(@alignCast(raw orelse return .failed));
+        if (view) |value| {
+            if (value.begin == null or value.end == null) return .failed;
+            self.execution_wait = value.*;
+        } else self.execution_wait = .{};
+        if (self.writer) |*writer| {
+            writer.control = self.outputControl();
+            if (writer.h2_writer) |*h2_writer| h2_writer.control = writer.control;
+        }
+        return .ok;
+    }
+
+    fn checkOutput(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
+        const self: *Outbound = @ptrCast(@alignCast(raw.?));
+        try self.write_control.check();
+    }
+    fn remainingOutput(raw: ?*anyopaque) httpx.socket.WriteControl.Error!?u64 {
+        const self: *Outbound = @ptrCast(@alignCast(raw.?));
+        if (self.write_control.remaining_ms_fn) |remaining| return remaining(self.write_control.ptr);
+        return null;
+    }
+    fn beginOutputWait(raw: ?*anyopaque) !void {
+        const self: *Outbound = @ptrCast(@alignCast(raw.?));
+        try callbackResult(self.execution_wait.begin.?(self.execution_wait.context));
+    }
+    fn endOutputWait(raw: ?*anyopaque) !void {
+        const self: *Outbound = @ptrCast(@alignCast(raw.?));
+        try callbackResult(self.execution_wait.end.?(self.execution_wait.context));
+    }
+    fn outputControl(self: *Outbound) httpx.socket.WriteControl {
+        if (self.execution_wait.begin == null) return self.write_control;
+        return .{ .ptr = self, .check_fn = checkOutput, .remaining_ms_fn = remainingOutput, .wait_begin_fn = beginOutputWait, .wait_end_fn = endOutputWait };
     }
 
     fn isCancelled(raw: ?*const anyopaque) callconv(.c) u8 {
@@ -94,7 +131,7 @@ pub const Outbound = struct {
         for (headers.slice()) |header| {
             self.context.response.headers.append(header.name.slice(), header.value.slice()) catch |err| return callbackStatusAfterIo(self.context, err);
         }
-        self.writer = self.context.streamResponseWithContentTypeControlled(status, content_type.slice(), self.write_control) catch |err| return callbackStatusAfterIo(self.context, err);
+        self.writer = self.context.streamResponseWithContentTypeControlled(status, content_type.slice(), self.outputControl()) catch |err| return callbackStatusAfterIo(self.context, err);
         self.started = true;
         return .ok;
     }
@@ -561,4 +598,56 @@ test "outbound callbacks prefer cancellation that arrives during transport IO" {
 
     cancellation.store(false, .release);
     try std.testing.expectEqual(.canceled, stream_sink.close.?(stream_sink.context));
+}
+
+test "outbound checked execution wait installation preserves fences and clears borrowed hooks" {
+    const std = @import("std");
+    const State = struct {
+        parked: bool = false,
+        canceled: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: ?*anyopaque) httpx.socket.WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.canceled) return error.Canceled;
+        }
+        fn begin(raw: ?*anyopaque) callconv(.c) abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.parked) return .failed;
+            self.parked = true;
+            self.begins += 1;
+            return .ok;
+        }
+        fn end(raw: ?*anyopaque) callconv(.c) abi.CallbackStatus {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (!self.parked) return .failed;
+            self.parked = false;
+            self.ends += 1;
+            return .ok;
+        }
+        fn operation(self: *@This()) !void {
+            try std.testing.expect(self.parked);
+        }
+    };
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "/stream");
+    defer request.deinit();
+    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer context.deinit();
+    var state = State{};
+    var outbound = Outbound{ .context = &context, .write_control = .{ .ptr = &state, .check_fn = State.check } };
+    const sink = outbound.stream();
+    try std.testing.expectEqual(.failed, sink.set_execution_wait.?(sink.context, &.{ .context = &state, .begin = State.begin }));
+    try std.testing.expect(outbound.execution_wait.begin == null);
+    try std.testing.expectEqual(.ok, sink.set_execution_wait.?(sink.context, &.{ .context = &state, .begin = State.begin, .end = State.end }));
+    try outbound.outputControl().withWait(State.operation, .{&state});
+    try std.testing.expect(!state.parked);
+    try std.testing.expectEqual(@as(usize, 1), state.begins);
+    try std.testing.expectEqual(@as(usize, 1), state.ends);
+    state.canceled = true;
+    try std.testing.expectError(error.Canceled, outbound.outputControl().withWait(State.operation, .{&state}));
+    try std.testing.expectEqual(@as(usize, 1), state.begins);
+    // Retirement must clear borrowed stack pointers despite cancellation.
+    try std.testing.expectEqual(.ok, sink.set_execution_wait.?(sink.context, null));
+    try std.testing.expect(outbound.outputControl().wait_begin_fn == null);
+    try std.testing.expectError(error.Canceled, outbound.outputControl().check());
 }

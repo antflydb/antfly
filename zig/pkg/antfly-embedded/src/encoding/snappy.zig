@@ -36,7 +36,43 @@ const hash_table_size: usize = 1 << hash_table_bits; // 16384
 /// Decode Snappy-compressed block data.
 /// Returns decompressed bytes owned by caller.
 pub fn decode(alloc: Allocator, src: []const u8) ![]u8 {
-    if (src.len == 0) return try alloc.alloc(u8, 0);
+    return decodeWithAdmission(alloc, src, null);
+}
+
+// Generic synchronous control keeps this codec independent of runtime ABI
+// imports. Null instantiation compiles out the controlled checks/copy loops.
+fn checkpoint(control: anytype) !void {
+    if (comptime @TypeOf(control) != @TypeOf(null)) {
+        if (control) |budget| try budget.checkpoint();
+    }
+}
+
+fn copyLiteralWithAdmission(dst: []u8, src: []const u8, control: anytype) !void {
+    if (comptime @TypeOf(control) == @TypeOf(null)) {
+        @memcpy(dst, src);
+        return;
+    }
+    if (control == null) {
+        @memcpy(dst, src);
+        return;
+    }
+    var cursor: usize = 0;
+    while (cursor < src.len) {
+        try checkpoint(control);
+        const end = cursor + @min(src.len - cursor, 64 * 1024);
+        @memcpy(dst[cursor..end], src[cursor..end]);
+        cursor = end;
+    }
+}
+
+pub fn decodeWithAdmission(alloc: Allocator, src: []const u8, control: anytype) ![]u8 {
+    try checkpoint(control);
+    if (src.len == 0) {
+        const empty = try alloc.alloc(u8, 0);
+        errdefer alloc.free(empty);
+        try checkpoint(control);
+        return empty;
+    }
 
     // Read uncompressed length (varint preamble)
     var pos: usize = 0;
@@ -46,8 +82,19 @@ pub fn decode(alloc: Allocator, src: []const u8) ![]u8 {
     errdefer alloc.free(dst);
 
     var d: usize = 0; // destination offset
+    var checked_destination: usize = 0;
+    var tags_since_check: usize = 0;
+    try checkpoint(control);
 
     while (pos < src.len) {
+        if (comptime @TypeOf(control) != @TypeOf(null)) {
+            if (tags_since_check >= 256 or d - checked_destination >= 64 * 1024) {
+                try checkpoint(control);
+                checked_destination = d;
+                tags_since_check = 0;
+            }
+            tags_since_check += 1;
+        }
         const tag = src[pos];
         pos += 1;
         const element_type: u2 = @truncate(tag);
@@ -69,7 +116,7 @@ pub fn decode(alloc: Allocator, src: []const u8) ![]u8 {
                 }
                 if (pos + length > src.len) return error.CorruptInput;
                 if (d + length > dst.len) return error.CorruptInput;
-                @memcpy(dst[d..][0..length], src[pos..][0..length]);
+                try copyLiteralWithAdmission(dst[d..][0..length], src[pos..][0..length], control);
                 d += length;
                 pos += length;
             },
@@ -113,6 +160,7 @@ pub fn decode(alloc: Allocator, src: []const u8) ![]u8 {
     }
 
     if (d != uncompressed_len) return error.CorruptInput;
+    try checkpoint(control);
     return dst;
 }
 
@@ -434,4 +482,44 @@ test "literal lengths > 60" {
     const decompressed = try decode(alloc, compressed);
     defer alloc.free(decompressed);
     try std.testing.expectEqualSlices(u8, &input, decompressed);
+}
+
+test "decode admission checks long literals and repeated copy tags without changing bytes" {
+    const len = 256 * 1024;
+    const literal = try std.testing.allocator.alloc(u8, len);
+    defer std.testing.allocator.free(literal);
+    for (literal, 0..) |*byte, i| byte.* = @truncate(i);
+    const Budget = struct {
+        calls: usize = 0,
+        fail_at: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls == self.fail_at) return error.OriginalReadDeadline;
+        }
+    };
+    for ([_]bool{ false, true }) |copies| {
+        var payload: std.ArrayListUnmanaged(u8) = .empty;
+        defer payload.deinit(std.testing.allocator);
+        try writeVarint(std.testing.allocator, &payload, len);
+        if (copies) {
+            try emitLiteral(std.testing.allocator, &payload, "a");
+            try emitCopy(std.testing.allocator, &payload, 1, len - 1);
+        } else try emitLiteral(std.testing.allocator, &payload, literal);
+        var budget = Budget{};
+        const decoded = try decodeWithAdmission(std.testing.allocator, payload.items, @as(?*Budget, &budget));
+        defer std.testing.allocator.free(decoded);
+        if (copies) {
+            for (decoded) |byte| try std.testing.expectEqual(@as(u8, 'a'), byte);
+        } else try std.testing.expectEqualSlices(u8, literal, decoded);
+        try std.testing.expect(budget.calls >= 6);
+        const total_checks = budget.calls;
+        for (1..total_checks + 1) |fail_at| {
+            budget = .{ .fail_at = fail_at };
+            try std.testing.expectError(error.OriginalReadDeadline, decodeWithAdmission(std.testing.allocator, payload.items, @as(?*Budget, &budget)));
+            try std.testing.expectEqual(fail_at, budget.calls);
+        }
+        const legacy = try decode(std.testing.allocator, payload.items);
+        defer std.testing.allocator.free(legacy);
+        try std.testing.expectEqualSlices(u8, legacy, decoded);
+    }
 }

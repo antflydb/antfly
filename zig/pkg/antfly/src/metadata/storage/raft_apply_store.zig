@@ -2035,6 +2035,7 @@ fn decodeMetadataCheckpoint(bytes: []const u8) !AppliedMetadataCheckpoint {
 
 pub const CatalogProjectionSnapshot = apply_contract.CatalogProjectionSnapshot;
 pub const CatalogCursor = apply_contract.CatalogCursor;
+pub const TransactionRoutingProjectionSnapshot = apply_contract.TransactionRoutingProjectionSnapshot;
 
 fn catalogProjectionDeadline(deadline_ns: ?u64, deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow) !void {
     if (deadline_ns) |deadline| {
@@ -9845,6 +9846,86 @@ pub const RaftApplyStore = struct {
             .tables = tables,
             .ranges = ranges,
         };
+    }
+
+    /// Admission-only capture. All four namespaces use one point-in-time
+    /// transaction; every cursor advance and record decode checks the original
+    /// request control. Backend waits still need their own bounded wait support.
+    pub fn captureTransactionRoutingProjection(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        budget: anytype,
+    ) !TransactionRoutingProjectionSnapshot {
+        try budget.checkpoint();
+        var txn = try self.store.beginReadTxnWithBudget(.retain, budget);
+        defer txn.abort();
+        try budget.checkpoint();
+        var revision_key_buf: [160]u8 = undefined;
+        const revision_bytes = txn.get(try catalogRevisionKeyForGroup(&revision_key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const revision = if (revision_bytes) |bytes| blk: {
+            if (bytes.len < @sizeOf(u64)) return error.InvalidMetadataApplyBatch;
+            break :blk std.mem.readInt(u64, bytes[0..8], .little);
+        } else 0;
+        var incarnation_key_buf: [160]u8 = undefined;
+        const incarnation_bytes = txn.get(try metadataIncarnationKeyForGroup(&incarnation_key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        const incarnation = if (incarnation_bytes) |bytes| (try decodeMetadataIncarnationRecord(bytes)).incarnation else null;
+        const tables = try captureTransactionNamespace(metadata.TableRecord, alloc, &txn, group_id, budget, tablePrefixForGroup, decodeTableRecord, metadata_table_manager.freeTable);
+        errdefer self.freeTables(alloc, tables);
+        const ranges = try captureTransactionNamespace(metadata.RangeRecord, alloc, &txn, group_id, budget, rangePrefixForGroup, decodeRangeRecord, metadata_table_manager.freeRange);
+        errdefer self.freeRanges(alloc, ranges);
+        const splits = try captureTransactionNamespace(metadata.SplitTransitionRecord, alloc, &txn, group_id, budget, splitTransitionPrefixForGroup, decodeSplitTransitionRecord, metadata_table_manager.freeSplitTransitionRecord);
+        errdefer self.freeSplitTransitions(alloc, splits);
+        const merges = try captureTransactionNamespace(metadata.MergeTransitionRecord, alloc, &txn, group_id, budget, mergeTransitionPrefixForGroup, decodeMergeTransitionRecord, metadata_table_manager.freeMergeTransitionRecord);
+        errdefer self.freeMergeTransitions(alloc, merges);
+        try budget.checkpoint();
+        return .{ .metadata_incarnation = incarnation, .catalog_revision = revision, .tables = tables, .ranges = ranges, .split_transitions = splits, .merge_transitions = merges };
+    }
+
+    fn captureTransactionNamespace(
+        comptime Record: type,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        budget: anytype,
+        comptime prefix_fn: anytype,
+        comptime decode_fn: anytype,
+        comptime free_fn: anytype,
+    ) ![]Record {
+        try budget.checkpoint();
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try prefix_fn(&prefix_buf, group_id);
+        var cursor = try txn.openCursorWithBudget(budget);
+        defer cursor.close();
+        var records = std.ArrayListUnmanaged(Record).empty;
+        errdefer {
+            for (records.items) |record| free_fn(alloc, record);
+            records.deinit(alloc);
+        }
+        const admission = @import("antfly_local_sources").read_admission;
+        var adapter = admission.Adapter(@TypeOf(budget)){ .budget = budget };
+        const payload = adapter.payload();
+        const control = admission.Port.init(&payload);
+        var entry = try cursor.seekAtOrAfterWithAdmission(prefix, control);
+        while (entry) |kv| {
+            try budget.checkpoint();
+            if (!std.mem.startsWith(u8, kv.key, prefix)) break;
+            {
+                const record = try decode_fn(alloc, kv.value);
+                errdefer free_fn(alloc, record);
+                try records.append(alloc, record);
+            }
+            try budget.checkpoint();
+            entry = try cursor.nextWithAdmission(control);
+        }
+        try budget.checkpoint();
+        return try records.toOwnedSlice(alloc);
     }
 
     /// Read the durable authority and applied revision from one storage
@@ -23729,6 +23810,59 @@ test "metadata raft apply store publishes listeners only after commit" {
     const tables = try store.listTables(std.testing.allocator, 41);
     defer store.freeTables(std.testing.allocator, tables);
     try std.testing.expectEqual(@as(usize, 0), tables.len);
+}
+
+test "transaction routing capture retains original payload policy wait budget and releases reader admission" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-capture-wait", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root, .no_sync = true });
+    defer store.deinit();
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+    defer clock.deinit();
+    const Budget = struct {
+        mode: enum { release, expire, cancel },
+        original: @import("antfly_local_sources").api_routing_budget.RoutingBudget,
+        clock: *@import("vopr").vopr_io.VoprIo,
+        signal: *std.atomic.Value(bool),
+        mutex: *std.Io.Mutex,
+        holder_locked: bool = true,
+        waits: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.original.checkpoint();
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            self.waits += 1;
+            switch (self.mode) {
+                .release => {
+                    self.holder_locked = false;
+                    self.mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+                },
+                .expire => self.clock.monotonic_ns = self.original.deadline_ns.?,
+                .cancel => self.signal.store(true, .release),
+            }
+        }
+    };
+    inline for (.{ .release, .expire, .cancel }) |mode| {
+        clock.monotonic_ns = 7 * std.time.ns_per_s;
+        var signal = std.atomic.Value(bool).init(false);
+        var budget = Budget{ .mode = mode, .clock = &clock, .signal = &signal, .mutex = &store.store.payload_policy_mutex, .original = .{ .deadline_ns = 8 * std.time.ns_per_s, .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&clock.io()), .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&signal) } };
+        try std.testing.expect(store.store.payload_policy_mutex.tryLock());
+        defer if (budget.holder_locked) store.store.payload_policy_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        if (mode == .release) {
+            const snapshot = try store.captureTransactionRoutingProjection(std.testing.allocator, 91, &budget);
+            defer store.freeTables(std.testing.allocator, snapshot.tables);
+            defer store.freeRanges(std.testing.allocator, snapshot.ranges);
+            defer store.freeSplitTransitions(std.testing.allocator, snapshot.split_transitions);
+            defer store.freeMergeTransitions(std.testing.allocator, snapshot.merge_transitions);
+        } else {
+            try std.testing.expectError(if (mode == .expire) error.CatalogRoutingSnapshotTimeout else error.Canceled, store.captureTransactionRoutingProjection(std.testing.allocator, 91, &budget));
+            try std.testing.expect(!store.store.payload_policy_mutex.tryLock());
+        }
+        try std.testing.expectEqual(@as(usize, 1), budget.waits);
+        try std.testing.expectEqual(@as(usize, 0), store.store.portable_import_reader_state.load(.acquire));
+    }
 }
 
 test "metadata raft apply store catalog projection uses storage snapshot independently from apply mutex" {

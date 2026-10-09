@@ -64,6 +64,16 @@ pub const Entry = struct {
     /// their independent completion Io must remain valid through all joins.
     completion_options: ?admission.Options = null,
     completion_active: bool = false,
+    /// Trusted physical cleanup reserved before publishing an owned resource.
+    /// This grants no durable-write authority and never changes CPU partition.
+    cleanup_options: ?admission.Options = null,
+    /// One-shot physical cleanup duration, consumed at first activation.
+    cleanup_duration_ns: ?u64 = null,
+    cleanup_active: bool = false,
+
+    fn retainedPhase(self: *const Entry) bool {
+        return self.completion_active or self.cleanup_active;
+    }
 };
 
 const Queue = struct { head: ?*Entry = null, tail: ?*Entry = null };
@@ -182,7 +192,7 @@ pub const Scheduler = struct {
     }
     fn dispatch(self: *Scheduler) void {
         // Close removes ordinary queued entries, but preauthorized active
-        // completion retains the same bounded queues and capacity partition.
+        // completion/cleanup retains the same bounded queues and capacity partition.
         while (self.queues[4].head) |e| {
             if (e.slots > self.config.control_slots - self.used[4]) break;
             self.grant(e);
@@ -247,10 +257,10 @@ pub const Scheduler = struct {
     }
 
     /// Initial acquisition retires an unpublished entry on failure. A caller
-    /// cannot use this API to discard an active completion's live consumers.
+    /// cannot use this API to discard retained completion/cleanup consumers.
     pub fn wait(self: *Scheduler, e: *Entry) !void {
         self.lock();
-        const completing = e.scheduler == self and e.completion_active;
+        const completing = e.scheduler == self and e.retainedPhase();
         self.mutex.unlock();
         if (completing) return self.waitRetained(e);
         return self.waitImpl(e, false);
@@ -310,7 +320,7 @@ pub const Scheduler = struct {
             const s = e.state;
             const failure = e.failure;
             const closed = self.closed;
-            const completing = e.completion_active;
+            const completing = e.retainedPhase();
             const waited = e.waited;
             self.mutex.unlock();
             if (!still_owned) return error.InvalidRunnableTransition;
@@ -360,7 +370,7 @@ pub const Scheduler = struct {
         e.bypasses = 0;
         self.sequence +|= 1;
         e.sequence = self.sequence;
-        if (self.closed and !e.completion_active) {
+        if (self.closed and !e.retainedPhase()) {
             e.state = .stopped;
             e.failure = error.SchedulerClosed;
             self.dispatch();
@@ -380,9 +390,9 @@ pub const Scheduler = struct {
         if (e.scheduler != self or e.state != .running) return error.InvalidRunnableTransition;
         const capacity = if (e.class == .control) self.config.control_slots else self.config.slots - self.config.control_slots;
         if (slots == 0 or slots > capacity) return error.InvalidRunnableDemand;
-        // Only a separately reserved/activated completion phase may resize
+        // Only a separately reserved/activated retained phase may resize
         // after close. Other live work keeps its existing grant until finish.
-        if (self.closed and !e.completion_active) return error.SchedulerClosed;
+        if (self.closed and !e.retainedPhase()) return error.SchedulerClosed;
         if (slots <= e.slots) {
             self.used[@backingInt(e.class)] -= e.slots - slots;
             e.slots = slots;
@@ -407,7 +417,7 @@ pub const Scheduler = struct {
         if (e.scheduler != self or e.state != .running or
             (reason != .resource_blocked and reason != .output_blocked)) return error.InvalidRunnableTransition;
         self.used[@backingInt(e.class)] -= e.slots;
-        if (self.closed and !e.completion_active) {
+        if (self.closed and !e.retainedPhase()) {
             e.state = .stopped;
             e.failure = error.SchedulerClosed;
             e.ready.set(e.options.io);
@@ -423,7 +433,7 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         if (e.scheduler != self) return error.InvalidRunnableTransition;
-        if (self.closed and !e.completion_active) return error.SchedulerClosed;
+        if (self.closed and !e.retainedPhase()) return error.SchedulerClosed;
         if (e.state != .resource_blocked and e.state != .output_blocked) return error.InvalidRunnableTransition;
         if (e.state == .resource_blocked) self.metrics.resource_blocked -= 1 else self.metrics.output_blocked -= 1;
         e.bypasses = 0;
@@ -439,10 +449,10 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         if (e.scheduler != self) return error.InvalidRunnableTransition;
-        if (self.closed and !e.completion_active) return error.SchedulerClosed;
+        if (self.closed and !e.retainedPhase()) return error.SchedulerClosed;
         if (e.state != .resource_blocked and e.state != .output_blocked) return error.InvalidRunnableTransition;
-        // Completion cannot promote itself into another capacity partition.
-        if (e.completion_active and class != e.class) return error.InvalidRunnableTransition;
+        // Retained completion/cleanup cannot promote its capacity partition.
+        if (e.retainedPhase() and class != e.class) return error.InvalidRunnableTransition;
         const capacity = if (class == .control) self.config.control_slots else self.config.slots - self.config.control_slots;
         if (e.slots > capacity) return error.InvalidRunnableDemand;
         e.class = class;
@@ -461,12 +471,92 @@ pub const Scheduler = struct {
         defer self.mutex.unlock();
         if (e.scheduler != self or e.state != .running or
             (e.class != .write and e.class != .control) or
-            e.completion_options != null or e.completion_active) return error.InvalidRunnableTransition;
+            e.completion_options != null or e.retainedPhase()) return error.InvalidRunnableTransition;
         if (self.closed) return error.SchedulerClosed;
         if (completion.retained_bytes > e.bytes) return error.InvalidRunnableDemand;
         var options = completion;
         options.retained_bytes = e.bytes;
         e.completion_options = options;
+    }
+
+    /// Reserve cleanup while foreground execution still owns a live grant.
+    /// The independent task, callback context, allocator and all physical work
+    /// must already be retained by the caller before publishing any resource.
+    /// Operation/bytes remain the existing bounded entry; no new admission or
+    /// control promotion is available when cleanup eventually activates.
+    pub fn reserveCleanup(self: *Scheduler, e: *Entry, cleanup: admission.Options) !void {
+        return self.reserveCleanupChecked(e, cleanup, null);
+    }
+
+    /// Preauthorize a finite physical cleanup duration before publishing a
+    /// resource whose idle lifetime can exceed the foreground query deadline.
+    /// This starts exactly once, including fair CPU wait, at activation. It
+    /// never refreshes query authority or an already active cleanup deadline.
+    pub fn reserveCleanupFor(self: *Scheduler, e: *Entry, cleanup: admission.Options, duration_ns: u64) !void {
+        return self.reserveCleanupChecked(e, cleanup, duration_ns);
+    }
+
+    fn reserveCleanupChecked(self: *Scheduler, e: *Entry, cleanup: admission.Options, duration_ns: ?u64) !void {
+        if (cleanup.cancellation != null or !cleanup.allow_wait) return error.InvalidArgument;
+        if (duration_ns) |duration| {
+            if (duration == 0 or cleanup.deadline_ns != null) return error.InvalidArgument;
+            _ = std.math.add(u64, cleanup.now(), duration) catch return error.InvalidArgument;
+        } else if (cleanup.deadline_ns == null) return error.InvalidArgument;
+        try e.options.check();
+        try cleanup.check();
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self or e.state != .running or e.cleanup_options != null or e.retainedPhase()) return error.InvalidRunnableTransition;
+        if (self.closed) return error.SchedulerClosed;
+        if (cleanup.retained_bytes > e.bytes) return error.InvalidRunnableDemand;
+        var options = cleanup;
+        options.retained_bytes = e.bytes;
+        e.cleanup_options = options;
+        e.cleanup_duration_ns = duration_ns;
+    }
+
+    /// After fencing foreground children, transfer the retained entry to its
+    /// preauthorized cleanup authority. Unlike durable completion, cleanup must
+    /// activate after foreground cancellation, denied reentry or owner close.
+    /// A stopped foreground is never resumed with its expired query authority.
+    /// Fair CPU reentry can fail; then the cleanup owner still retains all bytes
+    /// and must join or transfer physical ownership before owning finish.
+    pub fn activateCleanup(self: *Scheduler, e: *Entry) !void {
+        var cleanup = e.cleanup_options orelse return error.InvalidRunnableTransition;
+        const now = cleanup.now();
+        if (e.cleanup_duration_ns) |duration| {
+            cleanup.deadline_ns = std.math.add(u64, now, duration) catch return error.InvalidArgument;
+        }
+        try cleanup.check();
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self or e.retainedPhase()) return error.InvalidRunnableTransition;
+        switch (e.state) {
+            .running => {},
+            .queued => self.unlink(e),
+            .resource_blocked => self.metrics.resource_blocked -= 1,
+            .output_blocked => self.metrics.output_blocked -= 1,
+            .stopped => {},
+            .fresh, .finished => return error.InvalidRunnableTransition,
+        }
+        const running = e.state == .running;
+        e.options = cleanup;
+        e.cleanup_options = cleanup;
+        e.cleanup_duration_ns = null;
+        e.cleanup_active = true;
+        // Inactive write completion was never accepted. Its authorization
+        // cannot survive a transfer into physical cleanup.
+        e.completion_options = null;
+        e.failure = null;
+        e.bypasses = 0;
+        e.waited = false;
+        if (!running) {
+            self.sequence +|= 1;
+            e.sequence = self.sequence;
+            self.enqueue(e, now);
+            self.dispatch();
+            e.waited = e.state == .queued;
+        }
     }
 
     /// Enter the independent completion phase before possible durable
@@ -478,7 +568,7 @@ pub const Scheduler = struct {
         try completion.check();
         self.lock();
         defer self.mutex.unlock();
-        if (e.scheduler != self or e.state != .running or e.completion_active) return error.InvalidRunnableTransition;
+        if (e.scheduler != self or e.state != .running or e.retainedPhase()) return error.InvalidRunnableTransition;
         if (self.closed) return error.SchedulerClosed;
         const options = e.completion_options orelse return error.InvalidRunnableTransition;
         e.options = options;
@@ -513,6 +603,9 @@ pub const Scheduler = struct {
         e.scheduler = null;
         e.completion_options = null;
         e.completion_active = false;
+        e.cleanup_options = null;
+        e.cleanup_duration_ns = null;
+        e.cleanup_active = false;
         self.dispatch();
     }
     pub fn close(self: *Scheduler) void {
@@ -521,7 +614,7 @@ pub const Scheduler = struct {
         self.closed = true;
         var next = self.entries;
         while (next) |e| : (next = e.all_next) {
-            if (e.completion_active) continue;
+            if (e.retainedPhase()) continue;
             switch (e.state) {
                 .queued => self.unlink(e),
                 .resource_blocked => self.metrics.resource_blocked -= 1,
@@ -688,6 +781,41 @@ pub const Execution = struct {
         try options.check();
         try owner.activateCompletion(e);
         self.quantum_start_ns = options.now();
+        self.checkpoints = 0;
+    }
+    /// Read the retained completion fence without issuing a new deadline.
+    /// Foreground cancellation and scheduler close do not replace its clock.
+    pub fn completionRemainingNs(self: *Execution) !u64 {
+        const entry = if (self.entry) |*value| value else return error.ExecutionWaitUnsupported;
+        if (!entry.completion_active) return error.ExecutionWaitUnsupported;
+        const options = entry.completion_options orelse return error.InvalidRunnableTransition;
+        try options.check();
+        const deadline = options.deadline_ns orelse return error.InvalidArgument;
+        const remaining = deadline -| options.now();
+        if (remaining == 0) return error.DeadlineExceeded;
+        return remaining;
+    }
+
+    pub fn reserveCleanup(self: *Execution, cleanup: admission.Options) !void {
+        const e = if (self.entry) |*entry| entry else return error.ExecutionWaitUnsupported;
+        const owner = try schedulerFor(e, true);
+        try owner.reserveCleanup(e, cleanup);
+    }
+    pub fn reserveCleanupFor(self: *Execution, cleanup: admission.Options, duration_ns: u64) !void {
+        const e = if (self.entry) |*entry| entry else return error.ExecutionWaitUnsupported;
+        const owner = try schedulerFor(e, true);
+        try owner.reserveCleanupFor(e, cleanup, duration_ns);
+    }
+    pub fn activateCleanup(self: *Execution) !void {
+        const e = if (self.entry) |*entry| entry else return error.ExecutionWaitUnsupported;
+        // A stopped foreground deliberately retains its entry for cleanup.
+        // Validate ownership in the scheduler rather than rejecting that state
+        // through schedulerFor's foreground transition check.
+        const owner = e.scheduler orelse return error.InvalidRunnableTransition;
+        try owner.activateCleanup(e);
+        try owner.waitRetained(e);
+        self.resume_generation +%= 1;
+        self.quantum_start_ns = e.options.now();
         self.checkpoints = 0;
     }
     pub fn finish(self: *Execution) void {
@@ -1682,4 +1810,339 @@ test "runnable execution independent completion task outlives actual foreground 
         try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
         try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
     }
+}
+
+test "runnable scheduler cleanup reenters retained foreground states after cancellation and close" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    const Cancel = struct {
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    };
+    for ([_]State{ .running, .resource_blocked, .output_blocked, .queued, .stopped }) |before| {
+        Clock.value = 0;
+        var canceled = false;
+        var owner = try Scheduler.init(.{ .slots = 2, .control_slots = 1, .checkpoint_budget = 1 });
+        defer owner.close();
+        var query: Execution = .{};
+        defer query.finish();
+        var blocker: Execution = .{};
+        defer blocker.finish();
+        try query.start(&owner, .{ .io = std.testing.io, .deadline_ns = 5, .native_now_ns = Clock.now, .retained_bytes = 32, .cancellation = .{ .ptr = &canceled, .requested = Cancel.requested } }, .query);
+        try query.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = 100, .native_now_ns = Clock.now });
+        switch (before) {
+            .running => {},
+            .resource_blocked, .output_blocked => try query.park(before),
+            .queued => {
+                try query.park(.resource_blocked);
+                try blocker.start(&owner, .{ .io = std.testing.io }, .query);
+                try owner.unblock(&query.entry.?);
+            },
+            .stopped => owner.failWait(&query.entry.?, error.Canceled, true),
+            else => unreachable,
+        }
+        try std.testing.expectEqual(before, query.entry.?.state);
+        canceled = true;
+        Clock.value = 10;
+        owner.close();
+        try owner.activateCleanup(&query.entry.?);
+        try std.testing.expect(query.entry.?.cleanup_active);
+        try std.testing.expect(!query.entry.?.completion_active);
+        try std.testing.expectEqual(Class.query, query.entry.?.class);
+        try std.testing.expectEqual(@as(u64, 32), owner.stats().retained_bytes);
+        if (before == .queued) {
+            // Cleanup does not steal the occupied CPU or enter control capacity.
+            try std.testing.expectEqual(State.queued, query.entry.?.state);
+            try std.testing.expectEqual(@as(usize, 2), owner.stats().operations);
+            try std.testing.expectEqual(@as(usize, 1), owner.stats().runnable_slots);
+        }
+        blocker.finish();
+        try owner.waitRetained(&query.entry.?);
+        try query.checkpoint();
+        try query.park(.resource_blocked);
+        try std.testing.expectError(error.InvalidRunnableTransition, query.enter(.control));
+        try query.enter(.query);
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().control_slots);
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 32), owner.stats().retained_bytes);
+        query.finish();
+        try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    }
+}
+
+test "runnable execution cleanup activation preserves bounded ownership after denied foreground reentry" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    Clock.value = 0;
+    var owner = try Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer owner.close();
+    var query: Execution = .{};
+    defer query.finish();
+    try query.start(&owner, .{ .io = std.testing.io, .deadline_ns = 5, .native_now_ns = Clock.now, .retained_bytes = 13 }, .query);
+    try query.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = 100, .native_now_ns = Clock.now });
+    try query.park(.resource_blocked);
+    Clock.value = 10;
+    try std.testing.expectError(error.DeadlineExceeded, query.enter(.query));
+    try std.testing.expectEqual(State.stopped, query.entry.?.state);
+    try std.testing.expectError(error.DeadlineExceeded, query.checkpoint());
+    const generation = query.resume_generation;
+    try query.activateCleanup();
+    try std.testing.expect(query.resume_generation != generation);
+    try query.checkpoint();
+    try std.testing.expectEqual(@as(u64, 13), owner.stats().retained_bytes);
+    try std.testing.expectError(error.InvalidRunnableTransition, query.activateCleanup());
+    Clock.value = 100;
+    // Even the public initial-wait API cannot discard live cleanup consumers.
+    try std.testing.expectError(error.DeadlineExceeded, owner.wait(&query.entry.?));
+    try std.testing.expectEqual(State.stopped, query.entry.?.state);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 13), owner.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+}
+
+test "runnable execution cleanup requires prior independent finite authorization" {
+    var owner = try Scheduler.init(.{});
+    defer owner.close();
+    var query: Execution = .{};
+    defer query.finish();
+    try std.testing.expectError(error.ExecutionWaitUnsupported, query.activateCleanup());
+    try query.start(&owner, .{ .io = std.testing.io, .retained_bytes = 8 }, .query);
+    const deadline = query.entry.?.options.now() + 10 * std.time.ns_per_s;
+    try std.testing.expectError(error.InvalidRunnableTransition, query.activateCleanup());
+    try std.testing.expectError(error.InvalidArgument, query.reserveCleanup(.{ .io = std.testing.io }));
+    try std.testing.expectError(error.InvalidArgument, query.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = deadline, .allow_wait = false }));
+    try std.testing.expectError(error.InvalidRunnableDemand, query.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = deadline, .retained_bytes = 9 }));
+    try std.testing.expect(query.entry.?.cleanup_options == null);
+    try query.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = deadline });
+    try std.testing.expectEqual(@as(u64, 8), query.entry.?.cleanup_options.?.retained_bytes);
+    try std.testing.expectError(error.InvalidRunnableTransition, query.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = deadline }));
+    try query.activateCleanup();
+    try std.testing.expectError(error.InvalidRunnableTransition, query.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = deadline }));
+}
+
+test "runnable scheduler cleanup cannot replace active durable completion or authorize expired cleanup" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    Clock.value = 0;
+    var owner = try Scheduler.init(.{});
+    defer owner.close();
+    var write: Execution = .{};
+    defer write.finish();
+    try write.start(&owner, .{ .io = std.testing.io, .retained_bytes = 8 }, .write);
+    try write.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = 5, .native_now_ns = Clock.now });
+    try write.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = 5, .native_now_ns = Clock.now });
+    try write.activateCompletion();
+    try std.testing.expectError(error.InvalidRunnableTransition, write.activateCleanup());
+    try std.testing.expect(write.entry.?.completion_active);
+    var query: Execution = .{};
+    defer query.finish();
+    try query.start(&owner, .{ .io = std.testing.io, .retained_bytes = 13 }, .query);
+    try query.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = 5, .native_now_ns = Clock.now });
+    Clock.value = 5;
+    owner.close();
+    try std.testing.expectError(error.DeadlineExceeded, query.activateCleanup());
+    try std.testing.expect(!query.entry.?.cleanup_active);
+    try std.testing.expectEqual(@as(usize, 2), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 21), owner.stats().retained_bytes);
+}
+
+test "runnable scheduler cleanup consumes unused write completion and times out fairly under saturation" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    for ([_]bool{ false, true }) |completion_first| {
+        Clock.value = 0;
+        var owner = try Scheduler.init(.{ .slots = 2, .control_slots = 1, .max_wait_ms = 1 });
+        defer owner.close();
+        var write: Execution = .{};
+        defer write.finish();
+        const options = admission.Options{ .io = std.testing.io, .deadline_ns = 10 * std.time.ns_per_s, .native_now_ns = Clock.now };
+        try write.start(&owner, .{ .io = std.testing.io, .deadline_ns = 5, .retained_bytes = 13, .native_now_ns = Clock.now }, .write);
+        if (completion_first) {
+            try write.reserveCompletion(options);
+            try write.reserveCleanup(options);
+        } else {
+            try write.reserveCleanup(options);
+            try write.reserveCompletion(options);
+        }
+        try write.park(.resource_blocked);
+        var blocker: Execution = .{};
+        defer blocker.finish();
+        try blocker.start(&owner, .{ .io = std.testing.io }, .query);
+        Clock.value = 10;
+        try owner.activateCleanup(&write.entry.?);
+        try std.testing.expect(write.entry.?.completion_options == null);
+        try std.testing.expect(!write.entry.?.completion_active);
+        try std.testing.expectEqual(State.queued, write.entry.?.state);
+        var control: Execution = .{};
+        defer control.finish();
+        try control.start(&owner, .{ .io = std.testing.io }, .control);
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().control_slots);
+        Clock.value = 10 + std.time.ns_per_ms;
+        try std.testing.expectError(error.RunnableWaitTimeout, owner.wait(&write.entry.?));
+        try std.testing.expectEqual(State.stopped, write.entry.?.state);
+        try std.testing.expectEqual(@as(usize, 3), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 13), owner.stats().retained_bytes);
+        try std.testing.expectEqual(@as(usize, 2), owner.stats().runnable_slots);
+        try std.testing.expectError(error.RunnableWaitTimeout, write.activateCompletion());
+        blocker.finish();
+        control.finish();
+        try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+        try std.testing.expectEqual(@as(u64, 13), owner.stats().retained_bytes);
+    }
+}
+
+test "runnable scheduler cleanup activation budget survives idle expiry and cannot renew" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    const Cancel = struct {
+        requested: bool = false,
+        fn check(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.requested;
+        }
+    };
+    Clock.value = 0;
+    var cancel: Cancel = .{};
+    var owner = try Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer owner.close();
+    var query: Execution = .{};
+    defer query.finish();
+    try query.start(&owner, .{ .io = std.testing.io, .deadline_ns = 5, .native_now_ns = Clock.now, .retained_bytes = 11, .cancellation = .{ .ptr = &cancel, .requested = Cancel.check } }, .query);
+    try query.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = Clock.now }, 10);
+    try query.park(.output_blocked);
+    Clock.value = 500;
+    cancel.requested = true;
+    owner.close();
+    try query.activateCleanup();
+    try std.testing.expectEqual(Class.query, query.entry.?.class);
+    try std.testing.expectEqual(@as(?u64, 510), query.entry.?.options.deadline_ns);
+    try std.testing.expect(query.entry.?.cleanup_duration_ns == null);
+    try std.testing.expectError(error.InvalidRunnableTransition, query.enter(.control));
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 11), owner.stats().retained_bytes);
+    Clock.value = 509;
+    try query.checkpoint();
+    Clock.value = 510;
+    try std.testing.expectError(error.DeadlineExceeded, query.checkpoint());
+    try std.testing.expectError(error.DeadlineExceeded, query.activateCleanup());
+    try std.testing.expectEqual(@as(?u64, 510), query.entry.?.options.deadline_ns);
+    // Deadline failure retains the operation and all bytes until physical
+    // resource owners have joined and the owning caller explicitly finishes.
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 11), owner.stats().retained_bytes);
+    query.finish();
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+}
+
+test "runnable scheduler cleanup activation budget includes fair CPU wait and preserves control" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    Clock.value = 0;
+    var owner = try Scheduler.init(.{ .slots = 2, .control_slots = 1, .max_wait_ms = 1000 });
+    defer owner.close();
+    var query: Execution = .{};
+    defer query.finish();
+    try query.start(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now, .retained_bytes = 13 }, .query);
+    try query.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = Clock.now }, 10);
+    try query.park(.resource_blocked);
+    var blocker: Execution = .{};
+    defer blocker.finish();
+    try blocker.start(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now }, .write);
+    Clock.value = 500;
+    try owner.activateCleanup(&query.entry.?);
+    try std.testing.expectEqual(State.queued, query.entry.?.state);
+    try std.testing.expectEqual(@as(?u64, 510), query.entry.?.options.deadline_ns);
+    var control: Execution = .{};
+    defer control.finish();
+    try control.start(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now }, .control);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().control_slots);
+    Clock.value = 510;
+    try std.testing.expectError(error.DeadlineExceeded, owner.waitRetained(&query.entry.?));
+    try std.testing.expectEqual(State.stopped, query.entry.?.state);
+    try std.testing.expectEqual(@as(usize, 3), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 13), owner.stats().retained_bytes);
+    blocker.finish();
+    control.finish();
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 13), owner.stats().retained_bytes);
+}
+
+test "runnable scheduler cleanup activation budget rejects invalid and overflowing authority" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    Clock.value = 0;
+    var owner = try Scheduler.init(.{});
+    defer owner.close();
+    var query: Execution = .{};
+    defer query.finish();
+    try query.start(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now, .retained_bytes = 17 }, .query);
+    try std.testing.expectError(error.InvalidArgument, query.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = Clock.now }, 0));
+    try std.testing.expectError(error.InvalidArgument, query.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 100 }, 10));
+    try std.testing.expectError(error.InvalidArgument, query.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = Clock.now, .allow_wait = false }, 10));
+    try std.testing.expectError(error.InvalidRunnableDemand, query.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = Clock.now, .retained_bytes = 18 }, 10));
+    Clock.value = std.math.maxInt(u64) - 5;
+    try std.testing.expectError(error.InvalidArgument, query.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = Clock.now }, 10));
+    try std.testing.expect(query.entry.?.cleanup_options == null);
+    Clock.value = 0;
+    try query.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = Clock.now }, 10);
+    try std.testing.expectError(error.InvalidRunnableTransition, query.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = Clock.now }, 20));
+    Clock.value = std.math.maxInt(u64) - 5;
+    try std.testing.expectError(error.InvalidArgument, query.activateCleanup());
+    try std.testing.expect(!query.entry.?.cleanup_active);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 17), owner.stats().retained_bytes);
+}
+
+test "runnable scheduler cleanup activation budget cannot replace active durable completion" {
+    const Clock = struct {
+        var value: u64 = 0;
+        fn now() u64 {
+            return value;
+        }
+    };
+    Clock.value = 0;
+    var owner = try Scheduler.init(.{});
+    defer owner.close();
+    var write: Execution = .{};
+    defer write.finish();
+    try write.start(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now, .retained_bytes = 19 }, .write);
+    try write.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = 1000, .native_now_ns = Clock.now });
+    try write.reserveCleanupFor(.{ .io = std.testing.io, .native_now_ns = Clock.now }, 10);
+    try write.activateCompletion();
+    Clock.value = 500;
+    try std.testing.expectError(error.InvalidRunnableTransition, write.activateCleanup());
+    try std.testing.expect(write.entry.?.completion_active);
+    try std.testing.expect(!write.entry.?.cleanup_active);
+    try std.testing.expectEqual(@as(?u64, 1000), write.entry.?.options.deadline_ns);
+    try std.testing.expectEqual(@as(u64, 19), owner.stats().retained_bytes);
 }

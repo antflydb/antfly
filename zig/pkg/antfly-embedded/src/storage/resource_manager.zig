@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const read_admission = @import("../common/read_admission.zig");
 const builtin = @import("builtin");
 const platform_time = @import("antfly_platform").time;
 const shared_platform_time = @import("antfly_platform").time;
@@ -1033,13 +1034,19 @@ const ReclaimerSlot = struct {
     context: ?*anyopaque = null,
     reclaim: ?ReclaimerFn = null,
     weight: u32 = 1,
-    in_flight: u32 = 0,
+    in_flight: std.atomic.Value(u32) = .init(0),
     retiring: bool = false,
 };
 
+// Allocate slots in chunks so registry growth cannot move a callback's lease.
+// Chunking also avoids a page-sized allocation for every cache owner.
+const ReclaimerChunk = struct {
+    next: ?*ReclaimerChunk = null,
+    slots: [64]ReclaimerSlot = @splat(.{}),
+};
+
 const ReclaimerInvocation = struct {
-    slot_index: usize,
-    identity: u64,
+    slot: *ReclaimerSlot,
     context: *anyopaque,
     reclaim: ReclaimerFn,
     weight: u32,
@@ -1074,10 +1081,11 @@ pub const ResourceManager = struct {
     mutex: std.atomic.Mutex = .unlocked,
     reclaimer_mutex: std.atomic.Mutex = .unlocked,
     // Slots are never compacted while the manager is live: an invocation can
-    // safely retain its index while its callback runs without holding the
+    // safely retain its stable cell while its callback runs without holding the
     // registry mutex. Empty slots are reused, and the list grows on the
     // registration path instead of imposing a process-wide index-count cap.
-    reclaimers: std.ArrayListUnmanaged(ReclaimerSlot) = .empty,
+    reclaimers: std.ArrayListUnmanaged(*ReclaimerSlot) = .empty,
+    reclaimer_chunks: ?*ReclaimerChunk = null,
     next_reclaimer_identity: u64 = 1,
     reclaimer_cursor: usize = 0,
     reclaim_requests: @import("antfly_platform").atomic.Value(u64) = .init(0),
@@ -1176,6 +1184,7 @@ pub const ResourceManager = struct {
     /// Install before publishing this owner. Existing startup charges join the
     /// parent atomically; failure leaves both ledgers unchanged.
     pub fn installMemoryParent(self: *ResourceManager, parent: MemoryParent) !void {
+        if (!parent.valid()) return error.UnsupportedVersion;
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         if (parent.ptr == @as(*anyopaque, @ptrCast(self))) return error.InvalidMemoryParent;
@@ -1193,10 +1202,14 @@ pub const ResourceManager = struct {
         return .{
             .ptr = self,
             .reserve_fn = ParentCallbacks.reserve,
+            .try_reserve_fn = ParentCallbacks.tryReserve,
             .reclaim_fn = ParentCallbacks.reclaim,
+            .reclaim_admission = &ParentCallbacks.reclaim_admission_payload,
             .observe_fn = ParentCallbacks.observe,
             .release_fn = ParentCallbacks.release,
+            .try_release_fn = ParentCallbacks.tryRelease,
             .snapshot_fn = ParentCallbacks.snapshot,
+            .try_snapshot_fn = ParentCallbacks.trySnapshot,
             .epoch_fn = ParentCallbacks.epoch,
             .wait_fn = ParentCallbacks.wait,
             .notify_fn = ParentCallbacks.notify,
@@ -1210,10 +1223,18 @@ pub const ResourceManager = struct {
         fn reserve(ptr: *anyopaque, bytes: u64) callconv(.c) bool {
             return owner(ptr).reserveExternal(bytes);
         }
+        fn tryReserve(ptr: *anyopaque, bytes: u64) callconv(.c) MemoryParent.ReserveResult {
+            return owner(ptr).tryReserveExternal(bytes);
+        }
         fn reclaim(ptr: *anyopaque, bytes: u64) callconv(.c) u64 {
             // This requester has no local cache policy: reclaim only aggregate
             // memory from registered owners, using the normal bounded passes.
             return owner(ptr).reclaimForAllocation(.dense_apply_working_set, bytes);
+        }
+        const reclaim_admission_mod = @import("../common/parent_reclaim_admission.zig");
+        const reclaim_admission_payload = reclaim_admission_mod.Payload{ .vtable = &.{ .reclaim = reclaimWithAdmission } };
+        fn reclaimWithAdmission(ptr: *anyopaque, bytes: u64, control: read_admission.Port) !u64 {
+            return owner(ptr).reclaimForAllocationControlled(.dense_apply_working_set, bytes, control);
         }
         fn observe(ptr: *anyopaque, bytes: u64) callconv(.c) void {
             owner(ptr).observeExternal(bytes);
@@ -1221,11 +1242,21 @@ pub const ResourceManager = struct {
         fn release(ptr: *anyopaque, bytes: u64) callconv(.c) void {
             owner(ptr).releaseExternal(bytes);
         }
+        fn tryRelease(ptr: *anyopaque, bytes: u64) callconv(.c) MemoryParent.ReleaseResult {
+            return owner(ptr).tryReleaseExternal(bytes);
+        }
         fn snapshot(ptr: *anyopaque, out: *@import("runtime_memory_abi").ParentSnapshot) callconv(.c) void {
             const self = owner(ptr);
             lockAtomic(&self.mutex);
             defer self.mutex.unlock();
             out.* = .{ .used_bytes = self.memory.used_bytes, .soft_limit_bytes = self.memory.budget.soft_limit_bytes, .hard_limit_bytes = self.memory.budget.hard_limit_bytes };
+        }
+        fn trySnapshot(ptr: *anyopaque, out: *@import("runtime_memory_abi").ParentSnapshot) callconv(.c) MemoryParent.SnapshotResult {
+            const self = owner(ptr);
+            if (!self.mutex.tryLock()) return .busy;
+            defer self.mutex.unlock();
+            out.* = .{ .used_bytes = self.memory.used_bytes, .soft_limit_bytes = self.memory.budget.soft_limit_bytes, .hard_limit_bytes = self.memory.budget.hard_limit_bytes };
+            return .ready;
         }
         fn epoch(ptr: *anyopaque) callconv(.c) u64 {
             return owner(ptr).pressureEpoch();
@@ -1244,6 +1275,32 @@ pub const ResourceManager = struct {
                 self.memory.hard_limit_rejections +|= 1;
                 return error.ResourceBudgetExceeded;
             }
+        }
+    }
+
+    fn reserveParentWithoutWaiting(self: *ResourceManager, bytes: u64) !void {
+        const parent = self.memory_parent orelse return;
+        const attempt = parent.try_reserve_fn orelse return error.ExecutionWaitUnsupported;
+        switch (attempt(parent.ptr, bytes)) {
+            .reserved => {},
+            .busy => return error.ParentMemoryBusy,
+            .denied => {
+                self.memory.hard_limit_rejections +|= 1;
+                return error.ResourceBudgetExceeded;
+            },
+            .unsupported => return error.ExecutionWaitUnsupported,
+        }
+    }
+
+    fn releaseParentWithoutWaiting(self: *ResourceManager, bytes: u64) !void {
+        const parent = self.memory_parent orelse return;
+        if (!parent.valid()) return error.ExecutionWaitUnsupported;
+        const attempt = parent.try_release_fn orelse return error.ExecutionWaitUnsupported;
+        switch (attempt(parent.ptr, bytes)) {
+            .released => {},
+            .busy => return error.ParentMemoryBusy,
+            .mismatch => return error.ResourceAccountingMismatch,
+            .unsupported => return error.ExecutionWaitUnsupported,
         }
     }
 
@@ -1411,7 +1468,7 @@ pub const ResourceManager = struct {
     ) !u64 {
         lockAtomic(&self.reclaimer_mutex);
         defer self.reclaimer_mutex.unlock();
-        for (self.reclaimers.items) |*slot| {
+        for (self.reclaimers.items) |slot| {
             if (slot.identity != 0) continue;
             const identity = self.next_reclaimer_identity;
             self.next_reclaimer_identity +%= 1;
@@ -1425,16 +1482,27 @@ pub const ResourceManager = struct {
             };
             return identity;
         }
+        // Reserve the pointer before allocating a chunk: failure publishes no
+        // owner and leaks no chunk. Existing cells and leases remain stable.
+        try self.reclaimers.ensureUnusedCapacity(self.identity_allocator, 1);
+        const chunk_offset = self.reclaimers.items.len % 64;
+        if (chunk_offset == 0) {
+            const chunk = try self.identity_allocator.create(ReclaimerChunk);
+            chunk.* = .{ .next = self.reclaimer_chunks };
+            self.reclaimer_chunks = chunk;
+        }
+        const slot = &self.reclaimer_chunks.?.slots[chunk_offset];
         const identity = self.next_reclaimer_identity;
         self.next_reclaimer_identity +%= 1;
         if (self.next_reclaimer_identity == 0) self.next_reclaimer_identity = 1;
-        try self.reclaimers.append(self.identity_allocator, .{
+        slot.* = .{
             .identity = identity,
             .slice = slice,
             .context = context,
             .reclaim = reclaim,
             .weight = @max(@as(u32, 1), options.weight),
-        });
+        };
+        self.reclaimers.appendAssumeCapacity(slot);
         return identity;
     }
 
@@ -1443,11 +1511,11 @@ pub const ResourceManager = struct {
         while (true) {
             lockAtomic(&self.reclaimer_mutex);
             var found = false;
-            for (self.reclaimers.items) |*slot| {
+            for (self.reclaimers.items) |slot| {
                 if (slot.identity != identity) continue;
                 found = true;
                 slot.retiring = true;
-                if (slot.in_flight == 0) slot.* = .{};
+                if (slot.in_flight.load(.acquire) == 0) slot.* = .{};
                 break;
             }
             self.reclaimer_mutex.unlock();
@@ -1461,24 +1529,26 @@ pub const ResourceManager = struct {
     }
 
     fn releaseReclaimerInvocation(self: *ResourceManager, invocation: ReclaimerInvocation) void {
-        lockAtomic(&self.reclaimer_mutex);
-        defer self.reclaimer_mutex.unlock();
-        if (invocation.slot_index >= self.reclaimers.items.len) return;
-        const slot = &self.reclaimers.items[invocation.slot_index];
-        if (slot.identity != invocation.identity) return;
-        std.debug.assert(slot.in_flight > 0);
-        slot.in_flight -= 1;
-        if (slot.retiring and slot.in_flight == 0) slot.* = .{};
+        _ = self;
+        // This is mandatory cleanup, independent of admission and the registry
+        // mutex. Unregistration's acquire load observes callback completion.
+        // Do not touch the cell after decrement: the last lease permits reuse.
+        const previous = invocation.slot.in_flight.fetchSub(1, .release);
+        std.debug.assert(previous > 0);
     }
 
     /// Reclaim enough aggregate cache memory to make one allocation retry
     /// meaningful. Cache callbacks run outside the accounting mutex and may
     /// therefore publish their byte decreases through normal accounting APIs.
     pub fn reclaimForAllocation(self: *ResourceManager, requester: Slice, additional_bytes: u64) u64 {
-        const local_reclaimed = self.reclaimLocalForAllocation(requester, additional_bytes);
+        return self.reclaimForAllocationControlled(requester, additional_bytes, null) catch unreachable;
+    }
+
+    fn reclaimForAllocationControlled(self: *ResourceManager, requester: Slice, additional_bytes: u64, control: ?read_admission.Port) !u64 {
+        const local_reclaimed = try self.reclaimLocalForAllocationControlled(requester, additional_bytes, control);
         const parent = self.memory_parent orelse return local_reclaimed;
         const fits_local = blk: {
-            lockAtomic(&self.mutex);
+            if (control) |budget| try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, budget) else lockAtomic(&self.mutex);
             defer self.mutex.unlock();
             const state = self.slices[sliceIndex(requester)];
             break :blk (state.budget.hard_limit_bytes == 0 or state.used_bytes +| additional_bytes <= state.budget.hard_limit_bytes) and
@@ -1487,15 +1557,48 @@ pub const ResourceManager = struct {
         // Parent eviction cannot repair a child ceiling. Never call a cache
         // owner while holding the child's accounting or reclaimer mutex.
         if (!fits_local) return local_reclaimed;
+        if (control) |budget| {
+            try budget.checkpoint();
+            const payload = parent.reclaim_admission orelse return error.ExecutionWaitUnsupported;
+            return local_reclaimed +| try @import("../common/parent_reclaim_admission.zig").reclaim(payload, parent.ptr, additional_bytes, budget);
+        }
         return local_reclaimed +| parent.reclaim_fn(parent.ptr, additional_bytes);
     }
 
     fn reclaimLocalForAllocation(self: *ResourceManager, requester: Slice, additional_bytes: u64) u64 {
+        return self.reclaimLocalForAllocationControlled(requester, additional_bytes, null) catch unreachable;
+    }
+
+    fn snapshotParentWithAdmission(parent: MemoryParent, control: read_admission.Port) !@import("runtime_memory_abi").ParentSnapshot {
+        if (!parent.valid()) return error.UnsupportedVersion;
+        const attempt = parent.try_snapshot_fn orelse return error.ExecutionWaitUnsupported;
+        while (true) {
+            try control.checkpoint();
+            var pressure_snapshot: @import("runtime_memory_abi").ParentSnapshot = undefined;
+            switch (attempt(parent.ptr, &pressure_snapshot)) {
+                .ready => {
+                    try control.checkpoint();
+                    return pressure_snapshot;
+                },
+                .busy => try control.waitForProgress(),
+                .unsupported => return error.ExecutionWaitUnsupported,
+            }
+        }
+    }
+
+    fn reclaimLocalForAllocationControlled(self: *ResourceManager, requester: Slice, additional_bytes: u64, control: ?read_admission.Port) !u64 {
         if (additional_bytes == 0) return 0;
+        // Pressure targets are advisory; reservation remains authoritative.
+        // Obtain the parent observation before acquiring the child ledger so
+        // original-budget progress cannot reenter a held child accounting lock.
+        const admitted_parent_snapshot = if (control) |budget|
+            if (self.memory_parent) |parent| try snapshotParentWithAdmission(parent, budget) else null
+        else
+            null;
         const targets = blk: {
-            lockAtomic(&self.mutex);
+            if (control) |budget| try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, budget) else lockAtomic(&self.mutex);
             defer self.mutex.unlock();
-            const parent_snapshot = if (self.memory_parent) |parent| parent.snapshot() else null;
+            const parent_snapshot = if (control != null) admitted_parent_snapshot else if (self.memory_parent) |parent| parent.snapshot() else null;
             const memory_hard = if (parent_snapshot) |parent| parent.hard_limit_bytes else self.memory.budget.hard_limit_bytes;
             const memory_target = if (memory_hard == 0)
                 0
@@ -1522,7 +1625,8 @@ pub const ResourceManager = struct {
 
         _ = self.reclaim_requests.fetchAdd(1, .monotonic);
         var reclaimed: u64 = 0;
-        lockAtomic(&self.reclaimer_mutex);
+        defer _ = self.reclaimed_bytes.fetchAdd(reclaimed, .monotonic);
+        if (control) |budget| try @import("../common/bounded_mutex.zig").lockAtomic(&self.reclaimer_mutex, budget) else lockAtomic(&self.reclaimer_mutex);
         const scan_len = self.reclaimers.items.len;
         if (scan_len == 0) {
             self.reclaimer_mutex.unlock();
@@ -1541,6 +1645,7 @@ pub const ResourceManager = struct {
         // owner locks and therefore skip an in-flight scratch handle safely.
         const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .relational_preparation_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache };
         for (candidates, 0..) |candidate_slice, candidate_index| {
+            if (control) |budget| try budget.checkpoint();
             if (candidate_index == 0) {
                 if (targets.slice == 0) continue;
             } else if (targets.slice != 0) {
@@ -1564,10 +1669,10 @@ pub const ResourceManager = struct {
                 const before_pass = reclaimed;
                 var divided_target = false;
                 var remaining_weight: u64 = 0;
-                lockAtomic(&self.reclaimer_mutex);
+                if (control) |budget| try @import("../common/bounded_mutex.zig").lockAtomic(&self.reclaimer_mutex, budget) else lockAtomic(&self.reclaimer_mutex);
                 for (0..scan_len) |offset| {
                     const index = (start_cursor + offset) % scan_len;
-                    const slot = &self.reclaimers.items[index];
+                    const slot = self.reclaimers.items[index];
                     if (slot.identity == 0 or slot.identity > identity_cutoff or
                         slot.retiring or slot.slice != candidate_slice) continue;
                     remaining_weight +|= slot.weight;
@@ -1575,9 +1680,9 @@ pub const ResourceManager = struct {
                 self.reclaimer_mutex.unlock();
 
                 for (0..scan_len) |offset| {
-                    lockAtomic(&self.reclaimer_mutex);
+                    if (control) |budget| try @import("../common/bounded_mutex.zig").lockAtomic(&self.reclaimer_mutex, budget) else lockAtomic(&self.reclaimer_mutex);
                     const index = (start_cursor + offset) % scan_len;
-                    const slot = &self.reclaimers.items[index];
+                    const slot = self.reclaimers.items[index];
                     if (slot.identity == 0 or slot.identity > identity_cutoff or
                         slot.retiring or slot.slice != candidate_slice)
                     {
@@ -1585,13 +1690,13 @@ pub const ResourceManager = struct {
                         continue;
                     }
                     const invocation = ReclaimerInvocation{
-                        .slot_index = index,
-                        .identity = slot.identity,
+                        .slot = slot,
                         .context = slot.context.?,
                         .reclaim = slot.reclaim.?,
                         .weight = slot.weight,
                     };
-                    slot.in_flight += 1;
+                    const previous = slot.in_flight.fetchAdd(1, .monotonic);
+                    std.debug.assert(previous != std.math.maxInt(u32));
                     const remaining_target = target_bytes -| reclaimed;
                     if (pass == 0 and remaining_weight > invocation.weight) divided_target = true;
                     const fair_target = if (pass != 0 or remaining_weight <= invocation.weight)
@@ -1603,13 +1708,13 @@ pub const ResourceManager = struct {
 
                     reclaimed +|= invocation.reclaim(invocation.context, fair_target);
                     self.releaseReclaimerInvocation(invocation);
+                    if (control) |budget| try budget.checkpoint();
                     if (reclaimed >= target_bytes) break;
                 }
                 if (reclaimed >= target_bytes or reclaimed == before_pass or !divided_target) break;
             }
             if (reclaimed >= target_bytes) break;
         }
-        _ = self.reclaimed_bytes.fetchAdd(reclaimed, .monotonic);
         return reclaimed;
     }
 
@@ -1972,11 +2077,15 @@ pub const ResourceManager = struct {
         _ = alloc;
         lockAtomic(&self.reclaimer_mutex);
         for (self.reclaimers.items) |slot| {
-            if (slot.identity != 0 or slot.in_flight != 0)
+            if (slot.identity != 0 or slot.in_flight.load(.acquire) != 0)
                 @panic("resource manager deinitialized with live reclaimers");
         }
         self.reclaimers.deinit(self.identity_allocator);
         self.reclaimers = .empty;
+        while (self.reclaimer_chunks) |chunk| {
+            self.reclaimer_chunks = chunk.next;
+            self.identity_allocator.destroy(chunk);
+        }
         self.reclaimer_mutex.unlock();
 
         lockAtomic(&self.mutex);
@@ -2262,6 +2371,44 @@ pub const ResourceManager = struct {
         self.commitMemoryLocked(next);
         self.memory.external_bytes += bytes;
         return true;
+    }
+
+    /// Try the complete child-to-parent reservation chain without waiting.
+    /// Ancestors commit first; every local commit thereafter is infallible.
+    /// A rejected/busy chain leaves all capacity ownership unchanged.
+    pub fn tryReserveExternal(self: *ResourceManager, bytes: u64) MemoryParent.ReserveResult {
+        if (!self.mutex.tryLock()) return .busy;
+        defer self.mutex.unlock();
+        const next = self.checkMemoryLocked(bytes) catch return .denied;
+        if (self.memory_parent) |parent| {
+            if (!parent.valid()) return .unsupported;
+            const attempt = parent.try_reserve_fn orelse return .unsupported;
+            const result = attempt(parent.ptr, bytes);
+            if (result != .reserved) return result;
+        }
+        self.commitMemoryLocked(next);
+        self.memory.external_bytes += bytes;
+        return .reserved;
+    }
+
+    /// Try an exact external-charge release through all ancestors. Physical
+    /// bytes must already be retired. Validation and try-lock acquisition
+    /// precede any release; ancestors commit first, then local debit cannot fail.
+    /// No allocator, reclaim callback, blocking accounting or partial debit.
+    pub fn tryReleaseExternal(self: *ResourceManager, bytes: u64) MemoryParent.ReleaseResult {
+        if (!self.mutex.tryLock()) return .busy;
+        defer self.mutex.unlock();
+        if (bytes > self.memory.external_bytes or bytes > self.memory.used_bytes) return .mismatch;
+        if (self.memory_parent) |parent| {
+            if (!parent.valid()) return .unsupported;
+            const attempt = parent.try_release_fn orelse return .unsupported;
+            const result = attempt(parent.ptr, bytes);
+            if (result != .released) return result;
+        }
+        self.memory.external_bytes -= bytes;
+        self.memory.used_bytes -= bytes;
+        self.notifyPressureChange();
+        return .released;
     }
 
     /// Observation reports existing memory even above a ceiling. It is never
@@ -3034,6 +3181,18 @@ pub const ResourceManager = struct {
         next: u64,
         enforce_limits: bool,
     ) !void {
+        return self.reconcileUsageLockedWithParentAdmission(slice, observer_id, previous, next, enforce_limits, false);
+    }
+
+    fn reconcileUsageLockedWithParentAdmission(
+        self: *ResourceManager,
+        slice: Slice,
+        observer_id: usize,
+        previous: u64,
+        next: u64,
+        enforce_limits: bool,
+        bounded_parent: bool,
+    ) !void {
         const key = ObserverKey{ .slice = slice, .identity = observer_id };
         var inserted = false;
         const owned = self.observer_identities.getPtr(key) orelse blk: {
@@ -3084,9 +3243,16 @@ pub const ResourceManager = struct {
 
         if (memory_next > self.memory.used_bytes) {
             const growth = memory_next - self.memory.used_bytes;
-            if (enforce_limits) try self.reserveParentLocked(growth) else if (self.memory_parent) |parent| parent.observe_fn(parent.ptr, growth);
+            if (enforce_limits) {
+                if (bounded_parent) try self.reserveParentWithoutWaiting(growth) else try self.reserveParentLocked(growth);
+            } else if (self.memory_parent) |parent| parent.observe_fn(parent.ptr, growth);
         } else if (memory_next < self.memory.used_bytes) {
-            if (self.memory_parent) |parent| parent.release_fn(parent.ptr, self.memory.used_bytes - memory_next);
+            const released = self.memory.used_bytes - memory_next;
+            if (bounded_parent) {
+                // A busy parent leaves the observer and every charge intact.
+                // The controlled caller releases this ledger before waiting.
+                try self.releaseParentWithoutWaiting(released);
+            } else if (self.memory_parent) |parent| parent.release_fn(parent.ptr, released);
         }
 
         state.used_bytes = slice_next;
@@ -3107,7 +3273,106 @@ pub const ResourceManager = struct {
     }
 
     pub fn adjustUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) !void {
-        errdefer if (builtin.link_libc) {
+        return self.adjustUsageControlled(slice, current, next, null);
+    }
+
+    pub fn adjustUsageWithAdmission(self: *ResourceManager, slice: Slice, current: *u64, next: u64, control: read_admission.Port) !void {
+        return self.adjustUsageControlled(slice, current, next, control);
+    }
+
+    /// Admit a mandatory physical retirement before releasing its charge.
+    /// The infallible callback executes under this manager's ledger lock and
+    /// must not reenter the manager. Validation and all scoped waits precede
+    /// destruction; the existing parent release remains mandatory afterwards.
+    pub fn retireUsageWithAdmission(self: *ResourceManager, slice: Slice, current: *u64, next: u64, control: read_admission.Port, retirement: anytype) !void {
+        try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, control);
+        defer self.mutex.unlock();
+        if (next > current.*) return error.InvalidArgument;
+        const key = ObserverKey{ .slice = slice, .identity = @intFromPtr(current) };
+        const owned = self.observer_identities.getPtr(key) orelse return error.ResourceAccountingMismatch;
+        const state = &self.slices[sliceIndex(slice)];
+        if (owned.current != current.* or current.* > state.used_bytes or current.* > self.memory.used_bytes)
+            return error.ResourceAccountingMismatch;
+        // Decreasing an existing validated identity cannot allocate or exceed
+        // a budget. Physical bytes stop existing before their capacity becomes
+        // available to another owner. No admission checkpoint follows retire.
+        retirement.retire();
+        self.reconcileUsageLocked(slice, key.identity, current.*, next, true) catch unreachable;
+        current.* = next;
+    }
+
+    /// Retire physical bytes into caller-owned accounting debt. The caller
+    /// serializes current/debt and retains both until reconciliation completes.
+    /// Validation and scoped ledger admission precede infallible destruction;
+    /// no parent callback or capacity release occurs here. Debt is published
+    /// before destruction so cancellation after this call cannot lose its owner.
+    pub fn retireUsageToDebtWithAdmission(self: *ResourceManager, slice: Slice, current: *u64, debt: *u64, amount: u64, control: read_admission.Port, retirement: anytype) !void {
+        try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, control);
+        defer self.mutex.unlock();
+        try self.retireUsageToDebtLocked(slice, current, debt, amount, retirement);
+    }
+
+    /// Retire with a nonwaiting ledger-release fast path. If any parent is
+    /// unavailable, keep all bytes charged in debt for scoped retry after the
+    /// caller releases its physical-owner locks. No progress callback follows
+    /// destruction here, and no blocking parent accounting is permitted.
+    pub fn retireUsageWithRetainedDebtWithAdmission(self: *ResourceManager, slice: Slice, current: *u64, debt: *u64, amount: u64, control: read_admission.Port, retirement: anytype) !void {
+        try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, control);
+        defer self.mutex.unlock();
+        try self.retireUsageToDebtLocked(slice, current, debt, amount, retirement);
+        _ = self.tryFinishRetirementDebtLocked(slice, current, debt);
+    }
+
+    pub const PhysicalRetirementResult = enum { retired, busy, mismatch };
+
+    /// A finite accounting-lock attempt for optional reclamation. Busy or
+    /// invalid ownership never destroys the value. A retired result means
+    /// physical destruction happened exactly once; any uncommitted charge is
+    /// still owned by the caller's debt, not promised as reclaimed capacity.
+    pub fn tryRetireUsageWithRetainedDebt(self: *ResourceManager, slice: Slice, current: *u64, debt: *u64, amount: u64, retirement: anytype) PhysicalRetirementResult {
+        if (!self.mutex.tryLock()) return .busy;
+        defer self.mutex.unlock();
+        self.retireUsageToDebtLocked(slice, current, debt, amount, retirement) catch return .mismatch;
+        _ = self.tryFinishRetirementDebtLocked(slice, current, debt);
+        return .retired;
+    }
+
+    /// Caller serializes current/debt and keeps them alive. No waits,
+    /// allocations, reclamation or legacy parent callback are permitted.
+    pub fn tryFinishRetirementDebt(self: *ResourceManager, slice: Slice, current: *u64, debt: *u64) MemoryParent.ReleaseResult {
+        if (debt.* == 0) return .released;
+        if (!self.mutex.tryLock()) return .busy;
+        defer self.mutex.unlock();
+        return self.tryFinishRetirementDebtLocked(slice, current, debt);
+    }
+
+    fn tryFinishRetirementDebtLocked(self: *ResourceManager, slice: Slice, current: *u64, debt: *u64) MemoryParent.ReleaseResult {
+        if (debt.* == 0) return .released;
+        if (debt.* > current.*) return .mismatch;
+        const next = current.* - debt.*;
+        self.reconcileUsageLockedWithParentAdmission(slice, @intFromPtr(current), current.*, next, true, true) catch |err| return switch (err) {
+            error.ParentMemoryBusy => .busy,
+            error.ExecutionWaitUnsupported => .unsupported,
+            else => .mismatch,
+        };
+        current.* = next;
+        debt.* = 0;
+        return .released;
+    }
+
+    fn retireUsageToDebtLocked(self: *ResourceManager, slice: Slice, current: *u64, debt: *u64, amount: u64, retirement: anytype) !void {
+        const key = ObserverKey{ .slice = slice, .identity = @intFromPtr(current) };
+        const owned = self.observer_identities.getPtr(key) orelse return error.ResourceAccountingMismatch;
+        const state = &self.slices[sliceIndex(slice)];
+        if (owned.current != current.* or current.* > state.used_bytes or current.* > self.memory.used_bytes or
+            debt.* > current.* or amount > current.* - debt.*)
+            return error.ResourceAccountingMismatch;
+        debt.* += amount;
+        retirement.retire();
+    }
+
+    fn adjustUsageControlled(self: *ResourceManager, slice: Slice, current: *u64, next: u64, control: ?read_admission.Port) !void {
+        errdefer if (control == null and builtin.link_libc) {
             if (std.c.getenv("ANTFLY_RESOURCE_ALLOCATION_DIAGNOSTICS")) |raw| {
                 if (std.mem.eql(u8, std.mem.span(raw), "1")) {
                     const snapshot_stats = self.snapshot();
@@ -3117,11 +3382,28 @@ pub const ResourceManager = struct {
                 }
             }
         };
-        self.adjustUsageOnce(slice, current, next) catch |err| {
-            if (err != error.ResourceBudgetExceeded or next <= current.*) return err;
-            if (self.reclaimForAllocation(slice, next - current.*) == 0) return err;
-            return self.adjustUsageOnce(slice, current, next);
-        };
+        while (true) {
+            self.adjustUsageOnceControlled(slice, current, next, control) catch |err| {
+                if (err == error.ParentMemoryBusy) {
+                    // The failed attempt released the child ledger lock and
+                    // published no reservation. Spend only the caller's scope.
+                    try control.?.waitForProgress();
+                    continue;
+                }
+                if (err != error.ResourceBudgetExceeded or next <= current.*) return err;
+                if (try self.reclaimForAllocationControlled(slice, next - current.*, control) == 0) return err;
+                // A parent can become busy after reclamation; retry through
+                // the same original budget, not an unbounded second attempt.
+                self.adjustUsageOnceControlled(slice, current, next, control) catch |retry_err| {
+                    if (retry_err == error.ParentMemoryBusy) {
+                        try control.?.waitForProgress();
+                        continue;
+                    }
+                    return retry_err;
+                };
+            };
+            return;
+        }
     }
 
     /// Atomically admits as much of a requested observer growth as the slice
@@ -3280,9 +3562,13 @@ pub const ResourceManager = struct {
     }
 
     fn adjustUsageOnce(self: *ResourceManager, slice: Slice, current: *u64, next: u64) !void {
-        lockAtomic(&self.mutex);
+        return self.adjustUsageOnceControlled(slice, current, next, null);
+    }
+
+    fn adjustUsageOnceControlled(self: *ResourceManager, slice: Slice, current: *u64, next: u64, control: ?read_admission.Port) !void {
+        if (control) |budget| try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, budget) else lockAtomic(&self.mutex);
         defer self.mutex.unlock();
-        try self.reconcileUsageLocked(slice, @intFromPtr(current), current.*, next, true);
+        try self.reconcileUsageLockedWithParentAdmission(slice, @intFromPtr(current), current.*, next, true, control != null);
         current.* = next;
     }
 
@@ -3392,6 +3678,12 @@ pub const ResourceManager = struct {
 
         const state = self.slices[sliceIndex(slice)];
         return sliceStatsFromState(slice, state);
+    }
+
+    pub fn sliceStatsWithAdmission(self: *ResourceManager, slice: Slice, control: read_admission.Port) !SliceStats {
+        try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, control);
+        defer self.mutex.unlock();
+        return sliceStatsFromState(slice, self.slices[sliceIndex(slice)]);
     }
 
     /// Advisory headroom for sizing a bounded unit of work. Admission still

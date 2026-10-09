@@ -24,7 +24,7 @@ const native_abi = @import("antfly_runtime_abi").native_abi;
 pub const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 const antfly_image = @import("antfly_image");
 
-pub const abi_version: u32 = 30;
+pub const abi_version: u32 = 33;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -177,6 +177,10 @@ pub const ProviderOperation = enum(c_int) {
     /// Documents as ordered content parts; binary parts travel as payloads
     /// whose refs index the parts flattened in document order.
     rerank_documents = 22,
+    /// Raw JSON routes preserve the HTTP status and body contract while using
+    /// the provider request context and private-worker CPU grant transport.
+    generate_json = 23,
+    decide_json = 24,
 };
 
 pub const ProviderBinaryPayload = extern struct {
@@ -326,6 +330,12 @@ pub const HttpHandleContext = extern struct {
     stream: http_abi.StreamSink = .{},
     out_response_handle: *?*anyopaque,
     out_response: *http_abi.HttpResponseView,
+    deadline_ns: u64 = 0,
+    has_deadline: u8 = 0,
+    /// Synchronous HTTP dispatch borrows its caller's execution capsule.
+    runnable: ?*const runnable_abi.Borrowed = null,
+    /// A worker receives only scalar CPU demand, never parent callbacks.
+    admitted_cpu_slots: u32 = 0,
 };
 
 pub const Capability = struct {

@@ -730,6 +730,7 @@ test "portable auth seed preserves credentials policies roles filters and api ke
     const artifact = try source.exportPortableSeedWithLease(alloc, "seed-auth-7", &lease);
     lease.release();
     defer alloc.free(artifact);
+    try @import("../storage/hot_standby/seed_topology.zig").validatePortableAuthSeedBody(alloc, "seed-auth-7", artifact);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

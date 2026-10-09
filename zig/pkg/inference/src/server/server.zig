@@ -115,7 +115,23 @@ const InferenceExecutionControl = execution_control_mod.InferenceExecutionContro
 const cancellable_rerank_batch_size: usize = 8;
 const native_call_cancellation_grace_ns: u64 = 5 * std.time.ns_per_s;
 
+const borrowed_http_control_key = "antfly.inference.borrowed_execution_control";
+
+/// The caller owns this control until the synchronous handler has joined. It
+/// carries progress and the serial executor without adding a second HTTP ABI.
+pub fn installHttpExecutionControl(ctx: *httpx.Context, control: *const InferenceExecutionControl) !void {
+    try ctx.setData(borrowed_http_control_key, @constCast(control), null);
+}
+
 fn httpInferenceExecutionControl(node: *Node, ctx: *httpx.Context) InferenceExecutionControl {
+    if (ctx.getData(borrowed_http_control_key)) |raw| {
+        const borrowed: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+        var control = borrowed.*;
+        if (control.hard_cancellation == null) {
+            if (node.hard_cancellation_watchdog) |watchdog| control.hard_cancellation = watchdog.boundary();
+        }
+        return control;
+    }
     const Check = struct {
         fn check(raw: ?*anyopaque) !void {
             const request: *const httpx.Context = @ptrCast(@alignCast(raw.?));
@@ -3644,6 +3660,10 @@ test "direct generation rejects non-generator manifests before execution" {
     );
 }
 
+pub fn ExecutorAdmissionProvider(comptime RuntimeAbi: type) type {
+    return @import("runnable_execution.zig").ProviderFor(@import("../execution_control.zig"), RuntimeAbi);
+}
+
 pub const Node = struct {
     config: NodeConfig,
     allocator: std.mem.Allocator,
@@ -3669,6 +3689,7 @@ pub const Node = struct {
     /// Ownership is here, rather than the storage BackendRuntime, because Node
     /// owns resolved model generations and concrete fused executor callbacks.
     executor_microbatch_broker: ?executor_microbatch.Broker = null,
+    executor_admission: ?executor_microbatch.ExecutionAdmission = null,
     executor_microbatch_init_mutex: std.atomic.Mutex = .unlocked,
     admission_metrics_mutex: std.atomic.Mutex = .unlocked,
     compatibility_cache: std.StringHashMapUnmanaged(*CachedCompatibility) = .empty,
@@ -3944,11 +3965,44 @@ pub const Node = struct {
         self.compatibility_cache.deinit(self.allocator);
     }
 
+    /// Startup-only installation. The host retains the provider/owner until
+    /// all requests join and Node teardown disposes the broker.
+    pub fn configureExecutorAdmission(self: *Node, admission: executor_microbatch.ExecutionAdmission) !void {
+        if (self.request_surfaces_published or self.executor_admission != null)
+            return error.InvalidRunnableTransition;
+        // Preload calls may have created an unscheduled broker. Warmup has
+        // joined before installation; replace it before request publication.
+        if (self.executor_microbatch_broker) |*broker| broker.deinit();
+        self.executor_microbatch_broker = null;
+        self.executor_admission = admission;
+    }
+
+    pub fn testExecutorAdmission(self: *Node) !void {
+        if (!builtin.is_test) @compileError("test-only executor admission fixture");
+        const Executor = struct {
+            fn run(_: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+                std.debug.assert(@import("inference_linalg").pool.scopedWorkerLimit() == 1);
+                for (items) |item| item.slot.setValue(usize, item.payloadAs(usize).*, .serial);
+            }
+        };
+        const payload: usize = 42;
+        const broker = self.executorMicrobatchBroker();
+        const result = try broker.submit(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "fixture", .task = .embed, .resource_class = .cpu }, .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1 }, .{}, .{}, null, null, &payload, self, Executor.run);
+        try std.testing.expectEqual(payload, result.result.value);
+        const values = [_]usize{ 1, 2 };
+        const results = try broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "fixture", .task = .embed, .resource_class = .cpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, &.{ .{}, .{} }, &.{ .{}, .{} }, null, .{}, &values, self, Executor.run);
+        defer std.testing.allocator.free(results);
+        for (results, values) |value, expected| try std.testing.expectEqual(expected, value.result.value);
+    }
+
     fn executorMicrobatchBroker(self: *Node) *executor_microbatch.Broker {
         spinLock(&self.executor_microbatch_init_mutex);
         defer self.executor_microbatch_init_mutex.unlock();
         if (self.executor_microbatch_broker == null)
-            self.executor_microbatch_broker = executor_microbatch.Broker.init(self.allocator);
+            self.executor_microbatch_broker = if (self.executor_admission) |admission|
+                executor_microbatch.Broker.initWithAdmission(self.allocator, admission)
+            else
+                executor_microbatch.Broker.init(self.allocator);
         return &self.executor_microbatch_broker.?;
     }
 
@@ -19188,7 +19242,7 @@ pub const Node = struct {
         const request = try decide_mod.parse(a, request_json);
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
-        const io = self.inferenceIo(a, null, &owned_io);
+        const io = (if (control) |active| active.io else null) orelse self.inferenceIo(a, null, &owned_io);
         const path = try self.resolveRequestModelPath(a, io, request.model, "extractors");
         var manifest = try manifest_mod.loadListingFromDir(a, path);
         defer manifest.deinit();

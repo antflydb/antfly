@@ -150,7 +150,9 @@ test "SQL write team local completion bridge retains stable ownership and origin
         try std.testing.expectError(error.InvalidRunnableTransition, team.borrow.reserveCompletion(&.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 200 }));
         try std.testing.expect(receiver == &bridge.io.?);
         try std.testing.expectError(error.ExecutionWaitUnsupported, checked(team.borrow.park(team.borrow.context, @backingInt(runtime.runnable_abi.Wait.resource))));
+        try std.testing.expectError(error.ExecutionWaitUnsupported, team.borrow.completionRemainingNs());
         try team.borrow.activateCompletion();
+        try std.testing.expectEqual(@as(u64, 100), try team.borrow.completionRemainingNs());
         flag.store(true, .release);
         Clock.current = 11;
         try checked(team.borrow.park(team.borrow.context, @backingInt(runtime.runnable_abi.Wait.resource)));
@@ -159,12 +161,15 @@ test "SQL write team local completion bridge retains stable ownership and origin
         try health.start(&owner, .{ .io = io }, .control);
         health.finish();
         owner.close();
+        try std.testing.expectEqual(@as(u64, 89), try team.borrow.completionRemainingNs());
         try checked(team.borrow.enter(team.borrow.context, team.borrow.parent_class));
         try checked(team.borrow.checkpoint(team.borrow.context));
         if (control) try std.testing.expectError(error.InvalidRunnableDemand, team.borrow.resizeTeam(2));
         try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
         try std.testing.expectEqual(@as(u64, 256), owner.stats().retained_bytes);
         try checked(team.borrow.park(team.borrow.context, @backingInt(runtime.runnable_abi.Wait.resource)));
+        Clock.current = 100;
+        try std.testing.expectError(error.DeadlineExceeded, team.borrow.completionRemainingNs());
         Clock.current = 101;
         try std.testing.expectError(error.DeadlineExceeded, checked(team.borrow.enter(team.borrow.context, team.borrow.parent_class)));
         try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
@@ -198,4 +203,46 @@ test "SQL write team local completion bridge clears failed reservations and reje
     owner.close();
     try std.testing.expectError(error.SchedulerClosed, team.borrow.activateCompletion());
     try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+}
+
+test "SQL write team remaining completion budget preserves the independent Io clock" {
+    const IoClock = struct {
+        var current: i96 = 1000;
+        fn now(_: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+            return .{ .nanoseconds = current };
+        }
+    };
+    IoClock.current = 1000;
+    Clock.current = 0;
+    defer Clock.current = 0;
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = IoClock.now;
+    const clock_io: std.Io = .{ .userdata = null, .vtable = &vtable };
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    const clock_borrow = runtime.native_abi.IoBorrow.init(&clock_io);
+    var owner = try scheduler.Scheduler.init(.{ .slots = 3 });
+    var memory: allocation.Shared = .{ .child = std.heap.smp_allocator, .limit = 16384 };
+    var flag = std.atomic.Value(bool).init(false);
+    var execution: scheduler.Execution = .{};
+    defer execution.finish();
+    try execution.start(&owner, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &flag, .requested = canceled }, .retained_bytes = 256 }, .write);
+    var bridge = try writes.Completion.init(&execution, memory.allocator());
+    var team = try bridge.team();
+    try std.testing.expectError(error.ExecutionWaitUnsupported, team.borrow.completionRemainingNs());
+    try team.borrow.reserveCompletion(&.{ .io = &io_borrow, .clock_io = &clock_borrow, .deadline_ns = 1100 });
+    try std.testing.expectError(error.ExecutionWaitUnsupported, team.borrow.completionRemainingNs());
+    try team.borrow.activateCompletion();
+    try std.testing.expectEqual(@as(u64, 100), try team.borrow.completionRemainingNs());
+    flag.store(true, .release);
+    Clock.current = 100000;
+    owner.close();
+    IoClock.current = 1099;
+    try std.testing.expectEqual(@as(u64, 1), try team.borrow.completionRemainingNs());
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 256), owner.stats().retained_bytes);
+    IoClock.current = 1100;
+    try std.testing.expectError(error.DeadlineExceeded, team.borrow.completionRemainingNs());
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().runnable_slots);
 }

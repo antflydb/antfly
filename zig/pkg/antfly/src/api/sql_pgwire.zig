@@ -345,6 +345,7 @@ fn admissionOptions(request: wire.Request) @import("antfly_local_sources").commo
 /// The portal owns this entire capsule. No cursor retains Job.runInner's stack
 /// identity, authority, schema binding or temporary request context.
 const OwnedRead = struct {
+    retained_lease: wire.RetainedLifetime.Lease,
     alloc: std.mem.Allocator,
     adapter: *Adapter,
     arena: std.heap.ArenaAllocator,
@@ -362,7 +363,10 @@ const OwnedRead = struct {
     stream: *Pull.Stream,
     columns: []const wire.Column,
     policies: []const Policy,
-    detached: bool = false,
+    lifetime: @import("runnable_read_lifetime.zig").Lifetime,
+    cleanup: ?@import("runnable_cleanup_owner.zig").Registry.Reservation = null,
+    cleanup_started: bool = false,
+    physical_retired: bool = false,
     const Policy = struct { table: []const u8, filter: ?[]const u8, name: ?ast.Name = null, id: u64 = 0, schema_version: u32 = 0 };
 
     fn open(adapter: *Adapter, alloc: std.mem.Allocator, credential: *Credential, request: wire.Request) !?wire.ReadStream {
@@ -375,26 +379,43 @@ const OwnedRead = struct {
         var diagnostic: compiler.Diagnostic = .{};
         var plan = try server.sqlPlanCache().acquire(server.sqlPlanCacheIo(), .{ .statement = request.statement, .principal = credential.principal, .database = request.database orelse "default", .namespace = request.namespace orelse "public" }, &diagnostic);
         var moved = false;
-        defer if (!moved) plan.release(server.sqlPlanCacheIo());
+        var plan_in_setup = false;
+        defer if (!moved and !plan_in_setup) plan.release(server.sqlPlanCacheIo());
         if (plan.compiled().statement != .select) return null;
         preparation_runnable.finish();
         preparation.release();
         var admission = try server.acquireSqlExecutionWithOptions(false, admissionOptions(request));
         defer if (!moved) admission.release();
+        var retained_lease = if (request.retained_lifetime) |lifetime| lifetime.retain() else wire.RetainedLifetime.Lease{};
+        defer retained_lease.release();
         const self = try alloc.create(OwnedRead);
         errdefer alloc.destroy(self);
         self.alloc = alloc;
         self.runnable = .{};
-        errdefer self.runnable.finish();
+        // Later setup guards retire readers, fences and allocations first.
+        // This guard then retires the plan before returning execution capacity.
+        errdefer {
+            plan.release(server.sqlPlanCacheIo());
+            self.runnable.finish();
+        }
+        plan_in_setup = true;
         // Install the stable request before retaining its cancellation/I/O
         // borrows in an execution entry. Setup allocations then run admitted.
         self.identity = null;
         self.authority = .{ .credential = credential, .identity = &self.identity, .request = request };
         try server.startSqlRunnable(&self.runnable, admissionOptions(self.authority.request), .query);
+        // A retained cursor must not borrow connection-owned credential memory.
+        // Its copy uses the API allocator and still observes live revocation.
+        const owned_credential = try credential.cloneOwned(server.alloc);
+        errdefer Credential.release(owned_credential, server.alloc);
+        self.authority.credential = owned_credential;
         self.session_id = null;
         self.staged = .{};
         self.range_guards = .{};
-        self.detached = false;
+        self.lifetime = .{ .context = self, .retire = retirePhysical, .destroy = destroy };
+        self.cleanup = null;
+        self.cleanup_started = false;
+        self.physical_retired = false;
         self.adapter = adapter;
         self.arena = std.heap.ArenaAllocator.init(alloc);
         errdefer self.arena.deinit();
@@ -405,7 +426,7 @@ const OwnedRead = struct {
         errdefer if (self.session_id) |id| server.alloc.free(id);
         // Native catalog resolution extends this identity with aliases using
         // server.alloc; every allocation in the mutable identity must share it.
-        self.identity = try credential.identity(server.alloc);
+        self.identity = try owned_credential.identity(server.alloc);
         errdefer self.identity.?.deinit(server.alloc);
         // Statement, parameter and binding-guard data are portal-owned. Keep a
         // private request capsule so I/O borrows point to a stable address.
@@ -417,6 +438,18 @@ const OwnedRead = struct {
         self.authority.request.setting_overlay = try cloneSettingOverlay(arena, request.setting_overlay);
         self.authority.request.session_id = self.session_id;
         self.native_adapter = .{ .runnable = if (self.runnable.entry != null) &self.runnable else null, .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
+        if (self.native_adapter.runnable != null) {
+            // Async closure borrows the connection's allocator and listener
+            // adapter. A production session supplies the lifetime fence that
+            // holds both through physical cleanup and joined task metadata.
+            if (request.retained_lifetime == null) return error.SqlWriteCapacityUnavailable;
+            const owner = try server.sqlCleanupOwner();
+            const cleanup_io = try server.sqlCleanupIo();
+            const cleanup_borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&cleanup_io);
+            const borrow = self.native_adapter.providerRunnable() orelse return error.ExecutionWaitUnsupported;
+            self.cleanup = try owner.registry.reserve(cleanup_io, borrow, &.{ .io = &cleanup_borrow, .activation_budget = 1, .deadline_ns = 30 * std.time.ns_per_s }, self, cleanupCallbacks);
+        }
+        errdefer if (self.cleanup) |*reserved| reserved.abort() catch unreachable;
         if (self.native_adapter.runnable != null) try self.native_adapter.beginReadFence();
         errdefer self.native_adapter.endReadFence();
         var transaction_lease: ?@import("transactions.zig").SessionRegistry.CommitExecution = null;
@@ -436,7 +469,7 @@ const OwnedRead = struct {
         }
         self.decision_runtime = try self.native_adapter.decisionRuntime();
         if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
-        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
+        self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard, .cleanup = &self.runnable };
         const parameters = try normalizeParameters(arena, request.parameters, request.parameter_types);
         var stream_backend = self.guarded.backend();
         if (plan.compiled().uses_current_setting) stream_backend.setting_capture = self.native_adapter.settingCapture();
@@ -444,13 +477,25 @@ const OwnedRead = struct {
         // prepared epoch on that same snapshot before binding or reading rows.
         const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256 });
         if (opened == null) {
+            if (transaction_lease) |lease| {
+                lease.release();
+                transaction_lease = null;
+            }
+            if (self.cleanup) |*reserved| reserved.abort() catch unreachable;
+            self.cleanup = null;
             self.native_adapter.endReadFence();
-            self.runnable.finish();
-            self.identity.?.deinit(server.alloc);
-            self.arena.deinit();
             self.staged.deinit(alloc);
             self.range_guards.deinit(server.alloc);
+            self.identity.?.deinit(server.alloc);
             if (self.session_id) |id| server.alloc.free(id);
+            self.arena.deinit();
+            Credential.release(owned_credential, server.alloc);
+            // No stream was published. Retire setup ownership before returning
+            // its execution capacity, including the temporary plan lease.
+            plan.release(server.sqlPlanCacheIo());
+            self.runnable.finish();
+            admission.release();
+            moved = true;
             alloc.destroy(self);
             return null;
         }
@@ -482,12 +527,19 @@ const OwnedRead = struct {
         self.plan = plan;
         self.admission = admission;
         try self.runnable.park(.output_blocked);
+        if (self.cleanup) |*reserved| reserved.publish() catch unreachable;
+        self.retained_lease = retained_lease;
+        retained_lease = .{};
+        // This borrowed acquisition handle must not outlive open().
+        self.authority.request.retained_lifetime = null;
         moved = true;
         return .{ .context = self, .columns = columns, .next = next, .close = close, .detach = detach, .validate = validate };
     }
 
     pub fn validate(raw: *anyopaque, alloc: std.mem.Allocator, request: wire.Request) !void {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        self.lifetime.retain();
+        defer self.lifetime.release();
         var job = StreamJob{ .adapter = self.adapter, .alloc = alloc, .credential = self.authority.credential, .request = request, .owner = self, .validate_only = true };
         try job.dispatch();
     }
@@ -495,7 +547,7 @@ const OwnedRead = struct {
     fn validateCursor(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request) !void {
         try request.check();
         try self.authority.credential.validate();
-        var admission: ?http.RequestAdmission.Lease = if (self.detached and !request.completion_drain) try self.adapter.server.acquireSqlExecutionWithOptions(false, admissionOptions(request)) else null;
+        var admission: ?http.RequestAdmission.Lease = if (self.lifetime.detached.load(.acquire) and !request.completion_drain) try self.adapter.server.acquireSqlExecutionWithOptions(false, admissionOptions(request)) else null;
         defer if (admission) |*lease| lease.release();
         const original = self.authority.request;
         if (!std.mem.eql(u8, original.database.?, request.database orelse "default") or !std.mem.eql(u8, original.namespace.?, request.namespace orelse "public") or
@@ -518,6 +570,10 @@ const OwnedRead = struct {
 
     fn next(raw: *anyopaque, alloc: std.mem.Allocator, request: wire.Request, limit: u32) !wire.StreamPage {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        // StreamJob dispatch physically joins the foreground child before this
+        // borrow releases, including on failure or concurrent logical detach.
+        try self.lifetime.retainResource();
+        defer self.lifetime.releaseResource();
         var job = StreamJob{ .adapter = self.adapter, .alloc = alloc, .credential = self.authority.credential, .request = request, .owner = self, .limit = limit };
         try job.dispatch();
         return job.page.?;
@@ -525,7 +581,7 @@ const OwnedRead = struct {
 
     fn pull(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request, limit: u32) !wire.StreamPage {
         const state_alloc = if (request.completion_drain) self.adapter.server.controlAllocator() else self.adapter.server.alloc;
-        if (self.detached) return error.InvalidSqlBackendResponse;
+        if (self.lifetime.detached.load(.acquire)) return error.InvalidSqlBackendResponse;
         try self.runnable.enter(if (request.completion_drain) .control else .query);
         defer self.runnable.park(.output_blocked) catch {};
         try request.check();
@@ -552,7 +608,9 @@ const OwnedRead = struct {
             for (page.output.rows) |row| @constCast(row)[index] = try datetimeResult(page.arena.allocator(), row[index]);
         };
         const owner = try alloc.create(PageOwner);
-        owner.* = .{ .alloc = alloc, .page = page };
+        errdefer alloc.destroy(owner);
+        try self.lifetime.retainResource();
+        owner.* = .{ .alloc = alloc, .page = page, .read = self };
         return .{ .exhausted = page.exhausted, .result = .{
             .columns = self.columns,
             .rows = page.output.rows,
@@ -590,32 +648,89 @@ const OwnedRead = struct {
 
     fn releasePage(raw: *anyopaque) void {
         const owner: *PageOwner = @ptrCast(@alignCast(raw));
+        const read = owner.read;
         owner.page.deinit();
         owner.alloc.destroy(owner);
+        read.lifetime.releaseResource();
     }
 
-    const PageOwner = struct { alloc: std.mem.Allocator, page: Pull.Page };
+    const PageOwner = struct { alloc: std.mem.Allocator, page: Pull.Page, read: *OwnedRead };
 
     fn detach(raw: *anyopaque) void {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
-        if (self.detached) return;
-        self.detached = true;
+        self.lifetime.detach();
+    }
+
+    const cleanupCallbacks: @import("runnable_cleanup_owner.zig").Registry.Callbacks = .{
+        .retain = retainCleanup,
+        .release = releaseCleanup,
+        .cleanup = cleanupNative,
+        .retire = retireCleanup,
+    };
+
+    fn retainCleanup(raw: *anyopaque) anyerror!void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        self.lifetime.retain();
+    }
+    fn releaseCleanup(raw: *anyopaque) void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        if (self.cleanup_started) {
+            std.debug.assert(self.physical_retired);
+            // Registry releases only after its future joins and its task/slot
+            // metadata physically frees. Keep the execution root through it.
+            self.runnable.finish();
+            self.admission.release();
+        }
+        self.lifetime.release();
+    }
+    fn cleanupNative(raw: *anyopaque, _: @import("antfly_runtime_abi").runnable_abi.Borrowed, _: std.Io) anyerror!void {
+        retireNative(raw);
+    }
+    fn retireCleanup(raw: *anyopaque) anyerror!void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        // Successful cleanup is already physically retired. Failure remains
+        // owned until an explicit reaper retirement request invokes this path.
+        if (!self.physical_retired) retireNative(raw);
+    }
+    fn retirePhysical(raw: *anyopaque) void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        if (self.cleanup) |*reserved| {
+            self.cleanup_started = true;
+            reserved.start() catch unreachable;
+            reserved.transfer() catch unreachable;
+            return;
+        }
+        retireNative(raw);
+        self.runnable.finish();
+        self.admission.release();
+    }
+    fn retireNative(raw: *anyopaque) void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
+        std.debug.assert(!self.physical_retired);
         self.stream.close();
         self.native_adapter.endReadFence();
         self.plan.release(self.adapter.server.sqlPlanCacheIo());
-        self.runnable.finish();
-        self.admission.release();
+        // Retire invocation-owned buffers before releasing its retained root.
+        // Portal identity/arena storage has a separate retained lifetime.
         self.staged.deinit(self.alloc);
         self.range_guards.deinit(self.adapter.server.alloc);
+        self.physical_retired = true;
     }
 
     fn close(raw: *anyopaque) void {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
-        detach(raw);
+        self.lifetime.close();
+    }
+
+    fn destroy(raw: *anyopaque) void {
+        const self: *OwnedRead = @ptrCast(@alignCast(raw));
         self.identity.?.deinit(self.adapter.server.alloc);
         if (self.session_id) |id| self.adapter.server.alloc.free(id);
         self.arena.deinit();
+        Credential.release(self.authority.credential, self.adapter.server.alloc);
+        var retained_lease = self.retained_lease;
         self.alloc.destroy(self);
+        retained_lease.release();
     }
 };
 
@@ -712,6 +827,24 @@ const Credential = struct {
         // and session publication without retaining either password or hash.
         try self.validate();
         return self;
+    }
+
+    /// Own the authenticated capsule without retaining a connection allocator,
+    /// password or verifier hash. UserManager remains service-owned and must
+    /// outlive every capsule; validate/identity continue to read live authority.
+    fn cloneOwned(self: *const Credential, alloc: std.mem.Allocator) !*Credential {
+        try self.validate();
+        const copy = try alloc.create(Credential);
+        errdefer alloc.destroy(copy);
+        const name = try alloc.dupe(u8, self.username);
+        errdefer alloc.free(name);
+        const principal = try alloc.dupe(u8, self.principal);
+        errdefer alloc.free(principal);
+        copy.* = .{ .manager = self.manager, .username = name, .principal = principal, .verifier_mac = self.verifier_mac };
+        errdefer std.crypto.secureZero(u8, &copy.verifier_mac);
+        // Rotation during allocation must not publish a stale credential.
+        try copy.validate();
+        return copy;
     }
 
     pub fn validate(self: *const Credential) !void {
@@ -829,8 +962,18 @@ const Job = struct {
         defer identity.?.deinit(identity_alloc);
         var authority = Authority{ .credential = self.credential, .identity = &identity, .request = self.request };
         const context = try authority.context();
+        // Stable local completion receivers outlive the root's deferred finish.
+        var write_completion: ?@import("runnable_write_team.zig").Completion = null;
+        if (write) {
+            if (runnable.entry) |entry| {
+                const memory = server.request_memory orelse return error.ExecutionWaitUnsupported;
+                write_completion = try @import("runnable_write_team.zig").Completion.init(&runnable, memory.allocator(entry.class == .control));
+            }
+        }
         var native_adapter = execution.Adapter{
             .runnable = if ((!write or protected) and runnable.entry != null) &runnable else null,
+            .write_execution = if (write and runnable.entry != null) &runnable else null,
+            .write_completion = if (write_completion) |*bridge| bridge else null,
             .serial_execution = runnable.entry != null,
             .server = server,
             .identity = &identity,
@@ -1033,6 +1176,7 @@ const GuardedCatalog = struct {
     authority: *Authority,
     revision: *const ?u64,
     expected_guard: ?[]const u8,
+    cleanup: ?*http.RunnableScheduler.Execution = null,
     fn backend(self: *GuardedCatalog) catalog.Backend {
         var result = self.native;
         result.ptr = self;
@@ -1054,6 +1198,13 @@ const GuardedCatalog = struct {
     }
     fn checkpoint(raw: *anyopaque) !void {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
+        if (self.cleanup) |execution_owner| if (execution_owner.entry) |entry| if (entry.cleanup_active) {
+            // Logical detach fenced foreground readers before activation.
+            // Physical cleanup uses the authorized native deadline, including
+            // after request cancellation or credential revocation.
+            try self.native.vtable.checkpoint(self.native.ptr);
+            return;
+        };
         try self.authority.checkpoint();
         try self.native.vtable.checkpoint(self.native.ptr);
         // A native checkpoint may relinquish execution and wait. Authority
@@ -1391,6 +1542,33 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     try std.testing.expectError(error.InvalidPassword, Credential.authenticate(alloc, &manager, "alice", "wrong"));
     const credential = try Credential.authenticate(alloc, &manager, "alice", "secret");
     defer Credential.release(credential, alloc);
+    const CloneAllocation = struct {
+        fn check(failing: std.mem.Allocator, original: *Credential) !void {
+            const copy = try original.cloneOwned(failing);
+            defer Credential.release(copy, failing);
+            try std.testing.expect(copy.username.ptr != original.username.ptr);
+            try std.testing.expect(copy.principal.ptr != original.principal.ptr);
+            try std.testing.expectEqualStrings(original.username, copy.username);
+            try std.testing.expectEqualStrings(original.principal, copy.principal);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, CloneAllocation.check, .{credential});
+    const retained_credential = retained: {
+        var connection_arena = std.heap.ArenaAllocator.init(alloc);
+        defer connection_arena.deinit();
+        const connection_alloc = connection_arena.allocator();
+        const connection_credential = try credential.cloneOwned(connection_alloc);
+        defer Credential.release(connection_credential, connection_alloc);
+        break :retained try connection_credential.cloneOwned(alloc);
+    };
+    defer Credential.release(retained_credential, alloc);
+    // The connection credential and its allocator are gone; the retained
+    // capsule still owns its names and retains the original verifier fence.
+    try retained_credential.validate();
+    try std.testing.expectEqualStrings("alice", retained_credential.sessionPrincipal());
+    var retained_identity = try retained_credential.identity(alloc);
+    defer retained_identity.deinit(alloc);
+    try std.testing.expectEqual(user.instance_id, retained_identity.user_instance_id.?);
     var admitted = try credential.identity(alloc);
     defer admitted.deinit(alloc);
     try std.testing.expectEqual(user.instance_id, admitted.user_instance_id.?);
@@ -1566,6 +1744,9 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     try manager.updatePassword("alice", "new-secret");
     try std.testing.expectError(error.Unauthorized, credential.validate());
     try std.testing.expectError(error.Unauthorized, credential.identity(alloc));
+    try std.testing.expectError(error.Unauthorized, retained_credential.validate());
+    try std.testing.expectError(error.Unauthorized, retained_credential.identity(alloc));
+    try std.testing.expectError(error.Unauthorized, retained_credential.cloneOwned(alloc));
     const replacement = try Credential.authenticate(alloc, &manager, "alice", "new-secret");
     defer Credential.release(replacement, alloc);
     var replacement_identity = try replacement.identity(alloc);
@@ -1691,4 +1872,216 @@ test "workload deadline normalizes pgwire clock before native metadata handoff" 
     try context.ensureActive();
     canceled.store(true, .release);
     try std.testing.expectError(error.Canceled, context.ensureActive());
+}
+
+test "SQL pgwire retained lease releases after detached capsule physical cleanup" {
+    const Budget = @import("../pgwire/budget.zig").Budget;
+    const Fence = struct {
+        connection: *Budget,
+        service: *Budget,
+        references: usize = 0,
+        retired_before_release: bool = false,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retired_before_release = self.connection.used.load(.acquire) == 0 and self.service.used.load(.acquire) == 0;
+            self.references -= 1;
+        }
+    };
+    var connection: Budget = .{ .child = std.testing.allocator, .limit = 1 << 20 };
+    var service: Budget = .{ .child = std.testing.allocator, .limit = 1 << 20 };
+    var fence: Fence = .{ .connection = &connection, .service = &service };
+    const alloc = connection.allocator();
+    const service_alloc = service.allocator();
+    var server: http.ApiHttpServer = undefined;
+    server.alloc = service_alloc;
+    var adapter: Adapter = .{ .server = &server };
+    const credential = try service_alloc.create(Credential);
+    credential.* = .{ .manager = undefined, .username = try service_alloc.dupe(u8, "alice"), .principal = try service_alloc.dupe(u8, "basic:alice"), .verifier_mac = @splat(0) };
+    const owner = try alloc.create(OwnedRead);
+    owner.* = undefined;
+    owner.alloc = alloc;
+    owner.adapter = &adapter;
+    owner.cleanup = null;
+    owner.cleanup_started = false;
+    owner.physical_retired = false;
+    owner.lifetime = .{ .context = owner, .retire = OwnedRead.retirePhysical, .destroy = OwnedRead.destroy, .detached = .init(true), .retirement_started = true };
+    owner.arena = std.heap.ArenaAllocator.init(alloc);
+    _ = try owner.arena.allocator().alloc(u8, 4096);
+    owner.session_id = try service_alloc.dupe(u8, "retained-session");
+    owner.identity = .{ .username = try service_alloc.dupe(u8, "alice"), .credential_principal = try service_alloc.dupe(u8, "basic:alice") };
+    owner.authority = .{ .credential = credential, .identity = &owner.identity, .request = undefined };
+    owner.retained_lease = (wire.RetainedLifetime{ .context = &fence, .retain_fn = Fence.retain, .release_fn = Fence.release }).retain();
+    try std.testing.expect(connection.used.load(.acquire) > 0 and service.used.load(.acquire) > 0);
+    OwnedRead.close(owner);
+    try std.testing.expect(fence.retired_before_release);
+    try std.testing.expectEqual(@as(usize, 0), fence.references);
+}
+
+test "SQL pgwire supervised cleanup retains native stream allocator root and parents through returned pages and task join" {
+    const Budget = @import("../pgwire/budget.zig").Budget;
+    const Fence = struct {
+        connection: *Budget,
+        service: *Budget,
+        references: std.atomic.Value(usize) = .init(0),
+        retired_before_release: std.atomic.Value(bool) = .init(false),
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.references.fetchAdd(1, .monotonic);
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.retired_before_release.store(self.connection.used.load(.acquire) == 0 and self.service.used.load(.acquire) == 0, .release);
+            _ = self.references.fetchSub(1, .release);
+        }
+    };
+    var cleanup_threads = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(2) });
+    defer cleanup_threads.deinit();
+    var reaper_threads = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    defer reaper_threads.deinit();
+    var cleanup_memory: @import("../common/allocation_budget.zig").Shared = .{ .child = std.heap.smp_allocator, .limit = 1 << 16 };
+    const cleanup_runtime = try @import("runnable_cleanup_owner.zig").Runtime.create(cleanup_memory.allocator(), reaper_threads.io(), 2);
+    defer cleanup_runtime.deinit();
+    var connection: Budget = .{ .child = std.testing.allocator, .limit = 1 << 20 };
+    var service: Budget = .{ .child = std.testing.allocator, .limit = 1 << 20 };
+    var fence: Fence = .{ .connection = &connection, .service = &service };
+    const alloc = connection.allocator();
+    const service_alloc = service.allocator();
+    var server: http.ApiHttpServer = undefined;
+    server.alloc = service_alloc;
+    server.cfg = .{};
+    server.sql_plan_cache = @import("../sql/plan_cache.zig").Cache.init(std.testing.allocator, .{});
+    const cache_io = server.sqlPlanCacheIo();
+    defer server.sql_plan_cache.deinit(cache_io);
+    var adapter: Adapter = .{ .server = &server };
+    var scheduling = try http.RunnableScheduler.Scheduler.init(.{ .slots = 3, .max_operations = 4, .max_bytes = 128, .control_bytes = 32 });
+    defer scheduling.close();
+    var admission = http.RequestAdmission.init(1);
+    const credential = try service_alloc.create(Credential);
+    credential.* = .{ .manager = undefined, .username = try service_alloc.dupe(u8, "alice"), .principal = try service_alloc.dupe(u8, "basic:alice"), .verifier_mac = @splat(0) };
+    const owner = try alloc.create(OwnedRead);
+    owner.* = undefined;
+    owner.alloc = alloc;
+    owner.adapter = &adapter;
+    owner.cleanup = null;
+    owner.cleanup_started = false;
+    owner.physical_retired = false;
+    owner.lifetime = .{ .context = owner, .retire = OwnedRead.retirePhysical, .destroy = OwnedRead.destroy };
+    owner.arena = std.heap.ArenaAllocator.init(alloc);
+    _ = try owner.arena.allocator().alloc(u8, 1024);
+    owner.session_id = try service_alloc.dupe(u8, "retained-session");
+    owner.identity = .{ .username = try service_alloc.dupe(u8, "alice"), .credential_principal = try service_alloc.dupe(u8, "basic:alice") };
+    owner.authority = .{ .credential = credential, .identity = &owner.identity, .request = undefined };
+    owner.retained_lease = (wire.RetainedLifetime{ .context = &fence, .retain_fn = Fence.retain, .release_fn = Fence.release }).retain();
+    owner.runnable = .{};
+    try owner.runnable.start(&scheduling, .{ .io = std.testing.io, .retained_bytes = 17 }, .query);
+    owner.native_adapter = .{ .server = &server, .identity = &owner.identity, .context = .{}, .runnable = &owner.runnable };
+    owner.staged = .{};
+    owner.range_guards = .{};
+    owner.admission = admission.tryAcquireLease().?;
+    var diagnostic: compiler.Diagnostic = .{};
+    owner.plan = try server.sql_plan_cache.acquire(cache_io, .{ .statement = "SELECT 1" }, &diagnostic);
+    // Construct the native stream's real teardown surface. The page arenas
+    // below borrow this actual stream budget, exactly as next() pages do.
+    owner.stream = try alloc.create(Pull.Stream);
+    owner.stream.* = undefined;
+    owner.stream.budget = .{ .backing = alloc, .limit = 1 << 16 };
+    owner.stream.arena = std.heap.ArenaAllocator.init(owner.stream.budget.allocator());
+    _ = try owner.stream.arena.allocator().alloc(u8, 1024);
+    owner.stream.parallel = null;
+    owner.stream.pending_columns = null;
+    owner.stream.spool = null;
+    owner.stream.cursor = null;
+    owner.stream.after = null;
+    owner.stream.settings = null;
+    var pages: [2]*OwnedRead.PageOwner = undefined;
+    for (&pages) |*page| {
+        page.* = try alloc.create(OwnedRead.PageOwner);
+        var arena = std.heap.ArenaAllocator.init(owner.stream.budget.allocator());
+        _ = try arena.allocator().alloc(u8, 4096);
+        try owner.lifetime.retainResource();
+        page.*.* = .{ .alloc = alloc, .read = owner, .page = .{ .arena = arena, .output = undefined, .exhausted = false } };
+    }
+    const cleanup_io = cleanup_threads.io();
+    const cleanup_borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&cleanup_io);
+    owner.cleanup = try cleanup_runtime.registry.reserve(cleanup_io, owner.native_adapter.providerRunnable().?, &.{ .io = &cleanup_borrow, .activation_budget = 1, .deadline_ns = 30 * std.time.ns_per_s }, owner, OwnedRead.cleanupCallbacks);
+    try owner.cleanup.?.publish();
+    try owner.runnable.park(.output_blocked);
+    OwnedRead.close(owner);
+    try std.testing.expect(owner.lifetime.detached.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 3), owner.lifetime.references.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), fence.references.load(.acquire));
+    try std.testing.expect(connection.used.load(.acquire) > 0 and service.used.load(.acquire) > 0);
+    try std.testing.expectEqual(@as(usize, 1), admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 1), server.sql_plan_cache.stats(cache_io).leases);
+    try std.testing.expectEqual(@as(usize, 1), scheduling.stats().operations);
+    try std.testing.expectEqual(@as(u64, 17), scheduling.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduling.stats().runnable_slots);
+    var control: http.RunnableScheduler.Execution = .{};
+    try control.start(&scheduling, .{ .io = std.testing.io }, .control);
+    control.finish();
+    OwnedRead.releasePage(pages[0]);
+    try std.testing.expectEqual(@as(usize, 2), owner.lifetime.references.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 1), scheduling.stats().operations);
+    try std.testing.expectEqual(@as(u64, 17), scheduling.stats().retained_bytes);
+    // Last page deinit physically frees its arena and wrapper before stream
+    // close, native plan/root retirement and final connection parent release.
+    OwnedRead.releasePage(pages[1]);
+    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    while (cleanup_runtime.registry.retained() != 0) {
+        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) return error.Timeout;
+        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(fence.retired_before_release.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), fence.references.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), connection.used.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), service.used.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), admission.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 0), server.sql_plan_cache.stats(cache_io).leases);
+    try std.testing.expectEqual(@as(usize, 0), scheduling.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduling.stats().retained_bytes);
+}
+
+test "SQL pgwire guarded cleanup checkpoint preserves independent deadline after foreground cancellation" {
+    const runtime = @import("antfly_runtime_abi");
+    const Clock = struct {
+        var current: u64 = 0;
+        fn now() u64 {
+            return current;
+        }
+    };
+    Clock.current = 0;
+    var scheduling = try http.RunnableScheduler.Scheduler.init(.{ .slots = 3, .max_operations = 4, .max_bytes = 128, .control_bytes = 32 });
+    defer scheduling.close();
+    var owner: http.RunnableScheduler.Execution = .{};
+    defer owner.finish();
+    try owner.start(&scheduling, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .retained_bytes = 17 }, .query);
+    var server: http.ApiHttpServer = undefined;
+    server.embedding_provider_runtime.io = std.testing.io;
+    var identity: ?http.AuthenticatedIdentity = null;
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var credential: Credential = undefined;
+    const request: wire.Request = .{ .statement = "SELECT 1", .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(1)) }, .cancel_requested = &canceled };
+    var authority: Authority = .{ .credential = &credential, .identity = &identity, .request = request };
+    var native_adapter: execution.Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &owner };
+    var guarded: GuardedCatalog = .{ .native = native_adapter.backend(), .authority = &authority, .revision = &native_adapter.revision, .expected_guard = null, .cleanup = &owner };
+    const borrow = native_adapter.providerRunnable().?;
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    const reserved = borrow.reserve_cleanup.?(borrow.context, &.{ .io = &io_borrow, .native_deadline = 1, .activation_budget = 1, .deadline_ns = 10 });
+    if (!reserved.isOk()) return runtime.error_abi.errorFromStatus(reserved);
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, GuardedCatalog.checkpoint(&guarded));
+    Clock.current = 1000;
+    const activated = borrow.activate_cleanup.?(borrow.context);
+    if (!activated.isOk()) return runtime.error_abi.errorFromStatus(activated);
+    try GuardedCatalog.checkpoint(&guarded);
+    Clock.current = 1010;
+    try std.testing.expectError(error.DeadlineExceeded, GuardedCatalog.checkpoint(&guarded));
+    try std.testing.expectEqual(@as(usize, 1), scheduling.stats().operations);
+    try std.testing.expectEqual(@as(u64, 17), scheduling.stats().retained_bytes);
 }

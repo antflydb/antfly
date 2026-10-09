@@ -1477,6 +1477,11 @@ pub const BackendRuntime = struct {
         };
     }
 
+    /// Includes every admitted forwarding task until its physical I/O joins.
+    pub fn outstandingRequestForwardLeases(self: *const BackendRuntime) usize {
+        return self.request_forward_lane_gate.active();
+    }
+
     pub fn outstandingApiLeases(self: *const BackendRuntime) usize {
         return self.api_lane_gate.active();
     }

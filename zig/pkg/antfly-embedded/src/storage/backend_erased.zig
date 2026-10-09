@@ -21,6 +21,7 @@ const backend_adapter = @import("backend_adapter.zig");
 const backend_types = @import("backend_types.zig");
 const change_journal_mod = @import("db/derived/change_journal.zig");
 const internal_keys = @import("internal_keys.zig");
+const read_admission = @import("../common/read_admission.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 
 pub const types = backend_types;
@@ -179,6 +180,8 @@ pub const Cursor = struct {
         seek_at_or_after: *const fn (*anyopaque, []const u8) anyerror!?Entry,
         seek_at_or_before: *const fn (*anyopaque, []const u8) anyerror!?Entry,
         set_upper_bound: ?*const fn (*anyopaque, ?[]const u8) void = null,
+        next_with_admission: ?*const fn (*anyopaque, read_admission.Port) anyerror!?Entry = null,
+        seek_at_or_after_with_admission: ?*const fn (*anyopaque, []const u8, read_admission.Port) anyerror!?Entry = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -197,6 +200,18 @@ pub const Cursor = struct {
 
     pub fn next(self: *Cursor) !?Entry {
         return try BoundaryAbi.call("next", self.boundary_dispatch, self.vtable.next, .{self.ptr});
+    }
+
+    /// Admission is borrowed only during the call, and is never retained.
+    pub fn nextWithAdmission(self: *Cursor, control: read_admission.Port) !?Entry {
+        try control.checkpoint();
+        const next_controlled = self.vtable.next_with_admission orelse return error.ExecutionWaitUnsupported;
+        return try BoundaryAbi.call("next_with_admission", self.boundary_dispatch, next_controlled, .{ self.ptr, control });
+    }
+    pub fn seekAtOrAfterWithAdmission(self: *Cursor, key: []const u8, control: read_admission.Port) !?Entry {
+        try control.checkpoint();
+        const seek = self.vtable.seek_at_or_after_with_admission orelse return error.ExecutionWaitUnsupported;
+        return try BoundaryAbi.call("seek_at_or_after_with_admission", self.boundary_dispatch, seek, .{ self.ptr, key, control });
     }
 
     pub fn prev(self: *Cursor) !?Entry {
@@ -316,6 +331,7 @@ pub const ReadTxn = struct {
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
         fork_read: ?*const fn (Allocator, *anyopaque) anyerror!ReadTxn = null,
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
+        open_cursor_with_admission: ?*const fn (Allocator, *anyopaque, read_admission.Port) anyerror!Cursor = null,
     };
 
     pub fn abort(self: *ReadTxn) void {
@@ -343,6 +359,15 @@ pub const ReadTxn = struct {
 
     pub fn openCursor(self: *ReadTxn) !Cursor {
         return try self.vtable.open_cursor(self.allocator, self.ptr);
+    }
+
+    pub fn openCursorWithAdmission(self: *ReadTxn, control: read_admission.Port) !Cursor {
+        try control.checkpoint();
+        const open = self.vtable.open_cursor_with_admission orelse return error.ExecutionWaitUnsupported;
+        var cursor = try open(self.allocator, self.ptr, control);
+        errdefer cursor.close();
+        try control.checkpoint();
+        return cursor;
     }
 
     /// Owns the same immutable snapshot, with independent read/cursor scratch.
@@ -863,6 +888,8 @@ pub const Store = struct {
         /// Open one stable, range-scoped replay-lane view. The returned
         /// transaction may outlive multiple bounded derived-index windows.
         begin_replay_lane_scan: ?*const fn (Allocator, *anyopaque, u8, u64) anyerror!CurrentScanTxn = null,
+        /// Required control never falls back to an unbounded legacy read.
+        begin_read_with_admission: ?*const fn (Allocator, *anyopaque, backend_types.Namespace.BlockCacheAdmission, read_admission.Port) anyerror!ReadTxn = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -877,6 +904,13 @@ pub const Store = struct {
 
     pub fn beginRead(self: *Store) !ReadTxn {
         return try BoundaryAbi.call("begin_read", self.boundary_dispatch, self.vtable.begin_read, .{ self.allocator, self.ptr });
+    }
+
+    /// The caller retains the control payload only until this call returns.
+    pub fn beginReadWithAdmission(self: *Store, admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !ReadTxn {
+        try control.checkpoint();
+        const begin = self.vtable.begin_read_with_admission orelse return error.ExecutionWaitUnsupported;
+        return try BoundaryAbi.call("begin_read_with_admission", self.boundary_dispatch, begin, .{ self.allocator, self.ptr, admission, control });
     }
 
     pub fn beginReadWithBlockCacheAdmission(self: *Store, admission: backend_types.Namespace.BlockCacheAdmission) !ReadTxn {
@@ -1219,6 +1253,19 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
             };
         }
 
+        pub fn nextWithAdmission(ptr: *anyopaque, control: read_admission.Port) anyerror!?Entry {
+            return unbox(ptr).handle.nextWithAdmission(control) catch |err| {
+                if (err == error.NotFound) return null;
+                return err;
+            };
+        }
+        pub fn seekAtOrAfterWithAdmission(ptr: *anyopaque, key: []const u8, control: read_admission.Port) anyerror!?Entry {
+            return unbox(ptr).handle.seekAtOrAfterWithAdmission(key, control) catch |err| {
+                if (err == error.NotFound) return null;
+                return err;
+            };
+        }
+
         pub fn setUpperBound(ptr: *anyopaque, upper: ?[]const u8) void {
             unbox(ptr).handle.setUpperBound(upper);
         }
@@ -1229,6 +1276,8 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
         .ptr = box_ptr,
         .vtable = &.{
             .close = vt.close,
+            .next_with_admission = if (@hasDecl(Handle, "nextWithAdmission")) vt.nextWithAdmission else null,
+            .seek_at_or_after_with_admission = if (@hasDecl(Handle, "seekAtOrAfterWithAdmission")) vt.seekAtOrAfterWithAdmission else null,
             .first = vt.first,
             .last = vt.last,
             .next = vt.next,
@@ -1285,6 +1334,15 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
 
+        pub fn openCursorWithAdmission(alloc: Allocator, ptr: *anyopaque, control: read_admission.Port) anyerror!Cursor {
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            errdefer parent.releaseChild();
+            var cursor = try parent.handle.openCursorWithAdmission(control);
+            errdefer cursor.close();
+            return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
+        }
+
         pub fn forkRead(alloc: Allocator, ptr: *anyopaque) anyerror!ReadTxn {
             const parent = unbox(ptr);
             try parent.retainChild();
@@ -1317,6 +1375,7 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
             .abort = vt.abort,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
+            .open_cursor_with_admission = if (@hasDecl(Handle, "openCursorWithAdmission")) vt.openCursorWithAdmission else null,
             .open_cursor = vt.openCursor,
             .fork_read = if (@hasDecl(Handle, "forkBorrowedRead")) vt.forkRead else null,
             .open_read_scope = if (@hasDecl(Handle, "openReadScope")) vt.openReadScope else null,
@@ -1808,6 +1867,11 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return try readTxnFrom(alloc, try unbox(ptr).handle.beginRead());
         }
 
+        pub fn beginReadWithAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) anyerror!ReadTxn {
+            if (Handle == Store) return try unbox(ptr).handle.beginReadWithAdmission(admission, control);
+            return try readTxnFrom(alloc, try unbox(ptr).handle.beginReadWithAdmission(admission, control));
+        }
+
         pub fn beginReadWithBlockCacheAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission) anyerror!ReadTxn {
             if (Handle == Store) {
                 return try unbox(ptr).handle.beginReadWithBlockCacheAdmission(admission);
@@ -2061,6 +2125,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             .deinit = vt.deinit,
             .capabilities = vt.capabilities,
             .begin_read = vt.beginRead,
+            .begin_read_with_admission = if (Handle == Store or @hasDecl(Handle, "beginReadWithAdmission")) vt.beginReadWithAdmission else null,
             .begin_read_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginReadWithBlockCacheAdmission")) vt.beginReadWithBlockCacheAdmission else null,
             .begin_probe = if (Handle == Store or @hasDecl(Handle, "beginProbe")) vt.beginProbe else null,
             .begin_probe_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginProbeWithBlockCacheAdmission")) vt.beginProbeWithBlockCacheAdmission else null,

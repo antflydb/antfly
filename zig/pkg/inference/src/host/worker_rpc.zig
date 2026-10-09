@@ -26,8 +26,8 @@ const max_retained_bytes = 256 * 1024 * 1024;
 const control_budget_bytes = 4 * 1024 * 1024;
 const max_requests = 128;
 const header_len = 17;
-const Kind = enum(u8) { offer = 1, accept, reject, chunk, finish, abort, cancel, failure, capacity, resource_request, resource_reply, phase_request, phase_reply };
-const MessageKind = enum(u8) { request = 1, response, event };
+const Kind = enum(u8) { offer = 1, accept, reject, chunk, finish, abort, cancel, failure, capacity, resource_request, resource_reply, phase_request, phase_reply, event_reply };
+const MessageKind = enum(u8) { request = 1, response, event, acknowledged_event };
 const Failure = enum { failure, capacity };
 
 // Resource mutations use dedicated frames and slots, never payload offers.
@@ -106,6 +106,9 @@ pub const Control = struct {
     check: ?*const fn (?*anyopaque) anyerror!void = null,
     event: ?*const fn (?*anyopaque, Payload) anyerror!void = null,
     phase: ?*const fn (?*anyopaque, Phase) anyerror!void = null,
+    /// The acknowledged event's sink releases execution only at physical IO
+    /// waits. Its parsing and formatting must retain the current grant.
+    event_owns_waits: bool = false,
     /// A caller lending physical capacity cannot retire it until an uncertain
     /// child has been reaped by the endpoint's lifetime owner.
     fence_on_error: bool = false,
@@ -120,6 +123,10 @@ pub const Request = struct {
     phase_waiting: bool = false,
     phase_reply: ?PhaseStatus = null,
     phase_ready: std.Io.Event = .unset,
+    event_sequence: u64 = 0,
+    event_waiting: bool = false,
+    event_reply: ?PhaseStatus = null,
+    event_ready: std.Io.Event = .unset,
 
     fn check(raw: ?*anyopaque) !void {
         const self: *Request = @ptrCast(@alignCast(raw.?));
@@ -168,16 +175,61 @@ pub const Request = struct {
         }
     }
 
+    /// Use only at a synchronous boundary where this request's physical
+    /// computation is stopped. The recipient may park borrowed CPU while its
+    /// sink runs; this call cannot return successfully before reacquisition.
+    pub fn eventAcknowledged(self: *Request, payload: Payload) !void {
+        try check(self);
+        const endpoint = self.endpoint;
+        endpoint.mutex.lockUncancelable(endpoint.io);
+        if (self.event_waiting) {
+            endpoint.mutex.unlock(endpoint.io);
+            return error.InvalidWorkerEvent;
+        }
+        const sequence = std.math.add(u64, self.event_sequence, 1) catch {
+            endpoint.mutex.unlock(endpoint.io);
+            return error.InvalidWorkerEvent;
+        };
+        self.event_sequence = sequence;
+        self.event_waiting = true;
+        self.event_reply = null;
+        self.event_ready.reset();
+        endpoint.mutex.unlock(endpoint.io);
+        defer {
+            endpoint.mutex.lockUncancelable(endpoint.io);
+            self.event_waiting = false;
+            endpoint.mutex.unlock(endpoint.io);
+        }
+        errdefer self.cancelled.store(true, .release);
+        try endpoint.sendMessage(.acknowledged_event, self.id, payload, .{ .ptr = self, .check = check }, null, sequence);
+        while (true) {
+            try check(self);
+            endpoint.mutex.lockUncancelable(endpoint.io);
+            const status = self.event_reply;
+            const closed = endpoint.closed.load(.acquire);
+            endpoint.mutex.unlock(endpoint.io);
+            if (status) |value| return switch (value) {
+                .accepted => {},
+                .canceled => error.Cancelled,
+                .timeout => error.Timeout,
+                .denied => error.InferenceExecutionHandoffFailed,
+            };
+            if (closed) return error.InferenceWorkerUnavailable;
+            try endpoint.waitTick(&self.event_ready);
+        }
+    }
+
     pub fn event(self: *Request, payload: Payload) !void {
-        try self.endpoint.sendMessage(.event, self.id, payload, .{ .ptr = self, .check = check }, null);
+        try self.endpoint.sendMessage(.event, self.id, payload, .{ .ptr = self, .check = check }, null, 0);
     }
 };
 
-const Message = struct { kind: MessageKind, payload: OwnedPayload };
+const Message = struct { kind: MessageKind, payload: OwnedPayload, event_sequence: u64 = 0 };
 const Pending = struct {
     ready: std.Io.Event = .unset,
     terminal: ?Failure = null,
     next_phase_sequence: u64 = 1,
+    next_event_sequence: u64 = 1,
     phase: ?PhaseRequest = null,
     phase_inflight: bool = false,
     messages: std.ArrayListUnmanaged(Message) = .empty,
@@ -186,7 +238,7 @@ const Offer = struct {
     ready: std.Io.Event = .unset,
     accepted: bool = false,
 };
-const Assembly = struct { kind: MessageKind, request_id: u64, payload: OwnedPayload, received: usize = 0 };
+const Assembly = struct { kind: MessageKind, request_id: u64, payload: OwnedPayload, received: usize = 0, event_sequence: u64 = 0 };
 
 pub const Endpoint = struct {
     alloc: std.mem.Allocator,
@@ -322,7 +374,7 @@ pub const Endpoint = struct {
         var dispatch_possible = false;
         errdefer if (control.fence_on_error and dispatch_possible) self.fence();
         errdefer self.sendFrame(.cancel, id, "") catch {};
-        try self.sendMessage(.request, id, payload, control, &dispatch_possible);
+        try self.sendMessage(.request, id, payload, control, &dispatch_possible, 0);
         while (true) {
             if (control.check) |check| try check(control.ptr);
             self.mutex.lockUncancelable(self.io);
@@ -370,6 +422,25 @@ pub const Endpoint = struct {
                         defer item.payload.deinit();
                         if (control.event) |event| try event(control.ptr, item.payload.view());
                     },
+                    .acknowledged_event => {
+                        defer item.payload.deinit();
+                        const result = deliverAcknowledgedEvent(control, item.payload.view());
+                        const status: PhaseStatus = if (result) |_| .accepted else |err| switch (err) {
+                            error.Cancelled, error.Canceled => .canceled,
+                            error.Timeout, error.DeadlineExceeded => .timeout,
+                            else => .denied,
+                        };
+                        var bytes: [9]u8 = undefined;
+                        std.mem.writeInt(u64, bytes[0..8], item.event_sequence, .little);
+                        bytes[8] = @backingInt(status);
+                        self.sendFrame(.event_reply, id, &bytes) catch |err| {
+                            // The sink and reacquisition may have completed.
+                            // Fence uncertain delivery before retiring capacity.
+                            self.fence();
+                            return err;
+                        };
+                        try result;
+                    },
                     .request => unreachable,
                 }
             } else {
@@ -378,6 +449,27 @@ pub const Endpoint = struct {
                 try self.waitTick(&pending.ready);
             }
         }
+    }
+
+    fn deliverAcknowledgedEvent(control: Control, payload: Payload) !void {
+        if (control.check) |check| try check(control.ptr);
+        if (control.event_owns_waits) {
+            // The child cannot compute until this event is acknowledged, so
+            // cooperative checkpoints are safe at these formatter boundaries.
+            if (control.phase) |phase| try phase(control.ptr, .checkpoint);
+            if (control.event) |event| try event(control.ptr, payload);
+            if (control.check) |check| try check(control.ptr);
+            if (control.phase) |phase| try phase(control.ptr, .checkpoint);
+            return;
+        }
+        if (control.phase) |phase| try phase(control.ptr, .resource_wait);
+        if (control.check) |check| try check(control.ptr);
+        // On error the lending caller fences the child, then its existing
+        // invocation cleanup finishes this outstanding resource wait.
+        if (control.event) |event| try event(control.ptr, payload);
+        if (control.check) |check| try check(control.ptr);
+        if (control.phase) |phase| try phase(control.ptr, .runnable);
+        if (control.check) |check| try check(control.ptr);
     }
 
     pub fn callResource(self: *Endpoint, payload: []const u8) !ResourceReply {
@@ -437,7 +529,7 @@ pub const Endpoint = struct {
         };
     }
 
-    fn sendMessage(self: *Endpoint, kind: MessageKind, request_id: u64, payload: Payload, control: Control, dispatch_possible: ?*bool) !void {
+    fn sendMessage(self: *Endpoint, kind: MessageKind, request_id: u64, payload: Payload, control: Control, dispatch_possible: ?*bool, event_sequence: u64) !void {
         _ = try payload.size();
         var offer = Offer{};
         self.mutex.lockUncancelable(self.io);
@@ -464,13 +556,14 @@ pub const Endpoint = struct {
             _ = self.offers.remove(transfer);
             self.mutex.unlock(self.io);
         }
-        var description: [21]u8 = undefined;
+        var description: [29]u8 = undefined;
         description[0] = @backingInt(kind);
         std.mem.writeInt(u64, description[1..9], request_id, .little);
         std.mem.writeInt(u32, description[9..13], @intCast(payload.metadata.len), .little);
         std.mem.writeInt(u64, description[13..21], try payload.bodySize(), .little);
         errdefer self.sendFrame(.abort, transfer, "") catch {};
-        try self.sendFrame(.offer, transfer, &description);
+        if (kind == .acknowledged_event) std.mem.writeInt(u64, description[21..29], event_sequence, .little);
+        try self.sendFrame(.offer, transfer, description[0..if (kind == .acknowledged_event) @as(usize, 29) else 21]);
         while (!offer.ready.isSet()) {
             if (control.check) |check| try check(control.ptr);
             if (self.closed.load(.acquire)) return error.InferenceWorkerUnavailable;
@@ -596,6 +689,17 @@ pub const Endpoint = struct {
                         request.phase_ready.set(self.io);
                     }
                 },
+                .event_reply => {
+                    if (length != 9) return error.InvalidWorkerEvent;
+                    const sequence = std.mem.readInt(u64, bytes[0..8], .little);
+                    const status = std.enums.fromInt(PhaseStatus, bytes[8]) orelse return error.InvalidWorkerEvent;
+                    if (self.active.get(id)) |request| {
+                        if (!request.event_waiting or request.event_reply != null or sequence != request.event_sequence)
+                            return error.InvalidWorkerEvent;
+                        request.event_reply = status;
+                        request.event_ready.set(self.io);
+                    }
+                },
                 .resource_request => {
                     if (self.resource_handler == null or length == 0 or length > max_resource_bytes)
                         return error.InvalidResourceFrame;
@@ -625,8 +729,11 @@ pub const Endpoint = struct {
                     pending.ready.set(self.io);
                 },
                 .offer => {
-                    if (length != 21 or self.incoming.contains(id)) return error.InvalidWorkerFrame;
+                    if ((length != 21 and length != 29) or self.incoming.contains(id)) return error.InvalidWorkerFrame;
                     const message_kind = std.enums.fromInt(MessageKind, bytes[0]) orelse return error.InvalidWorkerFrame;
+                    if (length != (if (message_kind == .acknowledged_event) @as(u32, 29) else 21)) return error.InvalidWorkerFrame;
+                    const event_sequence = if (message_kind == .acknowledged_event) std.mem.readInt(u64, bytes[21..29], .little) else 0;
+                    if (message_kind == .acknowledged_event and event_sequence == 0) return error.InvalidWorkerEvent;
                     const request_id = std.mem.readInt(u64, bytes[1..9], .little);
                     const metadata_len = std.mem.readInt(u32, bytes[9..13], .little);
                     const body_len = std.mem.readInt(u64, bytes[13..21], .little);
@@ -646,7 +753,7 @@ pub const Endpoint = struct {
                         try self.replyOffer(.reject, id);
                         continue;
                     };
-                    self.incoming.put(self.alloc, id, .{ .kind = message_kind, .request_id = request_id, .payload = payload }) catch |err| {
+                    self.incoming.put(self.alloc, id, .{ .kind = message_kind, .request_id = request_id, .payload = payload, .event_sequence = event_sequence }) catch |err| {
                         payload.deinitLocked();
                         return err;
                     };
@@ -684,7 +791,11 @@ pub const Endpoint = struct {
                     } else if (self.pending.get(assembly.request_id)) |pending| {
                         // Bound empty-event floods as well as payload bytes.
                         std.debug.assert(pending.messages.items.len < 1024);
-                        try pending.messages.append(self.alloc, .{ .kind = assembly.kind, .payload = assembly.payload });
+                        if (assembly.kind == .acknowledged_event) {
+                            if (assembly.event_sequence != pending.next_event_sequence) return error.InvalidWorkerEvent;
+                            pending.next_event_sequence = try std.math.add(u64, assembly.event_sequence, 1);
+                        }
+                        try pending.messages.append(self.alloc, .{ .kind = assembly.kind, .payload = assembly.payload, .event_sequence = assembly.event_sequence });
                         pending.ready.set(self.io);
                         owned = false;
                     }
@@ -722,7 +833,7 @@ pub const Endpoint = struct {
             return;
         };
         defer response.deinit();
-        self.sendMessage(.response, request.id, response.view(), .{ .ptr = request, .check = Request.check }, null) catch |err| {
+        self.sendMessage(.response, request.id, response.view(), .{ .ptr = request, .check = Request.check }, null, 0) catch |err| {
             // Terminal failure never needs message credit or an offer slot.
             // Even a completely full recipient can finish this one request.
             self.sendFrame(if (err == error.ResourceTemporarilyUnavailable or err == error.QueueFull) .capacity else .failure, request.id, "") catch {};
@@ -787,6 +898,13 @@ pub const TestPair = struct {
                 return err;
             };
             request.transition(.runnable) catch |err| {
+                self.phase_denied.set(std.testing.io);
+                return err;
+            };
+            self.phase_resumed.store(true, .release);
+        }
+        if (std.mem.eql(u8, request.payload.view().body, "output")) {
+            request.eventAcknowledged(.{ .body = "chunk" }) catch |err| {
                 self.phase_denied.set(std.testing.io);
                 return err;
             };
@@ -1406,4 +1524,148 @@ test "inference worker concurrent resource callbacks route replies by ID" {
     defer _ = second.cancel(std.testing.io) catch {};
     try first.await(std.testing.io);
     try second.await(std.testing.io);
+}
+
+test "inference worker output acknowledgment blocks child compute through sink delivery and reacquisition" {
+    const Sink = struct {
+        pair: *TestPair,
+        thread: std.Thread.Id,
+        parked: bool = false,
+        writes: usize = 0,
+        transitions: usize = 0,
+        fn phase(raw: ?*anyopaque, value: Phase) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
+            try std.testing.expect(!self.pair.phase_resumed.load(.acquire));
+            try std.testing.expectEqual(if (self.parked) Phase.runnable else Phase.resource_wait, value);
+            self.parked = !self.parked;
+            self.transitions += 1;
+        }
+        fn event(raw: ?*anyopaque, payload: Payload) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            try std.testing.expectEqualStrings("chunk", payload.body);
+            // A second request can traverse the actual same pipes while the
+            // first child is held at its output boundary.
+            const peer = try self.pair.parent.call(.{ .body = "echo" }, .{});
+            defer peer.deinit();
+            try std.testing.expectEqualStrings("echo", peer.view().body);
+            for (0..15) |_| {
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                try std.testing.expect(!self.pair.phase_resumed.load(.acquire));
+            }
+            self.writes += 1;
+        }
+    };
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    var sink = Sink{ .pair = &pair, .thread = std.Thread.getCurrentId() };
+    const result = try pair.parent.call(.{ .body = "output" }, .{ .ptr = &sink, .event = Sink.event, .phase = Sink.phase, .fence_on_error = true });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("output", result.view().body);
+    try std.testing.expectEqual(@as(usize, 1), sink.writes);
+    try std.testing.expectEqual(@as(usize, 2), sink.transitions);
+    try std.testing.expect(!sink.parked);
+    try std.testing.expect(pair.phase_resumed.load(.acquire));
+}
+
+test "inference worker output failures preserve parent cause and fence child before capacity retirement" {
+    const Mode = enum { sink_failure, canceled, timeout, reacquire_failure, lost_ack };
+    const Sink = struct {
+        pair: *TestPair,
+        mode: Mode,
+        parked: bool = false,
+        writes: usize = 0,
+        reaped: bool = false,
+        fn phase(raw: ?*anyopaque, value: Phase) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (value == .resource_wait) {
+                self.parked = true;
+            } else if (value == .runnable) {
+                if (self.mode == .reacquire_failure) return error.Forbidden;
+                self.parked = false;
+            } else return error.InvalidWorkerPhase;
+        }
+        fn event(raw: ?*anyopaque, _: Payload) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            try std.testing.expect(!self.pair.phase_resumed.load(.acquire));
+            self.writes += 1;
+            switch (self.mode) {
+                .sink_failure => return error.InferenceTransportFailed,
+                .canceled => return error.Canceled,
+                .timeout => return error.DeadlineExceeded,
+                .reacquire_failure => {},
+                .lost_ack => self.pair.parent.fail(),
+            }
+        }
+        fn closed(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pair.child.fail();
+            // This fixture joins the actual handler at the mock process-reap
+            // boundary. It does not claim to test an OS child process.
+            self.pair.phase_denied.waitUncancelable(std.testing.io);
+            self.reaped = true;
+        }
+    };
+    for (std.enums.values(Mode)) |mode| {
+        var pair: TestPair = undefined;
+        try pair.init();
+        defer pair.deinit();
+        var sink = Sink{ .pair = &pair, .mode = mode };
+        pair.parent.context = &sink;
+        pair.parent.on_closed = Sink.closed;
+        const expected: anyerror = switch (mode) {
+            .sink_failure => error.InferenceTransportFailed,
+            .canceled => error.Canceled,
+            .timeout => error.DeadlineExceeded,
+            .reacquire_failure => error.Forbidden,
+            .lost_ack => error.InferenceWorkerUnavailable,
+        };
+        try std.testing.expectError(expected, pair.parent.call(.{ .body = "output" }, .{ .ptr = &sink, .event = Sink.event, .phase = Sink.phase, .fence_on_error = true }));
+        try std.testing.expect(sink.reaped);
+        try std.testing.expectEqual(@as(usize, 1), sink.writes);
+        try std.testing.expect(!pair.phase_resumed.load(.acquire));
+        // A failed sink/reentry leaves the loan parked until the caller's
+        // existing cleanup, after the fence, retires or resumes it.
+        try std.testing.expectEqual(mode != .lost_ack, sink.parked);
+    }
+}
+
+test "inference worker acknowledged output formatting retains execution while its sink owns physical waits" {
+    const State = struct {
+        parked: bool = false,
+        checkpoints: usize = 0,
+        fn phase(raw: ?*anyopaque, value: Phase) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            switch (value) {
+                .checkpoint => {
+                    try std.testing.expect(!self.parked);
+                    self.checkpoints += 1;
+                },
+                .resource_wait => {
+                    try std.testing.expect(!self.parked);
+                    self.parked = true;
+                },
+                .runnable => {
+                    try std.testing.expect(self.parked);
+                    self.parked = false;
+                },
+            }
+        }
+        fn event(raw: ?*anyopaque, _: Payload) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            // JSON/header formatting is CPU work and cannot begin parked.
+            try std.testing.expect(!self.parked);
+            try phase(raw, .resource_wait);
+            try std.testing.expect(self.parked);
+            try phase(raw, .runnable);
+            try std.testing.expect(!self.parked);
+        }
+    };
+    var state = State{};
+    try Endpoint.deliverAcknowledgedEvent(.{ .ptr = &state, .event = State.event, .phase = State.phase, .event_owns_waits = true }, .{ .metadata = "{}", .body = "payload" });
+    try std.testing.expect(!state.parked);
+    try std.testing.expectEqual(@as(usize, 2), state.checkpoints);
 }

@@ -71,6 +71,7 @@ pub const Completion = struct {
         value.borrow.resize_team = resizeTeam;
         value.borrow.reserve_completion = reserve;
         value.borrow.activate_completion = activate;
+        value.borrow.completion_remaining_ns = remaining;
         value.borrow.checkpoint = check;
         value.borrow.park = park;
         value.borrow.enter = enter;
@@ -110,6 +111,12 @@ pub const Completion = struct {
     }
     fn activate(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
         from(raw).execution.activateCompletion() catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn remaining(raw: *anyopaque, out: *u64) callconv(.c) runtime.error_abi.Status {
+        const self = from(raw);
+        self.active() catch |err| return runtime.error_abi.statusFromError(err);
+        out.* = self.execution.completionRemainingNs() catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
     fn resizeTeam(raw: *anyopaque, slots: usize) callconv(.c) runtime.error_abi.Status {

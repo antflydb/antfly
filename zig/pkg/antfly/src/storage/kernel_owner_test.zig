@@ -3603,6 +3603,104 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
     }
 }
 
+test "opaque transaction routing capture preserves original clock and fallible admission controls" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    try store.applyStandaloneCommand(91, .{ .upsert_table = .{ .table_id = 9, .name = "rows" } });
+    try store.applyStandaloneCommand(91, .{ .upsert_range = .{ .table_id = 9, .group_id = 301, .range_id = 301, .start_key = "" } });
+    var clock = try @import("vopr").vopr_io.VoprIo.init(.{ .monotonic_ns = 7 * std.time.ns_per_s });
+    defer clock.deinit();
+    const budget: @import("antfly_local_sources").api_routing_budget.RoutingBudget = .{ .deadline_ns = 8 * std.time.ns_per_s, .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&clock.io()) };
+    {
+        const captured = try store.captureTransactionRoutingProjection(alloc, 91, budget);
+        defer store.freeTables(alloc, captured.tables);
+        defer store.freeRanges(alloc, captured.ranges);
+        defer store.freeSplitTransitions(alloc, captured.split_transitions);
+        defer store.freeMergeTransitions(alloc, captured.merge_transitions);
+        try std.testing.expectEqual(@as(usize, 1), captured.tables.len);
+        try std.testing.expectEqual(@as(usize, 1), captured.ranges.len);
+        try std.testing.expectEqual(@as(usize, 0), captured.split_transitions.len);
+        try std.testing.expectEqual(@as(usize, 0), captured.merge_transitions.len);
+        try std.testing.expectEqualStrings("rows", captured.tables[0].name);
+        try std.testing.expectEqual(@as(u64, 301), captured.ranges[0].group_id);
+    }
+    clock.monotonic_ns = budget.deadline_ns.?;
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.captureTransactionRoutingProjection(alloc, 91, budget));
+    // Zero is an expired absolute deadline, never an alias for no deadline.
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, store.captureTransactionRoutingProjection(alloc, 91, .{ .deadline_ns = 0 }));
+
+    const Scoped = struct {
+        checks: usize = 0,
+        fn check(ptr: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            self.checks += 1;
+            // Fail after some owned records have already been accumulated.
+            if (self.checks >= 16) return error.GenerationPublicationChanged;
+        }
+    };
+    var scoped = Scoped{};
+    try std.testing.expectError(error.GenerationPublicationChanged, store.captureTransactionRoutingProjection(alloc, 91, .{ .cancellation = .{ .ptr = &scoped, .check_fn = Scoped.check } }));
+    try std.testing.expectEqual(@as(usize, 16), scoped.checks);
+
+    const port = @import("transaction_routing_budget_port.zig");
+    const Never = struct {
+        fn checkpoint(_: *anyopaque) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var state: u8 = 0;
+    const payload = port.Payload{ .ptr = &state, .vtable = &.{ .checkpoint = Never.checkpoint } };
+    var invalid = port.Port.init(&payload);
+    invalid.contract.layout_id +%= 1;
+    var response: abi.OwnedBytes = .{};
+    defer if (response.ptr) |bytes| alloc.free(bytes[0..@intCast(response.len)]);
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_metadata_apply_store_transaction_routing(store.handle, &.{ .group_id = 91, .control = &invalid }, &response));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
+    invalid = port.Port.init(&payload);
+    // A valid control cannot opt into unbounded storage-owner allocation.
+    try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_metadata_apply_store_transaction_routing(store.handle, &.{ .group_id = 91, .control = &invalid }, &response));
+    // Earlier uncommitted request layouts are rejected before the new field.
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_metadata_apply_store_transaction_routing(store.handle, &.{ .version = abi.abi_version, .group_id = 91, .control = &invalid }, &response));
+}
+
+test "opaque transaction routing capture bounds all caller allocations and cleanup" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var store = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = path, .no_sync = true });
+    defer store.deinit();
+    try store.applyStandaloneCommand(91, .{ .upsert_table = .{ .table_id = 9, .name = "rows" } });
+    try store.applyStandaloneCommand(91, .{ .upsert_range = .{ .table_id = 9, .group_id = 301, .range_id = 301, .start_key = "" } });
+    const Check = struct {
+        fn run(allocator: std.mem.Allocator, source: *metadata_apply_client.RaftApplyStore) !void {
+            const snapshot = try source.captureTransactionRoutingProjection(allocator, 91, .{});
+            defer source.freeTables(allocator, snapshot.tables);
+            defer source.freeRanges(allocator, snapshot.ranges);
+            defer source.freeSplitTransitions(allocator, snapshot.split_transitions);
+            defer source.freeMergeTransitions(allocator, snapshot.merge_transitions);
+            try std.testing.expectEqual(@as(usize, 1), snapshot.tables.len);
+            try std.testing.expectEqual(@as(usize, 1), snapshot.ranges.len);
+            try std.testing.expectEqualStrings("rows", snapshot.tables[0].name);
+        }
+    };
+    // The producer's first record allocation must use the invocation's
+    // allocator. A process-allocator fallback would hide this injected failure.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, Check.run(failing.allocator(), &store));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    // Sweep every physical record, response, parse, and clone allocation,
+    // requiring cleanup after each induced failure through the real C ABI.
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{&store});
+}
+
 test "opaque metadata apply owner preserves semantic error identity" {
     const path = "/tmp/antfly-storage-kernel-metadata-errors";
     cleanup(path);

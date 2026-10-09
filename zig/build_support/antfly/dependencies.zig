@@ -367,7 +367,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .filters = buildArguments(b) orelse &.{"pgwire"},
     });
     const run_pgwire_tests = b.addRunArtifact(pgwire_tests);
-    pgwire_tests.step.max_rss = 1024 * 1024 * 1024;
+    pgwire_tests.step.max_rss = 2 * 1024 * 1024 * 1024;
     run_pgwire_tests.step.max_rss = 64 * 1024 * 1024;
     b.step("pgwire-test", "Run PostgreSQL wire framing, session, and lifecycle tests").dependOn(&run_pgwire_tests.step);
     const openapi_root_check = addOpenApiRootCheckStep(b);
