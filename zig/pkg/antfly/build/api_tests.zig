@@ -254,6 +254,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     provider_lifetime_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
     provider_lifetime_root.addImport("antfly_platform", antfly_imports.platform);
+    provider_lifetime_root.addImport("antfly_cancellation", antfly_imports.cancellation);
     const provider_lifetime_tests = b.addTest(.{
         .name = "provider-lifetime-tests",
         .root_module = provider_lifetime_root,
