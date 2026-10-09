@@ -220,6 +220,76 @@ pub const Plan = struct {
     }
 };
 
+/// One metadata transaction may change a table's schema, binding and
+/// publication phase through separate producers. Keep its original cut
+/// immutable and replace only its proposed cut; transaction.get need not see
+/// pending writes. Compile all tables together before the first registry
+/// mutation so swaps and cross-table collisions use the final atomic cut.
+pub const Publication = struct {
+    alloc: A,
+    changes: std.AutoHashMapUnmanaged(u64, Plan) = .empty,
+    before_count: usize = 0,
+    after_count: usize = 0,
+
+    pub fn init(a: A) Publication {
+        return .{ .alloc = a };
+    }
+    pub fn deinit(self: *Publication) void {
+        var it = self.changes.valueIterator();
+        while (it.next()) |plan| plan.deinit();
+        self.changes.deinit(self.alloc);
+        self.* = undefined;
+    }
+    /// Borrowed until the next stage for this table. A missing entry differs
+    /// from a staged deletion, whose proposed cut is present but empty.
+    pub fn pending(self: *const Publication, table_id: u64) ?[]const Claim {
+        const plan = self.changes.getPtr(table_id) orelse return null;
+        return plan.after;
+    }
+    pub fn stage(self: *Publication, table_id: u64, before: []const Claim, after: []const Claim) !void {
+        if (table_id == 0) return error.InvalidCatalogRecord;
+        if (before.len > max_claims or after.len > max_claims) return error.CatalogCommandTooLarge;
+        for (before) |claim| if (claim.owner.table_id != table_id) return error.InvalidCatalogRecord;
+        for (after) |claim| if (claim.owner.table_id != table_id) return error.InvalidCatalogRecord;
+        const prior = self.changes.getPtr(table_id);
+        const before_count = self.before_count - (if (prior) |p| p.before.len else @as(usize, 0));
+        const after_count = self.after_count - (if (prior) |p| p.after.len else @as(usize, 0));
+        if (before.len > max_claims - before_count or after.len > max_claims - after_count or
+            (prior == null and self.changes.count() >= max_claims)) return error.CatalogCommandTooLarge;
+        var next = try Plan.init(self.alloc, before, after);
+        errdefer next.deinit();
+        if (prior) |p| {
+            if (p.before.len != next.before.len) return error.CatalogGenerationChanged;
+            for (p.before) |claim| {
+                const observed = next.before_by_name.get(claim.key) orelse return error.CatalogGenerationChanged;
+                if (!observed.eql(claim.owner)) return error.CatalogGenerationChanged;
+            }
+            // A failed replacement never destroys the preceding pending cut.
+            // Its independent arena also bounds memory across many updates.
+            p.deinit();
+            p.* = next;
+        } else try self.changes.put(self.alloc, table_id, next);
+        self.before_count = before_count + before.len;
+        self.after_count = after_count + after.len;
+    }
+    pub fn compile(self: *const Publication) !Plan {
+        const before = try self.alloc.alloc(Claim, self.before_count);
+        defer self.alloc.free(before);
+        const after = try self.alloc.alloc(Claim, self.after_count);
+        defer self.alloc.free(after);
+        var bi: usize = 0;
+        var ai: usize = 0;
+        var it = self.changes.valueIterator();
+        while (it.next()) |plan| {
+            @memcpy(before[bi..][0..plan.before.len], plan.before);
+            @memcpy(after[ai..][0..plan.after.len], plan.after);
+            bi += plan.before.len;
+            ai += plan.after.len;
+        }
+        return Plan.init(self.alloc, before, after);
+    }
+};
+
 const TestStore = struct {
     rows: std.ArrayList(Claim) = .empty,
     calls: usize = 0,
@@ -248,6 +318,117 @@ const TestStore = struct {
 };
 fn testClaim(namespace: u64, name: []const u8, table: u64, version: u32, kind: Kind) Claim {
     return .{ .key = .{ .namespace_id = namespace, .name = name }, .owner = .{ .table_id = table, .schema_version = version, .schema_digest = @splat(@intCast(version)), .kind = kind } };
+}
+
+test "catalog relation publication coalesces schemas and bindings before writing the final atomic cut" {
+    const a = std.testing.allocator;
+    const first = testClaim(2, "first", 7, 1, .table);
+    const second = testClaim(2, "second", 8, 1, .table);
+    const interim = testClaim(2, "temporary", 7, 2, .table);
+    const next_first = testClaim(2, "second", 7, 3, .table);
+    const next_second = testClaim(2, "first", 8, 2, .table);
+    var publication = Publication.init(a);
+    defer publication.deinit();
+    try std.testing.expect(publication.pending(7) == null);
+    try publication.stage(7, &.{first}, &.{interim});
+    try publication.stage(7, &.{first}, &.{next_first});
+    try publication.stage(8, &.{second}, &.{next_second});
+    try std.testing.expectEqual(@as(usize, 2), publication.before_count);
+    try std.testing.expectEqual(@as(usize, 2), publication.after_count);
+    var plan = try publication.compile();
+    defer plan.deinit();
+    var store: TestStore = .{};
+    defer store.rows.deinit(a);
+    try store.rows.appendSlice(a, &.{ first, second });
+    try std.testing.expectEqual(@as(usize, 0), store.writes);
+    try plan.apply(&store);
+    try std.testing.expectEqual(@as(usize, 2), store.calls);
+    try std.testing.expectEqual(@as(usize, 2), store.writes);
+    try std.testing.expect((try store.getClaim(first.key)).?.eql(next_second.owner));
+    try std.testing.expect((try store.getClaim(second.key)).?.eql(next_first.owner));
+    try std.testing.expect((try store.getClaim(interim.key)) == null);
+    // Repeated producers must retain the original read cut, not pretend the
+    // transaction's pending writes have become a new committed generation.
+    try std.testing.expectError(error.CatalogGenerationChanged, publication.stage(7, &.{interim}, &.{}));
+    try std.testing.expect(publication.pending(7).?[0].owner.eql(next_first.owner));
+    try std.testing.expectError(error.InvalidCatalogRecord, publication.stage(7, &.{first}, &.{next_second}));
+    try publication.stage(7, &.{first}, &.{});
+    try std.testing.expectEqual(@as(usize, 0), publication.pending(7).?.len);
+}
+
+test "catalog relation publication detects cross-table collisions before registry mutations" {
+    const a = std.testing.allocator;
+    var publication = Publication.init(a);
+    defer publication.deinit();
+    try publication.stage(7, &.{}, &.{testClaim(2, "shared", 7, 1, .index)});
+    try publication.stage(8, &.{}, &.{testClaim(2, "shared", 8, 1, .constraint_index)});
+    try std.testing.expectError(error.CatalogAlreadyExists, publication.compile());
+    try publication.stage(8, &.{}, &.{testClaim(3, "shared", 8, 1, .constraint_index)});
+    var plan = try publication.compile();
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 2), plan.after.len);
+}
+
+test "catalog relation publication bounds the aggregate cut and retains publication fences" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const claims = try arena.allocator().alloc(Claim, max_claims);
+    for (claims, 0..) |*claim, i| claim.* = testClaim(2, try std.fmt.allocPrint(arena.allocator(), "index_{d}", .{i}), 7, 1, .index);
+    var publication = Publication.init(a);
+    defer publication.deinit();
+    try publication.stage(7, claims, claims);
+    const other = testClaim(2, "other", 8, 1, .table);
+    try std.testing.expectError(error.CatalogCommandTooLarge, publication.stage(8, &.{}, &.{other}));
+    try std.testing.expectError(error.CatalogCommandTooLarge, publication.stage(8, &.{other}, &.{}));
+    try std.testing.expect(publication.pending(8) == null);
+    try std.testing.expectEqual(max_claims, publication.after_count);
+    try publication.stage(7, claims, &.{});
+    try publication.stage(8, &.{}, &.{other});
+    try std.testing.expectEqual(@as(usize, 1), publication.after_count);
+    const reserved = Claim{
+        .key = .{ .namespace_id = 3, .name = "reserved" },
+        .owner = .{ .table_id = 9, .schema_version = 1, .schema_digest = @splat(1), .kind = .constraint_index, .phase = .reserved, .publication_id = @splat(2) },
+    };
+    var fences = Publication.init(a);
+    defer fences.deinit();
+    try fences.stage(9, &.{reserved}, &.{reserved});
+    var stale = reserved;
+    stale.owner.publication_id = @splat(3);
+    try std.testing.expectError(error.CatalogGenerationChanged, fences.stage(9, &.{stale}, &.{}));
+    stale = reserved;
+    stale.owner.phase = .active;
+    try std.testing.expectError(error.CatalogGenerationChanged, fences.stage(9, &.{stale}, &.{}));
+    stale = reserved;
+    stale.owner.schema_digest = @splat(4);
+    try std.testing.expectError(error.CatalogGenerationChanged, fences.stage(9, &.{stale}, &.{}));
+    try std.testing.expect(fences.pending(9).?[0].owner.eql(reserved.owner));
+}
+
+test "catalog relation publication owns repeated cuts and unwinds allocation failures" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            var publication = Publication.init(a);
+            defer publication.deinit();
+            const old = testClaim(2, "old", 7, 1, .table);
+            const next = testClaim(3, "renamed", 7, 2, .table);
+            try publication.stage(7, &.{old}, &.{old});
+            publication.stage(7, &.{old}, &.{next}) catch |err| {
+                try std.testing.expect(publication.pending(7).?[0].owner.eql(old.owner));
+                try std.testing.expectEqual(@as(usize, 1), publication.after_count);
+                return err;
+            };
+            var plan = try publication.compile();
+            defer plan.deinit();
+            // A compiled cut must outlive subsequent producer replacements.
+            try publication.stage(7, &.{old}, &.{});
+            try std.testing.expectEqualStrings("renamed", plan.after[0].key.name);
+            try std.testing.expect(plan.after[0].owner.eql(next.owner));
+            try std.testing.expectEqual(@as(usize, 0), publication.after_count);
+        }
+    };
+    try Probe.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
 test "catalog relation ownership is namespace scoped and generation fenced" {

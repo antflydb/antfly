@@ -95,7 +95,13 @@ test "system catalog relation namespace transaction rolls back with schema and p
     const table_key = try tableKeyForGroup(&key_buf, 1, 7);
     var seed = try names.Plan.init(a, &.{}, &.{old});
     defer seed.deinit();
-    var transition = try names.Plan.init(a, &.{old}, &.{next});
+    var publication = names.Publication.init(a);
+    defer publication.deinit();
+    var intermediate = next;
+    intermediate.key.name = "unpublished_intermediate";
+    try publication.stage(7, &.{old}, &.{intermediate});
+    try publication.stage(7, &.{old}, &.{next});
+    var transition = try publication.compile();
     defer transition.deinit();
     {
         var store = try RaftApplyStore.init(a, .{ .root_dir = root });
@@ -129,6 +135,7 @@ test "system catalog relation namespace transaction rolls back with schema and p
             var registry: names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = 1 };
             try std.testing.expect((try registry.getClaim(old.key)).?.eql(old.owner));
             try std.testing.expect((try registry.getClaim(next.key)) == null);
+            try std.testing.expect((try registry.getClaim(intermediate.key)) == null);
             const actual = try decodeTableRecord(a, try txn.get(table_key));
             defer metadata_table_manager.freeTable(a, actual);
             try std.testing.expectEqualStrings(old_schema, actual.schema_json);
@@ -149,6 +156,7 @@ test "system catalog relation namespace transaction rolls back with schema and p
     var registry: names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = 1 };
     try std.testing.expect((try registry.getClaim(old.key)) == null);
     try std.testing.expect((try registry.getClaim(next.key)).?.eql(next.owner));
+    try std.testing.expect((try registry.getClaim(intermediate.key)) == null);
     try std.testing.expectError(error.CatalogGenerationChanged, transition.apply(&registry));
     const actual = try decodeTableRecord(a, try txn.get(table_key));
     defer metadata_table_manager.freeTable(a, actual);

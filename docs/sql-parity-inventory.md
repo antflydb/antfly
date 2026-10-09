@@ -1394,6 +1394,15 @@ namespace-qualified name space. Claims retain table identity, exact schema
 epoch/digest, publication identity and reserved/active/retiring phase. Keys are
 length-delimited UTF-8, preserving quoted names without delimiter ambiguity.
 Records have an explicit durable format and reject unknown tags or versions.
+The transaction-scoped `Publication` accumulator retains each table's original
+before cut and coalesces schema, binding and phase updates into its final after
+cut. This is necessary because metadata transactions do not read pending puts.
+Repeated producers must present the same original ownership fences; a changed
+digest, epoch, phase or publication identity is rejected without losing the
+previous pending cut. Independent arenas reclaim superseded proposals, and
+aggregate before/after claims and table entries are bounded. Compiling the
+whole transaction detects cross-table collisions before registry writes and
+permits atomic name swaps without publishing intermediate names.
 Validation performs one point lookup per distinct name in the before/after cut; it never
 scans unrelated tables. Replaying a stale cut is not accepted merely because
 the same table ID and name still exist. Unchanged cuts issue no writes.
@@ -1401,6 +1410,7 @@ the same table ID and name still exist. Unchanged cuts issue no writes.
 `zig build system-catalog-relation-test system-catalog-relation-store-test`
 checks collisions, namespaces, ownership phases, epoch fences, allocation
 faults, exact encoding and real metadata transaction abort/restart behavior.
+It also checks aggregate command limits, coalesced final cuts and atomic swaps.
 The storage regression injects failure after deleting an old claim and updating
 the schema, then verifies that abort restores both across restart. Independent
 PostgreSQL oracle coverage checks table/index namespace collisions, equal index
