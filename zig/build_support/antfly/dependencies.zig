@@ -355,6 +355,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     }) });
     const run_relation_name_tests = b.addRunArtifact(relation_name_tests);
+    relation_name_tests.root_module.addImport("antfly_platform", platform_mod);
     b.step("system-catalog-relation-test", "Test namespace ownership and atomic catalog publication plans")
         .dependOn(&run_relation_name_tests.step);
     run_sql_tests.step.dependOn(&run_relation_name_tests.step);

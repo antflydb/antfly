@@ -80,27 +80,31 @@ test "system catalog relation namespace transaction rolls back with schema and p
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/relation-namespace", .{tmp.sub_path});
     defer a.free(root);
-    const old_schema = "{\"version\":1}";
-    const new_schema = "{\"version\":2}";
-    var old_digest: [32]u8 = undefined;
-    var new_digest: [32]u8 = undefined;
-    std.crypto.hash.Blake3.hash(old_schema, &old_digest, .{});
-    std.crypto.hash.Blake3.hash(new_schema, &new_digest, .{});
-    const old: names.Claim = .{ .key = .{ .namespace_id = 2, .name = "email_key" }, .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = old_digest, .kind = .index } };
-    const next: names.Claim = .{ .key = .{ .namespace_id = 3, .name = "renamed_key" }, .owner = .{ .table_id = 7, .schema_version = 2, .schema_digest = new_digest, .kind = .index } };
+    const old_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_key","keys":[{"column":"email"}]}]}
+    ;
+    const new_schema =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"relational_indexes":[{"name":"renamed_key","keys":[{"column":"email"}]}]}
+    ;
+    var old_cut = try names.TableCut.init(a, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = old_schema });
+    defer old_cut.deinit();
+    var next_cut = try names.TableCut.init(a, .{ .namespace_id = 3, .table_id = 7, .name = "items", .schema_json = new_schema });
+    defer next_cut.deinit();
+    const old = old_cut.claims[1];
+    const next = next_cut.claims[1];
     const table: metadata.TableRecord = .{ .table_id = 7, .name = "items", .schema_json = old_schema };
     var replacement = table;
     replacement.schema_json = new_schema;
     var key_buf: [160]u8 = undefined;
     const table_key = try tableKeyForGroup(&key_buf, 1, 7);
-    var seed = try names.Plan.init(a, &.{}, &.{old});
+    var seed = try names.Plan.init(a, &.{}, old_cut.claims);
     defer seed.deinit();
     var publication = names.Publication.init(a);
     defer publication.deinit();
     var intermediate = next;
     intermediate.key.name = "unpublished_intermediate";
-    try publication.stage(7, &.{old}, &.{intermediate});
-    try publication.stage(7, &.{old}, &.{next});
+    try publication.stage(7, old_cut.claims, &.{ next_cut.claims[0], intermediate });
+    try publication.stage(7, old_cut.claims, next_cut.claims);
     var transition = try publication.compile();
     defer transition.deinit();
     {
@@ -134,6 +138,7 @@ test "system catalog relation namespace transaction rolls back with schema and p
             defer txn.abort();
             var registry: names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = 1 };
             try std.testing.expect((try registry.getClaim(old.key)).?.eql(old.owner));
+            try std.testing.expect((try registry.getClaim(old_cut.claims[0].key)).?.eql(old_cut.claims[0].owner));
             try std.testing.expect((try registry.getClaim(next.key)) == null);
             try std.testing.expect((try registry.getClaim(intermediate.key)) == null);
             const actual = try decodeTableRecord(a, try txn.get(table_key));
@@ -156,6 +161,8 @@ test "system catalog relation namespace transaction rolls back with schema and p
     var registry: names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = 1 };
     try std.testing.expect((try registry.getClaim(old.key)) == null);
     try std.testing.expect((try registry.getClaim(next.key)).?.eql(next.owner));
+    try std.testing.expect((try registry.getClaim(old_cut.claims[0].key)) == null);
+    try std.testing.expect((try registry.getClaim(next_cut.claims[0].key)).?.eql(next_cut.claims[0].owner));
     try std.testing.expect((try registry.getClaim(intermediate.key)) == null);
     try std.testing.expectError(error.CatalogGenerationChanged, transition.apply(&registry));
     const actual = try decodeTableRecord(a, try txn.get(table_key));

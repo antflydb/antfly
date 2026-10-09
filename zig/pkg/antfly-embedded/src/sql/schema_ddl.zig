@@ -90,6 +90,20 @@ fn indexOwnershipNamespaces(allocator: std.mem.Allocator) !void {
             try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, schema, .{}));
         }
     }
+    // The namespace publisher consumes the same canonical definitions as
+    // storage, not a second SQL-name interpretation or display-label parser.
+    var cut = try @import("../system_catalog/relation_names.zig").TableCut.init(allocator, .{
+        .namespace_id = 2,
+        .table_id = 7,
+        .name = "items",
+        .schema_json = try std.json.Stringify.valueAlloc(a, schema, .{}),
+    });
+    defer cut.deinit();
+    try std.testing.expectEqual(@as(usize, 6), cut.claims.len);
+    for (cut.claims) |claim| {
+        const expected: @import("../system_catalog/relation_names.zig").Kind = if (std.mem.eql(u8, claim.key.name, "items")) .table else if (std.mem.eql(u8, claim.key.name, "named_id")) .constraint_index else .index;
+        try std.testing.expectEqual(expected, claim.owner.kind);
+    }
     for ([_][]const u8{ "email_key", "partial_email", "folded_email", "tenant_folded_email" }) |name| {
         // This is the table-bound schema transition. PostgreSQL's unqualified
         // DROP INDEX additionally needs namespace/catalog owner resolution.

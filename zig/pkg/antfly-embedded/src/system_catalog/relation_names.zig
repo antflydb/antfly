@@ -108,6 +108,95 @@ pub const Key = struct {
     }
 };
 pub const Claim = struct { key: Key, owner: Owner };
+/// Name claims derived from one authoritative table definition and namespace
+/// binding. Own only the resulting names, not a second copy of the schema DOM.
+/// The digest fences the exact public schema bytes, independently of its
+/// numeric layout version. CHECK and FK names are not namespace relations.
+pub const TableCut = struct {
+    arena: std.heap.ArenaAllocator,
+    claims: []const Claim,
+
+    pub const Definition = struct {
+        namespace_id: u64,
+        table_id: u64,
+        name: []const u8,
+        schema_json: []const u8,
+        phase: Phase = .active,
+        publication_id: [16]u8 = @splat(0),
+    };
+    // A names-only projection skips column definitions, expressions, display
+    // metadata and other unrelated schema payloads without building their DOM.
+    const SchemaNames = struct {
+        version: u32 = 0,
+        relational_indexes: ?[]const struct { name: []const u8 } = null,
+        unique_constraints: ?[]const struct { name: []const u8, origin: ?[]const u8 = null } = null,
+    };
+    pub fn init(a: A, definition: Definition) !TableCut {
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        // Temporary parsing storage is reclaimed before returning the cut.
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const schema: SchemaNames = if (definition.schema_json.len == 0)
+            .{}
+        else
+            std.json.parseFromSliceLeaky(SchemaNames, scratch.allocator(), definition.schema_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidCatalogRecord,
+            };
+        const indexes = schema.relational_indexes orelse &.{};
+        const uniques = schema.unique_constraints orelse &.{};
+        if (indexes.len > max_claims or uniques.len > max_claims) return error.CatalogCommandTooLarge;
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(definition.schema_json, &digest, .{});
+        var owner: Owner = .{ .table_id = definition.table_id, .schema_version = schema.version, .schema_digest = digest, .kind = .table, .phase = definition.phase, .publication_id = definition.publication_id };
+        try owner.validate();
+        var claims: std.ArrayList(Claim) = .empty;
+        try append(owned, &claims, definition.namespace_id, definition.name, owner);
+        var names: std.StringHashMapUnmanaged(bool) = .empty;
+        try names.put(scratch.allocator(), definition.name, true);
+        for (indexes) |index| {
+            const name = index.name;
+            const found = try names.getOrPut(scratch.allocator(), name);
+            if (found.found_existing) return error.InvalidCatalogRecord;
+            found.value_ptr.* = false;
+            owner.kind = .index;
+            try append(owned, &claims, definition.namespace_id, name, owner);
+        }
+        for (uniques) |unique| {
+            const name = unique.name;
+            const index_owned = if (unique.origin) |origin| std.mem.eql(u8, origin, "index") else false;
+            if (unique.origin) |origin| if (!index_owned and !std.mem.eql(u8, origin, "constraint")) return error.InvalidCatalogRecord;
+            if (index_owned) {
+                // CREATE UNIQUE INDEX has an access declaration and a rule
+                // with explicit index provenance: one relation, not two.
+                // Never infer provenance from its editable description.
+                const mirrored = names.getPtr(name) orelse return error.InvalidCatalogRecord;
+                if (mirrored.*) return error.InvalidCatalogRecord;
+                mirrored.* = true;
+            } else {
+                const found = try names.getOrPut(scratch.allocator(), name);
+                if (found.found_existing) return error.InvalidCatalogRecord;
+                found.value_ptr.* = true;
+                owner.kind = .constraint_index;
+                try append(owned, &claims, definition.namespace_id, name, owner);
+            }
+        }
+        return .{ .arena = arena, .claims = try claims.toOwnedSlice(owned) };
+    }
+    pub fn deinit(self: *TableCut) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+    fn append(a: A, claims: *std.ArrayList(Claim), namespace: u64, name: []const u8, owner: Owner) !void {
+        if (claims.items.len == max_claims) return error.CatalogCommandTooLarge;
+        const key: Key = .{ .namespace_id = namespace, .name = name };
+        try key.validate();
+        try claims.append(a, .{ .key = .{ .namespace_id = namespace, .name = try a.dupe(u8, name) }, .owner = owner });
+    }
+};
+
 const Context = struct {
     pub fn hash(_: Context, key: Key) u64 {
         var h = std.hash.Wyhash.init(key.namespace_id);
@@ -318,6 +407,83 @@ const TestStore = struct {
 };
 fn testClaim(namespace: u64, name: []const u8, table: u64, version: u32, kind: Kind) Claim {
     return .{ .key = .{ .namespace_id = namespace, .name = name }, .owner = .{ .table_id = table, .schema_version = version, .schema_digest = @splat(@intCast(version)), .kind = kind } };
+}
+
+test "catalog table cuts preserve constraint and index provenance without duplicating unique index relations" {
+    const a = std.testing.allocator;
+    const schema =
+        \\{"version":9,"relational_indexes":[{"name":"ordinary","description":"SQL UNIQUE INDEX"},{"name":"unique","description":"operator edited"}],"unique_constraints":[{"name":"pk","primary":true},{"name":"named","origin":"constraint"},{"name":"unique","origin":"index"}],"checks":[{"name":"ordinary"}],"foreign_keys":[{"name":"unique"}]}
+    ;
+    var cut = try TableCut.init(a, .{ .namespace_id = 2, .table_id = 7, .name = "quoted.table:名", .schema_json = schema, .phase = .reserved, .publication_id = @splat(3) });
+    defer cut.deinit();
+    try std.testing.expectEqual(@as(usize, 5), cut.claims.len);
+    const kinds = [_]Kind{ .table, .index, .index, .constraint_index, .constraint_index };
+    const names = [_][]const u8{ "quoted.table:名", "ordinary", "unique", "pk", "named" };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema, &digest, .{});
+    for (cut.claims, kinds, names) |claim, kind, name| {
+        try std.testing.expectEqualStrings(name, claim.key.name);
+        try std.testing.expect(claim.owner.eql(.{ .table_id = 7, .schema_version = 9, .schema_digest = digest, .kind = kind, .phase = .reserved, .publication_id = @splat(3) }));
+        try std.testing.expectEqual(@as(u64, 2), claim.key.namespace_id);
+    }
+    var document = try TableCut.init(a, .{ .namespace_id = 3, .table_id = 8, .name = "document", .schema_json = "" });
+    defer document.deinit();
+    try std.testing.expectEqual(@as(usize, 1), document.claims.len);
+    try std.testing.expectEqual(@as(u32, 0), document.claims[0].owner.schema_version);
+}
+
+test "catalog table cuts skip unrelated schema payloads under bounded allocator headroom" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 128 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    const schema = try std.fmt.allocPrint(a, "{{\"version\":1,\"document_schemas\":{{\"row\":{{\"schema\":{{\"description\":\"{s}\"}}}}}},\"relational_indexes\":[{{\"name\":\"idx\",\"description\":\"{s}\"}}]}}", .{ payload, payload });
+    defer a.free(schema);
+    var storage: [16 * 1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var cut = try TableCut.init(fixed.allocator(), .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = schema });
+    defer cut.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cut.claims.len);
+    try std.testing.expectEqualStrings("idx", cut.claims[1].key.name);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema, &digest, .{});
+    try std.testing.expectEqualSlices(u8, &digest, &cut.claims[1].owner.schema_digest);
+}
+
+test "catalog table cuts reject ambiguous ownership and malformed declarations" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "[]",                                                                                                                                                     "{\"version\":null}",                                             "{\"version\":-1}",                                                    "{\"version\":4294967296}",
+        "{\"relational_indexes\":{}}",                                                                                                                            "{\"unique_constraints\":[null]}",                                "{\"relational_indexes\":[{\"name\":\"items\"}]}",                     "{\"relational_indexes\":[{\"name\":\"idx\"},{\"name\":\"idx\"}]}",
+        "{\"unique_constraints\":[{\"name\":\"idx\",\"origin\":\"index\"}]}",                                                                                     "{\"unique_constraints\":[{\"name\":\"idx\",\"origin\":false}]}", "{\"unique_constraints\":[{\"name\":\"idx\",\"origin\":\"future\"}]}", "{\"relational_indexes\":[{\"name\":\"idx\"}],\"unique_constraints\":[{\"name\":\"idx\"}]}",
+        "{\"relational_indexes\":[{\"name\":\"idx\"}],\"unique_constraints\":[{\"name\":\"idx\",\"origin\":\"index\"},{\"name\":\"idx\",\"origin\":\"index\"}]}",
+    }) |schema| try std.testing.expectError(error.InvalidCatalogRecord, TableCut.init(a, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = schema }));
+    try std.testing.expectError(error.InvalidCatalogName, TableCut.init(a, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = "{\"unique_constraints\":[{\"name\":\"\"}]}" }));
+}
+
+test "catalog table cuts own source names after schema retirement and unwind allocation failures" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            var cut = blk: {
+                const schema = try a.dupe(u8, "{\"version\":4,\"relational_indexes\":[{\"name\":\"idx\"}],\"unique_constraints\":[{\"name\":\"idx\",\"origin\":\"index\"}]}");
+                defer a.free(schema);
+                const name = try a.dupe(u8, "owned_table");
+                defer a.free(name);
+                break :blk try TableCut.init(a, .{ .namespace_id = 2, .table_id = 7, .name = name, .schema_json = schema });
+            };
+            defer cut.deinit();
+            try std.testing.expectEqualStrings("owned_table", cut.claims[0].key.name);
+            try std.testing.expectEqualStrings("idx", cut.claims[1].key.name);
+            var publication = Publication.init(a);
+            defer publication.deinit();
+            try publication.stage(7, &.{}, cut.claims);
+            var plan = try publication.compile();
+            defer plan.deinit();
+            try std.testing.expectEqual(@as(usize, 2), plan.after.len);
+        }
+    };
+    try Probe.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
 test "catalog relation publication coalesces schemas and bindings before writing the final atomic cut" {

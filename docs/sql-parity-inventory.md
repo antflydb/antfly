@@ -1394,6 +1394,16 @@ namespace-qualified name space. Claims retain table identity, exact schema
 epoch/digest, publication identity and reserved/active/retiring phase. Keys are
 length-delimited UTF-8, preserving quoted names without delimiter ambiguity.
 Records have an explicit durable format and reject unknown tags or versions.
+`TableCut` derives table, access-index and constraint-owned-index names from
+the authoritative schema and namespace binding. Its names-only JSON projection
+skips unrelated schema payloads, owns retained names independently of request
+bytes, and fences both layout version and the exact schema-byte digest. A
+UNIQUE index's paired access/rule declarations produce one index claim; a
+named UNIQUE or primary-key constraint produces a constraint-index claim.
+Unknown provenance, dangling index-origin rules and duplicate relation names
+are rejected. CHECK and FK constraint names do not reserve namespace relations.
+Canonical SQL lowering, allocation faults and a 256-KiB unrelated payload
+under 16-KiB allocator headroom test this extraction boundary.
 The transaction-scoped `Publication` accumulator retains each table's original
 before cut and coalesces schema, binding and phase updates into its final after
 cut. This is necessary because metadata transactions do not read pending puts.
