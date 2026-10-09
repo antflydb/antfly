@@ -45,12 +45,12 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     table.* = .{ .name = owned_name, .id = id, .db = try h.db_mod.DB.open(alloc, path, options) };
     errdefer table.db.close();
     try api.refreshLiteManagedEmbeddingRuntimeForDatabase(handle, &table.db);
-    table.db.startQuarantineRetryWorkerIfNeeded();
+    if (handle.embedded_open_options.start_optional_runtime_workers) table.db.startQuarantineRetryWorkerIfNeeded();
     return table;
 }
 
 fn destroy(handle: *h.Handle, table: *Table) void {
-    table.db.close();
+    if (handle.lease_snapshot) table.db.closeImmutableSnapshot() else table.db.close();
     handle.alloc.free(table.name);
     handle.alloc.destroy(table);
 }
@@ -160,7 +160,11 @@ pub fn drop(handle: *h.Handle, name: []const u8, if_exists: bool) !void {
     for (handle.table_handles.items) |id| {
         const child, const slot = h.handle_registry.enter(id) orelse continue;
         defer h.HandleRegistry.leave(slot);
-        if (child.selected_db == &table.db) return error.SqlStatementReadUnavailable;
+        // A child can still cache a pointer into a retired generation. That
+        // address may have been reused by an unrelated table after refresh.
+        if (child.selected_table_name) |selected_name| {
+            if (child.selected_table_id == table.id and std.mem.eql(u8, selected_name, name)) return error.SqlStatementReadUnavailable;
+        }
     }
     var sessions = handle.sql_sessions.valueIterator();
     while (sessions.next()) |session| {
@@ -196,12 +200,20 @@ fn checkDependency(handle: *h.Handle, db: *h.db_mod.DB, name: []const u8) !void 
 
 pub export fn antfly_db_create_table_json(ptr: ?*anyopaque, name: h.capi.Slice, schema: h.capi.Slice) h.capi.ErrorCode {
     const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     create(guard.handle, name.bytes(), schema.bytes(), false) catch |err| return h.capi.mapError(err);
     return .ok;
 }
 pub export fn antfly_db_drop_table(ptr: ?*anyopaque, name: h.capi.Slice) h.capi.ErrorCode {
     const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     drop(guard.handle, name.bytes(), false) catch |err| return h.capi.mapError(err);
     return .ok;
@@ -209,6 +221,10 @@ pub export fn antfly_db_drop_table(ptr: ?*anyopaque, name: h.capi.Slice) h.capi.
 pub export fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) h.capi.ErrorCode {
     out.* = .{};
     const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if (handle.parent_id != null) return .invalid_argument;
@@ -232,6 +248,10 @@ pub export fn antfly_db_list_tables_json(ptr: ?*anyopaque, out: *h.capi.Buffer) 
 pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?*anyopaque) h.capi.ErrorCode {
     out.* = null;
     const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const root = guard.handle;
     requireDatabase(root) catch |err| return h.capi.mapError(err);
@@ -249,7 +269,13 @@ pub export fn antfly_db_open_table(ptr: ?*anyopaque, name: h.capi.Slice, out: *?
     const db = get(root, name.bytes()) catch |err| return h.capi.mapError(err);
     const child = root.alloc.create(h.Handle) catch return .internal;
     child.* = .{ .alloc = root.alloc, .db = undefined, .selected_db = db, .parent_id = ptr, .parent_handle = root, .open_mode = root.open_mode, .lite_profile = root.lite_profile, .lite_generated_enrichment_replay = root.lite_generated_enrichment_replay };
+    child.selected_table_name = root.alloc.dupe(u8, name.bytes()) catch {
+        root.alloc.destroy(child);
+        return .internal;
+    };
+    child.selected_table_id = db.core.identity_namespace.table_id;
     const id = h.handle_registry.register(child) catch {
+        root.alloc.free(child.selected_table_name.?);
         root.alloc.destroy(child);
         return .internal;
     };

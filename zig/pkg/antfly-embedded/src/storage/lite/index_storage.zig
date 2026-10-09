@@ -73,6 +73,7 @@ pub const Store = struct {
         .sync_parent_absolute = syncParentAbsolute,
         .now_ns = nowNs,
         .root_identity_alloc = rootIdentityAlloc,
+        .requires_foreground_publication = requiresForegroundPublication,
         .rename_is_atomic = true,
     };
 
@@ -472,12 +473,25 @@ fn nowNs(ptr: *anyopaque) u64 {
     return @intCast(now.toNanoseconds());
 }
 
+fn requiresForegroundPublication(ptr: *anyopaque) bool {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    return self.docs.file.externally_locked;
+}
+
 fn rootIdentityAlloc(
     ptr: *anyopaque,
     allocator: Allocator,
     root_dir: []const u8,
 ) ![]u8 {
     const self: *Store = @ptrCast(@alignCast(ptr));
+    // Embedded connections coordinate publication with the native path lease.
+    // Their independent cached LSM generations must not reserve one lifetime
+    // process writer; a retired generation remains available to pinned cursors.
+    if (self.docs.file.externally_locked) return try std.fmt.allocPrint(
+        allocator,
+        "aflite-connection:{x}\x00{s}",
+        .{ @intFromPtr(self.docs), root_dir },
+    );
     const io = self.docs.file.runtime();
     const canonical = if (std.fs.path.isAbsolute(self.docs.file.path))
         try std.Io.Dir.realPathFileAbsoluteAlloc(io, self.docs.file.path, allocator)

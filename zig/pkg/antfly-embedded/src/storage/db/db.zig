@@ -4917,6 +4917,15 @@ pub const DB = struct {
         return collected;
     }
 
+    /// A connection retired this generation after another owner committed.
+    /// Its cached indexes must never flush over the newer durable generation.
+    pub fn closeImmutableSnapshot(self: *DB) void {
+        if (self.closed) return;
+        self.open_mode = .query_readonly;
+        self.core.discard_storage_writes = true;
+        self.close();
+    }
+
     pub fn close(self: *DB) void {
         if (self.closed) return;
         self.closed = true;
@@ -5384,7 +5393,7 @@ pub const DB = struct {
             .prepare = prepareEnrichmentReplacement,
             .restore = restoreEnrichmentPrevious,
             .publish = publishEnrichmentOwner,
-        }, cfg, options.start_replacement);
+        }, cfg, options.start_replacement and self.local_execution.optional_runtime_workers_enabled);
         if (!hook_present) self.setQueryVisibilityHook(null);
     }
     fn createEnrichmentReplacement(ptr: *anyopaque, cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
@@ -26920,6 +26929,9 @@ pub const DB = struct {
     }
 
     fn restartEnrichmentAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) !void {
+        // Manual hosts drive enrichment while holding their publication lease.
+        // Catalog changes must preserve the worker policy chosen at open.
+        if (!self.local_execution.optional_runtime_workers_enabled) return;
         self.async_context.enrichment_desired_running.store(true, .release);
         lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
         const runtime = self.async_context.enrichment_runtime orelse {
@@ -112848,12 +112860,18 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             .enabled = true,
             .max_pending_segments = 0,
             .resume_pending_segments = 0,
-            .max_pending_bytes = 1,
+            .max_pending_bytes = before.pending_heap_bytes + 1,
             .backpressure_max_wait_ms = 3,
         },
     );
     try byte_only_runtime.start();
+    // A disk-backed corpus can exceed the byte watermark while a merge is
+    // pending. Its retained bytes must not block a publication that fits the
+    // remaining heap budget, even if that merge cannot finish yet.
+    try std.testing.expect(before.pending_bytes > before.pending_heap_bytes + 1);
+    var byte_permit = try byte_only_runtime.acquireProducerPermit("ft_v1", 0, 1);
     try std.testing.expectError(error.TextMergeBackpressureTimeout, byte_only_runtime.acquireProducerPermit("ft_v1", 0, 1));
+    byte_permit.release();
     byte_only_runtime.deinit();
 
     resources.index_manager.cancelTextMergeTask(&held_task);
@@ -113404,10 +113422,24 @@ test "db text merge producer admission isolates quarantined dimensions" {
         },
     );
     defer byte_runtime.deinit();
+    // Disk-only quarantine cannot strand the heap byte dimension. In-flight
+    // reservations still enforce its cap and release independently of merges.
+    try std.testing.expectEqual(@as(u64, 0), quarantined_stats.pending_heap_bytes);
+    var disk_quarantine_permit = try byte_runtime.acquireProducerPermit("healthy", 0, 1);
     try std.testing.expectError(
-        error.TextMergeBackpressureUnavailable,
+        error.TextMergeBackpressureTimeout,
         byte_runtime.acquireProducerPermit("healthy", 0, 1),
     );
+    disk_quarantine_permit.release();
+    // One oversized publication is allowed when no heap or reservation debt
+    // exists, even above a retained disk corpus. It still excludes a second
+    // producer until its reservation is released.
+    var oversized_disk_permit = try byte_runtime.acquireProducerPermit("healthy", 0, 2);
+    try std.testing.expectError(
+        error.TextMergeBackpressureTimeout,
+        byte_runtime.acquireProducerPermit("healthy", 0, 1),
+    );
+    oversized_disk_permit.release();
 }
 
 test "db text kernel admits natural segments below hard segment limit" {
