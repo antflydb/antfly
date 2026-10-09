@@ -375,3 +375,20 @@ PyIceberg REST authority, with real manifests/Parquet and daemon restarts):
 ANTFLY_NATIVE_BINARY=/path/to/antfly ANTFLY_LIBRARY=/path/to/libantfly.dylib \
   uv run --project examples/hackernews pytest -q examples/hackernews/tests/test_catalog_http.py
 ```
+
+Native row ingestion is available with `--native-rows --native-endpoint
+http://localhost:8080/db/v1 --native-table hackernews`. For a continuously
+running producer, also set `--publish-interval 60`; each pass sends a bounded
+transaction instead of replacing affected months. Antfly handles the durable
+WAL, Parquet and Iceberg equality deletes, the configured managed or REST
+catalog commit, and automatic text/predicate index publication. The local
+Antfly Lite state keeps the exact pending request and per-item changes across
+restarts. Acknowledged rows are removed from that queue only if no newer local
+version has replaced them.
+
+The native table must use the generated writable catalog binding and the node
+must configure an independent artifact storage lane. The first publication
+initializes an absent catalog with the HN schema. The producer persists one
+source epoch and chains opaque checkpoints. Switching a pending request to a
+different endpoint/table is rejected. Durable acceptance is distinct from
+search visibility; use catalog coverage and index readiness to observe progress.

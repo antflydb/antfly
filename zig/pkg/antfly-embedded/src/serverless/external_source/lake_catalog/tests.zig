@@ -89,6 +89,7 @@ const FakeRest = struct {
     post_calls: usize = 0,
     lose_response: bool = false,
     fail_before_commit: bool = false,
+    reject_commit: bool = false,
     idempotency: bool = false,
     path_seen: bool = false,
     fn transport(self: *FakeRest) rest.Transport {
@@ -101,6 +102,7 @@ const FakeRest = struct {
         if (method == .POST) {
             self.post_calls += 1;
             if (self.fail_before_commit) return error.ConnectionResetByPeer;
+            if (self.reject_commit) return .{ .status = 409, .body = try allocator.dupe(u8, "{}") };
             try std.testing.expect((id != null) == self.idempotency);
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
@@ -186,4 +188,26 @@ test "lake catalog REST receipts retain committed proof after metadata markers e
     fake.current = without_markers;
     try std.testing.expectEqual(types.Outcome.committed, try catalog.resolve(a, c.id, &types.commitHash(c)));
     try std.testing.expectError(error.LakeCommitIdReused, catalog.resolve(a, c.id, "different-request"));
+}
+
+test "lake catalog REST preserves definitive rejection across restart without resending" {
+    var fake: FakeRest = .{ .current = try metadata.createAlloc(a, create_request, "uuid", 1, "gs://archive/hn"), .reject_commit = true };
+    defer a.free(fake.current);
+    var journal = storage.MemoryClient.init(a);
+    defer journal.deinit();
+    var catalog: rest.Rest = .{ .config = .{ .type = .rest, .connection = "rest", .uri = "https://catalog.example", .namespace = &.{"hn"}, .name = "items" }, .transport = fake.transport(), .journal = .{ .client = journal.client(), .bucket = "state", .prefix = "hn" }, .now_ms = 2 };
+    var initial = try catalog.load(a);
+    defer initial.deinit(a);
+    const c: types.Commit = .{ .id = "rejected", .expected_metadata_location = initial.metadata_location, .body = "{\"requirements\":[],\"updates\":[]}", .timestamp_ms = 2 };
+    try std.testing.expectError(error.LakeCommitConflict, catalog.commit(a, c));
+    try std.testing.expectEqual(types.Outcome.not_committed, try catalog.resolve(a, c.id, &types.commitHash(c)));
+    fake.reject_commit = false;
+    var restarted = catalog;
+    try std.testing.expectError(error.LakeCommitConflict, restarted.commit(a, c));
+    try std.testing.expectEqual(@as(usize, 1), fake.post_calls);
+    var next = c;
+    next.id = "rebased";
+    var accepted = try restarted.commit(a, next);
+    defer accepted.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), fake.post_calls);
 }

@@ -4,6 +4,18 @@
 //! The catalog owns a lake commit; index publication remains a separate step.
 const std = @import("std");
 pub const Context = @import("../../query/lake_read_context.zig").Context;
+/// Providers borrow this callback only for the synchronous object operation.
+/// It propagates deadlines as well as cancellation to active network I/O.
+pub fn contextCancellation(context: *const Context) @import("objectstore").CancellationToken {
+    return .{ .ptr = context, .is_cancelled_fn = struct {
+        fn check(raw: *const anyopaque) bool {
+            const current: *const Context = @ptrCast(@alignCast(raw));
+            current.ensureActive() catch return true;
+            return false;
+        }
+    }.check };
+}
+
 pub const max_metadata_bytes = 16 * 1024 * 1024;
 pub const max_commit_bytes = 4 * 1024 * 1024;
 

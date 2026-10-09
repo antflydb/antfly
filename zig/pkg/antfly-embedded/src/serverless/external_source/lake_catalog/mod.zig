@@ -5,6 +5,9 @@ pub const types = @import("types.zig");
 pub const metadata = @import("metadata.zig");
 pub const managed = @import("managed.zig");
 pub const rest = @import("rest.zig");
+pub const parquet_writer = @import("parquet_writer.zig");
+pub const avro_writer = @import("avro_writer.zig");
+pub const row_commit = @import("row_commit.zig");
 const std = @import("std");
 pub const Catalog = union(enum) {
     managed: managed.Managed,
@@ -35,5 +38,7 @@ pub const Catalog = union(enum) {
     }
 };
 test {
+    _ = parquet_writer;
+    _ = row_commit;
     _ = @import("tests.zig");
 }

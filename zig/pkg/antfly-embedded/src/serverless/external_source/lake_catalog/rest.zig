@@ -186,7 +186,9 @@ pub const Rest = struct {
             intent = (try std.json.parseFromSlice(Intent, scratch, value.body, .{ .allocate = .alloc_always })).value;
             if (intent.format != 1 or intent.operation != operation or !std.mem.eql(u8, intent.id, c.id) or !std.mem.eql(u8, intent.request_hash, &types.commitHash(c))) return error.LakeCommitIdReused;
             if (try getReceipt(a, &client, journal.bucket, receipt_key, cancellation)) |table| return table;
-            if (try self.resolve(a, c.id, &types.commitHash(c)) == .committed) return self.load(a);
+            const outcome = try self.resolve(a, c.id, &types.commitHash(c));
+            if (outcome == .committed) return self.load(a);
+            if (outcome == .not_committed) return error.LakeCommitConflict;
             if (intent.endpoint == null or !std.mem.eql(u8, intent.endpoint.?, uri)) return error.LakeCommitOutcomeUnknown;
             const lifetime = n.idempotency_ms orelse return error.LakeCommitOutcomeUnknown;
             if (self.now_ms < intent.created_ms or @as(u64, @intCast(self.now_ms - intent.created_ms)) >= lifetime) return error.LakeCommitOutcomeUnknown;
@@ -238,6 +240,14 @@ pub const Rest = struct {
         if (response.status != 200) {
             if (try self.resolve(a, c.id, &types.commitHash(c)) == .committed) return self.load(a);
             if (replay) return error.LakeCommitOutcomeUnknown;
+            if (response.status == 409) {
+                // Only an original, definitive rejection proves non-commit.
+                // Persist that proof before exposing a rebase-safe conflict.
+                const key = try journalKey(scratch, journal, "rejections", c.id);
+                const bytes = try std.json.Stringify.valueAlloc(scratch, Rejection{ .id = c.id, .request_hash = &types.commitHash(c) }, .{});
+                var rejected = client.putObject(journal.bucket, key, bytes, .{ .if_none_match = true, .content_type = "application/json", .cancellation = cancellation }) catch return error.LakeCommitOutcomeUnknown;
+                rejected.deinit(a);
+            }
             try status(response.status, true);
         }
         var table = tableResponse(a, response.body) catch return error.LakeCommitOutcomeUnknown;
@@ -285,6 +295,19 @@ pub const Rest = struct {
                     defer receipt.deinit(a);
                     return .committed;
                 }
+                const rejected_key = try journalKey(a, journal, "rejections", id);
+                defer a.free(rejected_key);
+                var rejected = client.getObject(journal.bucket, rejected_key, .{ .max_response_bytes = 4096, .cancellation = self.token() }) catch |err| switch (err) {
+                    error.FileNotFound, error.ObjectNotFound => null,
+                    else => return err,
+                };
+                defer if (rejected) |*proof| proof.deinit(a);
+                if (rejected) |proof| {
+                    var rejection = try std.json.parseFromSlice(Rejection, a, proof.body, .{});
+                    defer rejection.deinit();
+                    if (!std.mem.eql(u8, rejection.value.id, id) or !std.mem.eql(u8, rejection.value.request_hash, hash)) return error.LakeCommitIdReused;
+                    return .not_committed;
+                }
             }
         }
         var table = self.load(a) catch |err| switch (err) {
@@ -305,6 +328,8 @@ pub const Rest = struct {
         return .unknown;
     }
 };
+
+const Rejection = struct { id: []const u8, request_hash: []const u8 };
 
 fn marker(value: V, id: []const u8, hash: []const u8) !bool {
     if (value != .object) return error.InvalidLakeMetadata;

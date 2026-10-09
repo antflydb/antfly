@@ -997,6 +997,16 @@ pub fn parseInitializeLakeCatalogBody(allocator: std.mem.Allocator, body: []cons
     return std.json.parseFromSlice(types.LakeCatalogCreateRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// ingestLakeChanges
+pub const IngestLakeChangesPathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for ingestLakeChanges.
+pub fn parseIngestLakeChangesBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// commitLakeCatalog
 pub const CommitLakeCatalogPathParams = struct {
     table_name: []const u8,
@@ -1437,6 +1447,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/lake/catalog", .operation_id = "getLakeCatalog", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/lake/catalog", .operation_id = "initializeLakeCatalog", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/lake/changes", .operation_id = "ingestLakeChanges", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/lake/commits", .operation_id = "commitLakeCatalog", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/lake/commits/{commitId}", .operation_id = "getLakeCommitOutcome", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge", .request_body = .buffered, .streaming_response = false },
@@ -1597,6 +1608,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "retryIndex")) @compileError("ServerRouter: Impl missing required method 'retryIndex'");
         if (!@hasDecl(Impl, "getLakeCatalog")) @compileError("ServerRouter: Impl missing required method 'getLakeCatalog'");
         if (!@hasDecl(Impl, "initializeLakeCatalog")) @compileError("ServerRouter: Impl missing required method 'initializeLakeCatalog'");
+        if (!@hasDecl(Impl, "ingestLakeChanges")) @compileError("ServerRouter: Impl missing required method 'ingestLakeChanges'");
         if (!@hasDecl(Impl, "commitLakeCatalog")) @compileError("ServerRouter: Impl missing required method 'commitLakeCatalog'");
         if (!@hasDecl(Impl, "getLakeCommitOutcome")) @compileError("ServerRouter: Impl missing required method 'getLakeCommitOutcome'");
         if (!@hasDecl(Impl, "linearMerge")) @compileError("ServerRouter: Impl missing required method 'linearMerge'");
@@ -1755,6 +1767,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/indexes/:indexName/retry", httpx.Handler.bind(self.impl, retryIndex));
             try server.get("/tables/:tableName/lake/catalog", httpx.Handler.bind(self.impl, getLakeCatalog));
             try server.post("/tables/:tableName/lake/catalog", httpx.Handler.bind(self.impl, initializeLakeCatalog));
+            try server.post("/tables/:tableName/lake/changes", httpx.Handler.bind(self.impl, ingestLakeChanges));
             try server.post("/tables/:tableName/lake/commits", httpx.Handler.bind(self.impl, commitLakeCatalog));
             try server.get("/tables/:tableName/lake/commits/:commitId", httpx.Handler.bind(self.impl, getLakeCommitOutcome));
             try server.post("/tables/:tableName/merge", httpx.Handler.bind(self.impl, linearMerge));
@@ -2673,6 +2686,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.initializeLakeCatalog(ctx, table_name);
         }
 
+        /// ingestLakeChanges
+        /// POST /tables/{tableName}/lake/changes
+        fn ingestLakeChanges(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.ingestLakeChanges(ctx, table_name);
+        }
+
         /// commitLakeCatalog
         /// POST /tables/{tableName}/lake/commits
         fn commitLakeCatalog(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -3060,6 +3080,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn retryIndex(self: *Impl, ctx: *httpx.Context, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn getLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn initializeLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
+//   fn ingestLakeChanges(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn commitLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getLakeCommitOutcome(self: *Impl, ctx: *httpx.Context, table_name: []const u8, commit_id: []const u8, params: GetLakeCommitOutcomeParams) !httpx.Response
 //   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

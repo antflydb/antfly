@@ -166,6 +166,8 @@ def publish(
     project=None,
     native_endpoint=None,
     native_table="hackernews",
+    native_rows=False,
+    batch_size=1000,
 ):
     from native_catalog import NativeCatalog
     import pyarrow as pa
@@ -173,6 +175,24 @@ def publish(
     import uuid
     from pyiceberg.expressions import In
     from pyiceberg.io.pyarrow import schema_to_pyarrow
+
+    if native_rows:
+        from native_ingest import publish as publish_changes
+
+        if not native_endpoint:
+            raise ValueError("native row ingestion requires --native-endpoint")
+        if state.get("publication", ""):
+            raise RuntimeError(
+                "finish the pending file publication before changing producer mode"
+            )
+        catalog = NativeCatalog(state, warehouse, native_endpoint, native_table)
+        catalog.create_table_if_not_exists(
+            "hackernews.items",
+            schema=arrow_schema(),
+            location=warehouse,
+            properties={"format-version": "2"},
+        )
+        return publish_changes(state, native_endpoint, native_table, batch_size)
 
     catalog = (
         NativeCatalog(state, warehouse, native_endpoint, native_table)
@@ -426,6 +446,11 @@ def main():
         "--native-endpoint", help="Antfly API root, e.g. http://localhost:8080/db/v1"
     )
     parser.add_argument("--native-table", default="hackernews")
+    parser.add_argument(
+        "--native-rows",
+        action="store_true",
+        help="Send row CDC; Antfly owns WAL, Parquet and searchable publication",
+    )
     parser.add_argument("--batch-size", type=int, default=1000)
     parser.add_argument(
         "--backup-root", help="Dedicated gs:// or file:// state checkpoint root"
@@ -446,6 +471,10 @@ def main():
     sub.add_parser("restore")
     sub.add_parser("run")
     args = parser.parse_args()
+    if args.native_rows and not args.native_endpoint:
+        parser.error("--native-rows requires --native-endpoint")
+    if args.native_rows and args.batch_size > 16384:
+        parser.error("native transaction batches are limited to 16384 changes")
     if args.batch_size < 1:
         parser.error("batch size must be positive")
     if args.interval < 1 or args.publish_interval < 1:
@@ -469,7 +498,7 @@ def main():
             return
         state = State(args.state / "ingestion.aflite")
         try:
-            if state.get("publication", ""):
+            if state.get("publication", "") or state.get("native_changes_request", ""):
                 publish(
                     state,
                     args.state,
@@ -477,6 +506,8 @@ def main():
                     args.project,
                     args.native_endpoint,
                     args.native_table,
+                    args.native_rows,
+                    args.batch_size,
                 )
             if args.command == "backup":
                 print(
@@ -506,6 +537,8 @@ def main():
                             args.project,
                             args.native_endpoint,
                             args.native_table,
+                            args.native_rows,
+                            args.batch_size,
                         )
                         next_publication = time.monotonic() + args.publish_interval
                     print(
@@ -523,6 +556,8 @@ def main():
                 args.project,
                 args.native_endpoint,
                 args.native_table,
+                args.native_rows,
+                args.batch_size,
             )
             print(json.dumps(result))
         finally:

@@ -922,6 +922,11 @@ from .inference_transient_capacity_error import InferenceTransientCapacityError
 from .inference_transient_capacity_error_reason import InferenceTransientCapacityErrorReason
 from .inference_vad_config import InferenceVadConfig
 from .inferenceschemas_config import InferenceschemasConfig
+from .ingest_lake_changes_body import IngestLakeChangesBody
+from .ingest_lake_changes_body_changes_item import IngestLakeChangesBodyChangesItem
+from .ingest_lake_changes_body_changes_item_op import IngestLakeChangesBodyChangesItemOp
+from .ingest_lake_changes_body_changes_item_row import IngestLakeChangesBodyChangesItemRow
+from .ingest_lake_changes_response_202 import IngestLakeChangesResponse202
 from .install_extension_request import InstallExtensionRequest
 from .install_manifest import InstallManifest
 from .installed_extension import InstalledExtension
@@ -2351,6 +2356,11 @@ __all__ = (
     "InferenceTransientCapacityError",
     "InferenceTransientCapacityErrorReason",
     "InferenceVadConfig",
+    "IngestLakeChangesBody",
+    "IngestLakeChangesBodyChangesItem",
+    "IngestLakeChangesBodyChangesItemOp",
+    "IngestLakeChangesBodyChangesItemRow",
+    "IngestLakeChangesResponse202",
     "InstalledExtension",
     "InstalledExtensionStatus",
     "InstallExtensionRequest",

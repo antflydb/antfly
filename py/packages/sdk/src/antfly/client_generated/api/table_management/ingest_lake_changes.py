@@ -6,42 +6,40 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.lake_catalog_response import LakeCatalogResponse
-from ...types import UNSET, Response
+from ...models.ingest_lake_changes_body import IngestLakeChangesBody
+from ...models.ingest_lake_changes_response_202 import IngestLakeChangesResponse202
+from ...types import Response
 
 
 def _get_kwargs(
     table_name: str,
-    commit_id: str,
     *,
-    request_hash: str,
+    body: IngestLakeChangesBody,
 ) -> dict[str, Any]:
-
-    params: dict[str, Any] = {}
-
-    params["request_hash"] = request_hash
-
-    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
+    headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
-        "method": "get",
-        "url": "/db/v1/tables/{table_name}/lake/commits/{commit_id}".format(
+        "method": "post",
+        "url": "/db/v1/tables/{table_name}/lake/changes".format(
             table_name=quote(str(table_name), safe=""),
-            commit_id=quote(str(commit_id), safe=""),
         ),
-        "params": params,
     }
 
+    _kwargs["json"] = body.to_dict()
+
+    headers["Content-Type"] = "application/json"
+
+    _kwargs["headers"] = headers
     return _kwargs
 
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | LakeCatalogResponse | None:
-    if response.status_code == 200:
-        response_200 = LakeCatalogResponse.from_dict(response.json())
+) -> Any | IngestLakeChangesResponse202 | None:
+    if response.status_code == 202:
+        response_202 = IngestLakeChangesResponse202.from_dict(response.json())
 
-        return response_200
+        return response_202
 
     if response.status_code == 400:
         response_400 = cast(Any, None)
@@ -75,7 +73,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | LakeCatalogResponse]:
+) -> Response[Any | IngestLakeChangesResponse202]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -86,35 +84,32 @@ def _build_response(
 
 def sync_detailed(
     table_name: str,
-    commit_id: str,
     *,
     client: AuthenticatedClient,
-    request_hash: str,
-) -> Response[Any | LakeCatalogResponse]:
-    """getLakeCommitOutcome
+    body: IngestLakeChangesBody,
+) -> Response[Any | IngestLakeChangesResponse202]:
+    """ingestLakeChanges
 
-     Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require
-    table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files
-    and automatically schedule matching index publication. A committed response does not imply that
-    those indexes are already searchable. Native row transactions use lake/changes.
+     Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID,
+    source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images;
+    deletes contain only key fields. Acceptance precedes catalog commitment and searchable index
+    publication. Requires table admin permission and iceberg_writer policy.
 
     Args:
         table_name (str):
-        commit_id (str):
-        request_hash (str):
+        body (IngestLakeChangesBody):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | LakeCatalogResponse]
+        Response[Any | IngestLakeChangesResponse202]
     """
 
     kwargs = _get_kwargs(
         table_name=table_name,
-        commit_id=commit_id,
-        request_hash=request_hash,
+        body=body,
     )
 
     response = client.get_httpx_client().request(
@@ -126,70 +121,64 @@ def sync_detailed(
 
 def sync(
     table_name: str,
-    commit_id: str,
     *,
     client: AuthenticatedClient,
-    request_hash: str,
-) -> Any | LakeCatalogResponse | None:
-    """getLakeCommitOutcome
+    body: IngestLakeChangesBody,
+) -> Any | IngestLakeChangesResponse202 | None:
+    """ingestLakeChanges
 
-     Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require
-    table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files
-    and automatically schedule matching index publication. A committed response does not imply that
-    those indexes are already searchable. Native row transactions use lake/changes.
+     Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID,
+    source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images;
+    deletes contain only key fields. Acceptance precedes catalog commitment and searchable index
+    publication. Requires table admin permission and iceberg_writer policy.
 
     Args:
         table_name (str):
-        commit_id (str):
-        request_hash (str):
+        body (IngestLakeChangesBody):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | LakeCatalogResponse
+        Any | IngestLakeChangesResponse202
     """
 
     return sync_detailed(
         table_name=table_name,
-        commit_id=commit_id,
         client=client,
-        request_hash=request_hash,
+        body=body,
     ).parsed
 
 
 async def asyncio_detailed(
     table_name: str,
-    commit_id: str,
     *,
     client: AuthenticatedClient,
-    request_hash: str,
-) -> Response[Any | LakeCatalogResponse]:
-    """getLakeCommitOutcome
+    body: IngestLakeChangesBody,
+) -> Response[Any | IngestLakeChangesResponse202]:
+    """ingestLakeChanges
 
-     Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require
-    table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files
-    and automatically schedule matching index publication. A committed response does not imply that
-    those indexes are already searchable. Native row transactions use lake/changes.
+     Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID,
+    source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images;
+    deletes contain only key fields. Acceptance precedes catalog commitment and searchable index
+    publication. Requires table admin permission and iceberg_writer policy.
 
     Args:
         table_name (str):
-        commit_id (str):
-        request_hash (str):
+        body (IngestLakeChangesBody):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | LakeCatalogResponse]
+        Response[Any | IngestLakeChangesResponse202]
     """
 
     kwargs = _get_kwargs(
         table_name=table_name,
-        commit_id=commit_id,
-        request_hash=request_hash,
+        body=body,
     )
 
     response = await client.get_async_httpx_client().request(**kwargs)
@@ -199,36 +188,33 @@ async def asyncio_detailed(
 
 async def asyncio(
     table_name: str,
-    commit_id: str,
     *,
     client: AuthenticatedClient,
-    request_hash: str,
-) -> Any | LakeCatalogResponse | None:
-    """getLakeCommitOutcome
+    body: IngestLakeChangesBody,
+) -> Any | IngestLakeChangesResponse202 | None:
+    """ingestLakeChanges
 
-     Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require
-    table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files
-    and automatically schedule matching index publication. A committed response does not imply that
-    those indexes are already searchable. Native row transactions use lake/changes.
+     Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID,
+    source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images;
+    deletes contain only key fields. Acceptance precedes catalog commitment and searchable index
+    publication. Requires table admin permission and iceberg_writer policy.
 
     Args:
         table_name (str):
-        commit_id (str):
-        request_hash (str):
+        body (IngestLakeChangesBody):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | LakeCatalogResponse
+        Any | IngestLakeChangesResponse202
     """
 
     return (
         await asyncio_detailed(
             table_name=table_name,
-            commit_id=commit_id,
             client=client,
-            request_hash=request_hash,
+            body=body,
         )
     ).parsed

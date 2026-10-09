@@ -67,7 +67,7 @@ class RestAuthority(BaseHTTPRequestHandler):
         return self.server.root / relative
 
     def object_read(self, head=False):
-        if self.path.rstrip("/") == "/archive":
+        if urlsplit(self.path).path.rstrip("/") == "/archive":
             self.send_response(200)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -97,6 +97,11 @@ class RestAuthority(BaseHTTPRequestHandler):
         self.object_read(head=True)
 
     def do_PUT(self):
+        if urlsplit(self.path).path.rstrip("/") == "/archive":
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         path = self.object_path()
         if self.headers.get("If-None-Match") == "*" and path.exists():
             return self.respond(412, {})
@@ -201,7 +206,8 @@ class RestAuthority(BaseHTTPRequestHandler):
 
 
 @pytest.mark.parametrize("mode", ["managed", "rest"])
-def test_native_catalog_file_commit_read_and_restart(tmp_path, mode):
+@pytest.mark.parametrize("native_rows", [False, True, "delete_first"])
+def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows):
     binary = os.environ.get("ANTFLY_NATIVE_BINARY")
     if not binary:
         pytest.skip("set ANTFLY_NATIVE_BINARY for native HTTP qualification")
@@ -344,11 +350,19 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode):
                 "schema": {
                     "storage_mode": "relational",
                     "default_type": "row",
+                    "relational_indexes": [
+                        {"name": "amount_idx", "keys": [{"column": "amount"}]}
+                    ]
+                    if native_rows
+                    else [],
                     "document_schemas": {
                         "row": {
                             "schema": {
                                 "type": "object",
-                                "properties": {"amount": {"type": "integer"}},
+                                "properties": {
+                                    "amount": {"type": "integer"},
+                                    "body": {"type": "string"},
+                                },
                                 "additionalProperties": False,
                             }
                         }
@@ -362,23 +376,55 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode):
                         "write_policy": "iceberg_writer",
                         "catalog": catalog_config,
                     },
-                }
+                },
+                "indexes": {"body_text": {"type": "full_text", "field": "body"}}
+                if native_rows
+                else {},
             },
         )
         catalog = NativeCatalog(state, warehouse, endpoint, "hn")
         catalog._load_file_io = lambda *args, **kwargs: LocalS3IO()
         table = catalog.create_table(
             "hackernews.items",
-            pa.schema([pa.field("amount", pa.int64())]),
+            pa.schema([pa.field("amount", pa.int64()), pa.field("body", pa.string())]),
             location=warehouse,
             properties={"format-version": "2"},
         )
         with table.update_spec() as spec_update:
             spec_update.add_identity("amount")
+        wal_offset = int(native_rows == "delete_first")
+        if wal_offset:
+            empty = {
+                "batch_id": "delete-before-backfill",
+                "source": "wire-cdc",
+                "epoch": "exported-snapshot-1",
+                "checkpoint": "opaque-provider-offset-0",
+                "key_fields": ["amount"],
+                "changes": [{"op": "delete", "row": {"amount": 999}}],
+            }
+            assert call("POST", "/tables/hn/lake/changes", empty)["wal_lsn"] == 1
+            deadline = time.monotonic() + 180
+            while True:
+                loaded = call("GET", "/tables/hn/lake/catalog")
+                if loaded["metadata"]["properties"].get("antfly.wal.coverage") == "1":
+                    assert call(
+                        "POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn"}
+                    )["rows"] == [["0"]]
+                    break
+                assert time.monotonic() < deadline, (
+                    tmp_path / "server.log"
+                ).read_text()[-5000:]
+                time.sleep(0.1)
+            table = catalog.load_table("hackernews.items")
         table.append(
             pa.table(
-                {"amount": [1, 2, 3]},
-                schema=pa.schema([pa.field("amount", pa.int64())]),
+                {
+                    "amount": [1, 2, 3],
+                    "body": ["original one", "original two", "original three"],
+                },
+                schema=pa.schema(
+                    [pa.field("amount", pa.int64()), pa.field("body", pa.string())]
+                ),
             )
         )
         loaded = call("GET", "/tables/hn/lake/catalog")
@@ -390,6 +436,113 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode):
         rows = call("POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn"})
         assert rows["rows"] == [["3"]]
         assert not (root / "hn" / "metadata" / "version-hint.text").exists()
+        if native_rows:
+            batch = {
+                "batch_id": "cdc-transaction-1",
+                "source": "wire-cdc",
+                "epoch": "exported-snapshot-1",
+                "checkpoint": "opaque-provider-offset-1",
+                "key_fields": ["amount"],
+                "expected_checkpoint": "opaque-provider-offset-0"
+                if wal_offset
+                else None,
+                "changes": [
+                    {
+                        "op": "upsert",
+                        "row": {"amount": 1, "body": "native searchable comet"},
+                    },
+                    {"op": "delete", "row": {"amount": 2}},
+                    {"op": "upsert", "row": {"amount": 4, "body": ""}},
+                ],
+            }
+            accepted = call("POST", "/tables/hn/lake/changes", batch)
+            assert accepted == {
+                "state": "accepted",
+                "wal_lsn": 1 + wal_offset,
+                "searchable": False,
+            }
+            assert call("POST", "/tables/hn/lake/changes", batch) == accepted
+            # A caller restart immediately after acceptance must not strand WAL.
+            stop()
+            start()
+            deadline = time.monotonic() + 180
+            while True:
+                loaded = call("GET", "/tables/hn/lake/catalog")
+                if loaded["metadata"]["properties"].get("antfly.wal.coverage") == str(
+                    1 + wal_offset
+                ):
+                    break
+                assert time.monotonic() < deadline, (
+                    tmp_path / "server.log"
+                ).read_text()[-5000:]
+                time.sleep(0.1)
+            TableMetadataUtil.parse_obj(loaded["metadata"])
+            # Arrow verifies actual native pages, null levels and Iceberg IDs.
+            import pyarrow.parquet as pq
+
+            native_data = sorted((root / "hn" / "data").glob("antfly-*-data.parquet"))
+            assert len(native_data) == 1
+            assert pq.read_table(native_data[0]).to_pylist() == [
+                {"amount": 1, "body": "native searchable comet"},
+                {"amount": 4, "body": ""},
+            ]
+            refreshed = catalog.load_table("hackernews.items")
+            assert len(list(refreshed.current_snapshot().manifests(refreshed.io))) >= 3
+            # Publication is automatic: no create-index/refresh action here.
+            while True:
+                try:
+                    found = call(
+                        "POST",
+                        "/tables/hn/query",
+                        {
+                            "full_text_search": {"term": "comet", "field": "body"},
+                            "fields": ["amount", "body"],
+                            "limit": 10,
+                        },
+                    )
+                    result = found.get("responses", [found])[0]
+                    hits = result.get("hits", {}).get("hits", [])
+                    if hits:
+                        assert len(hits) == 1, found
+                        break
+                except HTTPError as error:
+                    assert error.code in (409, 422, 503), error.read().decode()
+                assert time.monotonic() < deadline, (
+                    tmp_path / "server.log"
+                ).read_text()[-5000:]
+                time.sleep(0.2)
+            assert call(
+                "POST", "/sql", {"statement": "SELECT amount FROM hn ORDER BY amount"}
+            )["rows"] == [["1"], ["3"], ["4"]]
+            changed = dict(batch, changes=[{"op": "delete", "row": {"amount": 1}}])
+            with pytest.raises(HTTPError) as conflict:
+                call("POST", "/tables/hn/lake/changes", changed)
+            assert conflict.value.code == 409
+            second = dict(
+                batch,
+                batch_id="cdc-transaction-2",
+                expected_checkpoint=batch["checkpoint"],
+                checkpoint="opaque-provider-offset-2",
+                changes=[
+                    {"op": "delete", "row": {"amount": 1}},
+                    {"op": "upsert", "row": {"amount": 4, "body": None}},
+                    {"op": "upsert", "row": {"amount": 5, "body": "next comet"}},
+                ],
+            )
+            assert (
+                call("POST", "/tables/hn/lake/changes", second)["wal_lsn"]
+                == 2 + wal_offset
+            )
+            while True:
+                loaded = call("GET", "/tables/hn/lake/catalog")
+                if loaded["metadata"]["properties"].get("antfly.wal.coverage") == str(
+                    2 + wal_offset
+                ):
+                    break
+                assert time.monotonic() < deadline, (
+                    tmp_path / "server.log"
+                ).read_text()[-5000:]
+                time.sleep(0.1)
         stop()
         start()
         assert (
@@ -399,6 +552,33 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode):
         assert call("POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn"})[
             "rows"
         ] == [["3"]]
+        if native_rows:
+            deadline = time.monotonic() + 180
+            while True:
+                try:
+                    result = call(
+                        "POST",
+                        "/tables/hn/query",
+                        {
+                            "full_text_search": {"term": "comet", "field": "body"},
+                            "fields": ["amount"],
+                            "limit": 10,
+                        },
+                    )
+                    result = result.get("responses", [result])[0]
+                    hits = result.get("hits", {}).get("hits", [])
+                    if hits:
+                        assert [hit["_source"]["amount"] for hit in hits] == [5], result
+                        break
+                except HTTPError as error:
+                    assert error.code in (409, 422, 503), error.read().decode()
+                assert time.monotonic() < deadline, (
+                    tmp_path / "server.log"
+                ).read_text()[-5000:]
+                time.sleep(0.1)
+            assert call(
+                "POST", "/sql", {"statement": "SELECT amount FROM hn ORDER BY amount"}
+            )["rows"] == [["3"], ["4"], ["5"]]
     finally:
         if process and process.poll() is None:
             stop()

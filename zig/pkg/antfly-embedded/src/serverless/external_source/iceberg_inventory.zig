@@ -78,7 +78,6 @@ pub fn planInventoryFromDataFilesAlloc(
         try validateResolvedManifestEntry(file);
         if (file.status != .deleted) active_count += 1;
     }
-    if (active_count == 0) return error.EmptyIcebergInventory;
 
     const sorted_indexes = try alloc.alloc(usize, active_count);
     defer alloc.free(sorted_indexes);
@@ -184,7 +183,6 @@ pub fn planInventoryFromSnapshotManifestsAlloc(
         try validateManifestSummary(manifest_entry, decoded.manifest);
         total_entries += decoded.manifest.entries.len;
     }
-    if (total_entries == 0) return error.EmptyIcebergInventory;
 
     const data_files = try alloc.alloc(iceberg_avro.DataFileEntry, total_entries);
     defer alloc.free(data_files);
@@ -741,13 +739,15 @@ fn testDataManifestAlloc(
     return .{ .entries = entries };
 }
 
-test "iceberg inventory planner rejects empty active snapshots" {
+test "iceberg inventory planner accepts authoritative empty active snapshots" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.EmptyIcebergInventory, planInventoryFromDataFilesAlloc(alloc, .{
+    var inventory = try planInventoryFromDataFilesAlloc(alloc, .{
         .source_id = "events",
         .source_uri = "s3://bucket/t",
         .snapshot_id = "12",
         .schema_fingerprint = "iceberg-schema:7",
         .data_files = &.{},
-    }));
+    });
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), inventory.files.len);
 }

@@ -6,6 +6,7 @@ import base64
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import heapq
+import hashlib
 from itertools import islice
 import json
 from pathlib import Path
@@ -148,6 +149,14 @@ class State:
     def dirty_months(self):
         return [key.split(":", 1)[1] for key, _ in self.db.entries("dirty:")]
 
+    def mark_changed(self, row):
+        # Pending markers stay small during a large BigQuery backfill. The
+        # exact bounded outgoing transaction owns its own row images.
+        digest = hashlib.sha256(
+            json.dumps(row, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.db.set("change:" + number(row["id"]), digest)
+
     def put(self, item):
         item = dict(item)
         if "type" in item or "item_type" in item:
@@ -181,6 +190,7 @@ class State:
                 self.db.set("invalidate:" + number(item_id), True)
         value = dict(id=item_id, parent=parent, root=root, month=month, payload=item)
         self.db.set("item:" + number(item_id), value)
+        self.mark_changed(value)
         self.db.set(f"month:{month}:{number(item_id)}", item_id)
         if parent:
             self.db.set(f"child:{number(parent)}:{number(item_id)}", item_id)
@@ -202,6 +212,7 @@ class State:
                     if row is not None:
                         row["root"] = None
                         self.db.set("item:" + number(item_id), row)
+                        self.mark_changed(row)
                         self.db.set("unresolved:" + number(item_id), item_id)
                         self.db.delete("root_work:" + number(item_id))
                         self.db.set("dirty:" + row["month"], True)
@@ -241,6 +252,7 @@ class State:
                 with self.transaction():
                     row["root"] = root
                     self.db.set("item:" + number(item_id), row)
+                    self.mark_changed(row)
                     self.db.delete(key)
                     self.db.set("root_work:" + number(item_id), item_id)
                     self.db.set("dirty:" + row["month"], True)
@@ -261,6 +273,7 @@ class State:
                         if child["root"] is None and parent["root"] is not None:
                             child["root"] = parent["root"]
                             self.db.set("item:" + number(child_id), child)
+                            self.mark_changed(child)
                             self.db.delete("unresolved:" + number(child_id))
                             self.db.set("root_work:" + number(child_id), child_id)
                             self.db.set("dirty:" + child["month"], True)
@@ -398,47 +411,46 @@ class State:
                 "maxitem", max(int(self.get("maxitem")), int(self.get("maximum_id")))
             )
 
+    @staticmethod
+    def serving_row(item):
+        from urllib.parse import urlsplit
+
+        row, root, month = item["payload"], item["root"], item["month"]
+        kind = row.get("type", row.get("item_type"))
+        if row.get("deleted") or row.get("dead") or kind not in ("story", "comment"):
+            return None
+        title, text, url = (
+            plain(row.get("title", "")),
+            row.get("text", row.get("text_html", "")) or "",
+            row.get("url", "") or "",
+        )
+        return dict(
+            hn_id=row["id"],
+            title=title,
+            url=url,
+            text_html=text,
+            body="\n".join(filter(None, (title, plain(text)))),
+            author=row.get("by", row.get("author", "")) or "",
+            points=int(row.get("score", row.get("points", 0)) or 0),
+            created_at=int(row.get("time", row.get("created_at", 0)) or 0),
+            item_type=kind,
+            parent_id=int(row.get("parent", row.get("parent_id", 0)) or 0),
+            comment_count=int(row.get("descendants", row.get("comment_count", 0)) or 0),
+            domain=urlsplit(url).hostname or "",
+            root_story_id=root,
+            created_month=month,
+        )
+
     def batches(self, months, schema, batch_size=4096):
         import pyarrow as pa
-        from urllib.parse import urlsplit
 
         for month in months:
             records = []
             for _, item_id in self.db.entries("month:" + month + ":"):
-                item = self.item(item_id)
-                row, root = item["payload"], item["root"]
-                kind = row.get("type", row.get("item_type"))
-                if (
-                    row.get("deleted")
-                    or row.get("dead")
-                    or kind not in ("story", "comment")
-                ):
+                row = self.serving_row(self.item(item_id))
+                if row is None:
                     continue
-                title, text, url = (
-                    plain(row.get("title", "")),
-                    row.get("text", row.get("text_html", "")) or "",
-                    row.get("url", "") or "",
-                )
-                records.append(
-                    dict(
-                        hn_id=row["id"],
-                        title=title,
-                        url=url,
-                        text_html=text,
-                        body="\n".join(filter(None, (title, plain(text)))),
-                        author=row.get("by", row.get("author", "")) or "",
-                        points=int(row.get("score", row.get("points", 0)) or 0),
-                        created_at=int(row.get("time", row.get("created_at", 0)) or 0),
-                        item_type=kind,
-                        parent_id=int(row.get("parent", row.get("parent_id", 0)) or 0),
-                        comment_count=int(
-                            row.get("descendants", row.get("comment_count", 0)) or 0
-                        ),
-                        domain=urlsplit(url).hostname or "",
-                        root_story_id=root,
-                        created_month=month,
-                    )
-                )
+                records.append(row)
                 if len(records) >= batch_size:
                     yield pa.RecordBatch.from_pylist(records, schema=schema)
                     records = []

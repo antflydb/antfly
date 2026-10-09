@@ -1846,7 +1846,8 @@ paths:
       summary: getLakeCatalog
       description: Native Iceberg catalog operation for managed or external REST authority. Catalog mutations
         require table admin permission and iceberg_writer policy. These endpoints commit already prepared
-        lake files; they do not perform ordinary row mutations or imply index publication.
+        lake files and automatically schedule matching index publication. A committed response does not
+        imply that those indexes are already searchable. Native row transactions use lake/changes.
       responses:
         '200':
           description: Authoritative catalog result
@@ -1877,7 +1878,8 @@ paths:
       summary: initializeLakeCatalog
       description: Native Iceberg catalog operation for managed or external REST authority. Catalog mutations
         require table admin permission and iceberg_writer policy. These endpoints commit already prepared
-        lake files; they do not perform ordinary row mutations or imply index publication.
+        lake files and automatically schedule matching index publication. A committed response does not
+        imply that those indexes are already searchable. Native row transactions use lake/changes.
       requestBody:
         required: true
         content:
@@ -1914,6 +1916,111 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/lake/changes:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: ingestLakeChanges
+      tags:
+        - table_management
+      summary: ingestLakeChanges
+      description: Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable
+        batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete
+        row images; deletes contain only key fields. Acceptance precedes catalog commitment and searchable
+        index publication. Requires table admin permission and iceberg_writer policy.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - batch_id
+                - source
+                - epoch
+                - checkpoint
+                - key_fields
+                - changes
+              properties:
+                batch_id:
+                  type: string
+                  minLength: 1
+                  maxLength: 256
+                source:
+                  type: string
+                  minLength: 1
+                  maxLength: 256
+                epoch:
+                  type: string
+                  minLength: 1
+                  maxLength: 256
+                checkpoint:
+                  type: string
+                  minLength: 1
+                  maxLength: 1024
+                expected_checkpoint:
+                  type: string
+                  nullable: true
+                key_fields:
+                  type: array
+                  minItems: 1
+                  maxItems: 32
+                  items:
+                    type: string
+                changes:
+                  type: array
+                  minItems: 1
+                  maxItems: 16384
+                  items:
+                    type: object
+                    required:
+                      - op
+                      - row
+                    properties:
+                      op:
+                        type: string
+                        enum:
+                          - upsert
+                          - delete
+                      row:
+                        type: object
+                        additionalProperties: true
+      responses:
+        '202':
+          description: Durable WAL acceptance; retry the same transaction after an ambiguous response.
+            Query visibility follows automatic publication.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:
+                    type: string
+                  wal_lsn:
+                    type: integer
+                    format: uint64
+                  searchable:
+                    type: boolean
+        '400':
+          description: Invalid transaction or unsupported row type
+        '403':
+          description: Unauthorized ingestion
+        '404':
+          description: Table or catalog not found
+        '409':
+          description: Source, predecessor checkpoint or batch identity conflict
+        '503':
+          description: Durable ingestion unavailable
+        '504':
+          description: Request deadline exceeded
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/lake/commits:
     parameters:
       - name: tableName
@@ -1928,7 +2035,8 @@ paths:
       summary: commitLakeCatalog
       description: Native Iceberg catalog operation for managed or external REST authority. Catalog mutations
         require table admin permission and iceberg_writer policy. These endpoints commit already prepared
-        lake files; they do not perform ordinary row mutations or imply index publication.
+        lake files and automatically schedule matching index publication. A committed response does not
+        imply that those indexes are already searchable. Native row transactions use lake/changes.
       requestBody:
         required: true
         content:
@@ -1989,7 +2097,8 @@ paths:
       summary: getLakeCommitOutcome
       description: Native Iceberg catalog operation for managed or external REST authority. Catalog mutations
         require table admin permission and iceberg_writer policy. These endpoints commit already prepared
-        lake files; they do not perform ordinary row mutations or imply index publication.
+        lake files and automatically schedule matching index publication. A committed response does not
+        imply that those indexes are already searchable. Native row transactions use lake/changes.
       responses:
         '200':
           description: Authoritative catalog result

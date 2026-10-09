@@ -10,7 +10,7 @@ const configured = @import("../serverless/configured_object_store_support.zig");
 const server_api = @import("http_server.zig");
 const operation = local.api_operation;
 const A = std.mem.Allocator;
-pub const Action = enum { load, create, commit, resolve };
+pub const Action = enum { load, create, commit, resolve, changes };
 pub const Request = struct {
     action: Action,
     body: []const u8 = "",
@@ -25,7 +25,7 @@ pub const Response = struct {
     }
 };
 pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, expected_id: ?u64, identity: ?server_api.AuthenticatedIdentity, context: operation.RequestContext, request: Request) !Response {
-    const mutation = request.action == .create or request.action == .commit;
+    const mutation = request.action == .create or request.action == .commit or request.action == .changes;
     if (identity) |value| {
         if (!server_api.permissionsAllow(value.permissions, .table, physical, if (mutation) .admin else .read)) return error.Forbidden;
         // Catalog writes are table-wide file commits, not row-policy mutations.
@@ -40,11 +40,19 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, ex
     if (source.binding.catalog == null) return error.InvalidLakeCatalog;
     const options: configured.BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
     const lake_context: catalog.types.Context = .{ .io = server.sharedApiNetworkIo(), .deadline_ns = context.deadline_ns, .cancellation = if (context.cancellation.ptr != null and context.cancellation.is_cancelled_fn != null) .{ .ptr = context.cancellation.ptr.?, .is_cancelled_fn = context.cancellation.is_cancelled_fn.? } else null };
+    if (request.action == .changes) {
+        const lsn = try @import("../serverless/lake_ingestion.zig").accept(a, source.binding, options, lake_context, request.body);
+        server.notifyLakeCommit(physical) catch |err| std.log.warn("lake ingestion wakeup deferred table={s} err={s}", .{ physical, @errorName(err) });
+        return .{ .status = 202, .body = try std.json.Stringify.valueAlloc(a, .{ .state = "accepted", .wal_lsn = lsn, .searchable = false }, .{}) };
+    }
     if (!mutation) {
         const call: configured.CatalogOperation = if (request.action == .load) .load else .{ .resolve = .{ .id = request.commit_id, .hash = request.request_hash } };
         if (request.action == .resolve and (request.commit_id.len == 0 or request.commit_id.len > 256 or request.request_hash.len != 64)) return error.InvalidLakeCommit;
         var result = try configured.executeLakeCatalogAlloc(a, source.binding, options, lake_context, call);
         defer result.deinit(a);
+        if (request.action == .resolve and result == .outcome and result.outcome == .committed) {
+            server.notifyLakeCommit(physical) catch |err| std.log.warn("lake publication wakeup deferred table={s} err={s}", .{ physical, @errorName(err) });
+        }
         return encode(a, result, if (request.action == .load) "loaded" else null, request.commit_id, request.request_hash);
     }
     if (request.body.len > catalog.types.max_commit_bytes) return error.LakeMetadataTooLarge;
@@ -72,10 +80,18 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, ex
     if (request.action == .create and std.mem.eql(u8, source.binding.schema_fingerprint, "auto")) {
         const prepared = (try @import("lake_schema_detection.zig").prepare(a, table.schema_json, options, lake_context)) orelse return error.InvalidLakeMetadata;
         defer a.free(prepared);
+        // Finalizing an auto fingerprint changes the durable runtime schema.
+        // Publish a new schema version so a native owner can reconcile/reopen
+        // it instead of rejecting a different layout at the same version.
+        const table_api = @import("tables.zig");
+        const version = std.math.add(u32, try table_api.schemaVersion(table.schema_json), 1) catch return error.SchemaVersionExhausted;
+        const normalized = try table_api.normalizeSchemaVersion(a, prepared, version);
+        defer a.free(normalized);
         var replacement = table.*;
-        replacement.schema_json = prepared;
+        replacement.schema_json = normalized;
         server.source.replaceTableDefinition(table.*, replacement) catch return .{ .status = 202, .body = try std.json.Stringify.valueAlloc(a, .{ .state = "lake_committed", .commit_id = c.id, .request_hash = &catalog.types.commitHash(c), .searchable = false, .binding_ready = false }, .{}) };
     }
+    server.notifyLakeCommit(physical) catch |err| std.log.warn("lake publication wakeup deferred table={s} err={s}", .{ physical, @errorName(err) });
     return encode(a, result, "lake_committed", c.id, &catalog.types.commitHash(c));
 }
 fn encode(a: A, result: configured.CatalogResult, state: ?[]const u8, id: []const u8, hash: []const u8) !Response {
@@ -88,7 +104,8 @@ pub fn errorStatus(err: anyerror) u16 {
     return switch (err) {
         error.Forbidden, error.LakeCatalogForbidden, error.ExternalLakeReadOnly, error.UnsupportedExternalLakeCredentialRef => 403,
         error.LakeTableNotFound, error.TableNotFound => 404,
-        error.TableGenerationChanged, error.LakeCommitConflict, error.LakeCommitIdReused, error.LakeRelocationRequired => 409,
+        error.TableGenerationChanged, error.LakeCommitConflict, error.LakeCommitIdReused, error.LakeRelocationRequired, error.WalIdempotencyConflict, error.LakeCheckpointConflict, error.LakeSourceConflict => 409,
+        error.InvalidLakeChangeBatch, error.InvalidLakeRow, error.UnsupportedLakeWriteType, error.LakeWriteTooLarge => 400,
         error.InvalidLakeCatalog, error.InvalidLakeMetadata, error.InvalidLakeCommit, error.UnsupportedLakeRequirement, error.UnsupportedLakeUpdate, error.UnsupportedLakeFormatVersion, error.LakeMetadataTooLarge, error.UnexpectedToken, error.UnknownField, error.MissingField => 400,
         error.DeadlineExceeded, error.Timeout => 504,
         else => 503,

@@ -1,7 +1,9 @@
 # Lake ingestion, change capture, and publication
 
-Status: proposed architecture, captured 2026-10-08. This is not a shipped API or
-an implementation status checklist. Existing behavior remains documented in
+Status: architecture and implementation contracts, captured 2026-10-08. The
+native transaction ingestion section describes the implementation in PR #1025;
+recent overlays, compaction, and additional managed connectors remain proposed.
+Existing behavior remains documented in
 [LAKES.md](../../zig/LAKES.md), [REMOTE_TABLE_SERVING.md](../../zig/REMOTE_TABLE_SERVING.md),
 [CDC.md](../../zig/CDC.md), and [SERVERLESS.md](../../zig/SERVERLESS.md).
 
@@ -22,9 +24,10 @@ object stores should use the same format, indexing, and execution machinery.
 
 Hacker News is a motivating integration, not an engine-specific source type.
 An HN adapter owns API polling, normalization, moderation interpretation, and
-story ancestry. Antfly should eventually own durable mutations, progress,
-archive publication, indexing, and recovery. A Python worker using Antfly Lite
-and PyIceberg is an interim implementation, not the required product topology.
+story ancestry. With native transaction ingestion, Antfly owns durable mutations,
+progress, archive publication, indexing, and recovery. The Python adapter retains
+its source normalization state in Antfly Lite; its optional PyIceberg file writer
+is an interim producer mode, not the required product topology.
 
 ## Related table-object-storage implementation
 
@@ -402,3 +405,88 @@ cutover guarantee before its underlying protocol is qualified.
   capabilities, and missing-log/reseed policies.
 - Compaction policy, external-reader retention evidence, publication cadence,
   and operational limits. No fixed performance guarantees are established here.
+
+### Native transaction ingestion and searchable publication
+
+The native row ingress is `POST /db/v1/tables/{tableName}/lake/changes`.
+It is available for a current-snapshot Iceberg binding with `iceberg_writer`
+and either managed or REST catalog authority. It requires table admin permission
+and independent Antfly artifact storage with `storage.primary`; lake read
+credentials alone cannot authorize ingestion or publication writes.
+
+A transaction supplies `batch_id`, `source`, `epoch`, `checkpoint`, optional
+`expected_checkpoint`, `key_fields`, and an ordered `changes` array. Each change
+is an `upsert` with a complete row image or a `delete` containing only its key
+fields. Provider offsets are opaque strings: the predecessor must match the
+previously admitted transaction, and Antfly never orders unrelated offsets.
+Only one source epoch and key definition owns a table in this implementation;
+changing source ownership needs an explicit reseed/migration. Multiple source
+conflict policies remain a separate extension.
+
+This is the common push boundary for database CDC adapters and application
+producers, rather than a new PostgreSQL polling coordinator. Existing managed
+PostgreSQL slot/publication and exported-snapshot orchestration stays in
+`replication_sources`. An adapter supplies complete transactions and must only
+acknowledge a provider transaction after durable acceptance. It must preserve
+its stable batch identity after a timeout. Partial images, key changes, and
+provider-specific snapshot/stream cutover must be normalized by the adapter;
+a key change is a delete of the old key plus an upsert of the new key in the
+same transaction. An object-created notification is not a row transaction and
+continues to require authoritative snapshot reconciliation.
+
+Native admission validates images against the pinned Iceberg schema and appends
+the transaction to Antfly-owned object storage. The WAL uses immutable segment
+headers and separate content-addressed row payloads,
+immutable request intents, a conditional tail, and durable acceptance receipts.
+Recovery walks only small headers and loads one bounded transaction payload.
+A tail response lost after successful CAS is resolved from the segment chain.
+A retained receipt makes an old request retry constant-size work. A bounded
+pending window provides backpressure while publication is unavailable; normal
+append work does not rewrite an archive-length log. The WAL namespace includes
+native table identity, object generation, and the configured catalog authority,
+so a recreated table or changed binding cannot inherit another writer's queue.
+WAL segments and receipts are retained; automated reader-safe WAL retention is
+not enabled by this path.
+
+One transaction is drained per publication-worker pass. The native writer
+preserves Parquet field IDs and nullability and writes immutable Parquet data,
+Iceberg equality deletes, data/delete manifests, and a manifest list. Repeated
+keys in a transaction keep their final mutation. Deletes and replacement data
+share a new sequence number: equality deletes suppress earlier versions and
+leave their replacement rows visible. Unpartitioned manifests allow global key
+deletes across existing partition specs without rewriting historical files.
+Existing manifest references are retained in the new snapshot. The writer
+supports flat primitive scalar schemas; unsupported nested and decimal schemas
+fail admission explicitly instead of dropping fields or encoding JSON as text.
+
+An exact catalog commit request is saved before calling the authority. Recovery
+replays that request or resolves its identity; it cannot rebase an ambiguous
+outcome. Catalog commitment advances the source checkpoint and WAL coverage in
+one metadata transaction. Neither uploaded files nor WAL acceptance advance
+these committed watermarks. A conditional conflict can be retried against a new
+pinned metadata version only after the prior outcome is proven uncommitted.
+
+Catalog commits and accepted transactions wake the existing supervised index
+publication worker. Its periodic authoritative sweep recovers missed wakeups,
+external commits, and restarts, including writable tables without requested
+indexes. Each draining pass also publishes the resulting snapshot's matching
+text and predicate indexes, so a continuous producer cannot indefinitely starve
+search visibility. A published generation remains fenced by the source snapshot,
+schema, index recipes, credential identity, artifact store, and native table
+incarnation. Upload completion alone never makes indexes ready.
+
+The acceptance response contains `state: accepted`, `wal_lsn`, and
+`searchable: false`. The catalog properties `antfly.wal.coverage` and
+`antfly.cdc.checkpoint` expose committed progress; existing index readiness/status
+reports searchable publication. This release does not advertise an immediately
+searchable recent overlay: queries use the committed lake snapshot and matching
+published indexes. Adding immediate overlay visibility still needs the unified
+key/tombstone, ranking, and cursor semantics specified above. File compaction,
+reader-safe WAL/snapshot retention, vendor-specific CDC adapters beyond existing
+PostgreSQL, and notification subscription provisioning remain explicit follow-on
+work, not implicit side effects of this endpoint.
+
+The native formats follow the [Iceberg v2 specification](https://iceberg.apache.org/spec/)
+and [Parquet format definitions](https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift).
+Independent Arrow and PyIceberg readers qualify the emitted artifacts and catalog
+updates in the managed and REST HTTP tests.

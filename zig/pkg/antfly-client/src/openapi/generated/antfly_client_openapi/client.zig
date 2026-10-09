@@ -3058,6 +3058,19 @@ pub const Client = struct {
         return ApiResponse(types.LakeCatalogResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// ingestLakeChanges
+    /// POST /db/v1/tables/{tableName}/lake/changes
+    pub fn ingestLakeChanges(self: *@This(), table_name: []const u8, body: std.json.Value) !ApiResponse(std.json.Value) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lake/changes", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
     /// commitLakeCatalog
     /// POST /db/v1/tables/{tableName}/lake/commits
     pub fn commitLakeCatalog(self: *@This(), table_name: []const u8, body: types.LakeCatalogCommitRequest) !ApiResponse(types.LakeCatalogResponse) {

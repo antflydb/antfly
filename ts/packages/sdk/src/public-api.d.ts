@@ -15,15 +15,37 @@ export interface paths {
         };
         /**
          * getLakeCatalog
-         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files; they do not perform ordinary row mutations or imply index publication.
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
          */
         get: operations["getLakeCatalog"];
         put?: never;
         /**
          * initializeLakeCatalog
-         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files; they do not perform ordinary row mutations or imply index publication.
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
          */
         post: operations["initializeLakeCatalog"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/lake/changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * ingestLakeChanges
+         * @description Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and searchable index publication. Requires table admin permission and iceberg_writer policy.
+         */
+        post: operations["ingestLakeChanges"];
         delete?: never;
         options?: never;
         head?: never;
@@ -43,7 +65,7 @@ export interface paths {
         put?: never;
         /**
          * commitLakeCatalog
-         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files; they do not perform ordinary row mutations or imply index publication.
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
          */
         post: operations["commitLakeCatalog"];
         delete?: never;
@@ -66,7 +88,7 @@ export interface paths {
         };
         /**
          * getLakeCommitOutcome
-         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files; they do not perform ordinary row mutations or imply index publication.
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
          */
         get: operations["getLakeCommitOutcome"];
         put?: never;
@@ -21240,6 +21262,93 @@ export interface operations {
                 content?: never;
             };
             /** @description Catalog authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    ingestLakeChanges: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    batch_id: string;
+                    source: string;
+                    epoch: string;
+                    checkpoint: string;
+                    expected_checkpoint?: string | null;
+                    key_fields: string[];
+                    changes: {
+                        /** @enum {string} */
+                        op: "upsert" | "delete";
+                        row: {
+                            [key: string]: unknown;
+                        };
+                    }[];
+                };
+            };
+        };
+        responses: {
+            /** @description Durable WAL acceptance; retry the same transaction after an ambiguous response. Query visibility follows automatic publication. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        state?: string;
+                        /** Format: uint64 */
+                        wal_lsn?: number;
+                        searchable?: boolean;
+                    };
+                };
+            };
+            /** @description Invalid transaction or unsupported row type */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized ingestion */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Source, predecessor checkpoint or batch identity conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Durable ingestion unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;

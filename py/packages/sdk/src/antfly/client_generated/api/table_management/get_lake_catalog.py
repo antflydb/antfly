@@ -81,8 +81,9 @@ def sync_detailed(
     """getLakeCatalog
 
      Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require
-    table admin permission and iceberg_writer policy. These endpoints commit already prepared lake
-    files; they do not perform ordinary row mutations or imply index publication.
+    table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files
+    and automatically schedule matching index publication. A committed response does not imply that
+    those indexes are already searchable. Native row transactions use lake/changes.
 
     Args:
         table_name (str):
@@ -114,8 +115,9 @@ def sync(
     """getLakeCatalog
 
      Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require
-    table admin permission and iceberg_writer policy. These endpoints commit already prepared lake
-    files; they do not perform ordinary row mutations or imply index publication.
+    table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files
+    and automatically schedule matching index publication. A committed response does not imply that
+    those indexes are already searchable. Native row transactions use lake/changes.
 
     Args:
         table_name (str):
@@ -142,8 +144,9 @@ async def asyncio_detailed(
     """getLakeCatalog
 
      Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require
-    table admin permission and iceberg_writer policy. These endpoints commit already prepared lake
-    files; they do not perform ordinary row mutations or imply index publication.
+    table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files
+    and automatically schedule matching index publication. A committed response does not imply that
+    those indexes are already searchable. Native row transactions use lake/changes.
 
     Args:
         table_name (str):
@@ -173,8 +176,9 @@ async def asyncio(
     """getLakeCatalog
 
      Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require
-    table admin permission and iceberg_writer policy. These endpoints commit already prepared lake
-    files; they do not perform ordinary row mutations or imply index publication.
+    table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files
+    and automatically schedule matching index publication. A committed response does not imply that
+    those indexes are already searchable. Native row transactions use lake/changes.
 
     Args:
         table_name (str):

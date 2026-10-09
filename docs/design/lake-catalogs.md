@@ -69,9 +69,11 @@ qualification; it uses Antfly's bucket layout, rather than a raw PyIceberg files
 warehouse. Full file-producer/read qualification uses the S3 protocol. Local caches are disposable; they are not commit authority.
 
 `read_only` remains the default. `iceberg_writer` enables explicit catalog file
-commits; it does not enable ordinary row batch mutations. Declare the document
+commits and native transaction ingestion through `lake/changes`; ordinary table
+batch mutations keep their existing contract. Declare the document
 schema when creating an empty table. Initialization finalizes an `auto` schema
-fingerprint after metadata exists.
+fingerprint after metadata exists and advances the native schema version, so
+reopening an owner does not see a changed layout under the old version.
 
 ## API and commit lifecycle
 
@@ -85,6 +87,8 @@ All routes are under the existing Antfly API prefix:
   `expected_metadata_location` used to prepare the update.
 - `GET /tables/{tableName}/lake/commits/{commitId}?request_hash=...`: resolve a
   prior outcome without submitting another update.
+- `POST /tables/{tableName}/lake/changes`: durably accept a normalized CDC
+  transaction for native WAL-to-Parquet writing and searchable publication.
 
 Reads require table read permission; mutations require table admin permission
 and an explicit writer policy. Row-filtered identities cannot make table-wide
@@ -97,7 +101,8 @@ new plan. HTTP 202 is an unresolved outcome, not permission to rebase the old
 request. Retry the exact request or resolve its returned hash first.
 
 Successful catalog mutations return `state: lake_committed` and
-`searchable: false`. Index publication is a separate step. Initialization may
+`searchable: false`. Matching index publication is scheduled automatically,
+with a distinct completion fence. Initialization may
 return `binding_ready: false` if metadata committed but native schema binding
 could not be finalized; replay initialization to finish that binding.
 
@@ -119,16 +124,23 @@ markers; durable receipts preserve acknowledgement after later metadata changes.
 Replay is allowed only within the service's explicitly advertised
 `idempotency-key-lifetime`. Without that capability, an ambiguous outcome remains
 unknown unless a marker or receipt proves success. Absence of a marker never
-proves failure after another writer has advanced or expired metadata.
+proves failure after another writer has advanced or expired metadata. An
+original HTTP 409 rejection is persisted as durable non-commit proof before
+exposing a conflict; restart cannot accidentally replay that rejected request.
 
 ## Boundaries and next layers
 
 These backends implement catalog load, initialization, explicit file commit and
 outcome recovery. File producers still write Parquet and Iceberg manifests before
 committing them. Native SQL schemas and schema fingerprints remain explicit
-bindings; evolving a lake schema requires a coordinated native binding change. The native row-to-Parquet background writer, general CDC adapters,
-compaction/garbage collection and atomic searchable publication are separate
-layers of the ingestion plan. Iceberg v3 encryption and view updates are not
+bindings; evolving a lake schema requires a coordinated native binding change.
+The native transaction ingress now owns a segmented durable WAL, Parquet data
+and equality-delete files, Iceberg manifests, catalog commitment, and automatic
+matching index publication. See [the transaction envelope and recovery contracts](../plans/lake-ingestion-and-publication.md#native-transaction-ingestion-and-searchable-publication).
+Flat scalar schemas and one source epoch/key definition per table are supported.
+Vendor-specific CDC subscription adapters, compaction/garbage collection,
+coordinated schema evolution, and immediate recent-overlay search remain
+separate layers of the ingestion plan. Iceberg v3 encryption and view updates are not
 accepted by the managed v2 writer.
 
 The underlying protocol is the [Iceberg REST catalog specification](https://iceberg.apache.org/docs/latest/rest-protocol/),

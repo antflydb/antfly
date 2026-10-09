@@ -16,6 +16,8 @@
 pub const antfly_sources = @import("source_owner_physical.zig");
 
 test {
+    _ = @import("serverless/lake_wal.zig");
+    _ = @import("serverless/lake_ingestion.zig");
     _ = @import("api/sql_execution.zig");
     _ = @import("api/tables.zig");
     _ = @import("api/table_contract.zig");
