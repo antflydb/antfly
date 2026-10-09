@@ -510,16 +510,30 @@ pub const Cache = struct {
                 continue;
             }
 
-            // Own the key before publishing a map slot. An OOM must not
-            // leave an uninitialized pending entry for waiters or cleanup.
-            const owned_key = try copyKey(self.allocator, key);
-            errdefer self.allocator.free(owned_key.path);
-            const gop = try shard.pending_loads.getOrPutContextAdapted(self.allocator, key, KeyContext{}, KeyContext{});
-            std.debug.assert(!gop.found_existing);
-            gop.key_ptr.* = owned_key;
-            gop.value_ptr.* = .{};
+            try self.publishPendingLoadLocked(shard, key);
             return;
         }
+    }
+
+    /// Optional work never waits for a loader or the pending-map mutex.
+    pub fn tryBeginLoadWithBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, kind: Kind, block_offset: u64, block_len: u32) !bool {
+        const key = makeKey(path, run_id, generation, kind, block_offset, block_len);
+        const shard = self.shardForKey(key);
+        if (!shard.pending_sync.tryLock()) return false;
+        defer shard.pending_sync.unlock();
+        if (shard.pending_loads.getPtrAdapted(key, KeyContext{}) != null) return false;
+        try self.publishPendingLoadLocked(shard, key);
+        return true;
+    }
+
+    fn publishPendingLoadLocked(self: *Cache, shard: *Shard, key: Key) !void {
+        // Own the key before publishing a map slot. OOM leaves no pending owner.
+        const owned_key = try copyKey(self.allocator, key);
+        errdefer self.allocator.free(owned_key.path);
+        const gop = try shard.pending_loads.getOrPutContextAdapted(self.allocator, key, KeyContext{}, KeyContext{});
+        std.debug.assert(!gop.found_existing);
+        gop.key_ptr.* = owned_key;
+        gop.value_ptr.* = .{};
     }
 
     pub fn finishLoad(self: *Cache, path: []const u8, run_id: u64, generation: u64, kind: Kind) void {
@@ -1049,6 +1063,10 @@ const PendingSync = if (supports_waitable_pending)
         mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
         cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
 
+        fn tryLock(self: *@This()) bool {
+            return std.c.pthread_mutex_trylock(&self.mutex) == .SUCCESS;
+        }
+
         fn lock(self: *@This()) void {
             if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
         }
@@ -1068,6 +1086,10 @@ const PendingSync = if (supports_waitable_pending)
 else
     struct {
         mutex: std.atomic.Mutex = .unlocked,
+
+        fn tryLock(self: *@This()) bool {
+            return self.mutex.tryLock();
+        }
 
         fn lock(self: *@This()) void {
             _ = lockAtomic(&self.mutex);
@@ -1752,4 +1774,32 @@ test "lsm cache hot prefix promotion elects one concurrent owner and bounds expa
     var transient = try cache.putTransientRunTablePhysicalBlock("transient", 2, 1, 0, 1, try a.dupe(u8, "x"));
     defer transient.release();
     for (0..16) |_| try std.testing.expect(!transient.claimPointBlockPromotion(4096));
+}
+
+test "lsm cache optional load gate skips busy owners and mutexes" {
+    const a = std.testing.allocator;
+    var cache = try Cache.initFallible(a, 1024 * 1024);
+    defer cache.deinit();
+    try std.testing.expect(try cache.tryBeginLoadWithBlock("optional", 1, 1, .run_table_block, 10, 20));
+    try std.testing.expect(!try cache.tryBeginLoadWithBlock("optional", 1, 1, .run_table_block, 10, 20));
+    cache.finishLoadWithBlock("optional", 1, 1, .run_table_block, 10, 20);
+    const shard = cache.shardForKey(makeKey("optional", 1, 1, .run_table_block, 10, 20));
+    shard.pending_sync.lock();
+    const busy = cache.tryBeginLoadWithBlock("optional", 1, 1, .run_table_block, 10, 20);
+    shard.pending_sync.unlock();
+    try std.testing.expect(!try busy);
+    try std.testing.expectEqual(@as(u64, 0), cache.snapshotStats().run_table_block.waits);
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var c = try Cache.initFallible(alloc, 1024 * 1024);
+            defer c.deinit();
+            const started = c.tryBeginLoadWithBlock("optional", 1, 1, .run_table_block, 10, 20) catch |err| {
+                for (c.shards) |*part| try std.testing.expectEqual(@as(usize, 0), part.pending_loads.count());
+                return err;
+            };
+            try std.testing.expect(started);
+            c.finishLoadWithBlock("optional", 1, 1, .run_table_block, 10, 20);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{});
 }

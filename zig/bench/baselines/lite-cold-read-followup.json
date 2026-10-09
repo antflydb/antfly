@@ -295,6 +295,46 @@
         "retention_slice": "lsm_block_table_cache"
       },
       "scope": "Native Debug helper fixture, MemoryStorage, C result allocator; before uses repeated physical-cache reads on the comparison head, after enables automatic promotion and attaches a resource manager. Timing samples are indicative, not end-to-end throughput or a controlled production benchmark. Targeted cases cover construction/retention denial, optional cache allocation failure, small-cache and transient bypass, invalidation with pinned values, concurrent promoter election and retry cooldown."
+    },
+    "shared_async_warm_decoded_reuse": {
+      "comparison_commit": "64fdb4ade236ac9335c09bc2a142a75038231d2b",
+      "entries": 192,
+      "lookups": 10000,
+      "before": {
+        "standalone_lookup_ns_samples": [
+          250346000,
+          244721000
+        ],
+        "decoder_scratch_allocations": 20000,
+        "owned_result_allocations": 10000
+      },
+      "after": {
+        "standalone_lookup_ns_samples": [
+          60741000,
+          59844000,
+          59796000
+        ],
+        "batch_pool_lookup_ns_samples": [
+          70096000,
+          70158000,
+          70636000
+        ],
+        "decoder_scratch_allocations": 0,
+        "owned_result_allocations": 10000,
+        "new_physical_reads": 0
+      },
+      "scope": "Native Debug prepare/consume helper fixtures with an already cached decoded prefix block; C result allocator. After tests standalone production consumption and production batch-slot preparation/pool transfer, including cancellation and a one-byte read scratch budget. Before used instrumented mandatory scratch consumption. This is not end-to-end QPS or a soak."
+    },
+    "shared_async_crc_cleanup": {
+      "before_unowned_payload_bytes": 509,
+      "after_unowned_payload_bytes": 0,
+      "scope": "Checksum rejection after one-shot future transfers payload ownership; read cleanup runs before live-byte assertion."
+    },
+    "shared_optional_promotion_busy_gate": {
+      "before_returned_while_gate_held": false,
+      "after_returned_while_gate_held": true,
+      "after_cache_waits": 0,
+      "scope": "Eighth successful synchronous prefix lookup while an existing decoded loader holds the pending gate. Optional gate tests also cover busy mutex and allocation failure publication cleanup."
     }
   },
   "scope": "Deterministic allocation, directory traversal, admission, and isolated Debug timing fixtures, not query throughput or a 2 GiB soak. Caller-owned mutable values, captured read-layout pointer arrays, payload IO/cache ownership, and first-use overlay promotion still have costs. Directory planning and index metadata reuse bounded resource-charged arenas; async candidate metadata has fixed stack storage.",
