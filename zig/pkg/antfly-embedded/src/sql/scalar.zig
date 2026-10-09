@@ -2692,11 +2692,14 @@ const Binder = struct {
                         continue;
                     }
                     if (function == .@"$array" and arg.* == .literal and arg.literal == .string) {
-                        if (nested_constructor) {
-                            const coercion = try self.alloc.create(ast.Scalar);
-                            coercion.* = .{ .cast = .{ .operand = arg, .type = .array, .element_type = kind.element_type } };
-                            out.* = try self.compileArrayContext(coercion, .array, kind.element_type, depth + 1);
-                        } else out.* = try self.compileArrayContext(arg, desired, kind.element_type, depth + 1);
+                        // Unknown literals use the selected domain's input
+                        // function during binding, just like an explicit raw
+                        // literal cast. Keep that conversion in the program so
+                        // query execution and durable lowering share the same
+                        // bounded preparation and PostgreSQL error boundary.
+                        const coercion = try self.alloc.create(ast.Scalar);
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = desired.?, .element_type = kind.element_type } };
+                        out.* = try self.compileArrayContext(coercion, desired, kind.element_type, depth + 1);
                         continue;
                     }
                     if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
@@ -3511,23 +3514,19 @@ const Evaluator = struct {
             try self.charge(std.math.mul(usize, args.len, @sizeOf(Datum)) catch return error.SqlProgramLimitExceeded);
             break :blk try self.alloc.alloc(Datum, args.len);
         };
-        var dimensions: []const arrays.Dimension = &.{};
-        var seen = false;
-        var count: usize = 0;
+        var admitted: @import("../common/sql_array_layout.zig").StackShape = .{};
         for (args, children) |arg, *child| {
             child.* = try self.runDatum(arg, depth);
             const shape: []const arrays.Dimension = if (child.sql_null) &.{} else (child.array orelse return error.SqlTypeMismatch).dimensions;
-            if (seen) {
-                if (shape.len != dimensions.len) return error.SqlArraySubscriptError;
-                for (shape, dimensions) |actual, expected| if (actual.length != expected.length or actual.lower != expected.lower) return error.SqlArraySubscriptError;
-            } else {
-                seen = true;
-                dimensions = shape;
-            }
-            if (child.array) |array| count = std.math.add(usize, count, array.elements.len) catch return error.SqlProgramLimitExceeded;
+            var context = self.numericContext();
+            const before = context.remaining;
+            defer self.steps += @intCast(before - context.remaining);
+            try context.charge(1 + shape.len);
+            try admitted.append(shape);
         }
-        if (dimensions.len == 6 or count > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
-        const rank = if (count == 0) 0 else dimensions.len + 1;
+        const stacked = try admitted.finish((arrays.Limits{}).elements);
+        const count: usize = stacked.count;
+        const rank: usize = stacked.rank;
         const cell_bytes = std.math.mul(usize, count, @sizeOf(arrays.Element)) catch return error.SqlProgramLimitExceeded;
         try self.charge(cell_bytes + rank * @sizeOf(arrays.Dimension) + @sizeOf(arrays.Value));
         const cells = try self.alloc.alloc(arrays.Element, count);
@@ -3541,10 +3540,7 @@ const Evaluator = struct {
             }
         };
         const shape = try self.alloc.alloc(arrays.Dimension, rank);
-        if (rank != 0) {
-            shape[0] = .{ .length = std.math.cast(u32, args.len) orelse return error.SqlProgramLimitExceeded };
-            @memcpy(shape[1..], dimensions);
-        }
+        @memcpy(shape, stacked.axes[0..rank]);
         const value = try self.alloc.create(arrays.Value);
         var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
         const initial = work.remaining;

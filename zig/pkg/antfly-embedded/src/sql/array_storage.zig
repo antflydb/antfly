@@ -202,6 +202,108 @@ pub const Prepared = struct {
     }
 };
 
+/// Stack pinned, already canonical child frames into one canonical frame.
+/// This is not an ingress validator: views retain their owning row's trust
+/// and lifetime. Two bounded passes inspect NULL bits then copy payloads;
+/// neither decoded cell vectors nor JSON DOMs are constructed.
+pub fn stackCanonicalAlloc(a: A, kind: arrays.ElementType, parts: []const ?layout.View, options: Options) ![]u8 {
+    return stackCanonicalAdmitted(a, kind, parts, options) catch |err| return preparationError(options, err);
+}
+
+fn stackCanonicalAdmitted(a: A, kind: arrays.ElementType, parts: []const ?layout.View, options: Options) ![]u8 {
+    var work: arrays.Budget = .{ .remaining = options.values.work, .shared = options.context };
+    try work.consume(0);
+    var shape: layout.StackShape = .{};
+    var non_null: usize = 0;
+    var payload_bytes: usize = 0;
+    for (parts) |part| {
+        var axes: [layout.max_rank]arrays.Dimension = undefined;
+        const rank: usize = if (part) |view| view.rank else 0;
+        try work.consume(1 + rank);
+        if (part) |view| {
+            if (view.kind != kind) return error.SqlTypeMismatch;
+            for (axes[0..rank], 0..) |*axis, i| axis.* = try view.dimension(i);
+        }
+        try shape.append(axes[0..rank]);
+        if (shape.count > options.values.elements) return error.SqlProgramLimitExceeded;
+        if (part) |view| {
+            if (layout.width(kind) == 0) payload_bytes = std.math.add(usize, payload_bytes, view.bytes.len - view.payload_start) catch return error.SqlProgramLimitExceeded;
+            for (0..view.count) |i| {
+                try work.consume(1);
+                non_null += @intFromBool(!(try view.cell(i)).sql_null);
+            }
+        }
+    }
+    const stacked = try shape.finish(options.values.elements);
+    const count: usize = stacked.count;
+    const dimensions = stacked.axes[0..stacked.rank];
+    const compact = layout.usesCompact(kind, count, non_null);
+    const size = std.math.add(usize, try layout.encodedSectionSize(kind, dimensions.len, count, non_null), payload_bytes) catch return error.SqlProgramLimitExceeded;
+    if (size > options.wire_bytes or size > options.values.bytes or size > std.math.maxInt(u32)) return error.SqlProgramLimitExceeded;
+    const bytes = try a.alloc(u8, size);
+    errdefer a.free(bytes);
+    const bitmap_start = layout.header_size + dimensions.len * 8;
+    const slots_start = bitmap_start + layout.bitmapSize(count);
+    const width = layout.width(kind);
+    const values_start = slots_start + if (compact) layout.checkpointSize(count) else @as(usize, 0);
+    const payload_start = try layout.sectionSize(kind, dimensions.len, count);
+    // Clear metadata only. Every emitted value is copied once, while dense
+    // NULL slots are explicitly cleared below. Large payloads are not zeroed
+    // merely to overwrite them immediately with authenticated source bytes.
+    const clear_until = if (width == 0) payload_start else values_start;
+    var cleared: usize = 0;
+    while (cleared < clear_until) {
+        const end = cleared + @min(clear_until - cleared, 256);
+        try work.consume(end - cleared);
+        @memset(bytes[cleared..end], 0);
+        cleared = end;
+    }
+    bytes[0] = layout.version;
+    bytes[1] = @intCast(dimensions.len);
+    bytes[2] = @intFromBool(compact);
+    std.mem.writeInt(u32, bytes[4..8], @intCast(count), .little);
+    for (dimensions, 0..) |axis, i| {
+        std.mem.writeInt(u32, bytes[layout.header_size + i * 8 ..][0..4], axis.length, .little);
+        std.mem.writeInt(i32, bytes[layout.header_size + i * 8 + 4 ..][0..4], axis.lower, .little);
+    }
+    var index: usize = 0;
+    var emitted: usize = 0;
+    var payload_at: usize = 0;
+    for (parts) |part| if (part) |view| {
+        for (0..view.count) |i| {
+            try work.consume(1);
+            const cell = try view.cell(i);
+            if (compact and index % 64 == 0) std.mem.writeInt(u32, bytes[slots_start + index / 64 * 4 ..][0..4], @intCast(emitted), .little);
+            if (width == 0) std.mem.writeInt(u32, bytes[slots_start + index * 4 ..][0..4], @intCast(payload_at), .little);
+            if (cell.sql_null) {
+                bytes[bitmap_start + index / 8] |= @as(u8, 1) << @intCast(index % 8);
+                if (width != 0 and !compact) {
+                    try work.consume(width);
+                    @memset(bytes[values_start + index * width ..][0..width], 0);
+                }
+            } else {
+                const start = if (width == 0) payload_start + payload_at else values_start + (if (compact) emitted else index) * width;
+                var copied: usize = 0;
+                while (copied < cell.bytes.len) {
+                    const end = copied + @min(cell.bytes.len - copied, 256);
+                    try work.consume(end - copied);
+                    @memcpy(bytes[start + copied ..][0 .. end - copied], cell.bytes[copied..end]);
+                    copied = end;
+                }
+                if (width == 0) payload_at += cell.bytes.len;
+                emitted += 1;
+            }
+            index += 1;
+        }
+    };
+    std.debug.assert(index == count and emitted == non_null and payload_at == payload_bytes);
+    if (count != 0) {
+        if (compact) std.mem.writeInt(u32, bytes[slots_start + (count + 63) / 64 * 4 ..][0..4], @intCast(emitted), .little);
+        if (width == 0) std.mem.writeInt(u32, bytes[slots_start + count * 4 ..][0..4], @intCast(payload_at), .little);
+    }
+    return bytes;
+}
+
 pub fn encodeAlloc(a: A, value: arrays.Value, options: Options) ![]u8 {
     var prepared = try Prepared.init(a, value, options);
     defer prepared.deinit();
@@ -359,6 +461,68 @@ test "SQL flat stored arrays roundtrip PostgreSQL binary goldens with canonical 
     }
 }
 
+test "SQL flat array stacking copies canonical PostgreSQL domains without decoded cell vectors" {
+    const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
+    const a = std.testing.allocator;
+    const fixture = try std.json.parseFromSlice(Fixture, a, @embedFile("fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    const Faults = struct {
+        fn run(alloc: A, kind: arrays.ElementType, view: layout.View, expected: []const u8) !void {
+            const bytes = try stackCanonicalAlloc(alloc, kind, &.{ view, view }, .{});
+            defer alloc.free(bytes);
+            try std.testing.expectEqualSlices(u8, expected, bytes);
+        }
+    };
+    for (fixture.value.entries) |entry| {
+        const pg = try a.alloc(u8, entry.binary.len / 2);
+        defer a.free(pg);
+        _ = try std.fmt.hexToBytes(pg, entry.binary);
+        var original = try @import("array_binary.zig").decode(a, entry.element_type, pg, .{});
+        defer original.deinit();
+        const canonical = try encodeAlloc(a, original.value, .{});
+        defer a.free(canonical);
+        const view = try validateCanonical(a, entry.element_type, canonical, .{});
+        var shape: layout.StackShape = .{};
+        try shape.append(original.value.dimensions);
+        try shape.append(original.value.dimensions);
+        const stacked = try shape.finish(65536);
+        const cells = try a.alloc(arrays.Element, original.value.elements.len * 2);
+        defer a.free(cells);
+        @memcpy(cells[0..original.value.elements.len], original.value.elements);
+        @memcpy(cells[original.value.elements.len..], original.value.elements);
+        const value = try arrays.Value.init(entry.element_type, stacked.axes[0..stacked.rank], cells, .{});
+        const expected = try encodeAlloc(a, value, .{});
+        defer a.free(expected);
+        const actual = try stackCanonicalAlloc(a, entry.element_type, &.{ view, view }, .{});
+        defer a.free(actual);
+        _ = try validateCanonical(a, entry.element_type, actual, .{});
+        try std.testing.expectEqualSlices(u8, expected, actual);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Faults.run, .{ entry.element_type, view, expected });
+    }
+}
+
+test "SQL flat array stacking rejects incompatible shapes before output allocation" {
+    const a = std.testing.allocator;
+    var left = try @import("array_text.zig").decode(a, .int32, "[-2:-1]={1,NULL}", .{});
+    defer left.deinit();
+    var right = try @import("array_text.zig").decode(a, .int32, "{3,4}", .{});
+    defer right.deinit();
+    const one = try encodeAlloc(a, left.value, .{});
+    defer a.free(one);
+    const two = try encodeAlloc(a, right.value, .{});
+    defer a.free(two);
+    const l = try validateCanonical(a, .int32, one, .{});
+    const r = try validateCanonical(a, .int32, two, .{});
+    try std.testing.expectError(error.SqlArraySubscriptError, stackCanonicalAlloc(std.testing.failing_allocator, .int32, &.{ l, r }, .{}));
+    try std.testing.expectError(error.SqlArraySubscriptError, stackCanonicalAlloc(std.testing.failing_allocator, .int32, &.{ l, null }, .{}));
+    try std.testing.expectError(error.SqlTypeMismatch, stackCanonicalAlloc(std.testing.failing_allocator, .int64, &.{l}, .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, stackCanonicalAlloc(std.testing.failing_allocator, .int32, &.{ l, l }, .{ .values = .{ .elements = 3 } }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, stackCanonicalAlloc(std.testing.failing_allocator, .int32, &.{l}, .{ .wire_bytes = 8 }));
+    const empty = try stackCanonicalAlloc(a, .int32, &.{ null, null }, .{});
+    defer a.free(empty);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0, 0, 0, 0 }, empty);
+}
+
 test "SQL flat stored array ownership and strict validation clean up every allocation failure" {
     const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
     const Faults = struct {
@@ -387,6 +551,58 @@ test "SQL flat stored array ownership and strict validation clean up every alloc
         defer original.deinit();
         try std.testing.checkAllAllocationFailures(a, Faults.run, .{original.value});
     }
+}
+
+test "SQL flat array stacking bounds sparse storage work and cancellation after allocation" {
+    const a = std.testing.allocator;
+    const cells = try a.alloc(arrays.Element, 32768);
+    defer a.free(cells);
+    @memset(cells, .{});
+    cells[12345] = arrays.Element.json(.{ .integer = 42 });
+    const source = try encodeAlloc(a, .{ .element_type = .int64, .dimensions = &.{.{ .length = 32768, .lower = -7 }}, .elements = cells }, .{});
+    defer a.free(source);
+    const view = try layout.View.open(.int64, source, .{});
+    var counted = std.testing.FailingAllocator.init(a, .{});
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    const result = try stackCanonicalAlloc(counted.allocator(), .int64, &.{ view, view }, .{});
+    defer counted.allocator().free(result);
+    const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started;
+    try std.testing.expectEqual(@as(usize, 1), counted.alloc_index);
+    try std.testing.expectEqual(result.len, counted.allocated_bytes);
+    try std.testing.expect(result.len < 16 * 1024);
+    const output = try validateCanonical(a, .int64, result, .{});
+    try std.testing.expectEqual(@as(usize, 65536), output.count);
+    try std.testing.expectEqual(@as(u32, 2), (try output.dimension(0)).length);
+    try std.testing.expectEqual(@as(i32, -7), (try output.dimension(1)).lower);
+    try std.testing.expectEqual(@as(i64, 42), std.mem.readInt(i64, (try output.cell(12345)).bytes[0..8], .little));
+    try std.testing.expectEqual(@as(i64, 42), std.mem.readInt(i64, (try output.cell(32768 + 12345)).bytes[0..8], .little));
+    try std.testing.expect((try output.cell(0)).sql_null);
+    var denied = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var parent: @import("numeric_value.zig").Context = .{ .alloc = a };
+    try std.testing.expectError(error.OutOfMemory, stackCanonicalAlloc(denied.allocator(), .int64, &.{ view, view }, .{ .context = &parent }));
+    try std.testing.expect(parent.failure == null);
+    var memory: MemoryBudget = .{ .backing = a, .limit = 16 * 1024 };
+    const Cancel = struct {
+        memory: *MemoryBudget,
+        saw_output: bool = false,
+        fn poll(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.memory.live != 0) {
+                self.saw_output = true;
+                return error.Canceled;
+            }
+        }
+    };
+    var cancel: Cancel = .{ .memory = &memory };
+    parent = .{ .alloc = a, .checkpoint = Cancel.poll, .ptr = &cancel };
+    try std.testing.expectError(error.Canceled, stackCanonicalAlloc(memory.allocator(), .int64, &.{ view, view }, .{ .context = &parent }));
+    try std.testing.expect(cancel.saw_output);
+    try std.testing.expectEqual(@as(usize, 0), memory.live);
+    try std.testing.expectError(error.Canceled, parent.charge(0));
+    parent = .{ .alloc = a, .remaining = 0 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, stackCanonicalAlloc(memory.allocator(), .int64, &.{ view, view }, .{ .context = &parent }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, parent.charge(0));
+    std.debug.print("SQL canonical array stack: cells=65536 stored_bytes={} output_allocations=1 decoded_cells=0 elapsed_ns={}\n", .{ result.len, elapsed });
 }
 
 test "SQL flat array dense compact rank directories agree across bitmap and checkpoint boundaries" {

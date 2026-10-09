@@ -21,6 +21,39 @@ and deliberate rejections must be distinguished.
 
 ## Provenance and scope
 
+### Durable ARRAY constructor architecture
+
+The shared binder records unknown-literal constructor coercions as mandatory,
+bounded input-function preparation. Durable lowering consumes those exact
+prepared values, rather than introducing permissive runtime text casts or
+reparsing literals for each row. Typed NULL acquires its destination domain.
+The native `array` opcode evaluates children once and admits zero to 32
+arguments under the enclosing expression's work, cancellation and byte limits.
+Scalar constructors encode canonical typed cells directly. Nested constructors
+stack pinned canonical frames with one output allocation, without a decoded
+cell vector or JSON round trip. Shared shape validation preserves PostgreSQL
+dimension/lower-bound agreement, empty/NULL subarray behavior and rank limits.
+
+`generate_sql_array_constructor_reference.py` independently verifies 27
+PostgreSQL values/types/SQLSTATEs. Native tests compare exact canonical bytes
+across query execution, pinned values, JSON ingress and cold AROW rows, and
+exercise non-NULL defaults, generated columns and CHECKs. Allocation-fault
+sweeps cover lowering and native execution. Sparse stacking emits a
+65,536-element result in 12,332 bytes with exactly one output allocation and
+no decoded output cells; cancellation after allocation frees the output and
+remains sticky. This is structural memory evidence, not a production latency
+claim. Constructor-bearing schemas and catalogs require capability 25, even
+with no array column and a scalar CHECK result; older array-only programs retain
+their independent capability 24 contract. Generated public clients retain
+constructor identity and explicit literal NULL values.
+
+Dynamic JSONB scalar construction, element-changing durable array casts, and
+array-valued ordered index keys remain guarded. These architectural and
+component proofs do not activate original corpus cases or change the audited
+448 implemented / 136 rejected / 73 superseded / 929 unresolved dispositions.
+
+### Compatibility standard
+
 PostgreSQL is the SQL compatibility standard for this work. Its behavior governs
 syntax, type coercion, result types, SQL NULL semantics, ordering, JSON/array
 operations and mutations. Historical source plans and SQLite results do not

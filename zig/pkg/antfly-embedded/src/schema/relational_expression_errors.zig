@@ -17,6 +17,7 @@
 //! Resource/provider failures are intentionally absent from this allowlist.
 pub const Error = error{
     SqlFeatureNotSupported,
+    SqlArraySubscriptError,
     RelationalExpressionOverflow,
     RelationalExpressionDivisionByZero,
     RelationalExpressionBudgetExceeded,

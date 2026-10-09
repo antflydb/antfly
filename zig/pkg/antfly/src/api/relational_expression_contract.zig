@@ -100,6 +100,7 @@ fn visit(value: std.json.Value, depth: usize, nodes: *usize) bool {
     if (value.object.get("sql_type")) |identity| {
         if (identity != .string or std.meta.stringToEnum(wire.SQLBuiltinType, identity.string) == null) return false;
     }
+    if (op == .array and value.object.get("sql_type") == null) return false;
     switch (op) {
         .literal => {
             const kind = value.object.get("type") orelse return false;
@@ -151,8 +152,8 @@ pub fn validType(value: std.json.Value) bool {
 /// This changes transport spelling only; native typed fingerprints are equal.
 pub fn canonicalizeOwnedExpression(alloc: std.mem.Allocator, expression: *wire.RelationalScalarExpression) !void {
     if (expression.op == .literal) {
-        if (expression.type) |kind| if (expression.value) |value| {
-            expression.value = try canonicalLiteral(alloc, kind, value);
+        if (expression.type) |kind| if (expression.value == .value) {
+            expression.value = .{ .value = try canonicalLiteral(alloc, kind, expression.value.value) };
         };
     }
     if (expression.args) |args| for (@constCast(args)) |*child| try canonicalizeOwnedExpression(alloc, child);
@@ -291,6 +292,10 @@ test "relational declarations public array casts preserve typed NULL and NUMERIC
 test "relational declarations public expression grammar shares typed array numeric CASE and IN shapes" {
     const a = std.testing.allocator;
     for ([_][]const u8{
+        \\{"op":"array","sql_type":"int32","args":[]}
+        ,
+        \\{"op":"array","sql_type":"numeric","args":[{"op":"literal","type":"numeric","sql_type":"numeric","value":"12.345"},{"op":"literal","type":"numeric","sql_type":"numeric","value":null}]}
+        ,
         \\{"op":"literal","type":"sql_array","sql_type":"int64"}
         ,
         \\{"op":"literal","type":"sql_array","sql_type":"int64","value":{"dimensions":[{"length":1,"lower_bound":-2}],"values":["9007199254740993"],"sql_nulls":[false]}}
@@ -305,7 +310,7 @@ test "relational declarations public expression grammar shares typed array numer
         defer parsed.deinit();
         try std.testing.expect(valid(parsed.value));
         const op = parsed.value.object.get("op").?.string;
-        const expected: ColumnKind = if (std.mem.eql(u8, op, "cast")) .numeric else if (std.mem.eql(u8, op, "literal")) .sql_array else if (std.mem.eql(u8, op, "case_when")) .integer else .boolean;
+        const expected: ColumnKind = if (std.mem.eql(u8, op, "cast")) .numeric else if (std.mem.eql(u8, op, "literal") or std.mem.eql(u8, op, "array")) .sql_array else if (std.mem.eql(u8, op, "case_when")) .integer else .boolean;
         var plan = try expressions.Plan.init(a, .{}, parsed.value, expected);
         defer plan.deinit();
         var arena = std.heap.ArenaAllocator.init(a);
@@ -313,6 +318,10 @@ test "relational declarations public expression grammar shares typed array numer
         _ = try plan.evaluate(arena.allocator(), &.{});
     }
     for ([_][]const u8{
+        \\{"op":"array","args":[]}
+        ,
+        \\{"op":"array","sql_type":"int32","args":[],"value":null}
+        ,
         \\{"op":"literal","type":"sql_array"}
         ,
         \\{"op":"literal","type":"sql_array","sql_type":"bad"}
@@ -340,11 +349,11 @@ test "relational declarations canonical public expression copy preserves borrowe
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const source: wire.RelationalScalarExpression = .{ .op = .add, .args = &.{
-        .{ .op = .literal, .type = .integer, .value = .{ .number_string = "9007199254740993" } },
-        .{ .op = .literal, .type = .integer, .value = .{ .number_string = "1" } },
+        .{ .op = .literal, .type = .integer, .value = .{ .value = .{ .number_string = "9007199254740993" } } },
+        .{ .op = .literal, .type = .integer, .value = .{ .value = .{ .number_string = "1" } } },
     } };
     const copy = try cloneCanonicalExpression(arena.allocator(), source);
-    try std.testing.expectEqualStrings("9007199254740993", source.args.?[0].value.?.number_string);
-    try std.testing.expectEqualStrings("9007199254740993", copy.args.?[0].value.?.string);
-    try std.testing.expectEqualStrings("1", copy.args.?[1].value.?.number_string);
+    try std.testing.expectEqualStrings("9007199254740993", source.args.?[0].value.value.number_string);
+    try std.testing.expectEqualStrings("9007199254740993", copy.args.?[0].value.value.string);
+    try std.testing.expectEqualStrings("1", copy.args.?[1].value.value.number_string);
 }

@@ -147,6 +147,7 @@ pub const Catalog = struct {
             if (self.schema_format_version < 22 and schema.requires_exact_numeric_validation) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 23 and schema.requires_numeric_modifiers) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 24 and schema.requires_array_expressions) return error.UnsupportedTableCapabilityVersion;
+            if (self.schema_format_version < 25 and schema.requires_array_constructors) return error.UnsupportedTableCapabilityVersion;
             if (self.schema_format_version < 20) for (schema.relational_columns) |column| {
                 if (column.column_type == .numeric or column.sql_element_type == .numeric) return error.UnsupportedTableCapabilityVersion;
             };
@@ -191,6 +192,10 @@ test "relational index system catalog fences array programs independently of phy
     table.requires_array_expressions = false;
     try catalog.validateForSchema(table);
     table.requires_array_expressions = true;
+    catalog.schema_format_version = 24;
+    try catalog.validateForSchema(table);
+    table.requires_array_constructors = true;
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, catalog.validateForSchema(table));
     catalog.schema_format_version = schema_mod.storage_format_version;
     try catalog.validateForSchema(table);
     const restored = try Catalog.decode(&catalog.encode());

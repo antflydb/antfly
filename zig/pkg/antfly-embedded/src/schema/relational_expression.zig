@@ -416,7 +416,7 @@ fn numericJsonOutput(execution: *Execution, bytes: []const u8) !std.json.Value {
     return scratch.json(parsed.value) catch |err| return scratch.failure(err);
 }
 
-pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list };
+pub const Op = enum { literal, column, add, subtract, multiply, divide, modulo, negate, concat, coalesce, lower_ascii, upper_ascii, eq, ne, gt, gte, lt, lte, is_null, is_not_null, is_distinct, is_not_distinct, @"and", @"or", not, cast, case_when, in_list, not_in_list, array };
 
 /// Shared structural grammar for public prechecks and typed compilation.
 /// These rules grant no column/type authority; the pinned compiler owns that.
@@ -426,6 +426,7 @@ pub fn acceptsField(op: Op, name: []const u8) bool {
         .literal => std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "value") or std.mem.eql(u8, name, "sql_type"),
         .column => std.mem.eql(u8, name, "column"),
         .cast => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "numeric_modifier"),
+        .array => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
         .add, .subtract, .multiply, .divide, .modulo, .negate => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
         else => std.mem.eql(u8, name, "args") or (isComparison(op) and std.mem.eql(u8, name, "collation")),
     };
@@ -434,6 +435,7 @@ pub fn acceptsField(op: Op, name: []const u8) bool {
 pub fn acceptsArity(op: Op, count: usize) bool {
     return switch (op) {
         .literal, .column => false,
+        .array => count <= 32,
         .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast => count == 1,
         .concat, .coalesce, .@"and", .@"or", .in_list, .not_in_list => count >= 2 and count <= 32,
         .case_when => count >= 3 and count <= 31 and count % 2 == 1,
@@ -557,12 +559,69 @@ pub const Plan = struct {
         };
     }
 
+    fn evaluateArray(self: *const Plan, execution: *Execution, source: Source, node: Node) !Value {
+        const arrays = @import("../sql/array_value.zig");
+        const storage = @import("../sql/array_storage.zig");
+        const kind = node.sql_type.?;
+        if (node.children.len != 0 and self.nodes[node.children[0]].kind == .sql_array) {
+            var parts: [32]?storage.layout.View = undefined;
+            for (node.children, parts[0..node.children.len]) |child, *part| {
+                const value = try self.evaluateNode(execution, source, child);
+                part.* = if (value == .null) null else if (value == .sql_array and value.sql_array.element_type == kind) try value.sql_array.view() else return error.InvalidRelationalExpressionInput;
+            }
+            var memory: @import("../sql/memory_budget.zig") = .{ .backing = execution.alloc, .limit = execution.bytes.*, .monotonic = true };
+            defer execution.bytes.* -|= memory.footprint();
+            const bytes = storage.stackCanonicalAlloc(memory.allocator(), kind, parts[0..node.children.len], .{
+                .context = &execution.numeric,
+                .values = .{ .bytes = execution.bytes.* },
+                .wire_bytes = max_output_bytes,
+            }) catch |err| return if (err == error.OutOfMemory and memory.isExhausted()) execution.limit() else executionFailure(err);
+            return .{ .sql_array = .{ .element_type = kind, .bytes = bytes } };
+        }
+        // Scalar constructors have at most 32 arguments. Keep their descriptors
+        // on the stack; only exact coefficients need bounded temporary limbs.
+        var values: [32]Value = undefined;
+        for (node.children, values[0..node.children.len]) |child, *value| value.* = try self.evaluateNode(execution, source, child);
+        var scratch: NumericScratch = undefined;
+        scratch.init(execution);
+        defer scratch.deinit();
+        var cells: [32]arrays.Element = undefined;
+        var numbers: [32]exact.Value = undefined;
+        for (values[0..node.children.len], 0..) |value, i| {
+            cells[i] = switch (value) {
+                .null => .{},
+                .integer => |integer| arrays.Element.json(.{ .integer = integer }),
+                .number => |number| arrays.Element.json(.{ .float = number }),
+                .boolean => |boolean| arrays.Element.json(.{ .bool = boolean }),
+                .string => |text| arrays.Element.json(.{ .string = text }),
+                .numeric => |bytes| blk: {
+                    numbers[i] = (binary.decodeCanonical(&execution.numeric, bytes) catch |err| return scratch.failure(err)).value;
+                    break :blk arrays.Element.typedNumeric(&numbers[i]);
+                },
+                else => return error.InvalidRelationalExpressionInput,
+            };
+        }
+        const dimensions = [_]arrays.Dimension{.{ .length = @intCast(node.children.len) }};
+        var prepared = storage.Prepared.init(scratch.arena.allocator(), .{
+            .element_type = kind,
+            .dimensions = if (node.children.len == 0) &.{} else &dimensions,
+            .elements = cells[0..node.children.len],
+        }, .{ .context = &execution.numeric, .values = .{ .bytes = execution.bytes.* }, .wire_bytes = max_output_bytes }) catch |err| return scratch.failure(err);
+        defer prepared.deinit();
+        if (prepared.encoded_size > execution.bytes.* -| scratch.memory.footprint()) return execution.limit();
+        const bytes = allocateOutput(execution.alloc, prepared.encoded_size, execution.bytes) catch |err| return scratch.failure(err);
+        errdefer execution.alloc.free(bytes);
+        prepared.writeInto(bytes) catch |err| return scratch.failure(err);
+        return .{ .sql_array = .{ .element_type = kind, .bytes = bytes } };
+    }
+
     fn evaluateNode(self: *const Plan, execution: *Execution, source: Source, index: u16) anyerror!Value {
         try execution.numeric.charge(1);
         const alloc = execution.alloc;
         const budget = execution.bytes;
         const node = self.nodes[index];
         if (node.op == .literal) return node.literal;
+        if (node.op == .array) return self.evaluateArray(execution, source, node);
         if (node.op == .column) {
             const value: Value = switch (source) {
                 .values => |values| if (node.ordinal < values.len) values[node.ordinal] else return error.InvalidRelationalExpressionInput,
@@ -1256,6 +1315,39 @@ test "relational declarations SQL array DDL publishes precise generated domains 
     try validator.execution.expressions.?.verifyJson(r, document.value);
 }
 
+test "relational declarations SQL ARRAY constructors activate defaults generated columns and CHECKs" {
+    const a = std.testing.allocator;
+    var parsed = try @import("../sql/compiler.zig").compile(a, "CREATE TABLE array_constructors (n integer, a integer[] DEFAULT ARRAY[1,NULL,2], g integer[] GENERATED ALWAYS AS (ARRAY[n,NULL,n+1]) STORED, matrix integer[] GENERATED ALWAYS AS (ARRAY[ARRAY[n,NULL],ARRAY[n+1,n+2]]) STORED, CHECK (g = ARRAY[n,NULL,n+1]))", .{});
+    defer parsed.deinit();
+    const json = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, parsed.statement.create_table);
+    defer a.free(json);
+    var validator = try @import("mod.zig").CompiledTableValidator.init(a, json);
+    defer validator.deinit(a);
+    const runtime = try @import("mod.zig").deriveRuntimeTableSchema(a, validator.schema);
+    defer schema.freeSchema(a, runtime);
+    try std.testing.expect(runtime.requires_array_expressions);
+    try std.testing.expect(runtime.requires_array_constructors);
+    var document = try std.json.parseFromSlice(std.json.Value, a, "{\"n\":12}", .{});
+    defer document.deinit();
+    const r = document.arena.allocator();
+    try validator.execution.expressions.?.applyJson(r, &document.value);
+    const arrays = @import("../sql/array_value.zig");
+    for ([_]struct { name: []const u8, text: []const u8 }{
+        .{ .name = "a", .text = "{1,NULL,2}" },
+        .{ .name = "g", .text = "{12,NULL,13}" },
+        .{ .name = "matrix", .text = "{{12,NULL},{13,14}}" },
+    }) |expected| {
+        var decoded = try @import("../sql/array_wire.zig").decode(r, .int32, document.value.object.get(expected.name).?, .{});
+        defer decoded.deinit();
+        var reference = try @import("../sql/array_text.zig").decode(r, .int32, expected.text, .{});
+        defer reference.deinit();
+        var work: arrays.Budget = .{};
+        try std.testing.expectEqual(std.math.Order.eq, try decoded.value.compare(reference.value, &work));
+    }
+    try std.testing.expectEqual(@as(?usize, null), try validator.execution.checks.?.firstViolationJson(r, document.value));
+    try validator.execution.expressions.?.verifyJson(r, document.value);
+}
+
 test "relational declarations typed array JSON adapter owns canonical PostgreSQL values and unwinds faults" {
     const a = std.testing.allocator;
     const arrays = @import("../sql/array_value.zig");
@@ -1705,6 +1797,28 @@ const Compiler = struct {
                     self.frame(&identity);
                 }
             },
+            .array => {
+                const identity = input.object.get("sql_type") orelse return error.InvalidRelationalExpressionType;
+                if (identity != .string) return error.InvalidRelationalExpressionType;
+                const kind = std.meta.stringToEnum(Numeric, identity.string) orelse return error.InvalidRelationalExpressionType;
+                const args = input.object.get("args") orelse return error.InvalidRelationalExpression;
+                if (args != .array or !acceptsArity(op, args.array.items.len)) return error.InvalidRelationalExpression;
+                const children = try self.alloc.alloc(u16, args.array.items.len);
+                for (args.array.items, children) |arg, *child| child.* = try self.compile(arg, depth + 1);
+                const nested = children.len != 0 and self.nodes.items[children[0]].kind == .sql_array;
+                for (children) |child| {
+                    const operand = self.nodes.items[child];
+                    if (nested) {
+                        if (operand.kind != .sql_array or operand.sql_type != kind) return error.InvalidRelationalExpressionType;
+                    } else {
+                        if (operand.kind != arrayScalarKind(kind)) return error.InvalidRelationalExpressionType;
+                        if ((operand.kind == .integer or operand.kind == .number or operand.kind == .numeric) and numericIdentity(operand) != kind) return error.InvalidRelationalExpressionType;
+                    }
+                }
+                self.hash.update(&.{@intCast(children.len)});
+                node.kind = .sql_array;
+                node.children = children;
+            },
             else => {
                 const args = input.object.get("args") orelse return error.InvalidRelationalExpression;
                 if (args != .array) return error.InvalidRelationalExpression;
@@ -1794,6 +1908,17 @@ const Compiler = struct {
         return index;
     }
 };
+
+fn arrayScalarKind(kind: Numeric) Kind {
+    return switch (kind) {
+        .int16, .int32, .int64 => .integer,
+        .float32, .float64 => .number,
+        .numeric => .numeric,
+        .boolean => .boolean,
+        .text, .uuid => .string,
+        .jsonb => .json,
+    };
+}
 
 fn numericIdentity(node: Node) Numeric {
     return node.sql_type orelse if (node.kind == .integer) .int64 else if (node.kind == .numeric) .numeric else .float64;

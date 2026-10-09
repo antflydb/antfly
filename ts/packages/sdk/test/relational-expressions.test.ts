@@ -20,6 +20,36 @@ describe("relational expression structural admission", () => {
     value,
   });
 
+  it("admits bounded typed constructors and array identity/modifier casts", () => {
+    expect(() => validate({ op: "array", sql_type: "int32", args: [] })).not.toThrow();
+    expect(() => validate({ op: "array", sql_type: "int32", args: [integer] })).not.toThrow();
+    expect(() =>
+      validate({ op: "array", sql_type: "int32", args: Array(32).fill(integer) })
+    ).not.toThrow();
+    expect(() =>
+      validate({ op: "array", sql_type: "int64", args: [array(), array()] })
+    ).not.toThrow();
+    expect(() =>
+      validate({ op: "cast", type: "sql_array", sql_type: "int64", args: [array()] })
+    ).not.toThrow();
+    expect(() =>
+      validate({
+        op: "cast",
+        type: "sql_array",
+        sql_type: "numeric",
+        numeric_modifier: { precision: 4, scale: 2 },
+        args: [array(null, "numeric")],
+      })
+    ).not.toThrow();
+    for (const value of [
+      { op: "array", args: [] },
+      { op: "array", sql_type: "unknown", args: [] },
+      { op: "array", sql_type: "int32", args: Array(33).fill(integer) },
+      { op: "array", sql_type: "int32", args: [], value: null },
+    ])
+      expect(() => validate(value)).toThrow(TypeError);
+  });
+
   it.each([
     "text",
     "int16",

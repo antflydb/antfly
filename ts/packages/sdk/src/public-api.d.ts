@@ -13705,7 +13705,7 @@ export interface components {
             aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
-        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list";
+        RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not" | "cast" | "case_when" | "modulo" | "in_list" | "not_in_list" | "array";
         /** @enum {string} */
         RelationalExpressionType: "string" | "blob" | "boolean" | "datetime" | "integer" | "number" | "numeric" | "sql_array";
         /**
@@ -13782,6 +13782,16 @@ export interface components {
          *     and shares invocation admission with the surrounding expression.
          *     Array-valued ordered index keys and element-changing array casts are
          *     not supported by this expression contract.
+         *     The array constructor requires sql_type and zero to 32 arguments.
+         *     Constructor programs additionally require reader capability version 25,
+         *     including constructors hidden inside scalar/boolean expressions.
+         *     Scalar arguments must have the declared element domain, with explicit
+         *     width-preserving numeric casts where needed. SQL NULL arguments become
+         *     NULL elements. Array arguments must all have matching element types,
+         *     dimensions and lower bounds; one leading dimension with lower bound 1
+         *     is added. All empty/NULL subarrays produce an empty array; mixing an
+         *     empty/NULL subarray with a nonempty one is a dimension mismatch. Child
+         *     expressions execute once, with shared work/cancellation and byte limits.
          *     case_when takes alternating boolean conditions and result expressions,
          *     followed by a mandatory fallback result (3 to 31 arguments, at most
          *     15 branches). Conditions are evaluated in order; only the selected

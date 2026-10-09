@@ -98,6 +98,49 @@ pub const Shape = struct {
     compact: bool,
 };
 
+/// Allocation-free PostgreSQL multidimensional ARRAY shape admission. NULL
+/// subarrays have rank zero, just like empty subarrays. Callers charge each
+/// bounded (at most six-axis) append against their own invocation work owner.
+pub const StackShape = struct {
+    axes: [max_rank]Dimension = @splat(.{ .length = 0 }),
+    rank: ?usize = null,
+    parts: usize = 0,
+    count: usize = 0,
+
+    pub fn append(self: *StackShape, dimensions: []const Dimension) !void {
+        if (dimensions.len > max_rank) return error.SqlProgramLimitExceeded;
+        if (self.rank) |rank| {
+            if (rank != dimensions.len) return error.SqlArraySubscriptError;
+            for (dimensions, self.axes[0..rank]) |actual, expected| {
+                if (actual.length != expected.length or actual.lower != expected.lower) return error.SqlArraySubscriptError;
+            }
+        } else {
+            self.rank = dimensions.len;
+            @memcpy(self.axes[0..dimensions.len], dimensions);
+        }
+        var count: usize = @intFromBool(dimensions.len != 0);
+        for (dimensions) |axis| {
+            if (axis.length == 0) return error.InvalidSqlArrayShape;
+            if (axis.length > std.math.maxInt(i32) or @as(i64, axis.lower) + axis.length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
+            count = std.math.mul(usize, count, axis.length) catch return error.SqlProgramLimitExceeded;
+        }
+        self.parts = std.math.add(usize, self.parts, 1) catch return error.SqlProgramLimitExceeded;
+        self.count = std.math.add(usize, self.count, count) catch return error.SqlProgramLimitExceeded;
+    }
+
+    pub fn finish(self: StackShape, elements: usize) !Shape {
+        var result: Shape = .{ .rank = 0, .count = 0, .axes = @splat(.{ .length = 0 }), .compact = false };
+        if (self.count == 0) return result;
+        const rank = self.rank orelse return error.InvalidSqlArrayShape;
+        if (rank == max_rank or self.count > elements or self.count > std.math.maxInt(i32) or self.parts >= std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
+        result.rank = @intCast(rank + 1);
+        result.count = @intCast(self.count);
+        result.axes[0] = .{ .length = @intCast(self.parts) };
+        @memcpy(result.axes[1..][0..rank], self.axes[0..rank]);
+        return result;
+    }
+};
+
 /// Header-only projection for an already authenticated row. O(rank), no cell
 /// scan or allocation. This proves addressing extents, not payload canonicality;
 /// untrusted publication/restore must also use View.open and JSONB validation.

@@ -4,6 +4,7 @@ from enum import StrEnum
 class RelationalExpressionOp(StrEnum):
     ADD = "add"
     AND = "and"
+    ARRAY = "array"
     CASE_WHEN = "case_when"
     CAST = "cast"
     COALESCE = "coalesce"

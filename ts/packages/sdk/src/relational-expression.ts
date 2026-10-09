@@ -3,6 +3,7 @@ import type { RelationalExpressionOp, RelationalExpressionType, SQLBuiltinType }
 const arities: Record<RelationalExpressionOp, readonly [number, number]> = {
   literal: [0, 0],
   column: [0, 0],
+  array: [0, 32],
   add: [2, 2],
   subtract: [2, 2],
   multiply: [2, 2],
@@ -224,7 +225,7 @@ export function validateRelationalExpression(
           ? ["op", "column"]
           : op === "cast"
             ? ["op", "type", "sql_type", "numeric_modifier", "args"]
-            : numericOperations.has(op)
+            : numericOperations.has(op) || op === "array"
               ? ["op", "args", "sql_type"]
               : comparisons.has(op)
                 ? ["op", "args", "collation"]
@@ -233,9 +234,11 @@ export function validateRelationalExpression(
     for (const key of Object.keys(node))
       if (!allowed.has(key)) throw new TypeError(`${location}.${key} is not valid for ${op}`);
     const arrayLiteral = op === "literal" && node.type === "sql_array";
-    if (arrayLiteral && (typeof node.sql_type !== "string" || !arrayIdentities.has(node.sql_type)))
+    const arrayDomain =
+      arrayLiteral || op === "array" || (op === "cast" && node.type === "sql_array");
+    if (arrayDomain && (typeof node.sql_type !== "string" || !arrayIdentities.has(node.sql_type)))
       throw new TypeError(`${location}.sql_type requires a supported SQL array element identity`);
-    if (node.sql_type !== undefined && !arrayLiteral) {
+    if (node.sql_type !== undefined && !arrayDomain) {
       const integer = typeof node.sql_type === "string" && integerIdentities.has(node.sql_type);
       const floating = typeof node.sql_type === "string" && floatIdentities.has(node.sql_type);
       const exact = node.sql_type === "numeric";
@@ -255,7 +258,7 @@ export function validateRelationalExpression(
     if (Object.prototype.hasOwnProperty.call(node, "numeric_modifier")) {
       const modifier = node.numeric_modifier;
       if (
-        node.type !== "numeric" ||
+        (node.type !== "numeric" && node.type !== "sql_array") ||
         node.sql_type !== "numeric" ||
         modifier === null ||
         typeof modifier !== "object" ||
@@ -344,6 +347,14 @@ export function validateRelationalExpression(
       );
     if (op === "case_when" && node.args.length % 2 !== 1)
       throw new TypeError(`${location}.args requires condition/result pairs and a fallback`);
+    if (op === "cast" && node.type === "sql_array") {
+      const child = node.args[0];
+      if (child !== null && typeof child === "object" && !Array.isArray(child)) {
+        const type = (child as Record<string, unknown>).type;
+        if (type !== undefined && type !== "sql_array")
+          throw new TypeError(`${location}.args requires an SQL array operand`);
+      }
+    }
     node.args.forEach((child, index) => {
       visit(child, `${location}.args[${index}]`, depth + 1);
     });

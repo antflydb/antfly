@@ -4,6 +4,24 @@ from antfly.client_generated.models.relational_expression_type import Relational
 from antfly.client_generated.models.sql_builtin_type import SQLBuiltinType
 
 
+def test_generated_array_constructor_preserves_identity_children_and_typed_null():
+    source = {
+        "column": "a",
+        "expression": {
+            "op": "array",
+            "sql_type": "int32",
+            "args": [
+                {"op": "literal", "type": "integer", "sql_type": "int32", "value": 1},
+                {"op": "literal", "type": "integer", "sql_type": "int32", "value": None},
+            ],
+        },
+    }
+    model = RelationalColumnExpression.from_dict(source)
+    assert model.expression.op is RelationalExpressionOp.ARRAY
+    assert model.expression.sql_type is SQLBuiltinType.INT32
+    assert model.to_dict() == source
+
+
 def test_generated_array_literal_keeps_exact_cells_bounds_and_sql_nulls():
     for identity in SQLBuiltinType:
         for value in (
