@@ -478,10 +478,13 @@ pub fn litePhysicalIndexConfigJson(
 /// them and to `LiteSemanticResolver`'s query-time resolution. Caller owns the
 /// returned slice.
 pub fn liteMergedIndexesJsonAlloc(handle: *Handle) ![]u8 {
-    const alloc = handle.alloc;
-    const configs = try handle.database().*.listIndexes(alloc);
+    return liteMergedIndexesForDatabaseJsonAlloc(handle.alloc, handle.database());
+}
+
+fn liteMergedIndexesForDatabaseJsonAlloc(alloc: Allocator, database: *db_mod.DB) ![]u8 {
+    const configs = try database.listIndexes(alloc);
     defer db_mod.types.freeIndexConfigs(alloc, configs);
-    const enrichments = try handle.database().*.listEnrichments(alloc);
+    const enrichments = try database.listEnrichments(alloc);
     defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -545,6 +548,12 @@ pub fn liteEnrichmentCatalogEntryJsonAlloc(alloc: Allocator, cfg: db_mod.types.E
 }
 
 pub fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
+    return refreshLiteManagedEmbeddingRuntimeForDatabase(handle, handle.database());
+}
+
+/// Reopened namespaces share the root's inference provider and replay options,
+/// but restore their own catalog's enrichment runtime before accepting writes.
+pub fn refreshLiteManagedEmbeddingRuntimeForDatabase(handle: *Handle, database: *db_mod.DB) !void {
     if (handle.lite_profile != .native) return;
     // A read-only/status-only handle has nothing to reconcile toward, and
     // `db.reconfigureEnrichmentRuntime` unconditionally fails with
@@ -554,7 +563,7 @@ pub fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
     if (!liteOpenModeCanWrite(handle.open_mode)) return;
     const provider = handle.liteAntflyProvider();
     const alloc = handle.alloc;
-    const merged_json = try liteMergedIndexesJsonAlloc(handle);
+    const merged_json = try liteMergedIndexesForDatabaseJsonAlloc(alloc, database);
     defer alloc.free(merged_json);
 
     // Not `local_write.reconfigureManagedDbEnrichmentRuntime` directly: that
@@ -574,7 +583,7 @@ pub fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
     var enrichments = try local_write.createManagedDbEnrichments(
         alloc,
         merged_json,
-        handle.database().*.backend_runtime,
+        database.backend_runtime,
         provider,
         null,
         null,
@@ -585,7 +594,7 @@ pub fn refreshLiteManagedEmbeddingRuntime(handle: *Handle) !void {
     defer enrichments.deinit(alloc);
     var cfg = enrichments.takeConfig();
     cfg.enable_without_producers = cfg.enable_without_producers or handle.lite_generated_enrichment_replay;
-    try handle.database().*.reconfigureEnrichmentRuntime(cfg);
+    try database.reconfigureEnrichmentRuntime(cfg);
 }
 
 pub const stamped_generation_optimistic_attempts = 4;
@@ -2753,6 +2762,7 @@ pub export fn antfly_db_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slic
     defer guard.leave();
     const handle = guard.handle;
     @import("tables.zig").requireDatabase(handle) catch |err| return capi.mapError(err);
+    if (!liteOpenModeCanWrite(handle.open_mode)) return capi.mapError(error.ReadOnly);
     @import("tables.zig").load(handle) catch |err| return capi.mapError(err);
     if (backup.len == 0 or backup.ptr == null) return .invalid_argument;
     if (handle.embedded_tables.count() != 0) return .invalid_argument;
@@ -4928,6 +4938,9 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
     defer parsed.deinit();
     if (parsed.value.database != null or parsed.value.namespace != null) return error.UnsupportedSqlExecution;
     const session = if (parsed.value.session_id) |id| handle.sql_sessions.get(id) orelse return error.SqlConnectionNotFound else null;
+    errdefer if (session) |value| {
+        if (value.active) value.failed = true;
+    };
     var compiled = sql.compiler.compile(temporary, parsed.value.statement, .{}) catch |err| {
         if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlProgramLimitExceeded;
         return err;
@@ -4944,9 +4957,6 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
         defer temporary.free(upper);
         if (std.mem.indexOf(u8, upper, "ISOLATION") == null) compiled.statement.begin.isolation = .read_committed;
     }
-    errdefer if (session) |value| {
-        if (value.active) value.failed = true;
-    };
     if (session) |value| {
         var transaction_id: ?db_mod.types.TxnId = null;
         const controlled = value.control(compiled.statement, &transaction_id) catch |err| {

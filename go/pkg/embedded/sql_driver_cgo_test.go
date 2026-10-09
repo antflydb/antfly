@@ -193,3 +193,42 @@ func TestSQLPoolRecoversAfterFailedCommit(t *testing.T) {
 		t.Fatalf("pooled connection retained failed transaction: %v", err)
 	}
 }
+
+func TestSQLSyntaxErrorAbortsTransaction(t *testing.T) {
+	db, err := sql.Open("antfly", "file:"+filepath.Join(t.TempDir(), "syntax.aflite")+"?no_sync=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err = db.Exec("CREATE TABLE numbers (n BIGINT)"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.ExecContext(context.Background(), "INSERT INTO numbers (_id,n) VALUES ('discarded',1)"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = tx.ExecContext(context.Background(), "INSERT INTO")
+	var diagnostic *SQLError
+	if !errors.As(err, &diagnostic) || diagnostic.Code != "42601" {
+		t.Fatalf("syntax error: %v", err)
+	}
+	err = tx.Commit()
+	if !errors.As(err, &diagnostic) || diagnostic.Code != "25P02" {
+		t.Fatalf("aborted commit: %v", err)
+	}
+	rows, err := db.Query("SELECT n FROM numbers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if rows.Next() {
+		t.Fatal("syntax-error transaction published its insert")
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -31,6 +31,9 @@ fn openTable(handle: *h.Handle, name: []const u8, id: u64) !*Table {
     options.prefer_existing_identity_namespace = false;
     if (handle.owned_lite_backend) |*backend| try backend.configureDbOpenOptionsForNamespace(&options, namespace);
     table.* = .{ .name = owned_name, .id = id, .db = try h.db_mod.DB.open(alloc, path, options) };
+    errdefer table.db.close();
+    try api.refreshLiteManagedEmbeddingRuntimeForDatabase(handle, &table.db);
+    table.db.startQuarantineRetryWorkerIfNeeded();
     return table;
 }
 

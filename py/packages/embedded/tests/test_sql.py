@@ -412,3 +412,57 @@ def test_database_backup_rebuilds_indexes_and_enrichments_before_readonly_open(
                     }
                 )
                 assert result["total_hits"] >= 1
+
+
+@pytest.mark.parametrize("storage", [af.Storage.LITE, af.Storage.DIRECTORY])
+@pytest.mark.parametrize("mode", [af.OpenMode.READONLY, af.OpenMode.STATUS_ONLY])
+def test_import_backup_rejects_non_writable_handles(require_native, tmp_path, storage, mode):
+    with af.create(tmp_path / "source.aflite", no_sync=True) as source:
+        source.sql("CREATE TABLE imported (n BIGINT)")
+        source.sql("INSERT INTO imported (n) VALUES (7)")
+        backup = source.backup()
+    path = tmp_path / ("empty.aflite" if storage == af.Storage.LITE else "empty")
+    options = af.OpenOptions(storage=storage, no_sync=True)
+    opener = af.create_with_options if storage == af.Storage.LITE else af.open_with_options
+    with opener(path, options):
+        pass
+    with af.open_with_options(path, af.OpenOptions(storage=storage, mode=mode)) as destination:
+
+        def contents():
+            files = [path] if path.is_file() else sorted(p for p in path.rglob("*") if p.is_file())
+            return [(str(p.relative_to(path.parent)), p.read_bytes()) for p in files]
+
+        before = contents()
+        with pytest.raises(af.InvalidArgumentError):
+            destination.import_backup(backup)
+        assert contents() == before
+        assert destination.list_tables() == ["default"]
+        destination.stats()  # Rejection must also leave the open handle usable.
+    with af.open_with_options(path, options) as destination:
+        assert destination.list_tables() == ["default"]
+        destination.import_backup(backup)
+        assert destination.sql("SELECT n FROM imported")["rows"] == [["7"]]
+
+
+@pytest.mark.parametrize("recovery", ["ROLLBACK", "ROLLBACK TO SAVEPOINT before_write"])
+def test_materialized_syntax_errors_abort_transactions(require_native, aflite_path, recovery):
+    from antfly_embedded._sql import SQLStateError
+
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql("CREATE TABLE numbers (n BIGINT)")
+        with closing(database.sql_session()) as session:
+            session.execute("BEGIN")
+            session.execute("SAVEPOINT before_write")
+            session.execute("INSERT INTO numbers (_id,n) VALUES ('discarded',1)")
+            with pytest.raises(SQLStateError) as syntax:
+                session.execute("INSERT INTO")
+            assert syntax.value.sqlstate == "42601"
+            for statement in ("SELECT n FROM numbers", "COMMIT"):
+                with pytest.raises(SQLStateError) as aborted:
+                    session.execute(statement)
+                assert aborted.value.sqlstate == "25P02"
+            session.execute(recovery)
+            assert session.execute("SELECT n FROM numbers")["rows"] == []
+            session.execute("INSERT INTO numbers (_id,n) VALUES ('kept',2)")
+            session.execute("COMMIT")
+        assert database.sql("SELECT n FROM numbers")["rows"] == [["2"]]

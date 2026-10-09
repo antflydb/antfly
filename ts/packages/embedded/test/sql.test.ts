@@ -11,6 +11,24 @@ import { Connection } from "../src/sql.js";
 import { describeWithLibrary } from "./helpers.js";
 
 describeWithLibrary("SQL", () => {
+  it("aborts execute transactions after syntax errors", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "antfly-syntax-"));
+    const db = await createWithOptions(join(directory, "db.aflite"), { noSync: true });
+    const connection = await Connection.open(db);
+    try {
+      await connection.execute("CREATE TABLE numbers (n BIGINT)");
+      await connection.execute("BEGIN");
+      await connection.execute("INSERT INTO numbers (_id,n) VALUES ('discarded',1)");
+      await expect(connection.execute("INSERT INTO")).rejects.toMatchObject({ sqlstate: "42601" });
+      await expect(connection.execute("COMMIT")).rejects.toMatchObject({ sqlstate: "25P02" });
+      await connection.execute("ROLLBACK");
+      expect((await connection.query("SELECT n FROM numbers")).rows).toEqual([]);
+    } finally {
+      await connection.close();
+      await db.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
   it("runs the shared type and SQLSTATE cases", async () => {
     const directory = await mkdtemp(join(tmpdir(), "antfly-sql-"));
     const db = await createWithOptions(join(directory, "db.aflite"), { noSync: true });
