@@ -4401,8 +4401,20 @@
     },
     {
       "id": "sql-0459",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over immutable native relational inputs. PostgreSQL independently verifies the exact empty result, labels, type OIDs and NULL provenance; bounded nonempty input probes prove the contradictory or disjoint set arms instead of accepting vacuous empty fixtures. Distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0460",
@@ -5408,8 +5420,20 @@
     },
     {
       "id": "sql-0516",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over immutable native relational inputs. PostgreSQL independently verifies the exact empty result, labels, type OIDs and NULL provenance; bounded nonempty input probes prove the contradictory or disjoint set arms instead of accepting vacuous empty fixtures. Distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0517",
@@ -5821,8 +5845,20 @@
     },
     {
       "id": "sql-0541",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over immutable native relational inputs. PostgreSQL independently verifies the exact empty result, labels, type OIDs and NULL provenance; bounded nonempty input probes prove the contradictory or disjoint set arms instead of accepting vacuous empty fixtures. Distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0542",

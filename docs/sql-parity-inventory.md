@@ -1,7 +1,7 @@
 # Original SQL extraction parity inventory
 
-Current audited dispositions: **475 implemented / 136 rejected / 73 superseded /
-902 unresolved**. Nine further cross-table INSERT/CTE, multi-row DO NOTHING and
+Current audited dispositions: **478 implemented / 136 rejected / 73 superseded /
+899 unresolved**. Nine further cross-table INSERT/CTE, multi-row DO NOTHING and
 qualified RETURNING contracts now have unchanged-source mounted native and
 PostgreSQL evidence. Every case verifies complete table postimages and genuine
 logical primary-key enforcement, rather than just affected counts or parsing.
@@ -236,8 +236,10 @@ contradictory active-status normalization is verified independently, and both
 case-projection arms must be nonempty and disjoint. Empty fixtures and unlisted
 empty reads still fail oracle admission. The exact PostgreSQL gate verifies all
 21 contracts without changing the previous eighteen results; five focused
-oracle regressions pass. The expanded native gate is still pending, so these
-three originals remain unresolved and no disposition credit is claimed yet.
+oracle regressions pass. The expanded mounted native gate completes all 82
+build steps and verifies the same 21 contracts; these three originals are now
+credited. This is immutable-fixture execution evidence, not distributed
+snapshot or concurrent publication certification.
 
 The catalog boundary now tests 6,585 original-source request truncations, with
 bounded diagnostic positions and no missing-token dereferences. Targeted
@@ -2264,6 +2266,10 @@ including the new contract round trip and strict legacy decoding. Inventory
 integrity remains 475 implemented / 136 rejected / 73 superseded / 902 unresolved.
 Standalone qualification is tracked separately; its running build is not
 evidence of a completed standalone gate.
+The current linked standalone catalog gate completes all 66 build steps: 172
+tests pass and one is skipped. This includes the qualified relation-owner
+contract and the production storage-provider linkage; it does not activate SQL
+index mutations or replace the required transactional ownership fence.
 The first standalone gate exposed missing storage-owner cleanup symbols in its
 unlinked test composition. Its catalog tests now use a dedicated module linked
 to the production ABI providers, without changing unrelated restore roots or
