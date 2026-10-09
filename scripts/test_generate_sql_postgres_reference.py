@@ -248,12 +248,18 @@ class PostgresReferenceTest(unittest.TestCase):
         import psycopg
 
         with self.db.transaction(force_rollback=True):
-            self.db.execute("CREATE TEMP TABLE not_valid_owner(id text PRIMARY KEY, amount bigint)")
+            self.db.execute(
+                "CREATE TEMP TABLE not_valid_owner(id text PRIMARY KEY, amount bigint)"
+            )
             self.db.execute("INSERT INTO not_valid_owner VALUES ('old', -1)")
-            self.db.execute("ALTER TABLE not_valid_owner ADD CONSTRAINT nonnegative CHECK (amount >= 0) NOT VALID")
+            self.db.execute(
+                "ALTER TABLE not_valid_owner ADD CONSTRAINT nonnegative CHECK (amount >= 0) NOT VALID"
+            )
             self.assertEqual(
                 [(False,)],
-                self.db.execute("SELECT convalidated FROM pg_constraint WHERE conrelid = 'not_valid_owner'::regclass AND conname = 'nonnegative'").fetchall(),
+                self.db.execute(
+                    "SELECT convalidated FROM pg_constraint WHERE conrelid = 'not_valid_owner'::regclass AND conname = 'nonnegative'"
+                ).fetchall(),
             )
             # NOT VALID exempts historical rows from the installation scan,
             # never a newly inserted or updated row from enforcement.
@@ -266,10 +272,19 @@ class PostgresReferenceTest(unittest.TestCase):
                     with self.assertRaises(psycopg.errors.CheckViolation) as caught:
                         with self.db.transaction():
                             self.db.execute(sql)
-                    self.assertEqual('23514', caught.exception.sqlstate)
-                    self.assertEqual([('old', -1)], self.db.execute("SELECT id, amount FROM not_valid_owner").fetchall())
-            self.db.execute("INSERT INTO not_valid_owner VALUES ('valid', 1), ('nullable', NULL)")
-            self.assertEqual(3, self.db.execute("SELECT count(*) FROM not_valid_owner").fetchone()[0])
+                    self.assertEqual("23514", caught.exception.sqlstate)
+                    self.assertEqual(
+                        [("old", -1)],
+                        self.db.execute(
+                            "SELECT id, amount FROM not_valid_owner"
+                        ).fetchall(),
+                    )
+            self.db.execute(
+                "INSERT INTO not_valid_owner VALUES ('valid', 1), ('nullable', NULL)"
+            )
+            self.assertEqual(
+                3, self.db.execute("SELECT count(*) FROM not_valid_owner").fetchone()[0]
+            )
 
     def test_array_overlap_and_string_output_match_shared_native_contracts(self):
         import json
@@ -2834,7 +2849,7 @@ class PostgresReferenceTest(unittest.TestCase):
 
         manifest = json.loads((FIXTURES / "sql_set_read_campaign.json").read_text())
         ids = {entry["id"] for entry in manifest["entries"]}
-        self.assertEqual(18, len(ids))
+        self.assertEqual(21, len(ids))
         inventory = json.loads((FIXTURES / "sql_parity_inventory.json").read_text())[
             "entries"
         ]
@@ -2844,7 +2859,15 @@ class PostgresReferenceTest(unittest.TestCase):
         result = read_reference(self.db, cases, profile)
         self.assertEqual([], result["excluded"])
         self.assertEqual(ids, {entry["id"] for entry in result["entries"]})
-        self.assertTrue(all(entry["rows"] for entry in result["entries"]))
+        empty_intersections = {"sql-0459", "sql-0516", "sql-0541"}
+        self.assertEqual(
+            empty_intersections,
+            {entry["id"] for entry in result["entries"] if not entry["rows"]},
+        )
+        # Retain all eighteen nonempty multiplicity/NULL witnesses. Legitimate
+        # contradictory or disjoint-expression intersections are separate
+        # exact contracts, not a weakened empty-result acceptance rule.
+        self.assertEqual(18, sum(bool(entry["rows"]) for entry in result["entries"]))
         golden = json.loads(
             (FIXTURES / "sql_set_read_campaign_reference.json").read_text()
         )
@@ -2859,6 +2882,46 @@ class PostgresReferenceTest(unittest.TestCase):
         )
         self.assertEqual({"a", None}, {row[0] for row in by_id["sql-0544"]["rows"]})
         self.assertEqual({"b", "c"}, {row[0] for row in by_id["sql-0543"]["rows"]})
+
+    def test_negative_set_contracts_reject_missing_input_witnesses(self):
+        import json
+
+        ids = {"sql-0459", "sql-0516", "sql-0541"}
+        cases = [
+            case
+            for case in json.loads(
+                (FIXTURES / "sql_parity_inventory.json").read_text()
+            )["entries"]
+            if case["id"] in ids
+        ]
+        profile = set_read_profile()
+        profile["rows"] = []
+        result = read_reference(self.db, cases, profile)
+        self.assertEqual([], result["entries"])
+        self.assertEqual(ids, {entry["id"] for entry in result["excluded"]})
+        self.assertTrue(
+            all(
+                "empty result does not exercise" in entry["reason"]
+                for entry in result["excluded"]
+            )
+        )
+
+    def test_unlisted_empty_read_still_requires_a_witness(self):
+        result = read_reference(
+            self.db,
+            [
+                {
+                    "id": "unlisted-empty-read",
+                    "sql": "SELECT id FROM usage_records WHERE false",
+                    "params": [],
+                }
+            ],
+            set_read_profile(),
+        )
+        self.assertEqual([], result["entries"])
+        self.assertEqual(
+            "empty result does not exercise this shape", result["excluded"][0]["reason"]
+        )
 
     def test_original_lateral_campaign_and_postgres_alias_scope(self):
         import json

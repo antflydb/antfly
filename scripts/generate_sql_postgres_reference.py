@@ -486,6 +486,50 @@ def create_table(db, name, props, rows, identity=False):
         db.execute(insert, values)
 
 
+def empty_set_contract(db, case):
+    """Explicit negative originals, with nonempty independent input witnesses.
+
+    This is not a general empty-result waiver: both contradictory-status
+    originals and the disjoint lower/upper projection have bounded probes.
+    Every other read retains the existing nonempty requirement.
+    """
+    if case.get("id") in {"sql-0459", "sql-0516"}:
+        probes = [
+            "SELECT id FROM usage_records WHERE enabled IS TRUE",
+            "SELECT id FROM usage_records WHERE lower(status) = 'open' OR lower(status) = 'pending'",
+            "SELECT lower('active') AS normalized",
+        ]
+        observed = [
+            execute(
+                db,
+                {"id": "negative-set-witness", "sql": query, "params": []},
+                read=True,
+            )
+            for query in probes
+        ]
+        if observed[2]["rows"] != [["active"]]:
+            raise ValueError("contradictory status witness changed")
+        return "contradictory_status_intersection"
+    if case.get("id") == "sql-0541":
+        probes = [
+            "SELECT lower(status) AS status_key FROM usage_records WHERE status = 'open'",
+            "SELECT upper(status) AS status_key FROM usage_records WHERE enabled IS TRUE",
+        ]
+        observed = [
+            execute(
+                db,
+                {"id": "negative-set-witness", "sql": query, "params": []},
+                read=True,
+            )
+            for query in probes
+        ]
+        left, right = ({tuple(row) for row in result["rows"]} for result in observed)
+        if left & right:
+            raise ValueError("case-projection witnesses are not disjoint")
+        return "disjoint_case_projection"
+    return None
+
+
 def execute(db, case, read=False):
     import psycopg
 
@@ -498,6 +542,7 @@ def execute(db, case, read=False):
     # A client-side cursor buffers the entire PG result before fetchmany().
     # Use a server-side raw cursor for reads so the row bound is real, without
     # appending LIMIT or changing the source's positional SQL parameters.
+    negative_contract = empty_set_contract(db, case) if read else None
     transaction = db.transaction(force_rollback=True) if read else nullcontext()
     with transaction:
         if read:
@@ -508,10 +553,17 @@ def execute(db, case, read=False):
             else psycopg.RawCursor(db)
         )
         with cursor:
-            return cursor_result(cursor, case, read)
+            result = cursor_result(
+                cursor, case, read, allow_empty=negative_contract is not None
+            )
+            if negative_contract is not None:
+                if result["rows"]:
+                    raise ValueError("explicit empty set contract produced rows")
+                result["empty_contract"] = negative_contract
+            return result
 
 
-def cursor_result(cursor, case, read):
+def cursor_result(cursor, case, read, allow_empty=False):
     cursor.execute(case["sql"], parameters(case), binary=True)
     # DECLARE ... FOR accepts SELECT, not arbitrary mutation statements.
     tag = "SELECT" if read else cursor.statusmessage.split()[0]
@@ -522,7 +574,7 @@ def cursor_result(cursor, case, read):
     rows = cursor.fetchmany(ROW_LIMIT + 1) if cursor.description else []
     if len(rows) > ROW_LIMIT:
         raise ValueError("reference exceeds row budget")
-    if not rows and read and case["id"] not in EMPTY_CONTRACTS:
+    if not rows and read and case["id"] not in EMPTY_CONTRACTS and not allow_empty:
         raise ValueError("empty result does not exercise this shape")
     if not read and cursor.rowcount <= 0:
         raise ValueError("non-exercising mutation")

@@ -223,14 +223,21 @@ it. Tests separately cover zero-file small sets, typed-array lower bounds and
 NULL elements across disk blocks, allocation faults, cancellation, disk quota
 and group caps. Debug timings are diagnostic measurements, not production
 throughput claims. This shared executor evidence is separate from original
-case completion. The eighteen-case `set_read` campaign supplies distinct
+case completion. The `set_read` campaign retains its eighteen nonempty witnesses
+and now also checks three explicit negative set contracts. It supplies distinct
 physical rows with repeated logical IDs, SQL NULLs, and archived/tenant tables
 without modifying the baseline read fixture. Its PostgreSQL golden and strict
 mounted native HTTP gate compare unchanged original queries, complete bags,
 ordering, labels, type OIDs and NULL provenance. The native fixture captures
 immutable local inputs; it does not certify distributed snapshot publication.
-Contradictory source predicates (sql-0459, sql-0516 and sql-0541) remain
-unresolved: the oracle's nonempty-witness admission is not relaxed for them.
+The three empty originals (sql-0459, sql-0516 and sql-0541) have dedicated bounded
+PostgreSQL input probes: enabled and lower-status inputs must be nonempty, the
+contradictory active-status normalization is verified independently, and both
+case-projection arms must be nonempty and disjoint. Empty fixtures and unlisted
+empty reads still fail oracle admission. The exact PostgreSQL gate verifies all
+21 contracts without changing the previous eighteen results; five focused
+oracle regressions pass. The expanded native gate is still pending, so these
+three originals remain unresolved and no disposition credit is claimed yet.
 
 The catalog boundary now tests 6,585 original-source request truncations, with
 bounded diagnostic positions and no missing-token dereferences. Targeted

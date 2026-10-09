@@ -662,6 +662,15 @@
   },
   "entries": [
     {
+      "id": "sql-0459",
+      "columns": ["id"],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [25],
+      "affected": 0,
+      "empty_contract": "contradictory_status_intersection"
+    },
+    {
       "id": "sql-0468",
       "columns": [
         "id"
@@ -982,6 +991,15 @@
       "affected": 0
     },
     {
+      "id": "sql-0516",
+      "columns": ["id"],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [25],
+      "affected": 0,
+      "empty_contract": "contradictory_status_intersection"
+    },
+    {
       "id": "sql-0537",
       "columns": [
         "id"
@@ -1020,6 +1038,15 @@
         25
       ],
       "affected": 0
+    },
+    {
+      "id": "sql-0541",
+      "columns": ["status_key"],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [25],
+      "affected": 0,
+      "empty_contract": "disjoint_case_projection"
     },
     {
       "id": "sql-0542",

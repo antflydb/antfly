@@ -13434,7 +13434,7 @@ test "httpx SQL PostgreSQL original set reads preserve cross table bags and null
         entries: []const struct { id: []const u8 },
     }, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 18), parsed.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 21), parsed.value.entries.len);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.profile.additional_tables.len);
     var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("sql-set-originals");
     defer directory.cleanup();
@@ -13473,9 +13473,13 @@ test "httpx SQL PostgreSQL original set reads preserve cross table bags and null
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
     const ids = [_][]const u8{
-        "sql-0468", "sql-0471", "sql-0473", "sql-0475", "sql-0476", "sql-0477",
-        "sql-0492", "sql-0493", "sql-0494", "sql-0495", "sql-0537", "sql-0540",
-        "sql-0542", "sql-0543", "sql-0544", "sql-0547", "sql-0548", "sql-0553",
+        "sql-0459", "sql-0516", "sql-0541",
+        "sql-0468", "sql-0471", "sql-0473",
+        "sql-0475", "sql-0476", "sql-0477",
+        "sql-0492", "sql-0493", "sql-0494",
+        "sql-0495", "sql-0537", "sql-0540",
+        "sql-0542", "sql-0543", "sql-0544",
+        "sql-0547", "sql-0548", "sql-0553",
     };
     try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
     try std.testing.expectEqual(ids.len, source.captures);
