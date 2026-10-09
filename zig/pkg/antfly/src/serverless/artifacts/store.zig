@@ -428,6 +428,31 @@ pub const ArtifactStore = struct {
         return try self.getRangeAllocWithCancellationUsingAllocator(self.allocator, artifact_id, offset, len, cancellation);
     }
 
+    /// Only the physical read parks the caller. Authentication and decoding
+    /// execute after reacquiring this call's CPU grant.
+    pub fn getRangeAllocFor(
+        self: *ArtifactStore,
+        result_alloc: Allocator,
+        artifact_id: []const u8,
+        offset: u64,
+        len: usize,
+        cancellation: CancellationToken,
+        context: ReadContext,
+    ) ![]u8 {
+        try context.ensureActive();
+        try cancellation.check();
+        const lifetime: ReadCancellation = .{ .context = context, .parent = cancellation };
+        const payload = execution_wait.runOwned(context.wait, ArtifactStore.getRangeAllocWithCancellationUsingAllocator, .{ self, result_alloc, artifact_id, offset, len, lifetime.token() }, discardPayload, .{result_alloc}) catch |err| {
+            try context.ensureActive();
+            try cancellation.check();
+            return err;
+        };
+        errdefer result_alloc.free(payload);
+        try context.ensureActive();
+        try cancellation.check();
+        return payload;
+    }
+
     pub fn getRangeAllocWithCancellationUsingAllocator(
         self: *ArtifactStore,
         result_alloc: Allocator,

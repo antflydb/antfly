@@ -292,8 +292,10 @@ pub const Cache = struct {
         bytes: []const u8,
         digest: [32]u8,
         pub fn authenticate(bytes: []const u8, digest: [32]u8) !@This() {
-            var actual: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+            return authenticateFor(bytes, digest, .{});
+        }
+        pub fn authenticateFor(bytes: []const u8, digest: [32]u8, context: Context) !@This() {
+            const actual = try Cache.hashImmutableFor(bytes, context);
             if (!std.mem.eql(u8, &actual, &digest)) return error.ArtifactIntegrityMismatch;
             return .{ .bytes = bytes, .digest = digest };
         }

@@ -21,6 +21,9 @@ const artifacts = @import("lake_index_aggregate_artifact.zig");
 const stores = @import("../serverless/artifacts/store.zig");
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
+const Context = local.serverless_query_lake_read_context.Context;
+const Execution = local.common_request_admission.runnable_scheduler.Execution;
+fn discardVoid(_: A, _: void) void {}
 const Ref = artifacts.ChunkRef;
 const block_bytes: usize = 64 * 1024;
 const legacy_block_bytes: usize = 256 * 1024;
@@ -75,6 +78,17 @@ pub const Read = struct {
     context: local.serverless_query_lake_read_context.Context,
     cancellation: Cancellation,
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
+    fn checkLifetime(self: Read) !void {
+        try self.context.checkLifetime();
+        try self.cancellation.check();
+        if (self.cache) |cache| try cache.context.checkLifetime();
+    }
+    fn withExecution(self: Read, execution: *Execution) Read {
+        var result = self;
+        result.context = self.context.withExecution(execution);
+        if (result.cache) |*cache| cache.context = cache.context.withExecution(execution);
+        return result;
+    }
     fn check(self: Read) !void {
         try self.context.ensureActive();
         try self.cancellation.check();
@@ -119,7 +133,7 @@ pub fn publish(a: A, out: A, store: *stores.ArtifactStore, bytes: []const u8, ca
 }
 pub fn loadDirectory(a: A, read: Read, ref: Ref) !Directory {
     if (ref.byte_len > 4 * 1024 * 1024) return error.InvalidNativeLakeTextCorpus;
-    const bytes = try artifacts.readArtifact(a, read.store, ref, read.cancellation, read.cache);
+    const bytes = try artifacts.readArtifactFor(a, read.store, ref, read.cancellation, read.cache, read.context);
     defer a.free(bytes);
     const directory = try std.json.parseFromSliceLeaky(Directory, a, bytes, .{ .allocate = .alloc_always });
     try directory.validate();
@@ -181,6 +195,7 @@ const PhysicalWarm = struct {
     }
 };
 const CoalescedRead = struct {
+    context: Context = .{},
     store: stores.ArtifactStore,
     pack: Ref,
     start: u64,
@@ -244,7 +259,7 @@ const CoalescedRead = struct {
             const start = self.pieces[first].pack_offset;
             const last = self.pieces[end - 1];
             const length: usize = @intCast(last.pack_offset + last.ref.byte_len - start);
-            const bytes = self.store.getRangeAllocWithCancellationUsingAllocator(a, self.pack.artifact_id, start, length, self.cancellation) catch |err| {
+            const bytes = self.store.getRangeAllocFor(a, self.pack.artifact_id, start, length, self.cancellation, cache.context) catch |err| {
                 try self.cancellation.check();
                 cache.context.ensureActive() catch return error.Canceled;
                 if (err == error.OutOfMemory) return err;
@@ -255,7 +270,7 @@ const CoalescedRead = struct {
             cache.cache.recordPhysicalRead(bytes.len);
             for (self.pieces[first..end]) |piece| {
                 const offset: usize = @intCast(piece.pack_offset - start);
-                const value: anyerror!ServingCache.VerifiedBytes = if (bytes.len != length) error.ArtifactIntegrityMismatch else ServingCache.VerifiedBytes.authenticate(bytes[offset..][0..@intCast(piece.ref.byte_len)], try stores.sha256DigestFromChecksum(piece.ref.checksum));
+                const value: anyerror!ServingCache.VerifiedBytes = if (bytes.len != length) error.ArtifactIntegrityMismatch else ServingCache.VerifiedBytes.authenticateFor(bytes[offset..][0..@intCast(piece.ref.byte_len)], try stores.sha256DigestFromChecksum(piece.ref.checksum), cache.context);
                 try units.append(a, .{ .offset = piece.pack_offset, .length = piece.ref.byte_len, .result = value });
             }
             first = end;
@@ -270,7 +285,7 @@ const CoalescedRead = struct {
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             self.group.cancellation.check() catch return true;
-            self.cached.context.ensureActive() catch return true;
+            self.cached.context.checkLifetime() catch return true;
             return false;
         }
     };
@@ -324,7 +339,7 @@ const CoalescedRead = struct {
         // Publish request-authority failures as cancellation so a live
         // waiter retries under its own capability instead of inheriting a
         // leader's expired reader lease. Restore our exact error below.
-        flight_context.checkpoint = null;
+        if (flight_context.execution == null) flight_context.checkpoint = null;
         flight_context.cancellation = .fromCallback(&loader, PhysicalLoader.canceled);
         while (true) {
             try self.cancellation.check();
@@ -362,16 +377,16 @@ const CoalescedRead = struct {
             // A concurrent flight may cover a different requested subset,
             // or this unit became warm while its leader was being planned.
             // A single-unit direct fallback cannot form a flight cycle.
-            const bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(a, self.pack.artifact_id, piece.pack_offset, @intCast(piece.ref.byte_len), self.cancellation);
+            const bytes = try self.store.getRangeAllocFor(a, self.pack.artifact_id, piece.pack_offset, @intCast(piece.ref.byte_len), self.cancellation, cache.context);
             cache.cache.recordPhysicalRead(bytes.len);
             errdefer a.free(bytes);
-            const value = try ServingCache.VerifiedBytes.authenticate(bytes, try stores.sha256DigestFromChecksum(piece.ref.checksum));
+            const value = try ServingCache.VerifiedBytes.authenticateFor(bytes, try stores.sha256DigestFromChecksum(piece.ref.checksum), cache.context);
             return .{ .value = value, .owner = .{ .bytes = bytes, .owner = .{ .allocation = a } } };
         }
     }
     fn range(self: *@This(), a: A, piece: Piece) ![]u8 {
         if (self.bytes == null) {
-            self.bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(self.a, self.pack.artifact_id, self.start, self.length, self.cancellation);
+            self.bytes = try self.store.getRangeAllocFor(self.a, self.pack.artifact_id, self.start, self.length, self.cancellation, self.context);
             if (self.bytes.?.len != self.length) return error.ArtifactIntegrityMismatch;
         }
         const offset: usize = @intCast(piece.pack_offset - self.start);
@@ -382,12 +397,16 @@ fn readPieceLease(a: A, store: stores.ArtifactStore, piece: Piece, cancellation:
     return readPieceLeaseCoalesced(a, store, piece, cancellation, cached, null);
 }
 fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead, coalesced: ?*CoalescedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
-    if (piece.pack == null) return artifacts.readArtifactLease(a, store, piece.ref, cancellation, cached);
+    return readPieceLeaseCoalescedFor(a, store, piece, cancellation, cached, coalesced, if (cached) |cache| cache.context else .{});
+}
+fn readPieceLeaseCoalescedFor(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead, coalesced: ?*CoalescedRead, context: Context) !ServingCache.ImmutableLease {
+    if (piece.pack == null) return artifacts.readArtifactLeaseFor(a, store, piece.ref, cancellation, cached, context);
     const Loader = struct {
         store: stores.ArtifactStore,
         piece: Piece,
         cancellation: Cancellation,
         coalesced: ?*CoalescedRead,
+        context: Context,
         cached: ?artifacts.CachedRead,
         traffic: local.serverless_query_lake_serving_cache.Cache.ProviderRead = .{ .requests = 0, .bytes = 0 },
         fn providerRead(raw: *anyopaque) local.serverless_query_lake_serving_cache.Cache.ProviderRead {
@@ -399,12 +418,10 @@ fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, canc
             var source = self.store;
             self.traffic = if (self.coalesced) |group| if (group.bytes == null) .{ .requests = 1, .bytes = group.length } else .{ .requests = 0, .bytes = 0 } else .{ .requests = 1, .bytes = self.piece.ref.byte_len };
             if (self.coalesced != null and self.cached != null) self.traffic = .{ .requests = 0, .bytes = 0 };
-            const bytes = if (self.coalesced) |group| try group.range(alloc, self.piece) else try source.getRangeAllocWithCancellationUsingAllocator(alloc, self.piece.pack.?.artifact_id, self.piece.pack_offset, @intCast(self.piece.ref.byte_len), self.cancellation);
+            const bytes = if (self.coalesced) |group| try group.range(alloc, self.piece) else try source.getRangeAllocFor(alloc, self.piece.pack.?.artifact_id, self.piece.pack_offset, @intCast(self.piece.ref.byte_len), self.cancellation, self.context);
             errdefer alloc.free(bytes);
             if (bytes.len != self.piece.ref.byte_len) return error.ArtifactIntegrityMismatch;
-            var digest: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-            if (!std.mem.eql(u8, &digest, &(try stores.sha256DigestFromChecksum(self.piece.ref.checksum)))) return error.ArtifactIntegrityMismatch;
+            _ = try ServingCache.VerifiedBytes.authenticateFor(bytes, try stores.sha256DigestFromChecksum(self.piece.ref.checksum), self.context);
             try self.cancellation.check();
             return bytes;
         }
@@ -416,14 +433,14 @@ fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, canc
         if (try cache.cache.lookupImmutableBlockLease(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context)) |lease| return lease;
         const verified = if (coalesced) |group| try group.verifiedLease(a, piece, cache) else direct: {
             var provider = store;
-            const bytes = try provider.getRangeAllocWithCancellationUsingAllocator(a, piece.pack.?.artifact_id, piece.pack_offset, length, cancellation);
+            const bytes = try provider.getRangeAllocFor(a, piece.pack.?.artifact_id, piece.pack_offset, length, cancellation, context);
             errdefer a.free(bytes);
             cache.cache.recordPhysicalRead(bytes.len);
-            break :direct ServingCache.VerifiedLease{ .value = try ServingCache.VerifiedBytes.authenticate(bytes, digest), .owner = .{ .bytes = bytes, .owner = .{ .allocation = a } } };
+            break :direct ServingCache.VerifiedLease{ .value = try ServingCache.VerifiedBytes.authenticateFor(bytes, digest, context), .owner = .{ .bytes = bytes, .owner = .{ .allocation = a } } };
         };
         return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, verified);
     }
-    var loader: Loader = .{ .store = store, .piece = piece, .cancellation = cancellation, .coalesced = coalesced, .cached = cached };
+    var loader: Loader = .{ .store = store, .piece = piece, .cancellation = cancellation, .coalesced = coalesced, .cached = cached, .context = context };
     return .{ .heap = .{ .alloc = a, .bytes = try Loader.load(&loader, a) } };
 }
 const Owner = struct {
@@ -473,22 +490,29 @@ const Owner = struct {
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             if (self.cancelled.load(.acquire)) return true;
-            self.capability.check() catch return true;
-            if (self.capability.cache) |cache| cache.context.ensureActive() catch return true;
+            self.capability.checkLifetime() catch return true;
+            if (self.capability.cache) |cache| cache.context.checkLifetime() catch return true;
             return false;
         }
         fn warm(self: *@This(), pieces: []const Piece) anyerror!void {
-            try self.capability.check();
+            return self.warmFor(pieces, self.capability.*);
+        }
+        fn warmChild(self: *@This(), pieces: []const Piece, child: *Execution) anyerror!void {
+            try self.capability.checkLifetime();
+            return self.warmFor(pieces, self.capability.withExecution(child));
+        }
+        fn warmFor(self: *@This(), pieces: []const Piece, capability: Read) anyerror!void {
+            try capability.check();
             const token: Cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
-            var cached = self.capability.cache;
+            var cached = capability.cache;
             if (cached) |*cache| cache.context.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
             const first = pieces[0];
             const last = pieces[pieces.len - 1];
-            var group: ?CoalescedRead = if (first.pack != null) .{ .store = self.capability.store, .pack = first.pack.?, .start = first.pack_offset, .length = last.offset + @as(usize, @intCast(last.ref.byte_len)) - first.offset, .logical_end = last.offset + @as(usize, @intCast(last.ref.byte_len)), .cancellation = token, .a = std.heap.page_allocator, .pieces = pieces } else null;
+            var group: ?CoalescedRead = if (first.pack != null) .{ .store = capability.store, .pack = first.pack.?, .start = first.pack_offset, .length = last.offset + @as(usize, @intCast(last.ref.byte_len)) - first.offset, .logical_end = last.offset + @as(usize, @intCast(last.ref.byte_len)), .cancellation = token, .a = std.heap.page_allocator, .pieces = pieces, .context = capability.context } else null;
             defer if (group) |*value| value.deinit();
             for (pieces) |piece| {
-                try self.capability.check();
-                var lease = try readPieceLeaseCoalesced(std.heap.page_allocator, self.capability.store, piece, token, cached, if (group) |*value| value else null);
+                try capability.check();
+                var lease = try readPieceLeaseCoalescedFor(std.heap.page_allocator, capability.store, piece, token, cached, if (group) |*value| value else null, capability.context);
                 lease.deinit();
             }
         }
@@ -568,7 +592,11 @@ const Owner = struct {
                 // A full speculative queue yields instead of stalling WAND
                 // on an unvisited range. Required reads recycle consumed slots.
                 if (slot == self.pending.len) return;
-                self.pending[slot] = local.sql_parallel_scheduler.global().submitTransient(io, @as(usize, @intCast(offset - piece.offset)) * 2, warm, .{ self, pieces }) orelse return;
+                const bytes = @as(usize, @intCast(offset - piece.offset)) * 2;
+                if (self.capability.context.execution) |execution| {
+                    const scope: local.sql_parallel_scheduler.ExecutionScope = .{ .execution = execution, .allocator = std.heap.page_allocator, .io = io, .wait = local.sql_spill.childWait(execution) };
+                    self.pending[slot] = (scope.submit(bytes, std.heap.page_allocator, warmChild, .{ self, pieces }, discardVoid) catch return) orelse return;
+                } else self.pending[slot] = local.sql_parallel_scheduler.global().submitTransient(io, bytes, warm, .{ self, pieces }) orelse return;
                 self.offsets[slot] = piece.offset;
                 self.lengths[slot] = offset - piece.offset;
             }
@@ -654,7 +682,10 @@ const Owner = struct {
                 const take = @min(out.len - done, finish - position);
                 const target = out[done..][0..take];
                 if (lane < tasks.len) {
-                    tasks[lane] = local.sql_parallel_scheduler.global().submit(io, pack_bytes * 3, readSerial, .{ self, capability, start + done, target });
+                    if (capability.context.execution) |execution| {
+                        const scope: local.sql_parallel_scheduler.ExecutionScope = .{ .execution = execution, .allocator = std.heap.page_allocator, .io = io, .wait = local.sql_spill.childWait(execution) };
+                        tasks[lane] = try scope.submit(pack_bytes * 3, std.heap.page_allocator, readSerialChild, .{ self, capability, start + done, target }, discardVoid);
+                    } else tasks[lane] = local.sql_parallel_scheduler.global().submit(io, pack_bytes * 3, readSerial, .{ self, capability, start + done, target });
                     if (tasks[lane] == null) try self.readSerial(capability, start + done, target);
                 } else try self.readSerial(capability, start + done, target);
                 done += take;
@@ -669,6 +700,10 @@ const Owner = struct {
             if (failure) |err| return err;
         }
         try capability.check();
+    }
+    fn readSerialChild(self: *@This(), capability: Read, start: u64, out: []u8, child: *Execution) anyerror!void {
+        try capability.checkLifetime();
+        return self.readSerial(capability.withExecution(child), start, out);
     }
     fn readSerial(self: *@This(), capability: Read, start: u64, out: []u8) anyerror!void {
         try capability.check();
@@ -694,10 +729,10 @@ const Owner = struct {
                         if (following.offset != piece.offset + length or following.offset >= requested_end or following.pack == null or !std.mem.eql(u8, following.pack.?.artifact_id, pack.artifact_id) or following.pack_offset != piece.pack_offset + length) break;
                         length += @intCast(following.ref.byte_len);
                     }
-                    group = .{ .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = std.heap.page_allocator, .pieces = self.directory.blocks[index..next] };
+                    group = .{ .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = std.heap.page_allocator, .pieces = self.directory.blocks[index..next], .context = capability.context };
                 };
             }
-            var lease = try readPieceLeaseCoalesced(std.heap.page_allocator, capability.store, piece, capability.cancellation, capability.cache, if (group) |*value| value else null);
+            var lease = try readPieceLeaseCoalescedFor(std.heap.page_allocator, capability.store, piece, capability.cancellation, capability.cache, if (group) |*value| value else null, capability.context);
             defer lease.deinit();
             const data = lease.bytes();
             try capability.check();
@@ -1365,4 +1400,119 @@ test "external lake required pack reads overlap and return every scheduler reser
     try std.testing.expectEqual(@as(usize, 0), provider.active.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().workers);
     try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().bytes);
+}
+
+test "external lake native text owns required and speculative children through physical retirement" {
+    const Runnable = local.common_request_admission.runnable_scheduler;
+    const Case = enum { success, canceled, expired };
+    const Clock = struct {
+        var value: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return value.load(.acquire);
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const Fixture = struct {
+        base: stores.ArtifactStore,
+        scheduler: *Runnable.Scheduler,
+        signal: *std.atomic.Value(bool),
+        case: Case,
+        calls: std.atomic.Value(usize) = .init(0),
+        controls: std.atomic.Value(usize) = .init(0),
+        children: std.atomic.Value(bool) = .init(false),
+        control_mutex: std.atomic.Mutex = .unlocked,
+        fn range(raw: *anyopaque, a: A, id: []const u8, offset: u64, len: usize, token: Cancellation) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const stats = self.scheduler.stats();
+            try std.testing.expect(stats.resource_blocked > 0);
+            if (stats.child_operations > 0) self.children.store(true, .release);
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            {
+                @import("antfly_platform").sync.lockYielding(&self.control_mutex);
+                defer self.control_mutex.unlock();
+                var control: Execution = .{};
+                try control.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                try control.checkpoint();
+                control.finish();
+            }
+            _ = self.controls.fetchAdd(1, .acq_rel);
+            const bytes = try self.base.getRangeAllocWithCancellationUsingAllocator(a, id, offset, len, token);
+            switch (self.case) {
+                .canceled => self.signal.store(true, .release),
+                .expired => Clock.value.store(10, .release),
+                .success => {},
+            }
+            return bytes;
+        }
+    };
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("text-call-owner");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var base = fs.artifactStore();
+    base.upload_scope = try stores.UploadScope.forPublication(@splat(3), 1, std.testing.io);
+    const bytes = try a.alloc(u8, pack_bytes * 3);
+    defer a.free(bytes);
+    for (0..bytes.len / block_bytes) |i| @memset(bytes[i * block_bytes ..][0..block_bytes], @intCast(i));
+    const ref = try publish(a, a, &base, bytes, .none);
+    defer a.free(ref.artifact_id);
+    defer a.free(ref.checksum);
+    const data = try load(a, .{ .store = base, .cache = null, .context = .{}, .cancellation = .none }, ref);
+    var physical = data.native;
+    defer physical.close();
+    const owner: *Owner = @ptrCast(@alignCast(physical.ranges.ptr));
+    for ([_]bool{ false, true }) |cached| for ([_]bool{ false, true }) |full| for (std.enums.values(Case)) |case| {
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 4, .max_operations = if (full) 2 else 16, .max_bytes = 64 * 1024 * 1024 });
+        var signal: std.atomic.Value(bool) = .init(false);
+        Clock.value.store(0, .release);
+        var execution: Execution = .{};
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &signal, .requested = Clock.requested } }, .query);
+        defer execution.finish();
+        var cache = ServingCache.init(std.heap.page_allocator);
+        defer cache.deinit();
+        var fixture: Fixture = .{ .base = base, .scheduler = &scheduler, .signal = &signal, .case = case };
+        var vtable = base.vtable.*;
+        vtable.get_range_alloc_with_cancellation = Fixture.range;
+        const store: stores.ArtifactStore = .{ .allocator = a, .ptr = &fixture, .vtable = &vtable };
+        const context = (Context{ .io = std.testing.io, .cancellation = .fromAtomic(&signal) }).withExecution(&execution);
+        var capability: Read = .{ .store = store, .cache = if (cached) .{ .cache = &cache, .scope = @splat(8), .context = context } else null, .context = context, .cancellation = .none };
+        var source = try Owner.bind(owner, a, &capability);
+        var open = true;
+        defer if (open) source.close();
+        if (cached and case == .success) {
+            source.prefetch(0, block_bytes * 4);
+            const query: *Owner.Query = @ptrCast(@alignCast(source.ranges.ptr));
+            var published: usize = 0;
+            for (query.pending) |task| if (task) |owned| {
+                try std.testing.expect(owned.scope != null);
+                published += 1;
+            };
+            try std.testing.expectEqual(@as(usize, if (full) 0 else 1), published);
+            query.drain(false);
+        }
+        const out = try a.alloc(u8, bytes.len);
+        defer a.free(out);
+        const result = source.readInto(0, out);
+        switch (case) {
+            .success => {
+                try result;
+                try std.testing.expectEqualSlices(u8, bytes, out);
+                try std.testing.expectEqual(!full, fixture.children.load(.acquire));
+            },
+            .canceled => try std.testing.expectError(error.Canceled, result),
+            .expired => try std.testing.expectError(error.DeadlineExceeded, result),
+        }
+        source.quiesce();
+        source.close();
+        open = false;
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().child_operations);
+        try std.testing.expectEqual(fixture.calls.load(.acquire), fixture.controls.load(.acquire));
+        try std.testing.expect(fixture.calls.load(.acquire) > 0);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().retained_bytes);
+    };
 }
