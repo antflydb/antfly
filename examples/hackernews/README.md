@@ -581,5 +581,8 @@ metadata-index build its own bounded pod lifetime. Run `--modes text-only` with
 a separate artifact prefix afterward. The default runs both modes in one pod;
 its lifetime must cover both builds and their queries. Single-mode reports mark
 `cross_mode_comparison` false, so they do not establish agreement between modes.
+Use `--cursor-retention-ms 3600000` when archive-scale filter checks need more
+than five minutes before the retained restart-pagination check. Reports include
+the configured retention window.
 The first durable generation's transfer latency and automatic background warming
 must be qualified separately from ordinary unordered search latency.

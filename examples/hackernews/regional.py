@@ -89,6 +89,7 @@ def main():
     )
     parser.add_argument("--expected-rows", type=int, default=10000)
     parser.add_argument("--build-timeout", type=int, default=300)
+    parser.add_argument("--cursor-retention-ms", type=int, default=300000)
     parser.add_argument("--lifetime", type=int, default=2700)
     parser.add_argument("--cpu", default="2")
     parser.add_argument("--memory", default="8Gi")
@@ -111,6 +112,8 @@ def main():
         )
     if args.concurrency < 1:
         parser.error("concurrency must be positive")
+    if not 1000 <= args.cursor_retention_ms <= 3600000:
+        parser.error("cursor retention must be between 1000 and 3600000 milliseconds")
     args.output.mkdir(parents=True, exist_ok=False)
     # kubectl's auth plugin may cache credentials beside its kubeconfig. Keep
     # those standard CLI files outside the delivered results and remove them.
@@ -248,6 +251,8 @@ def main():
                 str(args.build_timeout),
                 "--concurrency",
                 str(args.concurrency),
+                "--cursor-retention-ms",
+                str(args.cursor_retention_ms),
             ]
             if mode == "text-only":
                 command.append("--text-only")

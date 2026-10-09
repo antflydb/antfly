@@ -65,11 +65,14 @@ def main():
         help="Read a short-lived token from stdin instead of gcloud; never persist it",
     )
     parser.add_argument("--build-timeout", type=int, default=300)
+    parser.add_argument("--cursor-retention-ms", type=int, default=300000)
     args = parser.parse_args()
     if args.repeats < 1 or args.concurrency < 1:
         parser.error("repeats and concurrency must be positive")
     if args.expected_rows < 2 or args.build_timeout < 1:
         parser.error("expected rows must be >=2 and build timeout must be positive")
+    if not 1000 <= args.cursor_retention_ms <= 3600000:
+        parser.error("cursor retention must be between 1000 and 3600000 milliseconds")
     artifact_prefix = args.artifact_prefix or args.prefix
     metadata_columns = (
         []
@@ -123,6 +126,7 @@ def main():
             ),
         },
         "lake_cache": {"root": str(args.state / "cache"), "max_disk_bytes": 1073741824},
+        "lake_indexes": {"query_cursors": {"retention_ms": args.cursor_retention_ms}},
     }
     config_path = args.state / "config.json"
     config_path.write_text(json.dumps(config, indent=2) + "\n")
@@ -540,6 +544,7 @@ def main():
             "warm_samples_ms": warm_samples,
             "concurrent_search_ms": [elapsed for _, elapsed in concurrent_samples],
             "concurrency": args.concurrency,
+            "cursor_retention_ms": args.cursor_retention_ms,
             "metadata_filters": filter_results,
             "io_profiles": io_profiles,
             "io_profile_note": "Linux process CPU and pod-wide non-loopback network counters. Concurrent intervals overlap; not per-query byte attribution. Includes TLS/DNS/control metadata; not a GCS request trace.",
