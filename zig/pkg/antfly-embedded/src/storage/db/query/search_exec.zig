@@ -12897,7 +12897,10 @@ pub fn collectExplicitBackgroundTextStats(
                 .term = term,
             } });
             defer alloc.free(doc_nums);
-            for (doc_nums) |doc_num| try term_doc_sets[term_index].add(doc_num);
+            for (doc_nums, 0..) |doc_num, doc_index| {
+                if (doc_index % 64 == 0) try checkSearchRequestDeadline(executor.controls);
+                try term_doc_sets[term_index].add(doc_num);
+            }
         }
 
         var background_doc_count: u32 = 0;
@@ -12910,13 +12913,15 @@ pub fn collectExplicitBackgroundTextStats(
             }
             background_doc_count += 1;
             for (term_doc_freqs, 0..) |*item, term_index| {
+                if (term_index % 64 == 0) try checkSearchRequestDeadline(executor.controls);
                 if (term_doc_sets[term_index].contains(hit.doc_id)) item.doc_freq +|= 1;
             }
         }
 
+        const labels = try text_stats_ownership.backgroundLabels(alloc, request.aggregation_name, request.field);
         out[i] = .{
-            .aggregation_name = try alloc.dupe(u8, request.aggregation_name),
-            .field = try alloc.dupe(u8, request.field),
+            .aggregation_name = labels.aggregation_name,
+            .field = labels.field,
             .background_doc_count = if (request.resolved_doc_filter != null) background_doc_count else background_result.total_hits,
             .term_doc_freqs = term_doc_freqs,
         };

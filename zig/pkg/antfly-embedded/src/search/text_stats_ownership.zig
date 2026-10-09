@@ -55,6 +55,14 @@ pub fn freeRequests(alloc: std.mem.Allocator, requests: anytype, initialized: us
     alloc.free(requests);
 }
 
+/// Copy both result labels before publishing either. The caller takes both
+/// allocations together; failure leaves no partially owned result.
+pub fn backgroundLabels(alloc: std.mem.Allocator, aggregation_name: []const u8, field: []const u8) !struct { aggregation_name: []const u8, field: []const u8 } {
+    const owned_name = try alloc.dupe(u8, aggregation_name);
+    errdefer alloc.free(owned_name);
+    return .{ .aggregation_name = owned_name, .field = try alloc.dupe(u8, field) };
+}
+
 pub fn termDocFreq(alloc: std.mem.Allocator, source: anytype, field: []const u8, term: []const u8) !stats.TermDocFreq {
     const owned_term = try alloc.dupe(u8, term);
     errdefer alloc.free(owned_term);
@@ -128,6 +136,19 @@ test "statistics frequency result retires on allocation denial" {
             defer result.deinit(alloc);
             try std.testing.expectEqualStrings("alpha", result.term);
             try std.testing.expectEqual(@as(u32, 17), result.doc_freq);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "statistics background labels retire every partial allocation" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            const labels = try ownership.backgroundLabels(alloc, "significant_terms", "body");
+            defer alloc.free(labels.aggregation_name);
+            defer alloc.free(labels.field);
+            try std.testing.expectEqualStrings("significant_terms", labels.aggregation_name);
+            try std.testing.expectEqualStrings("body", labels.field);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
