@@ -226,11 +226,11 @@ const Mock = struct {
             if (self.expected_source) |table| try std.testing.expectEqualStrings(table, request.source_table);
             const kind = request.questions.object.get("answer").?.object.get("type").?.string;
             const bytes = if (std.mem.eql(u8, kind, "choice"))
-                "{\"model\":\"mock\",\"answers\":{\"answer\":{\"type\":\"choice\",\"choice\":\"yes\",\"probabilities\":{\"yes\":0.8,\"no\":0.2}}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}"
+                "{\"model\":\"mock\",\"answers\":[{\"name\":\"answer\",\"type\":\"choice\",\"decision_method\":\"typed\",\"choice\":\"yes\",\"probabilities\":[{\"value\":\"yes\",\"probability\":0.8},{\"value\":\"no\",\"probability\":0.2}]}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}"
             else if (std.mem.eql(u8, kind, "score"))
-                "{\"model\":\"mock\",\"answers\":{\"answer\":{\"type\":\"score\",\"score\":99,\"probabilities\":{\"0\":0.2,\"1\":0.8}}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}"
+                "{\"model\":\"mock\",\"answers\":[{\"name\":\"answer\",\"type\":\"score\",\"decision_method\":\"typed\",\"score\":99,\"probabilities\":[{\"value\":0,\"label\":\"low\",\"probability\":0.2},{\"value\":1,\"label\":\"high\",\"probability\":0.8}]}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}"
             else
-                "{\"model\":\"mock\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
+                "{\"model\":\"mock\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":0.9}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
             result.* = try std.json.parseFromSliceLeaky(decisions.Json, a, bytes, .{});
         }
         return results;
@@ -279,7 +279,7 @@ test "SQL decisions bind all builtins and validate prepared question parameters 
         "SELECT ai_score('refund', 'Severity', '[\"low\",\"high\"]', 'local')",
         "SELECT ai_decide('refund', $1::jsonb, 'local')",
     };
-    const questions = try std.json.parseFromSliceLeaky(decisions.Json, arena.allocator(), "{\"answer\":{\"type\":\"noul\",\"instructions\":\"Refund?\"}}", .{});
+    const questions = try std.json.parseFromSliceLeaky(decisions.Json, arena.allocator(), "[{\"name\":\"answer\",\"type\":\"predicate\",\"instructions\":\"Refund?\"}]", .{});
     for (cases, 0..) |query, i| {
         var compiled = try compiler.compile(a, query, .{});
         defer compiled.deinit();
@@ -295,7 +295,7 @@ test "SQL decisions bind all builtins and validate prepared question parameters 
             1 => try std.testing.expectApproxEqAbs(@as(f64, 0.8), value.value.float, 0.001),
             else => {
                 try std.testing.expectEqualStrings("mock", value.value.object.get("model").?.string);
-                try std.testing.expectError(error.DecisionLimitExceeded, validate(arena.allocator(), mock.provider(), &program, &.{decisions.jsonObject()}));
+                try std.testing.expectError(error.InvalidDecisionSpecification, validate(arena.allocator(), mock.provider(), &program, &.{decisions.jsonObject()}));
             },
         }
     }

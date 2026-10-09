@@ -10,7 +10,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.query_expression_criteria_type_0 import QueryExpressionCriteriaType0
-    from ..models.query_expression_questions import QueryExpressionQuestions
+    from ..models.query_expression_questions_item import QueryExpressionQuestionsItem
 
 
 T = TypeVar("T", bound="QueryExpression")
@@ -33,7 +33,8 @@ class QueryExpression:
                 ai_choice and ai_score require instructions and criteria. Named refs may
                 select nested JSON members with dotted paths. Binding cycles are invalid.
             decider (str | Unset):
-            questions (QueryExpressionQuestions | Unset):
+            questions (list[QueryExpressionQuestionsItem] | Unset): Named decision question array using choice choices,
+                score levels, or predicate instructions.
             statement (str | Unset):
             instructions (str | Unset):
             criteria (list[str] | QueryExpressionCriteriaType0 | Unset): Choice ID map or ordered score level array.
@@ -45,7 +46,7 @@ class QueryExpression:
     call: QueryExpressionCall | Unset = UNSET
     input_: QueryExpression | Unset = UNSET
     decider: str | Unset = UNSET
-    questions: QueryExpressionQuestions | Unset = UNSET
+    questions: list[QueryExpressionQuestionsItem] | Unset = UNSET
     statement: str | Unset = UNSET
     instructions: str | Unset = UNSET
     criteria: list[str] | QueryExpressionCriteriaType0 | Unset = UNSET
@@ -69,9 +70,12 @@ class QueryExpression:
 
         decider = self.decider
 
-        questions: dict[str, Any] | Unset = UNSET
+        questions: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.questions, Unset):
-            questions = self.questions.to_dict()
+            questions = []
+            for questions_item_data in self.questions:
+                questions_item = questions_item_data.to_dict()
+                questions.append(questions_item)
 
         statement = self.statement
 
@@ -114,7 +118,7 @@ class QueryExpression:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.query_expression_criteria_type_0 import QueryExpressionCriteriaType0
-        from ..models.query_expression_questions import QueryExpressionQuestions
+        from ..models.query_expression_questions_item import QueryExpressionQuestionsItem
 
         d = dict(src_dict)
         literal = d.pop("literal", UNSET)
@@ -140,11 +144,13 @@ class QueryExpression:
         decider = d.pop("decider", UNSET)
 
         _questions = d.pop("questions", UNSET)
-        questions: QueryExpressionQuestions | Unset
-        if isinstance(_questions, Unset):
-            questions = UNSET
-        else:
-            questions = QueryExpressionQuestions.from_dict(_questions)
+        questions: list[QueryExpressionQuestionsItem] | Unset = UNSET
+        if _questions is not UNSET:
+            questions = []
+            for questions_item_data in _questions:
+                questions_item = QueryExpressionQuestionsItem.from_dict(questions_item_data)
+
+                questions.append(questions_item)
 
         statement = d.pop("statement", UNSET)
 
