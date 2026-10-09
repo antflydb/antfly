@@ -335,6 +335,14 @@ pub const AntflyRootImports = struct {
         "usermgr_server_openapi",
     };
 
+    // Native API processes and serverless hosts both own object-table runtimes.
+    // Keep the bootstrap/remote inference contracts identical for those owners.
+    const object_runtime_imports = .{
+        "inference_api", "inference_config_openapi", "middleware_openapi",
+        "s3_openapi",    "scraping_openapi",         "vectorindex",
+        "matcher",
+    };
+
     /// Public local C API: no server provisioning, quorum observer, or routers.
     pub fn configureEmbedded(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         self.configureDatabase(mod, link_libc);
@@ -384,6 +392,7 @@ pub const AntflyRootImports = struct {
         self.configureDatabase(mod, link_libc);
         self.configureServerContracts(mod);
         inline for (api_imports) |field| self.addImport(mod, field);
+        inline for (object_runtime_imports) |field| self.addImport(mod, field);
         mod.addImport("antfly_openapi_specs", self.embedded_openapi);
         // Native remote corpora share local analysis and scoring semantics.
         addSnowballModule(mod.owner, mod);
@@ -393,11 +402,7 @@ pub const AntflyRootImports = struct {
     pub fn configureServerless(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         self.configureDatabase(mod, link_libc);
         mod.addImport("antfly_provision_contract", self.provision_contract);
-        inline for (.{
-            "inference_config_openapi", "middleware_openapi",
-            "s3_openapi",               "scraping_openapi",
-            "vectorindex",              "matcher",
-        }) |field| self.addImport(mod, field);
+        inline for (object_runtime_imports) |field| self.addImport(mod, field);
         addSnowballModule(b, mod);
     }
 

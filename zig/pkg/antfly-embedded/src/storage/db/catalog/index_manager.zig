@@ -14896,7 +14896,7 @@ pub const IndexManager = struct {
 
     fn typedDocValueReaderMatchesMapping(value_type: typed_dv.ValueType, mapping: schema_mod.FieldMapping) bool {
         return switch (mapping.field_type) {
-            .datetime => value_type == .u64_val,
+            .datetime => value_type == .u64_val or value_type == .datetime_ns,
             .numeric => switch (value_type) {
                 .u64_val, .i64_val, .f64_val, .numeric_val => true,
                 else => false,
@@ -18662,7 +18662,7 @@ pub const IndexManager = struct {
 
     pub fn beginSparseCompactionTask(self: *IndexManager) !?SparseCompactionTask {
         for (self.sparse_indexes.items) |*entry| {
-            var task = (try entry.index.beginSegmentCompactionTask(self.alloc, .{})) orelse continue;
+            var task = (try entry.index.beginSegmentCompactionTask(self.alloc, .{ .scratch = if (self.io) |io| .{ .io = io, .directory = self.base_path, .resource_manager = self.resource_manager } else null, .background_publication = true })) orelse continue;
             errdefer task.deinit(self.alloc);
             return .{
                 .index_name = try self.alloc.dupe(u8, entry.config.name),
@@ -18673,8 +18673,16 @@ pub const IndexManager = struct {
         return null;
     }
 
-    pub fn executeSparseCompactionTask(alloc: Allocator, task: *const SparseCompactionTask) !SparseCompactionResult {
+    pub fn executeSparseCompactionTask(alloc: Allocator, task: *SparseCompactionTask) !SparseCompactionResult {
         return try sparse_mod.SparseIndex.executeSegmentCompactionTask(alloc, &task.task, task.chunk_size);
+    }
+
+    pub fn publishSparseCompactionTask(self: *IndexManager, task: *const SparseCompactionTask, result: *SparseCompactionResult) !bool {
+        const entry = self.findSparseIndexEntry(task.index_name) orelse return false;
+        return try entry.index.publishSegmentCompactionTask(&task.task, result);
+    }
+    pub fn completeSparseCompactionTask(alloc: Allocator, task: *const SparseCompactionTask, result: *const SparseCompactionResult, gate: sparse_mod.SparseIndex.MaintenanceGate) !void {
+        try sparse_mod.SparseIndex.completeSegmentCompactionTask(alloc, &task.task, result, gate);
     }
 
     pub fn finishSparseCompactionTask(self: *IndexManager, task: *const SparseCompactionTask, result: *SparseCompactionResult) !bool {
