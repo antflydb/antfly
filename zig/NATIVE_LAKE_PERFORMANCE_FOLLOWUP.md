@@ -8,14 +8,17 @@ validation requirements.
 ## Native sparse predicate intersection
 
 Implemented through query-owned compressed native ordinal selections. Native
-sparse recipe v6 persists authenticated 1024-row physical-to-native ordinal
+sparse recipe v8 persists authenticated 1024-row physical-to-native ordinal
 blocks inside the checkpoint. Each entry stores a two-byte physical offset and
 four-byte native ordinal; ingestion coalesces writes with at most 64 resident
 blocks. Inserts, replacements, deletes and compaction update these maps in the
 same transaction. A completeness marker distinguishes missing vectors from
 legacy checkpoints, which retain point lookup fallback until rebuilt. Queries
-translate a physical selection with one lookup per occupied block and check
-cancellation between blocks, without formatting a document key per selected row.
+translate a physical selection with one borrowed cursor lookup per occupied block
+and check cancellation between blocks, without formatting a document key per
+selected row or retaining every LSM point-read payload until transaction close.
+Tombstone and incarnation checks use independent cursor leases and capped scalar
+epoch caches, so visibility metadata ownership remains bounded for broad queries.
 
 All positive selections use the canonical quantized posting scorer. Point filters
 seek directly to the posting block covering the next selected native ordinal;
@@ -23,27 +26,43 @@ broad filters intersect the same ordinal bitmaps with posting ranges. This keeps
 scores and ties identical to unfiltered scoring, including zero and negative
 scores for overlapping terms. Forward locators remain identity/update metadata.
 
-New immutable segments publish an `ASPSPG01` term-directory root and independent
-posting-block KV values keyed by segment, term, and final ordinal. Chunk payloads
-remain V1. Query cursors retain one encoded block per active stream, with a shared
-64 MiB resident-block admission budget; navigation has a separate byte budget
-instead of a fixed 4096-stream limit. Selective seeks avoid loading earlier blocks.
-Legacy `ASPSSEG1` roots remain readable with their original encoded-byte budget.
-Maintenance merges posting streams from a pinned backend snapshot, retaining one
-encoded block per active source and one output chunk. Native owners spool output
-blocks into a private capacity-accounted run; publication reads one bounded block
-at a time. Complete input segments and corpus-wide decoded posting/sort arrays are
-no longer required for paged compaction. Legacy roots remain readable. Term
-directories, captured incarnation proofs and docmap maintenance still use explicit
-memory admission; this is a bound on posting working state, not constant total
-maintenance memory. Pages, roots, incarnations and physical maps publish atomically. Replaced block keys are
-deleted in the same transaction, preserving existing backend snapshot readers.
-The v6 producer fence rebuilds older remote publications with term-to-segment
-routes. Routes, posting pages and roots commit atomically; a coverage marker
-allows older local checkpoints to retain segment discovery until their next
-publication creates complete routes. Compaction removes old routes in the same
-transaction. Queries seek relevant routes and reuse one posting-page cursor,
-avoiding archive-wide root discovery and per-block cursor construction. Native
+New immutable segments publish a 32-byte `ASPSPG02` root. Term directories live in
+independent pages of at most 64 terms; compaction iterators retain one copied page
+per input. Posting-block KV values remain keyed by segment, term, and final
+ordinal. Their optional `ASP2` transport bit-packs positive ordinal gaps and keeps
+the first absolute ordinal, V1 quantized weight bytes, range data and f32 decoding
+order unchanged. Blocks that do not shrink keep their original encoding. Readers
+validate and expand at most one bounded block per stream; the shared 64 MiB
+resident budget accounts expanded bytes. Navigation has a separate byte budget
+instead of a fixed 4096-stream limit. Selective seeks avoid earlier posting blocks.
+`ASPSSEG1` and `ASPSPG01` roots and uncompressed blocks remain readable. The v8
+native sparse recipe and v9 catalog definition fence rebuild older remote
+publications; local checkpoints upgrade through ordinary copy-on-write maintenance.
+
+Maintenance pins its input snapshot and reserves a durable generation intent in a
+short apply section. Modern incarnation proof capture, posting merges, directory
+spooling and bounded output staging run outside the apply lock. Each directory
+page stages its term routes and interval routes in the same transaction. A guarded
+route is usable only if the reader's same snapshot contains its generation root;
+partial staging and retired generations cannot enter scoring. Publication validates
+input roots, activates the new roots and retires old roots under the apply lock.
+Locator refresh reacquires the lock for at most 256 records per batch and checks
+both the live generation and current document incarnation before writing. A
+competing publication therefore cannot restore an obsolete locator.
+
+Retirement reclaims directory pages and their route ledgers in bounded batches,
+outside the apply lock, followed by posting, summary, incarnation and docmap
+entries. Durable intents recover interrupted staging, refresh and reclamation on
+restart. A live docmap retains its intent until refresh completes. Backend
+snapshots retain old-reader visibility throughout retirement. Legacy roots retain
+explicit memory admission and compatibility capture/publication paths. Modern
+maintenance retains one posting block per input, one output chunk, bounded sort
+state and file-backed proof/directory runs; the entire archive is not materialized.
+
+Term-to-segment and interval routes avoid archive-wide root discovery. A coverage
+marker keeps legacy local checkpoints on the discovery fallback until their next
+publication creates complete routes. Queries reuse posting and root cursors.
+Native
 queries also warm the following posting block through at most eight speculative
 jobs on the shared CPU/I/O scheduler. Each job owns an independent fork of the
 same immutable snapshot; saturation yields to required work. Completion or
@@ -88,8 +107,13 @@ keep authoritative shared semantics, including null evaluation and errors. Neste
 document evaluator. The resulting exact physical set is shared by dense and sparse
 membership. Text selections exceeding the late-visibility budget invert native
 ordinals into physical selections through the pinned file/block directory.
-Contiguous extents remain compressed, authenticated live-row bitmaps restore
-deleted holes, and temporary artifact copies are released between blocks.
+Contiguous extents remain compressed. Authenticated live-row bitmaps restore
+deleted holes through a four-slot cache with at most 4 MiB of decode/rank backing
+storage, including with arena-backed requests. Each slot prepares word-rank
+prefixes once; sparse selected ordinals use binary container/word rank-select
+rather than walking every live row. Broad selections retain sequential bitmap
+intersection. Eviction reuses fixed buffers instead of accumulating freed arena
+objects.
 Only selected blocks and residual dependencies reach the pinned scan.
 
 Keep the indexed superset for a partially resolved conjunction. Iterate it in
@@ -149,7 +173,8 @@ word kernels. Segment doc-number filters and counts use these kernels. A direct
 bitmap count over a segment without deletions uses rank/cardinality with no result
 allocation. Compound filters retain bitmap operations and deletion masks.
 Union/shift allocation failures now propagate with ownership-safe cleanup.
-Container membership uses binary search. Query-owned sparse selections prepare
+Container membership and the starting container for range slices use binary
+search. Query-owned sparse selections prepare
 per-word rank prefixes once; mutations invalidate that navigation metadata before
 changing containers.
 
@@ -380,3 +405,22 @@ metadata-only block rejection, single-get directory cleanup, bounded disk-proof
 lookup, hidden partial output, recovery of abandoned staging, old-reader leases,
 replacement/deletion fencing, forward lookup, and restart. Archive-scale cold/warm
 throughput remains a measurement requirement, not a claimed benchmark result.
+
+## Validation and remaining measurement
+
+Focused regressions cover bounded physical-map cursor reads, packed transport
+round trips across all gap widths, malformed input and allocation failures,
+constant-size roots with multiple term pages, hidden staged routes, abandoned
+output reclamation, pinned old readers, restart recovery, and generation retirement
+between locator batches. Live-row cache tests cycle more artifacts than fit in the
+cache while allowing exactly four backing buffers; rank/select tests compare each
+selected ordinal with scalar iteration across dense holes and u32 boundaries.
+Existing score differential tests cover negative terms, ties, filtering and spill.
+Real Parquet and PyIceberg end-to-end tests remain the integration gate.
+
+Representative archive benchmarks are still required to quantify throughput,
+provider bytes, expanded-block residency and apply-lock latency. The packed codec
+reduces bytes for dense-gap fixtures; that ratio is not an archive throughput
+claim. Legacy conversion work and source/document directories still have explicit
+admission costs. These changes do not promise constant total memory for arbitrary
+legacy checkpoints or eliminate the need to measure skewed workloads.

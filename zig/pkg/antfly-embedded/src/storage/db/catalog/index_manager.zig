@@ -18662,7 +18662,7 @@ pub const IndexManager = struct {
 
     pub fn beginSparseCompactionTask(self: *IndexManager) !?SparseCompactionTask {
         for (self.sparse_indexes.items) |*entry| {
-            var task = (try entry.index.beginSegmentCompactionTask(self.alloc, .{ .scratch = if (self.io) |io| .{ .io = io, .directory = self.base_path, .resource_manager = self.resource_manager } else null })) orelse continue;
+            var task = (try entry.index.beginSegmentCompactionTask(self.alloc, .{ .scratch = if (self.io) |io| .{ .io = io, .directory = self.base_path, .resource_manager = self.resource_manager } else null, .background_publication = true })) orelse continue;
             errdefer task.deinit(self.alloc);
             return .{
                 .index_name = try self.alloc.dupe(u8, entry.config.name),
@@ -18675,6 +18675,14 @@ pub const IndexManager = struct {
 
     pub fn executeSparseCompactionTask(alloc: Allocator, task: *SparseCompactionTask) !SparseCompactionResult {
         return try sparse_mod.SparseIndex.executeSegmentCompactionTask(alloc, &task.task, task.chunk_size);
+    }
+
+    pub fn publishSparseCompactionTask(self: *IndexManager, task: *const SparseCompactionTask, result: *SparseCompactionResult) !bool {
+        const entry = self.findSparseIndexEntry(task.index_name) orelse return false;
+        return try entry.index.publishSegmentCompactionTask(&task.task, result);
+    }
+    pub fn completeSparseCompactionTask(alloc: Allocator, task: *const SparseCompactionTask, result: *const SparseCompactionResult, gate: sparse_mod.SparseIndex.MaintenanceGate) !void {
+        try sparse_mod.SparseIndex.completeSegmentCompactionTask(alloc, &task.task, result, gate);
     }
 
     pub fn finishSparseCompactionTask(self: *IndexManager, task: *const SparseCompactionTask, result: *SparseCompactionResult) !bool {

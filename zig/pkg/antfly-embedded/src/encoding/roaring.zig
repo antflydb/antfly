@@ -1038,7 +1038,8 @@ pub const RoaringBitmap = struct {
         std.debug.assert(upper <= 0x1_0000_0000 and upper >= lower);
         var clipped = RoaringBitmap.init(alloc);
         defer clipped.deinit();
-        for (self.keys.items, self.containers.items) |key, *container| {
+        const first_container = self.lowerChunk(@intCast(lower >> 16));
+        for (self.keys.items[first_container..], self.containers.items[first_container..]) |key, *container| {
             const base = @as(u64, key) << 16;
             if (base >= upper) break;
             if (base + 65536 <= lower) continue;
@@ -1968,6 +1969,34 @@ pub const FrozenRankIndex = struct {
         }
         return entry.before + self.bitmap.containers.items[lo].rankBelow(low);
     }
+    /// Zero-based ordinal selection over the same immutable word prefixes.
+    pub fn select(self: *const @This(), ordinal: usize) ?u32 {
+        if (ordinal >= self.count) return null;
+        var lo: usize = 0;
+        var hi = self.entries.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const end = if (mid + 1 < self.entries.len) self.entries[mid + 1].before else self.count;
+            if (end <= ordinal) lo = mid + 1 else hi = mid;
+        }
+        const entry = self.entries[lo];
+        const within_rank = ordinal - entry.before;
+        const base = @as(u32, self.bitmap.keys.items[lo]) << 16;
+        if (entry.words) |words| {
+            var lower: usize = 0;
+            var upper = words.len;
+            while (lower < upper) {
+                const mid = lower + (upper - lower) / 2;
+                const end: usize = if (mid + 1 < words.len) words[mid + 1] else (if (lo + 1 < self.entries.len) self.entries[lo + 1].before else self.count) - entry.before;
+                if (end <= within_rank) lower = mid + 1 else upper = mid;
+            }
+            var bits = self.bitmap.containers.items[lo].bitmap[lower];
+            var skip = within_rank - words[lower];
+            while (skip != 0) : (skip -= 1) bits &= bits - 1;
+            return base | @as(u32, @intCast(lower * 64 + @ctz(bits)));
+        }
+        return base | self.bitmap.containers.items[lo].array.items[within_rank];
+    }
     pub fn retainedBytes(self: *const @This()) usize {
         var bytes = self.entries.len * @sizeOf(Entry);
         for (self.entries) |entry| if (entry.words) |words| {
@@ -2096,4 +2125,23 @@ test "external lake prepared bitmap navigation invalidates on mutations and surv
     };
     try Probe.run(a);
     try std.testing.checkAllAllocationFailures(a, Probe.run, .{});
+}
+
+test "frozen rank select skips dense words holes and empty containers" {
+    const a = std.testing.allocator;
+    var bitmap = RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    try bitmap.addRange(0, 131072);
+    for (0..131072) |i| if (i % 3 == 0) try bitmap.remove(@intCast(i));
+    try bitmap.add(200000);
+    try bitmap.remove(200000); // Retain an empty container between live ones.
+    try bitmap.add(std.math.maxInt(u32));
+    try bitmap.prepareRead();
+    var iterator = bitmap.iterator();
+    var ordinal: usize = 0;
+    while (iterator.next()) |value| : (ordinal += 1) {
+        try std.testing.expectEqual(value, bitmap.read_rank.?.select(ordinal).?);
+        try std.testing.expectEqual(ordinal, bitmap.rank(value));
+    }
+    try std.testing.expect(bitmap.read_rank.?.select(ordinal) == null);
 }

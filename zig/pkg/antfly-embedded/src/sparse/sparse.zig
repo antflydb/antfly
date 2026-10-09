@@ -1422,16 +1422,16 @@ fn selectPhysicalBlock(txn: anytype, a: Allocator, prefix: []const u8, high: u32
         else => return err,
     };
     if (!std.mem.eql(u8, marker, &.{1})) return error.InvalidSparsePhysicalMap;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
     var iterator = rows.iterator();
     while (iterator.next()) |first| {
         try checkSearchCancellation(cancellation);
         const base = first & ~@as(u32, 1023);
         const row = (@as(u64, high) << 32) | base;
         const block_key = try PhysicalMaps.key(prefix, row >> 10);
-        const data = txn.get(&block_key) catch |err| switch (err) {
-            error.NotFound => &.{},
-            else => return err,
-        };
+        const found = try cursor.seekAtOrAfter(&block_key);
+        const data: []const u8 = if (found) |entry| (if (std.mem.eql(u8, entry.key, &block_key)) entry.value else &.{}) else &.{};
         if (data.len % 6 != 0) return error.InvalidSparsePhysicalMap;
         var pos: usize = 0;
         while (pos < data.len) : (pos += 6) {
@@ -1577,7 +1577,17 @@ fn collectPostingStreams(a: Allocator, txn: anytype, query: *const SparseVector,
                         next_route = try cursor.next();
                         continue;
                     }
-                    if (route.value.len == 8) {
+                    if (route.value.len == 8 or route.value.len == 9) {
+                        if (route.value.len == 9) {
+                            if (route.value[8] != 1) return error.InvalidSparseSegment;
+                            var root_key: [16]u8 = undefined;
+                            const lookup = segmentKey(&root_key, id);
+                            const active = try roots.seekAtOrAfter(lookup);
+                            if (active == null or !std.mem.eql(u8, active.?.key, lookup)) {
+                                next_route = try cursor.next();
+                                continue;
+                            }
+                        }
                         const lower = std.mem.readInt(u32, route.value[0..4], .little);
                         const upper = std.mem.readInt(u32, route.value[4..8], .little);
                         if (lower > upper) return error.InvalidSparseSegment;
@@ -1635,7 +1645,7 @@ fn collectPostingStreams(a: Allocator, txn: anytype, query: *const SparseVector,
             var retained: ?[]const u8 = null;
             for (query.indices, query.values) |term, weight| {
                 if (posting_pages.paged(entry.value)) {
-                    if (!try posting_pages.hasTerm(entry.value, term)) continue;
+                    if (!try posting_pages.hasTermTxn(txn, id, entry.value, term)) continue;
                     if (streams.items.len == max_streams) return null;
                     try streams.append(a, .{ .weight = weight, .segment = id, .version = version, .term = term, .reader = page_reader.interface(), .allocator = a });
                 } else if (try segmentTermPayload(entry.value, term) != null) {
@@ -1729,6 +1739,32 @@ fn immutableVersion(data: []const u8) !u32 {
     if (version != 1 and version != SEGMENT_FORMAT_VERSION) return error.InvalidSparseSegment;
     return version;
 }
+
+/// Independent cursor leases release backend scratch as visibility advances.
+/// Epochs are copied into the bounded cache; no point-get payload survives in
+/// the parent query transaction, including when its allocator is an arena.
+const VisibilityReader = struct {
+    cursors: [3]backend_erased.Cursor,
+    fn init(txn: *backend_erased.ReadTxn) !@This() {
+        var cursors: [3]backend_erased.Cursor = undefined;
+        var count: usize = 0;
+        errdefer for (cursors[0..count]) |*cursor| cursor.close();
+        for (&cursors) |*cursor| {
+            cursor.* = try txn.openCursor();
+            count += 1;
+        }
+        return .{ .cursors = cursors };
+    }
+    fn deinit(self: *@This()) void {
+        for (&self.cursors) |*cursor| cursor.close();
+    }
+    pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+        const lane: usize = if (key[0] == key_doc_tombstone) 0 else if (key[0] == key_doc_incarnation) 1 else 2;
+        const entry = (try self.cursors[lane].seekAtOrAfter(key)) orelse return error.NotFound;
+        if (!std.mem.eql(u8, entry.key, key)) return error.NotFound;
+        return entry.value;
+    }
+};
 
 /// Query-local and hard capped: selective queries point-read only candidate
 /// incarnations, never load a segment-sized metadata blob. The caller's query
@@ -2461,6 +2497,7 @@ pub const SparseIndex = struct {
         min_segments: usize = 32,
         max_segments: usize = 128,
         scratch: ?@import("../spill_sort.zig").Options = null,
+        background_publication: bool = false,
     };
 
     pub const SegmentCompactionSource = struct {
@@ -2490,9 +2527,17 @@ pub const SparseIndex = struct {
         buffer_reservation: ?resource_manager_mod.Reservation = null,
         snapshot: ?backend_erased.ReadTxn = null,
         scratch: ?@import("../spill_sort.zig").Options = null,
+        generation: ?u64 = null,
+        // The maintenance owner pins the store lifecycle; this copy remains
+        // stable if the IndexManager's sparse entry array moves during apply.
+        store: ?backend_erased.Store = null,
 
         pub fn deinit(self: *SegmentCompactionTask, alloc: Allocator) void {
             if (self.snapshot) |*snapshot| snapshot.abort();
+            if (self.generation) |id| if (self.store) |store| {
+                var writer: CompactionWriter = .{ .alloc = alloc, .store = store };
+                discardStaging(&writer, id) catch {};
+            };
             if (self.buffer_reservation) |*reservation| reservation.release();
             for (self.sources) |source| source.deinit(alloc);
             alloc.free(self.sources);
@@ -2505,6 +2550,9 @@ pub const SparseIndex = struct {
     pub const SegmentCompactionResult = struct {
         data: ?[]u8 = null,
         pages: ?*posting_pages.Builder.Run = null,
+        directory_run: ?*posting_pages.Builder.Run = null,
+        staged: bool = false,
+        generation: ?u64 = null,
         docmap: ?[]u8 = null,
         map_sort: ?@import("../spill_sort.zig").Sorter = null,
         map_range: ?@import("../spill_sort.zig").Range = null,
@@ -2517,6 +2565,7 @@ pub const SparseIndex = struct {
         pub fn deinit(self: *SegmentCompactionResult, alloc: Allocator) void {
             if (self.data) |data| alloc.free(data);
             if (self.pages) |pages| pages.deinit();
+            if (self.directory_run) |run| run.deinit();
             if (self.proofs) |*proofs| proofs.deinit();
             if (self.docmap) |data| alloc.free(data);
             if (self.map_sort) |*sort| sort.deinit();
@@ -2616,10 +2665,8 @@ pub const SparseIndex = struct {
             const data = try alloc.dupe(u8, entry.value);
             var transferred = false;
             errdefer if (!transferred) alloc.free(data);
-            var proofs = if (options.scratch != null and try immutableVersion(data) == SEGMENT_FORMAT_VERSION) try captureDiskProofs(alloc, &txn, id, false, options.scratch.?) else null;
-            errdefer if (proofs) |*owned| owned.deinit();
-            const incarnations = if (proofs != null) try alloc.alloc(CapturedIncarnation, 0) else try captureIncarnations(alloc, &txn, id, data, false);
-            const source: SegmentCompactionSource = .{ .id = id, .data = data, .incarnations = incarnations, .proofs = proofs };
+            const incarnations = if (options.scratch != null and try immutableVersion(data) == SEGMENT_FORMAT_VERSION) try alloc.alloc(CapturedIncarnation, 0) else try captureIncarnations(alloc, &txn, id, data, false);
+            const source: SegmentCompactionSource = .{ .id = id, .data = data, .incarnations = incarnations };
             sources.append(alloc, source) catch |err| {
                 for (incarnations) |item| if (item.doc_id) |bytes| alloc.free(bytes);
                 alloc.free(incarnations);
@@ -2644,10 +2691,8 @@ pub const SparseIndex = struct {
             const data = try alloc.dupe(u8, entry.value);
             var transferred = false;
             errdefer if (!transferred) alloc.free(data);
-            var proofs = if (options.scratch != null and try immutableVersion(data) == SEGMENT_FORMAT_VERSION) try captureDiskProofs(alloc, &txn, id, true, options.scratch.?) else null;
-            errdefer if (proofs) |*owned| owned.deinit();
-            const incarnations = if (proofs != null) try alloc.alloc(CapturedIncarnation, 0) else try captureIncarnations(alloc, &txn, id, data, true);
-            docmaps.append(alloc, .{ .id = id, .data = data, .incarnations = incarnations, .proofs = proofs }) catch |err| {
+            const incarnations = if (options.scratch != null and try immutableVersion(data) == SEGMENT_FORMAT_VERSION) try alloc.alloc(CapturedIncarnation, 0) else try captureIncarnations(alloc, &txn, id, data, true);
+            docmaps.append(alloc, .{ .id = id, .data = data, .incarnations = incarnations }) catch |err| {
                 for (incarnations) |item| if (item.doc_id) |bytes| alloc.free(bytes);
                 alloc.free(incarnations);
                 return err;
@@ -2677,9 +2722,12 @@ pub const SparseIndex = struct {
             alloc.free(owned_docmaps);
         }
 
+        const generation = if (options.background_publication and options.scratch != null) try self.reserveCompactionId() else null;
         snapshot_transferred = true;
         return .{
             .snapshot = txn,
+            .generation = generation,
+            .store = self.store,
             .scratch = options.scratch,
             .sources = owned_sources,
             .docmaps = owned_docmaps,
@@ -2700,13 +2748,30 @@ pub const SparseIndex = struct {
             if (task.snapshot) |*snapshot| snapshot.abort();
             task.snapshot = null;
         }
+        if (task.scratch) |options| {
+            for (task.sources) |*source| if (source.proofs == null and try immutableVersion(source.data) == SEGMENT_FORMAT_VERSION) {
+                source.proofs = try captureDiskProofs(alloc, &task.snapshot.?, source.id, false, options);
+            };
+            for (task.docmaps) |*source| if (source.proofs == null and try immutableVersion(source.data) == SEGMENT_FORMAT_VERSION) {
+                source.proofs = try captureDiskProofs(alloc, &task.snapshot.?, source.id, true, options);
+            };
+        }
         var reader: PageReader = .{ .txn = if (task.snapshot) |*snapshot| snapshot else return error.InvalidSparseSegment };
         defer reader.deinit();
         var builder = try posting_pages.Builder.init(alloc, task.scratch);
         defer builder.deinit();
-        var term_positions = try alloc.alloc(usize, task.sources.len);
-        defer alloc.free(term_positions);
-        @memset(term_positions, 0);
+        const TermIterator = posting_pages.Terms(backend_erased.ReadTxn);
+        const term_iterators = try alloc.alloc(TermIterator, task.sources.len);
+        defer alloc.free(term_iterators);
+        var opened: usize = 0;
+        defer for (term_iterators[0..opened]) |*iterator| iterator.deinit();
+        const term_heads = try alloc.alloc(?[20]u8, task.sources.len);
+        defer alloc.free(term_heads);
+        for (task.sources, term_iterators, term_heads) |source, *iterator, *head| {
+            iterator.* = try TermIterator.init(&task.snapshot.?, source.id, source.data);
+            opened += 1;
+            head.* = try iterator.next();
+        }
         const proof_positions = try alloc.alloc(usize, task.sources.len);
         defer alloc.free(proof_positions);
         var streams = try alloc.alloc(daat.Stream, task.sources.len);
@@ -2717,21 +2782,18 @@ pub const SparseIndex = struct {
         var posting_count: u64 = 0;
         while (true) {
             var term: ?u32 = null;
-            for (task.sources, term_positions) |source, position| {
-                const dir = try posting_pages.directory(source.data);
-                if (position < dir.len) {
-                    const candidate = std.mem.readInt(u32, dir[position..][0..4], .little);
-                    term = if (term) |prior| @min(prior, candidate) else candidate;
-                }
-            }
+            for (term_heads) |head| if (head) |entry| {
+                const candidate = std.mem.readInt(u32, entry[0..4], .little);
+                term = if (term) |prior| @min(prior, candidate) else candidate;
+            };
             const current = term orelse break;
             @memset(proof_positions, 0);
             var active: usize = 0;
             defer for (streams[0..active]) |*stream| stream.deinit();
-            for (task.sources, term_positions, 0..) |source, position, source_index| {
-                const dir = try posting_pages.directory(source.data);
-                if (position == dir.len or std.mem.readInt(u32, dir[position..][0..4], .little) != current) continue;
-                term_positions[source_index] += 20;
+            for (task.sources, term_heads, 0..) |source, head, source_index| {
+                const entry = head orelse continue;
+                if (std.mem.readInt(u32, entry[0..4], .little) != current) continue;
+                term_heads[source_index] = try term_iterators[source_index].next();
                 streams[active] = if (posting_pages.paged(source.data))
                     .{ .weight = 1, .query_order = source_index, .segment = source.id, .term = current, .reader = reader.interface(), .allocator = alloc }
                 else
@@ -2870,9 +2932,15 @@ pub const SparseIndex = struct {
                 std.mem.writeInt(u32, data[8..12], SEGMENT_FORMAT_VERSION, .little);
                 std.mem.writeInt(u32, data[12..16], count, .little);
             }
-            const pages = builder.run;
+            var result: SegmentCompactionResult = .{ .data = merged, .pages = builder.run, .directory_run = builder.terms, .incarnations = incarnations, .proofs = proofs, .docmap = docmap, .map_sort = map_sort, .map_range = range, .source_segments = @intCast(task.sources.len), .postings = posting_count };
+            if (task.generation) |id| {
+                var writer: CompactionWriter = .{ .alloc = alloc, .store = task.store.? };
+                try stageCompaction(&writer, id, &result);
+                result.staged = true;
+            }
             builder.run = null;
-            return .{ .data = merged, .pages = pages, .incarnations = incarnations, .proofs = proofs, .docmap = docmap, .map_sort = map_sort, .map_range = range, .source_segments = @intCast(task.sources.len), .postings = posting_count };
+            builder.terms = null;
+            return result;
         }
         var docmap_bytes = std.ArrayListUnmanaged(u8).empty;
         defer docmap_bytes.deinit(alloc);
@@ -2943,7 +3011,7 @@ pub const SparseIndex = struct {
         try txn.commit();
         return id;
     }
-    fn reclaimCompactionId(self: *SparseIndex, id: u64) !void {
+    fn reclaimCompactionId(self: anytype, id: u64) !void {
         var read = try self.beginReadTxn();
         var root_key: [16]u8 = undefined;
         const posting_live = if (read.get(segmentKey(&root_key, id))) |_| true else |err| switch (err) {
@@ -2961,6 +3029,15 @@ pub const SparseIndex = struct {
             },
         };
         read.abort();
+        if (!posting_live) {
+            while (true) {
+                var txn = try self.beginBatchTxn(.{});
+                errdefer txn.abort();
+                const more = try posting_pages.reclaimDirectoryPage(&txn, id);
+                try txn.commit();
+                if (!more) break;
+            }
+        }
         for ([_]u8{ 0x0d, 0x11, key_segment_incarnation, key_docmap_incarnation, 0x13 }) |tag| {
             if (if (tag == key_docmap_incarnation or tag == 0x13) map_live else posting_live) continue;
             while (true) {
@@ -2985,11 +3062,20 @@ pub const SparseIndex = struct {
                     }
                 }
                 if (count == 0) break;
-                for (keys[0..count]) |key| try txn.delete(&key);
+                for (keys[0..count]) |key| txn.delete(&key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
                 try txn.commit();
                 batch_open = false;
             }
         }
+        // Another worker may retire only this generation's posting root
+        // while its live docmap still needs locator refresh. Its durable
+        // intent belongs to the refreshing owner (or restart recovery).
+        if (!map_live) try clearCompactionIntent(self, id);
+    }
+    fn clearCompactionIntent(self: anytype, id: u64) !void {
         var txn = try self.beginBatchTxn(.{});
         errdefer txn.abort();
         txn.delete(&pendingKey(id)) catch |err| switch (err) {
@@ -2998,7 +3084,7 @@ pub const SparseIndex = struct {
         };
         try txn.commit();
     }
-    fn refreshPagedLocators(self: *SparseIndex, id: u64) !void {
+    fn refreshPagedLocators(self: anytype, id: u64, gate: ?MaintenanceGate) !void {
         var read = try self.beginReadTxn();
         defer read.abort();
         var root_key: [16]u8 = undefined;
@@ -3014,8 +3100,16 @@ pub const SparseIndex = struct {
         const prefix = docMapEntryKey(id, 0);
         var next = try cursor.seekAtOrAfter(prefix[0..9]);
         while (next != null) {
+            if (gate) |g| try g.enter(g.ptr);
+            defer if (gate) |g| g.leave(g.ptr);
             var updates = try self.beginBatchTxn(.{});
-            errdefer updates.abort();
+            var updates_open = true;
+            defer if (updates_open) updates.abort();
+            const active = updates.get(docMapSegmentKey(&root_key, id)) catch |err| switch (err) {
+                error.NotFound => return,
+                else => return err,
+            };
+            if (!std.mem.eql(u8, active, root)) return;
             var count: usize = 0;
             while (next) |entry| {
                 if (entry.key.len != 17 or !std.mem.eql(u8, entry.key[0..9], prefix[0..9])) {
@@ -3053,6 +3147,7 @@ pub const SparseIndex = struct {
                 if (count == 256) break;
             }
             try updates.commit();
+            updates_open = false;
         }
     }
     fn recoverCompactionIntents(self: *SparseIndex) !void {
@@ -3066,11 +3161,12 @@ pub const SparseIndex = struct {
                 if (entry.key.len != 9 or entry.key[0] != 0x12) return;
                 break :blk std.mem.readInt(u64, entry.key[1..9], .big);
             };
-            try self.refreshPagedLocators(id);
+            try self.refreshPagedLocators(id, null);
             try self.reclaimCompactionId(id);
+            try clearCompactionIntent(self, id);
         }
     }
-    fn stageCompaction(self: *SparseIndex, id: u64, result: *SegmentCompactionResult) !void {
+    fn stageCompaction(self: anytype, id: u64, result: *SegmentCompactionResult) !void {
         if (result.pages) |run| {
             const view = try run.sealedView();
             var offset: u64 = 0;
@@ -3094,6 +3190,28 @@ pub const SparseIndex = struct {
                     batch_bytes += len;
                 }
                 try txn.commit();
+            }
+        }
+        if (result.directory_run) |run| {
+            const root = result.data orelse return error.InvalidSparseSegment;
+            const view = try run.sealedView();
+            const header_len = 16 + @as(u64, std.mem.readInt(u32, root[12..16], .little)) * 20;
+            var offset: u64 = 0;
+            while (offset < view.length) {
+                var entries: [posting_pages.directory_page_terms * 20]u8 = undefined;
+                const len: usize = @intCast(@min(entries.len, view.length - offset));
+                if (len % 20 != 0) return error.InvalidSparseSegment;
+                try view.readInto(offset, entries[0..len]);
+                var at: usize = 0;
+                while (at < len) : (at += 20) {
+                    const relative = std.mem.readInt(u64, entries[at + 8 ..][0..8], .little);
+                    std.mem.writeInt(u64, entries[at + 8 ..][0..8], try std.math.add(u64, header_len, relative), .little);
+                }
+                var txn = try self.beginBatchTxn(.{});
+                errdefer txn.abort();
+                try posting_pages.putDirectoryPage(&txn, id, root, entries[0..len]);
+                try txn.commit();
+                offset += len;
             }
         }
         if (result.map_range) |range| {
@@ -3136,17 +3254,17 @@ pub const SparseIndex = struct {
             }
         }
     }
-    pub fn finishSegmentCompactionTask(
+    pub fn publishSegmentCompactionTask(
         self: *SparseIndex,
         task: *const SegmentCompactionTask,
         result: *SegmentCompactionResult,
     ) !bool {
         if (task.sources.len < 2 and task.docmaps.len < 2) return false;
 
-        const segment_id = try self.reserveCompactionId();
+        const segment_id = task.generation orelse try self.reserveCompactionId();
         var published = false;
-        defer if (!published) self.reclaimCompactionId(segment_id) catch {};
-        try self.stageCompaction(segment_id, result);
+        defer if (!published and task.generation == null) self.reclaimCompactionId(segment_id) catch {};
+        if (!result.staged) try self.stageCompaction(segment_id, result);
         var txn = try self.beginBatchTxn(.{});
         var txn_open = true;
         defer if (txn_open) txn.abort();
@@ -3202,11 +3320,64 @@ pub const SparseIndex = struct {
         try txn.commit();
         txn_open = false;
         published = true;
-        try self.refreshPagedLocators(segment_id);
-        try self.reclaimCompactionId(segment_id);
-        for (task.sources) |source| try self.reclaimCompactionId(source.id);
-        for (task.docmaps) |source| try self.reclaimCompactionId(source.id);
+        result.generation = segment_id;
         return true;
+    }
+
+    pub const MaintenanceGate = struct {
+        ptr: *anyopaque,
+        enter: *const fn (*anyopaque) anyerror!void,
+        leave: *const fn (*anyopaque) void,
+    };
+    const CompactionWriter = struct {
+        alloc: Allocator,
+        store: backend_erased.Store,
+        fn beginReadTxn(self: *@This()) !backend_erased.ReadTxn {
+            return self.store.beginRead();
+        }
+        fn beginBatchTxn(self: *@This(), options: backend_types.BatchOptions) !backend_erased.Batch {
+            return self.store.beginBatchWithOptions(options);
+        }
+    };
+    fn discardStaging(writer: *CompactionWriter, id: u64) !void {
+        var read = try writer.beginReadTxn();
+        var key_buf: [16]u8 = undefined;
+        const live = blk: {
+            const posting = read.get(segmentKey(&key_buf, id)) catch |err| switch (err) {
+                error.NotFound => null,
+                else => {
+                    read.abort();
+                    return err;
+                },
+            };
+            if (posting != null) break :blk true;
+            const map = read.get(docMapSegmentKey(&key_buf, id)) catch |err| switch (err) {
+                error.NotFound => null,
+                else => {
+                    read.abort();
+                    return err;
+                },
+            };
+            if (map != null) break :blk true;
+            break :blk false;
+        };
+        read.abort();
+        // A live root retains its intent until locator refresh completes.
+        if (!live) try reclaimCompactionId(writer, id);
+    }
+    pub fn completeSegmentCompactionTask(alloc: Allocator, task: *const SegmentCompactionTask, result: *const SegmentCompactionResult, gate: ?MaintenanceGate) !void {
+        const id = result.generation orelse return;
+        var writer: CompactionWriter = .{ .alloc = alloc, .store = task.store.? };
+        try refreshPagedLocators(&writer, id, gate);
+        try reclaimCompactionId(&writer, id);
+        try clearCompactionIntent(&writer, id);
+        for (task.sources) |source| try reclaimCompactionId(&writer, source.id);
+        for (task.docmaps) |source| try reclaimCompactionId(&writer, source.id);
+    }
+    pub fn finishSegmentCompactionTask(self: *SparseIndex, task: *const SegmentCompactionTask, result: *SegmentCompactionResult) !bool {
+        const published = try self.publishSegmentCompactionTask(task, result);
+        if (published) try completeSegmentCompactionTask(self.alloc, task, result, null);
+        return published;
     }
 
     pub fn compactSegmentsWithOptions(self: *SparseIndex, alloc: Allocator, options: SegmentCompactionOptions) !bool {
@@ -4371,6 +4542,8 @@ pub const SparseIndex = struct {
         defer scores.deinit();
         var incarnations: IncarnationCache = .{};
         defer incarnations.deinit(alloc);
+        var visibility = try VisibilityReader.init(&txn);
+        defer visibility.deinit();
 
         // Point-seek the native reverse identity only for postings reached by
         // this query. Cache compressed decisions across terms; bulk publication
@@ -4387,6 +4560,7 @@ pub const SparseIndex = struct {
             alloc: Allocator,
             txn: @TypeOf(&txn),
             incarnations: *IncarnationCache,
+            visibility: *VisibilityReader,
             segment_id: ?u64 = null,
             segment_version: u32 = 1,
             query_weight: f32,
@@ -4422,8 +4596,8 @@ pub const SparseIndex = struct {
                 if (ctx.filter_doc_nums.count() > 0 and !ctx.filter_doc_nums.contains(doc_num)) return false;
                 if (ctx.direct_filter_doc_nums.count() > 0 and !ctx.direct_filter_doc_nums.contains(doc_num)) return false;
                 if (ctx.exclude_doc_nums.contains(doc_num) or ctx.direct_exclude_doc_nums.contains(doc_num)) return false;
-                if (ctx.index.docNumDeleted(ctx.txn, doc_num)) return false;
-                if (stream.segment) |id| if (!try ctx.incarnations.matches(ctx.alloc, ctx.txn, id, stream.version, doc_num)) return false;
+                if (ctx.index.docNumDeleted(ctx.visibility, doc_num)) return false;
+                if (stream.segment) |id| if (!try ctx.incarnations.matches(ctx.alloc, ctx.visibility, id, stream.version, doc_num)) return false;
                 return true;
             }
             fn shouldDecode(ctx: *@This(), bytes: []const u8, range: []const u8) !bool {
@@ -4439,7 +4613,7 @@ pub const SparseIndex = struct {
                     if (ctx.direct_filter_doc_nums.count() > 0 and !ctx.direct_filter_doc_nums.contains(doc_num)) continue;
                     if (ctx.exclude_doc_nums.contains(doc_num)) continue;
                     if (ctx.direct_exclude_doc_nums.contains(doc_num)) continue;
-                    if (ctx.segment_id) |id| if (!try ctx.incarnations.matches(ctx.alloc, ctx.txn, id, ctx.segment_version, doc_num)) continue;
+                    if (ctx.segment_id) |id| if (!try ctx.incarnations.matches(ctx.alloc, ctx.visibility, id, ctx.segment_version, doc_num)) continue;
                     if (ctx.key_predicate) |predicate| if (!ctx.decisions.allowed.contains(doc_num)) {
                         if (ctx.decisions.denied.contains(doc_num)) continue;
                         const id = ctx.index.resolveDocIdByDocNum(ctx.alloc, ctx.txn, doc_num) catch |err| switch (err) {
@@ -4480,6 +4654,7 @@ pub const SparseIndex = struct {
                     .alloc = alloc,
                     .txn = &txn,
                     .incarnations = &incarnations,
+                    .visibility = &visibility,
                     .query_weight = 0,
                     .scores = &scores,
                     .filter_doc_nums = &filter_doc_nums,
@@ -4521,6 +4696,7 @@ pub const SparseIndex = struct {
                         .alloc = alloc,
                         .txn = &txn,
                         .incarnations = &incarnations,
+                        .visibility = &visibility,
                         .segment_id = segmentIdFromKey(segment_entry.key) orelse return error.InvalidSparseSegment,
                         .segment_version = try immutableVersion(segment_entry.value),
                         .query_weight = query_vec.values[qi],
@@ -4572,6 +4748,7 @@ pub const SparseIndex = struct {
                         .alloc = alloc,
                         .txn = &txn,
                         .incarnations = &incarnations,
+                        .visibility = &visibility,
                         .query_weight = query_weight,
                         .scores = &scores,
                         .filter_doc_nums = &filter_doc_nums,
@@ -4604,7 +4781,7 @@ pub const SparseIndex = struct {
             while (try scores.next(constraints.cancellation)) |entry| {
                 try checkSearchCancellation(constraints.cancellation);
                 if (profile_enabled) profile.scored_docs += 1;
-                if (self.docNumDeleted(&txn, entry.doc_num)) continue;
+                if (self.docNumDeleted(&visibility, entry.doc_num)) continue;
                 if (!bounded) {
                     try entries.append(alloc, entry);
                 } else if (heap.items.len < k) {
@@ -6775,8 +6952,8 @@ test "sparse paged postings roundtrip seek and reclaim immutable blocks" {
         const restored = try posting_pages.materialize(a, &txn, 42, root);
         defer a.free(restored);
         try std.testing.expectEqualSlices(u8, legacy, restored);
-        try std.testing.expect(try posting_pages.hasTerm(root, 1));
-        try std.testing.expect(!try posting_pages.hasTerm(root, 99));
+        try std.testing.expect(try posting_pages.hasTermTxn(&txn, 42, root, 1));
+        try std.testing.expect(!try posting_pages.hasTermTxn(&txn, 42, root, 99));
         try txn.commit();
     }
     {
@@ -6965,14 +7142,27 @@ test "sparse streamed compaction keeps input pages pinned across competing publi
 
 test "sparse streamed compaction releases snapshots blocks and scratch on allocation failures" {
     const Probe = struct {
+        var nonce: u64 = 0;
+        fn random(_: ?*anyopaque, bytes: []u8) std.Io.RandomSecureError!void {
+            @memset(bytes, 0x80);
+            std.mem.writeInt(u64, bytes[0..8], nonce, .little);
+            nonce += 1;
+        }
         fn run(output: Allocator) !void {
+            // Private scratch filenames must repeat across fault-injection
+            // runs: random formatting lengths change allocator growth counts.
+            nonce = 0;
+            var io = std.testing.io;
+            var vtable = io.vtable.*;
+            vtable.randomSecure = random;
+            io.vtable = &vtable;
             const a = std.testing.allocator;
             var index = try SparseIndex.open(a, "unused", .{ .backend = .mem, .chunk_size = 1 });
             defer index.close();
             const bulk: BatchOptions = .{ .prefer_bulk_build = true, .assume_new_doc_ids = true };
             try index.batchWithOptions(&.{.{ .doc_id = "a", .vec = .{ .indices = &.{ 1, 2 }, .values = &.{ 2, -3 } } }}, &.{}, bulk);
             try index.batchWithOptions(&.{.{ .doc_id = "b", .vec = .{ .indices = &.{ 1, 2 }, .values = &.{ 5, -7 } } }}, &.{}, bulk);
-            var task = (try index.beginSegmentCompactionTask(a, .{ .min_segments = 2, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } })).?;
+            var task = (try index.beginSegmentCompactionTask(a, .{ .min_segments = 2, .background_publication = true, .scratch = .{ .io = io, .directory = "/tmp" } })).?;
             defer task.deinit(a);
             var result = try SparseIndex.executeSegmentCompactionTask(output, &task, 1);
             defer result.deinit(output);
@@ -6980,8 +7170,14 @@ test "sparse streamed compaction releases snapshots blocks and scratch on alloca
             try std.testing.expectEqual(@as(u64, 4), result.postings);
         }
     };
-    try Probe.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    // Force grow/copy allocation paths instead of address-dependent in-place
+    // remaps, so each fault index denotes the same allocation on every run.
+    var vtable = std.testing.allocator.vtable.*;
+    vtable.resize = Allocator.noResize;
+    vtable.remap = Allocator.noRemap;
+    const backing: Allocator = .{ .ptr = std.testing.allocator.ptr, .vtable = &vtable };
+    try Probe.run(backing);
+    try std.testing.checkAllAllocationFailures(backing, Probe.run, .{});
 }
 
 test "sparse staged generations hide partial output recover intents and retain old readers" {
@@ -6996,11 +7192,11 @@ test "sparse staged generations hide partial output recover intents and retain o
     var task = (try index.beginSegmentCompactionTask(a, .{ .min_segments = 2, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } })).?;
     defer task.deinit(a);
     for (task.sources) |source| {
-        try std.testing.expect(source.proofs != null);
+        try std.testing.expect(source.proofs == null);
         try std.testing.expectEqual(@as(usize, 0), source.incarnations.len);
     }
     for (task.docmaps) |source| {
-        try std.testing.expect(source.proofs != null);
+        try std.testing.expect(source.proofs == null);
         try std.testing.expectEqual(@as(usize, 0), source.incarnations.len);
     }
     var old = try index.beginReadTxn();
@@ -7082,4 +7278,178 @@ test "sparse staged generations hide partial output recover intents and retain o
     var read = try index.beginReadTxn();
     defer read.abort();
     try std.testing.expect((try locatedForwardBytes(&read, "a")) != null);
+}
+
+test "sparse physical translation borrows one map block instead of retaining point reads" {
+    const Probe = struct {
+        const Self = @This();
+        key: [89]u8 = undefined,
+        value: [6]u8 = undefined,
+        seeks: usize = 0,
+        gets: usize = 0,
+        closed: bool = false,
+        pub fn get(self: *@This(), k: []const u8) anyerror![]const u8 {
+            // An LSM point read survives until transaction close. Only the
+            // constant completeness marker may use that ownership contract.
+            if (!std.mem.eql(u8, k, metaKey(meta_complete_physical))) return error.RetainedPhysicalMapRead;
+            self.gets += 1;
+            return &.{1};
+        }
+        const Cursor = struct {
+            p: *Self,
+            pub fn close(self: *@This()) void {
+                self.p.closed = true;
+            }
+            pub fn seekAtOrAfter(self: *@This(), k: []const u8) !?struct { key: []const u8, value: []const u8 } {
+                self.p.seeks += 1;
+                self.p.key = k[0..89].*;
+                std.mem.writeInt(u16, self.p.value[0..2], 7, .little);
+                std.mem.writeInt(u32, self.p.value[2..6], @intCast(self.p.seeks), .little);
+                return .{ .key = &self.p.key, .value = &self.p.value };
+            }
+        };
+        pub fn openCursor(self: *@This()) !Cursor {
+            return .{ .p = self };
+        }
+    };
+    const a = std.testing.allocator;
+    var rows = @import("../encoding/roaring.zig").RoaringBitmap.init(a);
+    defer rows.deinit();
+    try rows.addRange(0, 1024 * 128);
+    var result = @import("../encoding/roaring.zig").RoaringBitmap.init(a);
+    defer result.deinit();
+    var txn: Probe = .{};
+    var prefix: [80]u8 = @splat('a');
+    @memcpy(prefix[0..6], "lake2:");
+    prefix[70] = ':';
+    prefix[79] = ':';
+    try std.testing.expect(try selectPhysicalBlock(&txn, a, &prefix, 0, &rows, &result, null));
+    try std.testing.expectEqual(@as(usize, 128), txn.seeks);
+    try std.testing.expectEqual(@as(usize, 1), txn.gets);
+    try std.testing.expect(txn.closed);
+    try std.testing.expectEqual(@as(u64, 128), result.cardinality());
+}
+
+test "sparse background directory pages stage routes before activation and reclaim abandoned output" {
+    const a = std.testing.allocator;
+    var index = try SparseIndex.open(a, "unused", .{ .backend = .mem });
+    defer index.close();
+    var terms: [130]u32 = undefined;
+    const weights: [130]f32 = @splat(2);
+    for (&terms, 0..) |*term, i| term.* = @intCast(i * 2);
+    const vector: SparseVector = .{ .indices = &terms, .values = &weights };
+    const bulk: BatchOptions = .{ .prefer_bulk_build = true, .assume_new_doc_ids = true };
+    for ([_][]const u8{ "a", "b" }) |id| try index.batchWithOptions(&.{.{ .doc_id = id, .vec = vector }}, &.{}, bulk);
+    const options: SparseIndex.SegmentCompactionOptions = .{ .min_segments = 2, .background_publication = true, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } };
+    var task = (try index.beginSegmentCompactionTask(a, options)).?;
+    var task_open = true;
+    defer if (task_open) task.deinit(a);
+    const id = task.generation.?;
+    var result = try SparseIndex.executeSegmentCompactionTask(a, &task, 8);
+    defer result.deinit(a);
+    try std.testing.expect(result.staged);
+    try std.testing.expectEqual(@as(usize, 32), result.data.?.len);
+    {
+        var read = try index.beginReadTxn();
+        defer read.abort();
+        var key_buf: [16]u8 = undefined;
+        try std.testing.expectError(error.NotFound, read.get(segmentKey(&key_buf, id)));
+        var iterator = try posting_pages.Terms(backend_erased.ReadTxn).init(&read, id, result.data.?);
+        defer iterator.deinit();
+        var count: usize = 0;
+        while (try iterator.next()) |entry| {
+            try std.testing.expectEqual(terms[count], std.mem.readInt(u32, entry[0..4], .little));
+            count += 1;
+        }
+        try std.testing.expectEqual(terms.len, count);
+        for (terms) |term| try std.testing.expect(try posting_pages.hasTermTxn(&read, id, result.data.?, term));
+        try std.testing.expect(!try posting_pages.hasTermTxn(&read, id, result.data.?, 127));
+        try std.testing.expectEqual(@as(usize, 9), (try read.get(&posting_pages.routeKey(258, id))).len);
+    }
+    try expectIncarnationSearch(&index, 258, &.{ .{ .id = "a", .score = 2 }, .{ .id = "b", .score = 2 } }, false);
+    // Cancellation before activation must reclaim both route families using
+    // their page ledger, even though no generation root ever existed.
+    task.deinit(a);
+    task_open = false;
+    {
+        var read = try index.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(&posting_pages.routeKey(258, id)));
+        try std.testing.expectError(error.NotFound, read.get(&posting_pages.bucketKey(258, posting_pages.intervalNode(0, 1), id)));
+        try std.testing.expectError(error.NotFound, read.get(&posting_pages.directoryKey(id, 258)));
+        try std.testing.expectError(error.NotFound, read.get(&SparseIndex.pendingKey(id)));
+    }
+    var active = (try index.beginSegmentCompactionTask(a, options)).?;
+    defer active.deinit(a);
+    var published = try SparseIndex.executeSegmentCompactionTask(a, &active, 8);
+    defer published.deinit(a);
+    try std.testing.expect(try index.publishSegmentCompactionTask(&active, &published));
+    try SparseIndex.completeSegmentCompactionTask(a, &active, &published, null);
+    try expectIncarnationSearch(&index, 258, &.{ .{ .id = "a", .score = 2 }, .{ .id = "b", .score = 2 } }, false);
+}
+
+test "sparse locator refresh stops after a generation retires between bounded batches" {
+    const a = std.testing.allocator;
+    var index = try SparseIndex.open(a, "unused", .{ .backend = .mem });
+    defer index.close();
+    const vector: SparseVector = .{ .indices = &.{1}, .values = &.{2} };
+    var ids: [512][16]u8 = undefined;
+    var writes: [512]SparseWrite = undefined;
+    for (&writes, &ids, 0..) |*write, *id, i| write.* = .{ .doc_id = try std.fmt.bufPrint(id, "doc-{d:0>4}", .{i}), .vec = vector };
+    const bulk: BatchOptions = .{ .prefer_bulk_build = true, .assume_new_doc_ids = true };
+    try index.batchWithOptions(writes[0..256], &.{}, bulk);
+    try index.batchWithOptions(writes[256..], &.{}, bulk);
+    const options: SparseIndex.SegmentCompactionOptions = .{ .min_segments = 2, .background_publication = true, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } };
+    var task = (try index.beginSegmentCompactionTask(a, options)).?;
+    defer task.deinit(a);
+    var result = try SparseIndex.executeSegmentCompactionTask(a, &task, 64);
+    defer result.deinit(a);
+    try std.testing.expect(try index.publishSegmentCompactionTask(&task, &result));
+    try index.batchWithOptions(&.{.{ .doc_id = "later", .vec = vector }}, &.{}, bulk);
+    const Gate = struct {
+        index: *SparseIndex,
+        enters: usize = 0,
+        leaves: usize = 0,
+        fn enter(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.enters += 1;
+            // A competing compaction fully installs the newer locators after
+            // the first 256 old records have been refreshed.
+            if (self.enters == 2) try std.testing.expect(try self.index.compactSegmentsWithOptions(std.testing.allocator, .{ .min_segments = 2, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } }));
+        }
+        fn leave(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.leaves += 1;
+        }
+    };
+    var gate: Gate = .{ .index = &index };
+    try SparseIndex.completeSegmentCompactionTask(a, &task, &result, .{ .ptr = &gate, .enter = Gate.enter, .leave = Gate.leave });
+    try std.testing.expectEqual(@as(usize, 2), gate.enters);
+    try std.testing.expectEqual(gate.enters, gate.leaves);
+    var read = try index.beginReadTxn();
+    defer read.abort();
+    for (writes) |write| {
+        const locator = (try readLocator(&read, write.doc_id)).?;
+        try std.testing.expect(locator.segment != result.generation.?);
+        try std.testing.expect((try locatedForwardBytes(&read, write.doc_id)) != null);
+    }
+}
+
+test "sparse background compaction retires fully deleted inputs without publishing empty spools" {
+    const a = std.testing.allocator;
+    var index = try SparseIndex.open(a, "unused", .{ .backend = .mem });
+    defer index.close();
+    for ([_][]const u8{ "a", "b" }) |id| try index.batchWithOptions(&.{.{ .doc_id = id, .vec = .{ .indices = &.{1}, .values = &.{2} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    try index.batch(&.{}, &.{ "a", "b" });
+    var task = (try index.beginSegmentCompactionTask(a, .{ .min_segments = 2, .background_publication = true, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } })).?;
+    defer task.deinit(a);
+    var result = try SparseIndex.executeSegmentCompactionTask(a, &task, 8);
+    defer result.deinit(a);
+    try std.testing.expect(result.staged);
+    try std.testing.expect(result.data == null);
+    try std.testing.expect(result.pages == null);
+    try std.testing.expect(result.directory_run == null);
+    try std.testing.expect(try index.publishSegmentCompactionTask(&task, &result));
+    try SparseIndex.completeSegmentCompactionTask(a, &task, &result, null);
+    try std.testing.expectEqual(@as(usize, 0), try index.segmentCount());
 }

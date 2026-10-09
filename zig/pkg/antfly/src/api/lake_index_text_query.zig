@@ -451,8 +451,7 @@ const Execution = struct {
         window: std.heap.ArenaAllocator,
         position: usize = 0,
         scanned: u64 = 0,
-        lookup: std.heap.ArenaAllocator,
-        bitmaps: std.StringHashMapUnmanaged(local.encoding_roaring.RoaringBitmap) = .empty,
+        bitmaps: @import("lake_index_text_predicate.zig").LiveRowsCache = .{},
         fn scannedCount(raw: *anyopaque) u64 {
             const self: *Ordered = @ptrCast(@alignCast(raw));
             return self.scanned;
@@ -461,7 +460,7 @@ const Execution = struct {
             const self: *Ordered = @ptrCast(@alignCast(raw));
             self.predicate.deinit();
             self.window.deinit();
-            self.lookup.deinit();
+            self.bitmaps.deinit(self.a);
             self.plan_arena.deinit();
             self.a.destroy(self);
         }
@@ -482,7 +481,7 @@ const Execution = struct {
                 self.scanned += 1;
                 const execution = self.execution;
                 const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &execution.server.lake_read_cache, .scope = execution.store.identity, .context = execution.context };
-                if (try self.identities.ordinal(self.lookup.allocator(), &self.bitmaps, execution.store.artifactStore(), cached, ref)) |number| return number;
+                if (try self.identities.ordinal(self.a, &self.bitmaps, execution.store.artifactStore(), cached, ref)) |number| return number;
             }
         }
     };
@@ -530,7 +529,7 @@ const Execution = struct {
         var predicate = (try sql_rows.tryOpenOrderedPredicate(a, self.server, self.table, .{ .fields = &.{}, .conditions = conditions.items, .order = orders, .limit = 256, .row_goal = @as(u64, req.offset) + req.limit }, self.request, self.source, req.search_before.len != 0)) orelse return null;
         errdefer predicate.deinit();
         const owner = try a.create(Ordered);
-        owner.* = .{ .a = a, .execution = self, .predicate = predicate, .plan_arena = arena, .window = .init(a), .identities = identities, .lookup = .init(a) };
+        owner.* = .{ .a = a, .execution = self, .predicate = predicate, .plan_arena = arena, .window = .init(a), .identities = identities };
         keep_arena = true;
         return .{ .ptr = owner, .next = Ordered.next, .scanned_count = Ordered.scannedCount, .close = Ordered.close };
     }

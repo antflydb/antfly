@@ -132,6 +132,7 @@ pub const SparseIndex = struct {
         min_segments: usize = 32,
         max_segments: usize = 128,
         scratch: ?@import("../../spill_sort.zig").Options = null,
+        background_publication: bool = false,
     };
 
     pub const SegmentCompactionTask = struct {
@@ -145,6 +146,18 @@ pub const SparseIndex = struct {
             self.* = undefined;
         }
     };
+
+    pub const MaintenanceGate = struct {
+        ptr: *anyopaque,
+        enter: *const fn (*anyopaque) anyerror!void,
+        leave: *const fn (*anyopaque) void,
+    };
+    pub fn publishSegmentCompactionTask(_: *SparseIndex, _: *const SegmentCompactionTask, _: *SegmentCompactionResult) !bool {
+        return error.UnsupportedPlatform;
+    }
+    pub fn completeSegmentCompactionTask(_: Allocator, _: *const SegmentCompactionTask, _: *const SegmentCompactionResult, _: ?MaintenanceGate) !void {
+        return error.UnsupportedPlatform;
+    }
 
     pub fn open(_: Allocator, _: [*:0]const u8, _: SparseIndexOptions) !SparseIndex {
         return error.UnsupportedPlatform;

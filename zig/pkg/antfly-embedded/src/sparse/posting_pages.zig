@@ -14,12 +14,16 @@
 // limitations under the License.
 
 //! Immutable posting blocks addressed by segment, term and final ordinal.
-//! Roots retain the legacy term directory. Queries seek posting blocks and
-//! native maintenance merges streams into spooled copy-on-write output.
+//! Constant-sized roots reference bounded term-directory pages. Queries seek
+//! posting blocks; maintenance spools copy-on-write output and retirement ledgers.
 const std = @import("std");
 const daat = @import("daat.zig");
+const block_codec = @import("block_codec.zig");
 const A = std.mem.Allocator;
 const magic = "ASPSPG01";
+const directory_magic = "ASPSPG02";
+pub const directory_tag: u8 = 0x15;
+pub const directory_page_terms = 64;
 const legacy_magic = "ASPSSEG1";
 const tag: u8 = 0x0d;
 pub const route_tag: u8 = 0x0e;
@@ -66,6 +70,8 @@ pub fn bucketed(txn: anytype) !bool {
     return std.mem.eql(u8, bytes, &.{2});
 }
 fn route(txn: anytype, id: u64, root: []const u8) !void {
+    // New directories and guarded routes stage together, before root activation.
+    if (externalDirectory(root)) return;
     const dir = try directory(root);
     const bounds = if (std.mem.readInt(u32, root[8..12], .little) == 2) try ordinalBounds(root) else null;
     var value: [8]u8 = undefined;
@@ -110,9 +116,10 @@ pub fn ensureRoutes(a: A, txn: anytype) !void {
 }
 pub const max_block_bytes = 1024 * 1024;
 pub fn paged(root: []const u8) bool {
-    return root.len >= 16 and std.mem.eql(u8, root[0..8], magic);
+    return root.len >= 16 and (std.mem.eql(u8, root[0..8], magic) or externalDirectory(root));
 }
 pub fn directory(root: []const u8) ![]const u8 {
+    if (externalDirectory(root)) return error.ExternalSparseDirectory;
     if (root.len < 16) return error.InvalidSparseSegment;
     const count = std.mem.readInt(u32, root[12..16], .little);
     const end = 16 + @as(u64, count) * 20;
@@ -122,6 +129,12 @@ pub fn directory(root: []const u8) ![]const u8 {
 /// Conservative authenticated segment bounds; older paged roots omit them.
 pub fn ordinalBounds(root: []const u8) !?[2]u32 {
     if (!paged(root)) return null;
+    if (externalDirectory(root)) {
+        if (root.len != 32) return error.InvalidSparseSegment;
+        const range: [2]u32 = .{ std.mem.readInt(u32, root[16..20], .little), std.mem.readInt(u32, root[20..24], .little) };
+        if (range[0] > range[1]) return error.InvalidSparseSegment;
+        return range;
+    }
     const dir = try directory(root);
     const tail = root[16 + dir.len ..];
     if (tail.len == 0) return null;
@@ -140,6 +153,172 @@ pub fn hasTerm(root: []const u8, term: u32) !bool {
         if (value < term) lower = middle + 1 else upper = middle;
     }
     return lower < dir.len / 20 and std.mem.readInt(u32, dir[lower * 20 ..][0..4], .little) == term;
+}
+pub fn externalDirectory(root: []const u8) bool {
+    return root.len >= 8 and std.mem.eql(u8, root[0..8], directory_magic);
+}
+pub fn directoryKey(id: u64, last: u32) [13]u8 {
+    var bytes: [13]u8 = undefined;
+    bytes[0] = directory_tag;
+    std.mem.writeInt(u64, bytes[1..9], id, .big);
+    std.mem.writeInt(u32, bytes[9..13], last, .big);
+    return bytes;
+}
+fn makeRoot(a: A, count: u32, first: u32, last: u32, materialized: u64) ![]u8 {
+    const bytes = try a.alloc(u8, 32);
+    @memcpy(bytes[0..8], directory_magic);
+    std.mem.writeInt(u32, bytes[8..12], 2, .little);
+    std.mem.writeInt(u32, bytes[12..16], count, .little);
+    std.mem.writeInt(u32, bytes[16..20], first, .little);
+    std.mem.writeInt(u32, bytes[20..24], last, .little);
+    std.mem.writeInt(u64, bytes[24..32], materialized, .little);
+    return bytes;
+}
+/// A page and its route records commit together. Guarded routes are invisible
+/// until the generation root exists in the reader's same immutable snapshot.
+pub fn putDirectoryPage(txn: anytype, id: u64, root: []const u8, entries: []const u8) !void {
+    if (entries.len == 0 or entries.len % 20 != 0 or entries.len > directory_page_terms * 20) return error.InvalidSparseSegment;
+    const bounds = (try ordinalBounds(root)) orelse return error.InvalidSparseSegment;
+    const node = intervalNode(bounds[0], bounds[1]);
+    var page: [4 + directory_page_terms * 20]u8 = undefined;
+    std.mem.writeInt(u32, page[0..4], node, .little);
+    @memcpy(page[4..][0..entries.len], entries);
+    var value: [9]u8 = undefined;
+    std.mem.writeInt(u32, value[0..4], bounds[0], .little);
+    std.mem.writeInt(u32, value[4..8], bounds[1], .little);
+    value[8] = 1;
+    var previous: ?u32 = null;
+    var at: usize = 0;
+    while (at < entries.len) : (at += 20) {
+        const term = std.mem.readInt(u32, entries[at..][0..4], .little);
+        if (previous) |prior| if (term <= prior) return error.InvalidSparseSegment;
+        previous = term;
+        try txn.put(&routeKey(term, id), &value);
+        try txn.put(&bucketKey(term, node, id), &value);
+    }
+    try txn.put(&directoryKey(id, previous.?), page[0 .. 4 + entries.len]);
+}
+/// Copy one bounded directory page before mutating through the write handle.
+/// The page itself is also the durable ledger for reclaiming staged routes.
+pub fn reclaimDirectoryPage(txn: anytype, id: u64) !bool {
+    var page: [4 + directory_page_terms * 20]u8 = undefined;
+    var page_key: [13]u8 = undefined;
+    const len = blk: {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const prefix = directoryKey(id, 0);
+        const entry = (try cursor.seekAtOrAfter(prefix[0..9])) orelse return false;
+        if (entry.key.len != 13 or !std.mem.eql(u8, entry.key[0..9], prefix[0..9])) return false;
+        _ = try checkedPage(entry.key, entry.value);
+        page_key = entry.key[0..13].*;
+        @memcpy(page[0..entry.value.len], entry.value);
+        break :blk entry.value.len;
+    };
+    const node = std.mem.readInt(u32, page[0..4], .little);
+    var at: usize = 4;
+    while (at < len) : (at += 20) {
+        const term = std.mem.readInt(u32, page[at..][0..4], .little);
+        txn.delete(&routeKey(term, id)) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        txn.delete(&bucketKey(term, node, id)) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+    }
+    txn.delete(&page_key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
+    return true;
+}
+fn checkedPage(k: []const u8, value: []const u8) ![]const u8 {
+    if (k.len != 13 or k[0] != directory_tag or value.len <= 4 or value.len > 4 + directory_page_terms * 20 or (value.len - 4) % 20 != 0) return error.InvalidSparseSegment;
+    const node = std.mem.readInt(u32, value[0..4], .little);
+    if (node >> 16 > 16) return error.InvalidSparseSegment;
+    const entries = value[4..];
+    var previous: ?u32 = null;
+    var at: usize = 0;
+    while (at < entries.len) : (at += 20) {
+        const term = std.mem.readInt(u32, entries[at..][0..4], .little);
+        if (previous) |prior| if (term <= prior) return error.InvalidSparseSegment;
+        previous = term;
+    }
+    if (previous.? != std.mem.readInt(u32, k[9..13], .big)) return error.InvalidSparseSegment;
+    return entries;
+}
+pub fn Terms(comptime Txn: type) type {
+    return struct {
+        const Cursor = @typeInfo(@TypeOf(@as(*Txn, undefined).openCursor())).error_union.payload;
+        cursor: ?Cursor = null,
+        root: []const u8,
+        id: u64,
+        position: usize = 0,
+        page: [directory_page_terms * 20]u8 = undefined,
+        page_len: usize = 0,
+        started: bool = false,
+        yielded: u32 = 0,
+        previous: ?u32 = null,
+        pub fn init(txn: *Txn, id: u64, root: []const u8) !@This() {
+            if (externalDirectory(root)) _ = try ordinalBounds(root);
+            return .{ .root = root, .id = id, .cursor = if (externalDirectory(root)) try txn.openCursor() else null };
+        }
+        pub fn deinit(self: *@This()) void {
+            if (self.cursor) |*cursor| cursor.close();
+        }
+        pub fn next(self: *@This()) !?[20]u8 {
+            if (self.cursor) |*cursor| {
+                if (self.position == self.page_len) {
+                    const prefix = directoryKey(self.id, 0);
+                    const found = if (self.started) try cursor.next() else try cursor.seekAtOrAfter(prefix[0..9]);
+                    const entry = found orelse {
+                        if (self.yielded != std.mem.readInt(u32, self.root[12..16], .little)) return error.InvalidSparseSegment;
+                        return null;
+                    };
+                    self.started = true;
+                    if (entry.key.len != 13 or !std.mem.eql(u8, entry.key[0..9], prefix[0..9])) {
+                        if (self.yielded != std.mem.readInt(u32, self.root[12..16], .little)) return error.InvalidSparseSegment;
+                        return null;
+                    }
+                    _ = try checkedPage(entry.key, entry.value);
+                    self.page_len = entry.value.len - 4;
+                    @memcpy(self.page[0..self.page_len], entry.value[4..]);
+                    self.position = 0;
+                }
+                const entry = self.page[self.position..][0..20].*;
+                const term = std.mem.readInt(u32, entry[0..4], .little);
+                if (self.previous) |prior| if (term <= prior) return error.InvalidSparseSegment;
+                if (self.yielded == std.mem.readInt(u32, self.root[12..16], .little)) return error.InvalidSparseSegment;
+                self.yielded += 1;
+                self.previous = term;
+                self.position += 20;
+                return entry;
+            }
+            const dir = try directory(self.root);
+            if (self.position == dir.len) return null;
+            const entry = dir[self.position..][0..20].*;
+            self.position += 20;
+            return entry;
+        }
+    };
+}
+pub fn hasTermTxn(txn: anytype, id: u64, root: []const u8, term: u32) !bool {
+    if (!externalDirectory(root)) return hasTerm(root, term);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    const seek = directoryKey(id, term);
+    const entry = (try cursor.seekAtOrAfter(&seek)) orelse return false;
+    if (entry.key.len != 13 or !std.mem.eql(u8, entry.key[0..9], seek[0..9])) return false;
+    _ = try ordinalBounds(root);
+    const dir = try checkedPage(entry.key, entry.value);
+    var lo: usize = 0;
+    var hi = dir.len / 20;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (std.mem.readInt(u32, dir[mid * 20 ..][0..4], .little) < term) lo = mid + 1 else hi = mid;
+    }
+    return lo < dir.len / 20 and std.mem.readInt(u32, dir[lo * 20 ..][0..4], .little) == term;
 }
 pub fn key(id: u64, term: u32, last: u32) [17]u8 {
     var result: [17]u8 = undefined;
@@ -164,7 +343,9 @@ pub fn putBlock(txn: anytype, id: u64, term: u32, last: u32, block: []const u8) 
     var summary_key = key(id, term, last);
     summary_key[0] = summary_tag;
     try txn.put(&summary_key, &summary);
-    try txn.put(&key(id, term, last), block);
+    const encoded = try block_codec.encode(txn.allocator, block);
+    defer if (encoded) |bytes| txn.allocator.free(bytes);
+    try txn.put(&key(id, term, last), encoded orelse block);
 }
 pub fn publish(a: A, txn: anytype, id: u64, legacy: []const u8) ![]u8 {
     try ensureRoutes(a, txn);
@@ -203,21 +384,21 @@ pub fn publish(a: A, txn: anytype, id: u64, legacy: []const u8) ![]u8 {
             at += @intCast(size);
         }
     }
-    const header_len = 16 + dir.len;
-    const root = try a.alloc(u8, header_len + @as(usize, if (first_ordinal != null) 12 else 0));
-    @memcpy(root[0..header_len], legacy[0..header_len]);
-    @memcpy(root[0..8], magic);
-    if (first_ordinal) |first| {
-        const tail = root[header_len..];
-        @memcpy(tail[0..4], "O32B");
-        std.mem.writeInt(u32, tail[4..8], first, .little);
-        std.mem.writeInt(u32, tail[8..12], last_ordinal, .little);
-    }
+    const root = try makeRoot(a, @intCast(dir.len / 20), first_ordinal orelse 0, last_ordinal, legacy.len);
     errdefer a.free(root);
-    try route(txn, id, root);
+    var page_offset: usize = 0;
+    while (page_offset < dir.len) {
+        const end = @min(dir.len, page_offset + directory_page_terms * 20);
+        try putDirectoryPage(txn, id, root, dir[page_offset..end]);
+        page_offset = end;
+    }
     return root;
 }
 pub fn materializedSize(root: []const u8) !usize {
+    if (externalDirectory(root)) {
+        if (root.len != 32) return error.InvalidSparseSegment;
+        return std.math.cast(usize, std.mem.readInt(u64, root[24..32], .little)) orelse error.InvalidSparseSegment;
+    }
     const dir = try directory(root);
     var size: u64 = 16 + dir.len;
     var at: usize = 0;
@@ -228,9 +409,19 @@ pub fn materialize(a: A, txn: anytype, id: u64, root: []const u8) ![]u8 {
     if (!paged(root)) return a.dupe(u8, root);
     const result = try a.alloc(u8, try materializedSize(root));
     errdefer a.free(result);
-    const header_len = 16 + (try directory(root)).len;
-    @memcpy(result[0..header_len], root[0..header_len]);
+    const header_len = if (externalDirectory(root)) 16 + @as(usize, std.mem.readInt(u32, root[12..16], .little)) * 20 else 16 + (try directory(root)).len;
+    if (header_len > result.len) return error.InvalidSparseSegment;
+    @memcpy(result[0..16], root[0..16]);
     @memcpy(result[0..8], legacy_magic);
+    var terms = try Terms(@typeInfo(@TypeOf(txn)).pointer.child).init(txn, id, root);
+    defer terms.deinit();
+    var directory_offset: usize = 16;
+    while (try terms.next()) |entry| {
+        if (directory_offset + 20 > header_len) return error.InvalidSparseSegment;
+        @memcpy(result[directory_offset..][0..20], &entry);
+        directory_offset += 20;
+    }
+    if (directory_offset != header_len) return error.InvalidSparseSegment;
     var cursor = try txn.openCursor();
     defer cursor.close();
     const prefix = key(id, 0, 0);
@@ -238,9 +429,11 @@ pub fn materialize(a: A, txn: anytype, id: u64, root: []const u8) ![]u8 {
     var at = header_len;
     while (next) |entry| {
         if (entry.key.len != 17 or !std.mem.eql(u8, entry.key[0..9], prefix[0..9])) break;
-        if (entry.value.len > result.len - at) return error.InvalidSparseSegment;
-        @memcpy(result[at..][0..entry.value.len], entry.value);
-        at += entry.value.len;
+        const decoded = try block_codec.decode(a, entry.value);
+        defer a.free(decoded);
+        if (decoded.len > result.len - at) return error.InvalidSparseSegment;
+        @memcpy(result[at..][0..decoded.len], decoded);
+        at += decoded.len;
         next = try cursor.next();
     }
     if (at != result.len) return error.InvalidSparseSegment;
@@ -251,6 +444,7 @@ pub fn removeRoutes(txn: anytype, id: u64) !void {
     root_key[0] = 0x03;
     std.mem.writeInt(u64, root_key[1..9], id, .big);
     if (txn.get(&root_key)) |root| {
+        if (externalDirectory(root)) return;
         const dir = try txn.allocator.dupe(u8, try directory(root));
         defer txn.allocator.free(dir);
         const bounds = if (std.mem.readInt(u32, root[8..12], .little) == 2) try ordinalBounds(root) else null;
@@ -274,6 +468,7 @@ pub fn removeRoutes(txn: anytype, id: u64) !void {
 }
 pub fn remove(txn: anytype, id: u64) !void {
     try removeRoutes(txn, id);
+    while (try reclaimDirectoryPage(txn, id)) {}
     const prefix = key(id, 0, 0);
     while (true) {
         var keys: [128][17]u8 = undefined;
@@ -391,11 +586,12 @@ pub fn Reader(comptime Txn: type) type {
             const seek = key(id, term, @intCast(lower));
             const entry = (try cursor.seekAtOrAfter(&seek)) orelse return null;
             if (entry.key.len != 17 or !std.mem.eql(u8, entry.key[0..13], seek[0..13])) return null;
-            if (entry.value.len > max_block_bytes or entry.value.len > self.budget -| self.resident) return error.ResourceBudgetExceeded;
-            const bytes = try a.dupe(u8, entry.value);
+            const decoded_size = try block_codec.decodedSize(entry.value);
+            if (decoded_size > self.budget -| self.resident) return error.ResourceBudgetExceeded;
+            const bytes = try block_codec.decode(a, entry.value);
             self.resident += bytes.len;
             self.blocks += 1;
-            self.bytes += bytes.len;
+            self.bytes += entry.value.len;
             self.prefetch(id, term, std.mem.readInt(u32, entry.key[13..17], .big));
             return bytes;
         }
@@ -410,7 +606,9 @@ pub fn forEachBlock(txn: anytype, id: u64, term: ?u32, context: anytype, comptim
     var next = try cursor.seekAtOrAfter(prefix[0..prefix_len]);
     while (next) |entry| {
         if (entry.key.len != 17 or !std.mem.eql(u8, entry.key[0..prefix_len], prefix[0..prefix_len])) break;
-        try visit(context, std.mem.readInt(u32, entry.key[9..13], .big), entry.value);
+        const decoded = if (block_codec.isPacked(entry.value)) try block_codec.decode(txn.allocator, entry.value) else null;
+        defer if (decoded) |bytes| txn.allocator.free(bytes);
+        try visit(context, std.mem.readInt(u32, entry.key[9..13], .big), decoded orelse entry.value);
         next = try cursor.next();
     }
 }
@@ -503,9 +701,9 @@ test "paged posting codec seeks one block bounds memory and reclaims every page 
             defer a.free(root);
             try std.testing.expect(paged(root));
             try std.testing.expectEqual([2]u32{ 0, 5 }, (try ordinalBounds(root)).?);
-            try std.testing.expectEqual(null, try ordinalBounds(root[0 .. root.len - 12]));
-            try std.testing.expect(try hasTerm(root, 7));
-            try std.testing.expect(!try hasTerm(root, 8));
+            try std.testing.expectEqual(@as(usize, 32), root.len);
+            try std.testing.expect(try hasTermTxn(&txn, 42, root, 7));
+            try std.testing.expect(!try hasTermTxn(&txn, 42, root, 8));
             const restored = try materialize(a, &txn, 42, root);
             defer a.free(restored);
             try std.testing.expectEqualSlices(u8, &legacy, restored);
@@ -544,12 +742,15 @@ test "paged posting codec seeks one block bounds memory and reclaims every page 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
-/// Incremental compaction output. Native owners spool blocks into a private,
-/// capacity-accounted run; only the term directory remains in memory.
+/// Incremental compaction output. Native owners spool blocks into private,
+/// capacity-accounted runs, including the term directory. Legacy callers without
+/// scratch retain their explicitly admitted in-memory representation.
 pub const Builder = struct {
     pub const Run = @import("../postings_run.zig").Run;
     a: A,
     run: ?*Run = null,
+    terms: ?*Run = null,
+    term_count: u32 = 0,
     payload: std.ArrayList(u8) = .empty,
     dir: std.ArrayList(u8) = .empty,
     current: ?u32 = null,
@@ -559,10 +760,13 @@ pub const Builder = struct {
     first: ?u32 = null,
     last: u32 = 0,
     pub fn init(a: A, scratch: ?@import("../spill_sort.zig").Options) !Builder {
-        return .{ .a = a, .run = if (scratch) |options| try Run.createWithResources(a, options.io, options.directory, options.resource_manager) else null };
+        const run = if (scratch) |options| try Run.createWithResources(a, options.io, options.directory, options.resource_manager) else null;
+        errdefer if (run) |owned| owned.deinit();
+        return .{ .a = a, .run = run, .terms = if (scratch) |options| try Run.createWithResources(a, options.io, options.directory, options.resource_manager) else null };
     }
     pub fn deinit(self: *Builder) void {
         if (self.run) |run| run.deinit();
+        if (self.terms) |run| run.deinit();
         self.payload.deinit(self.a);
         self.dir.deinit(self.a);
     }
@@ -573,7 +777,8 @@ pub const Builder = struct {
         std.mem.writeInt(u32, entry[4..8], self.chunks, .little);
         std.mem.writeInt(u64, entry[8..16], self.term_start, .little);
         std.mem.writeInt(u32, entry[16..20], std.math.cast(u32, self.total - self.term_start) orelse return error.ResourceBudgetExceeded, .little);
-        try self.dir.appendSlice(self.a, &entry);
+        if (self.terms) |terms| try terms.appendSlice(&entry) else try self.dir.appendSlice(self.a, &entry);
+        self.term_count = try std.math.add(u32, self.term_count, 1);
     }
     pub fn append(self: *Builder, term: u32, first: u32, last: u32, block: []const u8) !void {
         if (block.len > max_block_bytes) return error.ResourceBudgetExceeded;
@@ -598,12 +803,24 @@ pub const Builder = struct {
         self.last = @max(self.last, last);
     }
     pub fn finish(self: *Builder) !?[]u8 {
-        if (self.first == null) return null;
+        if (self.first == null) {
+            if (self.run) |run| run.deinit();
+            if (self.terms) |run| run.deinit();
+            self.run = null;
+            self.terms = null;
+            return null;
+        }
         try self.finishTerm();
+        if (self.run) |run| {
+            try run.seal(0);
+            try self.terms.?.seal(0);
+            const materialized = try std.math.add(u64, 16 + @as(u64, self.term_count) * 20, self.total);
+            return try makeRoot(self.a, self.term_count, self.first.?, self.last, materialized);
+        }
         const header_len = 16 + self.dir.items.len;
-        const bytes = try self.a.alloc(u8, header_len + if (self.run != null) @as(usize, 12) else self.payload.items.len);
+        const bytes = try self.a.alloc(u8, header_len + self.payload.items.len);
         errdefer self.a.free(bytes);
-        @memcpy(bytes[0..8], if (self.run != null) magic else legacy_magic);
+        @memcpy(bytes[0..8], legacy_magic);
         std.mem.writeInt(u32, bytes[8..12], 2, .little);
         std.mem.writeInt(u32, bytes[12..16], @intCast(self.dir.items.len / 20), .little);
         @memcpy(bytes[16..header_len], self.dir.items);
@@ -612,37 +829,10 @@ pub const Builder = struct {
             const offset = std.mem.readInt(u64, bytes[at + 8 ..][0..8], .little);
             std.mem.writeInt(u64, bytes[at + 8 ..][0..8], try std.math.add(u64, header_len, offset), .little);
         }
-        if (self.run) |run| {
-            try run.seal(0);
-            @memcpy(bytes[header_len..][0..4], "O32B");
-            std.mem.writeInt(u32, bytes[header_len + 4 ..][0..4], self.first.?, .little);
-            std.mem.writeInt(u32, bytes[header_len + 8 ..][0..4], self.last, .little);
-        } else @memcpy(bytes[header_len..], self.payload.items);
+        @memcpy(bytes[header_len..], self.payload.items);
         return bytes;
     }
 };
-
-pub fn publishRun(a: A, txn: anytype, id: u64, root: []const u8, run: *Builder.Run) !void {
-    if (!paged(root)) return error.InvalidSparseSegment;
-    try ensureRoutes(a, txn);
-    const view = try run.sealedView();
-    var offset: u64 = 0;
-    while (offset < view.length) {
-        var header: [12]u8 = undefined;
-        try view.readInto(offset, &header);
-        offset += 12;
-        const term = std.mem.readInt(u32, header[0..4], .little);
-        const last = std.mem.readInt(u32, header[4..8], .little);
-        const length = std.mem.readInt(u32, header[8..12], .little);
-        if (length > max_block_bytes) return error.InvalidSparseSegment;
-        const bytes = try a.alloc(u8, length);
-        defer a.free(bytes);
-        try view.readInto(offset, bytes);
-        try putBlock(txn, id, term, last, bytes);
-        offset += length;
-    }
-    try route(txn, id, root);
-}
 
 test "sparse interval routes cover boundary buckets without route duplication" {
     const intervals = [_][2]u32{
