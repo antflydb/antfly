@@ -698,7 +698,7 @@ test "external lake ordered pulls borrow each execution and retain publication a
         .{ .file_id = @constCast("a"), .object_uri = @constCast("file://a"), .byte_len = 1, .row_count = 2048, .row_groups = &.{} },
         .{ .file_id = @constCast("b"), .object_uri = @constCast("file://b"), .byte_len = 1, .row_count = 1, .row_groups = &.{} },
     };
-    var inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = @constCast(files[0..1]) };
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = @constCast(files[0..1]) };
     var first = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 64 * 1024);
     defer first.deinit();
     for (0..2048) |n| try Make.add(&first, @intCast(n), 0, n);
