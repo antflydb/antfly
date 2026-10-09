@@ -13081,20 +13081,19 @@ fn collectProvisionedAlgebraicDistributedPartials(
     captured_first_db: ?*db_mod.DB,
     required_identity_generations: ?[]const ?u64,
 ) !?db_mod.algebraic.distributed.MergeSet {
+    try checkQueryDeadline(req);
+    if (req.execution_runnable) |borrow| try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     if (searchRequestHasResolvedDocFilter(req)) return null;
     try validateRequiredIdentityGenerations(group_ids.len, required_identity_generations);
     var partials = std.ArrayListUnmanaged(db_mod.algebraic.distributed.Partial).empty;
-    errdefer {
-        for (partials.items) |partial| {
-            alloc.free(@constCast(partial.canonical_axis));
-            if (partial.metric.len > 0) alloc.free(@constCast(partial.metric));
-            alloc.free(@constCast(partial.value));
-        }
-        partials.deinit(alloc);
-    }
+    // Capability fallback is a successful null return, so cleanup must run
+    // on every exit, including after earlier shards supplied owned values.
+    defer algebraic_partial_ownership.deinitList(alloc, &partials);
 
     for (group_ids, 0..) |group_id, group_index| {
+        try checkQueryDeadline(req);
+        if (req.execution_runnable) |borrow| try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
         var group_req = req;
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[group_index].?;
         const body = try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, group_req.index_name orelse selected_index_name, group_req.identity_read_generation, access_paths, &.{}, tensor_program);
@@ -13125,8 +13124,7 @@ fn collectProvisionedAlgebraicDistributedPartials(
             error.HllCardinalityUnavailable => return null,
             else => return err,
         };
-        defer if (shard_partials.len > 0) alloc.free(shard_partials);
-        for (shard_partials) |partial| try partials.append(alloc, partial);
+        try algebraic_partial_ownership.appendOwned(alloc, &partials, shard_partials);
     }
 
     const partial_slice = try partials.toOwnedSlice(alloc);
@@ -14201,22 +14199,21 @@ fn collectHostedAlgebraicDistributedPartials(
     consistency: raft_mod.ReadConsistency,
     required_identity_generations: ?[]const ?u64,
 ) !?db_mod.algebraic.distributed.MergeSet {
+    try checkQueryDeadline(req);
+    if (req.execution_runnable) |borrow| try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
     try tableReadsValidateDocIdentityReadyForMultiGroup(alloc, self.catalog, table_name, group_ids.len);
     if (searchRequestHasResolvedDocFilter(req)) return null;
     try validateRequiredIdentityGenerations(group_ids.len, required_identity_generations);
     var partials = std.ArrayListUnmanaged(db_mod.algebraic.distributed.Partial).empty;
-    errdefer {
-        for (partials.items) |partial| {
-            alloc.free(@constCast(partial.canonical_axis));
-            if (partial.metric.len > 0) alloc.free(@constCast(partial.metric));
-            alloc.free(@constCast(partial.value));
-        }
-        partials.deinit(alloc);
-    }
+    // Capability fallback is a successful null return, so cleanup must run
+    // on every exit, including after earlier shards supplied owned values.
+    defer algebraic_partial_ownership.deinitList(alloc, &partials);
 
     const routes = (try table_router.resolveGroupRoutes(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids, routePolicyForConsistency(consistency))) orelse return null;
     defer deinitHostedShardRoutes(alloc, routes);
     for (group_ids, 0..) |group_id, group_index| {
+        try checkQueryDeadline(req);
+        if (req.execution_runnable) |borrow| try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
         var group_req = req;
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[group_index].?;
         const body = try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, group_req.index_name orelse selected_index_name, group_req.identity_read_generation, access_paths, &.{}, tensor_program);
@@ -14224,18 +14221,30 @@ fn collectHostedAlgebraicDistributedPartials(
         const route = routes[group_index];
         const shard_partials = switch (route) {
             .local => blk: {
-                var response = self.requireAlgebraicPartialsLocal(alloc, group_id, table_name, body) catch return null;
+                var response = self.requireAlgebraicPartialsLocal(alloc, group_id, table_name, body) catch {
+                    try checkQueryDeadline(group_req);
+                    if (group_req.execution_runnable) |borrow| try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
+                    return null;
+                };
                 defer response.deinit(alloc);
                 break :blk try parseAlgebraicPartialsResponse(alloc, response.json);
             },
             .remote => |remote| blk: {
-                var response = (algebraicPartialsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req) catch return null) orelse return null;
+                var authority_rejection: ?anyerror = null;
+                var response = (algebraicPartialsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req, &authority_rejection) catch |err| {
+                    if (authority_rejection) |cause| return cause;
+                    // Capability/transport fallback is permitted only while
+                    // the original query still owns execution and its budget.
+                    try checkQueryDeadline(group_req);
+                    if (group_req.execution_runnable) |borrow| try @import("runnable_fanout_owner.zig").checked(borrow.checkpoint(borrow.context));
+                    _ = err;
+                    return null;
+                }) orelse return null;
                 defer response.deinit(alloc);
                 break :blk try parseAlgebraicPartialsResponse(alloc, response.json);
             },
         };
-        defer if (shard_partials.len > 0) alloc.free(shard_partials);
-        for (shard_partials) |partial| try partials.append(alloc, partial);
+        try algebraic_partial_ownership.appendOwned(alloc, &partials, shard_partials);
     }
 
     const partial_slice = try partials.toOwnedSlice(alloc);
@@ -15559,6 +15568,7 @@ fn queryRemote(
 /// joining. The transport borrows the existing child/root and restores its
 /// actual phase between leaf waits; it never creates fresh query authority.
 const RemoteQueryWait = @import("runnable_fanout_owner.zig").RemoteWait;
+const algebraic_partial_ownership = @import("algebraic_partial_ownership.zig");
 
 fn queryResponseRemote(
     executor: http_common.RequestExecutor,
@@ -15649,12 +15659,29 @@ fn algebraicPartialsRemote(
     table_name: []const u8,
     body: []const u8,
     req: db_mod.types.SearchRequest,
+    authority_rejection: *?anyerror,
 ) !?query_api.QueryResponse {
+    authority_rejection.* = null;
     var client = http_client.ApiHttpClient.init(alloc, executor);
-    const timeout_ms = try queryRemainingTimeoutMs(req);
+    var request_wait = RemoteQueryWait{ .borrow = req.execution_runnable };
+    client.execution_wait = request_wait.boundary();
+    const timeout_ms = queryRemainingTimeoutMs(req) catch |err| {
+        authority_rejection.* = err;
+        return err;
+    };
     var cancellation = queryRequestCancellation(req);
     const cancellation_ptr = if (req.cancellation != null) &cancellation else null;
-    var result = try client.fetchGroupAlgebraicPartialsWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
+    var result = client.fetchGroupAlgebraicPartialsWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr) catch |err| {
+        if (request_wait.rejection) |cause| {
+            authority_rejection.* = cause;
+            return cause;
+        }
+        if (req.execution_runnable) |borrow| borrow.checkLifetime() catch |cause| {
+            authority_rejection.* = cause;
+            return cause;
+        };
+        return err;
+    };
     defer result.deinit(alloc);
     return .{ .json = try alloc.dupe(u8, result.body) };
 }
@@ -17365,10 +17392,11 @@ fn consumerTests() type {
 
             const FakeRouter = struct {
                 var batch_calls: usize = 0;
+                var expected_groups: []const u64 = &.{ 7, 8 };
                 fn routes(_: *anyopaque, allocator: std.mem.Allocator, groups: []const u64, _: table_router.RoutePolicy, budget: table_router.RouteBudget) !?[]table_router.GroupRoute {
                     try budget.check();
                     batch_calls += 1;
-                    try std.testing.expectEqualSlices(u64, &.{ 7, 8 }, groups);
+                    try std.testing.expectEqualSlices(u64, expected_groups, groups);
                     const result = try allocator.alloc(table_router.GroupRoute, groups.len);
                     var initialized: usize = 0;
                     errdefer {
@@ -17419,26 +17447,33 @@ fn consumerTests() type {
             const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
             const Capture = struct {
                 scheduler: ?*native.Scheduler = null,
-                phase: enum { candidate, preflight, text_stats } = .candidate,
+                phase: enum { candidate, preflight, text_stats, algebraic } = .candidate,
                 keys_seen: std.atomic.Value(usize) = .init(0),
                 calls: std.atomic.Value(usize) = .init(0),
                 fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.scheduler) |scheduler| {
                         const stats = scheduler.stats();
-                        try std.testing.expect(stats.operations >= 3);
+                        const fanout = self.phase != .algebraic;
+                        try std.testing.expect(stats.operations >= @as(usize, if (fanout) 3 else 1));
                         try std.testing.expect(stats.runnable_slots <= scheduler.config.slots - scheduler.config.control_slots);
-                        try std.testing.expect(stats.resource_blocked >= 1);
+                        if (fanout) try std.testing.expect(stats.resource_blocked >= 1);
                         const wait = req.execution_wait orelse return error.TestUnexpectedResult;
                         try wait.beginWait();
                         const parked = scheduler.stats();
-                        try std.testing.expect(parked.operations >= 3);
-                        try std.testing.expect(parked.resource_blocked >= 2);
+                        try std.testing.expect(parked.operations >= @as(usize, if (fanout) 3 else 1));
+                        try std.testing.expect(parked.resource_blocked >= @as(usize, if (fanout) 2 else 1));
                         var control: native.Execution = .{};
                         defer control.finish();
                         try control.start(scheduler, .{ .io = std.testing.io, .retained_bytes = 7 }, .control);
                         try control.checkpoint();
                         control.finish();
+                        if (self.phase == .algebraic) {
+                            _ = self.calls.fetchAdd(1, .monotonic);
+                            scheduler.close();
+                            try std.testing.expectError(error.SchedulerClosed, wait.endWait());
+                            return error.SchedulerClosed;
+                        }
                         try wait.endWait();
                     }
                     if (self.phase != .candidate) {
@@ -17461,6 +17496,7 @@ fn consumerTests() type {
             };
             for ([_]usize{ 0, 2, 3 }) |capacity| {
                 FakeRouter.batch_calls = 0;
+                FakeRouter.expected_groups = &.{ 7, 8 };
                 var scheduler = try native.Scheduler.init(.{ .slots = @max(capacity, 2), .control_slots = 1 });
                 defer scheduler.close();
                 var parent: native.Execution = .{};
@@ -17510,6 +17546,23 @@ fn consumerTests() type {
                     try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
                     try parent.checkLifetime();
                 }
+                capture.phase = .algebraic;
+                FakeRouter.expected_groups = &.{7};
+                const before_algebraic = capture.calls.load(.monotonic);
+                const algebraic = collectHostedAlgebraicDistributedPartials(&hosted, alloc, &.{7}, "docs", req, "alg", &.{}, .{ .output = .{ .input = 0 } }, .read_index, null);
+                if (capacity == 0) {
+                    // An ordinary capability/transport failure can still
+                    // select the original planner's fallback while it owns CPU.
+                    try std.testing.expect((try algebraic) == null);
+                } else {
+                    // Losing authority during the remote wait is terminal;
+                    // it must never turn into a successful null fallback.
+                    try std.testing.expectError(error.SchedulerClosed, algebraic);
+                    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+                    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+                }
+                try std.testing.expectEqual(before_algebraic + 1, capture.calls.load(.monotonic));
+                try std.testing.expectEqual(@as(usize, 5), FakeRouter.batch_calls);
             }
         }
         test "provisioned observed dynamic capability merge preserves ownership under allocation failure" {
@@ -24325,7 +24378,7 @@ fn consumerTests() type {
                         try control.checkpoint();
                         control.finish();
                         try wait.endWait();
-                    } else if (!std.mem.endsWith(u8, req.uri, http_routes.Routes.algebraic_partials_suffix)) return error.TestExpectedExecutionWait;
+                    } else return error.TestExpectedExecutionWait;
                     const cancellation = req.cancellation orelse return error.TestExpectedCancellation;
                     try std.testing.expect(!cancellation.isCancelled());
                     self.signal.store(true, .release);
@@ -24387,6 +24440,7 @@ fn consumerTests() type {
                 "{}",
                 controlled_request,
             ));
+            var algebraic_rejection: ?anyerror = null;
             try std.testing.expectError(error.Timeout, algebraicPartialsRemote(
                 state.iface(),
                 alloc,
@@ -24395,10 +24449,12 @@ fn consumerTests() type {
                 "docs",
                 "{}",
                 controlled_request,
+                &algebraic_rejection,
             ));
+            try std.testing.expect(algebraic_rejection == null);
             try std.testing.expectEqual(@as(usize, 5), state.calls);
             try std.testing.expect(state.algebraic_base64_header_seen);
-            try std.testing.expectEqual(@as(usize, 4), state.wait_calls);
+            try std.testing.expectEqual(@as(usize, 5), state.wait_calls);
             try std.testing.expectEqual(native.Class.inference, try root.retainedClass());
             try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
             try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);

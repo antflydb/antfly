@@ -63,6 +63,9 @@ pub fn resumeCoordinator(parent: ?abi.Borrowed, original_class: ?abi.Class) !voi
 pub const RemoteWait = struct {
     borrow: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
     parked_class: ?@import("antfly_runtime_abi").runnable_abi.Class = null,
+    /// A rejected ownership transition is terminal for this request view.
+    /// Preserve its original cause even if a transport adapter tries again.
+    rejection: ?anyerror = null,
 
     pub fn boundary(self: *@This()) ?@import("antfly_local_sources").common_execution_wait.Boundary {
         if (self.borrow == null) return null;
@@ -70,13 +73,27 @@ pub const RemoteWait = struct {
     }
     fn begin(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        if (self.parked_class != null) return error.InvalidRunnableTransition;
-        self.parked_class = try @import("runnable_fanout_owner.zig").parkCoordinator(self.borrow);
+        if (self.rejection) |cause| return cause;
+        if (self.parked_class != null) {
+            self.rejection = error.InvalidRunnableTransition;
+            return error.InvalidRunnableTransition;
+        }
+        self.parked_class = parkCoordinator(self.borrow) catch |err| {
+            self.rejection = err;
+            return err;
+        };
     }
     fn end(raw: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        const phase = self.parked_class orelse return error.InvalidRunnableTransition;
-        try @import("runnable_fanout_owner.zig").resumeCoordinator(self.borrow, phase);
+        if (self.rejection) |cause| return cause;
+        const phase = self.parked_class orelse {
+            self.rejection = error.InvalidRunnableTransition;
+            return error.InvalidRunnableTransition;
+        };
+        resumeCoordinator(self.borrow, phase) catch |err| {
+            self.rejection = err;
+            return err;
+        };
         self.parked_class = null;
     }
 };
@@ -238,6 +255,9 @@ test "remote wait restores the original request phase and rejects stopped author
         }
         if (case != .success) {
             try std.testing.expect(wait.parked_class != null);
+            const cause = wait.rejection orelse return error.TestExpectedAuthorityRejection;
+            try std.testing.expectError(cause, boundary.beginWait());
+            try std.testing.expectError(cause, boundary.endWait());
             try std.testing.expectEqual(grants, scheduler.stats().grants);
         }
         try std.testing.expectEqual(@as(?u64, deadline), root.entry.?.options.deadline_ns);
@@ -247,4 +267,8 @@ test "remote wait restores the original request phase and rejects stopped author
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     };
+}
+
+test {
+    _ = @import("algebraic_partial_ownership.zig");
 }
