@@ -360,7 +360,7 @@ const ParallelScan = struct {
             const self: *Worker = @ptrCast(@alignCast(raw));
             try self.execution.?.checkpoint();
         }
-        fn noResolve(_: *anyopaque, _: std.mem.Allocator, _: @import("sql_parser").ast.Name, _: catalog.Action) !catalog.Table {
+        fn noResolve(_: *anyopaque, _: std.mem.Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
             return error.InvalidChildScanBackend;
         }
         fn noScan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
