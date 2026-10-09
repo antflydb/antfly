@@ -1614,7 +1614,7 @@ pub fn loadRunTableIndexAllocWithStorage(storage: storage_io.Storage, allocator:
 
 pub fn loadRunTableIndexAllocWithStorageAndAdmission(storage: storage_io.Storage, allocator: Allocator, path: []const u8, control: ?@import("../../common/read_admission.zig").Port) !lsm_table_file.TableIndex {
     if (control) |budget| try budget.checkpoint();
-    const footer = try loadRunFooterWithStorage(storage, allocator, path);
+    const footer = try loadRunFooterWithStorageAndAdmission(storage, allocator, path, control);
     if (control) |budget| try budget.checkpoint();
     const metadata_bytes = if (control) |budget| try storage.readFileRangeAllocWithAdmission(allocator, path, footer.metadata_offset, footer.metadata_len, budget) else try storage.readFileRangeAlloc(allocator, path, footer.metadata_offset, footer.metadata_len);
     defer allocator.free(metadata_bytes);
@@ -1637,11 +1637,11 @@ pub fn loadRunFooterWithStorage(
     allocator: Allocator,
     path: []const u8,
 ) !lsm_table_file.Footer {
-    var trailer = try storage.readFileTrailerAlloc(
-        allocator,
-        path,
-        lsm_table_file.footer_len,
-    );
+    return loadRunFooterWithStorageAndAdmission(storage, allocator, path, null);
+}
+
+pub fn loadRunFooterWithStorageAndAdmission(storage: storage_io.Storage, allocator: Allocator, path: []const u8, control: ?@import("../../common/read_admission.zig").Port) !lsm_table_file.Footer {
+    var trailer = if (control) |budget| try storage.readFileTrailerAllocWithAdmission(allocator, path, lsm_table_file.footer_len, budget) else try storage.readFileTrailerAlloc(allocator, path, lsm_table_file.footer_len);
     defer trailer.deinit(allocator);
 
     const file_size = trailer.file_size;

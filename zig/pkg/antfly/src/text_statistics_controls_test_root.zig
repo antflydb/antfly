@@ -381,3 +381,150 @@ test "text statistics trusted controls keep memory copies charged and reject old
     try std.testing.expectEqual(checks, fixture.checks);
     try std.testing.expectEqual(@as(usize, 0), fixture.begins);
 }
+
+test "text statistics trusted controls pin metadata and whole file reads across pathname replacement" {
+    const storage_io = sources.storage_lsm_backend_storage_io;
+    const admission = sources.common_read_admission;
+    const Budget = sources.common_read_execution_budget.Budget(types.SearchRequest, checkReadBudget);
+    const Shape = enum { size, trailer, whole };
+    const Case = enum { success, replace, cancel_metadata, cancel_data, expire_metadata, shutdown_metadata, shutdown_data, grow_whole, shrink_whole };
+    const Probe = struct {
+        budget: *Budget,
+        storage: *storage_io.NativeStorage,
+        scheduler: *native.Scheduler,
+        canceled: *std.atomic.Value(bool),
+        case: Case,
+        path: []const u8,
+        replacement: []const u8,
+        begins: usize = 0,
+        ends: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.budget.checkpoint();
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            try self.budget.waitForProgress();
+        }
+        pub fn executionBoundary(self: *@This()) ?sources.common_execution_wait.Boundary {
+            return .{ .ptr = self, .begin = begin, .end = end };
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.budget.executionBoundary().?.beginWait();
+            self.begins += 1;
+            try std.testing.expect(self.storage.snapshotStats().fd_admitted_descriptors > 0);
+            const stats = self.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 0), stats.runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), stats.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 1), stats.operations);
+            try std.testing.expectEqual(@as(u64, 23), stats.retained_bytes);
+            var control: native.Execution = .{};
+            defer control.finish();
+            try control.start(self.scheduler, .{ .io = std.testing.io }, .control);
+            try control.checkpoint();
+            control.finish();
+            if (self.begins == 1) switch (self.case) {
+                .cancel_metadata => self.canceled.store(true, .release),
+                .expire_metadata => try std.testing.io.sleep(.fromMilliseconds(100), .awake),
+                .shutdown_metadata => self.scheduler.close(),
+                else => {},
+            };
+            if (self.begins == 2) switch (self.case) {
+                .cancel_data => self.canceled.store(true, .release),
+                .shutdown_data => self.scheduler.close(),
+                else => {},
+            };
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            try std.testing.expect(self.storage.snapshotStats().fd_admitted_descriptors > 0);
+            try self.budget.executionBoundary().?.endWait();
+            if (self.case == .replace and self.ends == 1) {
+                // Replace while the same admitted operation owns CPU again.
+                // Its active FD use must outlive cache invalidation/vacuum.
+                try self.storage.storage().renameAbsolute(self.replacement, self.path);
+            }
+            if (self.ends == 2) switch (self.case) {
+                .grow_whole => try self.storage.storage().appendFileAbsolute(std.testing.allocator, self.path, "extra", false),
+                .shrink_whole => try self.storage.storage().writeFileAbsolute(self.path, "short"),
+                else => {},
+            };
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/metadata-statistics-read", .{tmp.sub_path});
+    defer a.free(path);
+    const replacement = try std.fmt.allocPrint(a, "{s}.replacement", .{path});
+    defer a.free(replacement);
+    for ([_]native.Class{ .query, .inference }) |phase| for (std.enums.values(Shape)) |shape| for (std.enums.values(Case)) |case| {
+        if (shape == .size and (case == .cancel_data or case == .shutdown_data)) continue;
+        if (shape != .whole and (case == .grow_whole or case == .shrink_whole)) continue;
+        var storage = try storage_io.NativeStorage.init(a, .threaded);
+        defer storage.deinit();
+        const view = storage.storage();
+        try view.writeFileAbsolute(path, "old body end");
+        try view.writeFileAbsolute(replacement, "replacement new");
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var canceled = std.atomic.Value(bool).init(false);
+        var parent: native.Execution = .{};
+        defer parent.finish();
+        const deadline = clock.monotonicNs() + (if (case == .expire_metadata) @as(u64, 50) else 60000) * std.time.ns_per_ms;
+        try parent.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+        var read: Read = .{ .execution = &parent, .allocator = a };
+        const team = try read.team();
+        var budget: Budget = .{ .controls = .{ .execution_runnable = team.borrow, .execution_deadline_ns = deadline, .cancellation = .{ .ptr = &canceled, .is_cancelled_fn = requested } }, .io = std.testing.io };
+        var probe: Probe = .{ .budget = &budget, .storage = &storage, .scheduler = &scheduler, .canceled = &canceled, .case = case, .path = path, .replacement = replacement };
+        var adapter = admission.Adapter(*Probe){ .budget = &probe };
+        const payload = adapter.payload();
+        const port = admission.Port.init(&payload);
+        const expected_error: ?anyerror = switch (case) {
+            .success, .replace => null,
+            .grow_whole => error.StreamTooLong,
+            .shrink_whole => error.EndOfStream,
+            .cancel_metadata, .cancel_data => error.Canceled,
+            .expire_metadata => error.DeadlineExceeded,
+            .shutdown_metadata, .shutdown_data => error.SchedulerClosed,
+        };
+        switch (shape) {
+            .size => {
+                const result = view.fileSizeWithAdmission(path, port);
+                if (expected_error) |cause| try std.testing.expectError(cause, result) else try std.testing.expectEqual(@as(u64, 12), try result);
+            },
+            .trailer => {
+                const result = view.readFileTrailerAllocWithAdmission(a, path, 3, port);
+                if (expected_error) |cause| try std.testing.expectError(cause, result) else {
+                    var trailer = try result;
+                    defer trailer.deinit(a);
+                    try std.testing.expectEqual(@as(u64, 12), trailer.file_size);
+                    try std.testing.expectEqualStrings("end", trailer.bytes);
+                }
+            },
+            .whole => {
+                const result = view.readFileAllocWithAdmission(a, path, 12, port);
+                if (expected_error) |cause| try std.testing.expectError(cause, result) else {
+                    const bytes = try result;
+                    defer a.free(bytes);
+                    try std.testing.expectEqualStrings("old body end", bytes);
+                }
+            },
+        }
+        const expected_waits: usize = if (case == .grow_whole or case == .shrink_whole) 3 else if (expected_error != null) (if (case == .cancel_data or case == .shutdown_data) 2 else 1) else switch (shape) {
+            .size => 1,
+            .trailer => 2,
+            .whole => 3,
+        };
+        try std.testing.expectEqual(expected_waits, probe.begins);
+        try std.testing.expectEqual(expected_waits, probe.ends);
+        if (case == .replace) try std.testing.expectEqual(@as(u64, 15), try view.fileSize(path));
+        try std.testing.expectEqual(phase, try parent.retainedClass());
+        try std.testing.expectEqual(@as(?u64, deadline), parent.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}

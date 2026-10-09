@@ -583,6 +583,7 @@ pub const Storage = struct {
         acquire_lease: ?*const fn (*anyopaque) anyerror!Lease = null,
         create_dir_path: *const fn (*anyopaque, []const u8) anyerror!void,
         read_file_alloc: *const fn (*anyopaque, Allocator, []const u8, usize) anyerror![]u8,
+        read_file_alloc_with_admission: ?*const fn (*anyopaque, Allocator, []const u8, usize, read_admission.Port) anyerror![]u8 = null,
         read_file_range_alloc: *const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror![]u8,
         begin_read_file_range_alloc: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror!RangeReadFuture = null,
         begin_read_file_range_alloc_with_runtime: ?*const fn (*anyopaque, ?ReadRuntime, Allocator, []const u8, u64, usize) anyerror!RangeReadFuture = null,
@@ -591,6 +592,8 @@ pub const Storage = struct {
         read_file_range_into_with_admission: ?*const fn (*anyopaque, []const u8, u64, []u8, read_admission.Port) anyerror!void = null,
         read_file_range_at_most_into: ?*const fn (*anyopaque, []const u8, u64, []u8) anyerror!usize = null,
         file_size: *const fn (*anyopaque, []const u8) anyerror!u64,
+        file_size_with_admission: ?*const fn (*anyopaque, []const u8, read_admission.Port) anyerror!u64 = null,
+        read_file_trailer_alloc_with_admission: ?*const fn (*anyopaque, Allocator, []const u8, usize, read_admission.Port) anyerror!FileTrailer = null,
         /// Reads an exact suffix and reports the size already observed while
         /// locating it, avoiding a separate metadata operation.
         read_file_trailer_alloc: ?*const fn (*anyopaque, Allocator, []const u8, usize) anyerror!FileTrailer = null,
@@ -663,17 +666,16 @@ pub const Storage = struct {
 
     pub fn readFileAllocWithAdmission(self: Storage, allocator: Allocator, path: []const u8, max_bytes: usize, control: read_admission.Port) ![]u8 {
         try control.checkpoint();
-        const size = try self.fileSize(path);
-        if (size > max_bytes) return error.StreamTooLong;
-        const len = std.math.cast(usize, size) orelse return error.StreamTooLong;
-        const out = try self.readFileRangeAllocWithAdmission(allocator, path, 0, len, control);
+        // Providers bind their own immutable generation. Native opt-in retains
+        // one descriptor across metadata and data; compatibility keeps the
+        // existing complete-file operation instead of re-resolving its pathname.
+        const out = if (self.vtable.read_file_alloc_with_admission) |read|
+            try read(self.ptr, allocator, path, max_bytes, control)
+        else
+            try self.readFileAlloc(allocator, path, max_bytes);
         errdefer allocator.free(out);
-        // Preserve the immutable-size check; a growing file cannot publish an
-        // admitted prefix as though it were a complete artifact.
-        const final_size = try self.fileSize(path);
-        if (final_size > size) return error.StreamTooLong;
-        if (final_size < size) return error.EndOfStream;
         try control.checkpoint();
+        if (out.len > max_bytes) return error.StreamTooLong;
         return out;
     }
 
@@ -737,6 +739,27 @@ pub const Storage = struct {
 
     pub fn fileSize(self: Storage, path: []const u8) !u64 {
         return self.vtable.file_size(self.ptr, path);
+    }
+
+    pub fn fileSizeWithAdmission(self: Storage, path: []const u8, control: read_admission.Port) !u64 {
+        try control.checkpoint();
+        const size = if (self.vtable.file_size_with_admission) |stat| try stat(self.ptr, path, control) else try self.fileSize(path);
+        try control.checkpoint();
+        return size;
+    }
+
+    pub fn readFileTrailerAllocWithAdmission(self: Storage, allocator: Allocator, path: []const u8, len: usize, control: read_admission.Port) !FileTrailer {
+        try control.checkpoint();
+        // Compatibility providers retain their existing generation binding;
+        // independently re-resolving size and range would weaken that contract.
+        var trailer = if (self.vtable.read_file_trailer_alloc_with_admission) |read|
+            try read(self.ptr, allocator, path, len, control)
+        else
+            try self.readFileTrailerAlloc(allocator, path, len);
+        errdefer trailer.deinit(allocator);
+        try control.checkpoint();
+        if (trailer.bytes.len != len or trailer.file_size < len) return error.EndOfStream;
+        return trailer;
     }
 
     pub fn readFileTrailerAlloc(self: Storage, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
@@ -1432,6 +1455,57 @@ else
             const entry = try self.retain(namespace, io, path);
             defer self.release(io, entry);
             return try fileSizeFromFd(entry.fd);
+        }
+
+        fn fileSizeWithAdmission(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, control: read_admission.Port) !u64 {
+            try control.checkpoint();
+            const entry = try self.retain(namespace, io, path);
+            defer self.release(io, entry);
+            const size = if (try control.executionWait()) |boundary| try boundary.run(fileSizeFromFd, .{entry.fd}) else try fileSizeFromFd(entry.fd);
+            try control.checkpoint();
+            return size;
+        }
+
+        fn readFileAllocWithAdmission(self: *FdCache, namespace: u64, io: std.Io, allocator: Allocator, path: []const u8, max_bytes: usize, control: read_admission.Port) ![]u8 {
+            try control.checkpoint();
+            const entry = try self.retain(namespace, io, path);
+            defer self.release(io, entry);
+            const size = if (try control.executionWait()) |boundary| try boundary.run(fileSizeFromFd, .{entry.fd}) else try fileSizeFromFd(entry.fd);
+            try control.checkpoint();
+            if (size > max_bytes) return error.StreamTooLong;
+            const len = std.math.cast(usize, size) orelse return error.StreamTooLong;
+            const out = try allocator.alloc(u8, len);
+            errdefer allocator.free(out);
+            if (len != 0) {
+                if (try control.executionWait()) |boundary| {
+                    try boundary.run(readAllAtOffset, .{ entry.fd, out, 0 });
+                } else try readAllAtOffset(entry.fd, out, 0);
+            }
+            const final_size = if (try control.executionWait()) |boundary| try boundary.run(fileSizeFromFd, .{entry.fd}) else try fileSizeFromFd(entry.fd);
+            if (final_size > size) return error.StreamTooLong;
+            if (final_size < size) return error.EndOfStream;
+            try control.checkpoint();
+            return out;
+        }
+
+        fn readTrailerAllocWithAdmission(self: *FdCache, namespace: u64, io: std.Io, allocator: Allocator, path: []const u8, len: usize, control: read_admission.Port) !FileTrailer {
+            try control.checkpoint();
+            const entry = try self.retain(namespace, io, path);
+            defer self.release(io, entry);
+            // Both metadata and suffix bytes describe this one inode even if
+            // pathname replacement or vacuum retires the cache owner between IOs.
+            const size = if (try control.executionWait()) |boundary| try boundary.run(fileSizeFromFd, .{entry.fd}) else try fileSizeFromFd(entry.fd);
+            try control.checkpoint();
+            if (size < len) return error.EndOfStream;
+            const out = try allocator.alloc(u8, len);
+            errdefer allocator.free(out);
+            if (len != 0) {
+                if (try control.executionWait()) |boundary| {
+                    try boundary.run(readAllAtOffset, .{ entry.fd, out, size - len });
+                } else try readAllAtOffset(entry.fd, out, size - len);
+            }
+            try control.checkpoint();
+            return .{ .bytes = out, .file_size = size };
         }
 
         fn readTrailerAlloc(self: *FdCache, namespace: u64, io: std.Io, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
@@ -2338,12 +2412,15 @@ else blk: {
             const native_vtable: Storage.VTable = .{
                 .create_dir_path = createDirPath,
                 .read_file_alloc = readFileAlloc,
+                .read_file_alloc_with_admission = readFileAllocWithAdmission,
                 .read_file_range_alloc = readFileRangeAlloc,
                 .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
                 .read_file_range_into = readFileRangeInto,
                 .read_file_range_into_with_admission = readFileRangeIntoWithAdmission,
                 .read_file_range_at_most_into = readFileRangeAtMostInto,
                 .file_size = fileSize,
+                .file_size_with_admission = fileSizeWithAdmission,
+                .read_file_trailer_alloc_with_admission = readFileTrailerAllocWithAdmission,
                 .read_file_trailer_alloc = readFileTrailerAlloc,
                 .write_file_absolute = writeFileAbsolute,
                 .append_file_absolute = appendFileAbsolute,
@@ -2499,6 +2576,36 @@ else blk: {
                 };
             }
 
+            fn readFileAllocWithAdmission(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize, control: read_admission.Port) ![]u8 {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                if (comptime supports_posix_fd_cache) {
+                    const state = try self.state.retain();
+                    defer state.release();
+                    return state.fdCache().readFileAllocWithAdmission(state.cache_namespace, state.threaded.io(), allocator, path, max_bytes, control);
+                }
+                return readFileAlloc(ptr, allocator, path, max_bytes);
+            }
+
+            fn fileSizeWithAdmission(ptr: *anyopaque, path: []const u8, control: read_admission.Port) !u64 {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                if (comptime supports_posix_fd_cache) {
+                    const state = try self.state.retain();
+                    defer state.release();
+                    return state.fdCache().fileSizeWithAdmission(state.cache_namespace, state.threaded.io(), path, control);
+                }
+                return fileSize(ptr, path);
+            }
+
+            fn readFileTrailerAllocWithAdmission(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize, control: read_admission.Port) !FileTrailer {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                if (comptime supports_posix_fd_cache) {
+                    const state = try self.state.retain();
+                    defer state.release();
+                    return state.fdCache().readTrailerAllocWithAdmission(state.cache_namespace, state.threaded.io(), allocator, path, len, control);
+                }
+                return readFileTrailerAlloc(ptr, allocator, path, len);
+            }
+
             fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
                 if (comptime supports_posix_fd_cache) {
@@ -2650,12 +2757,15 @@ else blk: {
             .acquire_lease = acquireErasedLease,
             .create_dir_path = createDirPath,
             .read_file_alloc = readFileAlloc,
+            .read_file_alloc_with_admission = readFileAllocWithAdmission,
             .read_file_range_alloc = readFileRangeAlloc,
             .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
             .read_file_range_into = readFileRangeInto,
             .read_file_range_into_with_admission = readFileRangeIntoWithAdmission,
             .read_file_range_at_most_into = readFileRangeAtMostInto,
             .file_size = fileSize,
+            .file_size_with_admission = fileSizeWithAdmission,
+            .read_file_trailer_alloc_with_admission = readFileTrailerAllocWithAdmission,
             .read_file_trailer_alloc = readFileTrailerAlloc,
             .write_file_absolute = writeFileAbsolute,
             .append_file_absolute = appendFileAbsolute,
@@ -2820,6 +2930,36 @@ else blk: {
                 return try retained.fdCache().fileSize(retained.cache_namespace, retained.threaded.io(), path);
             }
             return try fileSizeWithIo(retained.threaded.io(), path);
+        }
+
+        fn readFileAllocWithAdmission(ptr: *anyopaque, allocator: Allocator, path: []const u8, max_bytes: usize, control: read_admission.Port) ![]u8 {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const retained = try state.retain();
+            defer retained.release();
+            if (comptime supports_posix_fd_cache) {
+                return retained.fdCache().readFileAllocWithAdmission(retained.cache_namespace, retained.threaded.io(), allocator, path, max_bytes, control);
+            }
+            return readFileAlloc(ptr, allocator, path, max_bytes);
+        }
+
+        fn fileSizeWithAdmission(ptr: *anyopaque, path: []const u8, control: read_admission.Port) !u64 {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const retained = try state.retain();
+            defer retained.release();
+            if (comptime supports_posix_fd_cache) {
+                return retained.fdCache().fileSizeWithAdmission(retained.cache_namespace, retained.threaded.io(), path, control);
+            }
+            return fileSize(ptr, path);
+        }
+
+        fn readFileTrailerAllocWithAdmission(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize, control: read_admission.Port) !FileTrailer {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const retained = try state.retain();
+            defer retained.release();
+            if (comptime supports_posix_fd_cache) {
+                return retained.fdCache().readTrailerAllocWithAdmission(retained.cache_namespace, retained.threaded.io(), allocator, path, len, control);
+            }
+            return readFileTrailerAlloc(ptr, allocator, path, len);
         }
 
         fn readFileTrailerAlloc(ptr: *anyopaque, allocator: Allocator, path: []const u8, len: usize) !FileTrailer {

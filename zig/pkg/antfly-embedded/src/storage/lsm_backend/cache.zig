@@ -645,7 +645,7 @@ pub const Cache = struct {
             return self.putRunTableRawWithAdmission(path, run_id, generation, raw, null);
         };
         try budget.checkpoint();
-        const size = try storage.fileSize(path);
+        const size = try storage.fileSizeWithAdmission(path, budget);
         try budget.checkpoint();
         if (size > max_bytes) return error.StreamTooLong;
         const input_bytes = std.math.cast(usize, size) orelse return error.StreamTooLong;
