@@ -1210,7 +1210,7 @@ pub const Adapter = struct {
         const normalized = try self.context.platformDeadline();
         var context: local.serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
         const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store };
-        var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, &self.server.lake_read_cache);
+        var source = try local.serverless_query_lake_serving.ServingSource.openCachedFor(a, .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, &self.server.lake_read_cache, if (self.cpuScope()) |scope| scope.execution else null);
         defer source.deinit();
         const owner = try a.create(AggregateArtifactCursor);
         owner.a = a;
@@ -1341,7 +1341,7 @@ pub const Adapter = struct {
                 const schema: @import("antfly_local_sources").storage_schema.TableSchema = .{ .storage_mode = .relational, .external_base_source = request.table.external_base_source };
                 const normalized = try self.context.platformDeadline();
                 const lake_options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store };
-                source.* = try @import("antfly_local_sources").serverless_query_lake_serving.ServingSource.openCached(alloc, schema, lake_options.lakeOptions(), .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, &self.server.lake_read_cache);
+                source.* = try @import("antfly_local_sources").serverless_query_lake_serving.ServingSource.openCachedFor(alloc, schema, lake_options.lakeOptions(), .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, &self.server.lake_read_cache, if (self.cpuScope()) |scope| scope.execution else null);
                 errdefer source.deinit();
                 try source.attachCache(&self.server.lake_read_cache, request.table.external_base_source.?.binding, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
                 try owner.sources.put(alloc, request.table.id, source);

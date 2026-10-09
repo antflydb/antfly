@@ -292,3 +292,22 @@ progress, and scanning after the planning execution finishes.
 Statement capture, object-provider initialization, index/artifact readers and
 actual row-group lookahead remain separate ownership qualification requirements,
 as do the full overload, durability and default-sizing proofs.
+
+
+### Lake statement capture (under qualification)
+
+Native lake statement and aggregate-source capture use a temporary query
+execution for inventory listing, Iceberg metadata and related provider reads.
+The exact Store operation suspends CPU while preserving the original token and
+deadline. A successful pinned source removes the execution before returning;
+it retains its original lifetime evidence and can survive the call's finish.
+Denied resume discards owned metadata and closes the acquired provider store.
+
+Qualification covers physical inventory-list CPU suspension, protected control
+progress, cancellation/expiry after an owned listing is acquired, independent
+source-lifetime rejection before provider opening, source access after call
+retirement, initializer failure cleanup, and unchanged unscheduled behavior.
+Provider initialization retains CPU for validation and credential parsing; its
+physical secret/file/credential waits need explicit context support rather than
+parking the entire initializer. Index/artifact reads, actual row-group lookahead
+and all global overload/durability/default-sizing proofs remain requirements.
