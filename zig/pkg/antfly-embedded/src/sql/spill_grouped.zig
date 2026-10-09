@@ -425,7 +425,12 @@ pub const Grouped = struct {
         distinct.execution = self.sort.execution;
         if (self.sort.execution != null) distinct.parallel_runs = false;
         var distinct_ordinal: u64 = 0;
+        var reduced_rows: usize = 0;
         while (true) {
+            if (self.sort.execution) |execution| {
+                if (reduced_rows % 64 == 0) try execution.checkpoint();
+            }
+            reduced_rows += 1;
             ordinal = @min(ordinal, row.ordinal);
             if (row.values.len == 0) return error.InvalidSqlSpill;
             if (row.values[0].value == .integer) {
@@ -699,9 +704,10 @@ test "SQL scoped partition reducers preserve exact aggregates and physically joi
         {
             var grouped = try Grouped.init(a, &manager, &.{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer } }, 1, 1024 * 1024);
             defer grouped.deinit();
-            var keys: [512]i64 = undefined;
+            const key_count: usize = if (mode == .skew) 1024 else 512;
+            var keys: [1024]i64 = undefined;
             var candidate: i64 = 0;
-            for (&keys, 0..) |*key, index| {
+            for (keys[0..key_count], 0..) |*key, index| {
                 if (mode == .skew) {
                     while (true) : (candidate += 1) {
                         var hash = std.hash.Wyhash.init(0);
@@ -716,10 +722,11 @@ test "SQL scoped partition reducers preserve exact aggregates and physically joi
                 } else key.* = @intCast(index);
             }
             for (0..4096) |index| {
-                try grouped.add(&.{Datum.json(.{ .integer = keys[index % 512] })}, &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = 3 }) }, index);
+                try grouped.add(&.{Datum.json(.{ .integer = keys[index % key_count] })}, &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = 3 }) }, index);
             }
             for (&grouped.partitions) |*file| if (file.*) |*open| try open.seal();
             const input_written = manager.written_bytes;
+            if (mode == .skew) grouped.reduction_lanes = 8;
             try grouped.startReductions(mode == .exact);
             if (mode == .registry_full) {
                 try std.testing.expectEqual(@as(usize, 0), grouped.reductions_started);
@@ -749,7 +756,7 @@ test "SQL scoped partition reducers preserve exact aggregates and physically joi
                     try std.testing.expectError(error.Forbidden, grouped.nextBatch(output.allocator(), 64, false));
                 },
                 .success, .exact, .skew, .registry_full => {
-                    var seen: [512]bool = @splat(false);
+                    var seen: [1024]bool = @splat(false);
                     var count: usize = 0;
                     while (true) {
                         _ = output.reset(.retain_capacity);
@@ -766,15 +773,15 @@ test "SQL scoped partition reducers preserve exact aggregates and physically joi
                                 defer sum.deinit();
                                 try std.testing.expectEqual(@as(i64, 24), (try sum.finish()).value.integer);
                             } else {
-                                try std.testing.expectEqual(@as(i64, 8), (try batch.aggregates.cell(output.allocator(), lane, 0)).value.integer);
-                                try std.testing.expectEqual(@as(i64, 24), sum_cell.value.integer);
+                                try std.testing.expectEqual(@as(i64, @intCast(4096 / key_count)), (try batch.aggregates.cell(output.allocator(), lane, 0)).value.integer);
+                                try std.testing.expectEqual(@as(i64, @intCast(3 * (4096 / key_count))), sum_cell.value.integer);
                             }
                             count += 1;
                         }
                     }
-                    try std.testing.expectEqual(@as(usize, 512), count);
-                    for (seen) |present| try std.testing.expect(present);
-                    if (mode == .skew) try std.testing.expect(manager.written_bytes > input_written);
+                    try std.testing.expectEqual(key_count, count);
+                    for (seen[0..key_count]) |present| try std.testing.expect(present);
+                    if (mode == .skew and manager.written_bytes <= input_written) return error.TestSkewFallbackNotExercised;
                 },
             }
         }
