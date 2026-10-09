@@ -1804,11 +1804,25 @@ terminal-history records, 64-row paging, cross-job rewind and forged reservation
 pointers. Real replacement-restore admission/restart fixtures check both owners
 and exhaustive allocation failures with arena resize disabled for deterministic
 fault points. The final gate passes 168 native catalog and 22 linked storage
-tests with no failures or leaks. The cursor/projector are not yet wired into
-ordinary reconciliation: phase-aware replica ownership proof must distinguish
-public owners prepared before a restore contribution from complete entries
-after that contribution. Activation/serving barriers and original SQL parity
-credit remain unfinished.
+tests with no failures or leaks.
+Active restore targets now participate in the ordinary production reconciliation
+source stream, after hidden creates and public tables. Native candidate-owner
+verification uses the durable source bookmark to distinguish public owners
+prepared before a restore contribution from complete entries after it. One owned
+projection per affected active plan maps old/new physical IDs to the same target;
+verification derives each full target cut once and retains only touched candidate
+names across targets. Admission bounds apply to touched candidates and source
+targets, not the sum of unrelated cold names in predecessor schemas.
+The integration regression exercises 70 replacement targets across public and
+restore page boundaries, rejects authentic-but-premature pending owners and
+forged publication IDs, and verifies structural, replay, source-epoch and native
+ownership proofs on every committed page. Real admitted replacement restores
+also run this pipeline after restart. The driver preserves durable job identity
+and verifies that a ready private generation does not publish a serving root.
+The final gate passes 169 native catalog and 22 linked storage tests; inventory,
+source-catalog, formatting and whitespace checks pass. Writer adoption,
+activation/serving barriers, root publication and original SQL parity credit
+remain unfinished.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,

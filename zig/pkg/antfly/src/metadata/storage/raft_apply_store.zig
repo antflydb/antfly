@@ -6630,6 +6630,141 @@ test "system catalog active restore cursor resumes bounded target pages without 
     try std.testing.expect((try first.claims[0].entry()).active == null);
 }
 
+fn reconcileRestoreNamesForTest(store: *RaftApplyStore, a: std.mem.Allocator, initial: relation_reconciliation.State) !relation_reconciliation.State {
+    const r = relation_reconciliation;
+    const group = initial.group_id;
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var buf: [128]u8 = undefined;
+        if (try RaftApplyStore.stagingGet(&txn, try r.jobKey(&buf, group))) |bytes| {
+            try std.testing.expect(std.meta.eql(initial, try r.State.decode(bytes)));
+        } else {
+            try r.start(&txn, &initial, initial.epoch, null);
+        }
+        try txn.commit();
+    }
+    var state = initial;
+    var pages: usize = 0;
+    while (state.phase != .ready) {
+        pages += 1;
+        if (pages > 32) return error.TestExpectedBoundedProgress;
+        var page = try store.prepareRelationReconciliationPage(a, state);
+        defer page.deinit();
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var journal = command_journal.Journal.initVerification(a, &txn, group, RaftApplyStore.relationSourceReplayBeforeKey);
+        defer journal.deinit();
+        try journal.attach();
+        try page.apply(&txn, initial.epoch);
+        try store.verifyReconciliationSourceOwnersTxn(&txn, group, &journal);
+        var before = journal.beforeReader();
+        var replay = try r.ReplayVerifier(command_journal.Journal.BeforeReader, docstore.DocStore.Txn).init(a, &before, &txn, group);
+        defer replay.deinit();
+        var keys = journal.originals.keyIterator();
+        while (keys.next()) |key| try replay.feed(key.*);
+        try replay.finish();
+        try RaftApplyStore.verifyReconciliationEpochTxn(&txn, group, &journal);
+        try RaftApplyStore.verifyRelationSourceDeltaTxn(a, &txn, group, &journal);
+        try verifyReconciliationGroupTxn(&txn, group);
+        try journal.accept();
+        try txn.commit();
+        state = page.after;
+    }
+    var read = try store.store.beginReadTxn();
+    defer read.abort();
+    var buf: [128]u8 = undefined;
+    try std.testing.expectError(error.NotFound, read.get(try r.rootKey(&buf, group)));
+    return state;
+}
+
+test "system catalog restore reconciliation authenticates source phases and canonical physical aliases" {
+    const a = std.testing.allocator;
+    const r = relation_reconciliation;
+    const group = group_ids.main_metadata_group_id;
+    const id: [16]u8 = @splat(9);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/restore-name-apply", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
+    var names: [70][32]u8 = undefined;
+    var schemas: [70][128]u8 = undefined;
+    var targets: [70]RaftApplyStore.RelationRestoreProjection.Target = undefined;
+    for (&targets, &names, &schemas, 0..) |*target, *name, *schema, index| {
+        const table_name = try std.fmt.bufPrint(name, "t{d:0>4}", .{100 + index});
+        target.* = .{
+            .table = .{ .table_id = 100 + index, .name = table_name, .schema_json = try std.fmt.bufPrint(schema, "{{\"version\":2,\"relational_indexes\":[{{\"name\":\"new_idx_{d:0>4}\"}}]}}", .{index}) },
+            .replace = .{ .table = .{ .table_id = 1000 + index, .name = table_name, .schema_json = "{}" } },
+        };
+    }
+    const job: RaftApplyStore.RelationRestoreProjection = .{ .plan = .{ .id = id, .targets = &targets } };
+    const json = try std.json.Stringify.valueAlloc(a, job, .{});
+    defer a.free(json);
+    const epoch: r.Epoch = .{ .incarnation = @splat(1), .revision = 1 };
+    const initial = try r.State.init(group, try r.nextJobId(null), epoch);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try r.advanceSource(&txn, group);
+        var buf: [512]u8 = undefined;
+        try txn.put(try restore_staging.jobKey(&buf, group, id), json);
+        try txn.put(try restore_staging.activeKey(&buf, group, id), &id);
+        try txn.put(try restore_staging.progressKey(&buf, group, id), "{}");
+        for (targets) |target| {
+            const old = target.replace.?.table;
+            const encoded = try encodeTableRecord(a, .{ .table_id = old.table_id, .name = old.name, .schema_json = old.schema_json });
+            defer a.free(encoded);
+            try txn.put(try tableKeyForGroup(&buf, group, old.table_id), encoded);
+            try txn.put(try restore_staging.nameKey(&buf, group, target.table.name), &id);
+            try txn.put(try restore_staging.identityKey(&buf, group, .table, target.table.table_id), &id);
+            try txn.put(try restore_staging.identityKey(&buf, group, .old_table, old.table_id), &id);
+        }
+        try r.start(&txn, &initial, epoch, null);
+        try txn.commit();
+    }
+    // Authentic pending bytes are still premature before their source bookmark.
+    // Test native authority independently of the structural fingerprint fence.
+    {
+        var page = try store.prepareRelationReconciliationPage(a, initial);
+        defer page.deinit();
+        try std.testing.expectEqual(@as(u64, 64), page.after.pass.rows);
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        var journal = command_journal.Journal.initVerification(a, &txn, group, RaftApplyStore.relationSourceReplayBeforeKey);
+        defer journal.deinit();
+        try journal.attach();
+        try page.apply(&txn, epoch);
+        try store.verifyReconciliationSourceOwnersTxn(&txn, group, &journal);
+        var reserved = try RaftApplyStore.relationRestoreTargetSnapshot(a, &txn, group, id, targets[0], false);
+        defer reserved.deinit();
+        var buf: [512]u8 = undefined;
+        const claim = reserved.claims()[0];
+        try txn.put(try r.candidateKey(&buf, &initial, claim.key), &(try (try claim.entry()).encode()));
+        try std.testing.expectError(error.InvalidCatalogRecord, store.verifyReconciliationSourceOwnersTxn(&txn, group, &journal));
+    }
+    const ready = try reconcileRestoreNamesForTest(&store, a, initial);
+    try std.testing.expectEqual(@as(u64, 140), ready.expected.rows);
+    try std.testing.expectEqual(@as(u64, 210), ready.expected.claims);
+    {
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        var journal = command_journal.Journal.initVerification(a, &txn, group, RaftApplyStore.relationSourceReplayBeforeKey);
+        defer journal.deinit();
+        try journal.attach();
+        var buf: [512]u8 = undefined;
+        const key = try r.candidateKey(&buf, &ready, .{ .namespace_id = system_catalog.default_namespace_id, .name = "t0100" });
+        var forged = try relation_names.Entry.decode(try txn.get(key));
+        try std.testing.expectEqual(@as(u64, 1000), forged.active.?.table_id);
+        try std.testing.expectEqual(@as(u64, 100), forged.pending.?.table_id);
+        forged.pending.?.publication_id[0] ^= 1;
+        try txn.put(key, &(try forged.encode()));
+        try std.testing.expectError(error.InvalidCatalogRecord, store.verifyReconciliationSourceOwnersTxn(&txn, group, &journal));
+    }
+}
+
 test "system catalog restore namespace projections bind names and skip artifact payloads" {
     const a = std.testing.allocator;
     const group = group_ids.main_metadata_group_id;
@@ -6741,6 +6876,7 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         defer store.deinit();
         try store.applyStandaloneCommand(group, .{ .upsert_table = original });
         try store.applyStandaloneCommand(group, .{ .upsert_range = original_range });
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
         {
             var tracked = try store.store.beginWriteTxn();
             errdefer tracked.abort();
@@ -6829,6 +6965,7 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         try std.testing.expect(std.mem.indexOf(u8, row, "schema_rewrite") != null);
     }
     try std.testing.expectEqual(.preparing_sources, (try store.loadRestoreStagingProgress(alloc, group, id)).?.state);
+    _ = try reconcileRestoreNamesForTest(&store, alloc, try relation_reconciliation.State.init(group, try relation_reconciliation.nextJobId(null), .{ .incarnation = @splat(1), .revision = 2 }));
     const namespace_source_cut = blk: {
         var read = try store.store.beginReadTxn();
         defer read.abort();
@@ -16776,6 +16913,8 @@ pub const RaftApplyStore = struct {
         defer source.deinit();
         var initial_buf: [160]u8 = undefined;
         source.initial = .{ .cursor = try read.openCursor(), .prefix = try fk_generation_publication.initialWorkPrefixForGroup(&initial_buf, expected.group_id) };
+        var restore_buf: [160]u8 = undefined;
+        source.restore = .{ .a = a, .txn = read, .group_id = expected.group_id, .raw = .{ .cursor = try read.openCursor(), .prefix = try restore_staging.activePrefix(&restore_buf, expected.group_id) } };
         return relation_reconciliation.Page.prepareSource(a, expected, epoch, &source);
     }
 
@@ -16840,10 +16979,12 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         raw: RelationCursor,
         initial: ?RelationCursor = null,
+        restore: ?RelationRestoreSource = null,
         cut: ?RelationSnapshot = null,
         fn deinit(self: *@This()) void {
             if (self.cut) |*cut| cut.deinit();
             if (self.initial) |*source| source.cursor.close();
+            if (self.restore) |*source| source.deinit();
             self.raw.cursor.close();
         }
         pub fn nextAfter(self: *@This(), after: []const u8) !?relation_reconciliation.SourceRow {
@@ -16860,10 +17001,14 @@ pub const RaftApplyStore = struct {
                     return .{ .key = row.key, .table_id = id, .claims = self.cut.?.claims() };
                 }
             };
-            const row = (try self.raw.nextAfter(after)) orelse return null;
-            const id = (try capturedRelationTableId(row.key, self.group_id)) orelse return error.InvalidCatalogRecord;
-            self.cut = try relationReconciliationSnapshot(self.a, self.txn, self.group_id, id);
-            return .{ .key = row.key, .table_id = id, .claims = self.cut.?.claims() };
+            if (self.restore) |*source| if (std.mem.order(u8, after, source.raw.prefix) != .lt) return source.nextAfter(after);
+            if (try self.raw.nextAfter(after)) |row| {
+                const id = (try capturedRelationTableId(row.key, self.group_id)) orelse return error.InvalidCatalogRecord;
+                self.cut = try relationReconciliationSnapshot(self.a, self.txn, self.group_id, id);
+                return .{ .key = row.key, .table_id = id, .claims = self.cut.?.claims() };
+            }
+            if (self.restore) |*source| return source.nextAfter(after);
+            return null;
         }
     };
 
@@ -16900,25 +17045,7 @@ pub const RaftApplyStore = struct {
             self.base_len = key.len;
             if (self.cached) |*job| job.deinit();
             self.cached = null;
-            var buf: [256]u8 = undefined;
-            const bytes = (try stagingGet(self.txn, try restore_staging.jobKey(&buf, self.group_id, id))) orelse return error.InvalidCatalogRecord;
-            if (bytes.len == 0 or bytes.len > restore_staging.max_encoded_bytes) return error.InvalidCatalogRecord;
-            var job = std.json.parseFromSlice(RelationRestoreProjection, self.a, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return error.InvalidCatalogRecord,
-            };
-            errdefer job.deinit();
-            if (!std.mem.eql(u8, &job.value.plan.id, &id)) return error.InvalidCatalogRecord;
-            _ = try relationRestoreSourceDigest(job.value.plan);
-            const progress_bytes = (try stagingGet(self.txn, try restore_staging.progressKey(&buf, self.group_id, id))) orelse return error.InvalidCatalogRecord;
-            if (progress_bytes.len > 1024) return error.InvalidCatalogRecord;
-            var progress = std.json.parseFromSlice(restore_staging.Progress, self.a, progress_bytes, .{}) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return error.InvalidCatalogRecord,
-            };
-            defer progress.deinit();
-            if (progress.value.revision == 0 or progress.value.state == .published or progress.value.state == .canceled) return error.InvalidCatalogRecord;
-            self.cached = job;
+            self.cached = try relationRestoreLoadActiveJob(self.a, self.txn, self.group_id, id);
             self.loaded_jobs += 1;
         }
         pub fn nextAfter(self: *@This(), after: []const u8) !?relation_reconciliation.SourceRow {
@@ -17126,6 +17253,87 @@ pub const RaftApplyStore = struct {
         };
         if (!std.mem.eql(u8, value, &id)) return error.InvalidCatalogRecord;
     }
+    fn relationRestoreLoadActiveJob(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, id: [16]u8) !std.json.Parsed(RelationRestoreProjection) {
+        var buf: [256]u8 = undefined;
+        try relationRestoreRequirePointer(txn, try restore_staging.activeKey(&buf, group_id, id), id);
+        const bytes = (try stagingGet(txn, try restore_staging.jobKey(&buf, group_id, id))) orelse return error.InvalidCatalogRecord;
+        if (bytes.len == 0 or bytes.len > restore_staging.max_encoded_bytes) return error.InvalidCatalogRecord;
+        var job = std.json.parseFromSlice(RelationRestoreProjection, a, bytes, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidCatalogRecord,
+        };
+        errdefer job.deinit();
+        if (!std.mem.eql(u8, &job.value.plan.id, &id)) return error.InvalidCatalogRecord;
+        _ = try relationRestoreSourceDigest(job.value.plan);
+        const progress_bytes = (try stagingGet(txn, try restore_staging.progressKey(&buf, group_id, id))) orelse return error.InvalidCatalogRecord;
+        if (progress_bytes.len > 1024) return error.InvalidCatalogRecord;
+        var progress = std.json.parseFromSlice(restore_staging.Progress, a, progress_bytes, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidCatalogRecord,
+        };
+        defer progress.deinit();
+        if (progress.value.revision == 0 or progress.value.state == .published or progress.value.state == .canceled) return error.InvalidCatalogRecord;
+        return job;
+    }
+    /// One projection per active plan and one canonical target per old/new
+    /// alias. A 64-target page must not require 128 independent owner cuts.
+    const RelationRestoreProofCache = struct {
+        const Target = struct { plan_id: [16]u8, index: usize, canonical_id: u64 };
+        const Proof = struct { plan_id: [16]u8, target: RelationRestoreProjection.Target, canonical_id: u64 };
+        a: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        jobs: std.AutoHashMapUnmanaged([16]u8, std.json.Parsed(RelationRestoreProjection)) = .empty,
+        aliases: std.AutoHashMapUnmanaged(u64, Target) = .empty,
+        fn deinit(self: *@This()) void {
+            var jobs = self.jobs.valueIterator();
+            while (jobs.next()) |job| job.deinit();
+            self.jobs.deinit(self.a);
+            self.aliases.deinit(self.a);
+        }
+        fn lookup(self: *@This(), table_id: u64, state: relation_reconciliation.State) !?Proof {
+            if (!self.aliases.contains(table_id)) {
+                var buf: [256]u8 = undefined;
+                const fresh_pointer = try stagingGet(self.txn, try restore_staging.identityKey(&buf, self.group_id, .table, table_id));
+                const pointer = fresh_pointer orelse
+                    (try stagingGet(self.txn, try restore_staging.identityKey(&buf, self.group_id, .old_table, table_id))) orelse return null;
+                if (pointer.len == 24) {
+                    if (fresh_pointer != null) return error.InvalidCatalogRecord;
+                    return null; // Published predecessor tombstone.
+                }
+                if (pointer.len != 16 or std.mem.allEqual(u8, pointer, 0)) return error.InvalidCatalogRecord;
+                const id: [16]u8 = pointer[0..16].*;
+                const active = (try stagingGet(self.txn, try restore_staging.activeKey(&buf, self.group_id, id))) orelse return null;
+                if (!std.mem.eql(u8, active, &id)) return error.InvalidCatalogRecord;
+                if (!self.jobs.contains(id)) {
+                    if (self.jobs.count() == restore_staging.max_active_attempts) return error.CatalogCommandTooLarge;
+                    var job = try relationRestoreLoadActiveJob(self.a, self.txn, self.group_id, id);
+                    var transferred = false;
+                    defer if (!transferred) job.deinit();
+                    try self.jobs.put(self.a, id, job);
+                    transferred = true;
+                    for (job.value.plan.targets, 0..) |target, index| {
+                        const value: Target = .{ .plan_id = id, .index = index, .canonical_id = target.table.table_id };
+                        const fresh = try self.aliases.getOrPut(self.a, target.table.table_id);
+                        if (fresh.found_existing) return error.InvalidCatalogRecord;
+                        fresh.value_ptr.* = value;
+                        if (target.replace) |old| {
+                            const prior = try self.aliases.getOrPut(self.a, old.table.table_id);
+                            if (prior.found_existing) return error.InvalidCatalogRecord;
+                            prior.value_ptr.* = value;
+                        }
+                    }
+                }
+            }
+            const alias = self.aliases.get(table_id) orelse return error.InvalidCatalogRecord;
+            var base_buf: [256]u8 = undefined;
+            var bookmark_buf: [relation_reconciliation.max_cursor_bytes]u8 = undefined;
+            const bookmark = try std.fmt.bufPrint(&bookmark_buf, "{s}:{x:0>4}", .{ try restore_staging.activeKey(&base_buf, self.group_id, alias.plan_id), alias.index });
+            if (state.phase == .building and std.mem.order(u8, bookmark, state.cursor()) == .gt) return null;
+            const job = self.jobs.get(alias.plan_id) orelse return error.InvalidCatalogRecord;
+            return .{ .plan_id = alias.plan_id, .target = job.value.plan.targets[alias.index], .canonical_id = alias.canonical_id };
+        }
+    };
     /// Target belongs to an owned job projection loaded from this same pinned
     /// reader. Pointer checks are dependencies, not independent plan authority.
     fn relationRestoreTargetSnapshot(a: std.mem.Allocator, reader: anytype, group_id: u64, id: [16]u8, target: RelationRestoreProjection.Target, contributions: bool) !RelationSnapshot {
@@ -17537,20 +17745,19 @@ pub const RaftApplyStore = struct {
     /// merely agree with a producer-supplied fingerprint. Point-derive each
     /// affected table once; aggregate names are bounded by the page contract.
     fn verifyReconciliationSourceOwnersTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, journal: *command_journal.Journal) !void {
-        const Cut = struct {
-            snapshot: RelationSnapshot,
-            by_name: relation_names.EntryMap = .empty,
-            fn deinit(cut: *@This(), a: std.mem.Allocator) void {
-                cut.by_name.deinit(a);
-                cut.snapshot.deinit();
-            }
+        const Candidate = struct { key: relation_names.Key, entry: relation_names.Entry };
+        const Group = struct {
+            table_id: u64,
+            restore: ?RelationRestoreProofCache.Proof,
+            candidates: std.ArrayList(Candidate) = .empty,
         };
-        var tables: std.AutoHashMapUnmanaged(u64, Cut) = .empty;
-        defer {
-            var plans = tables.valueIterator();
-            while (plans.next()) |plan| plan.deinit(self.alloc);
-            tables.deinit(self.alloc);
-        }
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var targets: std.AutoHashMapUnmanaged(u64, Group) = .empty;
+        var restores: RelationRestoreProofCache = .{ .a = self.alloc, .txn = txn, .group_id = group_id };
+        defer restores.deinit();
+        var state: ?relation_reconciliation.State = null;
         var count: usize = 0;
         var entries = journal.originals.iterator();
         while (entries.next()) |entry| {
@@ -17563,23 +17770,49 @@ pub const RaftApplyStore = struct {
             if (entry.value_ptr.*) |before| if (std.mem.eql(u8, before, bytes)) continue;
             const candidate = try relation_names.Entry.decode(bytes);
             const owner = candidate.active orelse candidate.pending orelse return error.InvalidCatalogRecord;
-            if (!tables.contains(owner.table_id)) {
-                if (tables.count() == relation_reconciliation.max_tables_per_page) return error.CatalogCommandTooLarge;
-                var cut: Cut = .{ .snapshot = try relationReconciliationSnapshot(self.alloc, txn, group_id, owner.table_id) };
-                errdefer cut.deinit(self.alloc);
-                count = std.math.add(usize, count, cut.snapshot.claims().len) catch return error.CatalogCommandTooLarge;
-                if (count > relation_names.max_claims) return error.CatalogCommandTooLarge;
-                try cut.by_name.ensureTotalCapacity(self.alloc, @intCast(cut.snapshot.claims().len));
-                for (cut.snapshot.claims()) |claim| {
-                    const item = cut.by_name.getOrPutAssumeCapacity(claim.key);
-                    if (item.found_existing) return error.InvalidCatalogRecord;
-                    item.value_ptr.* = try claim.entry();
-                }
-                try tables.put(self.alloc, owner.table_id, cut);
+            if (state == null) {
+                var buf: [128]u8 = undefined;
+                const value = (try stagingGet(txn, try relation_reconciliation.jobKey(&buf, group_id))) orelse return error.InvalidCatalogRecord;
+                state = try relation_reconciliation.State.decode(value);
+            }
+            if (record.group_id != group_id or state.?.group_id != group_id or
+                !std.mem.eql(u8, &state.?.job_id, &record.generation.?.job_id)) return error.InvalidCatalogRecord;
+            count += 1;
+            if (count > relation_names.max_claims) return error.CatalogCommandTooLarge;
+            const restore = try restores.lookup(owner.table_id, state.?);
+            const canonical_id = if (restore) |proof| proof.canonical_id else owner.table_id;
+            const slot = try targets.getOrPut(a, canonical_id);
+            if (!slot.found_existing) {
+                if (targets.count() > relation_reconciliation.max_tables_per_page) return error.CatalogCommandTooLarge;
+                slot.value_ptr.* = .{ .table_id = owner.table_id, .restore = restore };
             }
             const logical = try relation_reconciliation.logicalCandidateKey(entry.key_ptr.*, record.generation.?);
-            const expected = tables.getPtr(owner.table_id).?.by_name.get(logical) orelse return error.InvalidCatalogRecord;
-            if (!expected.eql(candidate)) return error.InvalidCatalogRecord;
+            try slot.value_ptr.candidates.append(a, .{ .key = logical, .entry = candidate });
+        }
+        // Retain only touched candidates across targets. A page containing a
+        // few new names must not retain every unrelated old index in each full
+        // owner cut, nor count those cold names against its admission budget.
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        var groups = targets.valueIterator();
+        while (groups.next()) |group| {
+            _ = scratch.reset(.retain_capacity);
+            var cut = if (group.restore) |proof|
+                try relationRestoreTargetSnapshot(self.alloc, txn, group_id, proof.plan_id, proof.target, false)
+            else
+                try relationReconciliationSnapshot(self.alloc, txn, group_id, group.table_id);
+            defer cut.deinit();
+            var by_name: relation_names.EntryMap = .empty;
+            try by_name.ensureTotalCapacity(scratch.allocator(), @intCast(cut.claims().len));
+            for (cut.claims()) |claim| {
+                const item = by_name.getOrPutAssumeCapacity(claim.key);
+                if (item.found_existing) return error.InvalidCatalogRecord;
+                item.value_ptr.* = try claim.entry();
+            }
+            for (group.candidates.items) |candidate| {
+                const expected = by_name.get(candidate.key) orelse return error.InvalidCatalogRecord;
+                if (!expected.eql(candidate.entry)) return error.InvalidCatalogRecord;
+            }
         }
     }
     fn applyRelationCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: TransitionCommand, journal: *command_journal.Journal) !void {
