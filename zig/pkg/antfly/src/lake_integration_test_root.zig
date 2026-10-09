@@ -26,6 +26,11 @@ test {
     _ = @import("api/lake_sql_overlay.zig");
     _ = @import("api/lake_maintenance_scheduler.zig");
     _ = @import("api/composed_query.zig");
+    _ = @import("api/lake_retained_cut.zig");
+    _ = @import("api/lake_recent_vectors.zig");
+    _ = @import("api/lake_vector_enrichment.zig");
+    _ = @import("api/lake_expiring_objects.zig");
+    _ = @import("api/lake_vector_enrichment_test.zig");
     _ = @import("api/lake_index_row_source.zig");
     _ = @import("api/lake_index_publication.zig");
     _ = @import("api/lake_index_store.zig");

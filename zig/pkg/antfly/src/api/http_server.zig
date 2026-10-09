@@ -16280,6 +16280,11 @@ pub const ApiHttpServer = struct {
                 // Keep the keyed reconciliation trigger alive while queued WAL
                 // transactions remain. The next pass resolves fresh authority
                 // before building indexes for the newly committed snapshot.
+                // Recent native segments/enrichment proceed before a blocked
+                // Parquet/catalog commit and never depend on its completion.
+                @import("lake_index_text_query.zig").reconcileRecent(std.heap.smp_allocator, self, table, .{ .deadline_ns = platform_time.monotonicNs() +| 60 * std.time.ns_per_s, .cancellation = .{ .ptr = self, .is_cancelled_fn = ingest_cancel.is_cancelled_fn } }) catch |err| {
+                    if (err != error.ExternalLakeIndexNotPublished and err != error.IndexRebuilding) std.log.warn("native lake recent vector work deferred table={s} err={s}", .{ table.name, @errorName(err) });
+                };
                 ingested = try @import("../serverless/lake_ingestion.zig").drain(std.heap.smp_allocator, source_binding.binding, ingest_options, context);
                 // Maintenance failures never block draining or publication.
                 const maintained = @import("lake_maintenance_scheduler.zig").run(std.heap.smp_allocator, self, table, source_binding.binding, ingest_options, context) catch |err| failed: {
@@ -16330,6 +16335,14 @@ pub const ApiHttpServer = struct {
         };
         var store = try @import("lake_index_store.zig").Store.openNative(a, config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
         defer store.deinit();
+        @import("lake_recent_vectors.zig").collect(&store, table.table_id, context) catch |err| {
+            std.log.warn("native recent vector collection deferred table={s} err={s}", .{ table.name, @errorName(err) });
+        };
+        var retained_artifacts = store.artifactStore();
+        @import("lake_retained_cut.zig").collect(&retained_artifacts, 0, store.identity, platform_time.realtimeNs() / std.time.ns_per_ms, cancel) catch {};
+        @import("lake_retained_cut.zig").collect(&retained_artifacts, table.table_id, store.identity, platform_time.realtimeNs() / std.time.ns_per_ms, cancel) catch |err| {
+            std.log.warn("native retained search cut collection deferred table={s} err={s}", .{ table.name, @errorName(err) });
+        };
         const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = config, .secret_store = self.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
         try self.prepareLakeCache();
         var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = schema.external_base_source }, options.lakeOptions(), context, &self.lake_read_cache);
@@ -16345,7 +16358,7 @@ pub const ApiHttpServer = struct {
                 context = reader_lease.?.readContext();
             }
         }
-        try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms });
+        try @import("lake_index_coordinator.zig").reconcile(a, self.embedding_provider_runtime.io, table, &source, &store, .{ .ptr = self, .replace = Hooks.replace }, context, cancel, .{ .ptr = self, .now_ms = Hooks.now }, .{ .lease_ms = lease_ms, .embedding_options = .{ .antfly_provider = self.antfly_provider, .io = self.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = context.deadline_ns, .cancellation = cancel, .secret_store = self.cfg.secret_store, .remote_content = self.cfg.remote_content, .inference_api_url = self.configuredInferenceAPIURL(), .inference_api_key = self.cfg.inference_api_key, .provider_runtime = &self.embedding_provider_runtime, .source_table = table.name } });
         if (ingested) return error.LakeIndexBuildInProgress;
     }
 
@@ -21590,9 +21603,29 @@ pub const ApiHttpServer = struct {
     ) !contextual_operations.OwnedResponse {
         const composed = @import("composed_query.zig");
         if (composed.hasSource(self.alloc, body) catch false) {
-            const source_root = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{});
+            var source_root = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{ .allocate = .alloc_always });
             defer source_root.deinit();
-            const source_value = source_root.value.object.get("source").?;
+            var composed_body = body;
+            var expanded_body: ?[]u8 = null;
+            defer if (expanded_body) |bytes| self.alloc.free(bytes);
+            var source_value = source_root.value.object.get("source").?;
+            if (source_value == .object) if (source_value.object.get("saved")) |saved| {
+                if (source_value.object.count() != 1 or saved != .string) return self.publicQueryOperationErrorResponse("", body, error.InvalidQueryRequest);
+                if (!admittedTablePermissionAllowed(authenticated_identity, saved.string, .read)) return contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden");
+                const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .cancellation = if (cancellation) |cancel| cancel.token() else .none };
+                const bytes = try self.source.systemCatalog(self.alloc, context, .{ .read = .{ .kind = .query_source, .name = saved.string } });
+                defer self.alloc.free(bytes);
+                var state = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_domain.State, self.alloc, bytes, .{});
+                defer state.deinit();
+                const resource = state.value.find(.query_source, 0, saved.string) orelse return self.publicQueryOperationErrorResponse("", body, error.CatalogNotFound);
+                // Arena ownership keeps the expanded immutable catalog definition
+                // alive through every leaf and binds continuation to its incarnation.
+                source_value = try std.json.parseFromSliceLeaky(std.json.Value, source_root.arena.allocator(), resource.source_json, .{ .allocate = .alloc_always });
+                try source_root.value.object.put(source_root.arena.allocator(), "source", source_value);
+                try source_root.value.object.put(source_root.arena.allocator(), "_source_identity", .{ .string = try std.fmt.allocPrint(source_root.arena.allocator(), "{d}", .{resource.id}) });
+                expanded_body = try std.json.Stringify.valueAlloc(self.alloc, source_root.value, .{});
+                composed_body = expanded_body.?;
+            };
             const overlay = source_value == .object and source_value.object.contains("overlay");
             const deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse("", body, error.InvalidQueryRequest);
             const Runner = struct {
@@ -21628,10 +21661,9 @@ pub const ApiHttpServer = struct {
                     var before = (try runner.server.source.linearizableSnapshot(context)) orelse return error.UnsupportedQueryRequest;
                     defer runner.server.source.freeAdminSnapshot(&before);
                     const bound = tables_api.findTableByName(&before, binding.physical) orelse return error.CatalogGenerationChanged;
-                    if (runner.overlay) if (try resolveEffectiveRowFilterJson(a, identity, binding.physical)) |filter| {
-                        a.free(filter);
-                        return error.UnsupportedQueryRequest;
-                    };
+                    const policy = try resolveEffectiveRowFilterJson(a, identity, binding.physical);
+                    defer if (policy) |filter| a.free(filter);
+                    if (runner.overlay and policy != null) return error.UnsupportedQueryRequest;
                     var response = try runner.server.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, leaf_query, null, identity, runner.cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
                     if (response.status != 200) return response;
                     errdefer response.deinit(runner.server.alloc);
@@ -21640,12 +21672,7 @@ pub const ApiHttpServer = struct {
                     const current = tables_api.findTableByName(&after, binding.physical) orelse return error.CatalogGenerationChanged;
                     if (bound.table_id != current.table_id or bound.object_storage_generation != current.object_storage_generation or bound.storage.engine != current.storage.engine) return error.CatalogGenerationChanged;
                     var parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, response.body, .{});
-                    const publication_bytes = if (bound.lake_index_catalog_json.len != 0) published: {
-                        var index_state = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(scratch, bound.lake_index_catalog_json);
-                        defer index_state.deinit();
-                        break :published try std.json.Stringify.valueAlloc(scratch, index_state.value.published, .{});
-                    } else "null";
-                    const identity_json = try std.json.Stringify.valueAlloc(scratch, .{ .id = bound.table_id, .generation = bound.object_storage_generation, .schema = &localDigest(bound.schema_json), .publication = &localDigest(publication_bytes) }, .{});
+                    const identity_json = try std.json.Stringify.valueAlloc(scratch, .{ .id = bound.table_id, .generation = bound.object_storage_generation, .schema = &localDigest(bound.schema_json), .indexes = &localDigest(bound.indexes_json), .policy = &localDigest(policy orelse "null") }, .{});
                     const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, identity_json, .{});
                     for (parsed.object.getPtr("responses").?.array.items) |*result| try result.object.put(scratch, "_composed_identity", value);
                     const encoded = try std.json.Stringify.valueAlloc(runner.server.alloc, parsed, .{});
@@ -21653,12 +21680,32 @@ pub const ApiHttpServer = struct {
                     response.body = encoded;
                     return response;
                 }
+                fn cursorCancelled(raw: *const anyopaque) bool {
+                    const cancel: *const http_common.RequestCancellation = @ptrCast(@alignCast(raw));
+                    return cancel.isCancelled();
+                }
+                fn saveCursor(raw: *anyopaque, a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+                    const runner: *@This() = @ptrCast(@alignCast(raw));
+                    try checkpoint(raw);
+                    var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
+                    defer store.deinit();
+                    var artifacts = store.artifactStore();
+                    return @import("lake_retained_cut.zig").saveCursor(a, &artifacts, store.identity, runner.server.embedding_provider_runtime.io, bytes, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| .{ .ptr = cancel, .is_cancelled_fn = cursorCancelled } else .none);
+                }
+                fn loadCursor(raw: *anyopaque, a: std.mem.Allocator, token: []const u8) ![]const u8 {
+                    const runner: *@This() = @ptrCast(@alignCast(raw));
+                    try checkpoint(raw);
+                    var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, true, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
+                    defer store.deinit();
+                    var artifacts = store.artifactStore();
+                    return @import("lake_retained_cut.zig").loadCursor(a, &artifacts, store.identity, token, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| .{ .ptr = cancel, .is_cancelled_fn = cursorCancelled } else .none);
+                }
                 fn localDigest(bytes: []const u8) [64]u8 {
                     return @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.digestHex(bytes);
                 }
             };
             var runner: Runner = .{ .server = self, .identity = authenticated_identity, .cancellation = cancellation, .overlay = overlay, .deadline = deadline };
-            return composed.execute(self.alloc, body, .{ .ptr = &runner, .execute = Runner.execute, .checkpoint = Runner.checkpoint }) catch |err| return self.publicQueryOperationErrorResponse("", body, err);
+            return composed.execute(self.alloc, composed_body, .{ .ptr = &runner, .execute = Runner.execute, .checkpoint = Runner.checkpoint, .save_cursor = Runner.saveCursor, .load_cursor = Runner.loadCursor }) catch |err| return self.publicQueryOperationErrorResponse("", body, err);
         }
         return try self.handlePublicTableMultiQueryWithCancellation(null, body, authenticated_identity, cancellation, null, null);
     }
@@ -27113,6 +27160,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
     if (try system_catalog_routes.parseAlloc(arena.allocator(), path)) |route| {
         if (route.kind == .table and route.name == null and method == .GET) return null;
         const resource_type: usermgr.ResourceType = switch (route.kind) {
+            .query_source => .table,
             .database => .database,
             .namespace => .namespace,
             .table => .table,

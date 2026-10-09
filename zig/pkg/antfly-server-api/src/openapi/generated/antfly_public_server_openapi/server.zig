@@ -867,6 +867,26 @@ pub fn parseAdministerSqlSettingsBody(allocator: std.mem.Allocator, body: []cons
     return std.json.parseFromSlice(types.SqlSettingMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Get saved query source
+pub const GetQuerySourcePathParams = struct {
+    source_name: []const u8,
+};
+
+/// Create saved query source
+pub const CreateQuerySourcePathParams = struct {
+    source_name: []const u8,
+};
+
+/// Parse the JSON request body for createQuerySource.
+pub fn parseCreateQuerySourceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Drop saved query source
+pub const DropQuerySourcePathParams = struct {
+    source_name: []const u8,
+};
+
 /// Parse the JSON request body for executeSQL.
 pub fn parseExecuteSQLBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLRequest) {
     return std.json.parseFromSlice(types.SQLRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -1682,6 +1702,10 @@ pub const routes = [_]Route{
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/settings", .operation_id = "administerSqlSettings", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/sources", .operation_id = "listQuerySources", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/sources/{sourceName}", .operation_id = "getQuerySource", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/sources/{sourceName}", .operation_id = "createQuerySource", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/sources/{sourceName}", .operation_id = "dropQuerySource", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/sql", .operation_id = "executeSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/sql/connections", .operation_id = "openSQLConnection", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/sql/connections/{connection_id}", .operation_id = "closeSQLConnection", .request_body = .none, .streaming_response = false },
@@ -1859,6 +1883,10 @@ pub const routes = [_]Route{
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn administerSqlSettings(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listQuerySources(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getQuerySource(self: *Impl, ctx: *httpx.Context, source_name: []const u8) !httpx.Response
+//   fn createQuerySource(self: *Impl, ctx: *httpx.Context, source_name: []const u8) !httpx.Response
+//   fn dropQuerySource(self: *Impl, ctx: *httpx.Context, source_name: []const u8) !httpx.Response
 //   fn executeSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn openSQLConnection(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn closeSQLConnection(self: *Impl, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response

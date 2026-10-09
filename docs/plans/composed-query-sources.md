@@ -1,6 +1,6 @@
 # Composed query sources and recent/archive visibility
 
-Status: implementation in progress, 2026-10-08. The implemented contracts and
+Status: native implementation and qualification, 2026-10-09. The implemented contracts and
 limits below are distinct from the remaining long-term architecture.
 
 This extends the [lake ingestion and publication plan](lake-ingestion-and-publication.md)
@@ -20,22 +20,30 @@ fail with a catalog conflict. Overlay currently rejects identities with row filt
 because hidden-key precedence needs a separately reviewed policy contract.
 
 Score ordering requires explicit `source_ranking: "rrf"`. Equal-weight RRF uses
-`1 / (60 + source_rank)`; scores are not shared-corpus BM25. A disjoint RRF union
-can serve the first 4096 global positions over arbitrarily large exact leaf totals:
-4096 candidates per input suffice because ranks decrease strictly within an input.
-Field ordering requires compatible sortable mappings/doc values in each leaf
-index. A field-specific text index does not consume unrelated sort columns.
-Field ordering and keyed overlays currently require complete matching inputs of
-at most 4096 rows per table. These requests fail closed above that budget. Up to
-16 union inputs and a 64 MiB composition arena are supported. Aggregation, hierarchy,
-graph queries, joins, analyses and stateful execution are not composed yet.
+`1 / (60 + visible_source_rank)`; scores are not shared-corpus BM25. The executor
+streams each source in 128-hit pages and merges at most 16 source heads. Keyed
+visibility resolves before assigning logical ranks. Indexed, unfiltered batched
+anti-lookups suppress replaced base rows even if the replacement does not match.
+Field ordering requires compatible sortable mappings/doc values in every leaf.
+Pages allow 1–4096 hits; there is no 4096-position archive horizon. A 64 MiB memory
+budget and request cancellation/deadlines apply. Union totals are exact. Ordinary
+large overlay totals use `relation: "gte"`; an explicit `count: true` request
+streams the entire visible relation for an exact count within its deadline.
+Aggregation, hierarchy, graph queries, joins, analyses and stateful execution are
+not composed yet.
 
-`next_source_cursor` feeds `source_cursor` on the next request. The cursor fingerprints
-the source/query/ranking, observed candidate window, totals, table incarnations and
-lake publication metadata. Changes to that observed cut return a conflict. This
-is an invalidation contract, not retention of old cross-table snapshots or isolation
-from changes outside the observed window. RRF union pagination stops at position
-4096; adaptive streaming and retained serving descriptors remain future work.
+`next_source_cursor` feeds `source_cursor` with the same source/query/ranking.
+Its server-written, content-addressed descriptor stores only per-leaf positions,
+retained snapshot capabilities and totals. Each leaf retains its original archive
+publication, Iceberg metadata, recent segment references and bounded WAL final
+images for 60 seconds. The composed cursor expires with the earliest leaf cut;
+paging does not extend that lifetime. Publication and process restart preserve
+that cut. Native durable reader leases and source snapshot pins protect archive
+artifacts; copied WAL images allow independent WAL retirement. Access, row-policy,
+schema/index recipe and source/table incarnation are rechecked on every page.
+Drop/recreate or policy changes return a conflict. Mutable native-table leaves
+without retained remote snapshots cannot issue a production composed cursor.
+These are independent per-table cuts, not an atomic cross-table transaction.
 
 Overlay keys are flat integer, string or boolean fields; numeric/timestamp key
 normalization is not enabled yet. The changes input must retain one unique latest
@@ -43,7 +51,13 @@ row per key, including deleted rows with a boolean `deleted: true` (or the expli
 configured `tombstone_field`). Indexed anti-lookups omit the user's search and filter
 so a nonmatching edit still suppresses a matching base row. Tombstone rows never
 appear in results. Physical removal from the changes table cannot express deletion
-of an older base row. No saved source/view DDL is implemented yet.
+of an older base row. Saved source definitions are immutable catalog resources: `POST /sources/{name}`
+with `{"source": <literal expression>}`, `GET /sources` or `/sources/{name}`, and
+`DELETE /sources/{name}`. Query with `"source":{"saved":"hackernews"}`. Native
+Antfly catalog persistence assigns a stable source ID; no SQLite is involved.
+Reads authorize the saved name and every leaf. Definitions permit literal union
+or overlay leaves only, preventing recursion. Drop/recreate changes the source ID
+and invalidates previous cursors; definitions do not freeze table contents.
 
 Direct HTTP SQL SELECT requests accept `lake_visibility: "accepted"`; the default
 remains `"committed"`. A statement pins one committed source and one immutable WAL
@@ -58,11 +72,29 @@ Writable-lake search requests accept `lake_read` with `visibility: "accepted"` o
 `wal_lsn`) and `wait_ms` from 0 to 60000. Change acceptance includes those receipt
 fields. Published reads explicitly select the archive publication and skip pending
 changes. A receipt requires its coverage and rejects a different incarnation.
-Vector/hybrid accepted reads with pending changes wake publication and wait within
-the request deadline; they return readiness errors when coverage is unavailable.
-This improves the previous unsupported-query rejection, but **does not implement
-recent vector segments or background embedding enrichment**. Those remain required
-for immediate vector visibility independently of archive publication.
+Vector/hybrid accepted reads use native recent HBC/sparse segments over the same
+pinned WAL final images as text. Superseded archive vectors are masked before ANN
+or sparse candidate selection, then compatible archive/recent scores are merged.
+All declared vector recipes must finish for the requested cut; incomplete or failed
+enrichment returns readiness rather than stale hits. The background worker runs
+recent enrichment before WAL-to-Parquet draining, so blocked Parquet publication
+does not block completed recent vectors. Materialized dense/sparse vectors and
+managed text-field embedding providers share the archive builder's row-to-vector
+semantics. Multimodal inputs and document template/chunking pipelines are outside
+this flat lake-row implementation.
+
+Durable, ETag-fenced jobs bind table incarnation, archive generation, WAL cut and
+index recipe. Completed per-input embeddings are memoized for seven days and
+reused after restart and during archive promotion. Leases fence stale completion; failures persist retry/backoff and errors.
+Graceful cancellation conditionally releases unfinished claims with a separate
+one-second cleanup budget, including ambiguous successful claim writes recovered
+by random ownership token; hard crashes use the 120-second lease expiry. `{"action":"enrichment_status"}` on
+`/tables/{table}/lake/maintenance` reports completed/failed recent coverage. Jobs
+and segment artifacts retain for 24 hours; bounded background conditional cleanup
+collects expired state. Index work still obeys the bounded WAL, memory and request
+budgets; large jobs make vendor progress through durable memoized inputs. A live
+embedding vendor and a compatible published baseline are required for managed
+embedding indexes. Acceptance is not a promise that an embedding already exists.
 
 Maintenance is opt-in through the Iceberg string property `antfly.maintenance.policy`,
 containing a JSON policy. The existing supervised publication sweep executes bounded
@@ -104,9 +136,11 @@ query, not the definition of a multi-table input relation.
 
 Native writable Iceberg tables currently provide durable acceptance, automatic
 Parquet/catalog/index publication, and a bounded accepted-WAL text overlay over
-a published archive baseline. SQL defaults to committed snapshots, with opt-in accepted visibility for direct
-SELECT requests. Pending vector queries wait for matching publication. Maintenance
-is bounded and can be explicitly invoked or scheduled through an opt-in policy. Additional vendor subscriptions are not automatically
+a published archive baseline, with coherent recent vector/enrichment segments.
+SQL defaults to committed snapshots, with opt-in accepted visibility for direct
+SELECT requests. Pending vectors wait for recent enrichment or explicit archive
+coverage. Maintenance is bounded and can be explicitly invoked or scheduled
+through an opt-in policy. Additional vendor subscriptions are not automatically
 provisioned. These are implementation boundaries, not the final product contract.
 
 ## JSON source expressions
@@ -158,7 +192,7 @@ Provider offsets are comparable only within their declared source epoch. Do not
 infer precedence by comparing unrelated CDC offsets. Multiple writers require
 an explicit conflict policy. A saved catalog view may encapsulate a source
 expression so clients can query a stable logical `hackernews` name; its DDL and
-authorization behavior remain to be specified.
+authorization behavior follow the native immutable source catalog contract above.
 
 ## Binding, planning and execution
 
@@ -201,8 +235,8 @@ expose stable logical identity. Apply a deterministic tie-breaker for ordering.
 Cursors bind the source expression, policies, table incarnations, pinned source
 snapshots, index publications, accepted-change cuts and ranking configuration.
 Retain these cuts for a declared cursor lifetime or explicitly expire the cursor
-when they are unavailable. The current lake text overlay invalidates cursors when
-its archive/WAL cut changes; retained cursor generations are future work.
+when they are unavailable. Retained lake cuts preserve archive/WAL pagination across publication and restart
+within their fixed 60-second lifetime; policy, recipe and incarnation changes invalidate them.
 
 ## Shared visibility for SQL and search
 
@@ -290,9 +324,10 @@ promise gap-free vendor CDC. Credentials remain named connections/secret referen
 
 ## Hacker News rollout and qualification
 
-The example currently targets one `hackernews` table. Its accepted-WAL overlay is
-a bounded publication backlog, not a rolling year-long current tier. It does not
-configure or qualify a deployed current/history pair.
+The example supports independent historical/current workers and HTTP qualification
+of a two-table union or overlay, including a saved logical source. Its accepted-WAL
+suffix is a bounded publication backlog, not a rolling year-long current tier. A
+public deployed current/history service still needs archive-scale latency qualification.
 
 Start the two-table example with an explicit date boundary and nonoverlapping
 inputs: current-only by default, history-only on selection, and composed union
@@ -302,7 +337,8 @@ Date partitions alone do not handle edits/deletes of old HN records. Route these
 to the historical writer or retain keyed changes/tombstones and use overlay
 composition. Define that policy before claiming complete moderation visibility.
 
-Implementation order:
+The first five phases below are implemented within the contracts above; full-archive
+qualification and the additional adapters in phase six remain:
 
 1. Add disjoint-source DSL union, schema/auth binding, exact ordering/counts/cursors,
    a declared ranking contract, and HN current/history qualification.

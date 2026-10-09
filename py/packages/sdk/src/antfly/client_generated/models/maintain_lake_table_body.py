@@ -17,7 +17,7 @@ class MaintainLakeTableBody:
     """
     Attributes:
         action (MaintainLakeTableBodyAction):
-        operation_id (str | Unset): Required for compact/vacuum/wal_gc; omitted for scheduler status.
+        operation_id (str | Unset): Required for compact/vacuum/wal_gc; omitted for scheduler or enrichment status.
         dry_run (bool | Unset):  Default: True.
         exclusive_ownership (bool | Unset):  Default: False.
         max_rows (int | Unset):  Default: 16384.

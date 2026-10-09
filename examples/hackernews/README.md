@@ -465,20 +465,41 @@ does not provision a rolling date boundary or migrate rows automatically.
 The HTTP fixtures exercise an independent historical/current pair and keyed
 precedence, including a newer nonmatching edit and a retained deleted record.
 
-RRF uses independent source ranks, not shared BM25 statistics. Disjoint RRF union
-supports the first 4096 global result positions with exact leaf totals. Keyed
-overlays and field ordering currently require complete matching sets of at most
-4096 rows per table. `next_source_cursor` is supplied as `source_cursor` for the
-next page and expires when its observed candidate cut changes. Read the
-[composition design and limits](../../docs/plans/composed-query-sources.md#implemented-contracts)
+RRF uses independent visible source ranks, not shared BM25 statistics. Union and
+keyed overlays stream bounded 128-hit source pages; result pages allow up to 4096
+hits without a fixed archive-position horizon. Large overlay totals are lower
+bounds unless `count: true` explicitly streams an exact count. Pass
+`next_source_cursor` as `source_cursor` on the next request. Lake cuts retain the
+same archive publication and accepted WAL images across publication and restart
+for up to 60 seconds; authorization and incarnation are always rechecked. Read the
+[composition contracts](../../docs/plans/composed-query-sources.md#implemented-contracts)
 before exposing all-time search over a full archive.
+
+Save the logical source once in the native Antfly catalog:
+
+```sh
+curl -fsS -X POST "$ANTFLY_URL/sources/hackernews" \
+  -H 'Content-Type: application/json' -d '{
+    "source":{"union":[{"table":"hackernews_current"},{"table":"hackernews_history"}]}
+  }'
+curl -fsS -X POST "$ANTFLY_URL/query" -H 'Content-Type: application/json' -d '{
+  "source":{"saved":"hackernews"},"source_ranking":"rrf",
+  "full_text_search":{"match":"distributed databases","field":"body"},"limit":20
+}'
+```
+
+Saved definitions are immutable; drop/recreate to change an expression. Reads need
+permission on the saved source and each underlying table. For overlapping edits,
+save an overlay instead and retain tombstones in its changes table.
 
 Direct HTTP SQL SELECT can use `"lake_visibility":"accepted"` to include the
 bounded durable WAL suffix after restart; committed visibility remains the default.
 Search can use `"lake_read":{"visibility":"published"}` to explicitly select a
 published archive, or add a `through` receipt from `/lake/changes` and `wait_ms`
-to require minimum coverage. Accepted vector queries currently wait for matching
-archive publication; recent vector/enrichment segments remain future work.
+to require minimum coverage. Accepted vector queries use coherent recent native
+dense/sparse segments; managed text embeddings are computed by a durable retrying background job before Parquet
+publication. Check `{"action":"enrichment_status"}` on the maintenance endpoint
+for the completed WAL cut or retry/error state.
 
 Set the Iceberg string property `antfly.maintenance.policy` to a JSON policy such
 as `{"enabled":true,"compact":true,"wal_gc":true,"vacuum":false}` to enable

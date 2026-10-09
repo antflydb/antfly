@@ -34,6 +34,7 @@ pub const Options = struct {
     lease_ms: u64 = 5 * 60 * 1000,
     retry_ms: u64 = 1000,
     build_limits: limits.Limits = .{},
+    embedding_options: ?local.inference_managed_embedder.InitOptions = null,
 };
 
 pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, authority: Authority, context: Context, cancellation: Cancellation, clock: publication.Clock, options: Options) !void {
@@ -76,7 +77,7 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     var working = try limits.WorkingSetAllocator.init(a, options.build_limits);
     const build_alloc = working.allocator();
     var handle = store.artifactStore();
-    const published_bytes = publication.buildWithLease(build_alloc, &handle, pending, source, store.identity, build_context, cancellation, clock, .{ .ptr = &lease, .snapshot = Renewal.snapshot }) catch |build_error| {
+    const published_bytes = publication.buildWithLeaseAndEmbedding(build_alloc, &handle, pending, source, store.identity, build_context, cancellation, clock, .{ .ptr = &lease, .snapshot = Renewal.snapshot }, options.embedding_options, .{ .store = store, .table_id = table.table_id, .recipe = catalog.desiredFingerprint(table), .context = build_context }) catch |build_error| {
         heartbeat.cancel(io);
         heartbeat_active = false;
         const failure_time = clock.now_ms(clock.ptr) catch return build_error;

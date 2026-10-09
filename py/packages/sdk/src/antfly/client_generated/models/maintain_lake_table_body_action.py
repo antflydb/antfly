@@ -3,6 +3,7 @@ from enum import StrEnum
 
 class MaintainLakeTableBodyAction(StrEnum):
     COMPACT = "compact"
+    ENRICHMENT_STATUS = "enrichment_status"
     STATUS = "status"
     VACUUM = "vacuum"
     WAL_GC = "wal_gc"

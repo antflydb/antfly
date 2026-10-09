@@ -17,20 +17,25 @@ T = TypeVar("T", bound="ComposedQuerySource")
 
 @_attrs_define
 class ComposedQuerySource:
-    """Specify exactly one of union or overlay. Union preserves duplicates and table provenance; overlay suppresses base
-    keys using unfiltered change lookups before global ordering. Disjoint RRF unions support the first 4096 global
-    positions over exact leaf totals. Overlays and field ordering require complete matching sets of at most 4096 per
-    input; larger sets fail without truncation.
+    """Specify exactly one of saved, union or overlay. Union preserves duplicates and table provenance. Overlay suppresses
+    replaced base keys and tombstones before ranking using indexed unfiltered change lookups. Inputs are streamed in
+    bounded pages; result pages allow at most 4096 hits. Large overlay totals are lower bounds unless count is
+    explicitly requested; exact count streams the full visible relation within the request deadline.
 
         Attributes:
+            saved (str | Unset): Immutable source name from the Antfly catalog. Saved definitions contain literal table
+                leaves, preventing recursive expansion.
             union (list[ComposedTableSource] | Unset):
             overlay (ComposedSourceOverlay | Unset):
     """
 
+    saved: str | Unset = UNSET
     union: list[ComposedTableSource] | Unset = UNSET
     overlay: ComposedSourceOverlay | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        saved = self.saved
+
         union: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.union, Unset):
             union = []
@@ -45,6 +50,8 @@ class ComposedQuerySource:
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
+        if saved is not UNSET:
+            field_dict["saved"] = saved
         if union is not UNSET:
             field_dict["union"] = union
         if overlay is not UNSET:
@@ -58,6 +65,8 @@ class ComposedQuerySource:
         from ..models.composed_table_source import ComposedTableSource
 
         d = dict(src_dict)
+        saved = d.pop("saved", UNSET)
+
         _union = d.pop("union", UNSET)
         union: list[ComposedTableSource] | Unset = UNSET
         if _union is not UNSET:
@@ -75,6 +84,7 @@ class ComposedQuerySource:
             overlay = ComposedSourceOverlay.from_dict(_overlay)
 
         composed_query_source = cls(
+            saved=saved,
             union=union,
             overlay=overlay,
         )

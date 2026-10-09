@@ -276,6 +276,7 @@ pub const SSEStepCompleted = types.SSEStepCompleted;
 pub const SSEStepProgress = types.SSEStepProgress;
 pub const SSEStepStarted = types.SSEStepStarted;
 pub const SSEToolMode = types.SSEToolMode;
+pub const SavedQuerySource = types.SavedQuerySource;
 pub const ScanKeysRequest = types.ScanKeysRequest;
 pub const SecretEntry = types.SecretEntry;
 pub const SecretList = types.SecretList;

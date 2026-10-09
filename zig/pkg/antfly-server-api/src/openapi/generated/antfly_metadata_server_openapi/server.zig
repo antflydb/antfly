@@ -624,6 +624,26 @@ pub fn parseAdministerSqlSettingsBody(allocator: std.mem.Allocator, body: []cons
     return std.json.parseFromSlice(types.SqlSettingMutationRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Get saved query source
+pub const GetQuerySourcePathParams = struct {
+    source_name: []const u8,
+};
+
+/// Create saved query source
+pub const CreateQuerySourcePathParams = struct {
+    source_name: []const u8,
+};
+
+/// Parse the JSON request body for createQuerySource.
+pub fn parseCreateQuerySourceBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Drop saved query source
+pub const DropQuerySourcePathParams = struct {
+    source_name: []const u8,
+};
+
 /// Parse the JSON request body for executeSQL.
 pub fn parseExecuteSQLBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(types.SQLRequest) {
     return std.json.parseFromSlice(types.SQLRequest, allocator, body, .{ .ignore_unknown_fields = true });
@@ -1415,6 +1435,10 @@ pub const routes = [_]Route{
     .{ .method = "PUT", .path = "/secrets/{key}", .operation_id = "putSecret", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/secrets/{key}", .operation_id = "deleteSecret", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/settings", .operation_id = "administerSqlSettings", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/sources", .operation_id = "listQuerySources", .request_body = .none, .streaming_response = false },
+    .{ .method = "GET", .path = "/sources/{sourceName}", .operation_id = "getQuerySource", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/sources/{sourceName}", .operation_id = "createQuerySource", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "DELETE", .path = "/sources/{sourceName}", .operation_id = "dropQuerySource", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/sql", .operation_id = "executeSQL", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/sql/connections", .operation_id = "openSQLConnection", .request_body = .buffered, .streaming_response = false },
     .{ .method = "DELETE", .path = "/sql/connections/{connection_id}", .operation_id = "closeSQLConnection", .request_body = .none, .streaming_response = false },
@@ -1577,6 +1601,10 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "putSecret")) @compileError("ServerRouter: Impl missing required method 'putSecret'");
         if (!@hasDecl(Impl, "deleteSecret")) @compileError("ServerRouter: Impl missing required method 'deleteSecret'");
         if (!@hasDecl(Impl, "administerSqlSettings")) @compileError("ServerRouter: Impl missing required method 'administerSqlSettings'");
+        if (!@hasDecl(Impl, "listQuerySources")) @compileError("ServerRouter: Impl missing required method 'listQuerySources'");
+        if (!@hasDecl(Impl, "getQuerySource")) @compileError("ServerRouter: Impl missing required method 'getQuerySource'");
+        if (!@hasDecl(Impl, "createQuerySource")) @compileError("ServerRouter: Impl missing required method 'createQuerySource'");
+        if (!@hasDecl(Impl, "dropQuerySource")) @compileError("ServerRouter: Impl missing required method 'dropQuerySource'");
         if (!@hasDecl(Impl, "executeSQL")) @compileError("ServerRouter: Impl missing required method 'executeSQL'");
         if (!@hasDecl(Impl, "openSQLConnection")) @compileError("ServerRouter: Impl missing required method 'openSQLConnection'");
         if (!@hasDecl(Impl, "closeSQLConnection")) @compileError("ServerRouter: Impl missing required method 'closeSQLConnection'");
@@ -1737,6 +1765,10 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.put("/secrets/:key", httpx.Handler.bind(self.impl, putSecret));
             try server.delete("/secrets/:key", httpx.Handler.bind(self.impl, deleteSecret));
             try server.post("/settings", httpx.Handler.bind(self.impl, administerSqlSettings));
+            try server.get("/sources", httpx.Handler.bind(self.impl, listQuerySources));
+            try server.get("/sources/:sourceName", httpx.Handler.bind(self.impl, getQuerySource));
+            try server.post("/sources/:sourceName", httpx.Handler.bind(self.impl, createQuerySource));
+            try server.delete("/sources/:sourceName", httpx.Handler.bind(self.impl, dropQuerySource));
             try server.post("/sql", httpx.Handler.bind(self.impl, executeSQL));
             try server.post("/sql/connections", httpx.Handler.bind(self.impl, openSQLConnection));
             try server.delete("/sql/connections/:connection_id", httpx.Handler.bind(self.impl, closeSQLConnection));
@@ -2370,6 +2402,33 @@ pub fn ServerRouter(comptime Impl: type) type {
         /// POST /settings
         fn administerSqlSettings(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.administerSqlSettings(ctx);
+        }
+
+        /// List saved query sources
+        /// GET /sources
+        fn listQuerySources(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            return impl.listQuerySources(ctx);
+        }
+
+        /// Get saved query source
+        /// GET /sources/{sourceName}
+        fn getQuerySource(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const source_name = ctx.param("sourceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: sourceName" });
+            return impl.getQuerySource(ctx, source_name);
+        }
+
+        /// Create saved query source
+        /// POST /sources/{sourceName}
+        fn createQuerySource(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const source_name = ctx.param("sourceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: sourceName" });
+            return impl.createQuerySource(ctx, source_name);
+        }
+
+        /// Drop saved query source
+        /// DELETE /sources/{sourceName}
+        fn dropQuerySource(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const source_name = ctx.param("sourceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: sourceName" });
+            return impl.dropQuerySource(ctx, source_name);
         }
 
         /// Execute a SQL statement
@@ -3058,6 +3117,10 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn putSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn deleteSecret(self: *Impl, ctx: *httpx.Context, key: []const u8) !httpx.Response
 //   fn administerSqlSettings(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn listQuerySources(self: *Impl, ctx: *httpx.Context) !httpx.Response
+//   fn getQuerySource(self: *Impl, ctx: *httpx.Context, source_name: []const u8) !httpx.Response
+//   fn createQuerySource(self: *Impl, ctx: *httpx.Context, source_name: []const u8) !httpx.Response
+//   fn dropQuerySource(self: *Impl, ctx: *httpx.Context, source_name: []const u8) !httpx.Response
 //   fn executeSQL(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn openSQLConnection(self: *Impl, ctx: *httpx.Context) !httpx.Response
 //   fn closeSQLConnection(self: *Impl, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response

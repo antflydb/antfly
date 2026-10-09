@@ -30,7 +30,7 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
     return executeWithDelivery(a, server, table, req, request, null);
 }
 pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, delivery: ?local.api_query_response.Delivery) !?local.api_query.QueryResponse {
-    return executePinned(a, server, table, req, request, delivery) catch |err| switch (err) {
+    return executePinned(a, server, table, req, request, delivery, false) catch |err| switch (err) {
         error.ExternalLakeIndexNotPublished, error.ExternalLakeIndexUnavailable => error.IndexRebuilding,
         error.ExternalLakeIndexDefinitionChanged, error.ExternalLakeIndexStoreChanged, error.ExternalLakeIndexCredentialsChanged, error.ExternalLakeIndexSourceChanged, error.ExternalLakeSnapshotMismatch => error.CatalogGenerationChanged,
         error.LakeIndexReaderLeaseExpired, error.NativeLakeTextCacheBusy, error.NativeLakeRuntimeCacheBusy, error.LakeSnapshotReadLeaseExpired, error.LakeSnapshotRetired, error.LakeOverlayCoverageUnavailable => error.StorageReadTemporarilyUnavailable,
@@ -39,7 +39,30 @@ pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local
         else => err,
     };
 }
-fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, delivery: ?local.api_query_response.Delivery) !?local.api_query.QueryResponse {
+pub fn reconcileRecent(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, request: local.api_operation.RequestContext) !void {
+    if (try executePinned(a, server, table, .{}, request, null, true)) |value| {
+        var response = value;
+        response.deinit(a);
+    }
+}
+fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, delivery: ?local.api_query_response.Delivery, build_recent: bool) !?local.api_query.QueryResponse {
+    const retained_api = @import("lake_retained_cut.zig");
+    // The cut lifetime begins at admission, so a slow query cannot extend a
+    // recent segment or lake pin beyond the retention checked when binding it.
+    const cut_expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms +| retained_api.ttl_ms;
+    var retained_arena = std.heap.ArenaAllocator.init(a);
+    defer retained_arena.deinit();
+    const ra = retained_arena.allocator();
+    var table = current_table;
+    var retained: ?retained_api.Descriptor = null;
+    const retained_cancellation: @import("antfly_cancellation").CancellationToken = .{ .ptr = request.cancellation.ptr, .is_cancelled_fn = request.cancellation.is_cancelled_fn };
+    if (req.remote_snapshot) |token| if (std.mem.startsWith(u8, token, retained_api.prefix)) {
+        var cut_store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+        defer cut_store.deinit();
+        var artifacts = cut_store.artifactStore();
+        retained = try retained_api.load(ra, &artifacts, cut_store.identity, token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, retained_cancellation);
+        table.lake_index_catalog_json = try local.metadata_lake_index_catalog.encode(ra, .{ .namespace = retained.?.publication.namespace, .generation = retained.?.publication.generation, .published = retained.?.publication });
+    };
     var schema = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return null;
     defer schema.deinit(a);
     // Graph and search aggregation execution require their own native ports;
@@ -52,16 +75,18 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     var state = try local.metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
     defer state.deinit();
     const publication = state.value.published orelse return error.ExternalLakeIndexNotPublished;
-    const lease = try server.lake_reader_leases.acquire(server.embedding_provider_runtime.io, authority, table.table_id, publication.generation, context);
+    const lease = try server.lake_reader_leases.acquireRetained(server.embedding_provider_runtime.io, authority, table.table_id, publication.generation, context, if (retained) |cut| cut.reader_token else null);
     defer lease.deinit();
     context = lease.readContext();
     try server.prepareLakeCache();
-    const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
+    const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .retained_catalog_metadata = if (retained) |cut| cut.catalog_metadata else null, .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
     var overlay_arena = std.heap.ArenaAllocator.init(a);
     defer overlay_arena.deinit();
     const oa = overlay_arena.allocator();
     var overlay: ?overlay_api.Overlay = null;
     var source_schema = schema;
+    var retained_metadata: ?local.serverless_external_source_mod.lake_catalog.types.Table = if (retained) |cut| cut.catalog_metadata else null;
+    var retained_pending: @import("../serverless/lake_ingestion.zig").Pending = .{ .lsn = 0, .key_fields = &.{}, .changes = &.{} };
     const published_only = if (req.lake_read) |read| read.visibility == .published else false;
     if (req.lake_read) |read| {
         if (schema.binding.write_policy != .iceberg_writer) return error.UnsupportedQueryRequest;
@@ -70,22 +95,29 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
             if (server.cfg.node_config == null or server.cfg.node_config.?.storage.artifacts.connection == null) return error.UnsupportedQueryRequest;
         }
     }
-    if (published_only) {
+    if (retained) |cut| {
+        if (cut.published_only != published_only) return error.CatalogGenerationChanged;
+        retained_pending = cut.pending;
+        if (cut.pending.changes.len != 0) overlay = try overlay_api.Overlay.init(oa, cut.pending);
+    }
+    if (published_only or retained != null) {
         const base_id = publication.base_source.external_iceberg.snapshot_id;
         source_schema.binding.write_policy = .read_only;
         source_schema.binding.snapshot_mode = if (std.mem.startsWith(u8, base_id, "empty:")) .current else .{ .snapshot_id = base_id };
     }
-    if (schema.binding.write_policy == .iceberg_writer and server.cfg.node_config != null and server.cfg.node_config.?.storage.artifacts.connection != null) {
+    if (retained == null and schema.binding.write_policy == .iceberg_writer and server.cfg.node_config != null and server.cfg.node_config.?.storage.artifacts.connection != null) {
         const catalog = local.serverless_external_source_mod.lake_catalog;
         var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, schema.binding, options, context, .load);
         defer current.deinit(a);
         const root = try catalog.metadata.parse(oa, current.table.metadata_json);
+        retained_metadata = try std.json.parseFromSliceLeaky(catalog.types.Table, oa, try std.json.Stringify.valueAlloc(oa, current.table, .{}), .{ .allocate = .alloc_always });
         const base_id = publication.base_source.external_iceberg.snapshot_id;
         const cut = try overlay_api.snapshotCoverage(root, base_id);
         if (published_only) {
             if (req.lake_read.?.through) |receipt| if (cut < receipt.wal_lsn) return error.IndexRebuilding;
         }
         const pending = if (!published_only) try @import("../serverless/lake_ingestion.zig").pending(oa, schema.binding, options, context, cut) else @import("../serverless/lake_ingestion.zig").Pending{ .lsn = cut, .key_fields = &.{}, .changes = &.{} };
+        retained_pending = pending;
         if (req.lake_read) |read| if (read.through) |receipt| if (pending.lsn < receipt.wal_lsn) return error.IndexRebuilding;
         if (pending.changes.len != 0) {
             try overlay_api.requireNativeAncestry(root, base_id);
@@ -96,11 +128,12 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
             source_schema.binding.snapshot_mode = if (std.mem.startsWith(u8, base_id, "empty:")) .current else .{ .snapshot_id = base_id };
         }
     }
+    if (retained != null) if (req.lake_read) |read| if (read.through) |receipt| if (retained_pending.lsn < receipt.wal_lsn) return error.IndexRebuilding;
     var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = source_schema }, options.lakeOptions(), context, &server.lake_read_cache);
     defer source.deinit();
     try source.attachCache(&server.lake_read_cache, schema.binding, context);
     context = source.protectContext(context);
-    var store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
+    var store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, req.remote_snapshot != null, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
     defer store.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -127,7 +160,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     snapshot_hash.final(&snapshot_digest);
     const snapshot_token = std.fmt.bytesToHex(snapshot_digest, .lower);
     if (req.remote_snapshot) |expected| {
-        if (!std.mem.eql(u8, expected, &snapshot_token)) return error.CatalogGenerationChanged;
+        if (retained == null and !std.mem.eql(u8, expected, &snapshot_token)) return error.CatalogGenerationChanged;
     } else if (req.search_after.len != 0 or req.search_before.len != 0) return error.CatalogGenerationChanged;
     var owner: Execution = .{ .server = server, .table = sql_table, .source = &source, .store = &store, .domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.table_id, store.identity, selected.publication().namespace), .declarations = selected.publication().declarations, .context = context, .request = normalized, .schema_json = table.schema_json, .arena = ca, .result_allocator = a, .overlay = if (overlay != null) &overlay.? else null };
     defer owner.deinit();
@@ -139,16 +172,31 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     owner.private_digests = metadata.private_digests;
     var effective = req;
     effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled };
-    const has_vectors = effective.dense != null or effective.sparse != null or effective.dense_queries.len != 0 or effective.sparse_queries.len != 0;
+    const has_vectors = build_recent or effective.dense != null or effective.sparse != null or effective.dense_queries.len != 0 or effective.sparse_queries.len != 0;
     const has_text = for (owner.declarations) |declaration| {
         if (declaration.artifact.kind == .text_segment) break true;
     } else false;
-    if (has_vectors and owner.overlay != null) {
-        server.notifyLakeCommit(table.name) catch {};
-        return error.IndexRebuilding;
-    }
+    if (has_vectors) if (owner.overlay) |pending_overlay| {
+        owner.recent_declarations = if (retained) |cut| cut.recent else @import("lake_recent_vectors.zig").prepare(ca, current_table, selected.publication(), pending_overlay, owner.declarations, &store, context, .{ .antfly_provider = server.antfly_provider, .io = server.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = normalized.deadline_ns, .cancellation = retained_cancellation, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content, .inference_api_url = server.configuredInferenceAPIURL(), .inference_api_key = server.cfg.inference_api_key, .provider_runtime = &server.embedding_provider_runtime, .source_table = table.name }, build_recent) catch |err| {
+            server.notifyLakeCommit(table.name) catch {};
+            return err;
+        };
+        // All declared vector recipes publish as one coherent recent cut.
+        var expected: usize = 0;
+        for (owner.declarations) |declaration| if (declaration.artifact.kind == .vector_segment or declaration.artifact.kind == .sparse_segment) {
+            expected += 1;
+        };
+        if (owner.recent_declarations.len != expected) return error.IndexRebuilding;
+    };
+    if (build_recent) return null;
     if (has_vectors) {
         const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = server, .table = sql_table, .source = &source, .context = normalized, .store = store.artifactStore(), .store_identity = store.identity, .read_context = context, .pinned = .{ .artifacts = store.artifactStore(), .store_identity = store.identity, .domain = owner.domain, .declarations = owner.declarations, .read_context = context } };
+        owner.vector_filter = if (effective.filter_query_json.len != 0) try std.json.parseFromSliceLeaky(std.json.Value, ca, effective.filter_query_json, .{}) else null;
+        owner.vector_exclusion = if (effective.exclusion_query_json.len != 0) try std.json.parseFromSliceLeaky(std.json.Value, ca, effective.exclusion_query_json, .{}) else null;
+        if (owner.overlay) |pending_overlay| {
+            const replaced = (try resolver.resolve(ca, pending_overlay.key_filter)) orelse return error.UnsupportedQueryRequest;
+            pending_overlay.physical = replaced.bitmap;
+        }
         if (effective.filter_query_json.len != 0) {
             const resolved = (try resolver.resolve(ca, effective.filter_query_json)) orelse return error.UnsupportedQueryRequest;
             owner.vector_include = resolved.bitmap;
@@ -171,7 +219,14 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     defer result.deinit();
     if (!owner.typed_delivery) try owner.attachHighlights(a, effective, &result);
     try context.ensureActive();
-    var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = &snapshot_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms) };
+    // Retain only immutable serving metadata and recent row images. The archive
+    // files/indexes remain shared, protected by their durable reader protocols.
+    const serving_token: []const u8 = if (retained != null) req.remote_snapshot.? else if (req.remote_snapshot != null) &snapshot_token else cut: {
+        var artifacts = store.artifactStore();
+        if (cut_expires_ms <= @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) return error.DeadlineExceeded;
+        break :cut try retained_api.save(ra, &artifacts, store.identity, server.embedding_provider_runtime.io, .{ .expires_ms = cut_expires_ms, .table_id = table.table_id, .object_generation = table.object_storage_generation, .desired = local.metadata_lake_index_catalog.desiredFingerprint(current_table), .publication = publication, .reader_token = lease.retainedToken(), .pending = retained_pending, .catalog_metadata = retained_metadata, .published_only = published_only, .recent = owner.recent_declarations }, retained_cancellation);
+    };
+    var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = serving_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms) };
     defer meta.deinit(a);
     try @import("query_post_processing.zig").applyQueryPostProcessing(a, effective, &result, &meta, .{ .source_table = table.name, .backend_runtime = server.cfg.backend_runtime, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content });
     var prepared_delivery = delivery;
@@ -199,6 +254,12 @@ const Execution = struct {
     request: local.api_operation.RequestContext,
     schema_json: []const u8,
     hydration_fields: ?[]const []const u8 = null,
+    vector_filter: ?std.json.Value = null,
+    vector_exclusion: ?std.json.Value = null,
+    active_recent: bool = false,
+    recent_declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact = &.{},
+    recent_dense_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.DenseIndex) = .empty,
+    recent_sparse_entries: std.StringHashMapUnmanaged(*local.storage_db_catalog_index_manager.IndexManager.SparseIndex) = .empty,
     vector_include: ?@import("lake_index_physical_set.zig").Set = null,
     vector_exclude: ?@import("lake_index_physical_set.zig").Set = null,
     typed_delivery: bool = false,
@@ -218,7 +279,7 @@ const Execution = struct {
     runtimes: std.ArrayList(*@import("lake_index_native_runtime_cache.zig").Entry) = .empty,
     fn vectorRequest(self: *Execution, req: types.SearchRequest) types.SearchRequest {
         var result = req;
-        if (self.vector_include != null or self.vector_exclude != null) {
+        if (self.overlay != null or self.vector_include != null or self.vector_exclude != null) {
             result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey };
             result.filter_query_json = "";
             result.exclusion_query_json = "";
@@ -227,8 +288,19 @@ const Execution = struct {
     }
     fn allowsVectorKey(raw: *anyopaque, key: []const u8) !bool {
         const self: *Execution = @ptrCast(@alignCast(raw));
+        try self.context.ensureActive();
+        if (self.overlay) |pending_overlay| if (pending_overlay.row(key)) |row| {
+            if (self.vector_filter) |query| {
+                if (!try local.storage_db_query_graph_exec.jsonDocMatchesPatternFilter(self.arena, key, row, query)) return false;
+            }
+            if (self.vector_exclusion) |query| {
+                if (try local.storage_db_query_graph_exec.jsonDocMatchesPatternFilter(self.arena, key, row, query)) return false;
+            }
+            return true;
+        };
         const coordinate = try @import("lake_index_native_state.zig").coordinates(key);
         const file = self.private_files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
+        if (self.overlay) |pending_overlay| if (pending_overlay.physical) |*mask| if (mask.contains(file, coordinate.group, coordinate.row)) return false;
         if (self.vector_include) |*include| if (!include.contains(file, coordinate.group, coordinate.row)) return false;
         if (self.vector_exclude) |*exclude| if (exclude.contains(file, coordinate.group, coordinate.row)) return false;
         return true;
@@ -538,19 +610,21 @@ const Execution = struct {
         const self = from(raw);
         try self.context.ensureActive();
         const native = @import("lake_index_native_dense.zig");
+        const declarations = if (self.active_recent) self.recent_declarations else self.declarations;
+        const entries = if (self.active_recent) &self.recent_dense_entries else &self.dense_entries;
         var count: usize = 0;
-        for (self.declarations) |declaration| if (declaration.artifact.kind == .vector_segment and declaration.artifact.metadata_version == native.metadata_version) {
+        for (declarations) |declaration| if (declaration.artifact.kind == .vector_segment and declaration.artifact.metadata_version == native.metadata_version) {
             count += 1;
         };
-        const selected = for (self.declarations) |declaration| {
+        const selected = for (declarations) |declaration| {
             if (declaration.artifact.kind == .vector_segment and declaration.artifact.metadata_version == native.metadata_version and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1)) break declaration;
         } else return error.IndexNotFound;
-        if (self.dense_entries.get(selected.name)) |entry| return entry;
+        if (entries.get(selected.name)) |entry| return entry;
         try self.runtimes.ensureUnusedCapacity(self.arena, 1);
-        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, self.domain, self.store.identity, self.context);
+        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context);
         errdefer runtime.release();
         const entry = runtime.dense_entry.?;
-        try self.dense_entries.put(self.arena, selected.name, entry);
+        try entries.put(self.arena, selected.name, entry);
         self.runtimes.appendAssumeCapacity(runtime);
         return entry;
     }
@@ -576,26 +650,43 @@ const Execution = struct {
     fn denseSearchProfiled(_: ?*anyopaque, entry: *local.storage_db_catalog_index_manager.IndexManager.DenseIndex, req: local.storage_hbc_adapter.SearchRequest) !local.storage_hbc_adapter.ProfiledSearchResults {
         return entry.index.searchProfiledRequest(req);
     }
-    fn searchDense(raw: ?*anyopaque, a: A, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
+    fn searchDense(raw: ?*anyopaque, a: A, req: types.SearchRequest, query: types.DenseKnnQuery) !types.SearchResult {
+        const self = from(raw);
+        if (self.recent_declarations.len == 0) return searchDensePart(raw, a, req, query);
+        var leaf = req;
+        leaf.offset = 0;
+        leaf.limit = std.math.add(u32, req.offset, req.limit) catch return error.QueryCandidateBudgetExceeded;
+        self.active_recent = false;
+        var base = try searchDensePart(raw, a, leaf, query);
+        defer base.deinit();
+        self.active_recent = true;
+        defer self.active_recent = false;
+        var recent = try searchDensePart(raw, a, leaf, query);
+        defer recent.deinit();
+        return local.api_query.mergeSearchResults(a, req, &.{ base, recent }, req.offset, req.limit);
+    }
+    fn searchDensePart(raw: ?*anyopaque, a: A, req: types.SearchRequest, dense: types.DenseKnnQuery) !types.SearchResult {
         return search.searchDense(a, from(raw).vectorRequest(req), dense, .{ .ctx = raw, .exact_doc_id_filters = true, .filter_candidate_presence = true, .text_index_entry = noLocal, .dense_index = denseIndex, .lookup_doc_key = lookupDocKey, .resolve_hit_key = densePublicKey, .lookup_vector_id = lookupVectorId, .load_projected_document = requireProjected, .load_projected_documents = loadProjected, .hbc_search = denseSearch, .hbc_search_profiled = denseSearchProfiled, .postprocess = postprocessVector });
     }
     fn sparseIndex(raw: ?*anyopaque, name: ?[]const u8) !?*local.storage_db_catalog_index_manager.IndexManager.SparseIndex {
         const self = from(raw);
         try self.context.ensureActive();
         const native = @import("lake_index_native_sparse.zig");
+        const declarations = if (self.active_recent) self.recent_declarations else self.declarations;
+        const entries = if (self.active_recent) &self.recent_sparse_entries else &self.sparse_entries;
         var count: usize = 0;
-        for (self.declarations) |declaration| if (declaration.artifact.kind == .sparse_segment and declaration.artifact.metadata_version == native.metadata_version) {
+        for (declarations) |declaration| if (declaration.artifact.kind == .sparse_segment and declaration.artifact.metadata_version == native.metadata_version) {
             count += 1;
         };
-        const selected = for (self.declarations) |declaration| {
+        const selected = for (declarations) |declaration| {
             if (declaration.artifact.kind == .sparse_segment and declaration.artifact.metadata_version == native.metadata_version and (if (name) |explicit| std.mem.eql(u8, explicit, declaration.name) else count == 1)) break declaration;
         } else return error.IndexNotFound;
-        if (self.sparse_entries.get(selected.name)) |entry| return entry;
+        if (entries.get(selected.name)) |entry| return entry;
         try self.runtimes.ensureUnusedCapacity(self.arena, 1);
-        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, self.domain, self.store.identity, self.context);
+        const runtime = try self.server.lake_native_runtimes.acquire(self.server, selected, try @import("lake_recent_vectors.zig").runtimeDomain(selected), self.store.identity, self.context);
         errdefer runtime.release();
         const entry = runtime.sparse_entry.?;
-        try self.sparse_entries.put(self.arena, selected.name, entry);
+        try entries.put(self.arena, selected.name, entry);
         self.runtimes.appendAssumeCapacity(runtime);
         return entry;
     }
@@ -605,7 +696,22 @@ const Execution = struct {
     fn postprocessVector(raw: ?*anyopaque, a: A, req: types.SearchRequest, result: types.SearchResult, _: bool) !types.SearchResult {
         return shape.postprocessVectorSearchResult(a, req, result, false, .{ .ctx = raw, .is_visible = visible, .resolve_parent_id = parent, .load_parent_stored = parentStored, .load_stored = loadOne, .load_many_stored = loadMany, .load_projected_stored = loadProjectedOne, .load_many_projected_stored = loadProjected });
     }
-    fn searchSparse(raw: ?*anyopaque, a: A, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
+    fn searchSparse(raw: ?*anyopaque, a: A, req: types.SearchRequest, query: types.SparseKnnQuery) !types.SearchResult {
+        const self = from(raw);
+        if (self.recent_declarations.len == 0) return searchSparsePart(raw, a, req, query);
+        var leaf = req;
+        leaf.offset = 0;
+        leaf.limit = std.math.add(u32, req.offset, req.limit) catch return error.QueryCandidateBudgetExceeded;
+        self.active_recent = false;
+        var base = try searchSparsePart(raw, a, leaf, query);
+        defer base.deinit();
+        self.active_recent = true;
+        defer self.active_recent = false;
+        var recent = try searchSparsePart(raw, a, leaf, query);
+        defer recent.deinit();
+        return local.api_query.mergeSearchResults(a, req, &.{ base, recent }, req.offset, req.limit);
+    }
+    fn searchSparsePart(raw: ?*anyopaque, a: A, req: types.SearchRequest, sparse: types.SparseKnnQuery) !types.SearchResult {
         return search.searchSparse(a, from(raw).vectorRequest(req), sparse, .{ .ctx = raw, .exact_doc_id_filters = true, .project_key = publicKey, .native_key = nativeKey, .filter_candidate_presence = true, .text_index_entry = noLocal, .sparse_index = sparseIndex, .load_projected_document = requireProjected, .load_projected_documents = loadProjected, .postprocess = postprocessVector });
     }
     fn cloneSet(_: ?*anyopaque, a: A, set: local.storage_db_query_graph_exec.NamedResultSet, stored: bool) !types.SearchResult {

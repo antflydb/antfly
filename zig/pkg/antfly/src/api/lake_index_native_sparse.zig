@@ -66,6 +66,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         binding.index_config_hash = try std.fmt.allocPrint(ca, "native-sparse-checkpoint-v2:{s}", .{binding.index_config_hash});
         const public_config = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{});
         const recipe = state.recipe(table, public_config);
+        var producer = try @import("lake_vector_enrichment.zig").Producer.init(a, wanted.name, wanted.build_spec.?.sparse.sparse_column, configs.object.get(wanted.name).?, provider.embedding_options);
+        defer producer.deinit();
+        producer.memo = provider.vector_memo;
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .sparse_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, wanted.name) and rebuild.bindingsEqual(binding, declaration.binding)) break declaration;
         } else null;
@@ -129,10 +132,8 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 try cancellation.check();
                 try provider.context.ensureActive();
                 const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{ordinal} };
-                var value = (try page.cell(pa, 0, wanted.build_spec.?.sparse.sparse_column)).value;
-                if (value == .null) continue;
-                if (value == .string) value = try std.json.parseFromSliceLeaky(std.json.Value, pa, value.string, .{});
-                const vector = try local.storage_db_document_mapper.parseSparseValue(pa, value);
+                const value = (try page.cell(pa, 0, wanted.build_spec.?.sparse.sparse_column)).value;
+                const vector = (try producer.sparse(pa, value)) orelse continue;
                 try stores.chargeReadBudget(&input, @as(u64, @intCast(vector.indices.len)) * 8 + 128);
                 const key = try plan.privateKey(pa, ref);
                 try tracker.append(ref, key);

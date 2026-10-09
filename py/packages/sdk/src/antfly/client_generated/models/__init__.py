@@ -167,6 +167,7 @@ from .create_full_text_index_request_type import CreateFullTextIndexRequestType
 from .create_graph_index_request import CreateGraphIndexRequest
 from .create_graph_index_request_type import CreateGraphIndexRequestType
 from .create_index_common import CreateIndexCommon
+from .create_query_source_body import CreateQuerySourceBody
 from .create_relational_index_request import CreateRelationalIndexRequest
 from .create_relational_index_request_type import CreateRelationalIndexRequestType
 from .create_table_request import CreateTableRequest
@@ -1244,6 +1245,7 @@ from .row_filter_entry_filter import RowFilterEntryFilter
 from .runtime_config_status import RuntimeConfigStatus
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
+from .saved_query_source import SavedQuerySource
 from .scan_keys_request import ScanKeysRequest
 from .scoped_row_filter import ScopedRowFilter
 from .scoped_row_filter_filter import ScopedRowFilterFilter
@@ -1644,6 +1646,7 @@ __all__ = (
     "CreateGraphIndexRequest",
     "CreateGraphIndexRequestType",
     "CreateIndexCommon",
+    "CreateQuerySourceBody",
     "CreateRelationalIndexRequest",
     "CreateRelationalIndexRequestType",
     "CreateTableRequest",
@@ -2688,6 +2691,7 @@ __all__ = (
     "RuntimeConfigStatus",
     "RuntimeDecl",
     "RuntimeDeclMode",
+    "SavedQuerySource",
     "ScanKeysRequest",
     "ScopedRowFilter",
     "ScopedRowFilterFilter",

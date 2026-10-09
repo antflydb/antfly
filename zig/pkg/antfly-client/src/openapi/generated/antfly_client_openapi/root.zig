@@ -800,6 +800,7 @@ pub const SSEStepProgress = types.SSEStepProgress;
 pub const SSEStepStarted = types.SSEStepStarted;
 pub const SSEToolMode = types.SSEToolMode;
 pub const STTProvider = types.STTProvider;
+pub const SavedQuerySource = types.SavedQuerySource;
 pub const ScanKeysRequest = types.ScanKeysRequest;
 pub const ScopedRowFilter = types.ScopedRowFilter;
 pub const SecretEntry = types.SecretEntry;

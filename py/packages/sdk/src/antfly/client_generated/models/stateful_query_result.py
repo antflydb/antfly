@@ -30,10 +30,12 @@ class StatefulQueryResult:
         took (int): Duration of the query in milliseconds.
         status (int): HTTP status code of the query operation.
         source_ranking (QueryResultBaseSourceRanking | Unset): Ranking contract for a composed result.
-        next_source_cursor (str | Unset): Opaque continuation for composed queries. Pass as source_cursor; expires if
-            the observed result or source identity changes.
-        remote_snapshot (str | Unset): Opaque remote publication and schema fence to echo with ordered pagination. This
-            token does not grant access or retain the publication.
+        next_source_cursor (str | Unset): Opaque continuation for composed queries. Pass as source_cursor with the same
+            query; valid until the earliest retained leaf cut expires (at most 60 seconds). Publication and restart preserve
+            it; authorization and incarnation fences remain enforced.
+        remote_snapshot (str | Unset): Opaque remote snapshot to echo with ordered pagination. Lake tokens retain the
+            archive publication, metadata and accepted WAL cut for 60 seconds; other remote engines may provide an
+            invalidation-only fence. Every use rechecks access and incarnation.
         evaluation (QueryResultBaseEvaluation | Unset): Function evaluation scope, population, usage, and scoped
             aggregations.
         hits (QueryHits | Unset): A list of query hits.

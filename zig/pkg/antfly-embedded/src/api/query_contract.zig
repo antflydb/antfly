@@ -2233,7 +2233,9 @@ fn applyCommonSearchRequestOptions(
     if (request.offset) |offset| req.offset = @intCast(offset);
     if (request.count) |count| req.count_only = count;
     if (request.remote_snapshot) |snapshot| {
-        if (snapshot.len != 64) return error.InvalidQueryRequest;
+        const retained_lake = std.mem.startsWith(u8, snapshot, "lake2:") and snapshot.len > 64 and snapshot.len <= 512;
+        if (snapshot.len != 64 and !retained_lake) return error.InvalidQueryRequest;
+        if (retained_lake) for (snapshot) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidQueryRequest;
         req.remote_snapshot = try alloc.dupe(u8, snapshot);
     }
     const has_result_page_options =
@@ -19011,4 +19013,20 @@ test "external lake streamed column delivery validates limits before headers and
     defer consumed.deinit(a);
     try std.testing.expectEqualStrings(expected.json, capture.bytes.items);
     for (hits) |hit| try std.testing.expect(hit.column_source == null);
+}
+
+test "external lake query parser accepts bounded retained capabilities and rejects malformed envelopes" {
+    const a = std.testing.allocator;
+    const retained_key: [175]u8 = @splat('a');
+    const token = "lake2:" ++ retained_key ++ ":42";
+    const body = try std.json.Stringify.valueAlloc(a, .{ .remote_snapshot = token }, .{});
+    defer a.free(body);
+    var parsed = try parseQueryRequest(a, null, "history", body);
+    defer parsed.deinit(a);
+    try std.testing.expectEqualStrings(token, parsed.req.remote_snapshot.?);
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "history", "{\"remote_snapshot\":\"lake2:short\"}"));
+    const oversized_key: [513]u8 = @splat('a');
+    const oversized = try std.json.Stringify.valueAlloc(a, .{ .remote_snapshot = "lake2:" ++ oversized_key }, .{});
+    defer a.free(oversized);
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "history", oversized));
 }

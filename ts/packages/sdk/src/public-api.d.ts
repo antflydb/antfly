@@ -2498,6 +2498,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List saved query sources */
+        get: operations["listQuerySources"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sources/{sourceName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sourceName: string;
+            };
+            cookie?: never;
+        };
+        /** Get saved query source */
+        get: operations["getQuerySource"];
+        put?: never;
+        /**
+         * Create saved query source
+         * @description Creates an immutable union or keyed overlay in the Antfly metadata catalog. Reads require permission on the saved name and every input table. Drop and recreate to change a definition; existing cursors cannot switch incarnations.
+         */
+        post: operations["createQuerySource"];
+        /** Drop saved query source */
+        delete: operations["dropQuerySource"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tablespaces": {
         parameters: {
             query?: never;
@@ -10962,8 +11003,16 @@ export interface components {
              */
             tombstone_field?: string;
         };
-        /** @description Specify exactly one of union or overlay. Union preserves duplicates and table provenance; overlay suppresses base keys using unfiltered change lookups before global ordering. Disjoint RRF unions support the first 4096 global positions over exact leaf totals. Overlays and field ordering require complete matching sets of at most 4096 per input; larger sets fail without truncation. */
+        SavedQuerySource: {
+            /** Format: uint64 */
+            source_id: number;
+            name: string;
+            source: components["schemas"]["ComposedQuerySource"];
+        };
+        /** @description Specify exactly one of saved, union or overlay. Union preserves duplicates and table provenance. Overlay suppresses replaced base keys and tombstones before ranking using indexed unfiltered change lookups. Inputs are streamed in bounded pages; result pages allow at most 4096 hits. Large overlay totals are lower bounds unless count is explicitly requested; exact count streams the full visible relation within the request deadline. */
         ComposedQuerySource: {
+            /** @description Immutable source name from the Antfly catalog. Saved definitions contain literal table leaves, preventing recursive expansion. */
+            saved?: string;
             union?: components["schemas"]["ComposedTableSource"][];
             overlay?: components["schemas"]["ComposedSourceOverlay"];
         };
@@ -10977,7 +11026,7 @@ export interface components {
              * @enum {string}
              */
             source_ranking?: "rrf";
-            /** @description Opaque composed result continuation. Expires when source identity or the observed ordered matching result changes. Leaf search_after/search_before tuples are unsupported. */
+            /** @description Opaque composed continuation retaining per-leaf archive publications and accepted WAL cuts for up to 60 seconds from their creation. Publication and restart preserve the cut. Authorization, policy, recipe, source and table incarnation changes invalidate it. Leaf search_after/search_before tuples are unsupported. */
             source_cursor?: string;
         };
         Analyses: {
@@ -11704,9 +11753,9 @@ export interface components {
              * @enum {string}
              */
             source_ranking?: "rrf" | "ordered";
-            /** @description Opaque continuation for composed queries. Pass as source_cursor; expires if the observed result or source identity changes. */
+            /** @description Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (at most 60 seconds). Publication and restart preserve it; authorization and incarnation fences remain enforced. */
             next_source_cursor?: string;
-            /** @description Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication. */
+            /** @description Opaque remote snapshot to echo with ordered pagination. Lake tokens retain the archive publication, metadata and accepted WAL cut for 60 seconds; other remote engines may provide an invalidation-only fence. Every use rechecks access and incarnation. */
             remote_snapshot?: string;
             /** @description Function evaluation scope, population, usage, and scoped aggregations. */
             evaluation?: {
@@ -21467,8 +21516,8 @@ export interface operations {
             content: {
                 "application/json": {
                     /** @enum {string} */
-                    action: "compact" | "vacuum" | "wal_gc" | "status";
-                    /** @description Required for compact/vacuum/wal_gc; omitted for scheduler status. */
+                    action: "compact" | "vacuum" | "wal_gc" | "status" | "enrichment_status";
+                    /** @description Required for compact/vacuum/wal_gc; omitted for scheduler or enrichment status. */
                     operation_id?: string;
                     /** @default true */
                     dry_run?: boolean;
@@ -25649,6 +25698,113 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["IndexMutationConflict"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    listQuerySources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Immutable catalog source definitions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SavedQuerySource"][];
+                };
+            };
+        };
+    };
+    getQuerySource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sourceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Source definition and immutable incarnation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SavedQuerySource"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createQuerySource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sourceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    source: components["schemas"]["ComposedQuerySource"];
+                };
+            };
+        };
+        responses: {
+            /** @description Source created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SavedQuerySource"];
+                };
+            };
+            /** @description Committed with visibility pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Source already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dropQuerySource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sourceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Source dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
         };
     };
     listTablespaces: {

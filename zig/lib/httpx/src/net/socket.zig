@@ -165,6 +165,13 @@ pub const Socket = struct {
 
     /// Connects to the given address and returns a connected TCP socket.
     pub fn connect(addr: Address, io: Io) !Self {
+        // A cancelled POSIX connect may complete before EINTR is observed.
+        // Threaded retries connect and treats the legitimate ISCONN completion
+        // as a programmer panic. Poll a nonblocking native connect instead;
+        // custom/virtual backends keep their own network and cancellation ABI.
+        if (comptime !is_windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
+            if (isThreadedNetworkIo(io) and io.vtable.netConnectIp == Io.Threaded.global_single_threaded.io().vtable.netConnectIp) return connectPosix(addr, io);
+        }
         const stream = try addr.connect(io, .{ .mode = .stream });
         return .{
             .handle = stream.socket.handle,
@@ -1327,6 +1334,112 @@ fn addressFromPosix(storage: *const PosixAddress) Address {
         } },
         else => unreachable,
     };
+}
+
+fn connectResult(err: posix.E) !void {
+    return switch (err) {
+        .SUCCESS, .ISCONN => {},
+        .ADDRNOTAVAIL => error.AddressUnavailable,
+        .AFNOSUPPORT => error.AddressFamilyUnsupported,
+        .CONNREFUSED => error.ConnectionRefused,
+        .CONNRESET, .CONNABORTED => error.ConnectionResetByPeer,
+        .HOSTUNREACH => error.HostUnreachable,
+        .NETUNREACH => error.NetworkUnreachable,
+        .TIMEDOUT => error.Timeout,
+        .ACCES, .PERM => error.AccessDenied,
+        .NETDOWN => error.NetworkDown,
+        .AGAIN => error.WouldBlock,
+        else => posix.unexpectedErrno(err),
+    };
+}
+fn socketFlags(fd: posix.socket_t, command: c_int, argument: usize, io: Io) !usize {
+    while (true) {
+        try io.checkCancel();
+        const rc = posix.system.fcntl(fd, command, argument);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+fn connectPosix(addr: Address, io: Io) !Socket {
+    try io.checkCancel();
+    const family: posix.sa_family_t = switch (addr) {
+        .ip4 => posix.AF.INET,
+        .ip6 => posix.AF.INET6,
+    };
+    const flags = posix.SOCK.STREAM | if (Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC;
+    const fd: posix.socket_t = while (true) {
+        try io.checkCancel();
+        const rc = posix.system.socket(family, flags, @backingInt(net.Protocol.tcp));
+        switch (posix.errno(rc)) {
+            .SUCCESS => break @intCast(rc),
+            .INTR => continue,
+            .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    var owned: net.Socket = .{ .handle = fd, .address = addr };
+    errdefer owned.close(io);
+    if (Io.Threaded.socket_flags_unsupported) _ = try socketFlags(fd, posix.F.SETFD, posix.FD_CLOEXEC, io);
+    const original = try socketFlags(fd, posix.F.GETFL, 0, io);
+    const nonblocking: u32 = @bitCast(posix.O{ .NONBLOCK = true });
+    _ = try socketFlags(fd, posix.F.SETFL, original | nonblocking, io);
+    var storage: PosixAddress = undefined;
+    const len = addressToPosix(addr, &storage);
+    var connected = false;
+    while (true) {
+        try io.checkCancel();
+        const err = posix.errno(posix.system.connect(fd, &storage.any, len));
+        switch (err) {
+            .SUCCESS, .ISCONN => {
+                connected = true;
+                break;
+            },
+            .INTR => continue,
+            .INPROGRESS, .ALREADY => break,
+            else => {
+                try connectResult(err);
+                break;
+            },
+        }
+    }
+    while (!connected) {
+        try io.checkCancel();
+        var descriptors = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+        if (try posix.poll(&descriptors, 0) == 0) {
+            // Yield through Io so pending connects do not occupy every worker
+            // needed by request deadline/cancellation watchdogs.
+            try io.sleep(.fromMilliseconds(10), .awake);
+            continue;
+        }
+        try io.checkCancel();
+        var completion: c_int = 0;
+        var completion_len: posix.socklen_t = @sizeOf(c_int);
+        while (true) {
+            const err = posix.errno(posix.system.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&completion), &completion_len));
+            switch (err) {
+                .SUCCESS => break,
+                .INTR => try io.checkCancel(),
+                else => return error.InvalidSocketOption,
+            }
+        }
+        try connectResult(@fromBackingInt(@intCast(completion)));
+        connected = true;
+    }
+    try io.checkCancel();
+    _ = try socketFlags(fd, posix.F.SETFL, original, io);
+    return .{ .handle = fd, .io = io, .native_timeouts = true };
+}
+
+test "TCP connect completion accepts a connection completed during interruption" {
+    if (comptime is_windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    try connectResult(.ISCONN);
+    try std.testing.expectError(error.ConnectionRefused, connectResult(.CONNREFUSED));
 }
 
 fn listenPosix(addr: Address, io: Io, options: TcpListener.ListenOptions) !net.Server {

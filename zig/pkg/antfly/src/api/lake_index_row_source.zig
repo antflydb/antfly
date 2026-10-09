@@ -27,6 +27,8 @@ const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 pub const Provider = struct {
     source: *serving.ServingSource,
+    vector_memo: ?@import("lake_vector_enrichment.zig").Memo = null,
+    embedding_options: ?local.inference_managed_embedder.InitOptions = null,
     context: Context,
     limits: stream_api.Limits = .{},
     expected_delete_objects: ?[32]u8 = null,

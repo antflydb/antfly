@@ -88,9 +88,25 @@ pub const BindingObjectStoreOpenOptions = struct {
     }
     fn loadLakeCatalog(raw: *const anyopaque, alloc: Allocator, source: catalog_binding.Binding, context: lake_catalog.types.Context) anyerror!lake_catalog.types.Table {
         const self: *const @This() = @ptrCast(@alignCast(raw));
-        const result = try executeLakeCatalogAlloc(alloc, source, self.*, context, .load);
+        var result = try executeLakeCatalogAlloc(alloc, source, self.*, context, .load);
+        if (self.retained_catalog_metadata) |retained| {
+            defer result.deinit(alloc);
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const current = try lake_catalog.metadata.parse(scratch, result.table.metadata_json);
+            const pinned = try lake_catalog.metadata.parse(scratch, retained.metadata_json);
+            const current_uuid = try lake_catalog.metadata.str(try lake_catalog.metadata.get(current, "table-uuid"));
+            const pinned_uuid = try lake_catalog.metadata.str(try lake_catalog.metadata.get(pinned, "table-uuid"));
+            if (!std.mem.eql(u8, current_uuid, pinned_uuid)) return error.ExternalLakeSnapshotMismatch;
+            const location = try alloc.dupe(u8, retained.metadata_location);
+            errdefer alloc.free(location);
+            return .{ .metadata_location = location, .metadata_json = try alloc.dupe(u8, retained.metadata_json) };
+        }
         return result.table;
     }
+    /// Server-authenticated metadata; load still verifies external incarnation.
+    retained_catalog_metadata: ?lake_catalog.types.Table = null,
     file_bucket: []const u8 = "antfly",
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,

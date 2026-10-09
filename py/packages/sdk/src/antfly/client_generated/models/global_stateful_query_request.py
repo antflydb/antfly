@@ -388,15 +388,18 @@ class GlobalStatefulQueryRequest:
             Strategy for merging legacy graph results with search results:
             - union: Include nodes from both search and graph results
             - intersection: Only include nodes appearing in both
-        source (ComposedQuerySource | Unset): Specify exactly one of union or overlay. Union preserves duplicates and
-            table provenance; overlay suppresses base keys using unfiltered change lookups before global ordering. Disjoint
-            RRF unions support the first 4096 global positions over exact leaf totals. Overlays and field ordering require
-            complete matching sets of at most 4096 per input; larger sets fail without truncation.
+        source (ComposedQuerySource | Unset): Specify exactly one of saved, union or overlay. Union preserves duplicates
+            and table provenance. Overlay suppresses replaced base keys and tombstones before ranking using indexed
+            unfiltered change lookups. Inputs are streamed in bounded pages; result pages allow at most 4096 hits. Large
+            overlay totals are lower bounds unless count is explicitly requested; exact count streams the full visible
+            relation within the request deadline.
         source_ranking (GlobalStatefulQueryRequestSourceRanking | Unset): Explicit reciprocal rank scoring across source
             lists after visibility resolution. Required for score ordering; shared corpus BM25 is not implemented. Constant
             60, equal source weights.
-        source_cursor (str | Unset): Opaque composed result continuation. Expires when source identity or the observed
-            ordered matching result changes. Leaf search_after/search_before tuples are unsupported.
+        source_cursor (str | Unset): Opaque composed continuation retaining per-leaf archive publications and accepted
+            WAL cuts for up to 60 seconds from their creation. Publication and restart preserve the cut. Authorization,
+            policy, recipe, source and table incarnation changes invalidate it. Leaf search_after/search_before tuples are
+            unsupported.
     """
 
     lake_read: LakeReadRequirement | Unset = UNSET

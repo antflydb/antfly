@@ -6589,6 +6589,7 @@ pub const AntflyApiHandler = struct {
                 const resource = try system_catalog_routes.resourceNameAlloc(ctx.allocator, destination);
                 defer ctx.allocator.free(resource);
                 const kind: usermgr.ResourceType = switch (target.kind) {
+                    .query_source => .table,
                     .database => .database,
                     .namespace => .namespace,
                     .table => .table,
@@ -6812,6 +6813,22 @@ pub const AntflyApiHandler = struct {
             .physical_name = physical_name,
         } });
         alloc.free(result);
+    }
+
+    pub fn listQuerySources(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.catalogResource(ctx, null);
+    }
+    pub fn getQuerySource(self: *AntflyApiHandler, ctx: *httpx.Context, source_name: []const u8) !httpx.Response {
+        _ = source_name;
+        return self.catalogResource(ctx, null);
+    }
+    pub fn createQuerySource(self: *AntflyApiHandler, ctx: *httpx.Context, source_name: []const u8) !httpx.Response {
+        _ = source_name;
+        return self.catalogResource(ctx, .create);
+    }
+    pub fn dropQuerySource(self: *AntflyApiHandler, ctx: *httpx.Context, source_name: []const u8) !httpx.Response {
+        _ = source_name;
+        return self.catalogResource(ctx, .drop);
     }
 
     pub fn listDatabases(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

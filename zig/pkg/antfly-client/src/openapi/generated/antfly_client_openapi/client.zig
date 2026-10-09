@@ -2409,6 +2409,50 @@ pub const Client = struct {
         return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
     }
 
+    /// List saved query sources
+    /// GET /db/v1/sources
+    pub fn listQuerySources(self: *@This()) !ApiResponse([]const types.SavedQuerySource) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sources", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse([]const types.SavedQuerySource).fromResponse(self.allocator, &resp);
+    }
+
+    /// Get saved query source
+    /// GET /db/v1/sources/{sourceName}
+    pub fn getQuerySource(self: *@This(), source_name: []const u8) !ApiResponse(types.SavedQuerySource) {
+        const encoded_source_name = try httpx.PercentEncoding.encode(self.allocator, source_name);
+        defer self.allocator.free(encoded_source_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sources/{s}", .{ self.base_url, encoded_source_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.SavedQuerySource).fromResponse(self.allocator, &resp);
+    }
+
+    /// Create saved query source
+    /// POST /db/v1/sources/{sourceName}
+    pub fn createQuerySource(self: *@This(), source_name: []const u8, body: std.json.Value) !ApiResponse(types.SavedQuerySource) {
+        const encoded_source_name = try httpx.PercentEncoding.encode(self.allocator, source_name);
+        defer self.allocator.free(encoded_source_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sources/{s}", .{ self.base_url, encoded_source_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(types.SavedQuerySource).fromResponse(self.allocator, &resp);
+    }
+
+    /// Drop saved query source
+    /// DELETE /db/v1/sources/{sourceName}
+    pub fn dropQuerySource(self: *@This(), source_name: []const u8) !ApiResponse(std.json.Value) {
+        const encoded_source_name = try httpx.PercentEncoding.encode(self.allocator, source_name);
+        defer self.allocator.free(encoded_source_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/sources/{s}", .{ self.base_url, encoded_source_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+    }
+
     /// Execute a SQL statement
     /// POST /db/v1/sql
     pub fn executeSQL(self: *@This(), body: types.SQLRequest) !ApiResponse(types.SQLResponse) {

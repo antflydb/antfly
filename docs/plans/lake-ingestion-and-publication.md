@@ -17,8 +17,11 @@ indexes over external rows. Its serverless path also has durable WAL ingest and
 publication of Antfly-owned artifacts; native row-fragment publication is a
 separate existing foundation. Native writable Iceberg now adds catalog commits,
 bounded recent text visibility, JSON union/keyed composition, opt-in accepted
-SQL visibility and scheduled bounded compaction/GC. Recent vector segments,
-retained cross-table cursor cuts and additional managed connectors remain extensions.
+SQL visibility and scheduled bounded compaction/GC. Recent dense/sparse vector
+segments, durable enrichment jobs, saved source definitions and retained composed
+cursor cuts are implemented for writable lakes. Additional managed connectors,
+multimodal/chunk enrichment and mutable native-table cursor retention remain
+extensions.
 
 The long-term goal is one table/query contract for externally owned lakes and
 Antfly-owned data, with a shared durable ingestion path for application writes,
@@ -505,20 +508,23 @@ The suffix is bounded to 64 transactions, 32 MiB and 65,536 distinct changes.
 A query fails closed when coverage is unavailable or the bound is exceeded.
 The archive must be an ancestor of the current head through native WAL or
 compaction transitions: an unpublished external writer commit requires archive
-publication. Cursors bind both archive publication and accepted tail; a changed
-cut invalidates the cursor rather than silently moving pagination to newer rows.
+publication. Cursors retain both the archive publication and accepted tail for 60 seconds in
+object-store descriptors. Publication and restart preserve the original cut;
+recipe, policy and incarnation changes invalidate it.
 The overlay is reconstructed from durable WAL after restart. Direct SQL SELECT
 requests can opt into `lake_visibility: "accepted"`; session/transaction modes
 retain committed visibility. `lake_read` selects accepted or published search
 visibility and optional receipt coverage with a bounded readiness wait. Pending
-vector queries wake and wait for matching publication; recent vector segments
-and asynchronous enrichment remain future work. See the
+vector queries wake background enrichment and wait for coherent native recent
+HBC/sparse segments, independently of Parquet publication. Durable per-input
+embedding completions resume after restart and are reused during archive promotion.
+Archive/recent vector masks apply before candidate selection. See the
 [implemented contracts](composed-query-sources.md#implemented-contracts).
 
 ### Compaction and garbage collection
 
 `POST /tables/{tableName}/lake/maintenance` accepts `action` (`compact`, `vacuum`,
-`wal_gc`, `status`), a stable `operation_id` for mutating/planning jobs, and defaults
+`wal_gc`, `status`, `enrichment_status`), a stable `operation_id` for mutating/planning jobs, and defaults
 to `dry_run: true`. Jobs can be invoked explicitly or scheduled through the
 Iceberg `antfly.maintenance.policy` property. Durable CAS progress resumes after
 restart; `status` reports that progress without an operation ID. Scheduling is

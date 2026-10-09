@@ -24,7 +24,7 @@ pub const default_database_id: u64 = 1;
 pub const default_namespace_id: u64 = 2;
 pub const max_name_bytes = 128;
 pub const max_command_bytes = 3 * 1024 * 1024;
-pub const Kind = enum { database, namespace, tablespace, table };
+pub const Kind = enum { database, namespace, tablespace, table, query_source };
 
 /// Request-owned query preparation data, excluding topology and unrelated
 /// tables. Read schema and index generations are captured together.
@@ -125,6 +125,7 @@ pub const Resource = struct {
     placement_policy: PlacementPolicy = .{},
     /// Compatibility metadata only, never a filesystem path override.
     location_json: []const u8 = "null",
+    source_json: []const u8 = "null",
 };
 
 pub const default_database: Resource = .{ .kind = .database, .id = default_database_id, .name = default_database_name };
@@ -232,6 +233,7 @@ pub const Mutation = struct {
     tablespace: ?[]const u8 = null,
     placement_policy: PlacementPolicy = .{},
     location_json: []const u8 = "null",
+    source_json: []const u8 = "null",
     /// Populated only by native table admission, never accepted from public JSON.
     table_id: u64 = 0,
     storage_name: []const u8 = "",
@@ -609,6 +611,8 @@ fn cloneResource(alloc: std.mem.Allocator, source: Resource) !Resource {
     errdefer alloc.free(r.name);
     r.storage_name = try alloc.dupe(u8, source.storage_name);
     errdefer alloc.free(r.storage_name);
+    r.source_json = try alloc.dupe(u8, source.source_json);
+    errdefer alloc.free(r.source_json);
     r.location_json = try alloc.dupe(u8, source.location_json);
     errdefer alloc.free(r.location_json);
     if (source.placement_policy.placement_role) |role| r.placement_policy.placement_role = try alloc.dupe(u8, role);
@@ -618,6 +622,7 @@ fn freeResource(alloc: std.mem.Allocator, r: Resource) void {
     alloc.free(r.name);
     alloc.free(r.storage_name);
     alloc.free(r.location_json);
+    alloc.free(r.source_json);
     if (r.placement_policy.placement_role) |role| alloc.free(role);
 }
 
@@ -655,6 +660,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     if (request.new_name) |name| try validateResourceName(request.kind, name);
     if (request.tablespace) |name| try validateName(name);
     try request.placement_policy.validate();
+    if (request.kind == .query_source and request.action == .create) try validateQuerySource(alloc, request.source_json) else if (!std.mem.eql(u8, request.source_json, "null")) return error.InvalidCatalogMutation;
     if (request.location_json.len > 64 * 1024) return error.InvalidTablespaceLocation;
     var location = std.json.parseFromSlice(std.json.Value, alloc, request.location_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -664,7 +670,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
     if (request.kind != .tablespace and (!std.mem.eql(u8, request.location_json, "null") or
         request.placement_policy.placement_role != null or request.placement_policy.desired_replica_count != null or request.placement_policy.min_ranges != null)) return error.InvalidCatalogMutation;
     const parent_id: u64 = switch (request.kind) {
-        .database, .tablespace => 0,
+        .database, .tablespace, .query_source => 0,
         .namespace => ((try reader.lookup(.database, 0, request.database)) orelse return error.DatabaseNotFound).id,
         .table => (try reader.namespaceFor(request.database, request.namespace)).id,
     };
@@ -685,7 +691,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
             if (request.new_name != null) return error.InvalidCatalogMutation;
             const binding = if (request.tablespace) |name| ((try reader.lookup(.tablespace, 0, name)) orelse return error.TablespaceNotFound).id else 0;
             if (request.kind == .tablespace and binding != 0) return error.InvalidCatalogMutation;
-            var resource: Resource = .{ .kind = request.kind, .id = next_id, .parent_id = parent_id, .name = request.name, .tablespace_id = binding, .placement_policy = request.placement_policy, .location_json = request.location_json };
+            var resource: Resource = .{ .kind = request.kind, .id = next_id, .parent_id = parent_id, .name = request.name, .tablespace_id = binding, .placement_policy = request.placement_policy, .location_json = request.location_json, .source_json = request.source_json };
             if (request.kind == .table) {
                 if (request.table_id == 0 or request.storage_name.len == 0) return error.InvalidCatalogMutation;
                 if (try reader.byId(.table, request.table_id) != null or try reader.bindingForStorage(request.storage_name) != null or
@@ -732,6 +738,7 @@ pub fn planWithTopology(alloc: std.mem.Allocator, reader: anytype, next: u64, re
                         },
                         .namespace => if ((try reader.children(.table, existing.id, 1)).len != 0) return error.NamespaceNotEmpty,
                         .tablespace => if (try reader.tablespaceInUse(existing.id)) return error.TablespaceInUse,
+                        .query_source => {},
                         .table => {
                             if (!dropping_table) return error.CatalogTableTopologyRequired;
                             if (request.table_id != existing.id or !std.mem.eql(u8, request.storage_name, existing.storage_name)) return error.CatalogGenerationChanged;
@@ -1299,3 +1306,61 @@ pub const OwnedState = struct {
         self.* = undefined;
     }
 };
+
+/// Definitions are immutable catalog objects. References resolve only at query
+/// admission; leaf tables retain their own permissions and incarnation fences.
+pub fn validateQuerySource(a: std.mem.Allocator, bytes: []const u8) !void {
+    if (bytes.len > 64 * 1024) return error.InvalidCatalogMutation;
+    var parsed = std.json.parseFromSlice(std.json.Value, a, bytes, .{}) catch return error.InvalidCatalogMutation;
+    defer parsed.deinit();
+    const value = parsed.value;
+    if (value != .object or value.object.count() != 1) return error.InvalidCatalogMutation;
+    if (value.object.get("union")) |items| {
+        if (items != .array or items.array.items.len < 2 or items.array.items.len > 16) return error.InvalidCatalogMutation;
+        for (items.array.items, 0..) |leaf, i| {
+            const name = try sourceLeaf(leaf);
+            for (items.array.items[0..i]) |prior| if (std.mem.eql(u8, name, try sourceLeaf(prior))) return error.InvalidCatalogMutation;
+        }
+    } else if (value.object.get("overlay")) |spec| {
+        if (spec != .object or spec.object.count() < 3 or spec.object.count() > 4) return error.InvalidCatalogMutation;
+        for (spec.object.keys()) |key| if (!std.mem.eql(u8, key, "base") and !std.mem.eql(u8, key, "changes") and !std.mem.eql(u8, key, "key") and !std.mem.eql(u8, key, "tombstone_field")) return error.InvalidCatalogMutation;
+        const base = try sourceLeaf(spec.object.get("base") orelse return error.InvalidCatalogMutation);
+        const changes = try sourceLeaf(spec.object.get("changes") orelse return error.InvalidCatalogMutation);
+        if (std.mem.eql(u8, base, changes)) return error.InvalidCatalogMutation;
+        const keys = spec.object.get("key") orelse return error.InvalidCatalogMutation;
+        if (keys != .array or keys.array.items.len == 0 or keys.array.items.len > 8) return error.InvalidCatalogMutation;
+        for (keys.array.items, 0..) |key, i| {
+            try sourceField(key);
+            for (keys.array.items[0..i]) |prior| if (std.mem.eql(u8, prior.string, key.string)) return error.InvalidCatalogMutation;
+        }
+        if (spec.object.get("tombstone_field")) |field| try sourceField(field);
+    } else return error.InvalidCatalogMutation;
+}
+fn sourceLeaf(value: std.json.Value) ![]const u8 {
+    if (value != .object or value.object.count() != 1) return error.InvalidCatalogMutation;
+    const name = value.object.get("table") orelse return error.InvalidCatalogMutation;
+    if (name != .string) return error.InvalidCatalogMutation;
+    try validateTableName(name.string);
+    return name.string;
+}
+fn sourceField(value: std.json.Value) !void {
+    if (value != .string or value.string.len == 0 or std.mem.indexOfAny(u8, value.string, "/.~") != null) return error.InvalidCatalogMutation;
+}
+test "external lake catalog saved sources reject recursion and retain definitions across rename" {
+    const a = std.testing.allocator;
+    const definition =
+        \\{"union":[{"table":"history"},{"table":"current"}]}
+    ;
+    var created = try plan(a, .{}, .{ .kind = .query_source, .action = .create, .name = "hackernews", .source_json = definition }, &.{});
+    defer created.deinit(a);
+    var owned = try MutableState.clone(a, .{ .resources = created.upserts, .next_id = created.next_id });
+    defer owned.deinit();
+    const saved = owned.value.find(.query_source, 0, "hackernews").?;
+    try std.testing.expectEqualStrings(definition, saved.source_json);
+    const identity = created.upserts[0].id;
+    var renamed = try plan(a, .{ .resources = created.upserts, .next_id = created.next_id }, .{ .kind = .query_source, .action = .rename, .name = "hackernews", .new_name = "news" }, &.{});
+    defer renamed.deinit(a);
+    try std.testing.expectEqual(identity, renamed.upserts[0].id);
+    try std.testing.expectEqualStrings(definition, renamed.upserts[0].source_json);
+    try std.testing.expectError(error.InvalidCatalogMutation, validateQuerySource(a, "{\"saved\":\"loop\"}"));
+}

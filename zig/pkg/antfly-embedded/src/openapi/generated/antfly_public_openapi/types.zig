@@ -2867,13 +2867,16 @@ pub const CommittedMutationOutcome = struct {
     status: []const u8,
 };
 
-/// Specify exactly one of union or overlay. Union preserves duplicates and table provenance; overlay suppresses base keys using unfiltered change lookups before global ordering. Disjoint RRF unions support the first 4096 global positions over exact leaf totals. Overlays and field ordering require complete matching sets of at most 4096 per input; larger sets fail without truncation.
+/// Specify exactly one of saved, union or overlay. Union preserves duplicates and table provenance. Overlay suppresses replaced base keys and tombstones before ranking using indexed unfiltered change lookups. Inputs are streamed in bounded pages; result pages allow at most 4096 hits. Large overlay totals are lower bounds unless count is explicitly requested; exact count streams the full visible relation within the request deadline.
 pub const ComposedQuerySource = struct {
+    /// Immutable source name from the Antfly catalog. Saved definitions contain literal table leaves, preventing recursive expansion.
+    saved: ?[]const u8 = null,
     @"union": ?[]const ComposedTableSource = null,
     overlay: ?ComposedSourceOverlay = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "saved", "saved", true },
         .{ "union", "union", true },
         .{ "overlay", "overlay", true },
     };
@@ -2888,6 +2891,10 @@ pub const ComposedQuerySource = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.saved) |value| {
+            try jw.objectField("saved");
+            try jw.write(value);
+        }
         if (self.@"union") |value| {
             try jw.objectField("union");
             try jw.write(value);
@@ -4840,7 +4847,7 @@ pub const GlobalStatefulQueryRequest = struct {
     source: ?ComposedQuerySource = null,
     /// Explicit reciprocal rank scoring across source lists after visibility resolution. Required for score ordering; shared corpus BM25 is not implemented. Constant 60, equal source weights.
     source_ranking: ?[]const u8 = null,
-    /// Opaque composed result continuation. Expires when source identity or the observed ordered matching result changes. Leaf search_after/search_before tuples are unsupported.
+    /// Opaque composed continuation retaining per-leaf archive publications and accepted WAL cuts for up to 60 seconds from their creation. Publication and restart preserve the cut. Authorization, policy, recipe, source and table incarnation changes invalidate it. Leaf search_after/search_before tuples are unsupported.
     source_cursor: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -8927,9 +8934,9 @@ pub const QueryResponses = struct {
 pub const QueryResult = struct {
     /// Ranking contract for a composed result.
     source_ranking: ?[]const u8 = null,
-    /// Opaque continuation for composed queries. Pass as source_cursor; expires if the observed result or source identity changes.
+    /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (at most 60 seconds). Publication and restart preserve it; authorization and incarnation fences remain enforced.
     next_source_cursor: ?[]const u8 = null,
-    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    /// Opaque remote snapshot to echo with ordered pagination. Lake tokens retain the archive publication, metadata and accepted WAL cut for 60 seconds; other remote engines may provide an invalidation-only fence. Every use rechecks access and incarnation.
     remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -9043,9 +9050,9 @@ pub const QueryResult = struct {
 pub const QueryResultBase = struct {
     /// Ranking contract for a composed result.
     source_ranking: ?[]const u8 = null,
-    /// Opaque continuation for composed queries. Pass as source_cursor; expires if the observed result or source identity changes.
+    /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (at most 60 seconds). Publication and restart preserve it; authorization and incarnation fences remain enforced.
     next_source_cursor: ?[]const u8 = null,
-    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    /// Opaque remote snapshot to echo with ordered pagination. Lake tokens retain the archive publication, metadata and accepted WAL cut for 60 seconds; other remote engines may provide an invalidation-only fence. Every use rechecks access and incarnation.
     remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -13881,6 +13888,12 @@ pub const SSEToolMode = struct {
     }
 };
 
+pub const SavedQuerySource = struct {
+    source_id: u64,
+    name: []const u8,
+    source: ComposedQuerySource,
+};
+
 /// Request to scan keys in a table within a key range. If no range is specified, scans all keys in the table.
 pub const ScanKeysRequest = struct {
     /// Start of the key range to scan (exclusive by default). Can be a full key or a prefix. If not specified, starts from the beginning of the table.
@@ -14908,9 +14921,9 @@ pub const StatefulQueryResponses = struct {
 pub const StatefulQueryResult = struct {
     /// Ranking contract for a composed result.
     source_ranking: ?[]const u8 = null,
-    /// Opaque continuation for composed queries. Pass as source_cursor; expires if the observed result or source identity changes.
+    /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (at most 60 seconds). Publication and restart preserve it; authorization and incarnation fences remain enforced.
     next_source_cursor: ?[]const u8 = null,
-    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    /// Opaque remote snapshot to echo with ordered pagination. Lake tokens retain the archive publication, metadata and accepted WAL cut for 60 seconds; other remote engines may provide an invalidation-only fence. Every use rechecks access and incarnation.
     remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,

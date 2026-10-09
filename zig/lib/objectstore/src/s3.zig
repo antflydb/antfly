@@ -2938,7 +2938,7 @@ test "s3 get object guards probed current-object reads without version permissio
                         .version_id = try request_alloc.dupe(u8, "v1"),
                     };
                 },
-                2 => blk: {
+                2, 4, 6, 8 => blk: {
                     try std.testing.expectEqual(HttpMethod.HEAD, method);
                     try std.testing.expect(std.mem.indexOf(u8, url, "/bucket/unversioned") != null);
                     break :blk .{
@@ -2953,7 +2953,7 @@ test "s3 get object guards probed current-object reads without version permissio
                         .content_length = 4,
                     };
                 },
-                3 => blk: {
+                3, 5, 7, 9 => blk: {
                     try std.testing.expectEqual(HttpMethod.GET, method);
                     try std.testing.expect(std.mem.indexOf(u8, url, "/bucket/unversioned") != null);
                     try expectHeaderValue(headers, "If-Match", "\"etag-u1\"");
@@ -3005,7 +3005,7 @@ test "s3 get object guards probed current-object reads without version permissio
     try std.testing.expectEqualStrings("sum-v1", pinned.metadata.checksum.?.value);
 
     try std.testing.expectError(error.PreconditionFailed, client.getObject("bucket", "unversioned", .{}));
-    try std.testing.expectEqual(@as(usize, 4), state.calls);
+    try std.testing.expectEqual(@as(usize, 10), state.calls);
 }
 
 test "s3 metadata reads fall back when checksum mode is forbidden or unsupported" {
