@@ -701,10 +701,10 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             // publication for this index. Bytes remain process-global because
             // they protect shared memory and storage resources.
             const admitted_segments = std.math.add(u64, active_segments, reserved_index_segments) catch std.math.maxInt(u64);
-            const admitted_bytes = std.math.add(u64, stats_snapshot.pending_bytes, reserved_bytes) catch std.math.maxInt(u64);
+            const pending_bytes = admissionPendingBytes(stats_snapshot);
+            const admitted_bytes = std.math.add(u64, pending_bytes, reserved_bytes) catch std.math.maxInt(u64);
             const request_oversized_bytes = self.config.max_pending_bytes > 0 and byte_count > self.config.max_pending_bytes;
-            const no_existing_debt = stats_snapshot.pending_segments == 0 and stats_snapshot.pending_bytes == 0 and
-                self.producer_segment_reservations == 0 and self.producer_byte_reservations == 0;
+            const no_existing_debt = pending_bytes == 0 and self.producer_byte_reservations == 0;
             const segments_admissible = self.config.max_pending_segments == 0 or admitted_segments <= self.config.max_pending_segments;
             const bytes_admissible = self.config.max_pending_bytes == 0 or admitted_bytes <= self.config.max_pending_bytes;
             const request_bytes_admissible = if (request_oversized_bytes) no_existing_debt else bytes_admissible;
@@ -930,7 +930,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         const stats_snapshot = self.index_manager.textMergeStatsSnapshot();
         self.apply_mutex.unlockShared();
         return (self.config.max_pending_segments > 0 and stats_snapshot.pending_segments > self.config.max_pending_segments) or
-            (self.config.max_pending_bytes > 0 and stats_snapshot.pending_bytes > self.config.max_pending_bytes);
+            (self.config.max_pending_bytes > 0 and admissionPendingBytes(stats_snapshot) > self.config.max_pending_bytes);
     }
 
     fn backpressureDrained(self: *TextMergeRuntime) bool {
@@ -940,7 +940,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         const segment_low = @min(self.config.resume_pending_segments, self.config.max_pending_segments);
         const bytes_low = self.config.max_pending_bytes / 2;
         return (self.config.max_pending_segments == 0 or stats_snapshot.pending_segments <= segment_low) and
-            (self.config.max_pending_bytes == 0 or stats_snapshot.pending_bytes <= bytes_low);
+            (self.config.max_pending_bytes == 0 or admissionPendingBytes(stats_snapshot) <= bytes_low);
     }
 
     fn backpressureBlockedByQuarantine(self: *TextMergeRuntime) bool {
@@ -950,6 +950,15 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         return quarantineBlocks(stats_snapshot);
     }
 };
+
+/// Bytes that count against the producer byte budget. File-backed (mmap)
+/// segments are already durable on disk and hold no heap memory. While an
+/// index is merge-pending, pending_bytes covers every one of its segments, so
+/// counting file-backed bytes caps total index size at max_pending_bytes and
+/// blocks every byte-carrying producer once a large index stays merge-pending.
+fn admissionPendingBytes(stats: types.TextMergeStats) u64 {
+    return stats.pending_heap_bytes;
+}
 
 fn quarantineBlocks(stats: types.TextMergeStats) bool {
     return stats.pending_segments > 0 and
