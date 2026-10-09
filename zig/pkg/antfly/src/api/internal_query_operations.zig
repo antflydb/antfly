@@ -349,13 +349,13 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
             };
         }
 
-        fn embedDenseWithContext(ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, context: managed_embedder.EmbeddingRequestContext) ![][]f32 {
+        fn embedDenseWithContext(ptr: *anyopaque, inner_alloc: std.mem.Allocator, model: []const u8, texts: []const []const u8, context: managed_embedder.EmbeddingRequestContext) ![][]f32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const grant = context.request.runnable orelse return error.TestMissingQueryRunnable;
             try std.testing.expectEqual(self.expected_borrow.?, grant.context);
             try grant.checkLifetime();
             try std.testing.expectEqual(@import("antfly_runtime_abi").runnable_abi.Class.query, try grant.currentClass());
-            return embedDense(ptr, alloc, model, texts);
+            return embedDense(ptr, inner_alloc, model, texts);
         }
 
         fn embedDense(ptr: *anyopaque, inner_alloc: std.mem.Allocator, _: []const u8, texts: []const []const u8) ![][]f32 {

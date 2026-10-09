@@ -100,7 +100,7 @@ test "fanout owner retains joined result slots and original phase through denied
             .cancellation = .{ .ptr = &canceled, .requested = Worker.requested },
         }, phase);
         var read: @import("runnable_local_read.zig").Read = .{ .execution = &root, .allocator = a };
-        var team = try read.team();
+        const team = try read.team();
         var owners: [2]Owner = @splat(.{});
         defer for (&owners) |*owner| owner.retire();
         for (&owners) |*owner| try owner.reserve(team.borrow, std.testing.io, 1024);
