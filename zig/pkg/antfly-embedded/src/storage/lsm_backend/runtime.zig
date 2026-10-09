@@ -2379,7 +2379,12 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             // Retain only sources already opened by real I/O. A fully cached
             // scan needs no extra descriptor or catalog publication.
             if (comptime @hasDecl(BackendType, "retainCachedRunSource")) {
-                if (self.source_run_leases.len != 0 and self.source_run_leases[source_index] == null) self.source_run_leases[source_index] = self.backend.retainCachedRunSource(run.path.?);
+                if (self.source_run_leases.len != 0 and self.source_run_leases[source_index] == null) {
+                    self.source_run_leases[source_index] = if (comptime @hasDecl(BackendType, "retainCachedRunSourceWithAdmission"))
+                        try self.backend.retainCachedRunSourceWithAdmission(run.path.?, self.admission.control)
+                    else
+                        self.backend.retainCachedRunSource(run.path.?);
+                }
             }
             self.source_block_indices[source_index] = window.relative_offset;
             try self.prefetchNextSourceBlock(source_index, run, index, block_index);

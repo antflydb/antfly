@@ -7377,7 +7377,7 @@ pub const Backend = struct {
         }
     }
 
-    fn openRunSource(self: *Backend, flight: *SourceOpen) !*RunSourceLease {
+    fn openRunSource(self: *Backend, flight: *SourceOpen, control: ?read_admission.Port) !*RunSourceLease {
         const lease = try self.allocator.create(RunSourceLease);
         errdefer self.allocator.destroy(lease);
         var source = try self.storage.?.openLeasedImmutableSource(self.allocator, flight.path);
@@ -7391,7 +7391,7 @@ pub const Backend = struct {
         source.enableIdleExpiry();
         const owned_path = try self.allocator.dupe(u8, flight.path);
         errdefer self.allocator.free(owned_path);
-        platform.sync.lockYielding(&self.run_source_mutex);
+        if (control) |budget| try bounded_mutex.lockAtomic(&self.run_source_mutex, budget) else platform.sync.lockYielding(&self.run_source_mutex);
         if (flight.epoch != self.run_source_epoch) {
             self.run_source_mutex.unlock();
             self.allocator.free(owned_path);
@@ -7404,7 +7404,6 @@ pub const Backend = struct {
             return err;
         };
         self.run_source_mutex.unlock();
-        self.trimRunSources();
         return lease;
     }
 
@@ -7469,7 +7468,14 @@ pub const Backend = struct {
         defer self.releaseSourceOpen(flight);
         const opened = blk: {
             if (control) |budget| budget.checkpoint() catch |err| break :blk @as(anyerror!*RunSourceLease, err);
-            break :blk self.openRunSource(flight);
+            const lease = self.openRunSource(flight, control) catch |err| break :blk @as(anyerror!*RunSourceLease, err);
+            // Publication transferred the cache owner. A failed trim releases
+            // only the flight's active use, leaving the published owner valid.
+            self.trimRunSourcesWithAdmission(control) catch |err| {
+                lease.release();
+                break :blk @as(anyerror!*RunSourceLease, err);
+            };
+            break :blk @as(anyerror!*RunSourceLease, lease);
         };
         platform.sync.lockYielding(&self.run_source_mutex);
         if (opened) |lease| flight.result = lease else |err| flight.failure = err;
@@ -7486,11 +7492,19 @@ pub const Backend = struct {
     }
 
     pub fn retainCachedRunSource(self: *Backend, path: []const u8) ?*RunSourceLease {
-        platform.sync.lockYielding(&self.run_source_mutex);
+        return self.retainCachedRunSourceWithAdmission(path, null) catch unreachable;
+    }
+
+    pub fn retainCachedRunSourceWithAdmission(self: *Backend, path: []const u8, control: ?read_admission.Port) !?*RunSourceLease {
+        if (control) |budget| try bounded_mutex.lockAtomic(&self.run_source_mutex, budget) else platform.sync.lockYielding(&self.run_source_mutex);
         const lease = self.findRunSourceAssumeLocked(path);
         self.run_source_mutex.unlock();
         if (lease) |held| {
-            if (held.activateHeld()) return held;
+            if (held.activateHeld()) {
+                errdefer held.release();
+                if (control) |budget| try budget.checkpoint();
+                return held;
+            }
             held.releaseOwner();
         }
         return null;
@@ -7499,8 +7513,12 @@ pub const Backend = struct {
     // Active cursors retain one lease per run. Only idle entries compete for
     // LRU space, avoiding catalog/descriptor thrash in broad merge cursors.
     pub fn trimRunSources(self: *Backend) void {
+        self.trimRunSourcesWithAdmission(null) catch unreachable;
+    }
+
+    fn trimRunSourcesWithAdmission(self: *Backend, control: ?read_admission.Port) !void {
         while (true) {
-            @import("antfly_platform").sync.lockYielding(&self.run_source_mutex);
+            if (control) |budget| try bounded_mutex.lockAtomic(&self.run_source_mutex, budget) else platform.sync.lockYielding(&self.run_source_mutex);
             if (self.run_sources.items.len <= 16) {
                 self.run_source_mutex.unlock();
                 return;
@@ -26947,5 +26965,214 @@ test "lsm routing cursor local decoder admission cancels cold compressed decode 
         var read = try runtime.beginRead();
         defer read.abort();
         try std.testing.expectEqualStrings(&value, try read.get("doc:a"));
+    }
+}
+
+test "lsm source read admission preserves original publication trim and warm-retain failure ownership" {
+    const Stage = enum { publication, trim, warm_retain };
+    const Context = struct {
+        backend: *Backend,
+        stage: Stage,
+        held: std.atomic.Value(bool) = .init(false),
+        trim_armed: bool = true,
+        active: usize = 0,
+        opens: usize = 0,
+        closes: usize = 0,
+        var current: *@This() = undefined;
+        fn releaseMutex(self: *@This()) void {
+            if (self.held.swap(false, .acq_rel)) self.backend.run_source_mutex.unlock();
+        }
+        fn open(_: *anyopaque, _: Allocator, _: []const u8) !@import("../segment_source.zig").Source {
+            const self = current;
+            self.opens += 1;
+            if (self.stage == .publication) {
+                try std.testing.expect(self.backend.run_source_mutex.tryLock());
+                self.held.store(true, .release);
+            }
+            return .{ .ranges = .{ .ptr = self, .length = 9, .read_into = read, .close = close, .acquire_use = acquire, .release_use = release } };
+        }
+        fn read(_: *anyopaque, offset: u64, out: []u8) !void {
+            const bytes = "immutable";
+            @memcpy(out, bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn acquire(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.active += 1;
+            return true;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active != 0);
+            self.active -= 1;
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.active == 0);
+            self.closes += 1;
+        }
+        fn rescue(self: *@This(), done: *std.atomic.Value(bool)) void {
+            const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+            while (!done.load(.acquire)) {
+                if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) break;
+                platform_time.yieldBriefly();
+            }
+            self.releaseMutex();
+        }
+    };
+    const Budget = struct {
+        context: *Context,
+        failure: ?anyerror,
+        failed: bool = false,
+        waits: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.failed) return self.failure.?;
+            if (self.context.stage == .trim and self.context.trim_armed and self.context.backend.run_sources.items.len == 1) {
+                self.context.trim_armed = false;
+                try std.testing.expect(self.context.backend.run_source_mutex.tryLock());
+                self.context.held.store(true, .release);
+            }
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            self.waits += 1;
+            self.context.releaseMutex();
+            self.failed = self.failure != null;
+        }
+    };
+    for ([_]Stage{ .publication, .trim, .warm_retain }) |stage| {
+        for ([_]?anyerror{ error.Canceled, error.DeadlineExceeded, null }) |failure| {
+            var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer memory.deinit();
+            var vtable = memory.storage().vtable.*;
+            vtable.open_leased_immutable_source = Context.open;
+            var backend = Backend.init(std.testing.allocator, .{ .storage = .{ .ptr = memory.storage().ptr, .vtable = &vtable } });
+            var context = Context{ .backend = &backend, .stage = stage };
+            Context.current = &context;
+            defer backend.close();
+            var budget = Budget{ .context = &context, .failure = failure };
+            var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+            const payload = adapter.payload();
+            if (stage == .warm_retain) {
+                const bytes = try backend.readRunRangeAlloc(std.testing.allocator, "/source", 0, 9);
+                std.testing.allocator.free(bytes);
+                try std.testing.expect(backend.run_source_mutex.tryLock());
+                context.held.store(true, .release);
+            }
+            var done: std.atomic.Value(bool) = .init(false);
+            const rescue = try std.Thread.spawn(.{}, Context.rescue, .{ &context, &done });
+            defer {
+                done.store(true, .release);
+                rescue.join();
+            }
+            if (stage == .warm_retain) {
+                const retained = backend.retainCachedRunSourceWithAdmission("/source", .init(&payload));
+                if (failure) |err| try std.testing.expectError(err, retained) else {
+                    const lease = (try retained) orelse return error.TestExpectedSource;
+                    lease.release();
+                }
+            } else {
+                const result = backend.readRunRangeAllocWithAdmission(std.testing.allocator, "/source", 0, 9, .init(&payload));
+                if (failure) |err| try std.testing.expectError(err, result) else {
+                    const bytes = try result;
+                    defer std.testing.allocator.free(bytes);
+                    try std.testing.expectEqualStrings("immutable", bytes);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 1), budget.waits);
+            try std.testing.expectEqual(@as(usize, 0), context.active);
+            try std.testing.expectEqual(@as(usize, 0), backend.run_source_opens.items.len);
+            if (stage == .publication and failure != null) {
+                try std.testing.expectEqual(@as(usize, 0), backend.run_sources.items.len);
+                try std.testing.expectEqual(@as(usize, 1), context.closes);
+            } else {
+                try std.testing.expectEqual(@as(usize, 1), backend.run_sources.items.len);
+                try std.testing.expectEqual(@as(usize, 0), context.closes);
+                try std.testing.expectEqual(@as(usize, 1), backend.run_sources.items[0].lease.refs.load(.acquire));
+            }
+            // Ordinary retry uses an independent scope after the failed borrow
+            // has ended; it can reuse only valid cache-owned provider state.
+            context.stage = .warm_retain;
+            const retry = try backend.readRunRangeAlloc(std.testing.allocator, "/source", 0, 9);
+            defer std.testing.allocator.free(retry);
+            try std.testing.expectEqualStrings("immutable", retry);
+            try std.testing.expectEqual(@as(usize, 0), context.active);
+        }
+    }
+}
+
+test "lsm source read admission cancels one coalesced waiter without retiring the producer" {
+    const Hook = struct {
+        var entered: std.Io.Event = .unset;
+        var go: std.Io.Event = .unset;
+        var opens: std.atomic.Value(usize) = .init(0);
+        fn open(_: *anyopaque, _: Allocator, _: []const u8) !@import("../segment_source.zig").Source {
+            _ = opens.fetchAdd(1, .monotonic);
+            entered.set(std.testing.io);
+            go.waitUncancelable(std.testing.io);
+            return .{ .contiguous = "immutable" };
+        }
+        fn produce(backend: *Backend) !void {
+            const bytes = try backend.readRunRangeAlloc(std.testing.allocator, "/source", 0, 9);
+            defer std.testing.allocator.free(bytes);
+            try std.testing.expectEqualStrings("immutable", bytes);
+        }
+        fn rescue(done: *std.atomic.Value(bool)) void {
+            const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+            while (!done.load(.acquire)) {
+                if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) break;
+                platform_time.yieldBriefly();
+            }
+            go.set(std.testing.io);
+        }
+    };
+    const Budget = struct {
+        failed: bool = false,
+        waits: usize = 0,
+        failure: anyerror,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.failed) return self.failure;
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            self.waits += 1;
+            self.failed = true;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded }) |failure| {
+        var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer memory.deinit();
+        var vtable = memory.storage().vtable.*;
+        vtable.open_leased_immutable_source = Hook.open;
+        var backend = Backend.init(std.testing.allocator, .{ .storage = .{ .ptr = memory.storage().ptr, .vtable = &vtable } });
+        defer backend.close();
+        Hook.entered.reset();
+        Hook.go.reset();
+        Hook.opens.store(0, .monotonic);
+        var producer = try std.testing.io.concurrent(Hook.produce, .{&backend});
+        defer {
+            Hook.go.set(std.testing.io);
+            producer.await(std.testing.io) catch {};
+        }
+        try Hook.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        var done: std.atomic.Value(bool) = .init(false);
+        const rescue = try std.Thread.spawn(.{}, Hook.rescue, .{&done});
+        defer {
+            done.store(true, .release);
+            rescue.join();
+        }
+        var budget = Budget{ .failure = failure };
+        var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+        const payload = adapter.payload();
+        try std.testing.expectError(failure, backend.readRunRangeAllocWithAdmission(std.testing.allocator, "/source", 0, 9, .init(&payload)));
+        try std.testing.expectEqual(@as(usize, 1), budget.waits);
+        platform.sync.lockYielding(&backend.run_source_mutex);
+        const retained_producer = backend.run_source_opens.items.len == 1 and backend.run_source_opens.items[0].refs == 1 and !backend.run_source_opens.items[0].completed.load(.acquire);
+        backend.run_source_mutex.unlock();
+        try std.testing.expect(retained_producer);
+        Hook.go.set(std.testing.io);
+        try producer.await(std.testing.io);
+        try std.testing.expectEqual(@as(usize, 0), backend.run_source_opens.items.len);
+        const retry = try backend.readRunRangeAlloc(std.testing.allocator, "/source", 0, 9);
+        defer std.testing.allocator.free(retry);
+        try std.testing.expectEqualStrings("immutable", retry);
+        try std.testing.expectEqual(@as(usize, 1), Hook.opens.load(.monotonic));
     }
 }
