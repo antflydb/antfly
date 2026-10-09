@@ -191,7 +191,7 @@ test "serverless document facts point reads authenticate bodies and materialize 
             defer materializer.freeDocuments(alloc, owned);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Failures.run, .{&session});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failures.run, .{&session});
     session.manifest.wal_end_lsn = 8;
     try std.testing.expectError(error.DocumentFactsSourceChanged, Reader.create(a, &session, &reads));
 }

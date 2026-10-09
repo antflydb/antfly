@@ -1,0 +1,2221 @@
+{
+  "artifacts": {
+    "contract_sha256": "0beb19e072fd46f0318bd7a1e2c0ac3b8ad1deaf47bdc0cf1ce7ca1e9c6364c5",
+    "generator_sha256": "ad272a7ec1aec50c0156c824d8ea67d4e7d8a186201b3c1a768a1264075512dd",
+    "public_decide_helper_sha256": "4364c3fc1cfacfca4bad2cd48e19a8600af8041339b817e44c111e252bb1a844",
+    "public_requests_sha256": "450cd404b0ce9bd00f0cb9ccf1a54744f9faeb31e39de020062f1b9bf296126a",
+    "requests_sha256": "b97d2c69860e3496b3f4d01df055c54a42b6b3b78e95fb33cbc83dbb371e8271",
+    "runtime_contract_sha256": "d807f5ad9fecbcd96c870c3965ca8357ca8a6fbfeafe3ecc5eace35f53a0e472",
+    "shared_helper_sha256": "4e9fee278e8e4757f1ee03aec87208dfc7cbb58eb7a009b30e8f525c8eb9cde5"
+  },
+  "format_version": 1,
+  "model": {
+    "architecture": "span",
+    "compatibility": {
+      "gliner25_boundary_converter": false,
+      "reason": "The checkpoint uses the span markerV0/count_lstm stack and a ModernBERT encoder; it is not a GLiNER2.5 boundary bundle."
+    },
+    "encoder_family": "modernbert",
+    "model_sha256": "02c567d791aed26550d300064c7f0c0094fd65291503c65969b45b30786e33b3",
+    "model_size_bytes": 4755208228,
+    "parameter_count": 1188796693,
+    "profile": "decide_1b",
+    "qualification": false,
+    "repo": "fastino/GLiNER2.5-Decide-1B",
+    "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+    "sidecars": {
+      "config.json": {
+        "sha256": "d2732928820b95649bc87f051345b2394fff87fc28c01f945610f943d6f402b2",
+        "size_bytes": 464
+      },
+      "encoder_config/config.json": {
+        "sha256": "c2cc4c15c7504b9e15651f2a32dff82b84fa9a99060a3218671a930da0a9b50d",
+        "size_bytes": 2160
+      },
+      "tokenizer.json": {
+        "sha256": "ddb379b6a4679ee16646bf0b726de9ec538d7c80ea9d4d4e33b069f19c9e1efb",
+        "size_bytes": 3585055
+      },
+      "tokenizer_config.json": {
+        "sha256": "8bb8d094c7cde84942866ef98fb5b24f7387245573a7f707c8349729484c27b3",
+        "size_bytes": 559
+      }
+    },
+    "status": "verified",
+    "tensor_count": 199,
+    "tensor_header_sha256": "449e7c096746bf06825e71d40d215de142f5f404f560c601a0d9bafc1bca0bae"
+  },
+  "native_runtime_qualified": false,
+  "production_qualified": false,
+  "public_decide_requests": [
+    {
+      "decide_expected": {
+        "answers": {
+          "action": {
+            "choice": "send_pin",
+            "probabilities": {
+              "balance_help": 0.048236917597701996,
+              "replace_card": 0.2788999926926913,
+              "send_pin": 0.6728630897096067
+            },
+            "type": "choice"
+          }
+        },
+        "model": "fastino/GLiNER2.5-Decide-1B"
+      },
+      "decide_request": {
+        "model": "fastino/GLiNER2.5-Decide-1B",
+        "questions": {
+          "action": {
+            "criteria": {
+              "balance_help": "Answer a balance question",
+              "replace_card": "Replace a lost or damaged physical card",
+              "send_pin": "Send or reset the card PIN"
+            },
+            "instructions": "Choose the one action that best resolves the customer's issue.",
+            "type": "choice"
+          }
+        },
+        "state": "The replacement card arrived, but the PIN never came and the card cannot be used."
+      },
+      "decide_request_json": "{\"model\":\"fastino/GLiNER2.5-Decide-1B\",\"state\":\"The replacement card arrived, but the PIN never came and the card cannot be used.\",\"questions\":{\"action\":{\"type\":\"choice\",\"instructions\":\"Choose the one action that best resolves the customer's issue.\",\"criteria\":{\"send_pin\":\"Send or reset the card PIN\",\"replace_card\":\"Replace a lost or damaged physical card\",\"balance_help\":\"Answer a balance question\"}}}}",
+      "encoded": {
+        "attention_mask": [
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+        ],
+        "end_mappings": [3, 15, 20, 28, 29, 33, 37, 41, 47, 52, 56, 60, 65, 72, 75, 80, 81],
+        "input_ids": [
+          9, 50370, 1913, 27, 28890, 253, 581, 2250, 326, 1682, 501, 14503, 253, 7731, 434, 2523, 15, 209, 50377, 5007,
+          64, 9852, 27, 23934, 390, 14932, 253, 3120, 39317, 209, 50377, 8171, 64, 9290, 27, 49083, 247, 3663, 390,
+          13572, 3520, 3120, 209, 50377, 6654, 64, 13070, 27, 37741, 247, 6654, 1953, 9, 50374, 13161, 64, 9852, 50374,
+          13481, 64, 9290, 50374, 20203, 64, 13070, 10, 10, 50369, 783, 250, 26380, 9290, 274, 30487, 13, 2858, 783,
+          9852, 7594, 34403, 395, 783, 9290, 32824, 1257, 3197, 15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "action: Choose the one action that best resolves the customer's issue. [DESCRIPTION] send_pin: Send or reset the card PIN [DESCRIPTION] replace_card: Replace a lost or damaged physical card [DESCRIPTION] balance_help: Answer a balance question",
+            "(",
+            "[L]",
+            "send_pin",
+            "[L]",
+            "replace_card",
+            "[L]",
+            "balance_help",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 4, 16, 21, 28, 30, 34, 38, 42, 48, 53, 57, 61, 66, 73, 76, 80],
+        "text_tokens": [
+          "the",
+          "replacement",
+          "card",
+          "arrived",
+          ",",
+          "but",
+          "the",
+          "pin",
+          "never",
+          "came",
+          "and",
+          "the",
+          "card",
+          "cannot",
+          "be",
+          "used",
+          "."
+        ]
+      },
+      "id": "described_prompt_choice",
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 1913, 27, 28890, 253, 581, 2250, 326, 1682, 501, 14503, 253, 7731, 434, 2523, 15, 209, 50377, 5007,
+          64, 9852, 27, 23934, 390, 14932, 253, 3120, 39317, 209, 50377, 8171, 64, 9290, 27, 49083, 247, 3663, 390,
+          13572, 3520, 3120, 209, 50377, 6654, 64, 13070, 27, 37741, 247, 6654, 1953, 9, 50374, 13161, 64, 9852, 50374,
+          13481, 64, 9290, 50374, 20203, 64, 13070, 10, 10, 50369, 783, 250, 26380, 9290, 274, 30487, 13, 2858, 783,
+          9852, 7594, 34403, 395, 783, 9290, 32824, 1257, 3197, 15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "send_pin",
+              "replace_card",
+              "balance_help"
+            ],
+            "name": "action",
+            "raw_logits": [0.28340578079223633, -0.5972828269004822, -2.3520114421844482]
+          }
+        ]
+      },
+      "native_schema": {
+        "classifications": [
+          {
+            "label_definitions": {
+              "balance_help": {
+                "description": "Answer a balance question"
+              },
+              "replace_card": {
+                "description": "Replace a lost or damaged physical card"
+              },
+              "send_pin": {
+                "description": "Send or reset the card PIN"
+              }
+            },
+            "labels": [
+              "send_pin",
+              "replace_card",
+              "balance_help"
+            ],
+            "name": "action",
+            "prompt": "Choose the one action that best resolves the customer's issue.",
+            "top_k": 3
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"action\",\"prompt\":\"Choose the one action that best resolves the customer's issue.\",\"top_k\":3,\"labels\":[\"send_pin\",\"replace_card\",\"balance_help\"],\"label_definitions\":{\"send_pin\":{\"description\":\"Send or reset the card PIN\"},\"replace_card\":{\"description\":\"Replace a lost or damaged physical card\"},\"balance_help\":{\"description\":\"Answer a balance question\"}}}]}",
+      "probabilities": {
+        "action": {
+          "balance_help": 0.048236917597701996,
+          "replace_card": 0.2788999926926913,
+          "send_pin": 0.6728630897096067
+        }
+      },
+      "raw_logits": {
+        "action": {
+          "balance_help": -2.3520114421844482,
+          "replace_card": -0.5972828269004822,
+          "send_pin": 0.28340578079223633
+        }
+      },
+      "schema": {
+        "tasks": {
+          "action": {
+            "instruction": "Choose the one action that best resolves the customer's issue.",
+            "labels": {
+              "balance_help": "Answer a balance question",
+              "replace_card": "Replace a lost or damaged physical card",
+              "send_pin": "Send or reset the card PIN"
+            },
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "selected": {
+        "action": [
+          "send_pin"
+        ]
+      },
+      "semantic": {
+        "actual_tasks": [
+          "action"
+        ],
+        "expected_tasks": [
+          "action"
+        ],
+        "pass": true
+      },
+      "text": "The replacement card arrived, but the PIN never came and the card cannot be used."
+    },
+    {
+      "decide_expected": {
+        "answers": {
+          "page_on_call": {
+            "noul": 0.7582321540982758,
+            "type": "noul"
+          },
+          "response": {
+            "choice": "rollback",
+            "probabilities": {
+              "observe": 0.07980681737365411,
+              "retry": 0.09080441819652658,
+              "rollback": 0.8293887644298192
+            },
+            "type": "choice"
+          },
+          "severity": {
+            "legend": {
+              "0": "Low impact",
+              "1": "Moderate impact",
+              "2": "High impact",
+              "3": "Critical impact"
+            },
+            "probabilities": {
+              "0": 0.23232969937318687,
+              "1": 0.16631679852930845,
+              "2": 0.23072744984945065,
+              "3": 0.37062605224805406
+            },
+            "score": 1.739649854972372,
+            "type": "score"
+          }
+        },
+        "model": "fastino/GLiNER2.5-Decide-1B"
+      },
+      "decide_request": {
+        "model": "fastino/GLiNER2.5-Decide-1B",
+        "questions": {
+          "page_on_call": {
+            "instructions": "Should the on-call engineer be paged now?",
+            "type": "noul"
+          },
+          "response": {
+            "criteria": {
+              "observe": "Wait and collect more evidence",
+              "retry": "Retry the current deployment",
+              "rollback": "Roll back to the last healthy release"
+            },
+            "instructions": "Choose the safest immediate response.",
+            "type": "choice"
+          },
+          "severity": {
+            "criteria": [
+              "Low impact",
+              "Moderate impact",
+              "High impact",
+              "Critical impact"
+            ],
+            "instructions": "Score the incident severity.",
+            "type": "score"
+          }
+        },
+        "state": "The deployment failed twice, affects all customers, and rollback is ready."
+      },
+      "decide_request_json": "{\"model\":\"fastino/GLiNER2.5-Decide-1B\",\"state\":\"The deployment failed twice, affects all customers, and rollback is ready.\",\"questions\":{\"response\":{\"type\":\"choice\",\"instructions\":\"Choose the safest immediate response.\",\"criteria\":{\"rollback\":\"Roll back to the last healthy release\",\"retry\":\"Retry the current deployment\",\"observe\":\"Wait and collect more evidence\"}},\"severity\":{\"type\":\"score\",\"instructions\":\"Score the incident severity.\",\"criteria\":[\"Low impact\",\"Moderate impact\",\"High impact\",\"Critical impact\"]},\"page_on_call\":{\"type\":\"noul\",\"instructions\":\"Should the on-call engineer be paged now?\"}}}",
+      "encoded": {
+        "attention_mask": [
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+        ],
+        "end_mappings": [3, 14, 21, 27, 28, 36, 40, 50, 51, 55, 64, 67, 73, 74],
+        "input_ids": [
+          9, 50370, 10927, 27, 28890, 253, 4389, 383, 8993, 2380, 15, 209, 50377, 4533, 2135, 27, 21508, 896, 281, 253,
+          1390, 5875, 3727, 209, 50377, 47327, 27, 416, 5704, 253, 1655, 19007, 209, 50377, 10018, 27, 21050, 285, 4822,
+          625, 1941, 9, 50374, 1811, 2135, 50374, 1221, 610, 50374, 706, 40875, 10, 10, 50368, 9, 50370, 26219, 414, 27,
+          27292, 253, 7119, 12147, 15, 209, 50377, 470, 27, 11578, 3486, 209, 50377, 337, 27, 4559, 5034, 3486, 209,
+          50377, 374, 27, 4855, 3486, 209, 50377, 495, 27, 34448, 3486, 9, 50374, 17, 50374, 18, 50374, 19, 50374, 20,
+          10, 10, 50368, 9, 50370, 6377, 64, 251, 64, 4065, 27, 14482, 253, 327, 14, 4065, 16518, 320, 268, 2961, 1024,
+          32, 209, 50377, 3221, 27, 16708, 209, 50377, 2032, 27, 11793, 9, 50374, 7750, 50374, 5672, 10, 10, 50369, 783,
+          615, 27378, 27337, 7553, 547, 13, 66, 887, 84, 455, 13994, 398, 13, 395, 1811, 2135, 261, 2038, 15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "response: Choose the safest immediate response. [DESCRIPTION] rollback: Roll back to the last healthy release [DESCRIPTION] retry: Retry the current deployment [DESCRIPTION] observe: Wait and collect more evidence",
+            "(",
+            "[L]",
+            "rollback",
+            "[L]",
+            "retry",
+            "[L]",
+            "observe",
+            ")",
+            ")"
+          ],
+          [
+            "(",
+            "[P]",
+            "severity: Score the incident severity. [DESCRIPTION] 0: Low impact [DESCRIPTION] 1: Moderate impact [DESCRIPTION] 2: High impact [DESCRIPTION] 3: Critical impact",
+            "(",
+            "[L]",
+            "0",
+            "[L]",
+            "1",
+            "[L]",
+            "2",
+            "[L]",
+            "3",
+            ")",
+            ")"
+          ],
+          [
+            "(",
+            "[P]",
+            "page_on_call: Should the on-call engineer be paged now? [DESCRIPTION] false: False [DESCRIPTION] true: True",
+            "(",
+            "[L]",
+            "false",
+            "[L]",
+            "true",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 4, 15, 22, 27, 29, 37, 41, 50, 52, 56, 65, 68, 73],
+        "text_tokens": [
+          "the",
+          "deployment",
+          "failed",
+          "twice",
+          ",",
+          "affects",
+          "all",
+          "customers",
+          ",",
+          "and",
+          "rollback",
+          "is",
+          "ready",
+          "."
+        ]
+      },
+      "id": "choice_score_noul",
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 10927, 27, 28890, 253, 4389, 383, 8993, 2380, 15, 209, 50377, 4533, 2135, 27, 21508, 896, 281, 253,
+          1390, 5875, 3727, 209, 50377, 47327, 27, 416, 5704, 253, 1655, 19007, 209, 50377, 10018, 27, 21050, 285, 4822,
+          625, 1941, 9, 50374, 1811, 2135, 50374, 1221, 610, 50374, 706, 40875, 10, 10, 50368, 9, 50370, 26219, 414, 27,
+          27292, 253, 7119, 12147, 15, 209, 50377, 470, 27, 11578, 3486, 209, 50377, 337, 27, 4559, 5034, 3486, 209,
+          50377, 374, 27, 4855, 3486, 209, 50377, 495, 27, 34448, 3486, 9, 50374, 17, 50374, 18, 50374, 19, 50374, 20,
+          10, 10, 50368, 9, 50370, 6377, 64, 251, 64, 4065, 27, 14482, 253, 327, 14, 4065, 16518, 320, 268, 2961, 1024,
+          32, 209, 50377, 3221, 27, 16708, 209, 50377, 2032, 27, 11793, 9, 50374, 7750, 50374, 5672, 10, 10, 50369, 783,
+          615, 27378, 27337, 7553, 547, 13, 66, 887, 84, 455, 13994, 398, 13, 395, 1811, 2135, 261, 2038, 15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "rollback",
+              "retry",
+              "observe"
+            ],
+            "name": "response",
+            "raw_logits": [0.8552014827728271, -1.3567795753479004, -1.485878586769104]
+          },
+          {
+            "labels": [
+              "0",
+              "1",
+              "2",
+              "3"
+            ],
+            "name": "severity",
+            "raw_logits": [-1.539130449295044, -1.8733935356140137, -1.546050786972046, -1.0720943212509155]
+          },
+          {
+            "labels": [
+              "false",
+              "true"
+            ],
+            "name": "page_on_call",
+            "raw_logits": [-0.7481071949005127, 0.3949044644832611]
+          }
+        ]
+      },
+      "native_schema": {
+        "classifications": [
+          {
+            "label_definitions": {
+              "observe": {
+                "description": "Wait and collect more evidence"
+              },
+              "retry": {
+                "description": "Retry the current deployment"
+              },
+              "rollback": {
+                "description": "Roll back to the last healthy release"
+              }
+            },
+            "labels": [
+              "rollback",
+              "retry",
+              "observe"
+            ],
+            "name": "response",
+            "prompt": "Choose the safest immediate response.",
+            "top_k": 3
+          },
+          {
+            "label_definitions": {
+              "0": {
+                "description": "Low impact"
+              },
+              "1": {
+                "description": "Moderate impact"
+              },
+              "2": {
+                "description": "High impact"
+              },
+              "3": {
+                "description": "Critical impact"
+              }
+            },
+            "labels": [
+              "0",
+              "1",
+              "2",
+              "3"
+            ],
+            "name": "severity",
+            "prompt": "Score the incident severity.",
+            "top_k": 4
+          },
+          {
+            "label_definitions": {
+              "false": {
+                "description": "False"
+              },
+              "true": {
+                "description": "True"
+              }
+            },
+            "labels": [
+              "false",
+              "true"
+            ],
+            "name": "page_on_call",
+            "prompt": "Should the on-call engineer be paged now?",
+            "top_k": 2
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"response\",\"prompt\":\"Choose the safest immediate response.\",\"top_k\":3,\"labels\":[\"rollback\",\"retry\",\"observe\"],\"label_definitions\":{\"rollback\":{\"description\":\"Roll back to the last healthy release\"},\"retry\":{\"description\":\"Retry the current deployment\"},\"observe\":{\"description\":\"Wait and collect more evidence\"}}},{\"name\":\"severity\",\"prompt\":\"Score the incident severity.\",\"top_k\":4,\"labels\":[\"0\",\"1\",\"2\",\"3\"],\"label_definitions\":{\"0\":{\"description\":\"Low impact\"},\"1\":{\"description\":\"Moderate impact\"},\"2\":{\"description\":\"High impact\"},\"3\":{\"description\":\"Critical impact\"}}},{\"name\":\"page_on_call\",\"prompt\":\"Should the on-call engineer be paged now?\",\"top_k\":2,\"labels\":[\"false\",\"true\"],\"label_definitions\":{\"false\":{\"description\":\"False\"},\"true\":{\"description\":\"True\"}}}]}",
+      "probabilities": {
+        "page_on_call": {
+          "false": 0.2417678459017241,
+          "true": 0.7582321540982758
+        },
+        "response": {
+          "observe": 0.07980681737365411,
+          "retry": 0.09080441819652658,
+          "rollback": 0.8293887644298192
+        },
+        "severity": {
+          "0": 0.23232969937318687,
+          "1": 0.16631679852930845,
+          "2": 0.23072744984945065,
+          "3": 0.37062605224805406
+        }
+      },
+      "raw_logits": {
+        "page_on_call": {
+          "false": -0.7481071949005127,
+          "true": 0.3949044644832611
+        },
+        "response": {
+          "observe": -1.485878586769104,
+          "retry": -1.3567795753479004,
+          "rollback": 0.8552014827728271
+        },
+        "severity": {
+          "0": -1.539130449295044,
+          "1": -1.8733935356140137,
+          "2": -1.546050786972046,
+          "3": -1.0720943212509155
+        }
+      },
+      "schema": {
+        "tasks": {
+          "page_on_call": {
+            "instruction": "Should the on-call engineer be paged now?",
+            "labels": {
+              "false": "False",
+              "true": "True"
+            },
+            "max_labels": 1,
+            "min_labels": 1
+          },
+          "response": {
+            "instruction": "Choose the safest immediate response.",
+            "labels": {
+              "observe": "Wait and collect more evidence",
+              "retry": "Retry the current deployment",
+              "rollback": "Roll back to the last healthy release"
+            },
+            "max_labels": 1,
+            "min_labels": 1
+          },
+          "severity": {
+            "instruction": "Score the incident severity.",
+            "labels": {
+              "0": "Low impact",
+              "1": "Moderate impact",
+              "2": "High impact",
+              "3": "Critical impact"
+            },
+            "max_labels": 1,
+            "min_labels": 1,
+            "ordered": true
+          }
+        }
+      },
+      "selected": {
+        "page_on_call": [
+          "true"
+        ],
+        "response": [
+          "rollback"
+        ],
+        "severity": [
+          "3"
+        ]
+      },
+      "semantic": {
+        "actual_tasks": [
+          "response",
+          "severity",
+          "page_on_call"
+        ],
+        "expected_tasks": [
+          "response",
+          "severity",
+          "page_on_call"
+        ],
+        "pass": true
+      },
+      "text": "The deployment failed twice, affects all customers, and rollback is ready."
+    }
+  ],
+  "qualification": false,
+  "requests": [
+    {
+      "encoded": {
+        "attention_mask": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        "end_mappings": [6, 13, 17, 27, 32, 39, 40],
+        "input_ids": [
+          9, 50370, 30699, 9, 50374, 709, 1504, 50374, 48746, 64, 13821, 50374, 44178, 10, 10, 50369, 32897, 709, 1504,
+          783, 563, 21821, 9290, 7778, 15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "intent",
+            "(",
+            "[L]",
+            "refund",
+            "[L]",
+            "technical_support",
+            "[L]",
+            "sales",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 7, 14, 18, 28, 33, 39],
+        "text_tokens": [
+          "please",
+          "refund",
+          "the",
+          "duplicate",
+          "card",
+          "charge",
+          "."
+        ]
+      },
+      "id": "english_intent",
+      "kind": "classification",
+      "logits": {
+        "intent": {
+          "refund": 2.7878055572509766,
+          "sales": -3.554849863052368,
+          "technical_support": -3.442857265472412
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 30699, 9, 50374, 709, 1504, 50374, 48746, 64, 13821, 50374, 44178, 10, 10, 50369, 32897, 709, 1504,
+          783, 563, 21821, 9290, 7778, 15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "refund",
+              "technical_support",
+              "sales"
+            ],
+            "name": "intent",
+            "raw_logits": [2.7878055572509766, -3.442857265472412, -3.554849863052368]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.9962860742432521,
+                "label": "refund"
+              }
+            ],
+            "name": "intent"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "labels": [
+              "refund",
+              "technical_support",
+              "sales"
+            ],
+            "max_labels": 1,
+            "min_labels": 1,
+            "name": "intent"
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"intent\",\"labels\":[\"refund\",\"technical_support\",\"sales\"],\"min_labels\":1,\"max_labels\":1}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 2.7878055572509766,
+          "violations": []
+        },
+        "intent": {
+          "confidence": 0.9962860742432521,
+          "probabilities": {
+            "refund": 0.9962860742432521,
+            "sales": 0.0017530883766326147,
+            "technical_support": 0.0019608373801152756
+          },
+          "value": "refund"
+        }
+      },
+      "probabilities": {
+        "intent": {
+          "refund": 0.9962860742432521,
+          "sales": 0.0017530883766326147,
+          "technical_support": 0.0019608373801152756
+        }
+      },
+      "schema": {
+        "tasks": {
+          "intent": {
+            "labels": [
+              "refund",
+              "technical_support",
+              "sales"
+            ],
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "schema_fingerprint": "654d8f24c8a8abf1feb6208002362ad4ef8c2562efd776ba07010315d16fe5cc",
+      "selected": {
+        "intent": [
+          "refund"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "refund"
+            ],
+            "expected": [
+              "refund"
+            ],
+            "kind": "selected",
+            "pass": true,
+            "task": "intent"
+          }
+        ],
+        "pass": true
+      },
+      "text": "Please refund the duplicate card charge."
+    },
+    {
+      "encoded": {
+        "attention_mask": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        "end_mappings": [6, 15, 18, 26, 31, 38, 39],
+        "input_ids": [
+          9, 50370, 565, 2083, 4501, 9, 50374, 373, 677, 274, 50374, 68, 1369, 11158, 50374, 35899, 274, 50374, 5040,
+          503, 274, 10, 10, 50369, 371, 29568, 35899, 274, 7373, 373, 677, 66, 18920, 785, 6621, 3230, 15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "intención",
+            "(",
+            "[L]",
+            "reservar",
+            "[L]",
+            "cambiar",
+            "[L]",
+            "cancelar",
+            "[L]",
+            "consultar",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 7, 16, 19, 27, 32, 38],
+        "text_tokens": [
+          "quiero",
+          "cancelar",
+          "mi",
+          "reserva",
+          "para",
+          "mañana",
+          "."
+        ]
+      },
+      "id": "spanish_intent",
+      "kind": "classification",
+      "logits": {
+        "intención": {
+          "cambiar": -4.376052379608154,
+          "cancelar": 3.6670308113098145,
+          "consultar": -5.33974552154541,
+          "reservar": -4.536904811859131
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 565, 2083, 4501, 9, 50374, 373, 677, 274, 50374, 68, 1369, 11158, 50374, 35899, 274, 50374, 5040,
+          503, 274, 10, 10, 50369, 371, 29568, 35899, 274, 7373, 373, 677, 66, 18920, 785, 6621, 3230, 15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "reservar",
+              "cambiar",
+              "cancelar",
+              "consultar"
+            ],
+            "name": "intención",
+            "raw_logits": [-4.536904811859131, -4.376052379608154, 3.6670308113098145, -5.33974552154541]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.9992830465241191,
+                "label": "cancelar"
+              }
+            ],
+            "name": "intención"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "labels": [
+              "reservar",
+              "cambiar",
+              "cancelar",
+              "consultar"
+            ],
+            "max_labels": 1,
+            "min_labels": 1,
+            "name": "intención"
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"intención\",\"labels\":[\"reservar\",\"cambiar\",\"cancelar\",\"consultar\"],\"min_labels\":1,\"max_labels\":1}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 3.6670308113098145,
+          "violations": []
+        },
+        "intención": {
+          "confidence": 0.9992830465241191,
+          "probabilities": {
+            "cambiar": 0.0003210863713091987,
+            "cancelar": 0.9992830465241191,
+            "consultar": 0.0001224884836443723,
+            "reservar": 0.00027337862092737604
+          },
+          "value": "cancelar"
+        }
+      },
+      "probabilities": {
+        "intención": {
+          "cambiar": 0.0003210863713091987,
+          "cancelar": 0.9992830465241191,
+          "consultar": 0.0001224884836443723,
+          "reservar": 0.00027337862092737604
+        }
+      },
+      "schema": {
+        "tasks": {
+          "intención": {
+            "labels": [
+              "reservar",
+              "cambiar",
+              "cancelar",
+              "consultar"
+            ],
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "schema_fingerprint": "cea3301803c5310208084fc122935ab1259572b9d728d84dfc307b5e59fb0467",
+      "selected": {
+        "intención": [
+          "cancelar"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "cancelar"
+            ],
+            "expected": [
+              "cancelar"
+            ],
+            "kind": "selected",
+            "pass": true,
+            "task": "intención"
+          }
+        ],
+        "pass": true
+      },
+      "text": "Quiero cancelar mi reserva para mañana."
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1
+        ],
+        "end_mappings": [14, 15, 16],
+        "input_ids": [
+          9, 50370, 16800, 240, 27661, 122, 9, 50374, 44712, 20855, 50374, 48892, 33859, 50374, 33548, 41760, 9467,
+          41662, 16509, 50374, 43397, 14670, 212, 46180, 120, 19119, 224, 10, 10, 50369, 44712, 20855, 6449, 33548,
+          41760, 9467, 41662, 16509, 18309, 14016, 13973, 13129, 5151, 4340, 15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "依頼",
+            "(",
+            "[L]",
+            "注文",
+            "[L]",
+            "変更",
+            "[L]",
+            "キャンセル",
+            "[L]",
+            "状況確認",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 14, 15],
+        "text_tokens": [
+          "注文をキャンセルしてください",
+          "。",
+          "."
+        ]
+      },
+      "id": "japanese_intent",
+      "kind": "classification",
+      "logits": {
+        "依頼": {
+          "キャンセル": 2.7734789848327637,
+          "変更": -4.246890544891357,
+          "注文": -2.0116703510284424,
+          "状況確認": -4.4611077308654785
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 16800, 240, 27661, 122, 9, 50374, 44712, 20855, 50374, 48892, 33859, 50374, 33548, 41760, 9467,
+          41662, 16509, 50374, 43397, 14670, 212, 46180, 120, 19119, 224, 10, 10, 50369, 44712, 20855, 6449, 33548,
+          41760, 9467, 41662, 16509, 18309, 14016, 13973, 13129, 5151, 4340, 15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "注文",
+              "変更",
+              "キャンセル",
+              "状況確認"
+            ],
+            "name": "依頼",
+            "raw_logits": [-2.0116703510284424, -4.246890544891357, 2.7734789848327637, -4.4611077308654785]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.9901307952257268,
+                "label": "キャンセル"
+              }
+            ],
+            "name": "依頼"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "labels": [
+              "注文",
+              "変更",
+              "キャンセル",
+              "状況確認"
+            ],
+            "max_labels": 1,
+            "min_labels": 1,
+            "name": "依頼"
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"依頼\",\"labels\":[\"注文\",\"変更\",\"キャンセル\",\"状況確認\"],\"min_labels\":1,\"max_labels\":1}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 2.7734789848327637,
+          "violations": []
+        },
+        "依頼": {
+          "confidence": 0.9901307952257268,
+          "probabilities": {
+            "キャンセル": 0.9901307952257268,
+            "変更": 0.000884677171106771,
+            "注文": 0.008270440024456262,
+            "状況確認": 0.0007140875787102114
+          },
+          "value": "キャンセル"
+        }
+      },
+      "probabilities": {
+        "依頼": {
+          "キャンセル": 0.9901307952257268,
+          "変更": 0.000884677171106771,
+          "注文": 0.008270440024456262,
+          "状況確認": 0.0007140875787102114
+        }
+      },
+      "schema": {
+        "tasks": {
+          "依頼": {
+            "labels": [
+              "注文",
+              "変更",
+              "キャンセル",
+              "状況確認"
+            ],
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "schema_fingerprint": "a9780e16ec4463145b48ad138d466274697520ed7c257810d9169bc351fbc676",
+      "selected": {
+        "依頼": [
+          "キャンセル"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "キャンセル"
+            ],
+            "expected": [
+              "キャンセル"
+            ],
+            "kind": "selected",
+            "pass": true,
+            "task": "依頼"
+          }
+        ],
+        "pass": true
+      },
+      "text": "注文をキャンセルしてください。"
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+        ],
+        "end_mappings": [4, 10, 15, 21, 25, 29, 36, 37],
+        "input_ids": [
+          9, 50370, 7427, 29937, 4467, 13621, 9, 50374, 21931, 23072, 29620, 50374, 8181, 50011, 6463, 44353, 50374, 148,
+          100, 4467, 50011, 10714, 96, 50374, 46978, 8181, 13793, 4467, 30901, 10, 10, 50369, 32416, 6900, 6463, 9211,
+          8181, 50011, 6463, 44353, 5843, 6534, 13793, 9211, 6900, 21931, 4467, 8181, 6463, 148, 100, 38033, 6463, 6534,
+          5843, 7427, 23072, 5843, 13793, 12458, 15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "الطلب",
+            "(",
+            "[L]",
+            "حجز",
+            "[L]",
+            "تغيير",
+            "[L]",
+            "إلغاء",
+            "[L]",
+            "استعلام",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 5, 11, 16, 22, 26, 30, 36],
+        "text_tokens": [
+          "أريد",
+          "تغيير",
+          "موعد",
+          "رحلتي",
+          "إلى",
+          "يوم",
+          "الجمعة",
+          "."
+        ]
+      },
+      "id": "arabic_intent",
+      "kind": "classification",
+      "logits": {
+        "الطلب": {
+          "إلغاء": -3.041379928588867,
+          "استعلام": -2.5336153507232666,
+          "تغيير": 1.5446805953979492,
+          "حجز": -2.4143543243408203
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 7427, 29937, 4467, 13621, 9, 50374, 21931, 23072, 29620, 50374, 8181, 50011, 6463, 44353, 50374, 148,
+          100, 4467, 50011, 10714, 96, 50374, 46978, 8181, 13793, 4467, 30901, 10, 10, 50369, 32416, 6900, 6463, 9211,
+          8181, 50011, 6463, 44353, 5843, 6534, 13793, 9211, 6900, 21931, 4467, 8181, 6463, 148, 100, 38033, 6463, 6534,
+          5843, 7427, 23072, 5843, 13793, 12458, 15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "حجز",
+              "تغيير",
+              "إلغاء",
+              "استعلام"
+            ],
+            "name": "الطلب",
+            "raw_logits": [-2.4143543243408203, 1.5446805953979492, -3.041379928588867, -2.5336153507232666]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.9558303563785708,
+                "label": "تغيير"
+              }
+            ],
+            "name": "الطلب"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "labels": [
+              "حجز",
+              "تغيير",
+              "إلغاء",
+              "استعلام"
+            ],
+            "max_labels": 1,
+            "min_labels": 1,
+            "name": "الطلب"
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"الطلب\",\"labels\":[\"حجز\",\"تغيير\",\"إلغاء\",\"استعلام\"],\"min_labels\":1,\"max_labels\":1}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 1.5446805953979492,
+          "violations": []
+        },
+        "الطلب": {
+          "confidence": 0.9558303563785708,
+          "probabilities": {
+            "إلغاء": 0.009742715931272027,
+            "استعلام": 0.016188231047846707,
+            "تغيير": 0.9558303563785708,
+            "حجز": 0.018238696642310485
+          },
+          "value": "تغيير"
+        }
+      },
+      "probabilities": {
+        "الطلب": {
+          "إلغاء": 0.009742715931272027,
+          "استعلام": 0.016188231047846707,
+          "تغيير": 0.9558303563785708,
+          "حجز": 0.018238696642310485
+        }
+      },
+      "schema": {
+        "tasks": {
+          "الطلب": {
+            "labels": [
+              "حجز",
+              "تغيير",
+              "إلغاء",
+              "استعلام"
+            ],
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "schema_fingerprint": "5497a351e3e32995578cdd209aea7aed4d477529acb46193aa08d60520a2c88b",
+      "selected": {
+        "الطلب": [
+          "تغيير"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "تغيير"
+            ],
+            "expected": [
+              "تغيير"
+            ],
+            "kind": "selected",
+            "pass": true,
+            "task": "الطلب"
+          }
+        ],
+        "pass": true
+      },
+      "text": "أريد تغيير موعد رحلتي إلى يوم الجمعة."
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1
+        ],
+        "end_mappings": [3, 7, 12, 20, 21, 25, 27, 33, 42, 46, 50, 54, 61, 65, 68, 69],
+        "input_ids": [
+          9, 50370, 30699, 209, 50377, 3120, 64, 9852, 64, 4168, 27, 380, 7731, 3198, 247, 747, 39317, 390, 858, 417,
+          4763, 352, 209, 50377, 3120, 64, 38483, 27, 380, 3520, 3120, 310, 5816, 209, 50377, 6654, 64, 21500, 11028, 27,
+          380, 7731, 12325, 323, 271, 2395, 6654, 9, 50374, 9290, 64, 9852, 64, 4168, 50374, 9290, 64, 38483, 50374,
+          20203, 64, 21500, 11028, 10, 10, 50369, 783, 1826, 9290, 274, 30487, 13, 2858, 74, 7594, 35413, 953, 9852, 395,
+          32824, 2327, 262, 15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "intent [DESCRIPTION] card_pin_change: The customer needs a new PIN or did not receive it [DESCRIPTION] card_lost: The physical card is missing [DESCRIPTION] balance_inquiry: The customer asks for an account balance",
+            "(",
+            "[L]",
+            "card_pin_change",
+            "[L]",
+            "card_lost",
+            "[L]",
+            "balance_inquiry",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 4, 8, 13, 20, 22, 26, 28, 34, 43, 47, 51, 55, 62, 66, 68],
+        "text_tokens": [
+          "the",
+          "new",
+          "card",
+          "arrived",
+          ",",
+          "but",
+          "i",
+          "never",
+          "received",
+          "its",
+          "pin",
+          "and",
+          "cannot",
+          "use",
+          "it",
+          "."
+        ]
+      },
+      "id": "described_labels",
+      "kind": "classification",
+      "logits": {
+        "intent": {
+          "balance_inquiry": -2.027876138687134,
+          "card_lost": -0.6882049441337585,
+          "card_pin_change": -0.44867444038391113
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 30699, 209, 50377, 3120, 64, 9852, 64, 4168, 27, 380, 7731, 3198, 247, 747, 39317, 390, 858, 417,
+          4763, 352, 209, 50377, 3120, 64, 38483, 27, 380, 3520, 3120, 310, 5816, 209, 50377, 6654, 64, 21500, 11028, 27,
+          380, 7731, 12325, 323, 271, 2395, 6654, 9, 50374, 9290, 64, 9852, 64, 4168, 50374, 9290, 64, 38483, 50374,
+          20203, 64, 21500, 11028, 10, 10, 50369, 783, 1826, 9290, 274, 30487, 13, 2858, 74, 7594, 35413, 953, 9852, 395,
+          32824, 2327, 262, 15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "card_pin_change",
+              "card_lost",
+              "balance_inquiry"
+            ],
+            "name": "intent",
+            "raw_logits": [-0.44867444038391113, -0.6882049441337585, -2.027876138687134]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.5017216929258406,
+                "label": "card_pin_change"
+              }
+            ],
+            "name": "intent"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "label_definitions": {
+              "balance_inquiry": {
+                "description": "The customer asks for an account balance"
+              },
+              "card_lost": {
+                "description": "The physical card is missing"
+              },
+              "card_pin_change": {
+                "description": "The customer needs a new PIN or did not receive it"
+              }
+            },
+            "labels": [
+              "card_pin_change",
+              "card_lost",
+              "balance_inquiry"
+            ],
+            "max_labels": 1,
+            "min_labels": 1,
+            "name": "intent"
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"intent\",\"labels\":[\"card_pin_change\",\"card_lost\",\"balance_inquiry\"],\"label_definitions\":{\"card_pin_change\":{\"description\":\"The customer needs a new PIN or did not receive it\"},\"card_lost\":{\"description\":\"The physical card is missing\"},\"balance_inquiry\":{\"description\":\"The customer asks for an account balance\"}},\"min_labels\":1,\"max_labels\":1}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": -0.44867444038391113,
+          "violations": []
+        },
+        "intent": {
+          "confidence": 0.5017216929258406,
+          "probabilities": {
+            "balance_inquiry": 0.10342470614355333,
+            "card_lost": 0.3948536009306061,
+            "card_pin_change": 0.5017216929258406
+          },
+          "value": "card_pin_change"
+        }
+      },
+      "probabilities": {
+        "intent": {
+          "balance_inquiry": 0.10342470614355333,
+          "card_lost": 0.3948536009306061,
+          "card_pin_change": 0.5017216929258406
+        }
+      },
+      "schema": {
+        "tasks": {
+          "intent": {
+            "labels": {
+              "balance_inquiry": "The customer asks for an account balance",
+              "card_lost": "The physical card is missing",
+              "card_pin_change": "The customer needs a new PIN or did not receive it"
+            },
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "schema_fingerprint": "1a00f6c491919cf8b37e52d6a8a693ed02b23ce7c88fa06266872d875a0e0475",
+      "selected": {
+        "intent": [
+          "card_pin_change"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "card_pin_change"
+            ],
+            "expected": [
+              "card_pin_change"
+            ],
+            "kind": "selected",
+            "pass": true,
+            "task": "intent"
+          }
+        ],
+        "pass": true
+      },
+      "text": "The new card arrived, but I never received its PIN and cannot use it."
+    },
+    {
+      "encoded": {
+        "attention_mask": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        "end_mappings": [3, 10, 14, 21, 24, 29, 33, 41, 46, 52, 55, 60, 61],
+        "input_ids": [
+          9, 50370, 31984, 27, 10348, 253, 23848, 4901, 715, 3490, 275, 9748, 32, 9, 50374, 9820, 50374, 2369, 10, 10,
+          50369, 783, 38441, 90, 4238, 36323, 249, 13895, 395, 49601, 14806, 4774, 249, 13549, 15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "answer: Did the treaty enter into force in 1992?",
+            "(",
+            "[L]",
+            "yes",
+            "[L]",
+            "no",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 4, 11, 15, 22, 25, 30, 34, 42, 47, 53, 56, 60],
+        "text_tokens": [
+          "the",
+          "treaty",
+          "was",
+          "signed",
+          "in",
+          "1992",
+          "and",
+          "entered",
+          "into",
+          "force",
+          "in",
+          "1993",
+          "."
+        ]
+      },
+      "id": "instruction_prompt",
+      "kind": "classification",
+      "logits": {
+        "answer": {
+          "no": -1.6395200490951538,
+          "yes": 1.8183664083480835
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 31984, 27, 10348, 253, 23848, 4901, 715, 3490, 275, 9748, 32, 9, 50374, 9820, 50374, 2369, 10, 10,
+          50369, 783, 38441, 90, 4238, 36323, 249, 13895, 395, 49601, 14806, 4774, 249, 13549, 15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "yes",
+              "no"
+            ],
+            "name": "answer",
+            "raw_logits": [1.8183664083480835, -1.6395200490951538]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.9694654633121459,
+                "label": "yes"
+              }
+            ],
+            "name": "answer"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "instruction": "Did the treaty enter into force in 1992?",
+            "labels": [
+              "yes",
+              "no"
+            ],
+            "max_labels": 1,
+            "min_labels": 1,
+            "name": "answer"
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"answer\",\"labels\":[\"yes\",\"no\"],\"min_labels\":1,\"max_labels\":1,\"instruction\":\"Did the treaty enter into force in 1992?\"}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 1.8183664083480835,
+          "violations": []
+        },
+        "answer": {
+          "confidence": 0.9694654633121459,
+          "probabilities": {
+            "no": 0.030534536687854136,
+            "yes": 0.9694654633121459
+          },
+          "value": "yes"
+        }
+      },
+      "probabilities": {
+        "answer": {
+          "no": 0.030534536687854136,
+          "yes": 0.9694654633121459
+        }
+      },
+      "schema": {
+        "tasks": {
+          "answer": {
+            "instruction": "Did the treaty enter into force in 1992?",
+            "labels": [
+              "yes",
+              "no"
+            ],
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "schema_fingerprint": "9c516cd2f349cedaa3efe040f9a219a846d2b0aee23755e7fcabf4268f9007c4",
+      "selected": {
+        "answer": [
+          "yes"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "yes"
+            ],
+            "expected": [
+              "no"
+            ],
+            "kind": "selected",
+            "pass": false,
+            "task": "answer"
+          }
+        ],
+        "pass": false
+      },
+      "text": "The treaty was signed in 1992 and entered into force in 1993."
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1
+        ],
+        "end_mappings": [3, 11, 16, 23, 29, 30, 34, 38, 47, 51, 58, 62, 72, 73],
+        "input_ids": [
+          9, 50370, 284, 808, 84, 9, 50374, 67, 27263, 50374, 2364, 4697, 50374, 14396, 50374, 32499, 50374, 19209,
+          50374, 13821, 10, 10, 50369, 783, 67, 27263, 37229, 9131, 77, 3204, 13, 2858, 783, 2364, 4697, 395, 14396, 609,
+          911, 26128, 15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "aspects",
+            "(",
+            "[L]",
+            "battery",
+            "[L]",
+            "keyboard",
+            "[L]",
+            "screen",
+            "[L]",
+            "camera",
+            "[L]",
+            "price",
+            "[L]",
+            "support",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [0, 4, 12, 17, 24, 29, 31, 35, 39, 48, 52, 59, 63, 72],
+        "text_tokens": [
+          "the",
+          "battery",
+          "dies",
+          "before",
+          "lunch",
+          ",",
+          "but",
+          "the",
+          "keyboard",
+          "and",
+          "screen",
+          "are",
+          "excellent",
+          "."
+        ]
+      },
+      "id": "multi_label_aspects",
+      "kind": "classification",
+      "logits": {
+        "aspects": {
+          "battery": 2.02371883392334,
+          "camera": -5.12205696105957,
+          "keyboard": 1.7001844644546509,
+          "price": -3.9481678009033203,
+          "screen": 1.531786322593689,
+          "support": -4.606496810913086
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 284, 808, 84, 9, 50374, 67, 27263, 50374, 2364, 4697, 50374, 14396, 50374, 32499, 50374, 19209,
+          50374, 13821, 10, 10, 50369, 783, 67, 27263, 37229, 9131, 77, 3204, 13, 2858, 783, 2364, 4697, 395, 14396, 609,
+          911, 26128, 15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "battery",
+              "keyboard",
+              "screen",
+              "camera",
+              "price",
+              "support"
+            ],
+            "name": "aspects",
+            "raw_logits": [
+              2.02371883392334, 1.7001844644546509, 1.531786322593689, -5.12205696105957, -3.9481678009033203,
+              -4.606496810913086
+            ]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.8832649972915061,
+                "label": "battery"
+              },
+              {
+                "confidence": 0.8455588254987787,
+                "label": "keyboard"
+              },
+              {
+                "confidence": 0.8222675242071651,
+                "label": "screen"
+              }
+            ],
+            "name": "aspects"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "labels": [
+              "battery",
+              "keyboard",
+              "screen",
+              "camera",
+              "price",
+              "support"
+            ],
+            "max_labels": 6,
+            "min_labels": 0,
+            "name": "aspects",
+            "threshold": 0.4
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"aspects\",\"labels\":[\"battery\",\"keyboard\",\"screen\",\"camera\",\"price\",\"support\"],\"min_labels\":0,\"max_labels\":6,\"threshold\":0.4}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 6.472084945296173,
+          "violations": []
+        },
+        "aspects": {
+          "confidence": 0.9165905368547196,
+          "probabilities": {
+            "battery": 0.8832649972915061,
+            "camera": 0.005928387701353327,
+            "keyboard": 0.8455588254987787,
+            "price": 0.01892495003697551,
+            "screen": 0.8222675242071651,
+            "support": 0.009887993699153375
+          },
+          "value": [
+            "battery",
+            "keyboard",
+            "screen"
+          ]
+        }
+      },
+      "probabilities": {
+        "aspects": {
+          "battery": 0.8832649972915061,
+          "camera": 0.005928387701353327,
+          "keyboard": 0.8455588254987787,
+          "price": 0.01892495003697551,
+          "screen": 0.8222675242071651,
+          "support": 0.009887993699153375
+        }
+      },
+      "schema": {
+        "tasks": {
+          "aspects": {
+            "labels": [
+              "battery",
+              "keyboard",
+              "screen",
+              "camera",
+              "price",
+              "support"
+            ],
+            "max_labels": 6,
+            "min_labels": 0,
+            "threshold": 0.4
+          }
+        }
+      },
+      "schema_fingerprint": "8fdbb34253884ca5f6825f324f9fe0bf876afb022000a8e33dca37e3e37a582d",
+      "selected": {
+        "aspects": [
+          "battery",
+          "keyboard",
+          "screen"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "battery",
+              "keyboard",
+              "screen"
+            ],
+            "expected": [
+              "battery",
+              "keyboard",
+              "screen"
+            ],
+            "kind": "selected_contains",
+            "pass": true,
+            "task": "aspects"
+          }
+        ],
+        "pass": true
+      },
+      "text": "The battery dies before lunch, but the keyboard and screen are excellent."
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+        ],
+        "end_mappings": [
+          6, 10, 17, 22, 27, 30, 38, 41, 50, 59, 62, 69, 70, 74, 79, 86, 95, 102, 110, 114, 124, 125, 133, 134, 138, 145,
+          154, 155, 162, 166, 172, 180, 181, 188, 197, 201, 208, 213, 218, 224, 229, 233, 243, 248, 253, 258, 264, 269,
+          271, 275, 282, 285, 294, 295, 305, 315, 321, 329, 330, 339, 345, 346, 354, 363, 364, 368, 381, 389, 390, 394,
+          402, 410, 414, 422, 425, 430, 437, 442, 450, 458, 465, 471, 479, 489, 494, 504, 505, 512, 517, 522, 529, 530,
+          536, 541, 548, 559, 560, 564, 568, 577, 583, 588, 596, 598, 607, 614, 620, 624, 630, 639, 645, 650, 657, 658
+        ],
+        "input_ids": [
+          9, 50370, 24841, 27, 28890, 253, 2014, 2022, 9400, 273, 436, 3389, 15, 209, 50377, 8410, 27, 329, 1436, 27022,
+          390, 2987, 323, 271, 6003, 209, 50377, 1885, 27, 329, 1885, 390, 7681, 985, 310, 5469, 209, 50377, 643, 27,
+          380, 2505, 310, 670, 1529, 2256, 9, 50374, 38361, 50374, 7509, 50374, 977, 10, 10, 50369, 75, 11208, 14906,
+          5309, 967, 317, 1405, 77, 5375, 249, 339, 4046, 284, 36642, 39874, 251, 78, 6461, 15, 783, 22035, 7973, 84,
+          31631, 8716, 39098, 1542, 73, 10472, 932, 13, 19221, 84, 13, 395, 4387, 356, 4601, 15, 32674, 783, 7053, 1405,
+          8211, 13, 75, 11208, 33349, 783, 20476, 11139, 3113, 3225, 5973, 1200, 1240, 395, 37467, 3529, 317, 1405, 77,
+          5375, 12756, 5758, 66, 1826, 30496, 249, 631, 1373, 15, 15179, 398, 35844, 264, 7645, 15177, 13, 10927, 15507,
+          13, 13552, 1974, 38211, 13, 395, 9961, 39661, 13821, 15, 783, 25610, 23824, 84, 783, 10408, 936, 13070, 79,
+          2244, 265, 8606, 15325, 46622, 27032, 6050, 23492, 19579, 2203, 18641, 15, 75, 11208, 9846, 26460, 73, 4261,
+          13, 3225, 5973, 9846, 48200, 42316, 13, 395, 783, 36642, 4399, 9846, 48336, 66, 24951, 16223, 6438, 783, 7053,
+          34590, 21845, 8384, 10167, 15
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "topic: Choose the single main topic of this document. [DESCRIPTION] employment: A person joins or works for an organization [DESCRIPTION] product: A product or technical system is discussed [DESCRIPTION] other: The text is about another subject",
+            "(",
+            "[L]",
+            "employment",
+            "[L]",
+            "product",
+            "[L]",
+            "other",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0, 7, 11, 18, 23, 28, 31, 39, 42, 51, 60, 63, 69, 71, 75, 80, 87, 96, 103, 111, 115, 124, 126, 133, 135, 139,
+          146, 154, 156, 163, 167, 173, 180, 182, 189, 198, 202, 209, 214, 219, 225, 230, 234, 244, 249, 254, 259, 265,
+          270, 272, 276, 283, 286, 294, 296, 306, 316, 322, 329, 331, 340, 345, 347, 355, 363, 365, 369, 382, 389, 391,
+          395, 403, 411, 415, 423, 426, 431, 438, 443, 451, 459, 466, 472, 480, 490, 495, 504, 506, 513, 518, 523, 529,
+          531, 537, 542, 549, 559, 561, 565, 569, 578, 584, 589, 597, 599, 608, 615, 621, 625, 631, 640, 646, 651, 657
+        ],
+        "text_tokens": [
+          "jordan",
+          "lee",
+          "joined",
+          "acme",
+          "labs",
+          "in",
+          "seattle",
+          "as",
+          "research",
+          "director",
+          "on",
+          "monday",
+          ".",
+          "the",
+          "team",
+          "builds",
+          "reliable",
+          "search",
+          "systems",
+          "for",
+          "hospitals",
+          ",",
+          "schools",
+          ",",
+          "and",
+          "public",
+          "agencies",
+          ".",
+          "during",
+          "the",
+          "first",
+          "meeting",
+          ",",
+          "jordan",
+          "reviewed",
+          "the",
+          "launch",
+          "plan",
+          "with",
+          "priya",
+          "shah",
+          "and",
+          "confirmed",
+          "that",
+          "acme",
+          "labs",
+          "would",
+          "open",
+          "a",
+          "new",
+          "office",
+          "in",
+          "portland",
+          ".",
+          "engineers",
+          "discussed",
+          "model",
+          "quality",
+          ",",
+          "response",
+          "speed",
+          ",",
+          "privacy",
+          "controls",
+          ",",
+          "and",
+          "multilingual",
+          "support",
+          ".",
+          "the",
+          "company",
+          "expects",
+          "the",
+          "project",
+          "to",
+          "help",
+          "nurses",
+          "find",
+          "patient",
+          "records",
+          "faster",
+          "while",
+          "keeping",
+          "sensitive",
+          "data",
+          "protected",
+          ".",
+          "jordan",
+          "will",
+          "lead",
+          "hiring",
+          ",",
+          "priya",
+          "will",
+          "manage",
+          "operations",
+          ",",
+          "and",
+          "the",
+          "research",
+          "group",
+          "will",
+          "publish",
+          "a",
+          "progress",
+          "report",
+          "after",
+          "the",
+          "first",
+          "customer",
+          "trial",
+          "next",
+          "spring",
+          "."
+        ]
+      },
+      "id": "long_context_cutoff",
+      "kind": "classification",
+      "logits": {
+        "topic": {
+          "employment": 0.5384681820869446,
+          "other": -1.902353048324585,
+          "product": -1.0756205320358276
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          9, 50370, 24841, 27, 28890, 253, 2014, 2022, 9400, 273, 436, 3389, 15, 209, 50377, 8410, 27, 329, 1436, 27022,
+          390, 2987, 323, 271, 6003, 209, 50377, 1885, 27, 329, 1885, 390, 7681, 985, 310, 5469, 209, 50377, 643, 27,
+          380, 2505, 310, 670, 1529, 2256, 9, 50374, 38361, 50374, 7509, 50374, 977, 10, 10, 50369, 75, 11208, 14906,
+          5309, 967, 317, 1405, 77, 5375, 249, 339, 4046, 284, 36642, 39874, 251, 78, 6461, 15, 783, 22035, 7973, 84,
+          31631, 8716, 39098, 1542, 73, 10472, 932, 13, 19221, 84, 13, 395, 4387, 356, 4601, 15, 32674, 783, 7053, 1405,
+          8211, 13, 75, 11208, 33349, 783, 20476, 11139, 3113, 3225, 5973, 1200, 1240, 395, 37467, 3529, 317, 1405, 77,
+          5375, 12756, 5758, 66, 1826, 30496, 249, 631, 1373, 15, 15179, 398, 35844, 264, 7645, 15177, 13, 10927, 15507,
+          13, 13552, 1974, 38211, 13, 395, 9961, 39661, 13821, 15, 783, 25610, 23824, 84, 783, 10408, 936, 13070, 79,
+          2244, 265, 8606, 15325, 46622, 27032, 6050, 23492, 19579, 2203, 18641, 15, 75, 11208, 9846, 26460, 73, 4261,
+          13, 3225, 5973, 9846, 48200, 42316, 13, 395, 783, 36642, 4399, 9846, 48336, 66, 24951, 16223, 6438, 783, 7053,
+          34590, 21845, 8384, 10167, 15
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "employment",
+              "product",
+              "other"
+            ],
+            "name": "topic",
+            "raw_logits": [0.5384681820869446, -1.0756205320358276, -1.902353048324585]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.7775074551015492,
+                "label": "employment"
+              }
+            ],
+            "name": "topic"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "instruction": "Choose the single main topic of this document.",
+            "label_definitions": {
+              "employment": {
+                "description": "A person joins or works for an organization"
+              },
+              "other": {
+                "description": "The text is about another subject"
+              },
+              "product": {
+                "description": "A product or technical system is discussed"
+              }
+            },
+            "labels": [
+              "employment",
+              "product",
+              "other"
+            ],
+            "max_labels": 1,
+            "min_labels": 1,
+            "name": "topic"
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"topic\",\"labels\":[\"employment\",\"product\",\"other\"],\"label_definitions\":{\"employment\":{\"description\":\"A person joins or works for an organization\"},\"product\":{\"description\":\"A product or technical system is discussed\"},\"other\":{\"description\":\"The text is about another subject\"}},\"min_labels\":1,\"max_labels\":1,\"instruction\":\"Choose the single main topic of this document.\"}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 0.5384681820869446,
+          "violations": []
+        },
+        "topic": {
+          "confidence": 0.7775074551015492,
+          "probabilities": {
+            "employment": 0.7775074551015492,
+            "other": 0.0677125813340639,
+            "product": 0.15477996356438692
+          },
+          "value": "employment"
+        }
+      },
+      "probabilities": {
+        "topic": {
+          "employment": 0.7775074551015492,
+          "other": 0.0677125813340639,
+          "product": 0.15477996356438692
+        }
+      },
+      "schema": {
+        "tasks": {
+          "topic": {
+            "instruction": "Choose the single main topic of this document.",
+            "labels": {
+              "employment": "A person joins or works for an organization",
+              "other": "The text is about another subject",
+              "product": "A product or technical system is discussed"
+            },
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "schema_fingerprint": "069dc3bfc5414224d2ee5aa67407734fbd0c945311198d17aea3bd68d58ac32e",
+      "selected": {
+        "topic": [
+          "employment"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "employment"
+            ],
+            "expected": [
+              "employment"
+            ],
+            "kind": "selected",
+            "pass": true,
+            "task": "topic"
+          }
+        ],
+        "pass": true
+      },
+      "text": "Jordan Lee joined Acme Labs in Seattle as research director on Monday. The team builds reliable search systems for hospitals, schools, and public agencies. During the first meeting, Jordan reviewed the launch plan with Priya Shah and confirmed that Acme Labs would open a new office in Portland. Engineers discussed model quality, response speed, privacy controls, and multilingual support. The company expects the project to help nurses find patient records faster while keeping sensitive data protected. Jordan will lead hiring, Priya will manage operations, and the research group will publish a progress report after the first customer trial next spring."
+    }
+  ],
+  "rope": {
+    "head_dim": 64,
+    "layers": {
+      "full_attention": {
+        "first": 1.0,
+        "inv_freq_count": 32,
+        "inv_freq_sha256_f32le": "adb41194debe8e6c185d47754f68cc2dd59960a03cb4ccbc71acd14b860c4604",
+        "last": 9.088847036764491e-06,
+        "rope_theta": 160000.0
+      },
+      "sliding_attention": {
+        "first": 1.0,
+        "inv_freq_count": 32,
+        "inv_freq_sha256_f32le": "adb41194debe8e6c185d47754f68cc2dd59960a03cb4ccbc71acd14b860c4604",
+        "last": 9.088847036764491e-06,
+        "rope_theta": 160000.0
+      }
+    }
+  },
+  "runtime": {
+    "device": "cpu",
+    "dtype": "float32",
+    "external_packages": {
+      "pydantic": "2.12.3",
+      "torch": "2.9.1"
+    },
+    "isolated_packages": {
+      "annotated-doc": "0.0.5",
+      "anyio": "4.15.1",
+      "certifi": "2026.7.22",
+      "click": "8.5.0",
+      "filelock": "4.0.12",
+      "fsspec": "2026.9.0",
+      "h11": "0.16.0",
+      "hf-xet": "1.6.0",
+      "httpcore": "1.0.9",
+      "httpx": "0.28.1",
+      "huggingface-hub": "1.33.0",
+      "idna": "3.20",
+      "markdown-it-py": "4.2.0",
+      "mdurl": "0.1.2",
+      "numpy": "2.5.3",
+      "packaging": "26.3",
+      "pygments": "2.21.0",
+      "pyyaml": "6.0.3",
+      "regex": "2026.9.29",
+      "rich": "15.0.0",
+      "safetensors": "0.8.0",
+      "shellingham": "1.5.4",
+      "tokenizers": "0.23.2",
+      "tqdm": "4.70.1",
+      "transformers": "5.17.0",
+      "typer": "0.27.3",
+      "typing-extensions": "4.16.0"
+    },
+    "python": "3.12.3",
+    "runtime_dir": "/private/tmp/antfly-gliner-transformers-5.17-py312",
+    "threads": 2,
+    "transformers_distribution": {
+      "filename": "transformers-5.17.0-py3-none-any.whl",
+      "installed_metadata_sha256": "cd295c5ad2c605e3c04456740df174e6a1bf5418eb2563788dc2163253f6d882",
+      "installed_record_sha256": "9abc15801d4bf3c6d5962bc03df670ae577967be4e5ac995c082c6255023910c",
+      "sha256": "78ec1ce21579b38dfb83950a0658cd119f87212a2fcfdff478096ce9d6c03801",
+      "size_bytes": 12295140,
+      "source_repo": "https://github.com/huggingface/transformers",
+      "source_revision": "856157a2f3e9594954310df18fdccc31ffddebe9"
+    },
+    "unicode": "15.0.0",
+    "verified_tree": {
+      "files": 4908,
+      "record_files": 27,
+      "tree_sha256": "6259dc40ff96d6bb7afaf079345be8e36bc3c3fd77194b9a88a6c635ba0f6969"
+    }
+  },
+  "scope": "upstream_decide_1b_classification_reference",
+  "semantic_pass": false,
+  "source": {
+    "checkout": "/private/tmp/antfly-gliner-family-upstream",
+    "package_version": "2.0.0",
+    "repo": "https://github.com/fastino-ai/GLiNER2",
+    "revision": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf"
+  },
+  "status": "captured"
+}

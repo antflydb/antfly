@@ -389,6 +389,8 @@ pub const ExternalLakeTableSource = struct {
     uri: []const u8,
     schema_fingerprint: ?[]const u8 = null,
     write_policy: ?[]const u8 = null,
+    /// Set immutable only when data files are never replaced at an existing URI. Allows authenticated provider-version proofs from retained index generations to be reused for unchanged data files. Metadata and delete files are still verified.
+    object_mutability: ?[]const u8 = null,
     credentials: ?ExternalLakeCredentialRef = null,
     snapshot: ?ExternalLakeSnapshotSelector = null,
 
@@ -400,6 +402,7 @@ pub const ExternalLakeTableSource = struct {
         .{ "uri", "uri", false },
         .{ "schema_fingerprint", "schema_fingerprint", true },
         .{ "write_policy", "write_policy", true },
+        .{ "object_mutability", "object_mutability", true },
         .{ "credentials", "credentials", true },
         .{ "snapshot", "snapshot", true },
     };
@@ -428,6 +431,10 @@ pub const ExternalLakeTableSource = struct {
         }
         if (self.write_policy) |value| {
             try jw.objectField("write_policy");
+            try jw.write(value);
+        }
+        if (self.object_mutability) |value| {
+            try jw.objectField("object_mutability");
             try jw.write(value);
         }
         if (self.credentials) |value| {

@@ -313,5 +313,5 @@ test "serverless external graph bootstrap unwinds every scratch allocation and c
             try std.testing.expectEqual(@as(usize, 0), canceled.index);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Exercise.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Exercise.run, .{});
 }

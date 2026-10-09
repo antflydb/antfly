@@ -16,7 +16,7 @@
 //! Canonical failure contract shared by every internal compiled runtime ABI.
 //! Keep this module free of storage, inference, and control-runtime imports.
 
-pub const abi_version: u32 = 60;
+pub const abi_version: u32 = 61;
 
 /// Stable semantic identities used for control flow across compiled runtime
 /// boundaries. Values are append-only. Distinct expected domain failures must
@@ -726,6 +726,13 @@ pub const Status = enum(u32) {
     graph_generation_mismatch = 766,
     initial_child_provision_already_committed = 767,
     metadata_replication_pending = 768,
+    enrichment_retry_in_progress = 769,
+    enrichment_wait_canceled = 770,
+    enrichment_wait_timeout = 771,
+    enrichment_worker_failed = 772,
+    commit_visibility_not_satisfied = 773,
+    commit_propagation_incomplete = 774,
+    invalid_generated_tool_arguments = 775,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.

@@ -846,7 +846,7 @@ test "serverless packed graph ownership and ordinal validation are failure safe"
             try std.testing.expectEqualStrings("b", decoded.adjacencies[0].out_edges[0].neighbor_id);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{segment});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.run, .{segment});
     const payload = try encodeAlloc(alloc, segment);
     defer alloc.free(payload);
     for (0..payload.len) |len| {

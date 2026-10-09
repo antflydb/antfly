@@ -32,6 +32,7 @@ pub const ManifestStore = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         put: *const fn (*anyopaque, manifest_types.Manifest) anyerror!void,
         get_alloc: *const fn (*anyopaque, Allocator, []const u8, u64) anyerror!manifest_types.Manifest,
+        get_alloc_with_cancellation: ?*const fn (*anyopaque, Allocator, []const u8, u64, CancellationToken) anyerror!manifest_types.Manifest = null,
         set_head: *const fn (*anyopaque, []const u8, u64) anyerror!void,
         get_head: *const fn (*anyopaque, []const u8) anyerror!u64,
         compare_and_swap_head: *const fn (*anyopaque, []const u8, ?u64, u64) anyerror!bool,
@@ -52,6 +53,17 @@ pub const ManifestStore = struct {
 
     pub fn getAlloc(self: *ManifestStore, namespace: []const u8, version: u64) !manifest_types.Manifest {
         return try self.vtable.get_alloc(self.ptr, self.allocator, namespace, version);
+    }
+
+    pub fn getAllocWithCancellation(self: *ManifestStore, namespace: []const u8, version: u64, cancellation: CancellationToken) !manifest_types.Manifest {
+        try cancellation.check();
+        var result = (if (self.vtable.get_alloc_with_cancellation) |read| read(self.ptr, self.allocator, namespace, version, cancellation) else self.getAlloc(namespace, version)) catch |err| {
+            try cancellation.check();
+            return err;
+        };
+        errdefer result.deinit(self.allocator);
+        try cancellation.check();
+        return result;
     }
 
     pub fn setHead(self: *ManifestStore, namespace: []const u8, version: u64) !void {

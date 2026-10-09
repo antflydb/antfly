@@ -145,3 +145,16 @@ test "backend atomic admission releases a newly acquired lock on admission failu
     try std.testing.expect(mutex.tryLock());
     mutex.unlock();
 }
+
+/// Read generation acquisition uses the same original wait authority.
+pub fn lockShared(mutex: *std.Io.RwLock, unlock_io: std.Io, budget: anytype) !void {
+    while (true) {
+        try budget.checkpoint();
+        if (mutex.tryLockShared(unlock_io)) {
+            errdefer mutex.unlockShared(unlock_io);
+            try budget.checkpoint();
+            return;
+        }
+        try budget.waitForProgress();
+    }
+}

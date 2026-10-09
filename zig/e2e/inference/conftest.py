@@ -29,6 +29,9 @@ Usage:
     # Optional inference server model-cache limit:
     ANTFLY_INFERENCE_MAX_LOADED_MODELS=1 uv run --project e2e/inference pytest e2e/inference
 
+    # Bounded local qualification of slower Debug generation/diarization:
+    ANTFLY_INFERENCE_REQUEST_TIMEOUT=120 uv run --project e2e/inference pytest e2e/inference
+
     # Separate deadline for explicitly marked first-use model/backend initialization:
     ANTFLY_INFERENCE_FIRST_USE_REQUEST_TIMEOUT=1800 uv run --project e2e/inference pytest e2e/inference
 
@@ -226,6 +229,7 @@ def _backend_selection_diagnostic(
 
 
 _SERVER_BUDGET_FLAGS = (
+    ("ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB", "--process-memory-budget-mb"),
     ("ANTFLY_INFERENCE_HOST_BUDGET_MB", "--host-budget-mb"),
     ("ANTFLY_INFERENCE_BACKEND_BUDGET_MB", "--backend-budget-mb"),
     ("ANTFLY_INFERENCE_COMBINED_BUDGET_MB", "--combined-budget-mb"),

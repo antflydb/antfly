@@ -4316,6 +4316,19 @@ components:
         Snapshot/backup and split operations currently reject vector_store tables;
         explicitly select primary_lsm when these operations are required.
       properties:
+        engine:
+          type: string
+          enum: [local, object]
+          default: local
+          description: >-
+            Durable table engine, independent of deployment. local uses the hosting process's
+            local or Lite backend and normal shard placement. object uses external lake data with
+            durable sidecars, or an Antfly-owned object WAL and published generations.
+            Object tables do not allocate data Raft groups; omit num_shards and
+            replication_sources. Metadata remains authoritative for table lifetime.
+            Configure the shared destination through storage.artifacts. Writable
+            object document tables initially require immutable schema and index
+            definitions; changes require a new table and explicit migration.
         dense_embeddings:
           type: string
           enum: [primary_lsm, vector_store]
@@ -9335,7 +9348,11 @@ components:
                   - required: [evaluate]
                   - required: [join]
                   - required: [foreign_sources]
+                  - required: [remote_snapshot]
       properties:
+        remote_snapshot:
+          type: string
+          description: Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
         evaluate:
           $ref: "#/components/schemas/QueryEvaluation"
         table_target:
@@ -10899,6 +10916,9 @@ components:
         - took
         - status
       properties:
+        remote_snapshot:
+          type: string
+          description: Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
         evaluation:
           type: object
           additionalProperties: true
@@ -13360,6 +13380,7 @@ paths:
         {"table":"docs","full_text_search":{"query":"tutorial"},"limit":10}
         ```
       operationId: globalQuery
+      x-antfly-response-streaming: true
       requestBody:
         required: true
         content:
@@ -14039,6 +14060,7 @@ paths:
       tags:
         - query_operations
       operationId: queryTable
+      x-antfly-response-streaming: true
       requestBody:
         required: true
         content:
@@ -14835,6 +14857,10 @@ paths:
             Read consistency for the lookup. The default `read_index` routes to
             the primary for linearizable reads. `stale` allows a hot standby to
             serve the lookup at its safe-read LSN.
+            Owned object document tables support only explicit `stale` reads of
+            published generations. The default `read_index` and `leader_lease`
+            are rejected with HTTP 400. Use `sync_level=full_index` on writes to
+            wait for publication before a stale lookup.
           schema:
             type: string
             enum:
@@ -16625,6 +16651,7 @@ paths:
       tags:
         - query_operations
       operationId: queryNamespaceTable
+      x-antfly-response-streaming: true
       requestBody:
         required: true
         content:

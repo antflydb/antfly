@@ -346,16 +346,15 @@ fn appendBatchGroupBy(
     options: AlgebraicGroupBySidecarBuildOptions,
 ) !void {
     const group_column = batch.findColumn(options.group_column) orelse return error.RowSourceColumnNotFound;
-    if (group_column.kind() != .bytes) return error.UnsupportedAlgebraicGroupColumnKind;
+    if (group_column.kind() != .bytes and group_column.kind() != .dictionary_bytes) return error.UnsupportedAlgebraicGroupColumnKind;
     const value_column = if (options.op == .count) null else batch.findColumn(options.value_column) orelse return error.RowSourceColumnNotFound;
     if (value_column) |column| {
-        if (column.kind() != .i64) return error.UnsupportedAlgebraicValueColumnKind;
+        if (column.kind() != .i64 and column.kind() != .dictionary_i64) return error.UnsupportedAlgebraicValueColumnKind;
     }
 
-    const group_values = group_column.values.bytes;
     for (0..batch.rowCount()) |row_idx| {
         if (group_column.nulls.isNull(row_idx)) continue;
-        const key = group_values[row_idx];
+        const key = try group_column.bytesAt(row_idx);
         if (key.len == 0) continue;
         const next_value = (try rowAggregateValue(options.op, value_column, row_idx)) orelse continue;
         const owned_key = try alloc.dupe(u8, key);
@@ -378,11 +377,11 @@ fn rowAggregateValue(
 ) !?algebraic_segment.AggregateValue {
     return switch (op) {
         .count => .{ .count = 1 },
-        .sum_i64 => .{ .sum_i64 = if (value_column.?.nulls.isNull(row_idx)) 0 else value_column.?.values.i64[row_idx] },
-        .min_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .min_i64 = value_column.?.values.i64[row_idx] },
-        .max_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .max_i64 = value_column.?.values.i64[row_idx] },
+        .sum_i64 => .{ .sum_i64 = if (value_column.?.nulls.isNull(row_idx)) 0 else try value_column.?.integerAt(row_idx) },
+        .min_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .min_i64 = try value_column.?.integerAt(row_idx) },
+        .max_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .max_i64 = try value_column.?.integerAt(row_idx) },
         .avg_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .avg_i64 = .{
-            .sum_i64 = value_column.?.values.i64[row_idx],
+            .sum_i64 = try value_column.?.integerAt(row_idx),
             .count = 1,
         } },
     };
@@ -421,10 +420,10 @@ fn appendBatchExpressions(
         }
 
         const value_column = batch.findColumn(expression.value_column) orelse return error.RowSourceColumnNotFound;
-        if (value_column.kind() != .i64) return error.UnsupportedAlgebraicValueColumnKind;
+        if (value_column.kind() != .i64 and value_column.kind() != .dictionary_i64) return error.UnsupportedAlgebraicValueColumnKind;
         for (0..batch.rowCount()) |row_idx| {
             if (value_column.nulls.isNull(row_idx)) continue;
-            const value = value_column.values.i64[row_idx];
+            const value = try value_column.integerAt(row_idx);
             switch (expression.op) {
                 .count => unreachable,
                 .sum_i64 => accumulator.value.sum_i64 = try aggregate_math.addI64(accumulator.value.sum_i64, value),

@@ -57,7 +57,7 @@ test "gliner boundary device reduced weight ownership survives failed preparatio
     var vt = cb.vtable.*;
     vt.glinerBoundaryDevice = Fake.execute;
     cb.vtable = &vt;
-    try std.testing.checkAllAllocationFailures(a, Fake.check, .{&cb});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Fake.check, .{&cb});
 }
 
 fn tensor(a: std.mem.Allocator, name: []const u8, data: []u8, dtype: tensor_mod.DType, shape: []const i64) tensor_mod.Tensor {

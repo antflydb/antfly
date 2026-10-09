@@ -130,6 +130,14 @@ pub fn mark(alloc: std.mem.Allocator, txn: anytype, authority: publication.Autho
     }
 }
 
+fn matchesDurableCatalog(txn: anytype, plan: *const Manager.WritePlanSnapshot, authority: publication.Authority) !bool {
+    // The plan serializes empty catalogs, while a durable empty catalog may
+    // have no record. Bind authority to the exact stored bytes and independently
+    // prove that the pinned plan represents those definitions.
+    const catalogs = try @import("artifact_inventory.zig").catalogs(txn);
+    return plan.matchesArtifactInventory(catalogs) and std.mem.eql(u8, &catalogs.digest(), &authority.catalog_digest);
+}
+
 fn register(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan: *const Manager.WritePlanSnapshot) !void {
     const requirements = if (plan.completion_plan) |*value| value else return;
     var txn = try store_handle.beginWriteTxn();
@@ -138,7 +146,7 @@ fn register(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan: *
         txn.abort();
         return;
     };
-    if (!std.mem.eql(u8, &requirements.catalog, &authority.catalog_digest) or !plan.matchesArtifactInventory(try @import("artifact_inventory.zig").catalogs(&txn))) return error.ArtifactCatalogDrift;
+    if (!try matchesDurableCatalog(&txn, plan, authority)) return error.ArtifactCatalogDrift;
     if (try load(alloc, &txn)) |current| {
         defer current.deinit(alloc);
         if (std.meta.eql(current.authority, authority) and current.root == root) {
@@ -154,13 +162,18 @@ fn register(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan: *
     };
     // Fixed upper bound makes migration finite under continued inserts. All
     // writes after registration enroll debt even behind the census cursor.
-    var cursor = try txn.openPhysicalCursorAdapter();
-    defer cursor.close();
-    var last = try cursor.seekAtOrBefore(&.{keys.user_namespace + 1});
-    if (last) |row| if (row.key.len != 0 and row.key[0] == keys.user_namespace + 1) {
-        last = try cursor.prev();
+    const bound = blk: {
+        var cursor = try txn.openPhysicalCursorAdapter();
+        defer cursor.close();
+        var last = try cursor.seekAtOrBefore(&.{keys.user_namespace + 1});
+        if (last) |row| if (row.key.len != 0 and row.key[0] == keys.user_namespace + 1) {
+            last = try cursor.prev();
+        };
+        const borrowed = if (last) |row| if (row.key.len != 0 and row.key[0] == keys.user_namespace) row.key else "" else "";
+        // Own the boundary and close the transaction's cursor before mutation.
+        break :blk try alloc.dupe(u8, borrowed);
     };
-    const bound = if (last) |row| if (row.key.len != 0 and row.key[0] == keys.user_namespace) row.key else "" else "";
+    defer alloc.free(bound);
     try store(alloc, &txn, .{ .raw = &.{}, .authority = authority, .root = root, .revision = 0, .baseline = ids.items.len == 0 or bound.len == 0, .requirements = ids.items, .cursor = "", .work_cursor = "", .bound = bound });
     try txn.commit();
 }
@@ -335,7 +348,7 @@ pub fn sourceComplete(alloc: std.mem.Allocator, txn: anytype, plan: *const Manag
     for (requirements.nodes) |node| {
         if ((node.kind != .generated and node.kind != .unit_children) or (!relevant.contains(node.artifact) and !relevant.contains(node.embedding))) continue;
         const current = state orelse return false;
-        if (!current.baseline or current.root != root or !std.mem.eql(u8, &requirements.catalog, &current.authority.catalog_digest) or !std.meta.eql((try publication.authority(txn)), @as(?publication.Authority, current.authority))) return false;
+        if (!current.baseline or current.root != root or !try matchesDurableCatalog(txn, plan, current.authority) or !std.meta.eql((try publication.authority(txn)), @as(?publication.Authority, current.authority))) return false;
         if (try count(txn, &counterKey(current.authority, current.root, node.id)) != 0) return false;
     }
     return true; // Authored sources have no asynchronous producer dependency.
@@ -433,7 +446,7 @@ const TestStore = struct {
 
 test "ordered artifact inventory producer readiness isolates streams and fences duplicate stale completion" {
     const a = std.testing.allocator;
-    const authority: publication.Authority = .{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) };
+    const authority: publication.Authority = .{ .namespace = @splat(1), .epoch = 1, .catalog_digest = (@import("artifact_inventory.zig").Catalogs{}).digest() };
     const ids = [_][32]u8{ @splat(3), @splat(4) };
     var memory: TestStore = .{};
     defer memory.deinit();
@@ -461,7 +474,7 @@ test "ordered artifact inventory producer readiness isolates streams and fences 
         .{ .id = ids[0], .kind = .generated, .scope = .document, .name = "text", .artifact = "text" },
         .{ .id = ids[1], .kind = .generated, .scope = .document, .name = "graph", .artifact = "relations", .upstream = "text" },
     };
-    var plan: Manager.WritePlanSnapshot = .{ .alloc = a, .generation = 1, .dense_fields = &.{}, .sparse_fields = &.{}, .graph_fields = &.{}, .generated_templates = &.{}, .chunk_dependents = &.{}, .completion_plan = .{ .arena = std.heap.ArenaAllocator.init(a), .catalog = authority.catalog_digest, .digest = authority.catalog_digest, .nodes = &nodes, .providers = &.{}, .definitions = .empty } };
+    var plan: Manager.WritePlanSnapshot = .{ .alloc = a, .generation = 1, .dense_fields = &.{}, .sparse_fields = &.{}, .graph_fields = &.{}, .generated_templates = &.{}, .chunk_dependents = &.{}, .artifact_catalogs = .{}, .catalog_empty = @splat(true), .completion_plan = .{ .arena = std.heap.ArenaAllocator.init(a), .catalog = authority.catalog_digest, .digest = authority.catalog_digest, .nodes = &nodes, .providers = &.{}, .definitions = .empty } };
     defer plan.completion_plan.?.deinit();
     try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "text"));
     try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "relations"));

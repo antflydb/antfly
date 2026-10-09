@@ -570,6 +570,8 @@ test "laya multi-row coalescing holds exactly with a dozen near-identical states
     const merged = try tree.coalesce(a, &sub_rows);
     defer merged.deinit(a);
     try std.testing.expectEqual(@as(usize, state_count), tree.treeCount(merged.row));
+    try std.testing.expect(merged.row.ids.len > fixture.encoder.max_position_embeddings);
+    for (merged.row.positions) |position| try std.testing.expect(position >= 0 and position < fixture.encoder.max_position_embeddings);
     // This directly exercises forwardRow, bypassing the session's own
     // max_packed_len budget (pipelines/laya.zig enforces that when grouping
     // rows into batches); validate the row's structure against its own size.

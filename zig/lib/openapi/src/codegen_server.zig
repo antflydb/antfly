@@ -82,6 +82,7 @@ pub const ServerGenerator = struct {
         request_body_type: ?[]const u8,
         response_type: []const u8,
         is_streaming: bool,
+        response_streaming: bool,
     };
 
     fn collectOperationInfo(
@@ -115,6 +116,7 @@ pub const ServerGenerator = struct {
             .request_body_type = request_body_type,
             .response_type = response_type,
             .is_streaming = is_streaming,
+            .response_streaming = is_streaming or op.response_streaming,
         };
     }
 
@@ -194,7 +196,7 @@ pub const ServerGenerator = struct {
                 op.path,
                 op.op_id,
                 if (op.request_body_type != null) "buffered" else "none",
-                op.is_streaming,
+                op.response_streaming,
             });
         }
         self.w.dedent();
@@ -382,4 +384,24 @@ test "server generator smoke" {
     var w = SourceWriter.init(arena);
     var type_gen = TypeGenerator.init(arena, &w, &resolver);
     _ = ServerGenerator.init(arena, &w, &resolver, &type_gen);
+}
+
+test "JSON transport streaming changes route capability while retaining typed response" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parser = @import("parser.zig").Parser.init(arena);
+    const doc = try parser.parseDocument(
+        \\{"openapi":"3.0.3","info":{"title":"Test","version":"1"},"paths":{"/query":{"post":{"operationId":"query","x-antfly-response-streaming":true,"responses":{"200":{"description":"ok","content":{"application/json":{"schema":{"type":"object","properties":{"value":{"type":"integer"}}}}}}}}}}}
+    );
+    var resolver = Resolver.init(arena, &doc);
+    var w = SourceWriter.init(arena);
+    var type_gen = TypeGenerator.init(arena, &w, &resolver);
+    var gen = ServerGenerator.init(arena, &w, &resolver, &type_gen);
+    const info = try gen.collectOperationInfo("/query", "post", "query", doc.paths.get("/query").?.post.?, &.{});
+    try std.testing.expect(!info.is_streaming);
+    try std.testing.expect(info.response_streaming);
+    try std.testing.expect(!std.mem.eql(u8, info.response_type, "void"));
+    try gen.generateRouteTable(&.{info});
+    try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), ".streaming_response = true") != null);
 }

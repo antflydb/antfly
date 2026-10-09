@@ -448,7 +448,6 @@ pub const OwnerScenario = struct {
         const resources = state.fixture.db.core.asyncResources();
         for (&state.owners, 0..) |*owner, i| {
             owner.* = Runtime.init(allocator, resources.store, resources.index_manager, resources.apply_mutex, state.fixture.db.backend_runtime, .{
-                .enabled = true,
                 .start_background_loop = false,
                 .role = .coordinator,
                 .runtime_id = if (i == 0) "original" else "replacement",

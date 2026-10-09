@@ -1805,7 +1805,9 @@ def test_live_index_activation_preempts_an_active_enrichment_quantum(
         # generation or identity of the first index.
         first_after = backup_api.get_index(table_name, first_index)["status"]
         assert first_after["incarnation"] == first_incarnation
-        assert first_after["readiness"]["queryable"] is True
+        assert first_after["readiness"]["queryable"] is True, json.dumps(
+            {"before": first_active, "after": first_after}, sort_keys=True
+        )
         assert first_after.get("repair") is None, (
             __import__("json").dumps(first_after, indent=2, sort_keys=True)
             + "\n"

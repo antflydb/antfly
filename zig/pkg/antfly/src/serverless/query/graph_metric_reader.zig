@@ -2439,7 +2439,7 @@ test "serverless graph metric candidate prefix keys preserve binary ties and all
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless graph metric transport admission bounds cache copies and adapts batch width" {
@@ -2510,7 +2510,7 @@ test "serverless graph metric top score transfer preserves ownership across allo
             try std.testing.expectError(error.GraphMetricScoresAlreadyTaken, result.takePublicScoresAlloc(alloc, &session));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless graph metric top limit cannot exceed the persisted ranked tier" {
@@ -2568,7 +2568,7 @@ test "serverless graph metric joint admission gives uneven columns their actual 
             for (result) |column| a.free(column);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{@as([]const RangePlanningColumn, &inputs)});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.run, .{@as([]const RangePlanningColumn, &inputs)});
 }
 
 test "serverless graph metric joint coalescing spends overfetch only where it saves most" {
@@ -2598,7 +2598,7 @@ test "serverless graph metric joint coalescing spends overfetch only where it sa
             for (result) |column| a.free(column);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{@as([]const RangePlanningColumn, &inputs)});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.run, .{@as([]const RangePlanningColumn, &inputs)});
 }
 
 test "serverless graph metric joint admission finds the byte-feasible alternative to greedy coalescing" {
@@ -2629,7 +2629,7 @@ test "serverless graph metric joint admission finds the byte-feasible alternativ
             for (ranges) |column| failing.free(column);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{@as([]const RangePlanningColumn, &inputs)});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.run, .{@as([]const RangePlanningColumn, &inputs)});
 }
 
 test "serverless graph metric bounded admission matches exhaustive range partitions" {
@@ -2724,7 +2724,7 @@ test "serverless graph metric partial partitions cross old windows and split mis
                 for (result) |column| a.free(column);
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{ @as([]const RangePlanningColumn, &columns), case.reads, case.bytes });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.run, .{ @as([]const RangePlanningColumn, &columns), case.reads, case.bytes });
     }
 }
 
@@ -3263,7 +3263,7 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
             defer loaded.deinit(failing_alloc);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{ &session, last_id });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationRunner.run, .{ &session, last_id });
 
     state.range_calls.store(0, .monotonic);
     state.reject_point_index_reads = true;
@@ -3551,7 +3551,7 @@ fn testAuthenticatedMetricReadsWithPrefix(score_count: usize, prefix: []const u8
         try std.testing.expectEqual(@as(?f64, @floatFromInt(96 * metric_segment.score_block_entries)), one_page.scores[0]);
         try std.testing.expectEqual(@as(usize, 0), state.range_calls.load(.monotonic));
     }
-    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{ &session, last_id });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationRunner.run, .{ &session, last_id });
     if (score_count == metric_segment.score_block_entries + 1) {
         const broken_root = try std.fmt.allocPrint(alloc, "{s}-unavailable", .{cache_root});
         defer alloc.free(broken_root);

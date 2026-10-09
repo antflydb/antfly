@@ -179,7 +179,7 @@ test "serverless enrichment stage cursor codec releases allocations at every fai
             try std.testing.expect(value.eql(decoded));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
 }
 
 pub const ProgressStore = struct {
@@ -191,6 +191,7 @@ pub const ProgressStore = struct {
         work_lease_provider: ?*const fn (*anyopaque) work_lease.Provider = null,
         deinit: *const fn (Allocator, *anyopaque) void,
         get_head: *const fn (*anyopaque, []const u8) anyerror!u64,
+        get_head_with_cancellation: ?*const fn (*anyopaque, []const u8, CancellationToken) anyerror!u64 = null,
         compare_and_swap_head: *const fn (*anyopaque, []const u8, ?u64, u64) anyerror!bool,
         compare_and_swap_head_fenced: *const fn (*anyopaque, []const u8, ?u64, u64, PublicationFence) anyerror!bool,
         get_gc_watermark: *const fn (*anyopaque, []const u8) anyerror!?u64,
@@ -224,6 +225,16 @@ pub const ProgressStore = struct {
 
     pub fn getHead(self: *ProgressStore, namespace: []const u8) !u64 {
         return try self.vtable.get_head(self.ptr, namespace);
+    }
+
+    pub fn getHeadWithCancellation(self: *ProgressStore, namespace: []const u8, cancellation: CancellationToken) !u64 {
+        try cancellation.check();
+        const result = (if (self.vtable.get_head_with_cancellation) |read| read(self.ptr, namespace, cancellation) else self.getHead(namespace)) catch |err| {
+            try cancellation.check();
+            return err;
+        };
+        try cancellation.check();
+        return result;
     }
 
     /// The provider and HEAD CAS must share the same atomic coordination record.

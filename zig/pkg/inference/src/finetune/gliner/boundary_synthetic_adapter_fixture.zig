@@ -221,7 +221,7 @@ fn testLayout(a: Allocator, dora: bool) !void {
 }
 
 test "boundary synthetic adapter fixture exact target shapes initial slots and all allocation cleanup" {
-    for ([_]bool{ false, true }) |dora| try std.testing.checkAllAllocationFailures(std.testing.allocator, testLayout, .{dora});
+    for ([_]bool{ false, true }) |dora| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testLayout, .{dora});
 }
 
 test "boundary synthetic adapter fixture rejects missing reordered nonfinite and substituted initial descriptors" {

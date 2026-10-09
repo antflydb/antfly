@@ -56,9 +56,39 @@ pub fn setStripRecursively(module: *std.Build.Module, visited: *std.AutoHashMap(
     if (result.found_existing) return;
 
     module.strip = true;
+    // Zig test roots otherwise retain error tracing while stripped provider
+    // archives disable it. Io futures contain trace-dependent native state;
+    // make that ABI choice explicit for every participant in this profile.
+    module.error_tracing = false;
     for (module.import_table.values()) |imported_module| {
         setStripRecursively(imported_module, visited);
     }
+}
+
+/// Shared imports must use the same debug-information profile as every
+/// consumer. LLVM can crash when an unstripped test references declarations
+/// from a module stripped by a production archive in the same build graph.
+pub fn stripBuildGraph(b: *std.Build) void {
+    var steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
+    defer steps.deinit();
+    var modules = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
+    defer modules.deinit();
+    for (b.top_level_steps.values()) |root| stripStep(&root.step, &steps, &modules);
+}
+
+fn stripStep(step: *std.Build.Step, steps: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
+    if ((steps.getOrPut(step) catch @panic("OOM")).found_existing) return;
+    if (step.cast(std.Build.Step.Compile)) |artifact| {
+        setStripRecursively(artifact.root_module, modules);
+        // Library dependencies are added by Build.Serialize after build()
+        // returns. Follow the authored links now so their roots receive the
+        // same profile as the consumer rather than retaining debug tracing.
+        for (artifact.root_module.getGraph().modules) |module| {
+            for (module.link_objects.items) |link| if (link == .other_step)
+                stripStep(&link.other_step.step, steps, modules);
+        }
+    }
+    for (step.dependencies.items) |dependency| stripStep(dependency, steps, modules);
 }
 const addMacosSdkPaths = @import("antfly_platform").addMacosSdkPaths;
 

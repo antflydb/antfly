@@ -289,7 +289,7 @@ pub const Adapter = struct {
             return;
         };
         job.done.waitUncancelable(network_io);
-        _ = future.await(io);
+        @import("protected_future.zig").wait(io, &future);
     }
 
     fn dispatch(self: *Adapter, job: *Job) !void {
@@ -302,7 +302,7 @@ pub const Adapter = struct {
         // listener sets cancellation/deadline on shutdown, native checkpoints
         // observe it, and this adapter joins rather than abandoning the job.
         job.done.waitUncancelable(job.request.io);
-        _ = future.await(io);
+        @import("protected_future.zig").wait(io, &future);
         if (job.failure) |err| return wireFailure(job.request, err);
     }
 };
@@ -597,24 +597,18 @@ const OwnedRead = struct {
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionNotActive;
         }
         try self.validateCurrentPolicies(alloc);
-        var page = try self.stream.next(limit);
+        var page = try self.stream.nextBatch(limit);
         errdefer page.deinit();
-        // Building a page can yield or wait on private spill I/O. Buffered
-        // rows must not escape using the policy checked before that wait.
+        // Buffered column pages can wait on spill or catalog work too.
         try request.check();
         try self.validateCurrentPolicies(alloc);
-        // Adapt only datetime cells; the page retains exact typed integers.
-        for (self.columns, 0..) |column, index| if (column.type == .datetime) {
-            for (page.output.rows) |row| @constCast(row)[index] = try datetimeResult(page.arena.allocator(), row[index]);
-        };
         const owner = try alloc.create(PageOwner);
         errdefer alloc.destroy(owner);
         try self.lifetime.retainResource();
         owner.* = .{ .alloc = alloc, .page = page, .read = self };
         return .{ .exhausted = page.exhausted, .result = .{
             .columns = self.columns,
-            .rows = page.output.rows,
-            .sql_nulls = page.output.sql_nulls,
+            .cells = .{ .context = owner, .count = page.values.len(), .width = self.columns.len, .read = PageOwner.cell },
             .command_tag = "SELECT",
             .owner = .{ .context = owner, .release = releasePage },
         } };
@@ -654,7 +648,16 @@ const OwnedRead = struct {
         read.lifetime.releaseResource();
     }
 
-    const PageOwner = struct { alloc: std.mem.Allocator, page: Pull.Page, read: *OwnedRead };
+    const PageOwner = struct {
+        alloc: std.mem.Allocator,
+        page: Pull.BatchPage,
+        read: *OwnedRead,
+        fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!wire.Cell {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const value = try self.page.values.cell(alloc, row, column);
+            return .{ .value = if (!value.sql_null and self.page.columns[column].type == .datetime) try datetimeResult(alloc, value.value) else value.value, .sql_null = value.sql_null };
+        }
+    };
 
     fn detach(raw: *anyopaque) void {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
@@ -754,7 +757,7 @@ const StreamJob = struct {
         const io = if (self.owner != null and self.request.completion_drain) try self.adapter.server.sqlControlIo() else try self.adapter.server.sqlExecutionIo();
         var future = io.concurrent(run, .{self}) catch return error.SqlWriteCapacityUnavailable;
         self.done.waitUncancelable(self.request.io);
-        _ = future.await(io);
+        @import("protected_future.zig").wait(io, &future);
         if (self.failure) |err| return wireFailure(self.request, err);
     }
     fn run(self: *StreamJob) void {
@@ -1075,6 +1078,52 @@ const Job = struct {
     }
 };
 
+test "SQL pgwire dispatch preserves imported executor authority including unavailable views" {
+    const Probe = struct {
+        attempts: usize = 0,
+        fn concurrent(raw: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.attempts += 1;
+            return error.ConcurrencyUnavailable;
+        }
+    };
+    var raw_probe: Probe = .{};
+    var imported_probe: Probe = .{};
+    var vtable = std.Io.failing.vtable.*;
+    vtable.concurrent = Probe.concurrent;
+    const raw_io: std.Io = .{ .userdata = &raw_probe, .vtable = &vtable };
+    const imported_io: std.Io = .{ .userdata = &imported_probe, .vtable = &vtable };
+    var runtime = try @import("antfly_local_sources").storage_background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = raw_io },
+    });
+    defer runtime.deinit();
+    // Dispatch must reject or schedule before dereferencing either object.
+    var manager: usermgr.UserManager = undefined;
+    var credential: Credential = undefined;
+    credential.manager = &manager;
+    var api: http.ApiHttpServer = undefined;
+    api.cfg = .{ .backend_runtime = runtime.ptr(), .user_manager = &manager, .imported_runtime_io = .{} };
+    var adapter: Adapter = .{ .server = &api };
+    var canceled: std.atomic.Value(bool) = .init(false);
+    const request: wire.Request = .{
+        .statement = "SELECT id FROM docs",
+        .limit = 1,
+        .io = std.testing.io,
+        .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } },
+        .cancel_requested = &canceled,
+    };
+    for ([_]?std.Io{ null, imported_io }, 0..) |executor, i| {
+        api.cfg.imported_runtime_io.?.durable = executor;
+        var job: Job = .{ .adapter = &adapter, .alloc = std.testing.allocator, .credential = &credential, .request = request, .kind = .execute };
+        try std.testing.expectError(error.SqlWriteCapacityUnavailable, adapter.dispatch(&job));
+        var stream: StreamJob = .{ .adapter = &adapter, .alloc = std.testing.allocator, .credential = &credential, .request = request };
+        try std.testing.expectError(error.SqlWriteCapacityUnavailable, stream.dispatch());
+        try std.testing.expectEqual(@as(usize, 0), raw_probe.attempts);
+        try std.testing.expectEqual(i * 2, imported_probe.attempts);
+    }
+}
+
 test "SQL pgwire execute arguments use bounded scalar semantics without table access" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1180,7 +1229,7 @@ const GuardedCatalog = struct {
     fn backend(self: *GuardedCatalog) catalog.Backend {
         var result = self.native;
         result.ptr = self;
-        result.vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
+        result.vtable = &.{ .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
         return result;
     }
     fn generateRowId(raw: *anyopaque, alloc: std.mem.Allocator) ![]const u8 {
@@ -1668,6 +1717,35 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
         .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.math.maxInt(i96) } },
         .cancel_requested = &cancellation,
     } };
+    {
+        const saved = authority.request;
+        defer authority.request = saved;
+        const OffsetClock = struct {
+            fn now(_: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+                if (clock == .awake) return .{ .nanoseconds = std.time.ns_per_s };
+                return std.testing.io.vtable.now(std.testing.io.userdata, clock);
+            }
+        };
+        var vtable = std.testing.io.vtable.*;
+        vtable.now = OffsetClock.now;
+        authority.request.io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+        authority.request.deadline.raw.nanoseconds = 10 * std.time.ns_per_s;
+        const before = @import("antfly_platform").time.monotonicNs();
+        const normalized = try authority.context();
+        const after = @import("antfly_platform").time.monotonicNs();
+        try std.testing.expect(normalized.deadline_io == null);
+        try std.testing.expect(normalized.deadline_ns.? >= before + 9 * std.time.ns_per_s);
+        try std.testing.expect(normalized.deadline_ns.? <= after + 9 * std.time.ns_per_s);
+        try normalized.ensureActive();
+        authority.request.deadline.raw.nanoseconds = std.math.maxInt(i96);
+        try std.testing.expect((try authority.context()).deadline_ns == null);
+        authority.request.deadline.raw.nanoseconds = std.time.ns_per_s;
+        try std.testing.expectError(error.QueryCanceled, authority.context());
+        authority.request.deadline.raw.nanoseconds = 10 * std.time.ns_per_s;
+        cancellation.store(true, .release);
+        defer cancellation.store(false, .release);
+        try std.testing.expectError(error.QueryCanceled, authority.context());
+    }
     const revision: ?u64 = 1;
     var guarded: GuardedCatalog = .{
         .native = .{ .ptr = &native_cursor, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .open_scan = NativeCursor.open, .checkpoint = NativeCursor.checkpoint } },
@@ -2003,7 +2081,7 @@ test "SQL pgwire supervised cleanup retains native stream allocator root and par
         var arena = std.heap.ArenaAllocator.init(owner.stream.budget.allocator());
         _ = try arena.allocator().alloc(u8, 4096);
         try owner.lifetime.retainResource();
-        page.*.* = .{ .alloc = alloc, .read = owner, .page = .{ .arena = arena, .output = undefined, .exhausted = false } };
+        page.*.* = .{ .alloc = alloc, .read = owner, .page = .{ .arena = arena, .columns = &.{}, .values = .{ .rows = &.{} }, .exhausted = false } };
     }
     const cleanup_io = cleanup_threads.io();
     const cleanup_borrow = @import("antfly_runtime_abi").native_abi.IoBorrow.init(&cleanup_io);

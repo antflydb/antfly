@@ -14,6 +14,12 @@
 // limitations.
 
 const std = @import("std");
+const CancellationToken = @import("antfly_cancellation").CancellationToken;
+
+fn transportCancellationRequested(raw: *const anyopaque) bool {
+    const cancellation: *const CancellationToken = @ptrCast(@alignCast(raw));
+    return cancellation.isCancelled();
+}
 const object_storage = @import("antfly_local_sources").storage_object_storage;
 const manifest_types = @import("types.zig");
 const manifest_codec = @import("codec.zig");
@@ -132,11 +138,15 @@ pub const ObjectStore = struct {
     }
 
     pub fn getAlloc(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8, version: u64) !manifest_types.Manifest {
+        return self.getAllocWithCancellation(alloc, namespace, version, .none);
+    }
+
+    pub fn getAllocWithCancellation(self: *ObjectStore, alloc: std.mem.Allocator, namespace: []const u8, version: u64, cancellation: CancellationToken) !manifest_types.Manifest {
         const key = try manifestKeyAlloc(alloc, self.opened.prefix, namespace, version);
         defer alloc.free(key);
         var client = self.opened.client;
         client.allocator = alloc;
-        var result = try client.getObject(self.opened.bucket, key, .{});
+        var result = try client.getObject(self.opened.bucket, key, .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = transportCancellationRequested } });
         defer result.deinit(alloc);
         return try manifest_codec.decodeAlloc(alloc, result.body);
     }
@@ -282,6 +292,7 @@ pub const ObjectStore = struct {
         .deinit = erasedDeinit,
         .put = erasedPut,
         .get_alloc = erasedGetAlloc,
+        .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
         .set_head = erasedSetHead,
         .get_head = erasedGetHead,
         .compare_and_swap_head = erasedCompareAndSwapHead,
@@ -303,6 +314,11 @@ pub const ObjectStore = struct {
     fn erasedGetAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, namespace: []const u8, version: u64) !manifest_types.Manifest {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.getAlloc(alloc, namespace, version);
+    }
+
+    fn erasedGetAllocWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, namespace: []const u8, version: u64, cancellation: CancellationToken) !manifest_types.Manifest {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.getAllocWithCancellation(alloc, namespace, version, cancellation);
     }
 
     fn erasedSetHead(ptr: *anyopaque, namespace: []const u8, version: u64) !void {

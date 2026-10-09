@@ -119,7 +119,7 @@ pub const TransitionDecision = struct {
     action: TransitionAction,
 };
 
-test "transition actions module compiles" {
+comptime {
     _ = TransitionAction;
     _ = TransitionDecision;
 }

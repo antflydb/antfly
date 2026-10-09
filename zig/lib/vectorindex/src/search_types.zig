@@ -75,7 +75,11 @@ pub const NativeLeafScanHandle = struct {
 pub const SearchResult = search_results.SearchResult;
 pub const SearchResults = search_results.SearchResults;
 
+/// Borrowed request-local predicate over native metadata keys. Evaluated before
+/// candidate heap admission, so selective filters do not discard an unfiltered top-k.
+pub const KeyPredicate = struct { ptr: *anyopaque, allows: *const fn (*anyopaque, []const u8) anyerror!bool };
 pub const SearchRequest = struct {
+    key_predicate: ?KeyPredicate = null,
     query: []const f32,
     k: usize,
     rerank_k: ?usize = null,

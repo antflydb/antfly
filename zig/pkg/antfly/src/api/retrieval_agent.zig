@@ -2048,7 +2048,15 @@ fn executeModelTools(
     while (budget.used < rounds) {
         @memset(navigation_advanced, false);
         const chain = try agent_tools.withTools(arena, base_chain, try modelToolSchema(arena, executable, request, navigation, web_config != null, fetch_config != null));
-        var generated = try AgentGenerationBudget.generate(&budget, alloc, chain, history.messages.items);
+        var generated = AgentGenerationBudget.generate(&budget, alloc, chain, history.messages.items) catch |err| switch (err) {
+            error.InvalidGeneratedToolArguments => {
+                outcome.rounds = budget.used;
+                try appendStep(arena, steps, live, .{ .kind = .planning, .name = "repair_tool_arguments", .action = "requested a corrected tool call after malformed model output", .status = .@"error" });
+                try history.append(.user, "The previous model response contained malformed tool arguments. Regenerate the tool call with balanced object and array delimiters and complete argument values. Do not execute or reuse the malformed call.", null);
+                continue;
+            },
+            else => return err,
+        };
         defer generated.deinit();
         outcome.rounds = budget.used;
         // A total call cap also bounds parallel fan-out across all rounds.
@@ -12263,6 +12271,8 @@ test "retrieval agent Exa web-only tool loop returns cited hits in JSON and SSE"
         searches: usize = 0,
         invalid_first: bool = false,
         fail: bool = false,
+        malformed_remaining: usize = 0,
+        malformed_injected: bool = false,
         fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return error.UnexpectedDatabaseSearch;
         }
@@ -12280,6 +12290,16 @@ test "retrieval agent Exa web-only tool loop returns cited hits in JSON and SSE"
         }
         fn generate(ptr: *anyopaque, a: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.malformed_remaining > 0) {
+                self.malformed_remaining -= 1;
+                self.malformed_injected = true;
+                return error.InvalidGeneratedToolArguments;
+            }
+            if (self.malformed_injected) {
+                try std.testing.expectEqual(generating.Role.user, messages[messages.len - 1].role);
+                try std.testing.expect(std.mem.indexOf(u8, messages[messages.len - 1].content.?.text, "malformed tool arguments") != null);
+                self.malformed_injected = false;
+            }
             self.turns += 1;
             const schema = chain[0].generator.tools_json.?;
             try std.testing.expect(std.mem.indexOf(u8, schema, "web_search") != null);
@@ -12304,27 +12324,30 @@ test "retrieval agent Exa web-only tool loop returns cited hits in JSON and SSE"
     };
     for ([_]bool{ false, true }) |stream| {
         for ([_]bool{ false, true }) |invalid| {
-            var fake = Fake{ .invalid_first = invalid };
-            const body = try std.fmt.allocPrint(std.testing.allocator,
-                \\{{"query":"Find evidence on the web","queries":[],"stream":{},"max_internal_iterations":3,"generator":{{"provider":"antfly","model":"test"}},"steps":{{"generation":{{}}}},"tools":{{"enabled_tools":["web_search"],"web_search_config":{{"provider":"exa","api_key":"private-key","include_content":true}}}}}}
-            , .{stream});
-            defer std.testing.allocator.free(body);
-            const result = try execute(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query, .prepare_web_search = Fake.prepare, .web_search = Fake.search } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
-            defer std.testing.allocator.free(result.body);
-            try std.testing.expectEqual(@as(usize, 1), fake.searches);
-            try std.testing.expect(std.mem.indexOf(u8, result.body, "private-key") == null);
-            try std.testing.expect(std.mem.indexOf(u8, result.body, "EXA-CANARY-713") != null);
-            if (stream) {
-                const events = try parseSseEventsAlloc(std.testing.allocator, result.body);
-                defer std.testing.allocator.free(events);
-                try std.testing.expectEqual(@as(usize, 1), countSseEvents(events, "hit"));
-                try std.testing.expectEqual(@as(usize, 1), countSseEvents(events, "done"));
-            } else {
-                const parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, result.body, .{});
-                defer parsed.deinit();
-                try std.testing.expectEqual(AgentStatus.completed, parsed.value.status);
-                try std.testing.expectEqualStrings("web:https://example.com/evidence", parsed.value.hits[0]._id);
-                try std.testing.expectEqual(@as(i64, if (invalid) 2 else 1), parsed.value.tool_calls_made.?);
+            for ([_]bool{ false, true }) |malformed| {
+                var fake = Fake{ .invalid_first = invalid, .malformed_remaining = if (malformed) 1 else 0 };
+                const body = try std.fmt.allocPrint(std.testing.allocator,
+                    \\{{"query":"Find evidence on the web","queries":[],"stream":{},"max_internal_iterations":{},"generator":{{"provider":"antfly","model":"test"}},"steps":{{"generation":{{}}}},"tools":{{"enabled_tools":["web_search"],"web_search_config":{{"provider":"exa","api_key":"private-key","include_content":true}}}}}}
+                , .{ stream, if (malformed) @as(usize, 4) else 3 });
+                defer std.testing.allocator.free(body);
+                const result = try execute(std.testing.allocator, .{ .ptr = &fake, .vtable = &.{ .run_query = Fake.query, .prepare_web_search = Fake.prepare, .web_search = Fake.search } }, .{ .ptr = &fake, .vtable = &.{ .execute_chain = Fake.generate } }, body);
+                defer std.testing.allocator.free(result.body);
+                try std.testing.expectEqual(@as(usize, 1), fake.searches);
+                if (malformed) try std.testing.expect(std.mem.indexOf(u8, result.body, "repair_tool_arguments") != null);
+                try std.testing.expect(std.mem.indexOf(u8, result.body, "private-key") == null);
+                try std.testing.expect(std.mem.indexOf(u8, result.body, "EXA-CANARY-713") != null);
+                if (stream) {
+                    const events = try parseSseEventsAlloc(std.testing.allocator, result.body);
+                    defer std.testing.allocator.free(events);
+                    try std.testing.expectEqual(@as(usize, 1), countSseEvents(events, "hit"));
+                    try std.testing.expectEqual(@as(usize, 1), countSseEvents(events, "done"));
+                } else {
+                    const parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, result.body, .{});
+                    defer parsed.deinit();
+                    try std.testing.expectEqual(AgentStatus.completed, parsed.value.status);
+                    try std.testing.expectEqualStrings("web:https://example.com/evidence", parsed.value.hits[0]._id);
+                    try std.testing.expectEqual(@as(i64, if (invalid) 2 else 1), parsed.value.tool_calls_made.?);
+                }
             }
         }
     }

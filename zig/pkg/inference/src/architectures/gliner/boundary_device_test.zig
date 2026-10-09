@@ -109,7 +109,7 @@ test "gliner boundary device rejects fallback and cleans failed preparation allo
     vt.backendKind = metalKind;
     vt.glinerBoundaryDevice = unavailableDevice;
     cb.vtable = &vt;
-    try std.testing.checkAllAllocationFailures(a, failedPrepare, .{ &cb, &config, input });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, failedPrepare, .{ &cb, &config, input });
     cb.execution_control = .{ .check_fn = struct {
         fn cancelled(_: ?*anyopaque) anyerror!void {
             return error.Cancelled;

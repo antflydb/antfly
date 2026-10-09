@@ -316,6 +316,6 @@ fn scalarCell(column: schema.RelationalColumn, ordinal: u32, value: expressions.
         .integer => |integer| .{ .i64_val = integer },
         .number => |number| .{ .f64_val = number },
         .boolean => |boolean| .{ .bool_val = boolean },
-        .datetime => |datetime| .{ .u64_val = datetime },
+        .datetime => |datetime| .{ .u64_val = std.math.cast(u64, datetime) orelse return error.InvalidRelationalExpressionInput },
     } };
 }

@@ -122,7 +122,7 @@ fn checkPreparedOwnership(allocator: std.mem.Allocator) !void {
 }
 
 test "prepared text admits before tokenization and unwinds every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkPreparedOwnership, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkPreparedOwnership, .{});
 }
 
 fn checkRealPrepared(alloc: std.mem.Allocator, tokenizer: Tokenizer) !void {
@@ -145,7 +145,7 @@ test "prepared text real Metaspace tokenizer unwinds every allocation failure" {
         \\{"model":{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0],["a",-1],["b",-1],["c",-1]]},"pre_tokenizer":{"type":"Metaspace","replacement":"▁","prepend_scheme":"always"}}
     );
     defer tok.deinitSelf();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRealPrepared, .{tok.tokenizer()});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkRealPrepared, .{tok.tokenizer()});
     // Check the tokenizer itself too: the rollback owner must not mask leaks.
     const Direct = struct {
         fn run(allocator: std.mem.Allocator, tokenizer: Tokenizer) !void {
@@ -153,7 +153,7 @@ test "prepared text real Metaspace tokenizer unwinds every allocation failure" {
             defer allocator.free(ids);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Direct.run, .{tok.tokenizer()});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Direct.run, .{tok.tokenizer()});
 }
 
 test "prepared text pooled owner reuses admission and rolls back abandoned allocations" {

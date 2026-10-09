@@ -220,19 +220,36 @@ pub fn executeResponse(
         incoming_index += 1;
     }
 
+    var response_status: []const u8 = "success";
     if (!req.dry_run and (changed_writes.items.len > 0 or deleted_ids.items.len > 0)) {
         // The batch call is the irreversible write boundary. Never report
         // cancellation after it begins because the outcome may be durable.
         try request.ensureActive();
-        _ = (try writes.batch(alloc, table_name, .{
+        const accepted = writes.batch(alloc, table_name, .{
             .writes = changed_writes.items,
             .deletes = deleted_ids.items,
             .sync_level = req.sync_level,
-        })) orelse return error.TableNotFound;
+        }) catch |err| switch (err) {
+            error.CommitVisibilityNotSatisfied,
+            error.CommitPropagationIncomplete,
+            error.EnrichmentWaitCanceled,
+            error.EnrichmentWaitTimeout,
+            error.EnrichmentRetryInProgress,
+            => blk: {
+                response_status = "committed_pending";
+                break :blk @as(?void, {});
+            },
+            error.EnrichmentWorkerFailed => blk: {
+                response_status = "committed_repair_required";
+                break :blk @as(?void, {});
+            },
+            else => return err,
+        };
+        _ = accepted orelse return error.TableNotFound;
     }
 
     return .{
-        .status = "success",
+        .status = response_status,
         .upserted = if (req.dry_run) 0 else changed_writes.items.len,
         .deleted = deleted_ids.items.len,
         .skipped = skipped,
@@ -403,6 +420,7 @@ test "linear merge uses one ordered hash scan and delegates mutations to the HA 
         writes: usize = 0,
         deletes: usize = 0,
         sync_level: ?db_mod.types.SyncLevel = null,
+        failure: ?anyerror = null,
 
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{ .ptr = self, .vtable = &.{ .batch = batch } };
@@ -414,6 +432,7 @@ test "linear merge uses one ordered hash scan and delegates mutations to the HA 
             self.writes += req.writes.len;
             self.deletes += req.deletes.len;
             self.sync_level = req.sync_level;
+            if (self.failure) |err| return err;
             return {};
         }
     };
@@ -462,4 +481,17 @@ test "linear merge uses one ordered hash scan and delegates mutations to the HA 
     try std.testing.expectEqual(@as(usize, 1), writes.calls);
     try std.testing.expectEqual(@as(usize, 0), reads.lookups);
     try std.testing.expectEqual(@as(usize, 2), reads.scans);
+    reads.cancel_after_scan = null;
+    for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentWaitTimeout, error.EnrichmentRetryInProgress, error.CommitVisibilityNotSatisfied, error.CommitPropagationIncomplete, error.EnrichmentWorkerFailed }) |err| {
+        writes.failure = err;
+        const committed = try executeResponse(std.testing.allocator, reads.source(), writes.source(), "docs", request, .{});
+        try std.testing.expectEqualStrings(if (err == error.EnrichmentWorkerFailed) "committed_repair_required" else "committed_pending", committed.status);
+        try std.testing.expectEqual(response.upserted, committed.upserted);
+        try std.testing.expectEqual(response.deleted, committed.deleted);
+        try std.testing.expectEqualStrings(response.next_cursor, committed.next_cursor);
+    }
+    for ([_]anyerror{ error.VersionConflict, error.RaftBatchWriteOutcomeUnknown, error.Canceled }) |err| {
+        writes.failure = err;
+        try std.testing.expectError(err, executeResponse(std.testing.allocator, reads.source(), writes.source(), "docs", request, .{}));
+    }
 }

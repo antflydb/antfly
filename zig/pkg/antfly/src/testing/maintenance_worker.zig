@@ -74,7 +74,6 @@ const CliConfig = struct {
 
     fn runtimeConfig(self: CliConfig, clock: platform_clock.Clock) graph_metric_runtime_mod.Config {
         return .{
-            .enabled = true,
             .start_background_loop = false,
             .role = self.role,
             .runtime_id = self.runtime_id,
@@ -2170,7 +2169,6 @@ test "graph metric maintenance command parses worker pool config" {
     try std.testing.expectEqualStrings("worker-a", parsed.worker_ids.items[0]);
     try std.testing.expectEqualStrings("worker-b", parsed.worker_ids.items[1]);
     const runtime_cfg = parsed.runtimeConfig(platform_clock.Clock.real());
-    try std.testing.expect(runtime_cfg.enabled);
     try std.testing.expect(!runtime_cfg.start_background_loop);
     try std.testing.expectEqual(RuntimeRole.worker_pool, runtime_cfg.role);
     try std.testing.expectEqual(@as(usize, 2), runtime_cfg.planned_options.worker_ids.len);

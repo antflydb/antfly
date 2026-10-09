@@ -3849,6 +3849,7 @@ paths:
 
         ```
       operationId: globalQuery
+      x-antfly-response-streaming: true
       requestBody:
         required: true
         content:
@@ -4666,6 +4667,7 @@ paths:
       tags:
         - query_operations
       operationId: queryTable
+      x-antfly-response-streaming: true
       requestBody:
         required: true
         content:
@@ -5607,6 +5609,14 @@ paths:
             the primary for linearizable reads. `stale` allows a hot standby to
 
             serve the lookup at its safe-read LSN.
+
+            Owned object document tables support only explicit `stale` reads of
+
+            published generations. The default `read_index` and `leader_lease`
+
+            are rejected with HTTP 400. Use `sync_level=full_index` on writes to
+
+            wait for publication before a stale lookup.
           schema:
             type: string
             enum:
@@ -7686,6 +7696,7 @@ paths:
       tags:
         - query_operations
       operationId: queryNamespaceTable
+      x-antfly-response-streaming: true
       requestBody:
         required: true
         content:
@@ -15940,6 +15951,19 @@ components:
         default does not migrate data. Snapshot/backup and split operations currently reject vector_store
         tables; explicitly select primary_lsm when these operations are required.
       properties:
+        engine:
+          type: string
+          enum:
+            - local
+            - object
+          default: local
+          description: Durable table engine, independent of deployment. local uses the hosting process's
+            local or Lite backend and normal shard placement. object uses external lake data with durable
+            sidecars, or an Antfly-owned object WAL and published generations. Object tables do not allocate
+            data Raft groups; omit num_shards and replication_sources. Metadata remains authoritative
+            for table lifetime. Configure the shared destination through storage.artifacts. Writable object
+            document tables initially require immutable schema and index definitions; changes require
+            a new table and explicit migration.
         dense_embeddings:
           type: string
           enum:
@@ -21706,7 +21730,14 @@ components:
                       - join
                   - required:
                       - foreign_sources
+                  - required:
+                      - remote_snapshot
       properties:
+        remote_snapshot:
+          type: string
+          description: Opaque remote index snapshot token returned by a previous query. Required when
+            replaying search_after or search_before against an external table; a changed publication returns
+            409.
         evaluate:
           $ref: '#/components/schemas/QueryEvaluation'
         table_target:
@@ -23690,6 +23721,10 @@ components:
         - took
         - status
       properties:
+        remote_snapshot:
+          type: string
+          description: Opaque remote publication and schema fence to echo with ordered pagination. This
+            token does not grant access or retain the publication.
         evaluation:
           type: object
           additionalProperties: true
@@ -27084,16 +27119,54 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/GraphResolverConfig'
+    AlgebraicAggregateConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - op
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        op:
+          type: string
+          enum:
+            - count
+            - sum
+            - avg
+            - min
+            - max
+        group_by:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+        measure:
+          type: string
+          minLength: 1
+          description: Required except for count. Omitted count means COUNT(*); a supplied column means
+            COUNT(column), excluding SQL NULL values.
     AlgebraicIndexConfig:
       type: object
-      description: Schema-derived algebraic sidecar configuration. Public requests may opt into schema
-        derivation, while materializations remain engine-owned.
+      description: Schema-derived algebraic index capabilities with optional declarative aggregate recipes.
+        Physical materialization state remains engine-owned.
       properties:
         derive_from_schema:
           x-go-type-skip-optional-pointer: true
           type: boolean
-          description: When true, derive the algebraic capability sidecar from the table schema. Internal
-            fields and materialization definitions are not public API.
+          description: When true, derive typed fields and capabilities from the table schema. Physical
+            fields, laws, joins and state remain engine-owned.
+        aggregates:
+          type: array
+          maxItems: 64
+          description: Desired exact aggregate recipes over schema column names. Eligible SQL automatically
+            reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning.
+          items:
+            $ref: '#/components/schemas/AlgebraicAggregateConfig'
     RelationalExpressionOp:
       type: string
       enum:
@@ -27558,6 +27631,15 @@ components:
           enum:
             - read_only
           default: read_only
+        object_mutability:
+          type: string
+          enum:
+            - mutable
+            - immutable
+          default: mutable
+          description: Set immutable only when data files are never replaced at an existing URI. Allows
+            authenticated provider-version proofs from retained index generations to be reused for unchanged
+            data files. Metadata and delete files are still verified.
         credentials:
           $ref: '#/components/schemas/ExternalLakeCredentialRef'
         snapshot:

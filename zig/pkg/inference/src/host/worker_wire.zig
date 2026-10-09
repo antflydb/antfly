@@ -462,7 +462,7 @@ fn checkNumericRoundTrip(alloc: std.mem.Allocator) !void {
 }
 
 test "inference worker typed numeric responses preserve ownership under allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkNumericRoundTrip, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkNumericRoundTrip, .{});
 }
 
 test "inference worker HTTP requires valid scalar demand for acknowledged phases" {

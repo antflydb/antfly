@@ -28,7 +28,7 @@ const Allocator = std.mem.Allocator;
 
 /// Index generations bind this format along with their schema/key definition.
 /// There is no compatibility decoder for the mega branch's unpublished format.
-pub const encoding_version: u32 = 1;
+pub const encoding_version: u32 = 2;
 
 /// Transport-neutral typed bounds and constraint operands. In particular an
 /// integer operand never crosses a floating-point/JSON-number conversion.
@@ -37,7 +37,7 @@ pub const Value = union(enum) {
     string: []const u8,
     blob: []const u8,
     boolean: bool,
-    datetime: u64,
+    datetime: i128,
     integer: i64,
     number: f64,
 };
@@ -279,6 +279,56 @@ pub const TuplePlan = struct {
         return has_null;
     }
 
+    /// Physical column paths required by this immutable key program. Resolve
+    /// them once per batch; dictionary IDs never become persistent keys.
+    pub fn columnBindings(self: TuplePlan, alloc: Allocator) ![]const []const u8 {
+        const used = try alloc.alloc(bool, self.columns.len);
+        defer alloc.free(used);
+        @memset(used, false);
+        for (self.keys) |key| {
+            if (key.expression) |expression| {
+                for (expression.plan.dependencies) |ordinal| used[ordinal] = true;
+            } else used[key.ordinal] = true;
+        }
+        var names: std.ArrayList([]const u8) = .empty;
+        errdefer names.deinit(alloc);
+        for (used, self.columns) |required, column| if (required) try names.append(alloc, column.path);
+        return names.toOwnedSlice(alloc);
+    }
+
+    /// Reuses native expression bytecode and tuple encoding over typed scan
+    /// vectors. Values borrow the retained Parquet batch, never JSON rows.
+    pub fn bindBatch(self: TuplePlan, alloc: Allocator, batch: @import("../rowsource/types.zig").ColumnBatch) !BatchKeys {
+        try batch.validate();
+        const inputs = try alloc.alloc(?usize, self.columns.len);
+        errdefer alloc.free(inputs);
+        @memset(inputs, null);
+        const values = try alloc.alloc(Value, self.columns.len);
+        errdefer alloc.free(values);
+        @memset(values, .null);
+        const needed = try alloc.alloc(bool, self.columns.len);
+        defer alloc.free(needed);
+        @memset(needed, false);
+        for (self.keys) |key| {
+            if (key.expression) |expression| {
+                for (expression.plan.dependencies) |ordinal| needed[ordinal] = true;
+            } else needed[key.ordinal] = true;
+        }
+        for (self.columns, 0..) |column, ordinal| {
+            if (!needed[ordinal]) continue;
+            for (batch.columns, 0..) |vector, index| if (std.mem.eql(u8, vector.name, column.path)) {
+                if (inputs[ordinal] != null) return error.RowSourceDuplicateColumn;
+                inputs[ordinal] = index;
+            };
+        }
+        for (self.keys) |key| {
+            if (key.expression) |expression| {
+                for (expression.plan.dependencies) |ordinal| if (inputs[ordinal] == null) return error.RowSourceMissingColumn;
+            } else if (inputs[key.ordinal] == null) return error.RowSourceMissingColumn;
+        }
+        return .{ .alloc = alloc, .plan = self, .batch = batch, .inputs = inputs, .values = values, .scratch = .init(alloc) };
+    }
+
     /// Append into the transaction's region or a reusable scratch buffer.
     /// Failure restores the original length, including on late corrupt cells.
     pub fn append(self: TuplePlan, alloc: Allocator, out: *std.ArrayList(u8), row: rows.OrdinalRowView) !bool {
@@ -305,6 +355,7 @@ pub const TuplePlan = struct {
                         break :blk bytes.len * 2 + 3;
                     },
                     .null => 1,
+                    .datetime => 17,
                     .boolean => 2,
                     else => 9,
                 };
@@ -359,7 +410,11 @@ pub const TuplePlan = struct {
                     if (escaped != ~marker) return error.InvalidRelationalIndexKey;
                 }
             } else {
-                const width: usize = if (key.column_type == .boolean) 1 else 8;
+                const width: usize = switch (key.column_type) {
+                    .boolean => 1,
+                    .datetime => 16,
+                    else => 8,
+                };
                 if (width > bytes.len - pos) return error.InvalidRelationalIndexKey;
                 pos += width;
             }
@@ -367,6 +422,76 @@ pub const TuplePlan = struct {
         return pos;
     }
 };
+
+pub const BatchKeys = struct {
+    alloc: Allocator,
+    plan: TuplePlan,
+    batch: @import("../rowsource/types.zig").ColumnBatch,
+    inputs: []?usize,
+    values: []Value,
+    scratch: std.heap.ArenaAllocator,
+
+    pub fn deinit(self: *BatchKeys) void {
+        self.alloc.free(self.inputs);
+        self.alloc.free(self.values);
+        self.scratch.deinit();
+        self.* = undefined;
+    }
+    pub fn append(self: *BatchKeys, alloc: Allocator, out: *std.ArrayList(u8), row: usize) !bool {
+        if (row >= self.batch.rowCount()) return error.RowSourceColumnLengthMismatch;
+        _ = self.scratch.reset(.retain_capacity);
+        const start = out.items.len;
+        errdefer out.shrinkRetainingCapacity(start);
+        // Only bound dependencies are decoded; unrelated wide columns stay in
+        // their physical vectors. NULL slots are checked before dictionary IDs.
+        for (self.inputs, self.plan.columns, self.values) |input, column, *value| {
+            value.* = if (input) |index| try vectorValue(self.batch.columns[index], column.column_type, row) else .null;
+        }
+        var budget: usize = expressions.max_allocated_bytes;
+        var has_null = false;
+        for (self.plan.keys) |key| {
+            const value = if (key.expression) |expression|
+                try expression.plan.evaluateWithBudget(self.scratch.allocator(), self.values, &budget)
+            else
+                self.values[key.ordinal];
+            const bytes: usize = switch (value) {
+                .string, .blob => |s| s.len *| 2 +| 3,
+                .null => 1,
+                .datetime => 17,
+                .boolean => 2,
+                else => 9,
+            };
+            if (bytes > budget) return error.RelationalExpressionBudgetExceeded;
+            budget -= bytes;
+            has_null = has_null or value == .null;
+            try appendValue(alloc, out, start, key, value);
+        }
+        return has_null;
+    }
+};
+
+fn vectorValue(vector: @import("../rowsource/types.zig").ColumnVector, kind: schema.RelationalColumnType, row: usize) !Value {
+    if (vector.nulls.isNull(row)) return .null;
+    return switch (kind) {
+        .string => .{ .string = try vector.bytesAt(row) },
+        .blob => .{ .blob = try vector.bytesAt(row) },
+        .integer => .{ .integer = try vector.integerAt(row) },
+        .datetime => blk: {
+            const value = try vector.integerAt(row);
+            break :blk .{ .datetime = value };
+        },
+        .number => .{ .number = switch (vector.values) {
+            .f64 => |v| v[row],
+            .dictionary_f64 => |v| v.at(row),
+            else => return error.RowSourceColumnKindMismatch,
+        } },
+        .boolean => .{ .boolean = switch (vector.values) {
+            .bool => |v| v[row],
+            else => return error.RowSourceColumnKindMismatch,
+        } },
+        else => error.UnsupportedRelationalIndexColumn,
+    };
+}
 
 fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, key: BoundKey, value: Value) !void {
     const encoded_size: usize = switch (value) {
@@ -376,6 +501,7 @@ fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, ke
             try @import("relational_index_limits.zig").admit(bytes.len);
             break :blk 3 + bytes.len + std.mem.count(u8, bytes, "\x00");
         },
+        .datetime => 17,
         else => 9,
     };
     try @import("relational_index_limits.zig").admit(out.items.len - tuple_start +| encoded_size);
@@ -388,7 +514,7 @@ fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, ke
         inline else => |_, tag| if (key.column_type != @field(schema.RelationalColumnType, @tagName(tag))) return error.InvalidRelationalIndexBound,
     }
     try out.append(alloc, 0x80);
-    var scalar: [8]u8 = undefined;
+    var scalar: [16]u8 = undefined;
     const bytes: []const u8 = switch (value) {
         .string => |v| v,
         .blob => |v| v,
@@ -397,20 +523,21 @@ fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, ke
             break :blk scalar[0..1];
         },
         .datetime => |v| blk: {
-            std.mem.writeInt(u64, &scalar, v, .big);
+            const bits: u128 = @bitCast(v);
+            std.mem.writeInt(u128, &scalar, bits ^ (@as(u128, 1) << 127), .big);
             break :blk &scalar;
         },
         .integer => |v| blk: {
             const bits: u64 = @bitCast(v);
-            std.mem.writeInt(u64, &scalar, bits ^ (@as(u64, 1) << 63), .big);
-            break :blk &scalar;
+            std.mem.writeInt(u64, scalar[0..8], bits ^ (@as(u64, 1) << 63), .big);
+            break :blk scalar[0..8];
         },
         .number => |v| blk: {
             if (!std.math.isFinite(v)) return error.InvalidColumnValue;
             const bits: u64 = @bitCast(if (v == 0) @as(f64, 0) else v);
             const ordered = if (bits >> 63 != 0) ~bits else bits ^ (@as(u64, 1) << 63);
-            std.mem.writeInt(u64, &scalar, ordered, .big);
-            break :blk &scalar;
+            std.mem.writeInt(u64, scalar[0..8], ordered, .big);
+            break :blk scalar[0..8];
         },
         .null => unreachable,
     };
@@ -800,4 +927,27 @@ test "relational tuple definition identity tracks semantics instead of epoch pla
     var nullable_first = try TuplePlan.init(alloc, a, &layout_a, &.{.{ .column = "label", .collation = "ci", .nulls = .first }});
     defer nullable_first.deinit();
     try std.testing.expect(!std.mem.eql(u8, &left.fingerprint, &nullable_first.fingerprint));
+}
+
+test "external lake relational index signed datetime bounds preserve epoch ordering and full local domain" {
+    const a = std.testing.allocator;
+    const definition = schema.TableSchema{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "ts", .path = "ts", .column_type = .datetime, .allows_null = true }} };
+    var layout = try rows.PhysicalLayout.init(a, definition);
+    defer layout.deinit();
+    var plan = try TuplePlan.init(a, definition, &layout, &.{.{ .column = "ts" }});
+    defer plan.deinit();
+    var previous: ?[]u8 = null;
+    defer if (previous) |key| a.free(key);
+    for ([_]i128{ -1000000000, -1, 0, 1, std.math.maxInt(u64) }) |ns| {
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(a);
+        _ = try plan.appendValues(a, &encoded, &.{.{ .datetime = ns }});
+        try std.testing.expectEqual(@as(usize, 17), encoded.items.len);
+        if (previous) |key| {
+            try std.testing.expectEqual(std.math.Order.lt, std.mem.order(u8, key, encoded.items));
+            a.free(key);
+            previous = null;
+        }
+        previous = try a.dupe(u8, encoded.items);
+    }
 }

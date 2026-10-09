@@ -3850,7 +3850,10 @@ fn cloneSplitRecord(alloc: std.mem.Allocator, record: transition_state.SplitTran
 }
 
 fn tableRecordsEqual(a: table_manager.TableRecord, b: table_manager.TableRecord) bool {
-    return a.table_id == b.table_id and
+    return a.storage.engine == b.storage.engine and
+        a.object_storage_generation == b.object_storage_generation and
+        std.mem.eql(u8, &a.object_storage_identity, &b.object_storage_identity) and
+        a.table_id == b.table_id and
         a.desired_replica_count == b.desired_replica_count and
         a.min_ranges == b.min_ranges and
         std.mem.eql(u8, a.description, b.description) and

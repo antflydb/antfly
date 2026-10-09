@@ -322,6 +322,7 @@ fn replayHasStateRecords(replay: *const posting_wal.Replay) bool {
 }
 
 pub const Store = struct {
+    read_only: bool = false,
     alloc: Allocator,
     storage: lsm_backend.Storage,
     root_dir: []u8,
@@ -335,7 +336,10 @@ pub const Store = struct {
     poisoned: bool,
 
     pub fn open(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !Store {
-        return try openInternal(alloc, storage, root_dir, null);
+        return try openInternal(alloc, storage, root_dir, null, false);
+    }
+    pub fn openReadOnly(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !Store {
+        return try openInternal(alloc, storage, root_dir, null, true);
     }
 
     /// Opens and validates the store while retaining the already-read segment
@@ -344,12 +348,18 @@ pub const Store = struct {
     /// process startup.
     pub fn openWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !OpenedWithSegment {
         var retained_segments: ?[]RetainedSegment = null;
-        var store = try openInternal(alloc, storage, root_dir, &retained_segments);
+        var store = try openInternal(alloc, storage, root_dir, &retained_segments, false);
         errdefer store.deinit();
         return .{
             .store = store,
             .segments = retained_segments orelse return error.MissingPostingCheckpoint,
         };
+    }
+    pub fn openReadOnlyWithSegmentAlloc(alloc: Allocator, storage: lsm_backend.Storage, root_dir: []const u8) !OpenedWithSegment {
+        var retained_segments: ?[]RetainedSegment = null;
+        var store = try openInternal(alloc, storage, root_dir, &retained_segments, true);
+        errdefer store.deinit();
+        return .{ .store = store, .segments = retained_segments orelse return error.MissingPostingCheckpoint };
     }
 
     fn openInternal(
@@ -357,14 +367,16 @@ pub const Store = struct {
         storage: lsm_backend.Storage,
         root_dir: []const u8,
         retained_segments: ?*?[]RetainedSegment,
+        read_only: bool,
     ) !Store {
         const owned_root = try alloc.dupe(u8, root_dir);
-        storage.createDirPath(owned_root) catch |err| {
+        if (!read_only) storage.createDirPath(owned_root) catch |err| {
             alloc.free(owned_root);
             return err;
         };
 
         var store: Store = .{
+            .read_only = read_only,
             .alloc = alloc,
             .storage = storage,
             .root_dir = owned_root,
@@ -386,6 +398,7 @@ pub const Store = struct {
         // file can reach EOF and still be admitted by the codec below.
         const current = storage.readFileAlloc(alloc, current_path, max_control_bytes + 1) catch |err| switch (err) {
             error.FileNotFound => {
+                if (read_only) return err;
                 try store.replaceWal(&.{});
                 return store;
             },
@@ -423,6 +436,7 @@ pub const Store = struct {
         // Never append after an incomplete or uncommitted tail: later frames
         // would remain permanently hidden behind the first ignored bytes.
         if (recovered.bytes.len != recovered.replay.committed_bytes) {
+            if (read_only) return error.PostingWalUncommittedTail;
             try store.replaceWal(recovered.bytes[0..recovered.replay.committed_bytes]);
         }
         store.wal_committed_bytes = recovered.replay.committed_bytes;
@@ -473,6 +487,7 @@ pub const Store = struct {
     /// checkpoint preparation can subsequently drop covered extents by name.
     /// The caller owns the writer lane. An ambiguous CURRENT write poisons it.
     pub fn sealWalForCheckpoint(self: *Store) !bool {
+        if (self.read_only) return error.ReadOnly;
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         var checkpoint = self.checkpoint orelse return error.MissingPostingCheckpoint;
         const sealed_bytes = checkpoint.sealedWalBytes();
@@ -507,6 +522,7 @@ pub const Store = struct {
     }
 
     pub fn markAuthoritative(self: *Store) !void {
+        if (self.read_only) return error.ReadOnly;
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, authority_name });
         defer self.alloc.free(path);
@@ -536,6 +552,7 @@ pub const Store = struct {
         covered_source_sequence: u64,
         options: AppendOptions,
     ) !void {
+        if (self.read_only) return error.ReadOnly;
         const trace = @import("dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_CAPTURE_STAGES");
         const started = if (trace) @import("antfly_platform").time.monotonicNs() else 0;
         if (self.poisoned) return error.PostingStoreRequiresReopen;
@@ -588,6 +605,7 @@ pub const Store = struct {
     }
 
     pub fn appendCoverage(self: *Store, batch_id: u64, covered_source_sequence: u64, options: AppendOptions) !void {
+        if (self.read_only) return error.ReadOnly;
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         if (self.checkpoint == null) return error.MissingPostingCheckpoint;
         if (covered_source_sequence < self.covered_source_sequence) return error.PostingWalOverlapsCheckpoint;
@@ -652,6 +670,7 @@ pub const Store = struct {
         segment_generation: u64,
         segment_bytes: []const u8,
     ) !StagedCheckpointSegment {
+        if (self.read_only) return error.ReadOnly;
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         if (self.checkpoint) |current| {
             if (segment_generation <= current.latestSegmentGeneration()) return error.OutOfOrderPostingSegmentGeneration;
@@ -683,6 +702,7 @@ pub const Store = struct {
         self: *Store,
         segment_generation: u64,
     ) !StagedCheckpointWriter {
+        if (self.read_only) return error.ReadOnly;
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         if (self.checkpoint) |current| {
             if (segment_generation <= current.latestSegmentGeneration()) return error.OutOfOrderPostingSegmentGeneration;
@@ -988,14 +1008,17 @@ pub const Store = struct {
         staged: StagedCheckpointSegment,
         mode: PublicationMode,
     ) !PreparedPublication {
+        if (self.read_only) return error.ReadOnly;
         return self.prepareCheckpointInternalMode(segment_generation, covered_source_sequence, null, flattened_wal_bytes, staged, mode);
     }
 
     pub fn prepareCheckpoint(self: *Store, segment_generation: u64, covered_source_sequence: u64, segment_bytes: []const u8) !PreparedPublication {
+        if (self.read_only) return error.ReadOnly;
         return self.prepareCheckpointInternalMode(segment_generation, covered_source_sequence, segment_bytes, null, null, .full);
     }
 
     pub fn commitPrepared(self: *Store, prepared: *PreparedPublication) !void {
+        if (self.read_only) return error.ReadOnly;
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         if (prepared.committed) return error.PostingPublicationAlreadyCommitted;
         if (!std.meta.eql(self.checkpoint, prepared.previous_checkpoint) or
@@ -1279,6 +1302,7 @@ pub const Store = struct {
     /// The caller must own startup/publication exclusion from unpublished
     /// checkpoint builders; observational Store.open calls never invoke this.
     pub fn reclaimUnreferencedFiles(self: *const Store) !ReclaimStats {
+        if (self.read_only) return error.ReadOnly;
         const names = try self.storage.listFileNamesAlloc(self.alloc, self.root_dir);
         defer lsm_backend.Storage.freeFileNames(self.alloc, names);
         var stats: ReclaimStats = .{};
@@ -1375,6 +1399,7 @@ pub const Store = struct {
     }
 
     fn replaceWal(self: *Store, contents: []const u8) !void {
+        if (self.read_only) return error.ReadOnly;
         const path = try self.walPathAlloc(self.wal_generation);
         defer self.alloc.free(path);
         const sealed_bytes: usize = @intCast(if (self.checkpoint) |checkpoint| checkpoint.sealedWalBytes() else 0);
@@ -1387,6 +1412,7 @@ pub const Store = struct {
     /// mutation can commit. Segment and WAL generations are intentionally left
     /// behind as harmless orphans; a later checkpoint replaces them.
     pub fn invalidate(self: *Store) !void {
+        if (self.read_only) return error.ReadOnly;
         const current_path = try self.currentPathAlloc();
         defer self.alloc.free(current_path);
         self.storage.deleteFileAbsolute(current_path) catch |err| switch (err) {

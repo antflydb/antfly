@@ -3445,9 +3445,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (sync_level != .enrichments or sequence == 0) return;
             const runtime = self.enrichment_runtime orelse return;
             const runtime_stats = runtime.stats();
-            if (runtime_stats.applied_sequence >= sequence -| 1 or
-                try self.noPendingEnrichmentReplayThrough(runtime_stats.applied_sequence, sequence))
-            {
+            // A contiguous sequence may still retain a producer that requires
+            // committed graph state. Only the replay lane proves no work remains.
+            if (try self.noPendingEnrichmentReplayThrough(runtime_stats.applied_sequence, sequence)) {
                 try runtime.markAppliedThrough(sequence);
             }
         }
@@ -3474,12 +3474,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn noPendingEnrichmentReplayThrough(self: anytype, applied_sequence: u64, sequence: u64) !bool {
-            const pending = try enrichment_worker.collectPendingDocumentGroups(self.alloc, self.core.replaySource(), applied_sequence);
-            defer enrichment_worker.freePendingDocumentGroups(self.alloc, pending);
-            for (pending) |group| {
-                if (group.sequence <= sequence) return false;
-            }
-            return true;
+            var cursor = try self.core.replaySource().openMatchingCursor(self.alloc, applied_sequence, .enrichment);
+            defer cursor.deinit(self.alloc);
+            const Probe = struct {
+                through: u64,
+                pending: bool = false,
+                fn consume(ptr: *anyopaque, at: u64, _: []const u8) !void {
+                    const probe: *@This() = @ptrCast(@alignCast(ptr));
+                    probe.pending = at <= probe.through;
+                }
+            };
+            var probe = Probe{ .through = sequence };
+            _ = try cursor.forEachNext(1, &probe, Probe.consume);
+            return !probe.pending;
         }
 
         pub fn notifyQueryVisibilityEvent(ctx: *AsyncContext, event: QueryVisibilityEvent) void {

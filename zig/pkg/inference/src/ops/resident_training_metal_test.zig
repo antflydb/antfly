@@ -248,7 +248,7 @@ test "resident training Metal allocation failures release every strict tensor" {
     var fixture = try Fixture.init(std.testing.allocator);
     defer fixture.deinit();
     const before = metal_tensor.memoryStatsSnapshot();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationCheck, .{fixture.backend});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationCheck, .{fixture.backend});
     const after = metal_tensor.memoryStatsSnapshot();
     try std.testing.expectEqual(before.device_owned_live_bytes, after.device_owned_live_bytes);
     try std.testing.expectEqual(before.host_mirror_download_bytes, after.host_mirror_download_bytes);

@@ -559,7 +559,7 @@ test "trained execution parser reclaims every allocation failure and admits a re
             try std.testing.expectEqual(@as(usize, 10), verified.inputs.value.cases.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Test.run, .{ fixture, inputs, raw });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Test.run, .{ fixture, inputs, raw });
     const owner = try Owner.create(a, 4096);
     defer owner.destroy();
     const owned = owner.allocator();
@@ -642,5 +642,5 @@ test "trained execution preloader and final verification reject same size substi
             try verifyArtifacts(allocator, test_io, path, expected, null);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Test.run, .{ io, directory, envelope });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Test.run, .{ io, directory, envelope });
 }

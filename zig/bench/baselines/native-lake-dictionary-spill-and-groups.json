@@ -1,0 +1,604 @@
+{
+  "date": "2026-10-05",
+  "source_base": "53f9f4214",
+  "command": "zig build sql-test pgwire-test sql-native-pipeline-bench -Doptimize=ReleaseSafe -j2 --summary all",
+  "source_files_sha256": {
+    "zig/pkg/antfly-embedded/src/local/sql/aggregate_runtime.zig": "b7fddf0423500a98f7c328fffa58c8b531c63f8dfc8f760c03e91d339b08694d",
+    "zig/pkg/antfly-embedded/src/local/sql/aggregate_state.zig": "8b888f1a76776bbee6d5908a4087d4e70004b6fcef00e6e512193fa38b051a32",
+    "zig/pkg/antfly-embedded/src/local/sql/batch_hash.zig": "04948b1552b76269361d558a71e9642269cdfa470b89db21312adb0f3b59c8ac",
+    "zig/pkg/antfly-embedded/src/local/sql/execution_batch.zig": "0dfd1bc6c917e81b8bd7c4dceedfd4fba9d39a7b561774a313ad7b35b87f7831",
+    "zig/pkg/antfly-embedded/src/local/sql/operators.zig": "4450f3230a88023e58f76ffd491027c77f2d322a183630356d5543ed581f213d",
+    "zig/pkg/antfly-embedded/src/local/sql/partition_join.zig": "356dacde7cbf503f290ba36f6ee861a1694a2fe674c990c23da64df02983784b",
+    "zig/pkg/antfly-embedded/src/local/sql/refinement_bench.zig": "ad400096b00d7d4805c3e412f57f7bb5fc412656b717959d8fc7ba766bb76bd7",
+    "zig/pkg/antfly-embedded/src/local/sql/spill.zig": "e661b36aaa13210312fb6a6143025a40e108d0e8056a8821c6cc69c5d5e96292",
+    "zig/pkg/antfly-embedded/src/local/sql/spill_grouped.zig": "0a7edf5136faf7798f0c522489f2e4d11d08934bedb7d2e7c6e820d8c744a1b5",
+    "zig/pkg/antfly-embedded/src/local/sql/vector_eval.zig": "fd57dea1da1f802b9127d3dd29e3bf1bd0bf67f6599ef2698c0783968ed31637"
+  },
+  "comparison_baseline": "native-lake-compact-typed-state.json",
+  "notes": [
+    "Equal-output checks and three samples; no timing assertions. A native Debug server build ran concurrently, so timings are illustrative.",
+    "Dictionary decode fixture: 4096 rows, 32 integer columns, four values per column, SQL NULLs, compressed typed spill blocks. Compact decode retains primitive unique entries and row IDs without a Datum matrix.",
+    "Dictionary decode peak is 54880 bytes versus 1162174 bytes for the expanded read of the same serialized records (95.3% lower).",
+    "The small-workspace sorted wide-string fixture still uses singleton records and retains more decode memory than dictionary gathering; merge fan-in and block budgets remain unchanged.",
+    "Wide spilled join allocation counts do not improve against the prior baseline; singleton input borrowing avoids needless lease ownership, but this fixture does not establish an allocation win.",
+    "Remote catalog index publication, complete coverage selection, and materialization substitution remain unimplemented; these native measurements do not establish remote index serving."
+  ],
+  "validation": {
+    "sql_native_tests": 118,
+    "sql_shared_tests": 305,
+    "pgwire_tests": 76,
+    "pipeline_benchmarks": 9,
+    "lake_shared_integration_tests": 46,
+    "lake_api_integration_tests": 6,
+    "real_parquet_e2e_tests": 2
+  },
+  "samples": [
+    {
+      "case": "owned_column_transfer",
+      "rows": 4096,
+      "width": 8,
+      "repeats": 16,
+      "sample": 0,
+      "copy_ns": 69587250,
+      "transfer_ns": 445542
+    },
+    {
+      "case": "owned_column_transfer",
+      "rows": 4096,
+      "width": 8,
+      "repeats": 16,
+      "sample": 1,
+      "copy_ns": 71449375,
+      "transfer_ns": 487875
+    },
+    {
+      "case": "owned_column_transfer",
+      "rows": 4096,
+      "width": 8,
+      "repeats": 16,
+      "sample": 2,
+      "copy_ns": 70983875,
+      "transfer_ns": 493916
+    },
+    {
+      "case": "query_narrow_limit",
+      "rows": 8192,
+      "sample": 0,
+      "ns": 1580458,
+      "allocations": 321,
+      "peak_bytes": 2080340,
+      "checksum": 41742336
+    },
+    {
+      "case": "query_narrow_limit",
+      "rows": 8192,
+      "sample": 1,
+      "ns": 1508083,
+      "allocations": 321,
+      "peak_bytes": 2495350,
+      "checksum": 41742336
+    },
+    {
+      "case": "query_narrow_limit",
+      "rows": 8192,
+      "sample": 2,
+      "ns": 1573125,
+      "allocations": 323,
+      "peak_bytes": 2443798,
+      "checksum": 41742336
+    },
+    {
+      "case": "query_wide_projection",
+      "rows": 8192,
+      "sample": 0,
+      "ns": 4180167,
+      "allocations": 424,
+      "peak_bytes": 8880780,
+      "checksum": 313131008
+    },
+    {
+      "case": "query_wide_projection",
+      "rows": 8192,
+      "sample": 1,
+      "ns": 3967500,
+      "allocations": 423,
+      "peak_bytes": 8735444,
+      "checksum": 313131008
+    },
+    {
+      "case": "query_wide_projection",
+      "rows": 8192,
+      "sample": 2,
+      "ns": 3969916,
+      "allocations": 422,
+      "peak_bytes": 9108836,
+      "checksum": 313131008
+    },
+    {
+      "case": "query_group_projection",
+      "rows": 100,
+      "sample": 0,
+      "ns": 2758375,
+      "allocations": 174,
+      "peak_bytes": 4035152,
+      "checksum": 100014950
+    },
+    {
+      "case": "query_group_projection",
+      "rows": 100,
+      "sample": 1,
+      "ns": 2679375,
+      "allocations": 174,
+      "peak_bytes": 4035152,
+      "checksum": 100014950
+    },
+    {
+      "case": "query_group_projection",
+      "rows": 100,
+      "sample": 2,
+      "ns": 2695250,
+      "allocations": 174,
+      "peak_bytes": 4035152,
+      "checksum": 100014950
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 0,
+      "ns": 978776916,
+      "allocations": 397116,
+      "peak_bytes": 9698882,
+      "checksum": 79999200000
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 1,
+      "ns": 963911583,
+      "allocations": 397116,
+      "peak_bytes": 9698882,
+      "checksum": 79999200000
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 2,
+      "ns": 1009708000,
+      "allocations": 397116,
+      "peak_bytes": 9698882,
+      "checksum": 79999200000
+    },
+    {
+      "case": "primitive_numeric_hash",
+      "rows": 100000,
+      "sample": 0,
+      "decimal_ns": 11666981375,
+      "primitive_ns": 414958
+    },
+    {
+      "case": "primitive_numeric_hash",
+      "rows": 100000,
+      "sample": 1,
+      "decimal_ns": 10164604375,
+      "primitive_ns": 405792
+    },
+    {
+      "case": "primitive_numeric_hash",
+      "rows": 100000,
+      "sample": 2,
+      "decimal_ns": 8382778709,
+      "primitive_ns": 412833
+    },
+    {
+      "case": "shared_expression_dag",
+      "shape": "short",
+      "rows": 131072,
+      "sample": 0,
+      "separate_ns": 12958208,
+      "fused_ns": 13549375,
+      "separate_peak_bytes": 194118,
+      "fused_peak_bytes": 197728
+    },
+    {
+      "case": "blocking_result_delivery",
+      "rows": 4096,
+      "sample": 0,
+      "indexed_ns": 3012375,
+      "block_ns": 2572625,
+      "indexed_peak_bytes": 33280,
+      "block_peak_bytes": 40619,
+      "indexed_written_bytes": 417792,
+      "block_written_bytes": 94839,
+      "indexed_reads": 104,
+      "block_reads": 26,
+      "indexed_writes": 104,
+      "block_writes": 26
+    },
+    {
+      "case": "shared_expression_dag",
+      "shape": "short",
+      "rows": 131072,
+      "sample": 1,
+      "separate_ns": 10421333,
+      "fused_ns": 12000375,
+      "separate_peak_bytes": 194118,
+      "fused_peak_bytes": 197728
+    },
+    {
+      "case": "blocking_result_delivery",
+      "rows": 4096,
+      "sample": 1,
+      "indexed_ns": 2765459,
+      "block_ns": 2637375,
+      "indexed_peak_bytes": 32256,
+      "block_peak_bytes": 33991,
+      "indexed_written_bytes": 417792,
+      "block_written_bytes": 94839,
+      "indexed_reads": 104,
+      "block_reads": 26,
+      "indexed_writes": 104,
+      "block_writes": 26
+    },
+    {
+      "case": "shared_expression_dag",
+      "shape": "short",
+      "rows": 131072,
+      "sample": 2,
+      "separate_ns": 12099916,
+      "fused_ns": 12861917,
+      "separate_peak_bytes": 194118,
+      "fused_peak_bytes": 197728
+    },
+    {
+      "case": "blocking_result_delivery",
+      "rows": 4096,
+      "sample": 2,
+      "indexed_ns": 3149584,
+      "block_ns": 2740417,
+      "indexed_peak_bytes": 32256,
+      "block_peak_bytes": 33991,
+      "indexed_written_bytes": 417792,
+      "block_written_bytes": 94839,
+      "indexed_reads": 104,
+      "block_reads": 26,
+      "indexed_writes": 104,
+      "block_writes": 26
+    },
+    {
+      "case": "shared_expression_dag",
+      "shape": "shared_chain",
+      "rows": 131072,
+      "sample": 0,
+      "separate_ns": 17980250,
+      "fused_ns": 15878875,
+      "separate_peak_bytes": 169542,
+      "fused_peak_bytes": 197728
+    },
+    {
+      "case": "shared_expression_dag",
+      "shape": "shared_chain",
+      "rows": 131072,
+      "sample": 1,
+      "separate_ns": 20963792,
+      "fused_ns": 14650708,
+      "separate_peak_bytes": 169542,
+      "fused_peak_bytes": 197728
+    },
+    {
+      "case": "shared_expression_dag",
+      "shape": "shared_chain",
+      "rows": 131072,
+      "sample": 2,
+      "separate_ns": 18521500,
+      "fused_ns": 14294958,
+      "separate_peak_bytes": 169542,
+      "fused_peak_bytes": 199310
+    },
+    {
+      "case": "wide_column_cache",
+      "rows": 1024,
+      "width": 8,
+      "sample": 0,
+      "four_entry_ns": 16107792,
+      "active_ns": 969417,
+      "four_entry_decodes": 8192,
+      "active_decodes": 160
+    },
+    {
+      "case": "wide_column_cache",
+      "rows": 1024,
+      "width": 8,
+      "sample": 1,
+      "four_entry_ns": 16837500,
+      "active_ns": 1072834,
+      "four_entry_decodes": 8192,
+      "active_decodes": 160
+    },
+    {
+      "case": "wide_column_cache",
+      "rows": 1024,
+      "width": 8,
+      "sample": 2,
+      "four_entry_ns": 18783833,
+      "active_ns": 625833,
+      "four_entry_decodes": 8192,
+      "active_decodes": 160
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": false,
+      "rows": 4096,
+      "sample": 0,
+      "gather_ns": 3288542,
+      "lease_ns": 1809709,
+      "gather_peak_bytes": 64325,
+      "lease_peak_bytes": 64325
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": false,
+      "rows": 4096,
+      "sample": 1,
+      "gather_ns": 3280916,
+      "lease_ns": 1724000,
+      "gather_peak_bytes": 64325,
+      "lease_peak_bytes": 64325
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": false,
+      "rows": 4096,
+      "sample": 2,
+      "gather_ns": 3677541,
+      "lease_ns": 1793959,
+      "gather_peak_bytes": 64325,
+      "lease_peak_bytes": 64325
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": true,
+      "rows": 4096,
+      "sample": 0,
+      "gather_ns": 14207959,
+      "lease_ns": 20741625,
+      "gather_peak_bytes": 127383,
+      "lease_peak_bytes": 303667
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": true,
+      "rows": 4096,
+      "sample": 1,
+      "gather_ns": 33602375,
+      "lease_ns": 13540083,
+      "gather_peak_bytes": 127383,
+      "lease_peak_bytes": 303667
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": true,
+      "rows": 4096,
+      "sample": 2,
+      "gather_ns": 32710625,
+      "lease_ns": 30500666,
+      "gather_peak_bytes": 127383,
+      "lease_peak_bytes": 303667
+    },
+    {
+      "case": "compact_typed_spill_decode",
+      "rows": 4096,
+      "width": 32,
+      "sample": 0,
+      "expanded_ns": 2720792,
+      "compact_ns": 1509667,
+      "expanded_peak_bytes": 1144700,
+      "compact_peak_bytes": 110284
+    },
+    {
+      "case": "compact_typed_spill_decode",
+      "rows": 4096,
+      "width": 32,
+      "sample": 1,
+      "expanded_ns": 2219250,
+      "compact_ns": 1412584,
+      "expanded_peak_bytes": 1144700,
+      "compact_peak_bytes": 110284
+    },
+    {
+      "case": "compact_typed_spill_decode",
+      "rows": 4096,
+      "width": 32,
+      "sample": 2,
+      "expanded_ns": 2256584,
+      "compact_ns": 1309125,
+      "expanded_peak_bytes": 1144700,
+      "compact_peak_bytes": 110284
+    },
+    {
+      "case": "dictionary_spill_decode",
+      "rows": 4096,
+      "width": 32,
+      "sample": 0,
+      "expanded_ns": 2154125,
+      "compact_ns": 2073208,
+      "expanded_peak_bytes": 1162174,
+      "compact_peak_bytes": 54880
+    },
+    {
+      "case": "dictionary_spill_decode",
+      "rows": 4096,
+      "width": 32,
+      "sample": 1,
+      "expanded_ns": 3355084,
+      "compact_ns": 2016459,
+      "expanded_peak_bytes": 1162174,
+      "compact_peak_bytes": 54880
+    },
+    {
+      "case": "dictionary_spill_decode",
+      "rows": 4096,
+      "width": 32,
+      "sample": 2,
+      "expanded_ns": 3428917,
+      "compact_ns": 1832958,
+      "expanded_peak_bytes": 1162174,
+      "compact_peak_bytes": 54880
+    },
+    {
+      "case": "primitive_numeric_hash",
+      "rows": 100000,
+      "sample": 0,
+      "decimal_ns": 11336805459,
+      "primitive_ns": 521208
+    },
+    {
+      "case": "primitive_numeric_hash",
+      "rows": 100000,
+      "sample": 1,
+      "decimal_ns": 9450907083,
+      "primitive_ns": 522833
+    },
+    {
+      "case": "primitive_numeric_hash",
+      "rows": 100000,
+      "sample": 2,
+      "decimal_ns": 8259770750,
+      "primitive_ns": 400125
+    },
+    {
+      "case": "owned_column_transfer",
+      "rows": 4096,
+      "width": 8,
+      "repeats": 16,
+      "sample": 0,
+      "copy_ns": 46077833,
+      "transfer_ns": 329458
+    },
+    {
+      "case": "owned_column_transfer",
+      "rows": 4096,
+      "width": 8,
+      "repeats": 16,
+      "sample": 1,
+      "copy_ns": 47309833,
+      "transfer_ns": 318833
+    },
+    {
+      "case": "owned_column_transfer",
+      "rows": 4096,
+      "width": 8,
+      "repeats": 16,
+      "sample": 2,
+      "copy_ns": 47093750,
+      "transfer_ns": 320334
+    },
+    {
+      "case": "query_narrow_limit",
+      "rows": 8192,
+      "sample": 0,
+      "ns": 1547333,
+      "allocations": 321,
+      "peak_bytes": 2483578,
+      "checksum": 41742336
+    },
+    {
+      "case": "query_narrow_limit",
+      "rows": 8192,
+      "sample": 1,
+      "ns": 1093083,
+      "allocations": 320,
+      "peak_bytes": 2154908,
+      "checksum": 41742336
+    },
+    {
+      "case": "query_narrow_limit",
+      "rows": 8192,
+      "sample": 2,
+      "ns": 1171791,
+      "allocations": 321,
+      "peak_bytes": 2358034,
+      "checksum": 41742336
+    },
+    {
+      "case": "query_wide_projection",
+      "rows": 8192,
+      "sample": 0,
+      "ns": 2876334,
+      "allocations": 423,
+      "peak_bytes": 8794972,
+      "checksum": 313131008
+    },
+    {
+      "case": "query_wide_projection",
+      "rows": 8192,
+      "sample": 1,
+      "ns": 2752167,
+      "allocations": 422,
+      "peak_bytes": 8863484,
+      "checksum": 313131008
+    },
+    {
+      "case": "query_wide_projection",
+      "rows": 8192,
+      "sample": 2,
+      "ns": 2619667,
+      "allocations": 422,
+      "peak_bytes": 8988864,
+      "checksum": 313131008
+    },
+    {
+      "case": "query_group_projection",
+      "rows": 100,
+      "sample": 0,
+      "ns": 2043083,
+      "allocations": 174,
+      "peak_bytes": 4035152,
+      "checksum": 100014950
+    },
+    {
+      "case": "query_group_projection",
+      "rows": 100,
+      "sample": 1,
+      "ns": 1844375,
+      "allocations": 174,
+      "peak_bytes": 4035152,
+      "checksum": 100014950
+    },
+    {
+      "case": "query_group_projection",
+      "rows": 100,
+      "sample": 2,
+      "ns": 1801583,
+      "allocations": 174,
+      "peak_bytes": 4035152,
+      "checksum": 100014950
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 0,
+      "ns": 633389208,
+      "allocations": 397116,
+      "peak_bytes": 9698882,
+      "checksum": 79999200000
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 1,
+      "ns": 626381417,
+      "allocations": 397116,
+      "peak_bytes": 9698882,
+      "checksum": 79999200000
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 2,
+      "ns": 623897334,
+      "allocations": 397116,
+      "peak_bytes": 9698882,
+      "checksum": 79999200000
+    }
+  ]
+}

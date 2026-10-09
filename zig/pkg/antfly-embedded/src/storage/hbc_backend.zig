@@ -63,6 +63,7 @@ pub const OpenedBackend = union(enum) {
 };
 
 pub const NativeBackend = struct {
+    read_only: bool = false,
     storage: lsm_backend.Storage,
     storage_lease: ?lsm_backend.NativeStorageLease,
     storage_owner: ?*lsm_backend.NativeStorage,
@@ -106,6 +107,7 @@ pub const NativeBackend = struct {
 
         const native = try alloc.create(NativeBackend);
         native.* = .{
+            .read_only = options.backend_options.backend.read_only,
             .storage = storage,
             .storage_lease = null,
             .storage_owner = storage_owner,

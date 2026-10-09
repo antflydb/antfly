@@ -218,12 +218,16 @@ pub const WeightStore = struct {
     allow_direct_quant: bool = true,
     quant_execution_mode: QuantExecutionMode = .prefer_backend_dense,
     prefer_f32_dense_tensors: bool = false,
-    /// Constructor-only capability for immutable legacy GLiNER inference
+    /// Constructor-only capability for qualified immutable GLiNER inference
     /// sessions. A request may borrow an aligned F32 host payload while holding
     /// its LazyWeightEntry pin. Generic and mutable training stores stay false;
     /// this never authorizes borrowing mutable parameters or retaining a CT
     /// beyond the request/backend lifetime.
     allow_immutable_f32_weight_borrow: bool = false,
+    /// Legacy GLiNER may additionally route borrowed weight+bias pairs through
+    /// its established MPS slot path. Other immutable-F32 inference sessions
+    /// borrow storage without changing their numerical dispatch.
+    prefer_immutable_gliner_f32_mps: bool = false,
     mirror_kv_to_manager: bool = true,
     access_epoch: u64 = 1,
     packed_expert_views: std.StringHashMapUnmanaged(PackedExpertViewEntry) = .empty,
@@ -246,6 +250,7 @@ test "gpu hosted immutable F32 borrowing is disabled for ordinary stores" {
         .lazy_weights = .empty,
     };
     try std.testing.expect(!store.allow_immutable_f32_weight_borrow);
+    try std.testing.expect(!store.prefer_immutable_gliner_f32_mps);
 }
 
 pub fn touchLazyWeight(data: *WeightStore, entry: *LazyWeightEntry) void {

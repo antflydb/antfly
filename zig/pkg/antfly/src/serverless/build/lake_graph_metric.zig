@@ -3354,7 +3354,7 @@ test "serverless graph metric indexed preparation selects topology and cleans up
             prepared.deinit(failing);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{ &artifacts, source, config });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.run, .{ &artifacts, source, config });
     var tiny = graph_metric_policy.Budget{ .limits = .{ .max_peak_memory_bytes = 128 } };
     try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareSelectedGraphArtifactOracleAlloc(alloc, &artifacts, source, &.{config}, .none, tiny.limits, &tiny));
     var no_reads = graph_metric_policy.Budget{ .limits = .{ .max_total_graph_payload_bytes = 0 } };
@@ -3511,7 +3511,7 @@ test "serverless packed topology matches reference kernels across filters and qu
             defer topology.deinit(failing_alloc);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Runner.prepare, .{payload});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.prepare, .{payload});
     var filter_types = [_][]u8{@constCast("alpha")};
     for ([_]graph_mod.GraphMetricEdgeFilter{ .{}, .{ .mode = .types, .types = &filter_types } }) |filter| {
         for ([_]graph_mod.GraphMetricKind{ .degree, .pagerank, .eigenvector, .hits_authority, .hits_hub }) |kind| {
@@ -4445,7 +4445,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{ &artifacts, @as([]const artifact_ref.ArtifactRef, baseline), @as([]const PublicationRequest, &.{ request_alias, request_a, renamed }) });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationRunner.run, .{ &artifacts, @as([]const artifact_ref.ArtifactRef, baseline), @as([]const PublicationRequest, &.{ request_alias, request_a, renamed }) });
 
     // Cache reuse must not inherit admission from the request that populated
     // the cache. A later caller's stricter source-topology limit still wins.

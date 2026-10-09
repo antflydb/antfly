@@ -8,6 +8,11 @@ The core idea is not to force database operations into group theory alone.
 Groups are useful for reversible updates, but ordinary database work also needs
 monoids, semirings, lattices, vector spaces, and sparse tensor operations.
 
+The serving contract for remote Parquet/Iceberg materializations, exact SQL state
+interchange, coverage proofs, and invalidation is described in
+[REMOTE_TABLE_SERVING.md](REMOTE_TABLE_SERVING.md). Its implementation status is the
+readiness gate for those capabilities.
+
 ## Thesis
 
 A database can model its state as a sparse formal vector:

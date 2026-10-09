@@ -655,7 +655,7 @@ test "gliner joint adapter releases every allocation on finalization failures" {
             try std.testing.expectEqual(@as(usize, 3), output.nodes.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{compiled.schema.joint_ie.?});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{compiled.schema.joint_ie.?});
 }
 
 test "gliner joint adapter uses pinned Unicode 15 Python repr for stable edge ties" {

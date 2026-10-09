@@ -1,0 +1,342 @@
+{
+  "format_version": 1,
+  "models": {
+    "decide_1b": {
+      "architecture": "span",
+      "architecture_class": "SpanExtractor",
+      "compatibility": {
+        "gliner25_boundary_converter": false,
+        "reason": "The checkpoint uses the span markerV0/count_lstm stack and a ModernBERT encoder; it is not a GLiNER2.5 boundary bundle."
+      },
+      "critical_tensors": {
+        "classifier.0.weight": [
+          3584,
+          1792
+        ],
+        "classifier.2.weight": [
+          1,
+          3584
+        ],
+        "count_embed.gru.weight_ih_l0": [
+          5376,
+          1792
+        ],
+        "count_pred.2.weight": [
+          20,
+          3584
+        ],
+        "encoder.embeddings.tok_embeddings.weight": [
+          50378,
+          1792
+        ],
+        "encoder.layers.0.attn.Wqkv.weight": [
+          5376,
+          1792
+        ],
+        "encoder.layers.0.mlp.Wi.weight": [
+          7680,
+          1792
+        ],
+        "span_rep.span_rep_layer.out_project.0.weight": [
+          7168,
+          3584
+        ]
+      },
+      "dtype": "F32",
+      "encoder": {
+        "global_attn_every_n_layers": 3,
+        "hidden_size": 1792,
+        "intermediate_size": 3840,
+        "local_attention": 128,
+        "max_position_embeddings": 7999,
+        "model_type": "modernbert",
+        "num_attention_heads": 28,
+        "num_hidden_layers": 28,
+        "position_embedding_type": "sans_pos",
+        "vocab_size": 50378
+      },
+      "model_name": "jhu-clsp/ettin-enc-from-dec-1b",
+      "model_sha256": "02c567d791aed26550d300064c7f0c0094fd65291503c65969b45b30786e33b3",
+      "model_size_bytes": 4755208228,
+      "parameter_count": 1188796693,
+      "repo": "fastino/GLiNER2.5-Decide-1B",
+      "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+      "sidecars": {
+        "config.json": {
+          "sha256": "d2732928820b95649bc87f051345b2394fff87fc28c01f945610f943d6f402b2",
+          "size_bytes": 464
+        },
+        "encoder_config/config.json": {
+          "sha256": "c2cc4c15c7504b9e15651f2a32dff82b84fa9a99060a3218671a930da0a9b50d",
+          "size_bytes": 2160
+        },
+        "tokenizer.json": {
+          "sha256": "ddb379b6a4679ee16646bf0b726de9ec538d7c80ea9d4d4e33b069f19c9e1efb",
+          "size_bytes": 3585055
+        },
+        "tokenizer_config.json": {
+          "sha256": "8bb8d094c7cde84942866ef98fb5b24f7387245573a7f707c8349729484c27b3",
+          "size_bytes": 559
+        }
+      },
+      "tensor_count": 199,
+      "tensor_header_length": 21448,
+      "tensor_header_sha256": "449e7c096746bf06825e71d40d215de142f5f404f560c601a0d9bafc1bca0bae",
+      "tokenizer": {
+        "model_max_length": 8192,
+        "tokenizer_class": "TokenizersBackend"
+      },
+      "top_level": {
+        "architecture_version": 1,
+        "counting_layer": "count_lstm",
+        "max_len": null,
+        "max_width": 8,
+        "token_pooling": "first"
+      }
+    },
+    "multi_decide": {
+      "architecture": "boundary",
+      "architecture_class": "BoundaryExtractor",
+      "compatibility": {
+        "gliner25_boundary_converter": true,
+        "reason": "The checkpoint has the released multilingual boundary tensor schema; runtime quality and backend qualification remain separate gates."
+      },
+      "critical_tensors": {
+        "boundary_head.boundary_encoder.output_projection.weight": [
+          128,
+          256
+        ],
+        "classifier.0.weight": [
+          1536,
+          768
+        ],
+        "classifier.3.weight": [
+          1,
+          1536
+        ],
+        "encoder.embeddings.word_embeddings.weight": [
+          250112,
+          768
+        ],
+        "encoder.encoder.layer.0.attention.self.query_proj.weight": [
+          768,
+          768
+        ],
+        "encoder.encoder.layer.0.intermediate.dense.weight": [
+          3072,
+          768
+        ]
+      },
+      "dtype": "F32",
+      "encoder": {
+        "hidden_size": 768,
+        "intermediate_size": 3072,
+        "max_position_embeddings": 512,
+        "model_type": "deberta-v2",
+        "num_attention_heads": 12,
+        "num_hidden_layers": 12,
+        "position_buckets": 256,
+        "vocab_size": 250112
+      },
+      "model_name": "microsoft/mdeberta-v3-base",
+      "model_sha256": "9efe0f88c99f2aa794452e9559dc60e98d60d9fa2bf1b60cf2710411b6da5b4e",
+      "model_size_bytes": 1149461028,
+      "parameter_count": 287355159,
+      "repo": "fastino/GLiNER2.5-multi-Decide",
+      "revision": "a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f",
+      "sidecars": {
+        "config.json": {
+          "sha256": "be5123080c0f3f01b938bc46a5dd0d7a2e515a34f6df798dfd70ed04c277c8bf",
+          "size_bytes": 3152
+        },
+        "encoder_config/config.json": {
+          "sha256": "d0ebbcb8b458e285a39e12cc315cbaf3d1c6f631e7281e6b22dd5b4071183f83",
+          "size_bytes": 858
+        },
+        "tokenizer.json": {
+          "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+          "size_bytes": 16035853
+        },
+        "tokenizer_config.json": {
+          "sha256": "fd4a31dc2f1f17e31638c5f0e783b81cdb2fbe6bddd116a8d9e5d50d78148cf1",
+          "size_bytes": 646
+        }
+      },
+      "tensor_count": 334,
+      "tensor_header_length": 40384,
+      "tensor_header_sha256": "013eacdfc5811df532e5afc637b013307dd93787b7dfdc95e5c404a9d6ca4e6c",
+      "tokenizer": {
+        "add_prefix_space": true,
+        "do_lower_case": false,
+        "tokenizer_class": "DebertaV2Tokenizer",
+        "vocab_type": "spm"
+      },
+      "top_level": {
+        "architecture_version": 1,
+        "max_len": 4096,
+        "token_pooling": "first"
+      }
+    },
+    "multi_v1": {
+      "architecture": "boundary",
+      "architecture_class": "BoundaryExtractor",
+      "compatibility": {
+        "gliner25_boundary_converter": true,
+        "reason": "The checkpoint is the released multilingual boundary profile; runtime quality and backend qualification remain separate gates."
+      },
+      "critical_tensors": {
+        "boundary_head.boundary_encoder.output_projection.weight": [
+          128,
+          256
+        ],
+        "classifier.0.weight": [
+          1536,
+          768
+        ],
+        "classifier.3.weight": [
+          1,
+          1536
+        ],
+        "encoder.embeddings.word_embeddings.weight": [
+          250112,
+          768
+        ],
+        "encoder.encoder.layer.0.attention.self.query_proj.weight": [
+          768,
+          768
+        ],
+        "encoder.encoder.layer.0.intermediate.dense.weight": [
+          3072,
+          768
+        ]
+      },
+      "dtype": "F32",
+      "encoder": {
+        "hidden_size": 768,
+        "intermediate_size": 3072,
+        "max_position_embeddings": 512,
+        "model_type": "deberta-v2",
+        "num_attention_heads": 12,
+        "num_hidden_layers": 12,
+        "position_buckets": 256,
+        "vocab_size": 250112
+      },
+      "model_name": "microsoft/mdeberta-v3-base",
+      "model_sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395",
+      "model_size_bytes": 1149461028,
+      "parameter_count": 287355159,
+      "repo": "fastino/gliner2.5-multi-v1",
+      "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+      "sidecars": {
+        "config.json": {
+          "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146",
+          "size_bytes": 3151
+        },
+        "encoder_config/config.json": {
+          "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716",
+          "size_bytes": 857
+        },
+        "tokenizer.json": {
+          "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+          "size_bytes": 16035853
+        },
+        "tokenizer_config.json": {
+          "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+          "size_bytes": 645
+        }
+      },
+      "tensor_count": 334,
+      "tensor_header_length": 40384,
+      "tensor_header_sha256": "013eacdfc5811df532e5afc637b013307dd93787b7dfdc95e5c404a9d6ca4e6c",
+      "tokenizer": {
+        "add_prefix_space": true,
+        "do_lower_case": false,
+        "tokenizer_class": "DebertaV2Tokenizer",
+        "vocab_type": "spm"
+      },
+      "top_level": {
+        "architecture_version": 1,
+        "max_len": 4096,
+        "token_pooling": "first"
+      }
+    }
+  },
+  "oracle_runtime": {
+    "absent_packages": [
+      "peft"
+    ],
+    "packages": {
+      "huggingface-hub": "0.36.0",
+      "numpy": "2.3.5",
+      "pydantic": "2.12.3",
+      "safetensors": "0.7.0",
+      "tokenizers": "0.21.4",
+      "torch": "2.9.1",
+      "transformers": "4.55.4"
+    },
+    "python": "3.12.3",
+    "unicode": "15.0.0"
+  },
+  "oracle_runtime_decide_1b": {
+    "python": "3.12.3",
+    "unicode": "15.0.0",
+    "isolated_packages": {
+      "annotated-doc": "0.0.5",
+      "anyio": "4.15.1",
+      "certifi": "2026.7.22",
+      "click": "8.5.0",
+      "filelock": "4.0.12",
+      "fsspec": "2026.9.0",
+      "h11": "0.16.0",
+      "hf-xet": "1.6.0",
+      "httpcore": "1.0.9",
+      "httpx": "0.28.1",
+      "huggingface-hub": "1.33.0",
+      "idna": "3.20",
+      "markdown-it-py": "4.2.0",
+      "mdurl": "0.1.2",
+      "numpy": "2.5.3",
+      "packaging": "26.3",
+      "pygments": "2.21.0",
+      "pyyaml": "6.0.3",
+      "regex": "2026.9.29",
+      "rich": "15.0.0",
+      "safetensors": "0.8.0",
+      "shellingham": "1.5.4",
+      "tokenizers": "0.23.2",
+      "tqdm": "4.70.1",
+      "transformers": "5.17.0",
+      "typer": "0.27.3",
+      "typing-extensions": "4.16.0"
+    },
+    "external_packages": {
+      "pydantic": "2.12.3",
+      "torch": "2.9.1"
+    },
+    "transformers_distribution": {
+      "filename": "transformers-5.17.0-py3-none-any.whl",
+      "sha256": "78ec1ce21579b38dfb83950a0658cd119f87212a2fcfdff478096ce9d6c03801",
+      "size_bytes": 12295140,
+      "source_repo": "https://github.com/huggingface/transformers",
+      "source_revision": "856157a2f3e9594954310df18fdccc31ffddebe9"
+    },
+    "rope_contract": {
+      "head_dim": 64,
+      "layer_types": [
+        "full_attention",
+        "sliding_attention"
+      ],
+      "rope_theta": 160000.0,
+      "rope_type": "default"
+    },
+    "compatibility": {
+      "gliner2_declared_transformers_range": "transformers>=4.38,<5",
+      "checkpoint_transformers_version": "5.17.0",
+      "status": "checkpoint_runtime_outside_upstream_declared_dependency_range"
+    }
+  },
+  "upstream_python": {
+    "repo": "https://github.com/fastino-ai/GLiNER2",
+    "revision": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf"
+  }
+}

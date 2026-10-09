@@ -167,7 +167,7 @@ fn buildSegmentInfosAlloc(
         const deletion_summary = seg.deletionSummary();
         infos[i] = .{
             .index = i,
-            .size = seg.data.bytes().len,
+            .size = seg.data.len(),
             .doc_count = seg.reader.doc_count,
             .deleted_count = deletion_summary.count,
             .has_deletions = deletion_summary.has_deletions,

@@ -1115,7 +1115,7 @@ test "relational index catalog prepared publication cleans every allocation fail
     defer schemas.deinit();
     var view = schemas.acquire().?;
     defer view.release();
-    try std.testing.checkAllAllocationFailures(alloc, testPublicationAllocations, .{ &store, view });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, testPublicationAllocations, .{ &store, view });
     var txn = try store.beginReadTxn();
     defer txn.abort();
     try std.testing.expect((try load(alloc, &txn)) == null);

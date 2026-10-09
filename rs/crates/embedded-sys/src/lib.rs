@@ -864,6 +864,12 @@ unsafe extern "C" {
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
+    /// Model-independent typed decisions, matching `POST /ai/v1/decide`.
+    pub fn antfly_inference_decide_json(
+        inference: *mut antfly_inference,
+        request_json: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
     pub fn antfly_inference_extract_json(
         inference: *mut antfly_inference,
         request_json: antfly_slice,

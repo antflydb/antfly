@@ -70,7 +70,7 @@ test "seeded no-gradient sessions are opt in and preserve strict parameter valid
     for ([_]seeded.Execution{ .native, .resident_metal }) |execution| {
         try std.testing.expectError(error.DisconnectedGradientParameter, seeded.Session.init(std.testing.allocator, &graph.graph, &.{graph.seed}, &.{graph.dormant}, .{ .execution = execution }));
         try std.testing.expectError(error.DisconnectedGradientParameter, seeded.Session.init(std.testing.allocator, &graph.graph, &.{graph.seed}, &.{graph.dormant}, .{ .execution = execution, .allow_no_gradients = true, .gradient = .{ .require_all_gradients = true } }));
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, construction, .{execution});
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, construction, .{execution});
     }
 }
 
@@ -158,7 +158,7 @@ fn cpu(a: Allocator) !void {
 }
 
 test "seeded no-gradient CPU direct and staged tapes consume ownership on success cancellation identity failure and OOM" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, cpu, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, cpu, .{});
 }
 
 test "seeded no-gradient Metal direct and staged tapes preserve resident ownership and finite cotangent checks" {

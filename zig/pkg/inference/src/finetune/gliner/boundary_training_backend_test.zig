@@ -125,7 +125,7 @@ fn cpuExercise(a: Allocator) !void {
 
 test "boundary training backend preserves native strict math source lifetime and empty frozen leases" {
     try cpuExercise(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, cpuExercise, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, cpuExercise, .{});
 }
 
 const Cancel = struct {
@@ -216,7 +216,7 @@ test "boundary training backend Metal validates bindings and recovers cancellati
     var g = try graph(a);
     defer g.deinit();
     const baseline = owner.metadata.live;
-    try std.testing.checkAllAllocationFailures(a, bindAllocation, .{ owner, &g });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, bindAllocation, .{ owner, &g });
     try std.testing.expectEqual(@as(usize, 0), owner.active_bindings);
     try std.testing.expectEqual(baseline, owner.metadata.live);
     var probe = Cancel{ .at = std.math.maxInt(usize) };

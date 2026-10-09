@@ -542,5 +542,5 @@ test "validated managed receipt cleans up every allocation failure" {
             defer receipt.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Runner.run, .{model_dir});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Runner.run, .{model_dir});
 }

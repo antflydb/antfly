@@ -1,5 +1,9 @@
 # GLiNER2.5-Decide
 
+For multilingual Decide and Decide-1B, see [GLINER25_FAMILY.md](GLINER25_FAMILY.md).
+Their saved architectures and encoders differ from the checkpoint described
+here.
+
 [`fastino/GLiNER2.5-Decide`](https://huggingface.co/fastino/GLiNER2.5-Decide)
 is Fastino's typed-decision classifier. Despite the name, it is **not** a
 GLiNER2.5 boundary checkpoint (see [GLINER25.md](GLINER25.md)). It is a
@@ -86,6 +90,13 @@ antfly inference export ~/.antfly/inference/models/fastino/GLiNER2.5-Decide \
   --target gguf --format q8_0 \
   --output ~/.antfly/inference/models/fastino/GLiNER2.5-Decide-Q8_0/gliner2-encoder.Q8_0.gguf
 ```
+
+This converted bundle retains the historically qualified ordinary
+`POST /ai/v1/extract` classification route. Export removes the reserved
+`decide` task and `typed_decisions` capability from its copied manifest, so
+the source FP32 checkpoint's exact-artifact public `/decide` grant does not
+carry over to Q8_0. A converted bundle needs its own public Decide
+qualification before those fields may be restored.
 
 `classifier.*` stays dense in every exported bundle (~8 MB): a quantized
 classifier costs more per request (27 ms vs 5 ms on Metal) than it saves.

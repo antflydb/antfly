@@ -1055,12 +1055,41 @@ components:
           additionalProperties: true
     AlgebraicIndexConfig:
       type: object
-      description: "Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned."
+      description: "Schema-derived algebraic index capabilities with optional declarative aggregate recipes. Physical materialization state remains engine-owned."
       properties:
         derive_from_schema:
           x-go-type-skip-optional-pointer: true
           type: boolean
-          description: "When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API."
+          description: "When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned."
+        aggregates:
+          type: array
+          maxItems: 64
+          description: "Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning."
+          items:
+            $ref: "#/components/schemas/AlgebraicAggregateConfig"
+    AlgebraicAggregateConfig:
+      type: object
+      additionalProperties: false
+      required: [name, op]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        op:
+          type: string
+          enum: [count, sum, avg, min, max]
+        group_by:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+        measure:
+          type: string
+          minLength: 1
+          description: "Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values."
     IndexReadinessState:
       type: string
       enum:

@@ -842,5 +842,5 @@ fn allocationLifecycle(allocator: Allocator) !void {
     try std.testing.expect(!try Context.validateValue(&context, validator, "Ab 12"));
 }
 test "extraction regex compile and simulation release allocations on every failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
 }

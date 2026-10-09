@@ -74,6 +74,7 @@ pub const MaterializedBatch = struct {
         for (self.batch.columns) |column| {
             if (column.nulls.bytes.len != 0) alloc.free(column.nulls.bytes);
             switch (column.values) {
+                inline .dictionary_i64, .dictionary_f64 => |values| values.deinit(alloc),
                 .bytes => |values| alloc.free(values),
                 .dictionary_bytes => |values| {
                     alloc.free(values.values);
@@ -245,6 +246,7 @@ fn freeColumnValues(alloc: Allocator, column: rowsource.ColumnVector) void {
 
 fn freeColumnValuesOnly(alloc: Allocator, column_values: rowsource.ColumnValues) void {
     switch (column_values) {
+        inline .dictionary_i64, .dictionary_f64 => |values| values.deinit(alloc),
         .bytes => |slice| alloc.free(slice),
         .dictionary_bytes => |values| {
             alloc.free(values.values);

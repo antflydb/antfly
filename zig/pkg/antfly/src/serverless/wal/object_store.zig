@@ -630,7 +630,7 @@ test "serverless objectstore WAL retained record cloning is allocation-failure s
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless objectstore-backed WAL conditionally appends and truncates over file uri" {

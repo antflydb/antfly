@@ -228,7 +228,7 @@ test "serverless graph metric configs are deterministic and honor disabled metri
             defer freeIndexSpecs(alloc, parsed_specs);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, AllocationRunner.run, .{
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, AllocationRunner.run, .{
         "{\"graph\":{\"type\":\"graph\",\"metrics\":{\"rank\":{\"kind\":\"pagerank\",\"edge_filter\":{\"types\":[\"cites\",\"mentions\"]}}}}}",
     });
 }

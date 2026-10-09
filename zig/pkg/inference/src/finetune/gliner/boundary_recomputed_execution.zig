@@ -458,7 +458,7 @@ test "boundary recomputed execution merges canonical shared parameters and prese
 test "boundary recomputed execution numerical ownership unwinds every allocation failure" {
     var tiny = try Tiny.init(std.testing.allocator);
     defer tiny.deinit();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseMerge, .{&tiny});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseMerge, .{&tiny});
 }
 
 test "boundary recomputed execution admission counts pending shared sums and native operand copies" {

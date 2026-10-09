@@ -65,6 +65,8 @@ class StatefulQueryRequest:
     the stateful public transport boundary for the v0.2 transition window.
 
         Attributes:
+            remote_snapshot (str | Unset): Opaque remote index snapshot token returned by a previous query. Required when
+                replaying search_after or search_before against an external table; a changed publication returns 409.
             evaluate (QueryEvaluation | Unset): Evaluate expressions after global retrieval merging, before final
                 offset/limit. Candidates require candidate_count; matches require
                 max_rows and fail if the full qualifying population exceeds that budget.
@@ -386,6 +388,7 @@ class StatefulQueryRequest:
                 - intersection: Only include nodes appearing in both
     """
 
+    remote_snapshot: str | Unset = UNSET
     evaluate: QueryEvaluation | Unset = UNSET
     table_target: CatalogTableTarget | Unset = UNSET
     table: str | Unset = UNSET
@@ -538,6 +541,8 @@ class StatefulQueryRequest:
         from ..models.term_query import TermQuery
         from ..models.term_range_query import TermRangeQuery
         from ..models.wildcard_query import WildcardQuery
+
+        remote_snapshot = self.remote_snapshot
 
         evaluate: dict[str, Any] | Unset = UNSET
         if not isinstance(self.evaluate, Unset):
@@ -833,6 +838,8 @@ class StatefulQueryRequest:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if remote_snapshot is not UNSET:
+            field_dict["remote_snapshot"] = remote_snapshot
         if evaluate is not UNSET:
             field_dict["evaluate"] = evaluate
         if table_target is not UNSET:
@@ -964,6 +971,8 @@ class StatefulQueryRequest:
         from ..models.wildcard_query import WildcardQuery
 
         d = dict(src_dict)
+        remote_snapshot = d.pop("remote_snapshot", UNSET)
+
         _evaluate = d.pop("evaluate", UNSET)
         evaluate: QueryEvaluation | Unset
         if isinstance(_evaluate, Unset):
@@ -1859,6 +1868,7 @@ class StatefulQueryRequest:
             expand_strategy = StatefulQueryRequestExpandStrategy(_expand_strategy)
 
         stateful_query_request = cls(
+            remote_snapshot=remote_snapshot,
             evaluate=evaluate,
             table_target=table_target,
             table=table,

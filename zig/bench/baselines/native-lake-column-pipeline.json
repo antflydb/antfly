@@ -1,0 +1,290 @@
+{
+  "compiler": "Zig 0.17.0",
+  "optimization": "ReleaseFast",
+  "platform": "aarch64-macos",
+  "comparison_commit": "6c1a0f6d16bb85889280721deb84b7060994ae32",
+  "fixture": "sql.read_stream.test.native pipeline refinements benchmark complete queries",
+  "method": "Same benchmark fixture appended to the comparison revision. Baseline and updated binaries run separately, three samples per query, identical row counts and checksums; query compilation precedes timing. Each query opens its stream, executes, and drains 137-row result pages.",
+  "measurement_limits": [
+    "In-memory native column sources, with local disk spill for the join. No remote Parquet/object-store or client/network throughput measurement.",
+    "Backing allocator call counts include stream execution and delivery, exclude compiled plan allocation and allocator resize/remap calls. They are not a count of individual arena objects.",
+    "Peak bytes measure the statement budget, not process RSS. Narrow ordered scans trade additional task metadata allocations for smaller retained output and finer scheduling.",
+    "An unrelated inference job remained active on this developer machine; timings are illustrative local samples. Group/join wall-clock differences are small or inconsistent, while allocation reductions and wide projection gains are repeatable.",
+    "The wide join reads two 100000-row sources with eight integer columns each, aggregates all sixteen joined columns to one result row, and asserts more than 1 MiB of spill writes so a tiny result spool cannot satisfy the spilling check."
+  ],
+  "cases": {
+    "query_narrow_limit": {
+      "input_rows": 10000,
+      "output_rows": 8192,
+      "before": [
+        {
+          "sample": 0,
+          "ns": 1642250,
+          "allocations": 288,
+          "peak_bytes": 980586,
+          "checksum": 41742336
+        },
+        {
+          "sample": 1,
+          "ns": 1511250,
+          "allocations": 288,
+          "peak_bytes": 974382,
+          "checksum": 41742336
+        },
+        {
+          "sample": 2,
+          "ns": 1543833,
+          "allocations": 289,
+          "peak_bytes": 985532,
+          "checksum": 41742336
+        }
+      ],
+      "after": [
+        {
+          "sample": 0,
+          "ns": 1487959,
+          "allocations": 327,
+          "peak_bytes": 725384,
+          "checksum": 41742336
+        },
+        {
+          "sample": 1,
+          "ns": 1196583,
+          "allocations": 327,
+          "peak_bytes": 746998,
+          "checksum": 41742336
+        },
+        {
+          "sample": 2,
+          "ns": 1023500,
+          "allocations": 330,
+          "peak_bytes": 746998,
+          "checksum": 41742336
+        }
+      ],
+      "medians": {
+        "before": {
+          "ns": 1543833,
+          "allocations": 288,
+          "peak_bytes": 980586
+        },
+        "after": {
+          "ns": 1196583,
+          "allocations": 327,
+          "peak_bytes": 746998
+        }
+      },
+      "ratios": {
+        "elapsed_before_over_after": 1.2902013483393964,
+        "allocations_after_over_before": 1.1354166666666667,
+        "peak_bytes_after_over_before": 0.7617873394072524
+      },
+      "retained_limit_bytes": 67108864
+    },
+    "query_wide_projection": {
+      "input_rows": 10000,
+      "output_rows": 8192,
+      "before": [
+        {
+          "sample": 0,
+          "ns": 4916666,
+          "allocations": 436,
+          "peak_bytes": 2804418,
+          "checksum": 313131008
+        },
+        {
+          "sample": 1,
+          "ns": 4927041,
+          "allocations": 435,
+          "peak_bytes": 2905830,
+          "checksum": 313131008
+        },
+        {
+          "sample": 2,
+          "ns": 4833000,
+          "allocations": 435,
+          "peak_bytes": 2905830,
+          "checksum": 313131008
+        }
+      ],
+      "after": [
+        {
+          "sample": 0,
+          "ns": 2343000,
+          "allocations": 402,
+          "peak_bytes": 2558362,
+          "checksum": 313131008
+        },
+        {
+          "sample": 1,
+          "ns": 2369250,
+          "allocations": 403,
+          "peak_bytes": 2579866,
+          "checksum": 313131008
+        },
+        {
+          "sample": 2,
+          "ns": 2328584,
+          "allocations": 405,
+          "peak_bytes": 2632092,
+          "checksum": 313131008
+        }
+      ],
+      "medians": {
+        "before": {
+          "ns": 4916666,
+          "allocations": 435,
+          "peak_bytes": 2905830
+        },
+        "after": {
+          "ns": 2343000,
+          "allocations": 403,
+          "peak_bytes": 2579866
+        }
+      },
+      "ratios": {
+        "elapsed_before_over_after": 2.0984489970123774,
+        "allocations_after_over_before": 0.9264367816091954,
+        "peak_bytes_after_over_before": 0.8878241328639321
+      },
+      "retained_limit_bytes": 67108864
+    },
+    "query_group_projection": {
+      "input_rows": 10000,
+      "output_rows": 100,
+      "before": [
+        {
+          "sample": 0,
+          "ns": 2059292,
+          "allocations": 292,
+          "peak_bytes": 4156340,
+          "checksum": 100014950
+        },
+        {
+          "sample": 1,
+          "ns": 1215166,
+          "allocations": 292,
+          "peak_bytes": 4156340,
+          "checksum": 100014950
+        },
+        {
+          "sample": 2,
+          "ns": 1215791,
+          "allocations": 292,
+          "peak_bytes": 4156340,
+          "checksum": 100014950
+        }
+      ],
+      "after": [
+        {
+          "sample": 0,
+          "ns": 1339875,
+          "allocations": 179,
+          "peak_bytes": 4157570,
+          "checksum": 100014950
+        },
+        {
+          "sample": 1,
+          "ns": 1122666,
+          "allocations": 179,
+          "peak_bytes": 4157570,
+          "checksum": 100014950
+        },
+        {
+          "sample": 2,
+          "ns": 1114792,
+          "allocations": 179,
+          "peak_bytes": 4157570,
+          "checksum": 100014950
+        }
+      ],
+      "medians": {
+        "before": {
+          "ns": 1215791,
+          "allocations": 292,
+          "peak_bytes": 4156340
+        },
+        "after": {
+          "ns": 1122666,
+          "allocations": 179,
+          "peak_bytes": 4157570
+        }
+      },
+      "ratios": {
+        "elapsed_before_over_after": 1.0829498711103747,
+        "allocations_after_over_before": 0.613013698630137,
+        "peak_bytes_after_over_before": 1.0002959334414412
+      },
+      "retained_limit_bytes": 67108864
+    },
+    "query_spilled_join": {
+      "input_rows": 100000,
+      "output_rows": 1,
+      "before": [
+        {
+          "sample": 0,
+          "ns": 2023674833,
+          "allocations": 1486429,
+          "peak_bytes": 9979586,
+          "checksum": 79999200000
+        },
+        {
+          "sample": 1,
+          "ns": 2082627458,
+          "allocations": 1469621,
+          "peak_bytes": 10300100,
+          "checksum": 79999200000
+        },
+        {
+          "sample": 2,
+          "ns": 2067451792,
+          "allocations": 1480576,
+          "peak_bytes": 10267097,
+          "checksum": 79999200000
+        }
+      ],
+      "after": [
+        {
+          "sample": 0,
+          "ns": 2024319500,
+          "allocations": 1379545,
+          "peak_bytes": 9764132,
+          "checksum": 79999200000
+        },
+        {
+          "sample": 1,
+          "ns": 2078641417,
+          "allocations": 1374183,
+          "peak_bytes": 9764132,
+          "checksum": 79999200000
+        },
+        {
+          "sample": 2,
+          "ns": 2196717625,
+          "allocations": 1368591,
+          "peak_bytes": 9764132,
+          "checksum": 79999200000
+        }
+      ],
+      "medians": {
+        "before": {
+          "ns": 2067451792,
+          "allocations": 1480576,
+          "peak_bytes": 10267097
+        },
+        "after": {
+          "ns": 2078641417,
+          "allocations": 1374183,
+          "peak_bytes": 9764132
+        }
+      },
+      "ratios": {
+        "elapsed_before_over_after": 0.9946168565157576,
+        "allocations_after_over_before": 0.9281408046598081,
+        "peak_bytes_after_over_before": 0.951011955959898
+      },
+      "retained_limit_bytes": 16777216
+    }
+  },
+  "delivery_page_rows": 137
+}

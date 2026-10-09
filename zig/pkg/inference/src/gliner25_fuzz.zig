@@ -400,7 +400,7 @@ test "GLiNER25 fuzz typed rejection cancellation allocation failure and recovery
     try std.testing.expectEqual(error.Cancelled, (try exercise(a, corpus.mixed, max_heap_bytes, 0)).rejection.?);
     try std.testing.expectEqual(error.ExtractionRegexLimitExceeded, (try exercise(a, corpus.regex_casefold_limit, max_heap_bytes, max_checks)).rejection.?);
     try allocationProbe(a);
-    try std.testing.checkAllAllocationFailures(a, allocationProbe, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, allocationProbe, .{});
 }
 
 fn solverLimitsOwned(a: Allocator) !void {

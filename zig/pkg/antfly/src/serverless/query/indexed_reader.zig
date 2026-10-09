@@ -2010,7 +2010,7 @@ test "serverless indexed reader owned results clean up every allocation failure"
             }, 1.0, .weighted_rrf);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "indexed reader uses text postings for all-term and prefix search" {

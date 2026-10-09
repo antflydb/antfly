@@ -19,9 +19,11 @@
  * (see zig/CAPI.md "Inference" and antfly.h), and the same coverage as
  * go/pkg/embedded/inference_cgo_test.go and py/packages/embedded/tests/test_inference.py.
  */
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { CancelledError, InvalidArgumentError, NotFoundError } from "../src/errors.js";
 import { Inference } from "../src/inference.js";
@@ -131,6 +133,85 @@ describeWithLibrary("Inference", () => {
         expect(err.message).toContain("MODEL_NOT_FOUND");
         expect(err.body).toBeTruthy();
         expect((err.body as { error?: string }).error).toBe("MODEL_NOT_FOUND");
+      } finally {
+        await inf.close();
+      }
+    });
+
+    it("decide preserves validation and missing-model errors and rejects closed handles", async () => {
+      const inf = await Inference.open({ modelsDir: tempModelsDir() });
+      try {
+        await expect(inf.decide({})).rejects.toMatchObject({
+          body: { error: "INVALID_REQUEST" },
+        });
+        await expect(
+          inf.decideRaw({
+            model: "no/such-model",
+            state: "refund",
+            questions: { refund: { type: "noul", instructions: "Refund?" } },
+          })
+        ).rejects.toMatchObject({ body: { error: "MODEL_NOT_FOUND" } });
+      } finally {
+        await inf.close();
+      }
+      await expect(inf.decide({})).rejects.toBeInstanceOf(InvalidArgumentError);
+    });
+
+    it("decide returns every answer type and raw JSON through the real runtime", async () => {
+      const modelsDir = tempModelsDir();
+      const script = fileURLToPath(
+        new URL("../../../../scripts/testing/create_decision_fixture.py", import.meta.url)
+      );
+      const model = execFileSync(
+        process.env.PYTHON ?? (process.platform === "win32" ? "python" : "python3"),
+        [script, modelsDir],
+        { encoding: "utf8" }
+      ).trim();
+      const request = {
+        model,
+        state: "Refund the duplicate charge.",
+        questions: {
+          route: {
+            type: "choice",
+            instructions: "Which team?",
+            criteria: { billing: "Charges", support: "Product" },
+          },
+          urgency: {
+            type: "score",
+            instructions: "How urgent?",
+            criteria: ["Routine", "Soon", "Immediate"],
+          },
+          refund: { type: "noul", instructions: "Refund requested?" },
+        },
+      };
+      const inf = await Inference.open({ modelsDir });
+      try {
+        const result = await inf.decide(request);
+        expect(result).toMatchObject({
+          model,
+          answers: {
+            route: {
+              type: "choice",
+              choice: "billing",
+              probabilities: { billing: 0.5, support: 0.5 },
+            },
+            urgency: {
+              type: "score",
+              score: expect.closeTo(1),
+              legend: { "0": "Routine", "1": "Soon", "2": "Immediate" },
+              probabilities: {
+                "0": expect.closeTo(1 / 3),
+                "1": expect.closeTo(1 / 3),
+                "2": expect.closeTo(1 / 3),
+              },
+            },
+            refund: { type: "noul", noul: 0.5 },
+          },
+          usage: { input_tokens: expect.any(Number), output_tokens: 0 },
+        });
+        const raw = await inf.decideRaw(JSON.stringify(request));
+        expect(Buffer.isBuffer(raw)).toBe(true);
+        expect(JSON.parse(raw.toString("utf8"))).toEqual(result);
       } finally {
         await inf.close();
       }

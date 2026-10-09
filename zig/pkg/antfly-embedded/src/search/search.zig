@@ -32,6 +32,7 @@ const scorer_mod = @import("scorer.zig");
 pub const SearchDiagnostics = scorer_mod.SearchDiagnostics;
 const query_mod = @import("query.zig");
 const aggregation_mod = @import("aggregation.zig");
+const roaring = @import("../encoding/roaring.zig");
 const typed_dv = @import("../section/typed_doc_values.zig");
 const segment_mod = @import("../segment.zig");
 const inverted = @import("../section/inverted.zig");
@@ -143,6 +144,8 @@ pub const SearchRequest = struct {
     graph_queries: []const NamedGraphQuery = &.{},
     expand_strategy: graph_query.ExpandStrategy = .@"union",
     distributed_text_stats: []const distributed_stats_mod.TextFieldStats = &.{},
+    filter_doc_bitmap: ?*const roaring.RoaringBitmap = null,
+    exclude_doc_bitmap: ?*const roaring.RoaringBitmap = null,
     filter_doc_nums: []const u32 = &.{},
     filter_doc_nums_positive: bool = false,
     exclude_doc_nums: []const u32 = &.{},
@@ -280,6 +283,7 @@ pub const DocIdQuery = struct {
 
 pub const DocNumQuery = struct {
     ids: []const u32,
+    bitmap: ?*const roaring.RoaringBitmap = null,
     boost: f32 = 1.0,
 };
 
@@ -389,7 +393,7 @@ pub const SearchResult = struct {
 
     pub fn deinit(self: *SearchResult) void {
         for (self.hits) |*hit| {
-            if (hit.stored_data) |d| self.alloc.free(d);
+            freeStoredHit(self.alloc, hit);
             freeIndexScores(self.alloc, hit.index_scores);
         }
         self.alloc.free(self.hits);
@@ -401,6 +405,58 @@ pub const SearchResult = struct {
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
     }
 };
+
+fn freeStoredHit(allocator: Allocator, hit: *const ScoredHit) void {
+    if (hit.stored_data) |body| allocator.free(body.ptr[0 .. body.len + hit.stored_id_bytes]);
+}
+
+fn freeStoredBodies(allocator: Allocator, hits: []ScoredHit) void {
+    for (hits) |*hit| {
+        freeStoredHit(allocator, hit);
+        hit.stored_data = null;
+        hit.stored_id_bytes = 0;
+        hit.id = null;
+    }
+}
+
+/// Sort only temporary references, leaving score/vector/fusion order intact.
+/// Normal revision-4 writers assign stored blocks in document-number order.
+/// One decoded block serves neighboring hits; output bodies remain owned.
+fn populateStoredHits(allocator: Allocator, snapshot: *const index_mod.IndexSnapshot, hits: []ScoredHit, diagnostics: ?*scorer_mod.SearchDiagnostics) !void {
+    if (hits.len == 0) return;
+    var single = [_]usize{0};
+    const order = if (hits.len == 1) &single else try allocator.alloc(usize, hits.len);
+    defer if (hits.len > 1) allocator.free(order);
+    for (order, 0..) |*slot, i| slot.* = i;
+    std.mem.sort(usize, order, hits, struct {
+        fn lessThan(context: []ScoredHit, left: usize, right: usize) bool {
+            return context[left].doc_id < context[right].doc_id;
+        }
+    }.lessThan);
+    var cursor = segment_mod.SegmentReader.StoredDocCursor.init(allocator);
+    defer cursor.deinit();
+    defer if (diagnostics) |diag| {
+        diag.stored_block_decodes +|= cursor.decode_count;
+    };
+    errdefer freeStoredBodies(allocator, hits);
+    for (order) |position| {
+        const hit = &hits[position];
+        if (try snapshot.storedDocWithCursor(&cursor, hit.doc_id)) |stored| {
+            const id_length = if (cursor.reader.?.native != null) stored.id.len else 0;
+            const allocation = try allocator.alloc(u8, try std.math.add(usize, stored.data.len, id_length));
+            const body = allocation[0..stored.data.len];
+            @memcpy(body, stored.data);
+            if (id_length != 0) @memcpy(allocation[body.len..], stored.id);
+            hit.id = if (id_length != 0) allocation[body.len..] else stored.id;
+            hit.stored_data = body;
+            hit.stored_id_bytes = id_length;
+            if (diagnostics) |diag| {
+                diag.stored_body_copies +|= 1;
+                diag.stored_body_bytes +|= body.len;
+            }
+        }
+    }
+}
 
 fn freeIndexScores(alloc: Allocator, scores: []fusion_mod.IndexScore) void {
     for (scores) |score| alloc.free(score.index_name);
@@ -457,6 +513,8 @@ pub const ScoredHit = struct {
     score: f32,
     id: ?[]const u8,
     stored_data: ?[]u8,
+    // Native identities share the body allocation as a trailing owned slice.
+    stored_id_bytes: usize = 0,
     index_scores: []fusion_mod.IndexScore = &.{},
 };
 
@@ -521,6 +579,15 @@ pub fn execute(
 /// skips BM25 scoring and stored payload loading; callers that need MVCC
 /// visibility or stored pattern filters can still postprocess the returned doc
 /// IDs through their normal result pipeline.
+/// Exact snapshot count with at most one segment's filter bitmap in memory.
+/// Callers must separately prove that no primary visibility/residual check is owed.
+pub fn countMatches(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: SearchQuery) !u32 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const filter = try searchQueryToFilterArena(arena.allocator(), query);
+    return std.math.cast(u32, try snap.countFilter(alloc, filter)) orelse error.CountOverflow;
+}
+
 pub fn executeCountCandidates(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
@@ -601,6 +668,9 @@ fn executeMatch(
     mq: MatchQuery,
     request: SearchRequest,
 ) !SearchResult {
+    if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) {
+        if (try executeSimpleTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request)) |result| return result;
+    }
     const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
     const tokens = try analyzer.analyze(alloc, mq.text);
     defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
@@ -638,6 +708,9 @@ fn executeTerm(
     tq: TermQuery,
     request: SearchRequest,
 ) !SearchResult {
+    if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) {
+        if (try executeSimpleTextBool(alloc, snap, .{ .should = &.{.{ .term = tq }} }, request)) |result| return result;
+    }
     const results = try searchSnapshotTerms(alloc, snap, tq.field, &.{tq.term}, request);
     defer alloc.free(results.hits);
     if (tq.boost != 1.0) {
@@ -655,13 +728,14 @@ fn searchSnapshotTerms(
     request: SearchRequest,
 ) !scorer_mod.SearchResults {
     const stats = matchingFieldStats(request.distributed_text_stats, field, terms);
+    const k = if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) @as(u32, @intCast(@min(snap.liveDocCount(), std.math.maxInt(u32)))) else effectiveK(request, snap);
     if (request.diagnostics) |diagnostics| {
         if (stats == null) {
             return snap.searchWithConfigDiagnostics(
                 alloc,
                 field,
                 terms,
-                effectiveK(request, snap),
+                k,
                 request.bm25_config,
                 diagnostics,
             );
@@ -671,7 +745,7 @@ fn searchSnapshotTerms(
         alloc,
         field,
         terms,
-        effectiveK(request, snap),
+        k,
         stats,
         request.bm25_config,
     );
@@ -854,8 +928,11 @@ fn executeScoredPhraseFilter(
 
     const scoring_doc_count = snap.scoringDocCount();
     var phrase_idf_sum: f32 = 0;
-    for (phrase_filter.terms) |term| {
-        const df = try snap.termDocFreq(alloc, phrase_filter.field, term);
+    var frequency_stack: [16]u32 = undefined;
+    const frequencies = if (phrase_filter.terms.len <= frequency_stack.len) frequency_stack[0..phrase_filter.terms.len] else try alloc.alloc(u32, phrase_filter.terms.len);
+    defer if (phrase_filter.terms.len > frequency_stack.len) alloc.free(frequencies);
+    try snap.termDocFreqs(alloc, phrase_filter.field, phrase_filter.terms, frequencies);
+    for (frequencies) |df| {
         if (df == 0) return .{ .alloc = alloc, .hits = try alloc.alloc(ScoredHit, 0), .total_hits = 0 };
         phrase_idf_sum += inverted.bm25Idf(scoring_doc_count, df);
     }
@@ -863,6 +940,8 @@ fn executeScoredPhraseFilter(
     var collector = FastTopK{
         .alloc = alloc,
         .k = effectiveK(request, snap),
+        .filter_doc_bitmap = request.filter_doc_bitmap,
+        .exclude_doc_bitmap = request.exclude_doc_bitmap,
         .filter_doc_nums = request.filter_doc_nums,
         .filter_doc_nums_positive = request.filter_doc_nums_positive,
         .exclude_doc_nums = request.exclude_doc_nums,
@@ -876,7 +955,8 @@ fn executeScoredPhraseFilter(
         const segment_offset = doc_offset;
         doc_offset += segment.reader.doc_count;
 
-        const inv_reader = (try segment.reader.invertedIndex(phrase_filter.field)) orelse continue;
+        var inv_reader = (try segment.reader.invertedIndexScoped(alloc, phrase_filter.field)) orelse continue;
+        defer inv_reader.deinit();
         segment.shared.lockDeletionShared();
         defer segment.shared.unlockDeletionShared();
         const PhraseScoreState = struct {
@@ -893,7 +973,7 @@ fn executeScoredPhraseFilter(
         var missing_term = false;
         var lead_index: usize = 0;
         for (phrase_filter.terms, 0..) |term, i| {
-            const lookup = inv_reader.lookup(term) orelse {
+            const lookup = (try inv_reader.lookup(term)) orelse {
                 missing_term = true;
                 break;
             };
@@ -1145,7 +1225,7 @@ fn executeDocNum(
     dq: DocNumQuery,
     request: SearchRequest,
 ) !SearchResult {
-    return executeFilterQuery(alloc, snap, .{ .doc_num = .{ .doc_nums = dq.ids } }, request, dq.boost);
+    return executeFilterQuery(alloc, snap, .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } }, request, dq.boost);
 }
 
 fn executeBoolField(
@@ -1302,22 +1382,18 @@ fn executeMatchAll(
 
     for (start..end) |i| {
         const global_id = doc_ids[i];
-        var hit = ScoredHit{
+        const hit = ScoredHit{
             .doc_id = global_id,
             .score = 1.0,
             .id = null,
             .stored_data = null,
         };
 
-        if (request.include_stored) {
-            if (try snap.storedDocDecompressed(alloc, global_id)) |stored| {
-                hit.id = stored.id;
-                hit.stored_data = stored.data;
-            }
-        }
-
         hits[i - start] = hit;
     }
+
+    errdefer freeStoredBodies(alloc, hits);
+    if (request.include_stored) try populateStoredHits(alloc, snap, hits, request.diagnostics);
 
     // Collect aggregations over ALL matching docs (not just the page)
     var agg_results: []NamedAggResult = &.{};
@@ -1488,10 +1564,12 @@ fn subtractScoresFromHits(alloc: Allocator, map: *ScoreMap, hits: []const scorer
 }
 
 fn requestHasDocNumConstraints(request: SearchRequest) bool {
-    return request.filter_doc_nums_positive or request.exclude_doc_nums.len > 0;
+    return request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null or request.filter_doc_nums_positive or request.exclude_doc_nums.len > 0;
 }
 
 fn requestAllowsDocNum(request: SearchRequest, doc_id: u32) bool {
+    if (request.filter_doc_bitmap) |bitmap| if (!bitmap.contains(doc_id)) return false;
+    if (request.exclude_doc_bitmap) |bitmap| if (bitmap.contains(doc_id)) return false;
     if (request.filter_doc_nums_positive and !containsSortedU32(request.filter_doc_nums, doc_id)) return false;
     if (containsSortedU32(request.exclude_doc_nums, doc_id)) return false;
     return true;
@@ -1577,6 +1655,8 @@ const FastTermState = struct {
 const FastTopK = struct {
     alloc: Allocator,
     k: u32,
+    filter_doc_bitmap: ?*const roaring.RoaringBitmap = null,
+    exclude_doc_bitmap: ?*const roaring.RoaringBitmap = null,
     filter_doc_nums: []const u32 = &.{},
     filter_doc_nums_positive: bool = false,
     exclude_doc_nums: []const u32 = &.{},
@@ -1606,6 +1686,8 @@ const FastTopK = struct {
     }
 
     fn allows(self: *const FastTopK, doc_id: u32) bool {
+        if (self.filter_doc_bitmap) |bitmap| if (!bitmap.contains(doc_id)) return false;
+        if (self.exclude_doc_bitmap) |bitmap| if (bitmap.contains(doc_id)) return false;
         if (self.filter_doc_nums_positive and !containsSortedU32(self.filter_doc_nums, doc_id)) return false;
         if (containsSortedU32(self.exclude_doc_nums, doc_id)) return false;
         return true;
@@ -1713,12 +1795,32 @@ fn initFastTermStates(
     };
     const scoring_doc_count = snap.scoringDocCount();
 
-    for (terms) |term| {
-        const lookup_result = inv_reader.lookup(term.term) orelse {
+    // Reject impossible conjunctions before reading corpus-wide scoring metadata.
+    // Retain lookups so accepted terms do not repeat dictionary navigation.
+    const lookups = try alloc.alloc(?inverted.LookupResult, terms.len);
+    defer alloc.free(lookups);
+    for (terms, lookups) |term, *lookup| {
+        lookup.* = try inv_reader.lookup(term.term);
+        if (require_all_terms and lookup.* == null) return null;
+    }
+    const names = try alloc.alloc([]const u8, terms.len);
+    defer alloc.free(names);
+    const frequencies = try alloc.alloc(u32, terms.len);
+    defer alloc.free(frequencies);
+    var present: usize = 0;
+    for (terms, lookups) |term, found| if (found != null) {
+        names[present] = term.term;
+        present += 1;
+    };
+    if (present != 0) try snap.termDocFreqs(alloc, field, names[0..present], frequencies[0..present]);
+    var frequency_index: usize = 0;
+    for (terms, lookups) |term, found| {
+        const lookup_result = found orelse {
             if (require_all_terms) return null;
             continue;
         };
-        const df = try snap.termDocFreq(alloc, field, term.term);
+        const df = frequencies[frequency_index];
+        frequency_index += 1;
         if (df == 0) {
             if (require_all_terms) return null;
             continue;
@@ -1810,6 +1912,29 @@ fn collectOptionalScores(
     return .{ .count = count, .score = score };
 }
 
+/// A monotonic bitmap/postings intersection. Selective predicates seek postings
+/// directly to the next admitted document instead of decoding every match.
+const BitmapGate = struct {
+    iterator: ?roaring.Iterator = null,
+    next: ?u32 = null,
+    end: u64,
+    fn init(bitmap: ?*const roaring.RoaringBitmap, offset: u32, count: u32) BitmapGate {
+        var gate: BitmapGate = .{ .end = @as(u64, offset) + count };
+        if (bitmap) |set| {
+            gate.iterator = set.iterator();
+            gate.iterator.?.seek(offset);
+            gate.next = gate.iterator.?.next();
+        }
+        return gate;
+    }
+    fn target(self: *BitmapGate, current: u32) ?u32 {
+        if (self.iterator == null) return current;
+        while (self.next != null and self.next.? < current) self.next = self.iterator.?.next();
+        const value = self.next orelse return null;
+        return if (value < self.end) value else null;
+    }
+};
+
 fn collectFastShouldSegment(
     collector: *FastTopK,
     seg: *const index_mod.SegmentEntry,
@@ -1822,6 +1947,7 @@ fn collectFastShouldSegment(
     bm25_config: inverted.BM25Config,
     boost: f32,
 ) !void {
+    var gate = BitmapGate.init(collector.filter_doc_bitmap, doc_offset, seg.reader.doc_count);
     while (true) {
         var min_doc: ?u32 = null;
         for (should_states) |state| {
@@ -1830,6 +1956,13 @@ fn collectFastShouldSegment(
             if (min_doc == null or doc_id < min_doc.?) min_doc = doc_id;
         }
         const doc_id = min_doc orelse break;
+        const admitted = gate.target(doc_offset + doc_id) orelse break;
+        if (admitted > doc_offset + doc_id) {
+            for (should_states) |*state| if (!state.exhausted) {
+                try state.advanceTo(admitted - doc_offset);
+            };
+            continue;
+        }
 
         var should_count: u32 = 0;
         var score: f32 = 0;
@@ -2083,7 +2216,13 @@ fn collectFastMustSegment(
         if (state.doc_freq < must_states[lead_idx].doc_freq) lead_idx = i;
     }
 
+    var gate = BitmapGate.init(collector.filter_doc_bitmap, doc_offset, seg.reader.doc_count);
     while (!must_states[lead_idx].exhausted) {
+        const admitted = gate.target(doc_offset + must_states[lead_idx].current.?.doc_id) orelse return;
+        if (admitted > doc_offset + must_states[lead_idx].current.?.doc_id) {
+            try must_states[lead_idx].advanceTo(admitted - doc_offset);
+            if (must_states[lead_idx].exhausted) return;
+        }
         var target = must_states[lead_idx].current.?.doc_id;
         var aligned = false;
 
@@ -2225,6 +2364,8 @@ fn executeSimpleTextBool(
     var collector = FastTopK{
         .alloc = alloc,
         .k = effectiveK(request, snap),
+        .filter_doc_bitmap = request.filter_doc_bitmap,
+        .exclude_doc_bitmap = request.exclude_doc_bitmap,
         .filter_doc_nums = request.filter_doc_nums,
         .filter_doc_nums_positive = request.filter_doc_nums_positive,
         .exclude_doc_nums = request.exclude_doc_nums,
@@ -2251,7 +2392,8 @@ fn executeSimpleTextBool(
         const segment_doc_offset = doc_offset;
         doc_offset += seg.reader.doc_count;
 
-        const inv_reader = (try seg.reader.invertedIndex(text_field)) orelse continue;
+        var inv_reader = (try seg.reader.invertedIndexScoped(alloc, text_field)) orelse continue;
+        defer inv_reader.deinit();
         {
             const maybe_must_states = try initFastTermStates(alloc, snap, inv_reader, text_field, must_terms.items, true);
             const must_states = maybe_must_states orelse continue;
@@ -2293,6 +2435,29 @@ fn executeBool(
     bq: BoolQuery,
     request: SearchRequest,
 ) anyerror!SearchResult {
+    if (bq.boost == 1 and bq.should.len == 0 and bq.must.len >= 1 and bq.must.len <= 2 and bq.must_not.len <= 1 and
+        request.filter_doc_bitmap == null and request.exclude_doc_bitmap == null)
+    {
+        var constrained = request;
+        var recognized = bq.must.len == 2 or bq.must_not.len == 1;
+        if (bq.must.len == 2) {
+            if (bq.must[1] == .doc_num and bq.must[1].doc_num.ids.len == 0 and bq.must[1].doc_num.boost == 0 and bq.must[1].doc_num.bitmap != null)
+                constrained.filter_doc_bitmap = bq.must[1].doc_num.bitmap
+            else
+                recognized = false;
+        }
+        if (bq.must_not.len == 1) {
+            if (bq.must_not[0] == .doc_num and bq.must_not[0].doc_num.ids.len == 0 and bq.must_not[0].doc_num.bitmap != null)
+                constrained.exclude_doc_bitmap = bq.must_not[0].doc_num.bitmap
+            else
+                recognized = false;
+        }
+        if (recognized) {
+            constrained.query = bq.must[0];
+            constrained.graph_queries = &.{};
+            return execute(alloc, snap, constrained);
+        }
+    }
     if (try executeSimpleTextBool(alloc, snap, bq, request)) |result| return result;
     return executeBoolAllHit(alloc, snap, bq, request);
 }
@@ -2459,7 +2624,7 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
             .inclusive_end = rq.inclusive_end,
         } },
         .doc_id => |dq| .{ .doc_id = .{ .doc_ids = dq.ids } },
-        .doc_num => |dq| .{ .doc_num = .{ .doc_nums = dq.ids } },
+        .doc_num => |dq| .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } },
         .bool_field => |bq| .{ .bool_field = .{ .field = bq.field, .value = bq.value } },
         .geo_distance => |gq| .{ .geo_distance = .{
             .field = gq.field,
@@ -2623,7 +2788,7 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             .filter_slice = &.{},
         },
         .doc_num => |dq| .{
-            .filter = .{ .doc_num = .{ .doc_nums = dq.ids } },
+            .filter = .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },
@@ -2748,6 +2913,9 @@ fn executeSort(
     snap: *const index_mod.IndexSnapshot,
     request: SearchRequest,
 ) !SearchResult {
+    var read_scope = segment_mod.TypedReadScope.init(alloc);
+    defer read_scope.deinit();
+    const reads = &read_scope;
     const sort_spec = request.sort.?;
 
     // Get matching doc IDs via filter
@@ -2762,7 +2930,7 @@ fn executeSort(
     defer doc_vals.deinit(alloc);
 
     for (doc_ids) |did| {
-        const val = try readF64ForDoc(alloc, snap, did, sort_spec.field) orelse 0.0;
+        const val = try readF64ForDoc(alloc, reads, snap, did, sort_spec.field) orelse 0.0;
         try doc_vals.append(alloc, .{ .doc_id = did, .value = val });
     }
 
@@ -2784,20 +2952,17 @@ fn executeSort(
     errdefer alloc.free(hits);
 
     for (page, 0..) |dv, i| {
-        var hit = ScoredHit{
+        const hit = ScoredHit{
             .doc_id = dv.doc_id,
             .score = @floatCast(dv.value),
             .id = null,
             .stored_data = null,
         };
-        if (request.include_stored) {
-            if (try snap.storedDocDecompressed(alloc, dv.doc_id)) |stored| {
-                hit.id = stored.id;
-                hit.stored_data = stored.data;
-            }
-        }
         hits[i] = hit;
     }
+
+    errdefer freeStoredBodies(alloc, hits);
+    if (request.include_stored) try populateStoredHits(alloc, snap, hits, request.diagnostics);
 
     // Collect aggregations over all matching docs
     var agg_results: []NamedAggResult = &.{};
@@ -2841,20 +3006,17 @@ fn executeKNN(
 
     for (hbc_results.items.items, 0..) |item, i| {
         const doc_id: u32 = @intCast(item.vector_id);
-        var hit = ScoredHit{
+        const hit = ScoredHit{
             .doc_id = doc_id,
             .score = 1.0 / (1.0 + item.distance),
             .id = null,
             .stored_data = null,
         };
-        if (request.include_stored) {
-            if (try snap.storedDocDecompressed(alloc, doc_id)) |stored| {
-                hit.id = stored.id;
-                hit.stored_data = stored.data;
-            }
-        }
         hits[i] = hit;
     }
+
+    errdefer freeStoredBodies(alloc, hits);
+    if (request.include_stored) try populateStoredHits(alloc, snap, hits, request.diagnostics);
 
     return .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(n) };
 }
@@ -2867,54 +3029,63 @@ fn executeHybrid(
     request: SearchRequest,
 ) !SearchResult {
     // Execute text search directly (avoid recursive execute → error set loop)
+    // Fusion needs document numbers and scores, not candidate bodies or
+    // aggregations. Materialize owned bodies once, for the fused winners.
+    var candidate_request = request;
+    candidate_request.include_stored = false;
+    candidate_request.aggregations = &.{};
     var text_result = switch (hq.text_query) {
-        .match_none => try executeMatchNone(alloc, request),
-        .match => |mq| try executeMatch(alloc, snap, mq, request),
-        .phrase => |pq| try executePhrase(alloc, snap, pq, request),
-        .term_phrase => |pq| try executeTermPhrase(alloc, snap, pq, request),
-        .multi_phrase => |pq| try executeMultiPhrase(alloc, snap, pq, request),
-        .term => |tq| try executeTerm(alloc, snap, tq, request),
-        .fuzzy => |fq| try executeFuzzy(alloc, snap, fq, request),
-        .numeric_range => |rq| try executeNumericRange(alloc, snap, rq, request),
-        .date_range => |rq| try executeDateRange(alloc, snap, rq, request),
-        .doc_id => |dq| try executeDocID(alloc, snap, dq, request),
-        .bool_field => |bq| try executeBoolField(alloc, snap, bq, request),
-        .geo_distance => |gq| try executeGeoDistance(alloc, snap, gq, request),
-        .geo_bbox => |gq| try executeGeoBBox(alloc, snap, gq, request),
-        .term_range => |rq| try executeTermRange(alloc, snap, rq, request),
-        .ip_range => |iq| try executeIPRange(alloc, snap, iq, request),
-        .geo_shape => |gq| try executeGeoShape(alloc, snap, gq, request),
-        .prefix => |pq| try executePrefix(alloc, snap, pq, request),
-        .wildcard => |wq| try executeWildcard(alloc, snap, wq, request),
-        .regexp => |rq| try executeRegexp(alloc, snap, rq, request),
-        .bool_query => |bq| try executeBool(alloc, snap, bq, request),
+        .match_none => try executeMatchNone(alloc, candidate_request),
+        .match => |mq| try executeMatch(alloc, snap, mq, candidate_request),
+        .phrase => |pq| try executePhrase(alloc, snap, pq, candidate_request),
+        .term_phrase => |pq| try executeTermPhrase(alloc, snap, pq, candidate_request),
+        .multi_phrase => |pq| try executeMultiPhrase(alloc, snap, pq, candidate_request),
+        .term => |tq| try executeTerm(alloc, snap, tq, candidate_request),
+        .fuzzy => |fq| try executeFuzzy(alloc, snap, fq, candidate_request),
+        .numeric_range => |rq| try executeNumericRange(alloc, snap, rq, candidate_request),
+        .date_range => |rq| try executeDateRange(alloc, snap, rq, candidate_request),
+        .doc_id => |dq| try executeDocID(alloc, snap, dq, candidate_request),
+        .bool_field => |bq| try executeBoolField(alloc, snap, bq, candidate_request),
+        .geo_distance => |gq| try executeGeoDistance(alloc, snap, gq, candidate_request),
+        .geo_bbox => |gq| try executeGeoBBox(alloc, snap, gq, candidate_request),
+        .term_range => |rq| try executeTermRange(alloc, snap, rq, candidate_request),
+        .ip_range => |iq| try executeIPRange(alloc, snap, iq, candidate_request),
+        .geo_shape => |gq| try executeGeoShape(alloc, snap, gq, candidate_request),
+        .prefix => |pq| try executePrefix(alloc, snap, pq, candidate_request),
+        .wildcard => |wq| try executeWildcard(alloc, snap, wq, candidate_request),
+        .regexp => |rq| try executeRegexp(alloc, snap, rq, candidate_request),
+        .bool_query => |bq| try executeBool(alloc, snap, bq, candidate_request),
     };
     defer text_result.deinit();
 
     // Execute KNN search directly
-    var knn_result = try executeKNN(alloc, snap, hq.knn, request);
+    var knn_result = try executeKNN(alloc, snap, hq.knn, candidate_request);
     defer knn_result.deinit();
 
     // Convert to fusion RankedResult format
     var text_ranked = try alloc.alloc(fusion_mod.RankedHit, text_result.hits.len);
     defer alloc.free(text_ranked);
+    var text_initialized: usize = 0;
+    defer for (text_ranked[0..text_initialized]) |rh| alloc.free(rh.doc_id);
     for (text_result.hits, 0..) |hit, i| {
         text_ranked[i] = .{
             .doc_id = try std.fmt.allocPrint(alloc, "{d}", .{hit.doc_id}),
             .score = @floatCast(hit.score),
         };
+        text_initialized += 1;
     }
-    defer for (text_ranked) |rh| alloc.free(rh.doc_id);
 
     var knn_ranked = try alloc.alloc(fusion_mod.RankedHit, knn_result.hits.len);
     defer alloc.free(knn_ranked);
+    var knn_initialized: usize = 0;
+    defer for (knn_ranked[0..knn_initialized]) |rh| alloc.free(rh.doc_id);
     for (knn_result.hits, 0..) |hit, i| {
         knn_ranked[i] = .{
             .doc_id = try std.fmt.allocPrint(alloc, "{d}", .{hit.doc_id}),
             .score = @floatCast(hit.score),
         };
+        knn_initialized += 1;
     }
-    defer for (knn_ranked) |rh| alloc.free(rh.doc_id);
 
     const ranked_results = [_]fusion_mod.RankedResult{
         .{ .index_name = "text", .hits = text_ranked },
@@ -2930,7 +3101,7 @@ fn executeHybrid(
     var initialized: usize = 0;
     errdefer {
         for (hits[0..initialized]) |*hit| {
-            if (hit.stored_data) |data| alloc.free(data);
+            freeStoredHit(alloc, hit);
             freeIndexScores(alloc, hit.index_scores);
         }
         alloc.free(hits);
@@ -2938,7 +3109,7 @@ fn executeHybrid(
 
     for (fused[0..result_count], 0..) |fh, i| {
         const doc_id = std.fmt.parseInt(u32, fh.doc_id, 10) catch 0;
-        var hit = ScoredHit{
+        const hit = ScoredHit{
             .doc_id = doc_id,
             .score = @floatCast(fh.score),
             .id = null,
@@ -2946,15 +3117,11 @@ fn executeHybrid(
             .index_scores = try cloneIndexScores(alloc, fh.index_scores),
         };
         errdefer freeIndexScores(alloc, hit.index_scores);
-        if (request.include_stored) {
-            if (try snap.storedDocDecompressed(alloc, doc_id)) |stored| {
-                hit.id = stored.id;
-                hit.stored_data = stored.data;
-            }
-        }
         hits[i] = hit;
         initialized += 1;
     }
+
+    if (request.include_stored) try populateStoredHits(alloc, snap, hits, request.diagnostics);
 
     return .{ .alloc = alloc, .hits = hits, .total_hits = @intCast(result_count) };
 }
@@ -2967,6 +3134,18 @@ fn buildResult(
     total_relation: TotalHitsRelation,
     request: SearchRequest,
 ) !SearchResult {
+    if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) {
+        var filtered: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty;
+        defer filtered.deinit(alloc);
+        for (scored) |hit| if (requestAllowsDocNum(request, hit.doc_id)) {
+            try filtered.append(alloc, hit);
+        };
+        var next = request;
+        next.filter_doc_bitmap = null;
+        next.exclude_doc_bitmap = null;
+        const count = if (filtered.items.len == scored.len) total_count else @as(u32, @intCast(filtered.items.len));
+        return buildResult(alloc, snap, filtered.items, count, total_relation, next);
+    }
     // Apply cursor filter: skip all results at or before the cursor position.
     // Scored results are sorted by (score desc, doc_id asc).
     var filtered_start: usize = 0;
@@ -2991,22 +3170,18 @@ fn buildResult(
     errdefer alloc.free(hits);
 
     for (result_slice, 0..) |sh, i| {
-        var hit = ScoredHit{
+        const hit = ScoredHit{
             .doc_id = sh.doc_id,
             .score = sh.score,
             .id = null,
             .stored_data = null,
         };
 
-        if (request.include_stored) {
-            if (try snap.storedDocDecompressed(alloc, sh.doc_id)) |stored| {
-                hit.id = stored.id;
-                hit.stored_data = stored.data;
-            }
-        }
-
         hits[i] = hit;
     }
+
+    errdefer freeStoredBodies(alloc, hits);
+    if (request.include_stored) try populateStoredHits(alloc, snap, hits, request.diagnostics);
 
     const agg_results = try collectAggregations(alloc, snap, scored, request.aggregations);
 
@@ -3027,16 +3202,21 @@ fn collectAggregations(
     scored: []const scorer_mod.ScoredHit,
     agg_specs: []const AggSpec,
 ) ![]NamedAggResult {
+    var read_scope = segment_mod.TypedReadScope.init(alloc);
+    defer read_scope.deinit();
+    const reads = &read_scope;
     if (agg_specs.len == 0) return &.{};
 
     var results = try alloc.alloc(NamedAggResult, agg_specs.len);
     errdefer alloc.free(results);
 
+    var candidates = StatsCandidates.init(alloc, snap, scored);
+    defer candidates.deinit();
     for (agg_specs, 0..) |spec, spec_idx| {
         results[spec_idx] = .{
             .name = spec.name,
-            .result = try collectOneAgg(alloc, snap, scored, spec),
-            .sub_results = try collectSubAggs(alloc, snap, scored, spec),
+            .result = try collectOneAgg(alloc, reads, snap, scored, spec, &candidates),
+            .sub_results = try collectSubAggs(alloc, reads, snap, scored, spec),
         };
     }
 
@@ -3047,6 +3227,7 @@ fn collectAggregations(
 /// Groups docs by bucket key, runs sub-aggs per bucket.
 fn collectSubAggs(
     alloc: Allocator,
+    reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     scored: []const scorer_mod.ScoredHit,
     spec: AggSpec,
@@ -3077,7 +3258,7 @@ fn collectSubAggs(
     switch (spec.agg_type) {
         .histogram => |h| {
             for (scored) |hit| {
-                if (try readF64ForDoc(alloc, snap, hit.doc_id, spec.field)) |val| {
+                if (try readF64ForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |val| {
                     const bk: i64 = @intFromFloat(@floor(val / h.interval));
                     const gop = try i64_buckets.getOrPut(alloc, bk);
                     if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -3087,7 +3268,7 @@ fn collectSubAggs(
         },
         .date_histogram => |dh| {
             for (scored) |hit| {
-                if (try readU64ForDoc(alloc, snap, hit.doc_id, spec.field)) |ns| {
+                if (try readU64ForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
                     const bk = aggregation_mod.truncateToInterval(ns, dh.interval);
                     const gop = try u64_buckets.getOrPut(alloc, bk);
                     if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -3097,7 +3278,7 @@ fn collectSubAggs(
         },
         .range => |r| {
             for (scored) |hit| {
-                if (try readF64ForDoc(alloc, snap, hit.doc_id, spec.field)) |val| {
+                if (try readF64ForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |val| {
                     for (r.ranges, 0..) |rng, ri| {
                         const above = if (rng.from) |f| val >= f else true;
                         const below = if (rng.to) |t| val < t else true;
@@ -3112,7 +3293,7 @@ fn collectSubAggs(
         },
         .geo_distance => |gd| {
             for (scored) |hit| {
-                if (try readGeoPointForDoc(alloc, snap, hit.doc_id, spec.field)) |pt| {
+                if (try readGeoPointForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |pt| {
                     const dist = geo_mod.haversineDistance(gd.center, pt);
                     for (gd.ranges, 0..) |rng, ri| {
                         const above = if (rng.from) |f| dist >= f else true;
@@ -3140,11 +3321,11 @@ fn collectSubAggs(
 
     // Build BucketSubResult array from whichever bucket map was used
     if (i64_buckets.count() > 0) {
-        return try buildSubResultsI64(alloc, snap, &i64_buckets, spec.sub_aggs);
+        return try buildSubResultsI64(alloc, reads, snap, &i64_buckets, spec.sub_aggs);
     } else if (u64_buckets.count() > 0) {
-        return try buildSubResultsU64(alloc, snap, &u64_buckets, spec.sub_aggs);
+        return try buildSubResultsU64(alloc, reads, snap, &u64_buckets, spec.sub_aggs);
     } else if (u32_buckets.count() > 0) {
-        return try buildSubResultsU32(alloc, snap, &u32_buckets, spec.sub_aggs);
+        return try buildSubResultsU32(alloc, reads, snap, &u32_buckets, spec.sub_aggs);
     }
     return null;
 }
@@ -3152,16 +3333,19 @@ fn collectSubAggs(
 /// Collect leaf-level aggregations (no sub-aggs) for a subset of docs.
 fn collectLeafAggs(
     alloc: Allocator,
+    reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     scored: []const scorer_mod.ScoredHit,
     sub_specs: []const AggSpec,
 ) ![]NamedAggResult {
     var results = try alloc.alloc(NamedAggResult, sub_specs.len);
     errdefer alloc.free(results);
+    var candidates = StatsCandidates.init(alloc, snap, scored);
+    defer candidates.deinit();
     for (sub_specs, 0..) |spec, i| {
         results[i] = .{
             .name = spec.name,
-            .result = try collectOneAgg(alloc, snap, scored, spec),
+            .result = try collectOneAgg(alloc, reads, snap, scored, spec, &candidates),
         };
     }
     return results;
@@ -3169,6 +3353,7 @@ fn collectLeafAggs(
 
 fn buildSubResultsI64(
     alloc: Allocator,
+    reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     buckets: *std.AutoHashMapUnmanaged(i64, std.ArrayListUnmanaged(scorer_mod.ScoredHit)),
     sub_specs: []const AggSpec,
@@ -3179,7 +3364,7 @@ fn buildSubResultsI64(
     while (it.next()) |entry| {
         results[idx] = .{
             .bucket_key = .{ .int = entry.key_ptr.* },
-            .aggs = try collectLeafAggs(alloc, snap, entry.value_ptr.items, sub_specs),
+            .aggs = try collectLeafAggs(alloc, reads, snap, entry.value_ptr.items, sub_specs),
         };
         idx += 1;
     }
@@ -3193,6 +3378,7 @@ fn buildSubResultsI64(
 
 fn buildSubResultsU64(
     alloc: Allocator,
+    reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     buckets: *std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(scorer_mod.ScoredHit)),
     sub_specs: []const AggSpec,
@@ -3203,7 +3389,7 @@ fn buildSubResultsU64(
     while (it.next()) |entry| {
         results[idx] = .{
             .bucket_key = .{ .uint = entry.key_ptr.* },
-            .aggs = try collectLeafAggs(alloc, snap, entry.value_ptr.items, sub_specs),
+            .aggs = try collectLeafAggs(alloc, reads, snap, entry.value_ptr.items, sub_specs),
         };
         idx += 1;
     }
@@ -3217,6 +3403,7 @@ fn buildSubResultsU64(
 
 fn buildSubResultsU32(
     alloc: Allocator,
+    reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     buckets: *std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(scorer_mod.ScoredHit)),
     sub_specs: []const AggSpec,
@@ -3227,7 +3414,7 @@ fn buildSubResultsU32(
     while (it.next()) |entry| {
         results[idx] = .{
             .bucket_key = .{ .range_idx = entry.key_ptr.* },
-            .aggs = try collectLeafAggs(alloc, snap, entry.value_ptr.items, sub_specs),
+            .aggs = try collectLeafAggs(alloc, reads, snap, entry.value_ptr.items, sub_specs),
         };
         idx += 1;
     }
@@ -3241,15 +3428,17 @@ fn buildSubResultsU32(
 
 fn collectOneAgg(
     alloc: Allocator,
+    reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     scored: []const scorer_mod.ScoredHit,
     spec: AggSpec,
+    candidates: *StatsCandidates,
 ) !AggResult {
     switch (spec.agg_type) {
         .stats => {
             // Batched path: iterate chunks per segment for SIMD-friendly bulk collection
             var stats = aggregation_mod.StatsAgg.init();
-            try collectStatsBatched(alloc, snap, scored, spec.field, &stats);
+            try collectStatsGrouped(reads, snap, candidates, spec.field, &stats);
             return .{ .stats = stats };
         },
         .histogram => |h| {
@@ -3257,7 +3446,7 @@ fn collectOneAgg(
             defer hist.deinit();
 
             for (scored) |hit| {
-                if (try readF64ForDoc(alloc, snap, hit.doc_id, spec.field)) |val| {
+                if (try readF64ForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |val| {
                     try hist.collect(val);
                 }
             }
@@ -3276,7 +3465,7 @@ fn collectOneAgg(
             defer facet.deinit();
 
             for (scored) |hit| {
-                if (try readBytesForDoc(alloc, snap, hit.doc_id, spec.field)) |val| {
+                if (try readBytesForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |val| {
                     defer alloc.free(val);
                     try facet.collect(val);
                 }
@@ -3290,7 +3479,7 @@ fn collectOneAgg(
             defer agg.deinit();
 
             for (scored) |hit| {
-                if (try readU64ForDoc(alloc, snap, hit.doc_id, spec.field)) |ns| {
+                if (try readU64ForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
                     try agg.collect(ns);
                 }
             }
@@ -3309,7 +3498,7 @@ fn collectOneAgg(
             defer agg.deinit();
 
             for (scored) |hit| {
-                if (try readF64ForDoc(alloc, snap, hit.doc_id, spec.field)) |val| {
+                if (try readF64ForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |val| {
                     agg.collect(val);
                 }
             }
@@ -3321,7 +3510,7 @@ fn collectOneAgg(
             defer agg.deinit();
 
             for (scored) |hit| {
-                if (try readGeoPointForDoc(alloc, snap, hit.doc_id, spec.field)) |pt| {
+                if (try readGeoPointForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |pt| {
                     agg.collect(pt);
                 }
             }
@@ -3333,7 +3522,7 @@ fn collectOneAgg(
             defer agg.deinit();
 
             for (scored) |hit| {
-                if (try readGeoPointForDoc(alloc, snap, hit.doc_id, spec.field)) |pt| {
+                if (try readGeoPointForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |pt| {
                     try agg.collect(pt);
                 }
             }
@@ -3347,116 +3536,111 @@ fn collectOneAgg(
 /// Batched stats collection: iterates chunks per segment, decompresses each chunk
 /// once, and collects all matching doc values in bulk using SIMD-friendly collectChunk.
 /// Falls back to per-doc reads for non-f64/u64 types.
+const StatsCandidates = struct {
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    scored: []const scorer_mod.ScoredHit,
+    docs: ?[]u32 = null,
+    offsets: ?[]usize = null,
+    count: usize = 0,
+
+    fn init(alloc: Allocator, snap: *const index_mod.IndexSnapshot, scored: []const scorer_mod.ScoredHit) StatsCandidates {
+        return .{ .alloc = alloc, .snap = snap, .scored = scored };
+    }
+    fn deinit(self: *StatsCandidates) void {
+        if (self.docs) |docs| self.alloc.free(docs);
+        if (self.offsets) |offsets| self.alloc.free(offsets);
+    }
+    fn prepare(self: *StatsCandidates) ![]const u32 {
+        if (self.docs) |docs| return docs[0..self.count];
+        // Sort global IDs once, then compact them to local IDs in place.
+        // Segment offsets cost O(segments); candidate storage stays four bytes
+        // per hit rather than carrying a segment index on every document.
+        const docs = try self.alloc.alloc(u32, self.scored.len);
+        errdefer self.alloc.free(docs);
+        const offsets = try self.alloc.alloc(usize, self.snap.segments.len + 1);
+        for (self.scored, docs) |hit, *id| id.* = hit.doc_id;
+        std.mem.sort(u32, docs, {}, struct {
+            fn less(_: void, x: u32, y: u32) bool {
+                return x < y;
+            }
+        }.less);
+        var count: usize = 0;
+        var segment: usize = 0;
+        offsets[0] = 0;
+        var base: u64 = 0;
+        for (docs) |global| {
+            while (segment < self.snap.segments.len and global >= base + self.snap.segments[segment].reader.doc_count) : (segment += 1) {
+                base += self.snap.segments[segment].reader.doc_count;
+                offsets[segment + 1] = count;
+            }
+            if (segment == self.snap.segments.len) continue;
+            docs[count] = @intCast(global - base);
+            count += 1;
+        }
+        while (segment < self.snap.segments.len) : (segment += 1) offsets[segment + 1] = count;
+        self.docs = docs;
+        self.offsets = offsets;
+        self.count = count;
+        return docs[0..count];
+    }
+};
+
 fn collectStatsBatched(
     alloc: Allocator,
+    reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     scored: []const scorer_mod.ScoredHit,
     field: []const u8,
     stats: *aggregation_mod.StatsAgg,
 ) !void {
-    // Build a set of matching doc IDs per segment
+    var candidates = StatsCandidates.init(alloc, snap, scored);
+    defer candidates.deinit();
+    try collectStatsGrouped(reads, snap, &candidates, field, stats);
+}
+
+fn collectStatsGrouped(
+    reads: *segment_mod.TypedReadScope,
+    snap: *const index_mod.IndexSnapshot,
+    candidates: *StatsCandidates,
+    field: []const u8,
+    stats: *aggregation_mod.StatsAgg,
+) !void {
+    const docs = try candidates.prepare();
     for (snap.segments, 0..) |*seg, seg_idx| {
-        const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse continue;
-        var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
+        const local_ids = docs[candidates.offsets.?[seg_idx]..candidates.offsets.?[seg_idx + 1]];
+        if (local_ids.len == 0) continue;
+        const reader = (try reads.get(&seg.reader, field)) orelse continue;
 
-        // Collect local doc IDs that belong to this segment
-        var local_ids = std.ArrayListUnmanaged(u32).empty;
-        defer local_ids.deinit(alloc);
-        for (scored) |hit| {
-            const resolved = snap.resolveDocId(hit.doc_id) orelse continue;
-            if (resolved.seg_idx == seg_idx) {
-                try local_ids.append(alloc, resolved.local_id);
+        // Selective aggregations probe only their candidates. Dense scans use
+        // one cursor and join sorted IDs in linear time without value arrays.
+        if (local_ids.len <= reader.num_chunks) {
+            var previous: ?u32 = null;
+            for (local_ids) |id| {
+                if (previous == id) continue;
+                previous = id;
+                if (try readNumericAsF64(reader, id)) |value| stats.collect(value);
             }
+            continue;
         }
-        if (local_ids.items.len == 0) continue;
-
-        // Sort for efficient chunk iteration
-        std.mem.sort(u32, local_ids.items, {}, struct {
-            fn cmp(_: void, a: u32, b: u32) bool {
-                return a < b;
-            }
-        }.cmp);
-
-        // Iterate chunks and collect matching values
-        switch (reader.value_type) {
-            .f64_val => {
-                for (0..reader.num_chunks) |ci| {
-                    const doc_ids = try reader.readChunkDocIds(@intCast(ci));
-                    defer alloc.free(doc_ids);
-                    const values = try reader.readF64Chunk(@intCast(ci));
-                    defer alloc.free(values);
-
-                    // Collect values for matching doc IDs
-                    for (doc_ids, 0..) |did, vi| {
-                        // Binary search in sorted local_ids
-                        if (std.sort.binarySearch(u32, local_ids.items, did, struct {
-                            fn cmp(key: u32, item: u32) std.math.Order {
-                                return std.math.order(key, item);
-                            }
-                        }.cmp) != null) {
-                            stats.collect(values[vi]);
-                        }
-                    }
-                }
-            },
-            .u64_val => {
-                for (0..reader.num_chunks) |ci| {
-                    const doc_ids = try reader.readChunkDocIds(@intCast(ci));
-                    defer alloc.free(doc_ids);
-                    const values = try reader.readU64Chunk(@intCast(ci));
-                    defer alloc.free(values);
-
-                    for (doc_ids, 0..) |did, vi| {
-                        if (std.sort.binarySearch(u32, local_ids.items, did, struct {
-                            fn cmp(key: u32, item: u32) std.math.Order {
-                                return std.math.order(key, item);
-                            }
-                        }.cmp) != null) {
-                            stats.collect(@floatFromInt(values[vi]));
-                        }
-                    }
-                }
-            },
-            .i64_val => {
-                for (0..reader.num_chunks) |ci| {
-                    const doc_ids = try reader.readChunkDocIds(@intCast(ci));
-                    defer alloc.free(doc_ids);
-                    const values = try reader.readI64Chunk(@intCast(ci));
-                    defer alloc.free(values);
-                    for (doc_ids, 0..) |did, vi| {
-                        if (std.sort.binarySearch(u32, local_ids.items, did, struct {
-                            fn cmp(key: u32, item: u32) std.math.Order {
-                                return std.math.order(key, item);
-                            }
-                        }.cmp) != null) {
-                            stats.collect(@floatFromInt(values[vi]));
-                        }
-                    }
-                }
-            },
-            .numeric_val => {
-                for (0..reader.num_chunks) |ci| {
-                    const doc_ids = try reader.readChunkDocIds(@intCast(ci));
-                    defer alloc.free(doc_ids);
-                    const values = try reader.readNumericChunk(@intCast(ci));
-                    defer alloc.free(values);
-                    for (doc_ids, 0..) |did, vi| {
-                        if (std.sort.binarySearch(u32, local_ids.items, did, struct {
-                            fn cmp(key: u32, item: u32) std.math.Order {
-                                return std.math.order(key, item);
-                            }
-                        }.cmp) != null) {
-                            stats.collect(typed_dv.numericValueAsF64(values[vi]));
-                        }
-                    }
-                }
-            },
-            else => {
-                // Fallback for non-numeric types (shouldn't happen for stats)
-                for (local_ids.items) |lid| {
-                    if (try reader.getF64(lid)) |v| stats.collect(v);
-                }
-            },
+        var selected: usize = 0;
+        // One decode per chunk, shared scratch, and no separate doc-ID/value
+        // arrays. Scans and sparse point operations share the field owner.
+        var cursor = typed_dv.TypedDocValuesReader.Cursor.init(reader);
+        defer cursor.deinit();
+        while (try cursor.next()) |entry| {
+            if (entry.doc_id >= seg.reader.doc_count) return error.InvalidData;
+            while (selected < local_ids.len and local_ids[selected] < entry.doc_id) : (selected += 1) {}
+            if (selected == local_ids.len) break;
+            if (local_ids[selected] != entry.doc_id) continue;
+            const value: ?f64 = switch (entry.value) {
+                .f64_val => |v| v,
+                .u64_val => |v| @floatFromInt(v),
+                .i64_val => |v| @floatFromInt(v),
+                .numeric_val => |v| typed_dv.numericValueAsF64(v),
+                else => null,
+            };
+            if (value) |v| stats.collect(v);
         }
     }
 }
@@ -3464,26 +3648,31 @@ fn collectStatsBatched(
 /// Read an f64 typed doc value for a global doc ID by resolving segment + field.
 fn readF64ForDoc(
     alloc: Allocator,
+    reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     global_id: u32,
     field: []const u8,
 ) !?f64 {
+    _ = alloc;
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
-    var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
+    const reader = (try reads.get(&seg.reader, field)) orelse return null;
+    return readNumericAsF64(reader, resolved.local_id);
+}
+
+fn readNumericAsF64(reader: *const typed_dv.TypedDocValuesReader, local_id: u32) !?f64 {
     return switch (reader.value_type) {
-        .f64_val => try reader.getF64(resolved.local_id),
+        .f64_val => try reader.getF64(local_id),
         .u64_val => {
-            const v = try reader.getU64(resolved.local_id) orelse return null;
+            const v = try reader.getU64(local_id) orelse return null;
             return @floatFromInt(v);
         },
         .i64_val => {
-            const v = try reader.getI64(resolved.local_id) orelse return null;
+            const v = try reader.getI64(local_id) orelse return null;
             return @floatFromInt(v);
         },
         .numeric_val => {
-            const v = try reader.getNumeric(resolved.local_id) orelse return null;
+            const v = try reader.getNumeric(local_id) orelse return null;
             return typed_dv.numericValueAsF64(v);
         },
         else => null,
@@ -3493,42 +3682,31 @@ fn readF64ForDoc(
 /// Read a bytes typed doc value for a global doc ID. Caller owns returned slice.
 fn readBytesForDoc(
     alloc: Allocator,
+    reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     global_id: u32,
     field: []const u8,
 ) !?[]u8 {
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
-    var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
+    const reader = (try reads.get(&seg.reader, field)) orelse return null;
     if (reader.value_type != .bytes_val) return null;
 
-    // Find the doc and read its bytes value
-    const found = try reader.findDoc(resolved.local_id) orelse return null;
-    defer alloc.free(found.chunk_data);
-    const num_docs = std.mem.readInt(u32, found.chunk_data[0..4], .little);
-    // Skip doc IDs, then skip preceding variable-length entries
-    var cursor: usize = 4 + @as(usize, num_docs) * 4;
-    for (0..found.pos) |_| {
-        const val_len = std.mem.readInt(u32, found.chunk_data[cursor..][0..4], .little);
-        cursor += 4 + val_len;
-    }
-    const val_len = std.mem.readInt(u32, found.chunk_data[cursor..][0..4], .little);
-    cursor += 4;
-    return try alloc.dupe(u8, found.chunk_data[cursor..][0..val_len]);
+    return reader.getBytesAllocWithAllocator(alloc, resolved.local_id);
 }
 
 /// Read a u64 typed doc value for a global doc ID.
 fn readU64ForDoc(
     alloc: Allocator,
+    reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     global_id: u32,
     field: []const u8,
 ) !?u64 {
+    _ = alloc;
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
-    var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
+    const reader = (try reads.get(&seg.reader, field)) orelse return null;
     if (reader.value_type != .u64_val) return null;
     return try reader.getU64(resolved.local_id);
 }
@@ -3536,14 +3714,15 @@ fn readU64ForDoc(
 /// Read a geo_point typed doc value for a global doc ID.
 fn readGeoPointForDoc(
     alloc: Allocator,
+    reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     global_id: u32,
     field: []const u8,
 ) !?geo_mod.GeoPoint {
+    _ = alloc;
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
-    const section_data = (try seg.reader.getSection(field, .typed_doc_values)) orelse return null;
-    var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
+    const reader = (try reads.get(&seg.reader, field)) orelse return null;
     if (reader.value_type != .geo_point) return null;
     const gp = try reader.getGeoPoint(resolved.local_id) orelse return null;
     return geo_mod.GeoPoint{ .lat = gp.lat, .lon = gp.lon };
@@ -5357,4 +5536,269 @@ test "search result has empty graph_results by default" {
 
     try std.testing.expectEqual(@as(usize, 0), result.graph_results.len);
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+}
+
+test "search stored hit cursor preserves order ownership and allocation failure cleanup" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "a", .data = "first", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 10 }} },
+        .{ .id = "b", .data = "second", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 10 }} },
+        .{ .id = "c", .data = "third", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const snapshot = writer.snapshot();
+    const Scenario = struct {
+        fn run(allocator: Allocator, snap: *const index_mod.IndexSnapshot) !void {
+            var hits = [_]ScoredHit{
+                .{ .doc_id = 2, .score = 3, .id = null, .stored_data = null },
+                .{ .doc_id = 0, .score = 2, .id = null, .stored_data = null },
+                .{ .doc_id = 1, .score = 1, .id = null, .stored_data = null },
+            };
+            defer freeStoredBodies(allocator, &hits);
+            try populateStoredHits(allocator, snap, &hits, null);
+            try std.testing.expectEqualStrings("c", hits[0].id.?);
+            try std.testing.expectEqualStrings("third", hits[0].stored_data.?);
+            try std.testing.expectEqualStrings("a", hits[1].id.?);
+            try std.testing.expectEqualStrings("first", hits[1].stored_data.?);
+            try std.testing.expectEqualStrings("b", hits[2].id.?);
+            try std.testing.expectEqualStrings("second", hits[2].stored_data.?);
+            try std.testing.expectEqual(@as(f32, 3), hits[0].score);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Scenario.run, .{snapshot});
+    var native = try index_mod.IndexWriter.init(a);
+    defer native.deinit();
+    try native.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    try Scenario.run(a, native.snapshot());
+    try std.testing.checkAllAllocationFailures(a, Scenario.run, .{native.snapshot()});
+    var native_single = [_]ScoredHit{.{ .doc_id = 1, .score = 1, .id = null, .stored_data = null }};
+    defer freeStoredBodies(a, &native_single);
+    try populateStoredHits(a, native.snapshot(), &native_single, null);
+    try std.testing.expectEqualStrings("b", native_single[0].id.?);
+    try std.testing.expectEqualStrings("second", native_single[0].stored_data.?);
+    try std.testing.expectEqual(@as(usize, 0), native.snapshot().segments[0].reader.native.?.identity_bytes);
+    var singleton = [_]ScoredHit{.{ .doc_id = 0, .score = 1, .id = null, .stored_data = null }};
+    defer freeStoredBodies(a, &singleton);
+    try populateStoredHits(a, snapshot, &singleton, null);
+    try std.testing.expectEqualStrings("first", singleton[0].stored_data.?);
+}
+
+test "search hybrid materializes only fused winners and cleans allocation failures" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "a", .data = "first", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 10 }} },
+        .{ .id = "b", .data = "second", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const Scenario = struct {
+        fn run(allocator: Allocator, snap: *const index_mod.IndexSnapshot) !void {
+            var diagnostics = scorer_mod.SearchDiagnostics{};
+            var result = try executeHybrid(allocator, snap, .{
+                .text_query = .{ .term = .{ .field = "title", .term = "hello" } },
+                .knn = .{ .index_name = "missing", .vector = &.{ 1, 2 }, .k = 2 },
+            }, .{ .query = .{ .match_none = {} }, .k = 2, .diagnostics = &diagnostics });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+            try std.testing.expectEqualStrings("first", result.hits[0].stored_data.?);
+            try std.testing.expectEqualStrings("second", result.hits[1].stored_data.?);
+            try std.testing.expectEqual(@as(u64, 2), diagnostics.stored_body_copies);
+            try std.testing.expectEqual(@as(u64, 1), diagnostics.stored_block_decodes);
+            try std.testing.expectEqual(@as(u64, 11), diagnostics.stored_body_bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Scenario.run, .{writer.snapshot()});
+}
+
+test "native stats aggregate dense and selective candidates with scoped ownership" {
+    const a = std.testing.allocator;
+    var values = typed_dv.TypedDocValuesWriter.init(a, .u64_val, 128);
+    defer values.deinit();
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for (0..1000) |doc| {
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{doc}), "");
+        if (doc % 2 == 0) try values.add(@intCast(doc), .{ .u64_val = doc + 1 });
+    }
+    const column = try values.build();
+    defer a.free(column);
+    try segment.addSection(try segment.addField("rank"), .typed_doc_values, column);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    const Harness = struct {
+        fn run(alloc: Allocator, snapshot: *const index_mod.IndexSnapshot) !void {
+            var reads = segment_mod.TypedReadScope.init(alloc);
+            defer reads.deinit();
+            const candidates = try alloc.alloc(scorer_mod.ScoredHit, 1000);
+            defer alloc.free(candidates);
+            for (candidates, 0..) |*candidate, doc| candidate.* = .{ .doc_id = @intCast(doc), .score = 0 };
+            var dense = aggregation_mod.StatsAgg.init();
+            try collectStatsBatched(alloc, &reads, snapshot, candidates, "rank", &dense);
+            try std.testing.expectEqual(@as(u64, 500), dense.count);
+            try std.testing.expectEqual(@as(f64, 250_000), dense.sum);
+            try std.testing.expectEqual(@as(usize, 0), reads.cache.?.decode_count);
+            var grouped = StatsCandidates.init(alloc, snapshot, candidates);
+            defer grouped.deinit();
+            var first = aggregation_mod.StatsAgg.init();
+            try collectStatsGrouped(&reads, snapshot, &grouped, "rank", &first);
+            const directory = (try grouped.prepare()).ptr;
+            var repeated = aggregation_mod.StatsAgg.init();
+            try collectStatsGrouped(&reads, snapshot, &grouped, "rank", &repeated);
+            try std.testing.expectEqual(first.count, repeated.count);
+            try std.testing.expectEqual(first.sum, repeated.sum);
+            try std.testing.expectEqual(directory, (try grouped.prepare()).ptr);
+
+            const selective = [_]scorer_mod.ScoredHit{ .{ .doc_id = 0, .score = 0 }, .{ .doc_id = 0, .score = 0 }, .{ .doc_id = 100, .score = 0 } };
+            var sparse = aggregation_mod.StatsAgg.init();
+            try collectStatsBatched(alloc, &reads, snapshot, &selective, "rank", &sparse);
+            try std.testing.expectEqual(@as(u64, 2), sparse.count);
+            try std.testing.expectEqual(@as(f64, 102), sparse.sum);
+            try std.testing.expect(reads.cache.?.decode_count <= 4);
+            try std.testing.expectEqual(@as(usize, 1), reads.entries.items.len);
+        }
+    };
+    try Harness.run(a, writer.snapshot());
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{writer.snapshot()});
+    try writer.addSegmentWithIdData(2, .fromNative(.{ .contiguous = bytes }));
+    var reads = segment_mod.TypedReadScope.init(a);
+    defer reads.deinit();
+    const mixed = [_]scorer_mod.ScoredHit{
+        .{ .doc_id = 1500, .score = 0 },                 .{ .doc_id = 0, .score = 0 },
+        .{ .doc_id = 1000, .score = 0 },                 .{ .doc_id = 0, .score = 0 },
+        .{ .doc_id = std.math.maxInt(u32), .score = 0 }, .{ .doc_id = 100, .score = 0 },
+        .{ .doc_id = 1800, .score = 0 },
+    };
+    var grouped = StatsCandidates.init(a, writer.snapshot(), &mixed);
+    defer grouped.deinit();
+    var stats = aggregation_mod.StatsAgg.init();
+    try collectStatsGrouped(&reads, writer.snapshot(), &grouped, "rank", &stats);
+    try std.testing.expectEqual(@as(u64, 5), stats.count);
+    try std.testing.expectEqual(@as(f64, 1405), stats.sum);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 3, 6 }, grouped.offsets.?);
+}
+
+test "native search identities and bodies outlive the source owner" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "aaa", .data = "first", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 10 }} },
+        .{ .id = "bbb", .data = "second", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 10 }} },
+    });
+    var writer = try index_mod.IndexWriter.init(a);
+    var owner_open = true;
+    defer if (owner_open) writer.deinit();
+    defer a.free(bytes);
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    var result = try execute(a, writer.snapshot(), .{ .query = .match_all, .k = 2, .include_stored = true });
+    defer result.deinit();
+    writer.deinit();
+    owner_open = false;
+    try std.testing.expectEqualStrings("aaa", result.hits[0].id.?);
+    try std.testing.expectEqualStrings("bbb", result.hits[1].id.?);
+    try std.testing.expectEqualStrings("first", result.hits[0].stored_data.?);
+    try std.testing.expectEqualStrings("second", result.hits[1].stored_data.?);
+}
+
+test "native ID filters and deletes never retain stable identity pages" {
+    const a = std.testing.allocator;
+    var builder = segment_mod.SegmentWriter.init(a);
+    defer builder.deinit();
+    for (0..2048) |i| {
+        var id: [1024]u8 = @splat('x');
+        std.mem.writeInt(u64, id[0..8], i, .little);
+        try builder.addStoredDoc(&id, "");
+    }
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    const entry = &writer.snapshot().segments[0];
+    const before = entry.reader.nativeNavigationBytes();
+    var matches = try (query_mod.DocIdFilter{ .doc_ids = &.{"absent"} }).execute(a, entry);
+    defer matches.deinit();
+    const after = entry.reader.nativeNavigationBytes();
+    try std.testing.expectEqual(@as(usize, 0), matches.cardinality());
+    try std.testing.expectEqual(@as(usize, 0), entry.reader.native.?.identity_bytes);
+    var id: [1024]u8 = @splat('x');
+    std.mem.writeInt(u64, id[0..8], 1023, .little);
+    const deletes = try writer.deleteAllByIdsTracked(a, &.{ &id, "absent" });
+    defer index_mod.IndexWriter.freeDeleteInfos(a, deletes);
+    try std.testing.expectEqual(@as(usize, 1), deletes.len);
+    try std.testing.expectEqual(@as(usize, 1), deletes[0].local_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), entry.reader.native.?.identity_bytes);
+    std.debug.print("LITE_ID_SCAN rows=2048 retained_growth={d} retained_ids=0\n", .{after - before});
+}
+
+test "external lake impossible Boolean conjunction skips global scoring reads" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "one", .data = "{}", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} },
+        .{ .id = "two", .data = "{}", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    const snap = writer.snapshot();
+    var reader = (try snap.segments[0].reader.invertedIndexScoped(a, "title")).?;
+    defer reader.deinit();
+    const terms = [_]SimpleTextTerm{
+        .{ .field = "title", .term = "absent", .boost = 1 },
+        .{ .field = "title", .term = "common", .boost = 1 },
+    };
+    try std.testing.expect((try initFastTermStates(a, snap, &reader, "title", &terms, true)) == null);
+    try std.testing.expectEqual(@as(u64, 0), snap.term_doc_freq_cache_misses);
+    const states = (try initFastTermStates(a, snap, &reader, "title", terms[1..], true)).?;
+    defer deinitFastTermStates(a, states);
+    try std.testing.expectEqual(@as(u32, 4), states[0].doc_freq);
+}
+
+test "external lake indexed bitmap filters preserve ranking disjunction and exact counts" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "zero", .data = "{}", .terms = &.{.{ .term = "alpha", .freq = 4, .norm = 10 }} },
+        .{ .id = "one", .data = "{}", .terms = &.{.{ .term = "beta", .freq = 2, .norm = 10 }} },
+        .{ .id = "two", .data = "{}", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    var bitmap = roaring.RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    try bitmap.add(1);
+    try bitmap.add(2);
+    const base: SearchQuery = .{ .match = .{ .field = "title", .text = "alpha beta" } };
+    const query: SearchQuery = .{ .bool_query = .{ .must = &.{ base, .{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap, .boost = 0 } } } } };
+    var original = try execute(a, writer.snapshot(), .{ .query = base, .k = 3, .include_stored = false });
+    defer original.deinit();
+    var filtered = try execute(a, writer.snapshot(), .{ .query = query, .k = 3, .include_stored = false });
+    defer filtered.deinit();
+    try std.testing.expectEqual(@as(usize, 2), filtered.hits.len);
+    for (filtered.hits) |hit| {
+        try std.testing.expect(bitmap.contains(hit.doc_id));
+        const score = for (original.hits) |before| {
+            if (before.doc_id == hit.doc_id) break before.score;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(score, hit.score);
+    }
+    var count = try executeCountCandidates(a, writer.snapshot(), query);
+    defer count.deinit();
+    try std.testing.expectEqual(@as(u32, 2), count.total_hits);
+    try std.testing.expectEqual(@as(u32, 2), try countMatches(a, writer.snapshot(), query));
+    const excluded: SearchQuery = .{ .bool_query = .{ .must = &.{base}, .must_not = &.{.{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap } }} } };
+    var remaining = try execute(a, writer.snapshot(), .{ .query = excluded, .k = 3, .include_stored = false });
+    defer remaining.deinit();
+    try std.testing.expectEqual(@as(usize, 1), remaining.hits.len);
+    try std.testing.expectEqual(@as(u32, 0), remaining.hits[0].doc_id);
 }

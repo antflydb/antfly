@@ -1,0 +1,932 @@
+{
+  "date": "2026-10-08",
+  "source": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261007/archive",
+  "row_count": 10000,
+  "binary": {
+    "revision": "10e36b97f1f9831bb9b788ec4ff370015a9369fa",
+    "target": "x86_64-linux-musl",
+    "optimize": "fast",
+    "stripped": true,
+    "sha256": "05d7d36fe47d7e4e6651758623a607c9a01bbb4573b891a3a511be7d59e71195"
+  },
+  "worker": {
+    "project": "antfly-dev-01",
+    "cluster": "antfly-dev",
+    "region": "us-central1",
+    "node": "gk3-antfly-dev-pool-2-7e8505e2-16ei",
+    "resources": {
+      "limits": {
+        "cpu": "2",
+        "ephemeral-storage": "4Gi",
+        "memory": "8Gi"
+      },
+      "requests": {
+        "cpu": "2",
+        "ephemeral-storage": "4Gi",
+        "memory": "8Gi"
+      }
+    },
+    "image": "gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:cde9dbd556000c21c08449d8e5828904ef91e690bec95207f71fa6a6685922c9"
+  },
+  "method": {
+    "cycles_per_mode": 2,
+    "warm_queries_per_cycle": 5,
+    "concurrency": 4,
+    "cold": "Stop after publication and SQL count, delete the state cache, restart, then query. Catalog and remote publications retained.",
+    "network_counters": "Pod-wide non-loopback bytes including TLS/DNS/control/background traffic; concurrent intervals overlap.",
+    "cpu_counters": "Linux process user+system time; aggregate across threads, 10ms resolution.",
+    "took_ms": "Reported native retrieval/ranking/hydration time; excludes earlier source/publication preparation and HTTP encoding/transport."
+  },
+  "metadata_indexes": [
+    "hn_id",
+    "created_at",
+    "item_type",
+    "author",
+    "points"
+  ],
+  "verified": [
+    "remote_bm25",
+    "projected_highlights",
+    "snapshot_pagination",
+    "restart_scores",
+    "restart_pagination",
+    "metadata_filters_match_residual",
+    "metadata_filters_after_restart",
+    "empty_date_filter_before_and_after_restart",
+    "concurrent_search",
+    "exact_filter",
+    "identical_hn_ids_and_scores_between_modes_and_cycles",
+    "identical_hn_ids_and_scores_before_and_after_planner_fix"
+  ],
+  "runs": {
+    "text-only": [
+      {
+        "artifacts": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261008-planner/usc1-1730/text-only/indexes",
+        "ready_seconds": 5.49,
+        "cache_files_before_search": 0,
+        "first_search_ms": 4590.42,
+        "warm_search_ms": 145.28,
+        "warm_samples_ms": [
+          134.5,
+          161.75,
+          138.98,
+          145.28,
+          175.18
+        ],
+        "after_restart_ms": 257.0,
+        "concurrent_search_ms": [
+          151.51,
+          163.2,
+          155.63,
+          151.01
+        ],
+        "cache_files": 99,
+        "cache_bytes": 5236324,
+        "metadata_filters": {
+          "item_type": {
+            "total": {
+              "value": 6,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              146.18,
+              173.18,
+              143.5,
+              172.49,
+              154.91
+            ],
+            "median_ms": 154.91,
+            "predicate": {
+              "term": {
+                "path": "/item_type",
+                "value": "story"
+              }
+            },
+            "after_restart_ms": 162.55
+          },
+          "author": {
+            "total": {
+              "value": 1,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              136.12,
+              128.23,
+              129.56,
+              149.6,
+              176.16
+            ],
+            "median_ms": 136.12,
+            "predicate": {
+              "term": {
+                "path": "/author",
+                "value": "harisund1990"
+              }
+            },
+            "after_restart_ms": 149.82
+          },
+          "points": {
+            "total": {
+              "value": 6,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              144.75,
+              145.97,
+              164.25,
+              155.42,
+              139.8
+            ],
+            "median_ms": 145.97,
+            "predicate": {
+              "range": {
+                "path": "/points",
+                "gte": 2
+              }
+            },
+            "after_restart_ms": 217.66
+          },
+          "created_at": {
+            "total": {
+              "value": 3,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              138.37,
+              142.16,
+              139.9,
+              154.53,
+              133.59
+            ],
+            "median_ms": 139.9,
+            "predicate": {
+              "range": {
+                "path": "/created_at",
+                "gte": 1759241970,
+                "lt": 1759245570
+              }
+            },
+            "after_restart_ms": 198.76
+          },
+          "combined": {
+            "total": {
+              "value": 1,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              133.36,
+              142.83,
+              189.49,
+              134.87,
+              164.59
+            ],
+            "median_ms": 142.83,
+            "predicate": {
+              "bool": {
+                "filter": [
+                  {
+                    "term": {
+                      "path": "/item_type",
+                      "value": "story"
+                    }
+                  },
+                  {
+                    "term": {
+                      "path": "/author",
+                      "value": "harisund1990"
+                    }
+                  },
+                  {
+                    "range": {
+                      "path": "/points",
+                      "gte": 2
+                    }
+                  },
+                  {
+                    "range": {
+                      "path": "/created_at",
+                      "gte": 1759241970,
+                      "lt": 1759245570
+                    }
+                  }
+                ]
+              }
+            },
+            "after_restart_ms": 155.5
+          }
+        },
+        "cold_profile": {
+          "elapsed_ms": 4590.42,
+          "took_ms": 1298,
+          "cpu_ms": 770.0,
+          "network_rx_bytes": 5815319,
+          "network_tx_bytes": 224642
+        },
+        "restart_profile": {
+          "elapsed_ms": 257.0,
+          "took_ms": 37,
+          "cpu_ms": 190.0,
+          "network_rx_bytes": 31863,
+          "network_tx_bytes": 52847
+        },
+        "warm_profile_median": {
+          "elapsed_ms": 145.28,
+          "took_ms": 5,
+          "cpu_ms": 30.0,
+          "network_rx_bytes": 18523,
+          "network_tx_bytes": 9094
+        },
+        "filter_profile_median": {
+          "item_type": {
+            "elapsed_ms": 154.91,
+            "took_ms": 5,
+            "cpu_ms": 40.0,
+            "network_rx_bytes": 18522,
+            "network_tx_bytes": 9094
+          },
+          "author": {
+            "elapsed_ms": 136.12,
+            "took_ms": 5,
+            "cpu_ms": 30.0,
+            "network_rx_bytes": 18522,
+            "network_tx_bytes": 9094
+          },
+          "points": {
+            "elapsed_ms": 145.97,
+            "took_ms": 5,
+            "cpu_ms": 30.0,
+            "network_rx_bytes": 18520,
+            "network_tx_bytes": 9094
+          },
+          "created_at": {
+            "elapsed_ms": 139.9,
+            "took_ms": 7,
+            "cpu_ms": 30.0,
+            "network_rx_bytes": 18521,
+            "network_tx_bytes": 9094
+          },
+          "combined": {
+            "elapsed_ms": 142.83,
+            "took_ms": 4,
+            "cpu_ms": 40.0,
+            "network_rx_bytes": 18522,
+            "network_tx_bytes": 9094
+          }
+        }
+      },
+      {
+        "artifacts": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261008-planner/usc1-1730/text-only/indexes",
+        "ready_seconds": 0.13,
+        "cache_files_before_search": 1,
+        "first_search_ms": 4001.11,
+        "warm_search_ms": 139.51,
+        "warm_samples_ms": [
+          171.46,
+          134.11,
+          139.51,
+          141.6,
+          126.17
+        ],
+        "after_restart_ms": 220.29,
+        "concurrent_search_ms": [
+          172.94,
+          135.73,
+          142.85,
+          165.29
+        ],
+        "cache_files": 99,
+        "cache_bytes": 5236324,
+        "metadata_filters": {
+          "item_type": {
+            "total": {
+              "value": 6,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              134.74,
+              168.48,
+              166.31,
+              166.38,
+              144.98
+            ],
+            "median_ms": 166.31,
+            "predicate": {
+              "term": {
+                "path": "/item_type",
+                "value": "story"
+              }
+            },
+            "after_restart_ms": 142.38
+          },
+          "author": {
+            "total": {
+              "value": 1,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              146.19,
+              144.22,
+              151.59,
+              180.68,
+              153.81
+            ],
+            "median_ms": 151.59,
+            "predicate": {
+              "term": {
+                "path": "/author",
+                "value": "harisund1990"
+              }
+            },
+            "after_restart_ms": 147.68
+          },
+          "points": {
+            "total": {
+              "value": 6,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              151.11,
+              169.38,
+              173.96,
+              186.72,
+              158.49
+            ],
+            "median_ms": 169.38,
+            "predicate": {
+              "range": {
+                "path": "/points",
+                "gte": 2
+              }
+            },
+            "after_restart_ms": 165.1
+          },
+          "created_at": {
+            "total": {
+              "value": 3,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              147.25,
+              172.27,
+              138.7,
+              151.71,
+              189.93
+            ],
+            "median_ms": 151.71,
+            "predicate": {
+              "range": {
+                "path": "/created_at",
+                "gte": 1759241970,
+                "lt": 1759245570
+              }
+            },
+            "after_restart_ms": 208.19
+          },
+          "combined": {
+            "total": {
+              "value": 1,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              201.66,
+              211.77,
+              144.73,
+              165.46,
+              199.94
+            ],
+            "median_ms": 199.94,
+            "predicate": {
+              "bool": {
+                "filter": [
+                  {
+                    "term": {
+                      "path": "/item_type",
+                      "value": "story"
+                    }
+                  },
+                  {
+                    "term": {
+                      "path": "/author",
+                      "value": "harisund1990"
+                    }
+                  },
+                  {
+                    "range": {
+                      "path": "/points",
+                      "gte": 2
+                    }
+                  },
+                  {
+                    "range": {
+                      "path": "/created_at",
+                      "gte": 1759241970,
+                      "lt": 1759245570
+                    }
+                  }
+                ]
+              }
+            },
+            "after_restart_ms": 143.15
+          }
+        },
+        "cold_profile": {
+          "elapsed_ms": 4001.11,
+          "took_ms": 1218,
+          "cpu_ms": 690.0,
+          "network_rx_bytes": 5722616,
+          "network_tx_bytes": 171347
+        },
+        "restart_profile": {
+          "elapsed_ms": 220.29,
+          "took_ms": 34,
+          "cpu_ms": 130.0,
+          "network_rx_bytes": 24290,
+          "network_tx_bytes": 10269
+        },
+        "warm_profile_median": {
+          "elapsed_ms": 139.51,
+          "took_ms": 5,
+          "cpu_ms": 30.0,
+          "network_rx_bytes": 18682,
+          "network_tx_bytes": 9094
+        },
+        "filter_profile_median": {
+          "item_type": {
+            "elapsed_ms": 166.31,
+            "took_ms": 5,
+            "cpu_ms": 30.0,
+            "network_rx_bytes": 18618,
+            "network_tx_bytes": 9094
+          },
+          "author": {
+            "elapsed_ms": 151.59,
+            "took_ms": 5,
+            "cpu_ms": 30.0,
+            "network_rx_bytes": 18617,
+            "network_tx_bytes": 9094
+          },
+          "points": {
+            "elapsed_ms": 169.38,
+            "took_ms": 6,
+            "cpu_ms": 40.0,
+            "network_rx_bytes": 18617,
+            "network_tx_bytes": 9094
+          },
+          "created_at": {
+            "elapsed_ms": 151.71,
+            "took_ms": 7,
+            "cpu_ms": 40.0,
+            "network_rx_bytes": 18617,
+            "network_tx_bytes": 9094
+          },
+          "combined": {
+            "elapsed_ms": 199.94,
+            "took_ms": 5,
+            "cpu_ms": 40.0,
+            "network_rx_bytes": 18682,
+            "network_tx_bytes": 9094
+          }
+        }
+      }
+    ],
+    "indexed": [
+      {
+        "artifacts": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261008-planner/usc1-1730/indexed/indexes",
+        "ready_seconds": 51.77,
+        "cache_files_before_search": 0,
+        "first_search_ms": 3922.9,
+        "warm_search_ms": 146.18,
+        "warm_samples_ms": [
+          160.75,
+          132.9,
+          146.18,
+          147.29,
+          144.71
+        ],
+        "after_restart_ms": 216.23,
+        "concurrent_search_ms": [
+          144.5,
+          161.89,
+          169.17,
+          129.55
+        ],
+        "cache_files": 117,
+        "cache_bytes": 5514132,
+        "metadata_filters": {
+          "item_type": {
+            "total": {
+              "value": 6,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              347.52,
+              136.77,
+              152.04,
+              139.84,
+              137.99
+            ],
+            "median_ms": 139.84,
+            "predicate": {
+              "term": {
+                "path": "/item_type",
+                "value": "story"
+              }
+            },
+            "after_restart_ms": 124.3
+          },
+          "author": {
+            "total": {
+              "value": 1,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              277.51,
+              128.77,
+              119.28,
+              136.19,
+              211.22
+            ],
+            "median_ms": 136.19,
+            "predicate": {
+              "term": {
+                "path": "/author",
+                "value": "harisund1990"
+              }
+            },
+            "after_restart_ms": 131.5
+          },
+          "points": {
+            "total": {
+              "value": 6,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              284.31,
+              158.86,
+              143.06,
+              138.65,
+              155.11
+            ],
+            "median_ms": 155.11,
+            "predicate": {
+              "range": {
+                "path": "/points",
+                "gte": 2
+              }
+            },
+            "after_restart_ms": 130.86
+          },
+          "created_at": {
+            "total": {
+              "value": 3,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              269.47,
+              137.75,
+              132.39,
+              141.27,
+              150.31
+            ],
+            "median_ms": 141.27,
+            "predicate": {
+              "range": {
+                "path": "/created_at",
+                "gte": 1759241970,
+                "lt": 1759245570
+              }
+            },
+            "after_restart_ms": 140.11
+          },
+          "combined": {
+            "total": {
+              "value": 1,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              138.18,
+              150.5,
+              148.17,
+              144.18,
+              129.51
+            ],
+            "median_ms": 144.18,
+            "predicate": {
+              "bool": {
+                "filter": [
+                  {
+                    "term": {
+                      "path": "/item_type",
+                      "value": "story"
+                    }
+                  },
+                  {
+                    "term": {
+                      "path": "/author",
+                      "value": "harisund1990"
+                    }
+                  },
+                  {
+                    "range": {
+                      "path": "/points",
+                      "gte": 2
+                    }
+                  },
+                  {
+                    "range": {
+                      "path": "/created_at",
+                      "gte": 1759241970,
+                      "lt": 1759245570
+                    }
+                  }
+                ]
+              }
+            },
+            "after_restart_ms": 131.22
+          }
+        },
+        "cold_profile": {
+          "elapsed_ms": 3922.9,
+          "took_ms": 1226,
+          "cpu_ms": 880.0,
+          "network_rx_bytes": 7496045,
+          "network_tx_bytes": 246239
+        },
+        "restart_profile": {
+          "elapsed_ms": 216.23,
+          "took_ms": 27,
+          "cpu_ms": 130.0,
+          "network_rx_bytes": 36609,
+          "network_tx_bytes": 9490
+        },
+        "warm_profile_median": {
+          "elapsed_ms": 146.18,
+          "took_ms": 5,
+          "cpu_ms": 40.0,
+          "network_rx_bytes": 86720,
+          "network_tx_bytes": 10956
+        },
+        "filter_profile_median": {
+          "item_type": {
+            "elapsed_ms": 139.84,
+            "took_ms": 6,
+            "cpu_ms": 40.0,
+            "network_rx_bytes": 86662,
+            "network_tx_bytes": 10824
+          },
+          "author": {
+            "elapsed_ms": 136.19,
+            "took_ms": 6,
+            "cpu_ms": 40.0,
+            "network_rx_bytes": 86668,
+            "network_tx_bytes": 10824
+          },
+          "points": {
+            "elapsed_ms": 155.11,
+            "took_ms": 6,
+            "cpu_ms": 40.0,
+            "network_rx_bytes": 120729,
+            "network_tx_bytes": 11689
+          },
+          "created_at": {
+            "elapsed_ms": 141.27,
+            "took_ms": 9,
+            "cpu_ms": 50.0,
+            "network_rx_bytes": 120602,
+            "network_tx_bytes": 11689
+          },
+          "combined": {
+            "elapsed_ms": 144.18,
+            "took_ms": 11,
+            "cpu_ms": 50.0,
+            "network_rx_bytes": 24774,
+            "network_tx_bytes": 44110
+          }
+        }
+      },
+      {
+        "artifacts": "gs://colony-import-sources-antfly-dev-01/hn-poc/20261008-planner/usc1-1730/indexed/indexes",
+        "ready_seconds": 0.13,
+        "cache_files_before_search": 1,
+        "first_search_ms": 4358.02,
+        "warm_search_ms": 152.44,
+        "warm_samples_ms": [
+          144.28,
+          152.44,
+          163.35,
+          184.13,
+          141.12
+        ],
+        "after_restart_ms": 202.51,
+        "concurrent_search_ms": [
+          169.73,
+          151.2,
+          150.79,
+          158.99
+        ],
+        "cache_files": 117,
+        "cache_bytes": 5514132,
+        "metadata_filters": {
+          "item_type": {
+            "total": {
+              "value": 6,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              358.89,
+              140.69,
+              140.53,
+              150.12,
+              147.26
+            ],
+            "median_ms": 147.26,
+            "predicate": {
+              "term": {
+                "path": "/item_type",
+                "value": "story"
+              }
+            },
+            "after_restart_ms": 155.08
+          },
+          "author": {
+            "total": {
+              "value": 1,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              302.23,
+              155.93,
+              155.34,
+              156.52,
+              141.86
+            ],
+            "median_ms": 155.93,
+            "predicate": {
+              "term": {
+                "path": "/author",
+                "value": "harisund1990"
+              }
+            },
+            "after_restart_ms": 135.36
+          },
+          "points": {
+            "total": {
+              "value": 6,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              329.05,
+              143.51,
+              156.74,
+              290.25,
+              151.65
+            ],
+            "median_ms": 156.74,
+            "predicate": {
+              "range": {
+                "path": "/points",
+                "gte": 2
+              }
+            },
+            "after_restart_ms": 140.38
+          },
+          "created_at": {
+            "total": {
+              "value": 3,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              407.6,
+              141.67,
+              148.41,
+              138.15,
+              139.69
+            ],
+            "median_ms": 141.67,
+            "predicate": {
+              "range": {
+                "path": "/created_at",
+                "gte": 1759241970,
+                "lt": 1759245570
+              }
+            },
+            "after_restart_ms": 153.69
+          },
+          "combined": {
+            "total": {
+              "value": 1,
+              "relation": "exact"
+            },
+            "samples_ms": [
+              149.0,
+              124.44,
+              142.67,
+              141.42,
+              133.24
+            ],
+            "median_ms": 141.42,
+            "predicate": {
+              "bool": {
+                "filter": [
+                  {
+                    "term": {
+                      "path": "/item_type",
+                      "value": "story"
+                    }
+                  },
+                  {
+                    "term": {
+                      "path": "/author",
+                      "value": "harisund1990"
+                    }
+                  },
+                  {
+                    "range": {
+                      "path": "/points",
+                      "gte": 2
+                    }
+                  },
+                  {
+                    "range": {
+                      "path": "/created_at",
+                      "gte": 1759241970,
+                      "lt": 1759245570
+                    }
+                  }
+                ]
+              }
+            },
+            "after_restart_ms": 166.85
+          }
+        },
+        "cold_profile": {
+          "elapsed_ms": 4358.02,
+          "took_ms": 1514,
+          "cpu_ms": 670.0,
+          "network_rx_bytes": 5685895,
+          "network_tx_bytes": 156459
+        },
+        "restart_profile": {
+          "elapsed_ms": 202.51,
+          "took_ms": 26,
+          "cpu_ms": 140.0,
+          "network_rx_bytes": 36653,
+          "network_tx_bytes": 9490
+        },
+        "warm_profile_median": {
+          "elapsed_ms": 152.44,
+          "took_ms": 5,
+          "cpu_ms": 40.0,
+          "network_rx_bytes": 18618,
+          "network_tx_bytes": 9094
+        },
+        "filter_profile_median": {
+          "item_type": {
+            "elapsed_ms": 147.26,
+            "took_ms": 6,
+            "cpu_ms": 40.0,
+            "network_rx_bytes": 18624,
+            "network_tx_bytes": 9094
+          },
+          "author": {
+            "elapsed_ms": 155.93,
+            "took_ms": 6,
+            "cpu_ms": 40.0,
+            "network_rx_bytes": 18617,
+            "network_tx_bytes": 9094
+          },
+          "points": {
+            "elapsed_ms": 156.74,
+            "took_ms": 7,
+            "cpu_ms": 40.0,
+            "network_rx_bytes": 18618,
+            "network_tx_bytes": 9094
+          },
+          "created_at": {
+            "elapsed_ms": 141.67,
+            "took_ms": 9,
+            "cpu_ms": 40.0,
+            "network_rx_bytes": 18522,
+            "network_tx_bytes": 9094
+          },
+          "combined": {
+            "elapsed_ms": 141.42,
+            "took_ms": 11,
+            "cpu_ms": 40.0,
+            "network_rx_bytes": 18521,
+            "network_tx_bytes": 9094
+          }
+        }
+      }
+    ]
+  },
+  "notes": [
+    "Only the unchanged 10k-row raw BigQuery export was qualified; archive/production capacity needs separate validation.",
+    "After cost-aware predicate planning and query-scoped artifact store/publication reuse. Relative work estimates use cardinalities, projected bytes/rows and metadata residency.",
+    "Compare against regional-qualification.json: same GKE node, region, raw export, optimization, pod resource requests and harness; separate temporary pods.",
+    "Counters include pod background/control traffic and overlapping concurrent intervals; they do not trace individual GCS requests.",
+    "Cache cleared before startup; recorded cache_files_before_search can include background files created after startup.",
+    "Exact totals, ranked pages, HN IDs/scores and restart behavior verified by the harness.",
+    "Temporary pod deleted; no IAM, bucket lifecycle or shared workload changes."
+  ]
+}

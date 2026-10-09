@@ -195,3 +195,109 @@ def test_generate_bounds_success_response(monkeypatch: pytest.MonkeyPatch) -> No
     with pytest.raises(AntflyException, match="generation response exceeded 32 bytes"):
         client.generate(generation_request())
     assert stream.closed
+
+
+def decision_request() -> dict:
+    return {
+        "model": "decision-model",
+        "state": "Refund the duplicate charge. 🐜",
+        "questions": {
+            "route": {
+                "type": "choice",
+                "instructions": "Which team?",
+                "criteria": {"billing": "Charges", "support": "Product"},
+            },
+            "urgency": {"type": "score", "instructions": "How urgent?", "criteria": ["Routine", "Soon", "Immediate"]},
+            "refund": {"type": "noul", "instructions": "Refund requested?"},
+        },
+    }
+
+
+def decision_response() -> dict:
+    return {
+        "model": "decision-model",
+        "answers": {
+            "route": {"type": "choice", "choice": "billing", "probabilities": {"billing": 0.9, "support": 0.1}},
+            "urgency": {
+                "type": "score",
+                "score": 1.1,
+                "probabilities": {"0": 0.1, "1": 0.7, "2": 0.2},
+                "legend": {"0": "Routine", "1": "Soon", "2": "Immediate"},
+            },
+            "refund": {"type": "noul", "noul": 0.95},
+        },
+        "usage": {"input_tokens": 20, "output_tokens": 0},
+    }
+
+
+@pytest.mark.parametrize("typed", [False, True])
+def test_decide_preserves_requests_auth_and_all_answer_types(typed: bool) -> None:
+    from antfly.client_generated.models import InferenceDecideRequest, InferenceDecideResponse
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/ai/v1/decide"
+        assert request.headers["authorization"] == "Bearer secret"
+        assert request.headers["accept"] == "application/json"
+        assert json.loads(request.read()) == decision_request()
+        return httpx.Response(200, json=decision_response())
+
+    client = AntflyClient("http://test", token="secret")
+    install_transport(client, httpx.MockTransport(handle))
+    body = InferenceDecideRequest.from_dict(decision_request()) if typed else decision_request()
+    result = client.decide(body)
+    assert isinstance(result, InferenceDecideResponse)
+    assert result.to_dict() == decision_response()
+
+
+@pytest.mark.parametrize(
+    "status,code", [(400, "INVALID_REQUEST"), (404, "MODEL_NOT_FOUND"), (413, "REQUEST_TOO_LARGE")]
+)
+def test_decide_surfaces_api_errors(status: int, code: str) -> None:
+    client = AntflyClient("http://test")
+    install_transport(
+        client, httpx.MockTransport(lambda _: httpx.Response(status, json={"error": code, "message": "detail"}))
+    )
+    with pytest.raises(InferenceAPIError) as caught:
+        client.decide(decision_request())
+    assert caught.value.status_code == status
+    assert caught.value.code == code
+
+
+def test_decide_preserves_capacity_retry_metadata() -> None:
+    client = AntflyClient("http://test")
+    install_transport(
+        client,
+        httpx.MockTransport(
+            lambda _: httpx.Response(
+                503,
+                headers={"Retry-After": "1"},
+                json={
+                    "error": "MODEL_RESOURCE_BUSY",
+                    "message": "busy",
+                    "reason": "inference_capacity",
+                    "retryable": True,
+                    "retry_after_ms": 1000,
+                },
+            )
+        ),
+    )
+    with pytest.raises(InferenceCapacityError) as caught:
+        client.decide(decision_request())
+    assert caught.value.retryable is True
+    assert caught.value.retry_after_ms == 1000
+
+
+@pytest.mark.parametrize("payload", [[], {}, {"model": "m", "answers": None, "usage": {}}])
+def test_decide_rejects_malformed_success_responses(payload) -> None:
+    client = AntflyClient("http://test")
+    install_transport(client, httpx.MockTransport(lambda _: httpx.Response(200, json=payload)))
+    with pytest.raises(AntflyException, match="decision returned invalid JSON"):
+        client.decide(decision_request())
+
+
+def test_decide_bounds_response_bytes() -> None:
+    client = AntflyClient("http://test", max_json_response_bytes=16)
+    install_transport(client, httpx.MockTransport(lambda _: httpx.Response(200, json=decision_response())))
+    with pytest.raises(AntflyException, match="decision response exceeded 16 bytes"):
+        client.decide(decision_request())

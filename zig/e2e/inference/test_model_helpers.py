@@ -58,9 +58,12 @@ def test_server_budget_args_validate_and_preserve_values(monkeypatch):
     ):
         monkeypatch.delenv(env_name, raising=False)
     monkeypatch.setenv("ANTFLY_INFERENCE_HOST_BUDGET_MB", "7000")
+    monkeypatch.setenv("ANTFLY_INFERENCE_PROCESS_MEMORY_BUDGET_MB", "8192")
     monkeypatch.setenv("ANTFLY_INFERENCE_SCRATCH_BUDGET_MB", "0")
 
     assert _server_budget_args() == [
+        "--process-memory-budget-mb",
+        "8192",
         "--host-budget-mb",
         "7000",
         "--scratch-budget-mb",

@@ -117,6 +117,9 @@ detail.
 
 ### Embedded inference without a database
 
+For typed decision requests and answer semantics, see the
+[decision guide](../../../docs/guides/decisions.md).
+
 [`Inference`] opens the same embedded inference runtime on its own, with no
 database -- `Inference::open`/`open_default` (options: [`InferenceOptions`],
 covering models directory, resource budgets, and a per-call timeout) and
@@ -125,7 +128,7 @@ waits for in-flight calls, idempotent, safe from any thread).
 
 Each method mirrors one `/ai/v1` route of the inference HTTP API and takes/
 returns raw JSON bytes: `embed`, `rerank`, `chunk`, `generate`,
-`generate_batch`, `rewrite`, `extract`, `read` (OCR), `transcribe`, and
+`generate_batch`, `rewrite`, `decide`, `extract`, `read` (OCR), `transcribe`, and
 `list_models`. Unlike `Database`'s `*_json` methods, these return
 [`InferenceResult<Vec<u8>>`] on failure: [`InferenceError`] carries both the
 mapped [`Error`] and the runtime's JSON error body
@@ -254,7 +257,7 @@ failing immediately with `Busy`, like `sqlite3_busy_timeout`.
   directly into an empty, already-open handle.
 - `Inference::open`/`open_default` (with [`InferenceOptions`]) open an
   embedded inference runtime with no database; `embed`, `rerank`, `chunk`,
-  `generate`, `generate_batch`, `rewrite`, `extract`, `read`, `transcribe`,
+  `generate`, `generate_batch`, `rewrite`, `decide`, `extract`, `read`, `transcribe`,
   `list_models`, and `pull` mirror the `/ai/v1` inference HTTP API 1:1.
   `generate_stream` streams a generate request chunk by chunk, and both it
   and `pull` accept a callback that can cancel the call by returning

@@ -581,11 +581,13 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_fixture_workspace.py
           tools/test_prune_completed_test_cache.py
+          tools/test_test_cache_lifetime.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
           tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
+          tools/test_capi_exports.py
           tools/test_run_build_cache_contracts.py
           tools/test_run_test_partitions.py
           tools/test_retain_test_process.py
@@ -635,6 +637,9 @@ jobs:
             scripts.test_summarize_cuda_flash_prefill_v2 \
             scripts.gemma4.test_validate_gemma4_cuda_candidate \
             scripts.gemma4.test_validate_gemma4_cuda_quality_candidate
+          python3 -m unittest discover -s scripts/gliner25 -p test_verify_family_contract.py
+          python3 -m unittest discover -s scripts/gliner25 -p test_compare_decide_performance.py
+          python3 scripts/gliner25/format_family_captures.py --check
 
       - name: Run Qwen model parity and promotion contract tests
         working-directory: zig/pkg/inference
@@ -992,11 +997,13 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_fixture_workspace.py
           tools/test_prune_completed_test_cache.py
+          tools/test_test_cache_lifetime.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
           tools/test_audit_unit_test_ownership.py
           tools/test_check_storage_compilation.py
+          tools/test_capi_exports.py
           tools/test_run_build_cache_contracts.py
           tools/test_run_test_partitions.py
           tools/test_retain_test_process.py
@@ -1472,7 +1479,7 @@ jobs:
           fi
           uv run --project e2e/antfly pytest --collect-only -q -p zig_e2e_shard \
             --antfly-ci-plan-output "${RUNNER_TEMP}/e2e-plan/plan.json" \
-            -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not slow" e2e/antfly
+            -m "not objectstore_integration and not standalone_integration and not real_model and not postgres_integration and not iceberg_integration and not slow" e2e/antfly
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: antfly-e2e-plan-${{ github.run_id }}
@@ -2124,6 +2131,7 @@ jobs:
         if: matrix.suite == 'antfly'
         working-directory: zig
         env:
+          ANTFLY_E2E_FULL_LAKE: "1"
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_E2E_PRESERVE_ROOT_ON_FAILURE: "1"
           ANTFLY_E2E_NATIVE_STACKS: "1"

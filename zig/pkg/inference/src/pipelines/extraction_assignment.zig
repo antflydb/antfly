@@ -275,7 +275,7 @@ test "extraction assignment stable ties transpose limits and ownership" {
             defer a.free(empty);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
     try std.testing.expectError(error.InvalidAssignmentCost, solve(std.testing.allocator, &.{std.math.nan(f64)}, 1, 1, .{}));
     try std.testing.expectError(error.ExtractionAssignmentLimitExceeded, solve(std.testing.allocator, &.{1}, 1, 1, .{ .max_work = 0 }));
 }

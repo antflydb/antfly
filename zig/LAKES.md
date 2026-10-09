@@ -1,5 +1,8 @@
 # Lake Query Mode
 
+The remote index lifecycle, persistent cache tiers, SQL materialization matching,
+and public status/explain contract are specified in [REMOTE_TABLE_SERVING.md](REMOTE_TABLE_SERVING.md).
+
 Antfly relational mode makes typed rows first-class while keeping JSON as a
 document-backed column type. Lake query mode extends that contract to files
 owned by users in object storage: Parquet datasets, Iceberg tables, and later
@@ -130,7 +133,45 @@ lanes and enough work to amortize scheduling. Larger external sorts build one ru
 in the background while ingesting the next; partitioned joins prepare independent
 builds ahead of probing. Small budgets retain inline paths. Parallel operators
 share synchronized statement allocation, disk quotas and task admission, and join
-workers before releasing their buffers or snapshots.
+workers before releasing their buffers or snapshots. PostgreSQL connection and
+cursor budgets serialize admission and reclamation across these workers.
+
+Ordered parallel scans transfer reference-counted projected column blocks to
+consumers without a row queue or a second retained copy. Delivery pages borrow
+bounded spans of those blocks. Two scheduler workers process up to sixteen
+contiguous ranges in order, with at most two retained blocks per worker. Provider
+metadata estimates reduce fanout before snapshots are cloned, reserving workspace
+for decoding and output. Credits
+follow the final delivery lease, so later ranges overlap without unbounded
+lookahead. Typed projections admit columns directly and reserve row/error metadata
+before publication; an allocation failure cannot expose a partially described row.
+Consumer admission counts scan work in source order, including filtered and OFFSET
+rows. Simple native scan page quotas count logical execution-sized row units,
+independently of physical row-group boundaries or range fragmentation; empty backend
+pulls still cost one unit. Speculative later ranges do not spend the quota needed to satisfy LIMIT. Projection failures on skipped
+rows or beyond LIMIT remain unobserved, while predicate failures and required
+projection failures retain their successful prefixes. Small LIMITs and memory
+budgets continue to use the serial path.
+
+Streaming relational cursors retain a statement spill manager until their joins
+and workers close, so memory pressure can trigger partition spilling during paged
+delivery as well as blocking execution.
+
+Partition join and native group workers deliver retained column leases through the
+same bounded batch contract. Native group keys and aggregate results remain columns
+through HAVING and final expression kernels; scalar materialization is confined to
+unsupported expressions, general sorted reducers and result boundaries. Exact
+partial sums retain their full i128 interchange until final SQL narrowing. Leases
+can outlive producer/pipe teardown, while their statement allocator stays alive.
+
+Numeric join/group keys hash finite integers and floats through their exact
+normalized dyadic representation, avoiding wide decimal conversion in the hot
+path. Exact JSON decimal tokens retain equality with primitive keys only when
+their values are equal without rounding. Window column caches admit an active
+column set under bounded metadata and payload budgets, avoiding repeated block
+decoding during wide row projection. Iceberg position-delete offsets are built
+once per request/file plan and shared by that plan's scan workers; cached delete
+membership remains immutable.
 
 ## Relationship To Arrow, Parquet, Iceberg, And Lance
 

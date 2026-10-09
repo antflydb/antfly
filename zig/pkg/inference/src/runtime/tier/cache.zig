@@ -321,6 +321,19 @@ pub const SharedCache = struct {
         binding.deinit();
     }
 
+    /// Admission credits owned by physical cache bytes above the session's
+    /// resident model baseline. The binding lock makes this an exact ownership
+    /// snapshot suitable for idle-domain conservation checks.
+    pub fn admissionAmounts(self: *SharedCache) memory.AdmissionAmounts {
+        const binding = self.admission orelse return .{};
+        binding.lock();
+        defer binding.mutex.unlock();
+        return .{
+            .host_weight_bytes = binding.host_credited_bytes,
+            .backend_weight_bytes = binding.backend_credited_bytes,
+        };
+    }
+
     pub fn isOverBudget(self: *const SharedCache, tier: ResidencyTier) bool {
         return switch (tier) {
             .disk => false,
@@ -479,13 +492,16 @@ test "serving cache growth leases only bytes beyond model baseline" {
         limits,
         .{ .host_limit_bytes = 100 },
     );
-    defer cache.deinitAdmission();
+    errdefer cache.deinitAdmission();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, cache.admissionAmounts());
 
     try cache.reserve(.host, 80);
     try std.testing.expectEqual(@as(usize, 100), controller.snapshot().host_weight_bytes);
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, cache.admissionAmounts());
 
     try cache.reserve(.host, 30);
     try std.testing.expectEqual(@as(usize, 110), controller.snapshot().host_weight_bytes);
+    try std.testing.expectEqual(memory.AdmissionAmounts{ .host_weight_bytes = 10 }, cache.admissionAmounts());
 
     // The request fits the configured policy in isolation, but not alongside
     // the currently resident model and cache credit, so callers may retry it
@@ -493,11 +509,15 @@ test "serving cache growth leases only bytes beyond model baseline" {
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, cache.reserve(.host, 20));
     try std.testing.expectEqual(@as(usize, 110), cache.host_bytes);
     try std.testing.expectEqual(@as(usize, 110), controller.snapshot().host_weight_bytes);
+    try std.testing.expectEqual(memory.AdmissionAmounts{ .host_weight_bytes = 10 }, cache.admissionAmounts());
 
     cache.noteRelease(.host, 30);
     try std.testing.expectEqual(@as(usize, 80), cache.host_bytes);
     try std.testing.expectEqual(@as(usize, 100), controller.snapshot().host_weight_bytes);
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, cache.admissionAmounts());
     cache.noteRelease(.host, 80);
+    cache.deinitAdmission();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, cache.admissionAmounts());
 }
 
 test "serving cache preserves retryable live-pressure denial" {

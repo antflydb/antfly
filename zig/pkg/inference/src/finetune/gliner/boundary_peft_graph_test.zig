@@ -259,5 +259,5 @@ test "GLiNER2.5 PEFT graph and parameter initialization release every allocation
     defer graph.deinit();
     var b = ml.Builder.init(&graph);
     _ = try buildToy(&b);
-    try std.testing.checkAllAllocationFailures(a, allocationFailure, .{&graph});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, allocationFailure, .{&graph});
 }

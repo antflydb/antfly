@@ -1,8 +1,10 @@
 # Laya typed decisions
 
 Laya models answer classification questions without generating text. Antfly serves
-prepared Laya checkpoints through `/ai/v1/extract` with `schema_version: 2` and
-extraction provider `antfly`. They appear under extractors in model discovery.
+prepared Laya checkpoints through `/ai/v1/decide` using the model-independent
+[typed decision contract](decisions.md). They appear under deciders in model
+discovery and also support `/ai/v1/extract` with `schema_version: 2` and
+extraction provider `antfly`.
 
 Prepare a checkpoint from a local upstream download, or from a pinned Hugging
 Face revision:
@@ -26,7 +28,46 @@ internal batches. The English checkpoint was validated on NVIDIA L4 using fatbin
 artifacts. Portable PTX requires a driver compatible with the CUDA toolkit used
 to generate it.
 
-Submit a text request to the server's AI endpoint:
+For decisions, submit the following to `/ai/v1/decide` (or pass the same JSON to
+`antfly_inference_decide_json` / Rust `Inference::decide`):
+
+```json
+{
+  "model": "laya",
+  "state": "Find the document about refunds.",
+  "questions": {
+    "tool": {
+      "type": "choice",
+      "instructions": "Which tool should handle the request?",
+      "criteria": {
+        "search": "Find documents matching a topic",
+        "fetch_document": "Retrieve a document with a known ID",
+        "no_tool": "Respond without a tool"
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "How urgent is this request?",
+      "criteria": ["Routine", "Soon", "Immediate"]
+    },
+    "tool_needed": {
+      "type": "noul",
+      "instructions": "Answering requires retrieving external information."
+    }
+  }
+}
+```
+
+The response has named `answers`: `choice` and its distribution, an expected
+zero-based `score` with its distribution and legend, and the `noul` true
+probability. See the [decision guide](decisions.md) for HTTP command hooks,
+embedded inference, and SQL providers.
+
+## Extraction compatibility
+
+The extraction form remains available at `/ai/v1/extract` for callers using
+classification schemas and extraction metadata:
+
 
 ```json
 {

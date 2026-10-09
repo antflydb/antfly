@@ -1850,6 +1850,7 @@ pub const SearchRequest = struct {
     query: Query = .{ .match_all = {} },
     index_name: ?[]const u8 = null,
     primary_text_index_name: ?[]const u8 = null,
+    remote_snapshot: ?[]const u8 = null,
     aggregations_json: []const u8 = "",
     count_only: bool = false,
     profile: bool = false,
@@ -1938,6 +1939,8 @@ pub const SearchRequest = struct {
     // Internal text-index execution hook. This is request-local state used to
     // avoid converting text-native doc nums through shard ordinals and back.
     resolved_text_doc_filter: ?*const anyopaque = null,
+    /// Request-local native metadata membership, never serialized to workers.
+    native_key_predicate: ?struct { ptr: *anyopaque, allows: *const fn (*anyopaque, []const u8) anyerror!bool } = null,
     resolved_doc_filter_owned: bool = false,
     resolved_doc_filter_wire_context: ?ResolvedDocFilterWireContext = null,
     /// Request-local authorization hook used only by the distributed graph
@@ -2015,6 +2018,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "query",
     "index_name",
     "primary_text_index_name",
+    "remote_snapshot",
     "aggregations_json",
     "count_only",
     "profile",
@@ -2056,6 +2060,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "filter_ids",
     "exclude_ids",
     "resolved_text_doc_filter",
+    "native_key_predicate",
     "graph_table_read_authorizer",
     "require_algebraic_filter_resolution",
     "distributed_text_stats",
@@ -2478,6 +2483,9 @@ pub const GraphMetricRerankScoreDetails = struct {
     }
 };
 
+pub const ColumnSource = @import("column_source.zig").Row;
+pub const ColumnSourcePage = @import("column_source.zig").Page;
+
 pub const SearchHit = struct {
     computed_json: ?[]u8 = null,
     id: []u8,
@@ -2495,6 +2503,13 @@ pub const SearchHit = struct {
     index_scores: []fusion_mod.IndexScore = &.{},
     sort_values: []std.json.Value = &.{},
     stored_data: ?[]u8 = null,
+    /// Owned typed source for providers that hydrate after source-dependent
+    /// ranking/filtering. Highlighting and public projection consume this
+    /// directly; encoding happens once at the response boundary. Providers
+    /// populate one of this, stored_data, or column_source.
+    source_value: ?std.json.Value = null,
+    /// Shared immutable vectors hydrated only after final ranking and movement.
+    column_source: ?ColumnSource = null,
     ancestor_source_data: ?[]u8 = null,
     ancestor_unit_data: ?[]u8 = null,
     artifact_ref: ?ArtifactRef = null,
@@ -2513,6 +2528,8 @@ pub const SearchHit = struct {
             freeIndexScores(alloc, cloned.index_scores);
             freeJsonValues(alloc, cloned.sort_values);
             if (cloned.stored_data) |data| alloc.free(data);
+            if (cloned.source_value) |*value| deinitJsonValue(alloc, value);
+            if (cloned.column_source) |source| source.deinit();
             if (cloned.ancestor_source_data) |data| alloc.free(data);
             if (cloned.ancestor_unit_data) |data| alloc.free(data);
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
@@ -2528,6 +2545,8 @@ pub const SearchHit = struct {
         cloned.index_scores = try cloneIndexScores(alloc, self.index_scores);
         cloned.sort_values = try cloneJsonValues(alloc, self.sort_values);
         cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.source_value = if (self.source_value) |value| try cloneJsonValue(alloc, value) else null;
+        cloned.column_source = if (self.column_source) |source| try source.cloneInto(alloc) else null;
         cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
         cloned.ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null;
         cloned.artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
@@ -2557,6 +2576,8 @@ pub const SearchHit = struct {
         freeIndexScores(alloc, self.index_scores);
         freeJsonValues(alloc, self.sort_values);
         if (self.stored_data) |data| alloc.free(data);
+        if (self.source_value) |*value| deinitJsonValue(alloc, value);
+        if (self.column_source) |source| source.deinit();
         if (self.ancestor_source_data) |data| alloc.free(data);
         if (self.ancestor_unit_data) |data| alloc.free(data);
         if (self.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);

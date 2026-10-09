@@ -259,6 +259,13 @@ pub fn appendEqualityColumnPart(alloc: Allocator, out: *std.ArrayListUnmanaged(u
             std.mem.writeInt(i64, &bytes, values[row], .little);
             try out.appendSlice(alloc, &bytes);
         },
+        .dictionary_i64 => |values| {
+            try out.append(alloc, 2);
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(i64, &bytes, values.at(row), .little);
+            try out.appendSlice(alloc, &bytes);
+        },
+        .dictionary_f64 => |values| try appendF64EqualityKeyPart(alloc, out, values.at(row)),
         .f64 => |values| try appendF64EqualityKeyPart(alloc, out, values[row]),
         .bool => |values| {
             try out.append(alloc, 4);

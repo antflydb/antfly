@@ -19,6 +19,7 @@ pub const AggregationRange = types.AggregationRange;
 pub const AggregationRequest = types.AggregationRequest;
 pub const AggregationResult = types.AggregationResult;
 pub const AggregationType = types.AggregationType;
+pub const AlgebraicAggregateConfig = types.AlgebraicAggregateConfig;
 pub const AlgebraicAggregationJoin = types.AlgebraicAggregationJoin;
 pub const AlgebraicIndexConfig = types.AlgebraicIndexConfig;
 pub const AlgebraicIndexStats = types.AlgebraicIndexStats;

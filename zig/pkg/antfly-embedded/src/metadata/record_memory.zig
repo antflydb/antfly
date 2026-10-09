@@ -16,6 +16,7 @@
 const std = @import("std");
 const records = @import("../common/topology_records.zig");
 pub fn freeTable(alloc: std.mem.Allocator, record: records.TableRecord) void {
+    alloc.free(record.lake_index_catalog_json);
     if (record.storage_migration) |migration| alloc.free(migration.request.job_id);
     alloc.free(record.relational_retirement_json);
     alloc.free(record.name);

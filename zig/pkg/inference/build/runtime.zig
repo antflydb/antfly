@@ -199,6 +199,7 @@ pub fn create(config: Config) Graph {
     const regex_mod = shared.regex orelse blk: {
         const mod = createSharedModule(config, "lib/regex/src/mod.zig");
         mod.addImport("antfly_fst", fst_mod);
+        mod.addImport("antfly_platform", platform_mod);
         break :blk mod;
     };
     const jsonschema_mod = shared.jsonschema orelse blk: {

@@ -613,7 +613,7 @@ test "serverless graph filtered cursors lazily coalesce canonical type runs" {
         try std.testing.expectEqual(@as(usize, 0), eager_work);
         try std.testing.expectEqual(@as(usize, 1024), if (incoming) eager.in_edges.len else eager.out_edges.len);
     }
-    try std.testing.checkAllAllocationFailures(a, exerciseIndexedCursor, .{ payload, source });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseIndexedCursor, .{ payload, source });
     const hub = (try reader.row("hub")).?;
     const entry_offset: usize = @intCast(hub.runs[0].offset);
     payload[entry_offset] ^= 1;
@@ -755,7 +755,7 @@ test "serverless graph paged adjacency preserves lookup semantics budgets and al
     var source = refs.ArtifactRef{ .kind = .graph_segment, .name = "g", .artifact_id = id, .checksum = &checksum, .byte_len = payload.len };
     try wire.bindTopologyControl(&source, payload);
     try exerciseReader(alloc, payload, source);
-    try std.testing.checkAllAllocationFailures(alloc, exerciseReader, .{ payload, source });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, exerciseReader, .{ payload, source });
 
     var memory = TestStore{ .payload = payload };
     var store = artifacts.ArtifactStore{ .allocator = alloc, .ptr = &memory, .vtable = &TestStore.vtable };

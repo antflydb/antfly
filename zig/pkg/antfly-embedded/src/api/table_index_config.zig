@@ -86,7 +86,6 @@ pub fn validateIndexConfigWithOptions(
     if (cfg.kind == .algebraic) {
         var parsed = std.json.parseFromSlice(algebraic.index.Config, alloc, cfg.config_json, .{
             .allocate = .alloc_always,
-            .ignore_unknown_fields = true,
         }) catch return error.InvalidCreateTableRequest;
         defer parsed.deinit();
         algebraic.index.validateConfig(parsed.value) catch return error.InvalidCreateTableRequest;
@@ -201,6 +200,7 @@ pub fn isCatalogMetadataField(kind: db_types.IndexKind, field: []const u8) bool 
         std.mem.eql(u8, field, "validation") or
         std.mem.eql(u8, field, "enrichments") or
         std.mem.eql(u8, field, "derive_from_schema") or
+        (kind == .algebraic and std.mem.eql(u8, field, "aggregates")) or
         std.mem.eql(u8, field, coverage_policy_mod.incarnation_field) or
         std.mem.eql(u8, field, coverage_policy_mod.legacy_coverage_incarnation_field))
     {

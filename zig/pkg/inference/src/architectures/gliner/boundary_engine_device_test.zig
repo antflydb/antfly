@@ -67,7 +67,7 @@ test "gliner boundary device encoder admission and failed allocation cleanup" {
     vt.backendKind = MissingDevice.kind;
     vt.glinerBoundaryDevice = MissingDevice.execute;
     cb.vtable = &vt;
-    try std.testing.checkAllAllocationFailures(a, MissingDevice.check, .{ &cb, &config, &prepared });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, MissingDevice.check, .{ &cb, &config, &prepared });
     const Cancel = struct {
         fn check(_: ?*anyopaque) anyerror!void {
             return error.Cancelled;

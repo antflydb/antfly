@@ -449,7 +449,7 @@ test "gliner boundary records solve exclusive fields globally and preserve natur
             try std.testing.expectEqual(@as(usize, 14), second.fields[2].values[0].span.start);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "gliner boundary records deduplicate latent seeds after assignment and enforce output limits" {
@@ -643,7 +643,7 @@ test "gliner boundary records streaming preserves complete global assignments an
             try std.testing.expectEqual(@as(usize, 1), result.records[0].fields[0].values[0].span.start);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
     try std.testing.expectError(error.ExtractionRecordLimitExceeded, decode(std.testing.allocator, streaming_exclusive_group, .{ .max_output_values = 6 }));
 }
 

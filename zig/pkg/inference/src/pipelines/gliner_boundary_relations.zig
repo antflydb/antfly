@@ -168,7 +168,7 @@ test "gliner boundary relation proposals preserve typed ranking self exclusion a
             try std.testing.expectEqual(@as(usize, 1), pairs[0].tail_query);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 pub const Mention = struct { text: []const u8, start: usize, end: usize };
@@ -420,5 +420,5 @@ test "gliner boundary relation semantic Unicode folding and allocation cleanup" 
             try std.testing.expectEqual(@as(usize, 90), result.edges[0].head.start);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

@@ -22,7 +22,13 @@ const std = @import("std");
 pub const TableRecord = struct {
     /// Internal metadata lifecycle intent; never accepted as public schema.
     relational_retirement_json: []const u8 = "",
+    /// Native, CAS-published generations over authorized external lake sources.
+    /// Internal control-plane state; never a user-supplied index configuration.
+    lake_index_catalog_json: []const u8 = "",
     storage: @import("table_storage.zig").Settings = .{},
+    /// Durable incarnation fence for native object-backed WAL and artifacts.
+    object_storage_generation: u64 = 0,
+    object_storage_identity: [32]u8 = @splat(0),
     storage_migration: ?@import("vector_migration.zig").Admission = null,
     table_id: u64,
     name: []const u8,
@@ -37,10 +43,22 @@ pub const TableRecord = struct {
     desired_replica_count: u16 = 3,
     min_ranges: u32 = 1,
 
+    pub fn jsonStringify(self: TableRecord, jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(TableRecord).@"struct".field_names) |field_name| {
+            const object_field = comptime std.mem.eql(u8, field_name, "object_storage_generation") or std.mem.eql(u8, field_name, "object_storage_identity");
+            if ((!object_field or self.storage.engine == .object) and (!std.mem.eql(u8, field_name, "lake_index_catalog_json") or self.lake_index_catalog_json.len != 0)) {
+                try jw.objectField(field_name);
+                try jw.write(@field(self, field_name));
+            }
+        }
+        try jw.endObject();
+    }
+
     /// Default legacy tables retain their exact durable record bytes. Storage
     /// ownership or an admitted migration requires the versioned extension.
     pub fn requiresStorageMetadataExtension(self: TableRecord) bool {
-        return self.storage.dense_embeddings != .primary_lsm or self.storage_migration != null;
+        return self.storage.engine != .local or self.storage.dense_embeddings != .primary_lsm or self.storage_migration != null;
     }
 
     pub fn migrationState(self: *const TableRecord) TableMigrationState {

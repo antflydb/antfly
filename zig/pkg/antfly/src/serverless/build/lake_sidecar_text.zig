@@ -231,9 +231,10 @@ fn appendBatchText(
 ) !usize {
     var posting_count: usize = 0;
     switch (column.values) {
-        .bytes => |values| {
-            for (values, 0..) |value, row| {
+        .bytes, .dictionary_bytes => {
+            for (0..column.rowCount()) |row| {
                 if (column.nulls.isNull(row)) continue;
+                const value = try column.bytesAt(row);
                 posting_count = std.math.add(usize, posting_count, try appendDocument(alloc, docs, term_map, batch.row_refs[row], value)) catch
                     return error.LakeSidecarBuildBudgetExceeded;
             }
@@ -743,4 +744,29 @@ fn findTerm(terms: []const text_segment.TermEntry, term: []const u8) ?text_segme
         if (std.mem.eql(u8, entry.term, term)) return entry;
     }
     return null;
+}
+
+test "external lake text publication treats dictionaries as logical bytes" {
+    const a = std.testing.allocator;
+    const external_binding: external_rowsource.Binding = .{ .format = .parquet, .source_id = "events", .source_uri = "file:///lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema" };
+    const refs = [_]rowsource.RowRef{
+        try external_rowsource.makeRowRef(external_binding, "part", 0, 0),
+        try external_rowsource.makeRowRef(external_binding, "part", 0, 1),
+        try external_rowsource.makeRowRef(external_binding, "part", 0, 2),
+        try external_rowsource.makeRowRef(external_binding, "part", 0, 3),
+    };
+    const binding = source_binding.bindingFromSnapshot(.text, .external_parquet, external_binding.snapshot(), external_binding.schema_fingerprint, &.{"body"}, "text-config");
+    var flat: ?[]u8 = null;
+    defer if (flat) |bytes| a.free(bytes);
+    for ([_]rowsource.ColumnValues{
+        .{ .bytes = &.{ "repeat word", "other word", "repeat word", "" } },
+        .{ .dictionary_bytes = .{ .values = &.{ "repeat word", "other word" }, .indices = &.{ 0, 1, 0, 99 } } },
+    }) |values| {
+        const columns = [_]rowsource.ColumnVector{.{ .name = "body", .values = values, .nulls = .{ .bytes = &.{ 0, 0, 0, 1 } } }};
+        const batches = [_]rowsource.ColumnBatch{.{ .snapshot = external_binding.snapshot(), .row_refs = &refs, .columns = &columns }};
+        var input = try external_rowsource.BatchSource.init(external_binding, &batches);
+        var result = try buildTextSidecarFromRowSourceAlloc(a, input.rowSource(), binding, .{ .name = "body_text", .text_column = "body" });
+        defer result.deinit(a);
+        if (flat) |bytes| try std.testing.expectEqualSlices(u8, bytes, result.payload) else flat = try a.dupe(u8, result.payload);
+    }
 }

@@ -22,6 +22,11 @@ const head_coordination = @import("../head_coordination.zig");
 const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
 const object_store_support = @import("antfly_local_sources").serverless_object_store_support;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
+
+fn transportCancellationRequested(raw: *const anyopaque) bool {
+    const cancellation: *const CancellationToken = @ptrCast(@alignCast(raw));
+    return cancellation.isCancelled();
+}
 const work_lease = @import("../build/work_lease.zig");
 const ObjectWorkLeaseStore = @import("../build/object_work_lease_store.zig").ObjectWorkLeaseStore;
 
@@ -157,9 +162,13 @@ pub const ObjectProgressStore = struct {
     }
 
     pub fn getHead(self: *ObjectProgressStore, namespace: []const u8) !u64 {
+        return self.getHeadWithCancellation(namespace, .none);
+    }
+
+    pub fn getHeadWithCancellation(self: *ObjectProgressStore, namespace: []const u8, cancellation: CancellationToken) !u64 {
         const key = try keyAlloc(self.alloc, self.prefix, namespace, "HEAD");
         defer self.alloc.free(key);
-        var current = (try self.tryReadHeadCurrentMaybeEtag(key, false)) orelse return error.FileNotFound;
+        var current = (try self.tryReadHeadCurrentMaybeEtagWithCancellation(key, false, cancellation)) orelse return error.FileNotFound;
         defer current.deinit(self.alloc);
         if (current.record.head_version == 0) return error.FileNotFound;
         return current.record.head_version;
@@ -561,7 +570,11 @@ pub const ObjectProgressStore = struct {
     }
 
     fn tryReadHeadCurrentMaybeEtag(self: *ObjectProgressStore, key: []const u8, require_etag: bool) !?CurrentHead {
-        var result = self.client.getObject(self.bucket, key, .{}) catch |err| switch (err) {
+        return self.tryReadHeadCurrentMaybeEtagWithCancellation(key, require_etag, .none);
+    }
+
+    fn tryReadHeadCurrentMaybeEtagWithCancellation(self: *ObjectProgressStore, key: []const u8, require_etag: bool, cancellation: CancellationToken) !?CurrentHead {
+        var result = self.client.getObject(self.bucket, key, .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = transportCancellationRequested } }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -571,10 +584,10 @@ pub const ObjectProgressStore = struct {
         // same body. Some adapters omit it from GET; a bare STAT would race
         // publication, so read again conditionally before trusting its ETag.
         if (require_etag and result.metadata.etag == null) {
-            var metadata = try self.client.statObject(self.bucket, key);
+            var metadata = try self.client.statObjectWithOptions(self.bucket, key, .{ .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = transportCancellationRequested } });
             defer metadata.deinit(self.alloc);
             const etag = metadata.etag orelse return error.MissingObjectEtag;
-            var verified = try self.client.getObject(self.bucket, key, .{ .if_match_etag = etag });
+            var verified = try self.client.getObject(self.bucket, key, .{ .if_match_etag = etag, .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = transportCancellationRequested } });
             errdefer verified.deinit(self.alloc);
             if (verified.metadata.etag) |actual| {
                 if (!std.mem.eql(u8, actual, etag)) return error.PreconditionFailed;
@@ -655,6 +668,7 @@ pub const ObjectProgressStore = struct {
         .work_lease_provider = erasedWorkLeaseProvider,
         .deinit = erasedDeinit,
         .get_head = erasedGetHead,
+        .get_head_with_cancellation = erasedGetHeadWithCancellation,
         .compare_and_swap_head = erasedCompareAndSwapHead,
         .compare_and_swap_head_fenced = erasedCompareAndSwapHeadFenced,
         .get_gc_watermark = erasedGetGcWatermark,
@@ -731,6 +745,11 @@ pub const ObjectProgressStore = struct {
     fn erasedGetHead(ptr: *anyopaque, namespace: []const u8) !u64 {
         const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
         return try self.getHead(namespace);
+    }
+
+    fn erasedGetHeadWithCancellation(ptr: *anyopaque, namespace: []const u8, cancellation: CancellationToken) !u64 {
+        const self: *ObjectProgressStore = @ptrCast(@alignCast(ptr));
+        return self.getHeadWithCancellation(namespace, cancellation);
     }
 
     fn erasedCompareAndSwapHead(ptr: *anyopaque, namespace: []const u8, expected: ?u64, version: u64) !bool {
@@ -1126,4 +1145,30 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "serverless object HEAD reads carry deadline checkpoints into the client" {
+    const Fixture = struct {
+        expired: bool = false,
+        reads: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.expired) return error.DeadlineExceeded;
+        }
+        fn get(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, options: objectstore.GetOptions) !objectstore.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            const cancellation = options.cancellation orelse return error.MissingRequestDeadline;
+            self.expired = true;
+            try cancellation.check();
+            return error.ExpectedDeadlineExceeded;
+        }
+    };
+    var fixture: Fixture = .{};
+    var client_vtable: objectstore.Client.VTable = undefined;
+    client_vtable.get_object = Fixture.get;
+    var store: ObjectProgressStore = .{ .alloc = std.testing.allocator, .client = .{ .allocator = std.testing.allocator, .ptr = &fixture, .vtable = &client_vtable }, .bucket = @constCast("test"), .prefix = @constCast(""), .owns_client = false };
+    var progress = store.progressStore();
+    try std.testing.expectError(error.DeadlineExceeded, progress.getHeadWithCancellation("docs", .{ .ptr = &fixture, .check_fn = Fixture.check }));
+    try std.testing.expectEqual(@as(usize, 1), fixture.reads);
 }

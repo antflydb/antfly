@@ -542,7 +542,7 @@ antfly_error_code antfly_db_match_pattern_json(antfly_db *db, antfly_slice reque
  * use and stay cached until the handle closes. Each call takes the request
  * JSON and returns the response JSON of the matching /ai/v1 route of the
  * Antfly inference HTTP API (see specs/openapi/inference/api.yaml): embed,
- * rerank, chunk, generate, generate/batch, rewrite, extract, read (OCR),
+ * rerank, chunk, generate, generate/batch, rewrite, decide, extract, read (OCR),
  * transcribe, and models. Binary inputs such as images and audio are passed inline, as base64
  * or data: URIs. The _json calls return complete responses: a generate
  * request with "stream": true fails with ANTFLY_INVALID_ARGUMENT; use
@@ -632,6 +632,9 @@ antfly_error_code antfly_inference_generate_stream_json(
  * are reported in the response. */
 antfly_error_code antfly_inference_generate_batch_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_rewrite_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
+/* Named choice, ordinal score, and Boolean questions. Uses DecideRequest and
+ * DecideResponse from specs/openapi/inference/api.yaml; no database required. */
+antfly_error_code antfly_inference_decide_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_extract_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_read_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);
 antfly_error_code antfly_inference_transcribe_json(antfly_inference *inference, antfly_slice request_json, antfly_buffer *out);

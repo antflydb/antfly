@@ -149,7 +149,9 @@ const ForwardScoreEntry = struct {
     doc_id: ?[]u8,
 };
 
+pub const KeyPredicate = struct { ptr: *anyopaque, allows: *const fn (*anyopaque, []const u8) anyerror!bool };
 pub const SearchConstraints = struct {
+    key_predicate: ?KeyPredicate = null,
     filter_doc_ids: []const []const u8 = &.{},
     exclude_doc_ids: []const []const u8 = &.{},
     filter_doc_nums: []const u32 = &.{},
@@ -3497,7 +3499,7 @@ pub const SparseIndex = struct {
         defer direct_exclude_doc_nums.deinit(alloc);
         if (profile_enabled) profile.filter_resolve_ns = nowNs() - filter_start_ns;
 
-        if (try self.maybeSearchFilterDriven(
+        if (constraints.key_predicate == null) if (try self.maybeSearchFilterDriven(
             alloc,
             &txn,
             query_vec,
@@ -3534,7 +3536,7 @@ pub const SparseIndex = struct {
                 );
             }
             return results;
-        }
+        };
 
         // Accumulate scores: docNum → score
         var scores = std.AutoHashMapUnmanaged(u32, f32).empty;
@@ -3542,6 +3544,16 @@ pub const SparseIndex = struct {
         var incarnations: IncarnationCache = .{};
         defer incarnations.deinit(alloc);
 
+        // Point-seek the native reverse identity only for postings reached by
+        // this query. Cache compressed decisions across terms; bulk publication
+        // already persists reverse keys, so no corpus dictionary pass is needed.
+        const Decisions = struct {
+            allowed: @import("../encoding/roaring.zig").RoaringBitmap,
+            denied: @import("../encoding/roaring.zig").RoaringBitmap,
+        };
+        var decisions: Decisions = .{ .allowed = .init(alloc), .denied = .init(alloc) };
+        defer decisions.allowed.deinit();
+        defer decisions.denied.deinit();
         const ScoreSource = enum { segment, delta };
         const AccumulateContext = struct {
             alloc: Allocator,
@@ -3558,6 +3570,9 @@ pub const SparseIndex = struct {
             profile: ?*SearchProfile,
             source: ScoreSource,
             cancellation: ?CancellationToken,
+            key_predicate: ?KeyPredicate,
+            index: *SparseIndex,
+            decisions: *Decisions,
 
             fn visit(ctx: *@This(), decoded: DecodedChunk) !void {
                 const collect_start_ns = if (ctx.profile != null) nowNs() else 0;
@@ -3568,6 +3583,19 @@ pub const SparseIndex = struct {
                     if (ctx.exclude_doc_nums.contains(doc_num)) continue;
                     if (ctx.direct_exclude_doc_nums.contains(doc_num)) continue;
                     if (ctx.segment_id) |id| if (!try ctx.incarnations.matches(ctx.alloc, ctx.txn, id, ctx.segment_version, doc_num)) continue;
+                    if (ctx.key_predicate) |predicate| if (!ctx.decisions.allowed.contains(doc_num)) {
+                        if (ctx.decisions.denied.contains(doc_num)) continue;
+                        const id = ctx.index.resolveDocIdByDocNum(ctx.alloc, ctx.txn, doc_num) catch |err| switch (err) {
+                            error.NotFound => continue,
+                            else => return err,
+                        };
+                        defer ctx.alloc.free(id);
+                        if (!try predicate.allows(predicate.ptr, id)) {
+                            try ctx.decisions.denied.add(doc_num);
+                            continue;
+                        }
+                        try ctx.decisions.allowed.add(doc_num);
+                    };
                     const doc_weight = decoded.weights[di];
                     const gop = try ctx.scores.getOrPut(ctx.alloc, doc_num);
                     if (!gop.found_existing) gop.value_ptr.* = 0;
@@ -3609,6 +3637,9 @@ pub const SparseIndex = struct {
                     .profile = if (profile_enabled) &profile else null,
                     .source = .segment,
                     .cancellation = constraints.cancellation,
+                    .key_predicate = constraints.key_predicate,
+                    .index = self,
+                    .decisions = &decisions,
                 };
                 const segment_decode_start_ns = if (profile_enabled) nowNs() else 0;
                 try forEachSegmentChunk(alloc, segment_entry.value, term_id, &ctx, AccumulateContext.visit);
@@ -3653,6 +3684,9 @@ pub const SparseIndex = struct {
                     .profile = if (profile_enabled) &profile else null,
                     .source = .delta,
                     .cancellation = constraints.cancellation,
+                    .key_predicate = constraints.key_predicate,
+                    .index = self,
+                    .decisions = &decisions,
                 };
                 try AccumulateContext.visit(&ctx, decoded);
                 if (profile_enabled) profile.delta_chunk_ns += nowNs() - delta_start_ns;
@@ -5231,6 +5265,36 @@ test "sparse constrained search filters before top-k ranking" {
 
     try std.testing.expectEqual(@as(usize, 1), filtered.len);
     try std.testing.expectEqualStrings("doc:b", filtered[0].doc_id);
+}
+
+test "external lake sparse native key membership is applied before top-k and propagates callback errors" {
+    const alloc = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "native-key-predicate");
+    defer cleanupTmp(path);
+    var idx = try SparseIndex.open(alloc, path, .{});
+    defer idx.close();
+    const writes = [_]SparseWrite{
+        .{ .doc_id = "high", .vec = .{ .indices = &.{1}, .values = &.{10} } },
+        .{ .doc_id = "low", .vec = .{ .indices = &.{1}, .values = &.{1} } },
+    };
+    const Predicate = struct {
+        fail: bool = false,
+        fn allows(raw: *anyopaque, key: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.Cancelled;
+            return std.mem.eql(u8, key, "low");
+        }
+    };
+    var predicate: Predicate = .{};
+    try idx.batchWithOptions(&writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+    const result = try idx.searchConstrained(alloc, &query, 1, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows } });
+    defer SparseIndex.freeResults(alloc, result);
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("low", result[0].doc_id);
+    predicate.fail = true;
+    try std.testing.expectError(error.Cancelled, idx.searchConstrained(alloc, &query, 1, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows } }));
 }
 
 test "sparse search supports caller supplied ordinal doc nums" {

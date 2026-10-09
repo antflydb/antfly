@@ -373,7 +373,7 @@ test "seeded device transaction failures after mutation and every dispatch prese
     const count = try exercise(std.testing.allocator, null, false, null);
     for (1..count + 1) |index| try std.testing.expectError(error.InjectedDeviceFailure, exercise(std.testing.allocator, index, false, null));
     try std.testing.expectError(error.InjectedDeviceFailure, exercise(std.testing.allocator, null, true, null));
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseAllocation, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseAllocation, .{});
 }
 
 test "seeded device transaction cancellation checks both controls and releases all private buffers" {

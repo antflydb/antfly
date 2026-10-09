@@ -1240,6 +1240,29 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (generated, 0..) |request, request_index| {
                     if (document_execution) |execution| execution.select(request_index);
                     if (!try shouldPrecomputeGeneratedRequest(self, precompute_mode, request)) {
+                        if (request.kind == .asset and containsName(force_generated_artifact_names, requestArtifactName(request))) {
+                            var producer = try @import("enrichment/asset_producer.zig").parseProducerConfig(alloc, request.producer_json);
+                            defer producer.deinit(alloc);
+                            if (producer.type == .document_extraction) {
+                                const intent = @import("artifact_reprocess_intent.zig");
+                                const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", requestArtifactName(request));
+                                defer alloc.free(manifest_key);
+                                const manifest = self.core.store.get(alloc, manifest_key) catch |err| switch (err) {
+                                    error.NotFound => null,
+                                    else => return err,
+                                };
+                                defer if (manifest) |raw| alloc.free(raw);
+                                const generation = if (manifest) |raw| try S.documentExtractionManifestGeneration(alloc, raw) else 0;
+                                const encoded = intent.encode(request.producer_json, std.math.add(u64, generation, 1) catch return error.ResourceLimitExceeded);
+                                const key = try intent.keyAlloc(alloc, request.doc_key, requestArtifactName(request));
+                                errdefer alloc.free(key);
+                                const value = try alloc.dupe(u8, &encoded);
+                                errdefer alloc.free(value);
+                                // Commit the target with its source mutation. It
+                                // survives request coalescing and owner restart.
+                                try artifact_writes.append(alloc, .{ .key = key, .value = value });
+                            }
+                        }
                         try appendGeneratedEnrichmentRef(alloc, &planned, request);
                         continue;
                     }

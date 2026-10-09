@@ -500,7 +500,7 @@ test "serverless compactor document entry views borrow payloads and only own the
             try std.testing.expectEqual(source[0].body.ptr, view[0].body.ptr);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Run.run, .{&docs});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{&docs});
 }
 
 fn allocDocumentEntries(

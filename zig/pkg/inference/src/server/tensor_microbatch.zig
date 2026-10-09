@@ -981,7 +981,7 @@ test "tensor microbatch row-view ownership unwinds every allocation failure" {
             std.debug.assert(view[1].asFloat32()[0] == 4);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.check, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.check, .{});
 }
 
 test "tensor microbatch admission subdivision happens before any fused forward" {

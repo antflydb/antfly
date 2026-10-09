@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "base_commit": "d3a436b063",
+  "platform": "aarch64-macos",
+  "optimization": "Debug",
+  "scope": "Deterministic allocation, contention, and lifetime fixtures; not a query-throughput or 2 GiB soak benchmark",
+  "warm_local_block_borrowing": {
+    "hits": 4096,
+    "decoded_block_bytes": 32768,
+    "reference_copy_allocator_calls": 4096,
+    "reference_copy_payload_allocated_bytes": 134217728,
+    "borrow_allocator_calls": 0,
+    "borrow_payload_allocated_bytes": 0,
+    "leases_survive_cache_eviction": true
+  },
+  "owned_point_result": {
+    "warm": true,
+    "returned_value_bytes": 5,
+    "owned_result_bytes": 5,
+    "owned_result_allocator_calls": 1,
+    "backend_allocator_calls": 0,
+    "selected_row_scratch_copied": false
+  },
+  "reader_admission": {
+    "reads": 128,
+    "writer_fsync_deliberately_blocked": true,
+    "baseline_reads_completed_before_fsync_release": false,
+    "baseline_progress_timeout_seconds": 2,
+    "updated_reads_completed_before_fsync_release": true,
+    "old_snapshot_preserved_after_commit": true
+  },
+  "artifact_sources": {
+    "single_path_reads": 128,
+    "single_path_catalog_lease_creations": 1,
+    "checkpoint_wide_reader_pins_retained": 0,
+    "active_pinned_sources": 24,
+    "repeated_rounds": 4,
+    "additional_catalog_publications_during_repeated_rounds": 0,
+    "idle_source_limit": 16,
+    "original_bytes_survive_replacement_and_vacuum": true,
+    "retired_inode_charge_released_after_eviction": true,
+    "idle_retired_inode_bytes_after_vacuum": 0,
+    "expired_sources_reopen_lazily": true,
+    "unrelated_warm_reads_progress_during_blocked_source_close": true,
+    "idle_sources_expire_before_adoption_admission": true,
+    "active_sources_remain_charged_during_admission": true,
+    "teardown_progresses_during_blocked_publication_and_retirement": true
+  },
+  "native_merge_cursor": {
+    "persisted_runs": 24,
+    "documents": 48,
+    "active_source_entries_exceed_idle_limit": true,
+    "source_entries_after_cursor_close_at_most": 16,
+    "point_read_after_cursor_close_succeeds": true
+  },
+  "notes": [
+    "The copy reference measures the previous payload-duplication mechanism directly, rather than end-to-end lookup timing.",
+    "Cold block decoding, source creation, cursor metadata, and owned API results still allocate.",
+    "Active cursors retain artifact-specific leases; idle leases are trimmed to 16 and obsolete-run cleanup invalidates them.",
+    "The on-disk .aflite format and public C ABI are unchanged."
+  ],
+  "local_batch_results": {
+    "values": 2,
+    "retained_block_pins": 1,
+    "value_payload_copies": 0,
+    "results_survive_cache_eviction": true,
+    "max_retained_payload_bytes_per_owner": 1048576,
+    "max_retained_local_blocks_per_owner": 64,
+    "excess_values_copied": true
+  },
+  "cold_source_singleflight": {
+    "concurrent_native_reads": 16,
+    "catalog_lease_creations": 1,
+    "failure_waiters": 8,
+    "failed_provider_calls": 1,
+    "retry_supported": true,
+    "partial_allocations_failpoint_checked": true
+  },
+  "compressed_owned_point_result": {
+    "compression_policy": "snappy_adaptive",
+    "warm_decoded_cache": true,
+    "queries": 100,
+    "reference_backend_allocator_calls": 500,
+    "reference_encoded_block_loads": 100,
+    "updated_backend_allocator_calls": 0,
+    "updated_encoded_block_loads": 0,
+    "owned_result_values_still_copied": true,
+    "reference_scope": "Two distinct prefix-compressed keys; encoded loads can hit the provider memory cache.",
+    "verified_compressions": [
+      "prefix",
+      "prefix_snappy"
+    ]
+  }
+}

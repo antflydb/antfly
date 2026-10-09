@@ -750,7 +750,7 @@ test "relational index system mixed schema scan compiles each snapshot layout on
     try std.testing.expect(reader.source_cache_hits >= 510);
     try std.testing.expect(reader.binding_bytes <= 2 * 1024 * 1024);
     std.debug.print("mixed schema LSM scan: rows={d} compilations={d} hits={d} elapsed_us={d}\n", .{ count, reader.source_compilations, reader.source_cache_hits, (time.monotonicNs() - started) / 1000 });
-    try std.testing.checkAllAllocationFailures(alloc, mixedScanAllocations, .{&db});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, mixedScanAllocations, .{&db});
 }
 
 fn expressionKeyAllocations(test_alloc: std.mem.Allocator) !void {

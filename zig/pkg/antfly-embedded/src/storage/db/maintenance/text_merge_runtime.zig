@@ -57,6 +57,7 @@ pub var test_start_failures_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_execute_admission_failures_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_finish_admission_failures_remaining: std.atomic.Value(u32) = .init(0);
 pub var test_finish_lookup_required_remaining: std.atomic.Value(u32) = .init(0);
+pub var test_publication_handoffs: std.atomic.Value(u32) = .init(0);
 pub var test_lookup_prepare_apply_lock_released: std.atomic.Value(bool) = .init(false);
 pub var test_wait_for_fd_admission: std.atomic.Value(bool) = .init(false);
 pub var test_fd_admission_entered: std.atomic.Value(bool) = .init(false);
@@ -461,10 +462,24 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         };
         defer result.deinit(work_alloc);
 
+        var preparation_passes: usize = 0;
+        var next_lease: ?*std.atomic.Mutex = null;
+        defer if (next_lease) |lease| lease.unlock();
         while (true) {
-            lockApplyExclusive(self.apply_mutex);
+            var publication_lease = next_lease;
+            next_lease = null;
+            defer if (publication_lease) |lease| lease.unlock();
+            // Never wait for the global lock while retaining the index lock:
+            // replay can hold the global lock and be waiting for this index.
+            const handed_off = tryPublicationHandoff(self.apply_mutex, &publication_lease);
+            if (builtin.is_test and handed_off) _ = test_publication_handoffs.fetchAdd(1, .monotonic);
+            if (!handed_off) {
+                if (publication_lease) |lease| lease.unlock();
+                publication_lease = null;
+                lockApplyExclusive(self.apply_mutex);
+            }
             const finish_fd_epoch = self.native_storage_pool.admissionEpoch();
-            _ = finishTextMergeTaskForRuntime(self.index_manager, &task, &result) catch |err| {
+            _ = finishTextMergeTaskForRuntime(self.index_manager, &task, &result, publication_lease != null) catch |err| {
                 if (err == error.TextMergePublicationLookupRequired) {
                     // A post-snapshot deletion needs an output identity map.
                     // Release the database-wide apply lock before the O(n)
@@ -475,7 +490,15 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                         test_lookup_prepare_apply_lock_released.store(lock_released, .release);
                         if (lock_released) self.apply_mutex.unlockExclusive();
                     }
+                    preparation_passes += 1;
+                    if (preparation_passes >= 3) {
+                        next_lease = publication_lease;
+                        publication_lease = null;
+                        if (next_lease == null) next_lease = self.index_manager.tryTextMergePublicationLease(&task);
+                    }
                     index_manager_mod.IndexManager.prepareTextMergeTaskPublicationLookup(&task, &result) catch |prepare_err| {
+                        if (next_lease) |lease| lease.unlock();
+                        next_lease = null;
                         lockApplyExclusive(self.apply_mutex);
                         if (prepare_err == error.Canceled) {
                             self.index_manager.cancelTextMergeTask(&task);
@@ -1021,6 +1044,7 @@ fn finishTextMergeTaskForRuntime(
     index_manager: *index_manager_mod.IndexManager,
     task: *const index_manager_mod.IndexManager.TextMergeTask,
     result: *index_manager_mod.IndexManager.TextMergeResult,
+    borrowed_apply_lease: bool,
 ) !bool {
     if (builtin.is_test and consumeTestFailure(&test_finish_lookup_required_remaining)) {
         return error.TextMergePublicationLookupRequired;
@@ -1028,7 +1052,7 @@ fn finishTextMergeTaskForRuntime(
     if (builtin.is_test and consumeTestFailure(&test_finish_admission_failures_remaining)) {
         return error.PersistentDescriptorAdmissionExhausted;
     }
-    return try index_manager.finishTextMergeTask(task, result);
+    return if (borrowed_apply_lease) try index_manager.finishTextMergeTaskWithPublicationLease(task, result) else try index_manager.finishTextMergeTask(task, result);
 }
 
 fn consumeTestFailure(counter: *std.atomic.Value(u32)) bool {
@@ -1045,4 +1069,32 @@ fn consumeTestFailure(counter: *std.atomic.Value(u32)) bool {
 
 fn lockApplyShared(lock: *apply_rw_lock_mod.ApplyRwLock) void {
     lock.lockShared();
+}
+
+fn tryPublicationHandoff(apply_mutex: *apply_rw_lock_mod.ApplyRwLock, lease: *?*std.atomic.Mutex) bool {
+    if (lease.* == null) return false;
+    if (apply_mutex.tryLockExclusive()) return true;
+    lease.*.?.unlock();
+    lease.* = null;
+    return false;
+}
+
+test "text merge publication handoff releases index lease before global contention" {
+    var global: apply_rw_lock_mod.ApplyRwLock = .{};
+    var index: std.atomic.Mutex = .unlocked;
+    var lease: ?*std.atomic.Mutex = &index;
+    global.lockShared();
+    try std.testing.expect(index.tryLock());
+    try std.testing.expect(!tryPublicationHandoff(&global, &lease));
+    try std.testing.expect(lease == null);
+    try std.testing.expect(index.tryLock());
+    index.unlock();
+    global.unlockShared();
+    try std.testing.expect(index.tryLock());
+    lease = &index;
+    try std.testing.expect(tryPublicationHandoff(&global, &lease));
+    try std.testing.expect(lease != null);
+    try std.testing.expect(!global.tryLockExclusive());
+    global.unlockExclusive();
+    lease.?.unlock();
 }

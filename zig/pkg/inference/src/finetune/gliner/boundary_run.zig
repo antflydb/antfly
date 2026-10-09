@@ -422,7 +422,7 @@ test "boundary training run bounds memory rejects quantized profiles and replays
 }
 
 test "boundary training run allocation failures reclaim order and fingerprint buffers" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseOrder, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseOrder, .{});
 }
 
 test "boundary training run clipping order resolves canonical aliases" {

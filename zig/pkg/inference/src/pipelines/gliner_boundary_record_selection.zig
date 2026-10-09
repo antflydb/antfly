@@ -497,5 +497,5 @@ test "gliner boundary record selection preserves alternatives and distinguishes 
             try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, result.selected);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Check.run, .{&candidates});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{&candidates});
 }

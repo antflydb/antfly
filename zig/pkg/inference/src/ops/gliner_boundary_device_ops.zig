@@ -27,6 +27,38 @@ pub const DerivedKey = union(enum) {
     relative_normalized,
     relative_query: u32,
     relative_key: u32,
+    /// Generation-owned row concatenation of one encoder layer's immutable
+    /// query, key and value matrices. Shape is `[3 * hidden, hidden]`.
+    packed_qkv_weight: u32,
+};
+
+pub const PackedQkvRequest = struct {
+    input: CT,
+    packed_weight: CT,
+    biases: [3]CT,
+    rows: usize,
+    hidden: usize,
+};
+
+pub const PackedQkvResult = struct {
+    query: CT,
+    key: CT,
+    value: CT,
+};
+
+pub const FusedFfnRequest = struct {
+    input: CT,
+    residual: CT,
+    first_weight: CT,
+    first_bias: CT,
+    second_weight: CT,
+    second_bias: CT,
+    norm_weight: CT,
+    norm_bias: CT,
+    rows: usize,
+    hidden: usize,
+    intermediate: usize,
+    eps: f32,
 };
 
 /// Only intermediate FP32 GEMM products use this workspace. Bias outputs,
@@ -157,6 +189,8 @@ pub const ScopeStats = struct {
     workspace_products: u64 = 0,
     workspace_oversized_products: u64 = 0,
     workspace_drains: u64 = 0,
+    /// Successful strict boundary fused-FFN dispatches in this backend scope.
+    fused_ffn_calls: u64 = 0,
 };
 
 /// Allocation-free admission state. Pending payload includes queued upload
@@ -309,6 +343,10 @@ pub const Kind = enum(u32) {
     laya_decisions = 47,
     laya_exact_gelu = 48,
     laya_logits = 49,
+    /// Packed [rows, 3 * hidden] -> [3, rows, hidden], split-half Q/K RoPE.
+    packed_qkv_rope = 50,
+    /// Centered-variance norm(a+b), optionally followed by its residual sum.
+    add_norm_centered = 51,
 };
 
 pub const Params = extern struct {
@@ -364,6 +402,24 @@ pub fn layoutFor(kind: Kind, d: [8]u32, scalars: [4]f32) !Layout {
     var r = Layout{};
     for (scalars) |v| if (!std.math.isFinite(v)) return error.InvalidBoundaryDeviceShape;
     switch (kind) {
+        .packed_qkv_rope => { // rows, hidden, head_dim; explicit int32 positions
+            if (d[2] == 0 or d[1] % d[2] != 0 or d[2] % 2 != 0 or scalars[0] <= 0) return error.InvalidBoundaryDeviceShape;
+            r.output_elements = try shape(&.{ d[0], d[1], 3 });
+            r.input_elements[0] = r.output_elements;
+            r.input_elements[1] = d[0];
+            r.integer_inputs = 1 << 1;
+        },
+        .add_norm_centered => { // rows, hidden, retain_sum
+            if (d[2] > 1 or d[1] > 4096 or scalars[0] <= 0) return error.InvalidBoundaryDeviceShape;
+            const elements = try mul(d[0..2]);
+            r.input_elements[0] = elements;
+            r.input_elements[1] = elements;
+            r.input_elements[2] = d[1];
+            r.input_elements[3] = d[1];
+            r.output_elements = try shape(&.{ elements, @as(usize, d[2]) + 1 });
+            r.work_items = try shape(&.{ d[0], 32 });
+            r.simd_groups = true;
+        },
         .laya_qkv => { // rows,hidden,heads,sequence,part,rotate
             if (d[2] == 0 or d[1] % d[2] != 0 or (d[1] / d[2]) % 2 != 0 or d[3] == 0 or d[4] > 2 or d[5] > 1 or (d[5] == 1 and scalars[0] <= 0)) return error.InvalidBoundaryDeviceShape;
             r.output_elements = try mul(d[0..2]);
@@ -787,4 +843,39 @@ test "strict GLiNER boundary scope workspace geometry and fenced ranges are boun
     cursor.retired();
     try std.testing.expectEqual(@as(?usize, 0), try cursor.reserve(4));
     try std.testing.expectEqual(@as(usize, 32), cursor.peak_bytes);
+}
+
+test "packed QKV product consumes one exact arena range and drains atomically" {
+    const rows: usize = 61;
+    const hidden: usize = 768;
+    const intermediate: usize = 3072;
+    const plan = try EncoderWorkspacePlan.init(1, rows, hidden, intermediate);
+    var cursor = try ProductWorkspaceCursor.init(plan.capacity_bytes, plan.max_product_elements);
+    const packed_elements = rows * 3 * hidden;
+    try std.testing.expect(try cursor.eligible(packed_elements));
+    try std.testing.expectEqual(@as(?usize, 0), try cursor.reserve(packed_elements));
+    const after_first = cursor;
+    try std.testing.expectEqual(@as(?usize, packed_elements * 4), try cursor.reserve(packed_elements));
+    try std.testing.expect(!try cursor.needsDrain(packed_elements));
+    for (0..4) |_| _ = try cursor.reserve(packed_elements);
+    try std.testing.expect(try cursor.needsDrain(packed_elements));
+    try std.testing.expectError(error.GlinerBoundaryWorkspaceFenceRequired, cursor.reserve(packed_elements));
+    try std.testing.expect(cursor.used_bytes > after_first.used_bytes);
+    cursor.retired();
+    try std.testing.expectEqual(@as(?usize, 0), try cursor.reserve(packed_elements));
+}
+
+test "packed QKV scope admission charges three logical dispatches atomically" {
+    const output_bytes: usize = 61 * 768 * 3 * @sizeOf(f32);
+    var scope = ScopeAccounting{};
+    try scope.begin(.{ .max_pending_device_bytes = output_bytes, .max_dispatches = 3 });
+    try scope.reserve(output_bytes, 3);
+    const full = scope;
+    try std.testing.expectError(error.ResourceLimitExceeded, scope.reserve(1, 0));
+    try std.testing.expectEqualDeep(full, scope);
+    try std.testing.expectError(error.ResourceLimitExceeded, scope.reserve(0, 1));
+    try std.testing.expectEqualDeep(full, scope);
+    scope.retired();
+    try std.testing.expectEqual(@as(usize, 0), scope.stats.pending_device_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scope.scope_dispatches);
 }

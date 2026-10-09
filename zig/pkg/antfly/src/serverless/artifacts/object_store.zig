@@ -52,6 +52,8 @@ pub const ObjectStore = struct {
     gcs_client: ?*objectstore.Gcs.JsonApiClient = null,
     s3_client: ?*objectstore.S3.Client = null,
     owns_client: bool = true,
+    read_only: bool = false,
+    local_inventory: ?@import("fs_store.zig").FsStore = null,
     bucket: []u8,
     prefix: []u8,
     verified_mu: std.atomic.Mutex = .unlocked,
@@ -99,11 +101,16 @@ pub const ObjectStore = struct {
         errdefer alloc.free(owned_bucket);
         const owned_prefix = try alloc.dupe(u8, "");
         errdefer alloc.free(owned_prefix);
+        const directories = try fs.artifactDirectoriesAlloc(alloc, owned_bucket);
+        defer alloc.free(directories.objects);
+        defer alloc.free(directories.inventory);
+        const inventory = try @import("fs_store.zig").FsStore.initExistingWithInventory(alloc, directories.objects, directories.inventory);
         client_initialized = false;
         return .{
             .alloc = alloc,
             .client = owned_client,
             .fs_client = fs,
+            .local_inventory = inventory,
             .bucket = owned_bucket,
             .prefix = owned_prefix,
         };
@@ -173,22 +180,51 @@ pub const ObjectStore = struct {
     }
 
     pub fn initWithClient(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8) !ObjectStore {
+        return initWithClientOptions(alloc, client, bucket, prefix, .{ .ensure_bucket = true });
+    }
+
+    /// Borrow a configured client without widening its provisioning authority.
+    /// Readers and require-existing writers must not create missing buckets.
+    pub fn initWithClientOptions(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8, options: struct { ensure_bucket: bool = false, read_only: bool = false, filesystem: ?*objectstore.FilesystemClient = null }) !ObjectStore {
+        if (options.read_only and options.ensure_bucket) return error.InvalidArtifactStoreOptions;
         var owned_client = client;
-        if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        if (!(try owned_client.bucketExists(bucket))) {
+            if (!options.ensure_bucket) return error.ArtifactBucketNotFound;
+            try owned_client.makeBucket(bucket);
+        }
         const owned_bucket = try alloc.dupe(u8, bucket);
         errdefer alloc.free(owned_bucket);
         const owned_prefix = try alloc.dupe(u8, prefix);
         errdefer alloc.free(owned_prefix);
+        const inventory: ?@import("fs_store.zig").FsStore = if (options.filesystem) |fs| value: {
+            if (prefix.len != 0) {
+                if (std.fs.path.isAbsolute(prefix) or std.mem.indexOfScalar(u8, prefix, 0) != null or std.mem.indexOfScalar(u8, prefix, '\\') != null) return error.InvalidObjectPrefix;
+                var components = std.mem.splitScalar(u8, std.mem.trimEnd(u8, prefix, "/"), '/');
+                while (components.next()) |component| if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidObjectPrefix;
+            }
+
+            const directories = try fs.artifactDirectoriesAlloc(alloc, bucket);
+            defer alloc.free(directories.objects);
+            defer alloc.free(directories.inventory);
+            const local_root = try std.fs.path.join(alloc, &.{ directories.objects, prefix });
+            defer alloc.free(local_root);
+            const inventory_root = try std.fs.path.join(alloc, &.{ directories.inventory, prefix });
+            defer alloc.free(inventory_root);
+            break :value try @import("fs_store.zig").FsStore.initExistingWithInventory(alloc, local_root, inventory_root);
+        } else null;
         return .{
             .alloc = alloc,
             .client = owned_client,
+            .local_inventory = inventory,
             .owns_client = false,
+            .read_only = options.read_only,
             .bucket = owned_bucket,
             .prefix = owned_prefix,
         };
     }
 
     pub fn deinit(self: *ObjectStore) void {
+        if (self.local_inventory) |*inventory| inventory.deinit();
         lockAtomic(&self.verified_mu);
         var verified_it = self.verified_objects.iterator();
         while (verified_it.next()) |entry| {
@@ -224,6 +260,7 @@ pub const ObjectStore = struct {
 
     fn putInScope(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
         try cancellation.check();
+        if (self.read_only) return error.ArtifactStoreReadOnly;
         const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
         errdefer alloc.free(checksum);
         const artifact_id = if (scope) |value| scoped: {
@@ -234,6 +271,7 @@ pub const ObjectStore = struct {
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
 
+        if (scope) |upload| if (self.local_inventory) |*inventory| try inventory.registerScopedUpload(upload, checksum, cancellation);
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         _ = std.fmt.hexToBytes(&digest, checksum) catch unreachable;
         var checksum_base64_buf: [std.base64.standard.Encoder.calcSize(digest.len)]u8 = undefined;
@@ -290,6 +328,35 @@ pub const ObjectStore = struct {
         defer result.deinit(self.client.allocator);
         try cancellation.check();
         return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
+    }
+
+    fn getBoundedAllocWithCancellation(
+        self: *ObjectStore,
+        alloc: std.mem.Allocator,
+        artifact_id: []const u8,
+        expected_len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
+        defer self.alloc.free(key);
+        var client = self.client;
+        client.allocator = alloc;
+        // Fetch the complete body: a prefix Range GET cannot prove object length.
+        // The content-addressed identity is authenticated by the caller's hash.
+        var result = client.getObject(self.bucket, key, .{
+            .skip_metadata_probe = true,
+            .max_response_bytes = @max(expected_len, 1),
+            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+        }) catch |err| {
+            if (err == error.ResponseTooLarge) return error.ArtifactIntegrityMismatch;
+            return normalizeCancellationError(err, cancellation);
+        };
+        defer result.deinit(alloc);
+        try cancellation.check();
+        const body = result.body;
+        result.body = &.{};
+        return body;
     }
 
     pub fn getRangeAlloc(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
@@ -501,6 +568,7 @@ pub const ObjectStore = struct {
     }
 
     pub fn delete(self: *ObjectStore, artifact_id: []const u8) !void {
+        if (self.read_only) return error.ArtifactStoreReadOnly;
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         try self.client.deleteObject(self.bucket, key, .{});
@@ -569,11 +637,18 @@ pub const ObjectStore = struct {
     }
 
     fn visitScopedUploads(self: *ObjectStore, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
+        if (!self.read_only and visitor.checkpoint != null) if (self.local_inventory) |*inventory| {
+            var local_store = inventory.artifactStore();
+            return local_store.visitScopedUploads(domain, visitor, cancellation);
+        };
         const prefix = if (self.prefix.len == 0)
             try std.fmt.allocPrint(self.alloc, "graph/{s}/", .{std.fmt.bytesToHex(&domain, .lower)})
         else
             try std.fmt.allocPrint(self.alloc, "{s}/graph/{s}/", .{ self.prefix, std.fmt.bytesToHex(&domain, .lower) });
         defer self.alloc.free(prefix);
+        const start = if (visitor.after_suffix) |after| try std.mem.concat(self.alloc, u8, &.{ prefix, after }) else null;
+        defer if (start) |key| self.alloc.free(key);
+        var visited: usize = 0;
         var token: ?[]u8 = null;
         defer if (token) |value| self.alloc.free(value);
         while (true) {
@@ -583,6 +658,7 @@ pub const ObjectStore = struct {
                 .recursive = true,
                 .max_keys = 256,
                 .continuation_token = token,
+                .start_after = if (token == null) start else null,
                 .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
             });
             defer page.deinit(self.client.allocator);
@@ -592,7 +668,18 @@ pub const ObjectStore = struct {
             for (page.entries) |entry| {
                 try cancellation.check();
                 if (!std.mem.startsWith(u8, entry.key, prefix)) return error.InvalidArtifactId;
-                try artifact_store.visitScopedSuffix(domain, entry.key[prefix.len..], visitor);
+                const suffix = entry.key[prefix.len..];
+                if (suffix.len != 97 or suffix[32] != '/') continue;
+                var encoded_attempt: [16]u8 = undefined;
+                _ = std.fmt.hexToBytes(&encoded_attempt, suffix[0..32]) catch return error.InvalidArtifactId;
+                const fence = std.mem.readInt(u64, encoded_attempt[0..8], .big);
+                if (visitor.exclude_attempt) |excluded| if (std.mem.eql(u8, &excluded, &encoded_attempt)) continue;
+                if (visitor.only_attempt) |only| if (!std.mem.eql(u8, &only, &encoded_attempt)) continue;
+                if (fence < visitor.fencing_floor) continue;
+                if (visitor.fencing_cutoff) |cutoff| if (fence >= cutoff) return;
+                if (visitor.max_entries) |maximum| if (visited == maximum) return error.ArtifactEnumerationPaused;
+                try artifact_store.visitScopedSuffix(domain, suffix, visitor);
+                visited += 1;
             }
             if (token) |value| self.alloc.free(value);
             token = next;
@@ -607,8 +694,10 @@ pub const ObjectStore = struct {
         .put_with_cancellation = erasedPutWithCancellation,
         .put_scoped = erasedPutScoped,
         .visit_scoped_uploads = erasedVisitScopedUploads,
+        .reclaim_retired_scoped_inventory = erasedReclaimRetiredScopedInventory,
         .get_alloc = erasedGetAlloc,
         .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
+        .get_bounded_alloc_with_cancellation = erasedGetBoundedAllocWithCancellation,
         .get_range_alloc = erasedGetRangeAlloc,
         .get_range_alloc_with_cancellation = erasedGetRangeAllocWithCancellation,
         .get_verified_range_alloc_with_cancellation = erasedGetVerifiedRangeAllocWithCancellation,
@@ -639,6 +728,15 @@ pub const ObjectStore = struct {
         return self.putInScope(alloc, scope, contents, cancellation);
     }
 
+    fn erasedReclaimRetiredScopedInventory(raw: *anyopaque, domain: [32]u8, floor: u64, cutoff: u64, cancellation: CancellationToken) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.read_only) return error.ArtifactStoreReadOnly;
+        if (self.local_inventory) |*inventory| {
+            var store = inventory.artifactStore();
+            try store.reclaimRetiredScopedInventory(domain, floor, cutoff, cancellation);
+        }
+    }
+
     fn erasedVisitScopedUploads(ptr: *anyopaque, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return self.visitScopedUploads(domain, visitor, cancellation);
@@ -652,6 +750,11 @@ pub const ObjectStore = struct {
     fn erasedGetAllocWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, cancellation: CancellationToken) ![]u8 {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.getAllocWithCancellation(alloc, artifact_id, cancellation);
+    }
+
+    fn erasedGetBoundedAllocWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, expected_len: usize, cancellation: CancellationToken) ![]u8 {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.getBoundedAllocWithCancellation(alloc, artifact_id, expected_len, cancellation);
     }
 
     fn erasedGetRangeAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
@@ -851,6 +954,21 @@ test "objectstore-backed artifacts store round-trips over file uri" {
     try std.testing.expectEqualStrings("payload", got);
 }
 
+test "objectstore-backed artifact readers preserve bucket provisioning authority" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    try std.testing.expectError(error.ArtifactBucketNotFound, ObjectStore.initWithClientOptions(alloc, memory.client(), "missing-bucket", "tenant/a", .{}));
+    var memory_client = memory.client();
+    try std.testing.expect(!(try memory_client.bucketExists("missing-bucket")));
+    var impl = try ObjectStore.initWithClientOptions(alloc, memory.client(), "artifact-bucket", "tenant/a", .{ .ensure_bucket = true });
+    defer impl.deinit();
+    var reader = try ObjectStore.initWithClientOptions(alloc, memory.client(), "artifact-bucket", "tenant/a", .{ .read_only = true });
+    defer reader.deinit();
+    try std.testing.expectError(error.ArtifactStoreReadOnly, reader.put(alloc, "denied"));
+    try std.testing.expectError(error.ArtifactStoreReadOnly, reader.delete("sha256:abcd"));
+}
+
 test "objectstore-backed artifacts reject malformed content addresses before I/O" {
     const alloc = std.testing.allocator;
     var memory = objectstore.MemoryClient.init(alloc);
@@ -901,9 +1019,11 @@ test "serverless objectstore-backed artifacts preserve distinct client and resul
     try std.testing.expectEqual(@as(u64, "allocator-safe".len), stat.byte_len);
     try store.verifyContentWithCancellationUsingAllocator(result_alloc, meta.artifact_id, meta.byte_len, meta.checksum, .none);
 
-    var query_buffer: [1024]u8 = undefined;
-    var query_fba = std.heap.FixedBufferAllocator.init(&query_buffer);
-    const query_alloc = query_fba.allocator();
+    // A fixed buffer only reclaims its tail, so its cursor cannot prove that
+    // metadata freed before a retained body was released is leak-free.
+    var query_budget = @import("antfly_local_sources").storage_test_allocator.BoundedAllocator.init(result_alloc, 1024);
+    defer std.debug.assert(query_budget.deinit() == 0);
+    const query_alloc = query_budget.allocator();
     const verified = try store.getVerifiedAllocWithCancellationUsingAllocator(
         query_alloc,
         meta.artifact_id,
@@ -911,9 +1031,9 @@ test "serverless objectstore-backed artifacts preserve distinct client and resul
         meta.checksum,
         .none,
     );
-    try std.testing.expect(query_fba.ownsSlice(verified));
+    try std.testing.expectEqual(verified.len, query_budget.live);
     query_alloc.free(verified);
-    try std.testing.expectEqual(@as(usize, 0), query_fba.end_index);
+    try std.testing.expectEqual(@as(usize, 0), query_budget.live);
 
     const key = try keyForChecksumAlloc(result_alloc, "tenant/a", meta.checksum);
     defer result_alloc.free(key);
@@ -1069,8 +1189,8 @@ test "serverless objectstore-backed artifact initialization cleans up every allo
             defer impl.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.borrowed, .{});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.owned, .{file_uri});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.borrowed, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.owned, .{file_uri});
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
@@ -1096,4 +1216,35 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "external lake complete artifact reads avoid metadata probes and reject tampering" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var impl = try ObjectStore.initWithClient(alloc, memory.client(), "bucket", "cold");
+    var store = impl.artifactStore();
+    defer store.deinit();
+    var metadata = try store.put("verified");
+    defer metadata.deinit(alloc);
+    memory.resetOperationCount();
+    const body = try store.getVerifiedAllocWithCancellation(metadata.artifact_id, metadata.byte_len, metadata.checksum, .none);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("verified", body);
+    try std.testing.expectEqual(@as(u64, 1), memory.operationCount());
+    const key = try keyForArtifactIdAlloc(alloc, impl.prefix, metadata.artifact_id);
+    defer alloc.free(key);
+    var client = memory.client();
+    for ([_][]const u8{ "verified-extra", "short", "modified" }) |corrupt| {
+        var put = try client.putObject("bucket", key, corrupt, .{});
+        put.deinit(alloc);
+        try std.testing.expectError(error.ArtifactIntegrityMismatch, store.getVerifiedAllocWithCancellation(metadata.artifact_id, metadata.byte_len, metadata.checksum, .none));
+    }
+    var empty = try store.put("");
+    defer empty.deinit(alloc);
+    const empty_body = try store.getVerifiedAllocWithCancellation(empty.artifact_id, 0, empty.checksum, .none);
+    defer alloc.free(empty_body);
+    try std.testing.expectEqual(@as(usize, 0), empty_body.len);
+    try store.delete(empty.artifact_id);
+    try std.testing.expectError(error.FileNotFound, store.getVerifiedAllocWithCancellation(empty.artifact_id, 0, empty.checksum, .none));
 }

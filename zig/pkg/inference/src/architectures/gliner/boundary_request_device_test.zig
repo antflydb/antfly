@@ -133,7 +133,7 @@ test "gliner boundary device request rejects external frames and unwinds failed 
     try std.testing.expectError(error.GlinerBoundaryExternalFrame, request.runWindows(&cb, a, &config, &prepared, &schemas, .{}));
     try std.testing.expectError(error.GlinerBoundaryExternalFrame, math.Context.create(a, &cb, .{}, null));
     vtable.decoderRuntimeHasActiveFrame = null;
-    try std.testing.checkAllAllocationFailures(a, MissingDevice.allocationFailure, .{ &cb, &config, &prepared, &schemas });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, MissingDevice.allocationFailure, .{ &cb, &config, &prepared, &schemas });
     const Cancel = struct {
         fn check(_: ?*anyopaque) anyerror!void {
             return error.Cancelled;

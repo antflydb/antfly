@@ -125,6 +125,8 @@ pub fn create(
     // durable catalog shape. Normalize at the transport-neutral admission
     // boundary so embedded, HTTP-local, and forwarded callers cannot persist
     // different definitions for the same request.
+    try (req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{}).validateCreate(req.num_shards, if (req.replication_sources_json) |sources| !std.mem.eql(u8, sources, "[]") else false);
+    try tables_api.validateObjectCreateDefinition(alloc, req);
     var normalized_req = req;
     if (try @import("fk_generation_publication.zig").schemaHasForeignKeys(alloc, tables_api.effectiveSchemaJson(req.schema_json)))
         return error.ForeignKeyGenerationPublicationRequired;
@@ -148,7 +150,7 @@ pub fn create(
     // under the lane immediately before deriving the admission snapshot.
     const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(
         request,
-        topology_protocol.atomic_table_topology_version,
+        if ((req.storage orelse @import("antfly_local_sources").common_table_storage.Settings{}).engine == .object) topology_protocol.object_table_engine_version else topology_protocol.atomic_table_topology_version,
     );
     lockTableCatalogMutation(svc, table_name);
     var catalog_locked = true;
@@ -169,6 +171,7 @@ pub fn create(
     var identity_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &identity_bytes, table.table_id, .little);
     const storage_generation = if (table.table_id == original_table_id) transition_generation else std.hash.Wyhash.hash(transition_generation, &identity_bytes);
+    if (table.storage.engine == .object) table.object_storage_generation = storage_generation;
     const ranges = try tables_api.deriveInitialRangesForGeneration(
         alloc,
         table,

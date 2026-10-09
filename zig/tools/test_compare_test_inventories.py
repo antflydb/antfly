@@ -47,14 +47,22 @@ class CompareTestInventoriesTest(unittest.TestCase):
             inventories.parse_inventory("TEST\tone\nTEST\tone\n")
 
     def test_excludes_unnamed_import_aggregation_tests_by_default(self):
-        output = "TEST\troot.test_0\nTEST\tstorage.db.test.named\n"
+        output = "TEST\troot.test_0\nTEST\troot.test_1\nTEST\tstorage.db.test.named\n"
         self.assertEqual(
             frozenset({"storage.db.test.named"}),
             inventories.parse_inventory(output),
         )
         self.assertEqual(
-            frozenset({"root.test_0", "storage.db.test.named"}),
+            frozenset({"root.test_0", "root.test_1", "storage.db.test.named"}),
             inventories.parse_inventory(output, include_unnamed=True),
+        )
+
+    def test_preserves_named_tests_with_anonymous_looking_suffixes(self):
+        self.assertEqual(
+            frozenset({"root.test.test_1", "root.test.named.test_2"}),
+            inventories.parse_inventory(
+                "TEST\troot.test.test_1\nTEST\troot.test.named.test_2\n"
+            ),
         )
 
     def test_combines_disjoint_executable_inventories(self):

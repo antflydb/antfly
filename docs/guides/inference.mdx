@@ -18,7 +18,7 @@ tags: [inference, embeddings, reranking, models]
 - Why is my index stuck with pending enrichments?
 </Questions>
 
-Antfly Inference is the model runtime inside Antfly. It runs embedding, chunking, reranking, extraction, transcription, reading, and generation models (text generation from text, image, and audio prompts) on the same machine as the database, with no external API and nothing leaving the host. It executes model artifacts through the native backend (CPU, Metal on macOS, CUDA in CUDA builds), plus ONNX Runtime and `ortgenai` in builds compiled with ONNX support. The decision it puts in front of you is which model to pull for each job; the [Local Model Compatibility](/docs/guides/supported-models) page holds the verified list, and this page covers how the runtime finds, stores, and serves them.
+Antfly Inference is the model runtime inside Antfly. It runs embedding, chunking, reranking, extraction, decision, transcription, reading, and generation models (text generation from text, image, and audio prompts) on the same machine as the database, with no external API and nothing leaving the host. It executes model artifacts through the native backend (CPU, Metal on macOS, CUDA in CUDA builds), plus ONNX Runtime and `ortgenai` in builds compiled with ONNX support. The decision it puts in front of you is which model to pull for each job; the [Local Model Compatibility](/docs/guides/supported-models) page holds the verified list, and this page covers how the runtime finds, stores, and serves them.
 
 Pull a model, then embed a sentence through the running engine:
 
@@ -251,3 +251,5 @@ Then prompt it with the outcome, for example "Set up local embeddings and rerank
 - [Multimodal Embeddings](/docs/guides/multimodal): the ClipClap embedder on an image index
 - [Tune Hybrid Search](/docs/guides/hybrid-search): the reranker in a query pipeline
 - [Inference API reference](/inference/api): the HTTP surface
+
+- [Typed Decisions](decisions.md): named choice, ordinal score, and Boolean questions through HTTP and C, Rust, Go, Python, or TypeScript embedded inference

@@ -40,7 +40,8 @@ pub fn query(alloc: std.mem.Allocator, adapter: *Adapter, target: @import("antfl
     if (table.id != expected_id) return error.CatalogGenerationChanged;
     if (table.external_base_source == null) return null;
     const native = try std.json.parseFromSliceLeaky(@import("antfly_metadata_openapi").types.RelationalRowQueryRequest, a, request.relational_query_json, .{ .parse_numbers = false });
-    if (native.index != null or native.lower != null or native.upper != null or native.after != null) return error.UnsupportedRowsQuery;
+    if (native.index == null and (native.lower != null or native.upper != null or native.after != null)) return error.InvalidRelationalRowsRequest;
+    if (native.index != null and (native.schema_version == null or request.from.len != 0 or request.to.len != 0)) return error.InvalidRelationalRowsRequest;
     if (native.schema_version) |version| if (version != table.schema_version) return error.CatalogGenerationChanged;
     const input_conditions: []const @import("antfly_metadata_openapi").types.RelationalRowCondition = native.conditions orelse &.{};
     var fields: std.ArrayList([]const u8) = .empty;
@@ -71,7 +72,13 @@ pub fn query(alloc: std.mem.Allocator, adapter: *Adapter, target: @import("antfl
         try pushed.append(a, .{ .column = condition.column, .op = op, .value = value });
     }
     const conditions = try normalizeConditions(a, table, input_conditions);
-    const cursor = try adapter.openLakeScan(scan_alloc, table, .{ .fields = fields.items, .conditions = pushed.items, .after = if (request.from.len == 0) null else request.from, .before = if (request.to.len == 0) null else request.to, .primary_order = true, .limit = request.opts.limit });
+    const index_range: ?catalog.Scan.IndexRange = if (native.index) |name| .{
+        .name = name,
+        .lower = if (native.lower) |bound| .{ .values = bound.values, .inclusive = bound.inclusive orelse true } else null,
+        .upper = if (native.upper) |bound| .{ .values = bound.values, .inclusive = bound.inclusive orelse true } else null,
+        .after = native.after,
+    } else null;
+    const cursor = try adapter.openLakeScan(scan_alloc, table, .{ .fields = fields.items, .conditions = pushed.items, .index_range = index_range, .after = if (request.from.len == 0) null else request.from, .before = if (request.to.len == 0) null else request.to, .primary_order = index_range == null, .limit = request.opts.limit });
     defer cursor.close(cursor.ptr);
     var output: std.Io.Writer.Allocating = .init(alloc);
     errdefer output.deinit();
@@ -91,7 +98,11 @@ pub fn query(alloc: std.mem.Allocator, adapter: *Adapter, target: @import("antfl
             var projected = std.json.ObjectMap.empty;
             for (native.fields) |name| try projected.put(row_alloc, name, (try row.cell(name)).value);
             var encoded: std.Io.Writer.Allocating = .init(row_alloc);
-            try std.json.Stringify.value(.{ ._id = row.id, .row = std.json.Value{ .object = projected }, .version = "0", .schema_version = table.schema_version }, .{}, &encoded.writer);
+            if (row.index_cursor) |continuation| {
+                try std.json.Stringify.value(.{ ._id = row.id, .row = std.json.Value{ .object = projected }, .version = "0", .schema_version = table.schema_version, .cursor = continuation }, .{}, &encoded.writer);
+            } else {
+                try std.json.Stringify.value(.{ ._id = row.id, .row = std.json.Value{ .object = projected }, .version = "0", .schema_version = table.schema_version }, .{}, &encoded.writer);
+            }
             if (encoded.written().len >= 32 * 1024 * 1024 -| output.written().len) return error.SqlResultTooLarge;
             try output.writer.writeAll(encoded.written());
             try output.writer.writeByte('\n');

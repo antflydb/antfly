@@ -129,6 +129,30 @@ fn embed_with_missing_model_is_not_found() {
 }
 
 #[test]
+fn decide_validates_requests_and_reports_missing_models() {
+    run_with_stack(|| {
+        let models_dir = tmp_dir("decide");
+        let inference =
+            Inference::open(&InferenceOptions::new().models_dir(&models_dir)).expect("open");
+        let err = inference
+            .decide("{}")
+            .expect_err("invalid decision request");
+        assert_eq!(err.error, Error::InvalidArgument);
+        assert!(err.body.contains("INVALID_REQUEST"), "{err:?}");
+
+        let request = r#"{"model":"no/such-model","state":"Refund requested","questions":{"refund":{"type":"noul","instructions":"Does this request ask for a refund?"}}}"#;
+        let err = inference
+            .decide(request)
+            .expect_err("missing decision model");
+        assert_eq!(err.error, Error::NotFound);
+        assert!(err.body.contains("MODEL_NOT_FOUND"), "{err:?}");
+        inference.close().expect("close");
+        let err = inference.decide(request).expect_err("closed handle");
+        assert_eq!(err.error, Error::InvalidArgument);
+    });
+}
+
+#[test]
 fn pull_empty_request_is_invalid_argument() {
     run_with_stack(|| {
         let models_dir = tmp_dir("pull-empty-request");

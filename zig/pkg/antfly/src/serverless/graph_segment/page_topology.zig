@@ -235,5 +235,5 @@ fn allocationExercise(alloc: Allocator) !void {
 }
 
 test "serverless paged topology releases every failed preparation allocation" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
 }

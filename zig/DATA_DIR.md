@@ -12,6 +12,9 @@ marker applies to the whole directory tree, not to an individual node mode.
   ANTFLY_FORMAT
   secrets.json
 
+  cache/
+    lake-ranges/
+
   metadata/
     replicas/
     catalog.txt
@@ -86,3 +89,33 @@ ML predictor discovery defaults to `~/.antfly/inference/ml`.
 `secrets.json` is rooted at `<data-dir>/secrets.json` because secrets are
 runtime-wide process configuration, not metadata replica state or data replica
 state.
+
+
+## Lake serving cache
+
+`cache/lake-ranges/` is disposable, versioned object-range storage used by native
+Parquet and Iceberg SQL/rows reads. It defaults beneath the configured local base
+directory; Lite uses the directory containing its database file. `lake_cache.root`
+can select a separate local disk, including for object-only deployments. One API
+cache owner uses each root and drains accepted writes on shutdown. This directory
+is separate from durable table/index artifacts and private SQL spill files.
+
+```json
+{
+  "lake_cache": {
+    "enabled": true,
+    "max_memory_bytes": 67108864,
+    "max_disk_bytes": 10737418240,
+    "max_entries": 16384,
+    "max_write_queue_bytes": 33554432,
+    "max_write_queue_entries": 16,
+    "protected_bytes": 268435456
+  }
+}
+```
+
+The protected disk pool is capped at one quarter of disk capacity. Cache pressure
+or a failed local cache initialization preserves source reads. Configuration bounds
+must be positive; `protected_bytes: 0` disables the disk reservation. See
+[REMOTE_TABLE_SERVING.md](REMOTE_TABLE_SERVING.md) for cache identity, authorization,
+metrics and the wider remote-index design.

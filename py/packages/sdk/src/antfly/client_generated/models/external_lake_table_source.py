@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 
 from ..models.external_lake_table_source_format import ExternalLakeTableSourceFormat
 from ..models.external_lake_table_source_kind import ExternalLakeTableSourceKind
+from ..models.external_lake_table_source_object_mutability import ExternalLakeTableSourceObjectMutability
 from ..models.external_lake_table_source_write_policy import ExternalLakeTableSourceWritePolicy
 from ..types import UNSET, Unset
 
@@ -31,6 +32,10 @@ class ExternalLakeTableSource:
             schema_fingerprint (str | Unset):  Default: 'auto'.
             write_policy (ExternalLakeTableSourceWritePolicy | Unset):  Default:
                 ExternalLakeTableSourceWritePolicy.READ_ONLY.
+            object_mutability (ExternalLakeTableSourceObjectMutability | Unset): Set immutable only when data files are
+                never replaced at an existing URI. Allows authenticated provider-version proofs from retained index generations
+                to be reused for unchanged data files. Metadata and delete files are still verified. Default:
+                ExternalLakeTableSourceObjectMutability.MUTABLE.
             credentials (ExternalLakeCredentialRef | Unset):
             snapshot (ExternalLakeSnapshotSelector | Unset):
     """
@@ -41,6 +46,7 @@ class ExternalLakeTableSource:
     uri: str
     schema_fingerprint: str | Unset = "auto"
     write_policy: ExternalLakeTableSourceWritePolicy | Unset = ExternalLakeTableSourceWritePolicy.READ_ONLY
+    object_mutability: ExternalLakeTableSourceObjectMutability | Unset = ExternalLakeTableSourceObjectMutability.MUTABLE
     credentials: ExternalLakeCredentialRef | Unset = UNSET
     snapshot: ExternalLakeSnapshotSelector | Unset = UNSET
 
@@ -58,6 +64,10 @@ class ExternalLakeTableSource:
         write_policy: str | Unset = UNSET
         if not isinstance(self.write_policy, Unset):
             write_policy = self.write_policy.value
+
+        object_mutability: str | Unset = UNSET
+        if not isinstance(self.object_mutability, Unset):
+            object_mutability = self.object_mutability.value
 
         credentials: dict[str, Any] | Unset = UNSET
         if not isinstance(self.credentials, Unset):
@@ -81,6 +91,8 @@ class ExternalLakeTableSource:
             field_dict["schema_fingerprint"] = schema_fingerprint
         if write_policy is not UNSET:
             field_dict["write_policy"] = write_policy
+        if object_mutability is not UNSET:
+            field_dict["object_mutability"] = object_mutability
         if credentials is not UNSET:
             field_dict["credentials"] = credentials
         if snapshot is not UNSET:
@@ -111,6 +123,13 @@ class ExternalLakeTableSource:
         else:
             write_policy = ExternalLakeTableSourceWritePolicy(_write_policy)
 
+        _object_mutability = d.pop("object_mutability", UNSET)
+        object_mutability: ExternalLakeTableSourceObjectMutability | Unset
+        if isinstance(_object_mutability, Unset):
+            object_mutability = UNSET
+        else:
+            object_mutability = ExternalLakeTableSourceObjectMutability(_object_mutability)
+
         _credentials = d.pop("credentials", UNSET)
         credentials: ExternalLakeCredentialRef | Unset
         if isinstance(_credentials, Unset):
@@ -132,6 +151,7 @@ class ExternalLakeTableSource:
             uri=uri,
             schema_fingerprint=schema_fingerprint,
             write_policy=write_policy,
+            object_mutability=object_mutability,
             credentials=credentials,
             snapshot=snapshot,
         )

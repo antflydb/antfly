@@ -159,8 +159,8 @@ fn canonicalLiteral(alloc: std.mem.Allocator, kind: wire.RelationalExpressionTyp
             if (integer > safe or integer < -safe) return .{ .string = try std.fmt.allocPrint(alloc, "{d}", .{integer}) };
         },
         .datetime => {
-            const timestamp = @import("antfly_local_sources").schema_table_schema_impl.documentDateTimeToNs(value) orelse return value;
-            if (timestamp > safe) return .{ .string = try std.fmt.allocPrint(alloc, "{d}", .{timestamp}) };
+            const timestamp = @import("antfly_local_sources").schema_relational_checks.signedDateTime(value) orelse return value;
+            if (timestamp > safe or timestamp < -safe) return .{ .string = try std.fmt.allocPrint(alloc, "{d}", .{timestamp}) };
         },
         else => {},
     }

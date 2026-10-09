@@ -378,6 +378,7 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ),
     ("antfly_inference_generate_batch_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_rewrite_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_inference_decide_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_extract_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_read_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_inference_transcribe_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),

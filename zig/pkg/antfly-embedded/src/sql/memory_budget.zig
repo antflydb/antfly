@@ -23,6 +23,17 @@ live: usize = 0,
 peak: usize = 0,
 exhausted: bool = false,
 mutex: std.atomic.Mutex = .unlocked,
+/// Optional shared admission for the live allocations of an active operation.
+/// Reservations grow with actual allocator capacity, never a size estimate.
+admission: ?struct { ptr: *anyopaque, reserve: *const fn (*anyopaque, usize) bool, release: *const fn (*anyopaque, usize) void } = null,
+admission_exhausted: bool = false,
+
+pub fn finishAdmission(self: *Budget) void {
+    self.lock();
+    defer self.mutex.unlock();
+    if (self.admission) |owner| owner.release(owner.ptr, self.live);
+    self.admission = null;
+}
 
 fn lock(self: *Budget) void {
     while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -36,7 +47,14 @@ fn admit(self: *Budget, growth: usize) bool {
         self.exhausted = true;
         return false;
     }
+    if (self.admission) |owner| if (!owner.reserve(owner.ptr, growth)) {
+        self.admission_exhausted = true;
+        return false;
+    };
     return true;
+}
+fn releaseAdmission(self: *Budget, bytes: usize) void {
+    if (self.admission) |owner| owner.release(owner.ptr, bytes);
 }
 fn account(self: *Budget, old: usize, new: usize) void {
     self.live = self.live - old + new;
@@ -47,7 +65,10 @@ fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?
     self.lock();
     defer self.mutex.unlock();
     if (!self.admit(len)) return null;
-    const result = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+    const result = self.backing.rawAlloc(len, alignment, ra) orelse {
+        self.releaseAdmission(len);
+        return null;
+    };
     self.account(0, len);
     return result;
 }
@@ -56,7 +77,11 @@ fn resize(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize
     self.lock();
     defer self.mutex.unlock();
     if (!self.admit(len -| bytes.len)) return false;
-    if (!self.backing.rawResize(bytes, alignment, len, ra)) return false;
+    if (!self.backing.rawResize(bytes, alignment, len, ra)) {
+        self.releaseAdmission(len -| bytes.len);
+        return false;
+    }
+    self.releaseAdmission(bytes.len -| len);
     self.account(bytes.len, len);
     return true;
 }
@@ -65,7 +90,11 @@ fn remap(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize,
     self.lock();
     defer self.mutex.unlock();
     if (!self.admit(len -| bytes.len)) return null;
-    const result = self.backing.rawRemap(bytes, alignment, len, ra) orelse return null;
+    const result = self.backing.rawRemap(bytes, alignment, len, ra) orelse {
+        self.releaseAdmission(len -| bytes.len);
+        return null;
+    };
+    self.releaseAdmission(bytes.len -| len);
     self.account(bytes.len, len);
     return result;
 }
@@ -74,6 +103,7 @@ fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) v
     self.lock();
     defer self.mutex.unlock();
     self.backing.rawFree(bytes, alignment, ra);
+    self.releaseAdmission(bytes.len);
     self.account(bytes.len, 0);
 }
 

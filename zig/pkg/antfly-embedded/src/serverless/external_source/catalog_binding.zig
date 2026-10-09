@@ -103,6 +103,10 @@ pub const WritePolicy = enum(u8) {
     }
 };
 
+/// Immutable data objects are never replaced at an existing URI. Metadata
+/// and deletion objects are still verified; this is an explicit source contract.
+pub const ObjectMutability = enum { mutable, immutable };
+
 pub const Binding = struct {
     table_id: []const u8,
     format: external_source.Format,
@@ -111,6 +115,7 @@ pub const Binding = struct {
     snapshot_mode: SnapshotMode = .current,
     schema_fingerprint: []const u8,
     write_policy: WritePolicy = .read_only,
+    object_mutability: ObjectMutability = .mutable,
 
     pub fn validate(self: Binding) !void {
         if (self.table_id.len == 0) return error.InvalidExternalTableBinding;

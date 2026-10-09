@@ -1099,7 +1099,7 @@ test "seeded gradient trainer native transaction admission bounds measured accum
 }
 
 test "seeded gradient trainer native transaction admission ownership survives every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseNativeAdmission, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseNativeAdmission, .{});
 }
 
 fn hashInteger(hash: *std.crypto.hash.sha2.Sha256, value: u64) void {
@@ -1189,7 +1189,7 @@ test "seeded gradient trainer preserves groups absent gradients and partial wind
 }
 
 test "seeded gradient trainer allocation failures preserve parameter and moment ownership" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseTrainer, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseTrainer, .{});
 }
 
 const restore_parameters = [_]Parameter{.{ .name = "restore.weight", .values = &.{ 1, 2 }, .dimensions = &.{2}, .group = 0 }};
@@ -1279,7 +1279,7 @@ test "seeded gradient trainer restore admits header heap and file before parsing
     try std.testing.expectEqual(before, trainer.identity());
     try std.testing.expectEqualSlices(f32, &weights, trainer.owner.regular_params.items[0].weights);
     try exerciseRestore(a, path);
-    try std.testing.checkAllAllocationFailures(a, exerciseRestore, .{path});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseRestore, .{path});
 }
 
 test "seeded gradient trainer matches pinned Torch AdamW groups clipping moments and partial flush" {

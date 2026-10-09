@@ -408,7 +408,7 @@ test "serverless canonical block fill allocations unwind every partial claim" {
             defer alloc.free(copied);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless canonical block fills reject duplicate keys without leaking pending claims" {

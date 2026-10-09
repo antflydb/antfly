@@ -87,7 +87,7 @@ fn allocationLifecycle(a: Allocator) !void {
     _ = try build(&g);
 }
 test "boundary training graph releases descriptors and graph on allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
 }
 
 test "boundary training input gradients preserve independent shift accumulation" {
@@ -195,7 +195,7 @@ fn candidateLifecycle(a: Allocator) !void {
 }
 
 test "boundary training graph candidate scratch and descriptors survive allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, candidateLifecycle, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, candidateLifecycle, .{});
 }
 
 test "boundary training graph builds explicit spans relations and every record mode with live inputs" {

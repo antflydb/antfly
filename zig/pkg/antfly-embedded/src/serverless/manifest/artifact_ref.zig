@@ -50,6 +50,7 @@ pub const ArtifactKind = enum(u8) {
     /// Source-fenced point directory for immutable document bodies and exact
     /// projection/enrichment facts. Root aggregates serve bounded status reads.
     document_facts = 14,
+    ordered_row_index = 15,
 };
 
 pub const ArtifactRef = struct {

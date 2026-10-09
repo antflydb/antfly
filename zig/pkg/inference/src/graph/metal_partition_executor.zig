@@ -16425,7 +16425,7 @@ test "compiled parameter acquisitions release reservations and lazy pins indepen
 test "compiled parameter acquisitions unwind allocation failures" {
     inline for (.{ false, true }) |lazy| {
         inline for (.{ false, true }) |on_demand| {
-            try std.testing.checkAllAllocationFailures(std.testing.allocator, testCompiledParameterWeightOwnership, .{ lazy, on_demand });
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testCompiledParameterWeightOwnership, .{ lazy, on_demand });
         }
     }
 }

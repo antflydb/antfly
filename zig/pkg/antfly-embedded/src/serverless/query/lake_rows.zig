@@ -814,11 +814,15 @@ fn predicateMatches(predicate: Predicate, column: rowsource.ColumnVector, row_id
             else => error.UnsupportedLakeRowsPredicateColumnKind,
         },
         .eq_i64 => switch (column.values) {
+            .dictionary_i64 => |items| items.at(row_idx) == predicate.i64_value,
+            .dictionary_f64 => |items| items.at(row_idx) == @as(f64, @floatFromInt(predicate.i64_value)),
             .i64 => |items| items[row_idx] == predicate.i64_value,
             .f64 => |items| items[row_idx] == @as(f64, @floatFromInt(predicate.i64_value)),
             else => error.UnsupportedLakeRowsPredicateColumnKind,
         },
         .eq_f64 => switch (column.values) {
+            .dictionary_f64 => |items| items.at(row_idx) == predicate.f64_value,
+            .dictionary_i64 => |items| if (exactI64FromF64(predicate.f64_value)) |value| items.at(row_idx) == value else false,
             .f64 => |items| items[row_idx] == predicate.f64_value,
             .i64 => |items| if (exactI64FromF64(predicate.f64_value)) |value| items[row_idx] == value else false,
             else => error.UnsupportedLakeRowsPredicateColumnKind,
@@ -1035,18 +1039,18 @@ fn resultFromSourceAlloc(
     while (try source.next(alloc)) |batch| {
         try budget.admitBatch(batch.rowCount());
         const group_column = batch.findColumn(request.group_column) orelse return error.RowSourceColumnNotFound;
-        if (group_column.kind() != .bytes) return error.UnsupportedLakeRowsGroupColumnKind;
+        if (group_column.kind() != .bytes and group_column.kind() != .dictionary_bytes) return error.UnsupportedLakeRowsGroupColumnKind;
         const value_column = if (request.op == .count) null else batch.findColumn(request.value_column) orelse return error.RowSourceColumnNotFound;
         if (value_column) |column| {
-            if (column.kind() != .i64) return error.UnsupportedLakeRowsValueColumnKind;
+            if (column.kind() != .i64 and column.kind() != .dictionary_i64) return error.UnsupportedLakeRowsValueColumnKind;
         }
 
         for (0..batch.rowCount()) |row_idx| {
             if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.row_refs[row_idx])) continue;
             if (group_column.nulls.isNull(row_idx)) continue;
-            const key = group_column.values.bytes[row_idx];
+            const key = try group_column.bytesAt(row_idx);
             if (key.len == 0) continue;
-            const next_value = rowAggregateValue(request.op, value_column, row_idx) orelse continue;
+            const next_value = (try rowAggregateValue(request.op, value_column, row_idx)) orelse continue;
             if (map.getPtr(key)) |value| {
                 value.* = try aggregate_math.combine(value.*, next_value);
             } else {
@@ -1107,13 +1111,13 @@ fn expressionResultFromSourceAlloc(
             else
                 batch.findColumn(accumulator.spec.value_column) orelse return error.RowSourceColumnNotFound;
             if (value_column.*) |column| {
-                if (column.kind() != .i64) return error.UnsupportedLakeRowsValueColumnKind;
+                if (column.kind() != .i64 and column.kind() != .dictionary_i64) return error.UnsupportedLakeRowsValueColumnKind;
             }
         }
         for (0..batch.rowCount()) |row_idx| {
             if (rowIsDeletedLookup(deleted_lookup, request.deleted_row_filter, batch.row_refs[row_idx])) continue;
             for (accumulators, value_columns) |*accumulator, value_column| {
-                const next_value = rowAggregateValue(accumulator.spec.op, value_column, row_idx) orelse continue;
+                const next_value = (try rowAggregateValue(accumulator.spec.op, value_column, row_idx)) orelse continue;
                 if (!accumulator.initialized) {
                     accumulator.value = next_value;
                     accumulator.initialized = true;
@@ -1154,14 +1158,14 @@ fn rowAggregateValue(
     op: algebraic_segment.AggregateOp,
     value_column: ?rowsource.ColumnVector,
     row_idx: usize,
-) ?algebraic_segment.AggregateValue {
+) !?algebraic_segment.AggregateValue {
     return switch (op) {
         .count => .{ .count = 1 },
-        .sum_i64 => .{ .sum_i64 = if (value_column.?.nulls.isNull(row_idx)) 0 else value_column.?.values.i64[row_idx] },
-        .min_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .min_i64 = value_column.?.values.i64[row_idx] },
-        .max_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .max_i64 = value_column.?.values.i64[row_idx] },
+        .sum_i64 => .{ .sum_i64 = if (value_column.?.nulls.isNull(row_idx)) 0 else try value_column.?.integerAt(row_idx) },
+        .min_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .min_i64 = try value_column.?.integerAt(row_idx) },
+        .max_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .max_i64 = try value_column.?.integerAt(row_idx) },
         .avg_i64 => if (value_column.?.nulls.isNull(row_idx)) null else .{ .avg_i64 = .{
-            .sum_i64 = value_column.?.values.i64[row_idx],
+            .sum_i64 = try value_column.?.integerAt(row_idx),
             .count = 1,
         } },
     };
@@ -1221,7 +1225,7 @@ fn projectedRowAllocatedBytes(
             .bytes, .json => |items| items[row_idx].len,
             .dictionary_bytes => |items| items.at(row_idx).len,
             .vector_f32 => |items| std.math.mul(usize, items[row_idx].len, @sizeOf(f32)) catch return std.math.maxInt(usize),
-            .i64, .f64, .bool => 0,
+            .i64, .f64, .bool, .dictionary_i64, .dictionary_f64 => 0,
         };
         total = std.math.add(usize, total, payload_bytes) catch return std.math.maxInt(usize);
     }
@@ -1249,6 +1253,8 @@ fn cloneCellValueAlloc(
         .bytes => |items| .{ .bytes = try alloc.dupe(u8, items[row_idx]) },
         .dictionary_bytes => |items| .{ .bytes = try alloc.dupe(u8, items.at(row_idx)) },
         .json => |items| .{ .json = try alloc.dupe(u8, items[row_idx]) },
+        .dictionary_i64 => |items| .{ .i64 = items.at(row_idx) },
+        .dictionary_f64 => |items| .{ .f64 = items.at(row_idx) },
         .i64 => |items| .{ .i64 = items[row_idx] },
         .f64 => |items| .{ .f64 = items[row_idx] },
         .bool => |items| .{ .bool = items[row_idx] },

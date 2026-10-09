@@ -1362,7 +1362,7 @@ fn exerciseContextualLabelGather(a: std.mem.Allocator) !void {
 }
 
 test "GLiNER contextual batch label gather allocation failure releases ownership" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseContextualLabelGather, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseContextualLabelGather, .{});
 }
 
 // Small analytic head: the span MLP returns its first word vector, the zero
@@ -1516,7 +1516,7 @@ test "GLiNER complete batched head releases host allocations on failure and retr
     // Fail every architecture-owned allocation, including the second word
     // gather and span-index allocations. The backend uses its own allocator,
     // so an error must unwind CT ownership as well as these host buffers.
-    try std.testing.checkAllAllocationFailures(a, exerciseHeadAllocationFailures, .{&cb});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseHeadAllocationFailures, .{&cb});
     try exerciseHeadAllocationFailures(a, &cb);
 }
 

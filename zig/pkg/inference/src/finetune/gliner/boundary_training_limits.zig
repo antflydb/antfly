@@ -403,7 +403,7 @@ fn exerciseParse(a: std.mem.Allocator) !void {
 
 test "boundary training limits parser cleans every allocation failure" {
     try exerciseParse(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseParse, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseParse, .{});
 }
 
 fn exerciseRegionalParse(a: std.mem.Allocator) !void {
@@ -425,7 +425,7 @@ fn exerciseRegionalParse(a: std.mem.Allocator) !void {
 
 test "boundary training limits regional groups map exact integers and unwind every parse allocation failure" {
     try exerciseRegionalParse(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseRegionalParse, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseRegionalParse, .{});
 }
 
 test "boundary training limits regional JSON rejects invalid types bounds and integer overflow" {

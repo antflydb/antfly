@@ -1,0 +1,156 @@
+{
+  "date": "2026-10-05",
+  "source_base": "77f71ede6",
+  "command": "zig build sql-test pgwire-test sql-native-pipeline-bench -Doptimize=ReleaseSafe -j2 --summary all",
+  "source_files_sha256": {
+    "zig/pkg/antfly-embedded/src/local/sql/execution_batch.zig": "3d3de06c587ad49b30998e52a3bb3081d1ce3d8487d2273eeb4c808ce5d7043c",
+    "zig/pkg/antfly-embedded/src/local/sql/partition_join.zig": "d232a71ed18cf40dcf5ae749a7e68c7b13278962ae2566e677fe5baedcad12af",
+    "zig/pkg/antfly-embedded/src/local/sql/read_stream.zig": "4765968be5ff4d0c870d850ff7bc5e59910dad5cdb711ee6f05f897da1da8ecc",
+    "zig/pkg/antfly-embedded/src/local/sql/refinement_bench.zig": "3474da19826d1aff7127d517fcc91f1dd934bd48fc3b673a5f4139253279ee8b",
+    "zig/pkg/antfly-embedded/src/local/sql/relation_runtime.zig": "4ba7f5494596a9444cf67e60bc1f4fc40cce102bb26190e6709e779ddd83b839",
+    "zig/pkg/antfly-embedded/src/local/sql/result_cursor.zig": "a55840f73ed4d4bda3a0ddcbfdbde5c3356b10d935344a3909cd39066a731ef7",
+    "zig/pkg/antfly-embedded/src/local/sql/spill.zig": "58896a8978c5af04f1cd40447f81dcfcc97e0631b963a771d56b677cf88a32a4",
+    "zig/pkg/antfly-embedded/src/local/sql/typed_store.zig": "7b493ee847f1583eb25983e191233b6eb34b41e32f45d4d1f4a4be34e8cc4903",
+    "zig/pkg/antfly-embedded/src/local/sql/vector_eval.zig": "51a7744dec9e1999f1d3bbf3df459b6d0e9a11fea0f344053d73f35a3c0dc6ac"
+  },
+  "comparison_baseline": "native-lake-workspace-and-leases.json",
+  "notes": [
+    "ReleaseSafe native fixtures with equal-output checks, three samples, and no timing assertions.",
+    "Native Debug integration compilation ran concurrently; timing samples are illustrative.",
+    "Typed decode: 4096 rows, 32 integer columns, SQL NULLs, compressed spill blocks; peak excludes identical file construction.",
+    "Delivery: 4096 rows, repeated 1024-byte payload, 137-row pages, 256 KiB page admission.",
+    "Sorted wide-string leases still retain more decode memory than dictionary gathering; admission remains bounded.",
+    "These samples cover execution and delivery; remote catalog index/materialization publication and selection are not implemented by these changes.",
+    "Only whitespace formatting changed after verification; measured_source_files_sha256 records the compiled bytes and source_files_sha256 records the formatted equivalent."
+  ],
+  "samples": [
+    {
+      "case": "leased_result_delivery",
+      "sorted": false,
+      "rows": 4096,
+      "sample": 0,
+      "gather_ns": 7201000,
+      "lease_ns": 4058417,
+      "gather_peak_bytes": 76987,
+      "lease_peak_bytes": 76987
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": false,
+      "rows": 4096,
+      "sample": 1,
+      "gather_ns": 7145459,
+      "lease_ns": 4211667,
+      "gather_peak_bytes": 76987,
+      "lease_peak_bytes": 76987
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": false,
+      "rows": 4096,
+      "sample": 2,
+      "gather_ns": 7168750,
+      "lease_ns": 3810875,
+      "gather_peak_bytes": 76987,
+      "lease_peak_bytes": 76987
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": true,
+      "rows": 4096,
+      "sample": 0,
+      "gather_ns": 19650583,
+      "lease_ns": 19642000,
+      "gather_peak_bytes": 127383,
+      "lease_peak_bytes": 303307
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": true,
+      "rows": 4096,
+      "sample": 1,
+      "gather_ns": 28231541,
+      "lease_ns": 18354583,
+      "gather_peak_bytes": 127383,
+      "lease_peak_bytes": 303307
+    },
+    {
+      "case": "leased_result_delivery",
+      "sorted": true,
+      "rows": 4096,
+      "sample": 2,
+      "gather_ns": 57964958,
+      "lease_ns": 17207792,
+      "gather_peak_bytes": 127383,
+      "lease_peak_bytes": 303307
+    },
+    {
+      "case": "compact_typed_spill_decode",
+      "rows": 4096,
+      "width": 32,
+      "sample": 0,
+      "expanded_ns": 1653375,
+      "compact_ns": 1426916,
+      "expanded_peak_bytes": 1144700,
+      "compact_peak_bytes": 110284
+    },
+    {
+      "case": "compact_typed_spill_decode",
+      "rows": 4096,
+      "width": 32,
+      "sample": 1,
+      "expanded_ns": 1674875,
+      "compact_ns": 1301833,
+      "expanded_peak_bytes": 1144700,
+      "compact_peak_bytes": 110284
+    },
+    {
+      "case": "compact_typed_spill_decode",
+      "rows": 4096,
+      "width": 32,
+      "sample": 2,
+      "expanded_ns": 1654583,
+      "compact_ns": 1321583,
+      "expanded_peak_bytes": 1144700,
+      "compact_peak_bytes": 110284
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 0,
+      "ns": 564409625,
+      "allocations": 365597,
+      "peak_bytes": 9698882,
+      "checksum": 79999200000
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 1,
+      "ns": 615004875,
+      "allocations": 365596,
+      "peak_bytes": 9654832,
+      "checksum": 79999200000
+    },
+    {
+      "case": "query_spilled_join",
+      "rows": 1,
+      "sample": 2,
+      "ns": 713193209,
+      "allocations": 365596,
+      "peak_bytes": 9654832,
+      "checksum": 79999200000
+    }
+  ],
+  "measured_source_files_sha256": {
+    "zig/pkg/antfly-embedded/src/local/sql/execution_batch.zig": "3d3de06c587ad49b30998e52a3bb3081d1ce3d8487d2273eeb4c808ce5d7043c",
+    "zig/pkg/antfly-embedded/src/local/sql/partition_join.zig": "d232a71ed18cf40dcf5ae749a7e68c7b13278962ae2566e677fe5baedcad12af",
+    "zig/pkg/antfly-embedded/src/local/sql/read_stream.zig": "4765968be5ff4d0c870d850ff7bc5e59910dad5cdb711ee6f05f897da1da8ecc",
+    "zig/pkg/antfly-embedded/src/local/sql/refinement_bench.zig": "3474da19826d1aff7127d517fcc91f1dd934bd48fc3b673a5f4139253279ee8b",
+    "zig/pkg/antfly-embedded/src/local/sql/relation_runtime.zig": "4ba7f5494596a9444cf67e60bc1f4fc40cce102bb26190e6709e779ddd83b839",
+    "zig/pkg/antfly-embedded/src/local/sql/result_cursor.zig": "a55840f73ed4d4bda3a0ddcbfdbde5c3356b10d935344a3909cd39066a731ef7",
+    "zig/pkg/antfly-embedded/src/local/sql/spill.zig": "58896a8978c5af04f1cd40447f81dcfcc97e0631b963a771d56b677cf88a32a4",
+    "zig/pkg/antfly-embedded/src/local/sql/typed_store.zig": "7b493ee847f1583eb25983e191233b6eb34b41e32f45d4d1f4a4be34e8cc4903",
+    "zig/pkg/antfly-embedded/src/local/sql/vector_eval.zig": "cc3b6b5c543d56598a400e0910b6b550e58226e54d01207709db2911839a0757"
+  }
+}

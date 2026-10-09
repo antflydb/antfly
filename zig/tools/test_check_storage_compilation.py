@@ -79,10 +79,19 @@ class LiteralSourceOwnership(unittest.TestCase):
                     name.startswith("runtime_")
                     and name != "runtime_distributed_root.zig"
                 ):
-                    path = measurement.literal_import_path(
-                        root, source / "api/table_writes.zig"
-                    )
-                    self.assertIsNone(path, path)
+                    for coordination in ("api/table_reads.zig", "api/table_writes.zig"):
+                        path = measurement.literal_import_path(
+                            root, source / coordination
+                        )
+                        self.assertIsNone(path, path)
+
+    def test_shared_query_transforms_do_not_import_coordination(self):
+        source = measurement.ZIG_ROOT / "pkg/antfly/src"
+        root = source / "api/query_post_processing.zig"
+        for coordination in ("api/table_reads.zig", "api/table_writes.zig"):
+            with self.subTest(source=coordination):
+                path = measurement.literal_import_path(root, source / coordination)
+                self.assertIsNone(path, path)
 
     def test_imports_in_inactive_test_bodies_are_cache_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:

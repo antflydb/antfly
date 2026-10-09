@@ -32,6 +32,16 @@ pub const Request = struct {
     questions: []Question,
 };
 
+pub const ExecutionContract = enum {
+    span_marker,
+    boundary,
+    laya,
+
+    fn usesClassifications(self: ExecutionContract) bool {
+        return self == .span_marker or self == .boundary;
+    }
+};
+
 fn object(v: Value) !std.json.ObjectMap {
     return if (v == .object) v.object else error.InvalidDecideRequest;
 }
@@ -126,7 +136,17 @@ pub const ExtractionInput = struct {
 
 /// Produce an extraction v2 request and the exact serialized schema size used
 /// by inference.limits.max_schema_bytes. GLiNER's top_k includes every option.
-pub fn extractionInput(a: Allocator, request: Request, gliner: bool) !ExtractionInput {
+pub fn extractionInput(a: Allocator, request: Request, contract: ExecutionContract) !ExtractionInput {
+    const input = try extractionValue(a, request, contract);
+    return .{ .json = try std.json.Stringify.valueAlloc(a, input.value, .{}), .schema_bytes = input.schema_bytes };
+}
+
+pub const ExtractionValue = struct { value: Value, schema_bytes: usize };
+
+/// Trusted internal envelope. The original Decide request is limited to 1 MiB;
+/// all generated nesting is fixed and parseValue still enforces schema/text limits.
+pub fn extractionValue(a: Allocator, request: Request, contract: ExecutionContract) !ExtractionValue {
+    const classifications = contract.usesClassifications();
     var root: std.json.ObjectMap = .empty;
     try put(a, &root, "schema_version", .{ .integer = 2 });
     try put(a, &root, "model", string(request.model));
@@ -140,13 +160,13 @@ pub fn extractionInput(a: Allocator, request: Request, gliner: bool) !Extraction
     for (request.questions) |question| {
         var task: std.json.ObjectMap = .empty;
         try put(a, &task, "name", string(question.name));
-        try put(a, &task, if (gliner) "prompt" else "instruction", string(question.instructions));
-        if (!gliner) try put(a, &task, "mode", string(switch (question.kind) {
+        try put(a, &task, if (classifications) "prompt" else "instruction", string(question.instructions));
+        if (!classifications) try put(a, &task, "mode", string(switch (question.kind) {
             .choice => "single",
             .score => "ordinal",
             .noul => "boolean",
         }));
-        if (gliner) try put(a, &task, "top_k", .{ .integer = @intCast(question.labels.len) });
+        if (classifications) try put(a, &task, "top_k", .{ .integer = @intCast(question.labels.len) });
         var labels: std.array_list.Managed(Value) = .init(a);
         var definitions: std.json.ObjectMap = .empty;
         for (question.labels, question.descriptions) |label, description| {
@@ -162,13 +182,13 @@ pub fn extractionInput(a: Allocator, request: Request, gliner: bool) !Extraction
     try put(a, &schema, "classifications", .{ .array = tasks });
     const schema_json = try std.json.Stringify.valueAlloc(a, Value{ .object = schema }, .{});
     try put(a, &root, "schema", .{ .object = schema });
-    if (gliner) {
+    if (classifications) {
         var options: std.json.ObjectMap = .empty;
         try put(a, &options, "include_confidence", .{ .bool = true });
         try put(a, &root, "options", .{ .object = options });
     }
     return .{
-        .json = try std.json.Stringify.valueAlloc(a, Value{ .object = root }, .{}),
+        .value = .{ .object = root },
         .schema_bytes = schema_json.len,
     };
 }
@@ -188,25 +208,53 @@ fn tokenCount(v: Value) !Value {
 }
 
 /// Translate both executors' distributions with one decision presenter.
-pub fn responseJson(a: Allocator, request: Request, extraction_json: []const u8, gliner: bool) ![]u8 {
+pub fn responseJson(a: Allocator, request: Request, extraction_json: []const u8, contract: ExecutionContract) ![]u8 {
     const parsed = std.json.parseFromSlice(Value, a, extraction_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidDecideOutput,
     };
-    const root = try outputObject(parsed.value);
+    return responseValue(a, request, parsed.value, contract);
+}
+
+/// Present typed classifier results without an extraction JSON round trip.
+pub fn responseClassifications(a: Allocator, request: Request, classifications: []const @import("../pipelines/gliner_boundary_pipeline.zig").Classification, prompt_tokens: usize) ![]u8 {
+    var rows: std.array_list.Managed(Value) = .init(a);
+    for (classifications) |classification| for (classification.labels) |label| {
+        var row: std.json.ObjectMap = .empty;
+        try put(a, &row, "name", string(classification.name));
+        try put(a, &row, "label", string(label.label));
+        try put(a, &row, "score", .{ .float = label.confidence });
+        try rows.append(.{ .object = row });
+    };
+    var item: std.json.ObjectMap = .empty;
+    try put(a, &item, "classifications", .{ .array = rows });
+    var data: std.array_list.Managed(Value) = .init(a);
+    try data.append(.{ .object = item });
+    var usage: std.json.ObjectMap = .empty;
+    try put(a, &usage, "prompt_tokens", .{ .integer = @intCast(prompt_tokens) });
+    try put(a, &usage, "completion_tokens", .{ .integer = 0 });
+    var root: std.json.ObjectMap = .empty;
+    try put(a, &root, "data", .{ .array = data });
+    try put(a, &root, "usage", .{ .object = usage });
+    return responseValue(a, request, .{ .object = root }, .span_marker);
+}
+
+fn responseValue(a: Allocator, request: Request, value: Value, contract: ExecutionContract) ![]u8 {
+    const classifications = contract.usesClassifications();
+    const root = try outputObject(value);
     const data = root.get("data") orelse return error.InvalidDecideOutput;
     if (data != .array or data.array.items.len != 1) return error.InvalidDecideOutput;
     const item = try outputObject(data.array.items[0]);
-    const rows = item.get(if (gliner) "classifications" else "decisions") orelse return error.InvalidDecideOutput;
+    const rows = item.get(if (classifications) "classifications" else "decisions") orelse return error.InvalidDecideOutput;
     if (rows != .array) return error.InvalidDecideOutput;
     var expected_rows: usize = 0;
-    for (request.questions) |question| expected_rows += if (gliner) question.labels.len else 1;
+    for (request.questions) |question| expected_rows += if (classifications) question.labels.len else 1;
     if (rows.array.items.len != expected_rows) return error.InvalidDecideOutput;
     var answers: std.json.ObjectMap = .empty;
     for (request.questions, 0..) |question, question_index| {
         const probabilities = try a.alloc(f64, question.labels.len);
         @memset(probabilities, -1);
-        const raw_probabilities = if (gliner) rows.array.items else blk: {
+        const raw_probabilities = if (classifications) rows.array.items else blk: {
             const row = try outputObject(rows.array.items[question_index]);
             const row_name = try outputNonempty(row.get("name") orelse return error.InvalidDecideOutput);
             if (!std.mem.eql(u8, row_name, question.name)) return error.InvalidDecideOutput;
@@ -216,12 +264,12 @@ pub fn responseJson(a: Allocator, request: Request, extraction_json: []const u8,
         };
         for (raw_probabilities) |raw_probability| {
             const entry = try outputObject(raw_probability);
-            if (gliner) {
+            if (classifications) {
                 const row_name = try outputNonempty(entry.get("name") orelse return error.InvalidDecideOutput);
                 if (!std.mem.eql(u8, row_name, question.name)) continue;
             }
             const label = try outputNonempty(entry.get("label") orelse return error.InvalidDecideOutput);
-            const probability = try number(entry.get(if (gliner) "score" else "probability") orelse return error.InvalidDecideOutput);
+            const probability = try number(entry.get(if (classifications) "score" else "probability") orelse return error.InvalidDecideOutput);
             if (!std.math.isFinite(probability) or probability < 0 or probability > 1) return error.InvalidDecideOutput;
             for (question.labels, probabilities) |expected, *dest| {
                 if (std.mem.eql(u8, label, expected)) {
@@ -278,17 +326,20 @@ test "decide validates questions before building an extraction request" {
     ;
     const request = try parse(a, valid);
     try std.testing.expectEqual(@as(usize, 3), request.questions.len);
-    const laya = try extractionInput(a, request, false);
+    const laya = try extractionInput(a, request, .laya);
     try std.testing.expect(std.mem.indexOf(u8, laya.json, "\"mode\":\"ordinal\"") != null);
-    const gliner = try extractionInput(a, request, true);
+    const gliner = try extractionInput(a, request, .span_marker);
     try std.testing.expect(std.mem.indexOf(u8, gliner.json, "\"top_k\":2") != null);
+    const boundary = try extractionInput(a, request, .boundary);
+    try std.testing.expect(std.mem.indexOf(u8, boundary.json, "\"top_k\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, boundary.json, "\"prompt\":\"Intent?\"") != null);
     const longer_state = try a.alloc(u8, 4096);
     @memset(longer_state, 'x');
     var longer_request = request;
     longer_request.state = longer_state;
-    for ([_]bool{ false, true }) |span| {
-        const short = try extractionInput(a, request, span);
-        const long = try extractionInput(a, longer_request, span);
+    for ([_]ExecutionContract{ .laya, .span_marker, .boundary }) |contract| {
+        const short = try extractionInput(a, request, contract);
+        const long = try extractionInput(a, longer_request, contract);
         var parsed = try std.json.parseFromSlice(Value, a, short.json, .{});
         defer parsed.deinit();
         const actual_schema = try std.json.Stringify.valueAlloc(a, parsed.value.object.get("schema").?, .{});
@@ -304,7 +355,7 @@ test "decide validates questions before building an extraction request" {
     ));
 }
 
-test "decide presents complete Laya and GLiNER distributions" {
+test "decide presents complete Laya span and boundary distributions" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -317,8 +368,12 @@ test "decide presents complete Laya and GLiNER distributions" {
     const span =
         \\{"data":[{"classifications":[{"name":"intent","label":"other","score":0.2},{"name":"intent","label":"refund","score":0.8},{"name":"urgency","label":"0","score":0.25},{"name":"urgency","label":"1","score":0.75},{"name":"act","label":"false","score":0.1},{"name":"act","label":"true","score":0.9}]}],"usage":{"prompt_tokens":10,"completion_tokens":0}}
     ;
-    for ([_]struct { []const u8, bool }{ .{ laya, false }, .{ span, true } }) |case| {
-        const json = try responseJson(a, request, case[0], case[1]);
+    const typed = try responseClassifications(a, request, &.{
+        .{ .name = "intent", .multi_label = false, .labels = &.{ .{ .label = "other", .confidence = 0.2 }, .{ .label = "refund", .confidence = 0.8 } } },
+        .{ .name = "urgency", .multi_label = false, .labels = &.{ .{ .label = "0", .confidence = 0.25 }, .{ .label = "1", .confidence = 0.75 } } },
+        .{ .name = "act", .multi_label = false, .labels = &.{ .{ .label = "false", .confidence = 0.1 }, .{ .label = "true", .confidence = 0.9 } } },
+    }, 10);
+    for ([_][]const u8{ typed, try responseJson(a, request, laya, .laya), try responseJson(a, request, span, .span_marker), try responseJson(a, request, span, .boundary) }) |json| {
         var parsed = try std.json.parseFromSlice(Value, a, json, .{});
         defer parsed.deinit();
         const answers = parsed.value.object.get("answers").?.object;
@@ -342,9 +397,9 @@ test "decide reports malformed executor responses as output failures" {
         "{\"data\":[{\"decisions\":[null]}]}",
         "{\"data\":[{\"decisions\":[{\"name\":42,\"probabilities\":[]}]}]}",
         "{\"data\":[{\"decisions\":[{\"name\":\"act\",\"probabilities\":[null,null]}]}]}",
-    }) |malformed| try std.testing.expectError(error.InvalidDecideOutput, responseJson(a, request, malformed, false));
+    }) |malformed| try std.testing.expectError(error.InvalidDecideOutput, responseJson(a, request, malformed, .laya));
     const valid_decision = "{\"data\":[{\"decisions\":[{\"name\":\"act\",\"probabilities\":[{\"label\":\"false\",\"probability\":0.25},{\"label\":\"true\",\"probability\":0.75}]}]}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":0}}";
-    _ = try responseJson(a, request, valid_decision, false);
+    _ = try responseJson(a, request, valid_decision, .laya);
     for ([_][]const u8{
         "\"prompt_tokens\":\"10\",\"completion_tokens\":0",
         "\"prompt_tokens\":-1,\"completion_tokens\":0",
@@ -355,6 +410,42 @@ test "decide reports malformed executor responses as output failures" {
             "{{\"data\":[{{\"decisions\":[{{\"name\":\"act\",\"probabilities\":[{{\"label\":\"false\",\"probability\":0.25}},{{\"label\":\"true\",\"probability\":0.75}}]}}]}}],\"usage\":{{{s}}}}}",
             .{invalid_usage},
         );
-        try std.testing.expectError(error.InvalidDecideOutput, responseJson(a, request, response, false));
+        try std.testing.expectError(error.InvalidDecideOutput, responseJson(a, request, response, .laya));
     }
+}
+
+test "decide typed presenter rejects missing duplicate unknown and nonfinite labels" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = try parse(a,
+        \\{"model":"m","state":"x","questions":{"act":{"type":"noul","instructions":"Act?"}}}
+    );
+    const Label = @import("../pipelines/gliner_boundary_pipeline.zig").Label;
+    const cases = [_][]const Label{
+        &.{.{ .label = "false", .confidence = 1 }},
+        &.{ .{ .label = "false", .confidence = 0.5 }, .{ .label = "false", .confidence = 0.5 } },
+        &.{ .{ .label = "false", .confidence = 0.5 }, .{ .label = "unknown", .confidence = 0.5 } },
+        &.{ .{ .label = "false", .confidence = 0.5 }, .{ .label = "true", .confidence = std.math.nan(f32) } },
+        &.{ .{ .label = "false", .confidence = 0.5 }, .{ .label = "true", .confidence = 0.3 } },
+    };
+    for (cases) |labels| try std.testing.expectError(error.InvalidDecideOutput, responseClassifications(a, request, &.{.{ .name = "act", .multi_label = false, .labels = labels }}, 10));
+}
+
+test "decide typed envelope retains schema and text admission limits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = try parse(a,
+        \\{"model":"m","state":"long text","questions":{"act":{"type":"noul","instructions":"Act?"}}}
+    );
+    const wire = @import("extraction_v2.zig");
+    const input = try extractionValue(a, request, .span_marker);
+    var parsed = try wire.parseValue(a, input.value, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(request.state, parsed.items[0].text);
+    try std.testing.expectEqualStrings("false", parsed.items[0].compiled.schema.classifications[0].task.labels[0]);
+    try std.testing.expectEqualStrings("true", parsed.items[0].compiled.schema.classifications[0].task.labels[1]);
+    try std.testing.expectError(error.ExtractionTextLimitExceeded, wire.parseValue(a, input.value, .{ .limits = .{ .max_text_bytes_per_input = 1 } }));
+    try std.testing.expectError(error.ExtractionSchemaLimitExceeded, wire.parseValue(a, input.value, .{ .limits = .{ .max_total_schema_bytes = 1 } }));
 }

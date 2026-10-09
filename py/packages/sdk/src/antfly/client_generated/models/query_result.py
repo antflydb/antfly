@@ -28,6 +28,8 @@ class QueryResult:
     Attributes:
         took (int): Duration of the query in milliseconds.
         status (int): HTTP status code of the query operation.
+        remote_snapshot (str | Unset): Opaque remote publication and schema fence to echo with ordered pagination. This
+            token does not grant access or retain the publication.
         evaluation (QueryResultBaseEvaluation | Unset): Function evaluation scope, population, usage, and scoped
             aggregations.
         hits (QueryHits | Unset): A list of query hits.
@@ -46,6 +48,7 @@ class QueryResult:
 
     took: int
     status: int
+    remote_snapshot: str | Unset = UNSET
     evaluation: QueryResultBaseEvaluation | Unset = UNSET
     hits: QueryHits | Unset = UNSET
     aggregations: QueryResultBaseAggregations | Unset = UNSET
@@ -61,6 +64,8 @@ class QueryResult:
         took = self.took
 
         status = self.status
+
+        remote_snapshot = self.remote_snapshot
 
         evaluation: dict[str, Any] | Unset = UNSET
         if not isinstance(self.evaluation, Unset):
@@ -102,6 +107,8 @@ class QueryResult:
                 "status": status,
             }
         )
+        if remote_snapshot is not UNSET:
+            field_dict["remote_snapshot"] = remote_snapshot
         if evaluation is not UNSET:
             field_dict["evaluation"] = evaluation
         if hits is not UNSET:
@@ -137,6 +144,8 @@ class QueryResult:
         took = d.pop("took")
 
         status = d.pop("status")
+
+        remote_snapshot = d.pop("remote_snapshot", UNSET)
 
         _evaluation = d.pop("evaluation", UNSET)
         evaluation: QueryResultBaseEvaluation | Unset
@@ -194,6 +203,7 @@ class QueryResult:
         query_result = cls(
             took=took,
             status=status,
+            remote_snapshot=remote_snapshot,
             evaluation=evaluation,
             hits=hits,
             aggregations=aggregations,

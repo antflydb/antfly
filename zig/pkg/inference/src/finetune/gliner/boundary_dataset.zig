@@ -525,7 +525,7 @@ test "boundary training dataset resolves named mixed tasks and keeps exact occur
 }
 
 test "boundary training dataset allocation failures release snapshots schemas samples and split indexes" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseDataset, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseDataset, .{});
 }
 
 test "boundary training dataset rejects invalid rows duplicates version schema omissions and byte boundaries" {

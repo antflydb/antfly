@@ -1271,5 +1271,5 @@ test "reader capability probe distinguishes unsupported metadata and preserves a
             try std.testing.expectEqual(ReaderKind.encoder_decoder, support.supported);
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
 }

@@ -1131,7 +1131,7 @@ test "serverless graph cursor queries stop early retain top k and share authenti
     const id = try (@import("../artifacts/store.zig").UploadScope{ .domain = tree_store.domain, .attempt = tree_store.attempt }).artifactId(&checksum);
     const ref = manifest_mod.ArtifactRef{ .kind = .graph_segment, .name = "g", .artifact_id = &id, .checksum = &checksum, .byte_len = root_bytes.len, .metadata_version = pages_mod.Root.metadata_version };
     const fixture = Fixture{ .root = &root_bytes, .pages = &memory_pages };
-    try std.testing.checkAllAllocationFailures(alloc, Run.allocationFailure, .{ &fixture, ref });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Run.allocationFailure, .{ &fixture, ref });
     var foreign_root = root;
     foreign_root.domain = page_store.PageStore.namespaceDomain("other-namespace");
     var foreign_bytes = foreign_root.encode();
@@ -1365,7 +1365,7 @@ test "serverless graph traversal result materialization is allocation-failure sa
             defer node.deinit(a);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{&parents});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationRunner.run, .{&parents});
 }
 
 test "serverless graph reader traverses breadth-first with parent metadata" {

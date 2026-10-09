@@ -289,6 +289,7 @@ pub const RaBitQIndex = struct {
     num_vecs: usize,
     /// Raw vectors (float32, row-major). Owned, aligned copy.
     raw_vectors: []f32,
+    raw_range: ?@import("../segment_source.zig").View = null,
     /// Decoded quantized vector set. Owned.
     quantized_set: proto.RaBitQuantizedVectorSet,
     /// The quantizer (needed for search).
@@ -522,6 +523,78 @@ pub fn readRaBitQIndex(alloc: Allocator, data: []const u8, vec_doc_ids: []u32) !
     };
 }
 
+/// Range admission keeps raw vectors on disk. Search owns the quantized set
+/// required by the SIMD estimator; reconstruction reads only requested rows.
+/// The immutable source must remain alive until index deinit.
+pub fn readRaBitQIndexRanges(alloc: Allocator, section: @import("../segment_source.zig").View) !RaBitQIndex {
+    var input = VectorRangeInput{ .view = section };
+    if (try input.varint() != field_not_uninverted or try input.varint() != field_not_uninverted) return error.InvalidData;
+    const opt = try input.varint();
+    if (opt > 2) return error.InvalidData;
+    const n = std.math.cast(usize, try input.varint()) orelse return error.InvalidData;
+    if (try input.varint() != 0 or n > section.length - input.pos) return error.InvalidData;
+    const ids = try alloc.alloc(u32, n);
+    errdefer alloc.free(ids);
+    for (ids) |*id| id.* = std.math.cast(u32, try input.varint()) orelse return error.InvalidData;
+    if (try input.varint() != @backingInt(IndexType.rabitq)) return error.UnsupportedIndexType;
+    const size = try input.varint();
+    if (size != section.length - input.pos or size < 26) return error.InvalidData;
+    const blob = try @import("../segment_source.zig").View.init(section.source, section.offset + input.pos, size);
+    var header: [22]u8 = undefined;
+    try blob.readInto(0, &header);
+    if (!std.mem.eql(u8, header[0..4], &rabitq_magic)) return error.InvalidMagic;
+    if (header[4] != rabitq_version) return error.UnsupportedVersion;
+    const dims: usize = std.mem.readInt(u32, header[5..9], .little);
+    const metric = std.enums.fromInt(vec.DistanceMetric, header[9]) orelse return error.InvalidData;
+    const seed = std.mem.readInt(u64, header[10..18], .little);
+    if (dims == 0 or std.mem.readInt(u32, header[18..22], .little) != n) return error.InvalidData;
+    const raw_size = try std.math.mul(u64, try std.math.mul(u64, n, dims), 4);
+    if (raw_size > size - 26) return error.InvalidData;
+    var size_bytes: [4]u8 = undefined;
+    try blob.readInto(22 + raw_size, &size_bytes);
+    const qs_size = std.mem.readInt(u32, &size_bytes, .little);
+    if (qs_size != size - 26 - raw_size) return error.InvalidData;
+    const bytes = try alloc.alloc(u8, qs_size);
+    defer alloc.free(bytes);
+    try blob.readInto(26 + raw_size, bytes);
+    var qs = try proto.RaBitQuantizedVectorSet.decode(alloc, bytes);
+    errdefer qs.deinit(alloc);
+    const width = (dims - 1) / 64 + 1;
+    if (qs.codes.count != n or qs.codes.width != width or qs.codes.data.len != try std.math.mul(usize, n, width) or qs.code_counts.len != n or qs.centroid.len != dims or qs.centroid_distances.len != n or qs.quantized_dot_products.len != n or qs.metric != metric) return error.InvalidData;
+    if (metric != .l2_squared and qs.centroid_dot_products.len != n) return error.InvalidData;
+    var quantizer = try quantizer_mod.RaBitQuantizer.init(alloc, dims, seed, metric);
+    errdefer quantizer.deinit();
+    return .{ .dims = dims, .metric = metric, .seed = seed, .num_vecs = n, .raw_vectors = &.{}, .raw_range = try @import("../segment_source.zig").View.init(blob.source, blob.offset + 22, raw_size), .quantized_set = qs, .quantizer = quantizer, .alloc = alloc, .vec_doc_ids_buf = ids };
+}
+const VectorRangeInput = struct {
+    view: @import("../segment_source.zig").View,
+    pos: u64 = 0,
+    start: u64 = 0,
+    valid: usize = 0,
+    bytes: [8192]u8 = undefined,
+    fn byte(self: *@This()) !u8 {
+        if (self.pos >= self.view.length) return error.InvalidData;
+        if (self.valid == 0 or self.pos - self.start >= self.valid) {
+            self.start = self.pos;
+            self.valid = @intCast(@min(self.bytes.len, self.view.length - self.pos));
+            try self.view.readInto(self.pos, self.bytes[0..self.valid]);
+        }
+        const b = self.bytes[@intCast(self.pos - self.start)];
+        self.pos += 1;
+        return b;
+    }
+    fn varint(self: *@This()) !u64 {
+        var value: u64 = 0;
+        for (0..10) |i| {
+            const b = try self.byte();
+            if (i == 9 and b > 1) return error.InvalidData;
+            value |= @as(u64, b & 127) << @as(u6, @intCast(i * 7));
+            if (b & 128 == 0) return value;
+        }
+        return error.InvalidData;
+    }
+};
+
 /// Reconstruct original vectors by IDs (needed for segment merges).
 /// Returns a newly allocated float32 slice with the reconstructed vectors.
 pub fn reconstructVectors(
@@ -530,12 +603,14 @@ pub fn reconstructVectors(
     vec_ids: []const u32,
 ) ![]f32 {
     const dims = index.dims;
-    const result = try alloc.alloc(f32, vec_ids.len * dims);
+    const result = try alloc.alloc(f32, std.math.mul(usize, vec_ids.len, dims) catch return error.InvalidData);
     errdefer alloc.free(result);
 
     for (vec_ids, 0..) |vid, i| {
-        const src = index.raw_vectors[vid * dims ..][0..dims];
-        @memcpy(result[i * dims ..][0..dims], src);
+        if (vid >= index.num_vecs) return error.InvalidVectorId;
+        if (index.raw_range) |view| {
+            try view.readInto(@as(u64, vid) * dims * 4, std.mem.sliceAsBytes(result[i * dims ..][0..dims]));
+        } else @memcpy(result[i * dims ..][0..dims], index.raw_vectors[vid * dims ..][0..dims]);
     }
 
     return result;
@@ -653,4 +728,56 @@ test "vector section reconstruct vectors" {
     for (0..dims) |d| {
         try std.testing.expectApproxEqAbs(v1[d], reconstructed[d], 1e-6);
     }
+}
+
+test "vector range reader owns quantized state and fetches selected raw rows" {
+    const a = std.testing.allocator;
+    var content = VectorIndexContent.init(a, 8, .l2_squared, .recall_optimized);
+    defer content.deinit();
+    const first = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const second = [_]f32{ 8, 7, 6, 5, 4, 3, 2, 1 };
+    try content.addVector(&first, 10);
+    try content.addVector(&second, 20);
+    const bytes = try writeVectorSection(a, &content, 42);
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        reads: usize = 0,
+        fail: bool = false,
+        fn read(ptr: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail) return error.TestReadFailure;
+            self.reads += out.len;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = State{ .bytes = bytes };
+    const view = try @import("../segment_source.zig").View.init(.{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close } }, 0, bytes.len);
+    var range = try readRaBitQIndexRanges(a, view);
+    defer range.deinit();
+    try std.testing.expectEqual(@as(usize, 0), range.raw_vectors.len);
+    const before = state.reads;
+    const rows = try reconstructVectors(a, &range, &.{1});
+    defer a.free(rows);
+    try std.testing.expectEqualSlices(f32, &second, rows);
+    try std.testing.expectEqual(@as(usize, 32), state.reads - before);
+    var hits = try range.search(&first, 2, range.vec_doc_ids_buf);
+    defer hits.deinit();
+    try std.testing.expectEqual(@as(u32, 10), hits.getHits()[0].doc_id);
+    state.fail = true;
+    try std.testing.expectError(error.TestReadFailure, reconstructVectors(a, &range, &.{0}));
+    state.fail = false;
+    try std.testing.expectError(error.InvalidVectorId, reconstructVectors(a, &range, &.{2}));
+    const Sweep = struct {
+        fn run(allocator: Allocator, source: @import("../segment_source.zig").View) !void {
+            var reader = try readRaBitQIndexRanges(allocator, source);
+            defer reader.deinit();
+            const reconstructed = try reconstructVectors(allocator, &reader, &.{0});
+            defer allocator.free(reconstructed);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Sweep.run, .{view});
+    const truncated = try @import("../segment_source.zig").View.init(view.source, 0, bytes.len - 1);
+    try std.testing.expectError(error.InvalidData, readRaBitQIndexRanges(a, truncated));
 }

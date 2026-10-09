@@ -23,9 +23,11 @@ pub const Context = struct {
     io: ?std.Io = null,
     deadline_ns: ?u64 = null,
     cancellation: ?storage.CancellationToken = null,
+    checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
     pub fn ensureActive(self: Context) !void {
         if (self.cancellation) |token| try token.check();
         if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        if (self.checkpoint) |hook| try hook.check(hook.ptr);
     }
 };
 

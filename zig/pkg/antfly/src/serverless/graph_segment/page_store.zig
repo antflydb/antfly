@@ -524,5 +524,5 @@ test "serverless paged public adjacency reader preserves query-local identities 
 }
 
 test "serverless paged public adjacency reader cleans every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exercisePageReader, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exercisePageReader, .{});
 }

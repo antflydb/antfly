@@ -598,7 +598,7 @@ fn poolAllocationProbe(allocator: std.mem.Allocator) !void {
 }
 
 test "gliner boundary shared pool stable ties deduplicate quotas and unwind every failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, poolAllocationProbe, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, poolAllocationProbe, .{});
 }
 
 test "gliner boundary shared pool masks padding and inactive queries per sample" {

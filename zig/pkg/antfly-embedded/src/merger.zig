@@ -155,6 +155,7 @@ pub const SegmentInfo = struct {
 };
 
 pub const MergeOutputOptions = struct {
+    source_map: ?*segment_mod.MergeSourceMap = null,
     target_segment_bytes: usize = 256 * 1024 * 1024,
     index_sort: []const segment_mod.SegmentIndexSortField = &.{},
     /// Optional task-owned deletion view aligned with `segment_indices`.
@@ -229,7 +230,7 @@ pub fn mergeSegmentsBounded(
     var total_input_bytes: u64 = 0;
     for (segment_indices, 0..) |si, i| {
         const seg = &snap.segments[si];
-        total_input_bytes += seg.data.bytes().len;
+        total_input_bytes += seg.data.len();
         if (options.deleted_docs == null) owned_deleted_docs[i] = try seg.cloneDeleted(alloc);
         inputs[i] = .{
             .reader = &seg.reader,
@@ -252,7 +253,10 @@ pub fn mergeSegmentsBounded(
         errdefer alloc.free(segments);
         segments[0] = try segment_mod.mergeSegmentInputsWithOptions(alloc, inputs, .{
             .index_sort = effective_index_sort,
+            .source_map = options.source_map,
         });
+        errdefer alloc.free(segments[0]);
+        if (options.source_map) |map| try map.finishOutput(live_docs);
         return segments;
     }
 
@@ -273,12 +277,16 @@ pub fn mergeSegmentsBounded(
         var window_len = @min(docs_per_segment, live_docs - window_start);
         const segment = while (true) {
             const window_end = window_start + window_len;
-            const candidate = try mergeLiveDocWindow(alloc, inputs, window_start, window_end, effective_index_sort);
+            const candidate = try mergeLiveDocWindow(alloc, inputs, window_start, window_end, effective_index_sort, options.source_map);
             if (candidate.len <= target_bytes or window_len == 1) break candidate;
             alloc.free(candidate);
             window_len = @max(@as(u32, 1), window_len / 2);
         };
-        try outputs.append(alloc, segment);
+        outputs.append(alloc, segment) catch |err| {
+            alloc.free(segment);
+            return err;
+        };
+        if (options.source_map) |map| try map.finishOutput(window_len);
         window_start += window_len;
     }
 
@@ -374,6 +382,7 @@ fn mergeLiveDocWindow(
     window_start: u32,
     window_end: u32,
     index_sort: []const segment_mod.SegmentIndexSortField,
+    source_map: ?*segment_mod.MergeSourceMap,
 ) ![]u8 {
     const window_inputs = try alloc.alloc(segment_mod.MergeInput, inputs.len);
     defer alloc.free(window_inputs);
@@ -409,6 +418,7 @@ fn mergeLiveDocWindow(
 
     return try segment_mod.mergeSegmentInputsWithOptions(alloc, window_inputs, .{
         .index_sort = index_sort,
+        .source_map = source_map,
     });
 }
 
@@ -555,7 +565,9 @@ test "bounded merge splits output and preserves live documents" {
     try writer.addSegment(seg2);
     try writer.addSegment(seg3);
 
-    const merged = try mergeSegmentsBounded(alloc, writer.snapshot(), &.{ 0, 1, 2 }, .{ .target_segment_bytes = 1 });
+    var source_map = try segment_mod.MergeSourceMap.init(alloc, &.{ 1, 1, 1 });
+    defer source_map.deinit();
+    const merged = try mergeSegmentsBounded(alloc, writer.snapshot(), &.{ 0, 1, 2 }, .{ .target_segment_bytes = 1, .source_map = &source_map });
     defer freeMergedSegments(alloc, merged);
 
     try std.testing.expect(merged.len > 1);
@@ -567,6 +579,13 @@ test "bounded merge splits output and preserves live documents" {
         total_docs += reader.doc_count;
     }
     try std.testing.expectEqual(@as(u32, 3), total_docs);
+    for (0..3) |source_index| {
+        const mapped = source_map.lookup(source_index, 0).?;
+        var reader = try segment_mod.SegmentReader.init(alloc, merged[mapped.segment]);
+        defer reader.deinit();
+        const original = (try writer.snapshot().segments[source_index].reader.storedDoc(0)).?;
+        try std.testing.expectEqualStrings(original.id, (try reader.storedDoc(mapped.doc)).?.id);
+    }
 }
 
 test "merge policy drains a small-segment backlog and applyMerge replaces it" {
@@ -604,7 +623,7 @@ test "merge policy drains a small-segment backlog and applyMerge replaces it" {
         const deletion_summary = seg.deletionSummary();
         infos[i] = .{
             .index = i,
-            .size = seg.data.bytes().len,
+            .size = seg.data.len(),
             .doc_count = seg.reader.doc_count,
             .deleted_count = deletion_summary.count,
             .has_deletions = deletion_summary.has_deletions,

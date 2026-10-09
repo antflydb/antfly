@@ -2957,7 +2957,7 @@ pub const GraphIndex = struct {
             else => return err,
         };
         const meta = decodeGraphMetricMeta(raw) orelse return score_generation;
-        return if (meta.target_edge_generation != 0)
+        return if (meta.schema_version >= 4)
             meta.target_edge_generation
         else
             score_generation;
@@ -19581,7 +19581,7 @@ pub const GraphIndex = struct {
             defer self.alloc.free(meta_key);
             if (txn.get(meta_key)) |raw| {
                 if (decodeGraphMetricMeta(raw)) |meta| {
-                    if (meta.target_edge_generation != 0) published_edge_generation = meta.target_edge_generation;
+                    if (meta.schema_version >= 4) published_edge_generation = meta.target_edge_generation;
                     if (meta.schema_version >= 3) {
                         config_fingerprint_stale = meta.config_fingerprint != graphMetricConfigFingerprint(cfg);
                     }
@@ -19664,7 +19664,7 @@ pub const GraphIndex = struct {
         // pre-v4 materializations used the same value for both.
         const published_edge_generation = if (published_generation == 0)
             0
-        else if (meta.target_edge_generation != 0)
+        else if (meta.schema_version >= 4)
             meta.target_edge_generation
         else
             published_generation;

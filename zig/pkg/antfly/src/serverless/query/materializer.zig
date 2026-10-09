@@ -172,7 +172,7 @@ test "serverless materializer transfers output ownership and unwinds every alloc
             try std.testing.expectEqualStrings("c", docs[1].doc_id);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "materializer applies upserts and deletes into document state" {

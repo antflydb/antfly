@@ -358,7 +358,7 @@ fn freeParsedGraphEdges(alloc: Allocator, edges: []ParsedGraphEdge) void {
 }
 
 test "serverless lake graph parser propagates allocation failure without losing edges" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(alloc: Allocator) !void {
             const edges = try parseGraphEdgesAlloc(alloc, "[{\"target\":\"b\",\"edge_type\":\"link\",\"target_table\":\"other\"}]");
             defer freeParsedGraphEdges(alloc, edges);
