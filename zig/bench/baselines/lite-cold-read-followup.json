@@ -299,5 +299,40 @@
       "covers": "immutable values and tombstones, namespace separation; snapshot memtable precedence remains in the existing read path"
     },
     "validation_scope": "native fixtures; directory selection counts are not an end-to-end throughput benchmark; no new 2 GiB soak"
+  },
+  "sync_cache_comparison_commit": "befe770af2eaa68f12bd2048bfc14e3cbb5b93e5",
+  "sync_cache_followup": {
+    "cold_prefix_arena": {
+      "lookups": 64,
+      "before_owned_row_bytes": 4224,
+      "after_owned_row_bytes": 3392,
+      "before_arena_backing_bytes": 486496,
+      "after_arena_backing_bytes": 6526,
+      "before_read_budget_limit_bytes": 1,
+      "before_read_budget_result": "lookup incorrectly succeeded",
+      "after_read_budget_result": "ResourceBudgetExceeded before result allocation",
+      "after_admitted_read_charge_on_return_bytes": 0
+    },
+    "warm_decoded_prefix": {
+      "lookups": 64,
+      "after_result_backing_allocations": 0,
+      "after_physical_reads": 0,
+      "after_owned_row_allocations": 0,
+      "returned_values": "borrowed from retained decoded handles; callers preserve normal pin/value ownership"
+    },
+    "normal_miss": {
+      "before_cached_block_references": [
+        1,
+        2
+      ],
+      "after_cached_block_references": [
+        1,
+        1
+      ],
+      "cold_prefix_miss": "one physical load; no second full-block decode"
+    },
+    "implementation": "shared PointReadScratch admission and error translation; PrefixPointReader bounds and count validation; warm decoded-block lookup first; explicit handle ownership transfer; physical IO buffer released on checksum failure",
+    "coverage": "denied and admitted scratch, caller arena storage, warm reads under a denied scratch budget, namespace-preserving point semantics, invalid entry counts, corruption, result allocation failures, cache invalidation and returned-row lifetime",
+    "scope": "isolated native cache fixtures; not an end-to-end throughput or 2 GiB soak"
   }
 }
