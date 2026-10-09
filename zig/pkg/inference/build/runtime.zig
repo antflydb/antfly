@@ -349,7 +349,12 @@ pub fn create(config: Config) Graph {
         .target = target,
         .optimize = optimize,
     });
-    inference_mod.addImport("antfly_decisions", @import("../../../lib/decisions/build.zig").create(b, b.path(pathJoin(b, paths.shared_lib_root, "lib/decisions/root.zig"))));
+    // Reuse the embedded consumer's source identity when sharing a build.
+    // Keep build imports inside this package so standalone builds work too.
+    const decisions_mod = b.modules.get("antfly_decisions") orelse b.addModule("antfly_decisions", .{
+        .root_source_file = b.path(pathJoin(b, paths.shared_lib_root, "lib/decisions/root.zig")),
+    });
+    inference_mod.addImport("antfly_decisions", decisions_mod);
     addInferenceRootImports(inference_mod, .{
         .c_bindings = c_bindings,
         .build_info_mod = shared.build_info_mod,
@@ -391,7 +396,7 @@ pub fn create(config: Config) Graph {
         .target = target,
         .optimize = optimize,
     });
-    inference_internal_mod.addImport("antfly_decisions", @import("../../../lib/decisions/build.zig").create(b, b.path(pathJoin(b, paths.shared_lib_root, "lib/decisions/root.zig"))));
+    inference_internal_mod.addImport("antfly_decisions", decisions_mod);
     inference_internal_mod.addImport("build_info", shared.build_info_mod);
     identities.addImports(inference_internal_mod);
     inference_internal_mod.addImport("build_options", build_options_mod);

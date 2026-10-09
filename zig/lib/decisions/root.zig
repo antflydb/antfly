@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Public named-array decision contract. The model adapters retain their
 //! private typed-classification representation behind this boundary.
 const std = @import("std");
@@ -131,7 +144,16 @@ pub fn requestJson(backing: A, model: []const u8, input: []const u8, questions: 
         }
         if (original.get("embedding_options")) |configured| {
             try q.put(a, "embedding_options", configured);
-        } else if (!original.contains("similarity_thresholds") and acceptance.count() != 0) try q.put(a, "embedding_options", .{ .object = acceptance });
+        } else if (acceptance.count() != 0) {
+            var policy = acceptance;
+            if (original.contains("similarity_thresholds")) {
+                // Explicit multi-choice cutoffs replace fitted/choice cutoffs,
+                // but still need the configured ambiguity margin.
+                policy = .{};
+                if (acceptance.get("min_margin")) |margin| try policy.put(a, "min_margin", margin);
+            }
+            if (policy.count() != 0) try q.put(a, "embedding_options", .{ .object = policy });
+        }
         if (original.get("similarity_thresholds")) |thresholds| try q.put(a, "similarity_thresholds", thresholds);
         try out.append(.{ .object = q });
     }

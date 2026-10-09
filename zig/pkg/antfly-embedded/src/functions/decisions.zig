@@ -596,6 +596,23 @@ test "decision provider OpenAI configuration and score limits" {
     try validateQuestions(questions, capabilities(.antfly));
 }
 
+test "decision provider multi choice cutoffs retain the configured ambiguity margin" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const public = try std.json.parseFromSliceLeaky(Json, a,
+        \\[{"name":"tags","type":"multi_choice","instructions":"Tags","choices":[{"value":"a"},{"value":"b"}],"similarity_thresholds":0.5}]
+    , .{});
+    const questions = try publicQuestions(a, public);
+    const cfg: DeciderConfig = .{ .provider = .antfly, .model = "embeddinggemma2", .decision_method = .embedding_similarity, .embedding_options = .{ .min_similarity = 0.4, .min_margin = 0.1 } };
+    const request = try contract.parse(a, try wireRequest(a, cfg, "input", questions));
+    const policy = request.policies[0];
+    try std.testing.expectEqual(@as(?f64, null), policy.options.min_similarity);
+    try std.testing.expectEqual(@as(?f64, 0.1), policy.options.min_margin);
+    const selection = try contract.scoring.selectMulti(a, &.{ 0.51, 0.2 }, policy.thresholds.?, policy.options.min_margin);
+    try std.testing.expectEqualStrings("abstained", selection.status);
+}
+
 test "decision provider named arrays isolate calibration and validate empty multi choice" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

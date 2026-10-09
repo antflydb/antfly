@@ -12,7 +12,7 @@ The initial supported checkpoint is revision
 `914f7f89142e33e77833254d9c9b90c3cef7303b`. Acquire its original weights and sidecars:
 
 ```sh
-python3 zig/pkg/inference/tools/embeddinggemma2/reference.py acquire models/embedders/embeddinggemma2
+python3 tools/embeddinggemma2/reference.py acquire models/embedders/embeddinggemma2
 ```
 
 The acquisition tool verifies the resolved revision and LFS weight digest, keeps
@@ -222,7 +222,7 @@ Collect real application scores and truth labels with disjoint `fit`,
 ```
 
 ```sh
-python3 zig/pkg/inference/tools/embeddinggemma2/calibrate.py scores.json \
+python3 tools/embeddinggemma2/calibrate.py scores.json \
   models/embedders/embeddinggemma2/calibrations/support_v1.json \
   --precision 0.9 --minimum-coverage 0.2
 ```
@@ -255,7 +255,7 @@ calibration artifact is supplied by this change.
 Run the socket-level contract campaign against the current supervised server:
 
 ```sh
-python3 zig/pkg/inference/tools/embeddinggemma2/qualify.py \
+python3 tools/embeddinggemma2/qualify.py \
   --url http://127.0.0.1:8090/ai/v1 --model embeddinggemma2 \
   --oracle artifacts/oracle.json --media-oracle artifacts/media-oracle.json \
   --iterations 32 --concurrency 4 --output artifacts/live-qualification.json
@@ -377,7 +377,7 @@ and a source manifest mapping repository-relative files to SHA-256 digests:
 cd zig/pkg/inference
 zig build build-embeddinggemma2-bench -Dmetal=true -Doptimize=ReleaseFast -j1
 cd ../../..
-python3 zig/pkg/inference/tools/embeddinggemma2/encoder_campaign.py \
+python3 tools/embeddinggemma2/encoder_campaign.py \
   --model-dir <model-dir> --suite suite.json \
   --baseline <archived-encoder-binary> \
   --candidate zig/pkg/inference/zig-out/bin/antfly-embeddinggemma2-bench \
@@ -417,11 +417,11 @@ Prepare the suite once, then run each backend in a separate process:
 ```sh
 export PYTHONPATH=<pinned-python-dependencies>
 export VECLIB_MAXIMUM_THREADS=4 OMP_NUM_THREADS=4
-python3 zig/pkg/inference/tools/embeddinggemma2/compare.py --backend prepare \
+python3 tools/embeddinggemma2/compare.py --backend prepare \
   --model-dir <model-dir> --artifacts-dir <oracle-and-media-dir> --output suite.json
-python3 zig/pkg/inference/tools/embeddinggemma2/compare.py --backend mps \
+python3 tools/embeddinggemma2/compare.py --backend mps \
   --model-dir <model-dir> --suite suite.json --output pytorch-mps.json
-python3 zig/pkg/inference/tools/embeddinggemma2/compare.py --backend metal \
+python3 tools/embeddinggemma2/compare.py --backend metal \
   --model-dir <model-dir> --suite suite.json --reference pytorch-mps.json \
   --binary zig/pkg/inference/zig-out/bin/antfly-inference --output metal.json
 ```
