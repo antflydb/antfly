@@ -456,6 +456,119 @@ test "system catalog relation namespace transaction replay verification skips un
     try journal.accept();
 }
 
+test "system catalog relation namespace transaction snapshots verify ownership before atomic replacement" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    const T = struct {
+        fn seed(store: *RaftApplyStore, table: metadata.TableRecord) !void {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var buf: [160]u8 = undefined;
+            try txn.put(try RaftApplyStore.relationWriterKeyForGroup(&buf, group), "AFRW01");
+            try txn.commit();
+            try store.replaceStandaloneCatalog(group, 0, &.{table}, &.{}, "{}");
+        }
+        fn onProjection(ptr: *anyopaque, _: ProjectionSignal) void {
+            const count: *usize = @ptrCast(@alignCast(ptr));
+            count.* += 1;
+        }
+        fn onKey(ptr: *anyopaque, _: CommittedKeySignal) void {
+            const count: *usize = @ptrCast(@alignCast(ptr));
+            count.* += 1;
+        }
+        const Variant = enum { missing, forged, extra, writer, legacy, orphan, namespace };
+        fn tamper(rows: []const docstore.OwnedKVPair, variant: Variant) ![]u8 {
+            var selected: std.ArrayListUnmanaged(docstore.OwnedKVPair) = .empty;
+            defer selected.deinit(a);
+            var owner: relation_names.Owner = undefined;
+            for (rows) |row| if (try relation_names.Key.fromStorageKey(row.key, group) != null) {
+                owner = try relation_names.Owner.decode(row.value);
+                break;
+            };
+            owner.schema_digest[0] ^= 1;
+            var encoded_owner = try owner.encode();
+            const extra_key = try (relation_names.Key{ .namespace_id = system_catalog.default_namespace_id, .name = "injected" }).storageKeyAlloc(a, group);
+            defer a.free(extra_key);
+            var buf: [160]u8 = undefined;
+            const writer_key = try RaftApplyStore.relationWriterKeyForGroup(&buf, group);
+            var invalid_writer = [_]u8{ 'b', 'a', 'd' };
+            const namespace_key = try std.fmt.allocPrint(a, "\x00\x00__metadata__:system_catalog:{d}:record:namespace:2", .{group});
+            defer a.free(namespace_key);
+            const invalid_namespace = try std.json.Stringify.valueAlloc(a, system_catalog.Resource{ .kind = .namespace, .id = 2, .parent_id = 999, .name = system_catalog.default_namespace_name }, .{});
+            defer a.free(invalid_namespace);
+            for (rows) |row| {
+                const is_claim = try relation_names.Key.fromStorageKey(row.key, group) != null;
+                const is_writer = std.mem.eql(u8, row.key, writer_key);
+                if ((variant == .missing and is_claim) or (variant == .legacy and (is_claim or is_writer))) continue;
+                var copy = row;
+                if (variant == .forged and is_claim) copy.value = &encoded_owner;
+                if (variant == .writer and is_writer) copy.value = &invalid_writer;
+                if (variant == .namespace and std.mem.eql(u8, row.key, namespace_key)) copy.value = invalid_namespace;
+                try selected.append(a, copy);
+            }
+            if (variant == .extra) try selected.append(a, .{ .key = extra_key, .value = &encoded_owner });
+            const binding_key = try std.fmt.allocPrint(a, "\x00\x00__metadata__:system_catalog:{d}:record:table:999", .{group});
+            defer a.free(binding_key);
+            const binding = try std.json.Stringify.valueAlloc(a, system_catalog.Resource{ .kind = .table, .id = 999, .parent_id = system_catalog.default_namespace_id, .name = "orphan", .storage_name = "absent" }, .{});
+            defer a.free(binding);
+            if (variant == .orphan) try selected.append(a, .{ .key = binding_key, .value = binding });
+            return encodeMetadataSnapshot(a, selected.items);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const source_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/relation-snapshot-source", .{tmp.sub_path});
+    defer a.free(source_root);
+    const target_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/relation-snapshot-target", .{tmp.sub_path});
+    defer a.free(target_root);
+    var source = try RaftApplyStore.init(a, .{ .root_dir = source_root });
+    defer source.deinit();
+    try T.seed(&source, .{ .table_id = 7, .name = "incoming", .schema_json = "{}" });
+    var bindings = [_]system_catalog.Resource{.{ .kind = .table, .id = 7, .parent_id = system_catalog.default_namespace_id, .name = "incoming", .storage_name = "incoming" }};
+    try source.updateStandaloneCatalog(group, try source.standaloneRevision(), .{
+        .logical = .{ .previous_revision = 0, .delta = .{ .upserts = &bindings, .removes = &.{}, .next_id = 8 } },
+    });
+    const snapshot = try source.snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(snapshot);
+    const rows = try decodeMetadataSnapshotAlloc(a, snapshot);
+    defer freeMetadataSnapshotRows(a, rows);
+    var cancelled: std.atomic.Value(bool) = .init(true);
+    try std.testing.expectError(error.SnapshotBuildCancelled, validateMetadataSnapshotRowsCancelable(a, group, rows, &cancelled));
+    {
+        var target = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+        defer target.deinit();
+        try T.seed(&target, .{ .table_id = 9, .name = "retired", .schema_json = "{}" });
+        try target.applyStandaloneCommand(42, .{ .upsert_table = .{ .table_id = 11, .name = "other_group", .schema_json = "{}" } });
+        var signals: usize = 0;
+        try target.addProjectionListener(.{ .ptr = &signals, .vtable = &.{ .on_projection_signal = T.onProjection } });
+        try target.addCommittedKeyListener(.{ .ptr = &signals, .vtable = &.{ .matches_key = MetadataReplayTest.Capture.matchesKey, .on_committed_key = T.onKey } });
+        for ([_]T.Variant{ .missing, .forged, .extra, .writer, .legacy, .orphan, .namespace }) |variant| {
+            const invalid = try T.tamper(rows, variant);
+            defer a.free(invalid);
+            try std.testing.expectError(error.InvalidMetadataSnapshot, target.snapshotBuilder().installSnapshot(a, group, 5, invalid));
+            try std.testing.expectEqual(@as(u64, 0), try target.durableAppliedIndex(group));
+            try std.testing.expectEqual(@as(usize, 0), signals);
+            var txn = try target.store.beginReadTxn();
+            defer txn.abort();
+            var buf: [160]u8 = undefined;
+            _ = try txn.get(try tableKeyForGroup(&buf, group, 9));
+        }
+        try std.testing.expect(try target.snapshotBuilder().installSnapshot(a, group, 5, snapshot));
+        try std.testing.expect(signals > 0);
+    }
+    var recovered = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+    defer recovered.deinit();
+    var txn = try recovered.store.beginReadTxn();
+    defer txn.abort();
+    try std.testing.expect(try RaftApplyStore.relationWriterEnabledTxn(&txn, group));
+    var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = group };
+    try std.testing.expectEqual(@as(u64, 7), (try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "incoming" })).?.table_id);
+    try std.testing.expect((try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "retired" })) == null);
+    var buf: [160]u8 = undefined;
+    _ = try txn.get(try tableKeyForGroup(&buf, 42, 11));
+    try std.testing.expectEqual(@as(u64, 5), try recovered.durableAppliedIndex(group));
+}
+
 test "system catalog relation namespace transaction rolls back with schema and persists across restart" {
     const a = std.testing.allocator;
     const names = @import("antfly_local_sources").system_catalog_relation_names;
@@ -13529,6 +13642,8 @@ pub const RaftApplyStore = struct {
     const MetadataSnapshotProjection = enum {
         secret_collection,
         system_catalog,
+        relation_writer,
+        relation_names,
         topology_activation,
         metadata_incarnation,
         split_transition,
@@ -13588,6 +13703,8 @@ pub const RaftApplyStore = struct {
         .{ .projection = .secret_collection, .key = .{ .prefix = secret_store.prefixForGroup } },
         .{ .projection = .topology_activation, .key = .{ .point = topologyActivationKeyForGroup } },
         .{ .projection = .system_catalog, .key = .{ .prefix = system_catalog_storage.prefixForGroup } },
+        .{ .projection = .relation_writer, .key = .{ .point = relationWriterKeyForGroup } },
+        .{ .projection = .relation_names, .key = .{ .prefix = relation_names.Key.prefixForGroup } },
         .{ .projection = .metadata_incarnation, .key = .{ .point = metadataIncarnationKeyForGroup } },
         .{ .projection = .split_transition, .key = .{ .prefix = splitTransitionPrefixForGroup } },
         .{ .projection = .merge_transition, .key = .{ .prefix = mergeTransitionPrefixForGroup } },
@@ -13714,7 +13831,10 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.catalog_revision),
         };
         // Table publication and DROP update lifecycle roots in the same cut.
-        return if ((mask & metadataSnapshotProjectionBit(.table)) != 0) mask | metadataSnapshotProjectionBit(.lake_index_lifecycle) else mask;
+        return if ((mask & metadataSnapshotProjectionBit(.table)) != 0)
+            mask | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.relation_names)
+        else
+            mask;
     }
 
     const PreparedSnapshot = struct {
@@ -13804,6 +13924,14 @@ pub const RaftApplyStore = struct {
         const existing = blk: {
             var read_txn = try self.store.beginReadTxn();
             defer read_txn.abort();
+            if (try relationWriterEnabledTxn(&read_txn, group_id)) {
+                var writer_buf: [160]u8 = undefined;
+                const writer_key = try relationWriterKeyForGroup(&writer_buf, group_id);
+                const retained = for (rows) |row| {
+                    if (std.mem.eql(u8, row.key, writer_key)) break true;
+                } else false;
+                if (!retained) return error.InvalidMetadataSnapshot;
+            }
             break :blk try self.collectMetadataSnapshotRowsTxn(alloc, &read_txn, group_id, null, false);
         };
         defer freeMetadataSnapshotRows(alloc, existing);
@@ -13845,6 +13973,8 @@ pub const RaftApplyStore = struct {
     ) ![]u8 {
         const rows = try self.collectMetadataSnapshotRowsTxn(alloc, txn, group_id, cancelled, true);
         defer freeMetadataSnapshotRows(alloc, rows);
+        try validateMetadataSnapshotRowsCancelable(alloc, group_id, rows, cancelled);
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
         return try encodeMetadataSnapshot(alloc, rows);
     }
 
@@ -14232,12 +14362,30 @@ pub const RaftApplyStore = struct {
         if (binding) |value| {
             if (!std.mem.eql(u8, value.value.storage_name, table.name)) return error.InvalidCatalogRecord;
         } else if (!allow_legacy) return error.InvalidCatalogRecord;
+        try validateRelationBindingHierarchy(a, reader, group_id, if (binding) |value| value.value.parent_id else system_catalog.default_namespace_id);
         return .{ .bound = binding != null, .cut = try relation_names.TableCut.init(a, .{
             .namespace_id = if (binding) |value| value.value.parent_id else system_catalog.default_namespace_id,
             .table_id = table_id,
             .name = if (binding) |value| value.value.name else table.name,
             .schema_json = table.query_definition.?.schema_json,
         }) };
+    }
+    fn validateRelationBindingHierarchy(a: std.mem.Allocator, reader: anytype, group_id: u64, namespace_id: u64) !void {
+        var namespace = try system_catalog_storage.getById(a, reader, group_id, .namespace, namespace_id);
+        defer if (namespace) |*value| value.deinit();
+        if (namespace == null and namespace_id != system_catalog.default_namespace_id) return error.InvalidCatalogRecord;
+        const database_id = if (namespace) |value| value.value.parent_id else system_catalog.default_database_id;
+        if (namespace) |value| try system_catalog.validateResourceName(.namespace, value.value.name);
+        if (namespace_id == system_catalog.default_namespace_id and namespace != null and
+            (database_id != system_catalog.default_database_id or !std.mem.eql(u8, namespace.?.value.name, system_catalog.default_namespace_name))) return error.InvalidCatalogRecord;
+        var database = try system_catalog_storage.getById(a, reader, group_id, .database, database_id);
+        defer if (database) |*value| value.deinit();
+        if (database == null and database_id != system_catalog.default_database_id) return error.InvalidCatalogRecord;
+        if (database) |value| {
+            try system_catalog.validateResourceName(.database, value.value.name);
+            if (value.value.parent_id != 0) return error.InvalidCatalogRecord;
+            if (database_id == system_catalog.default_database_id and !std.mem.eql(u8, value.value.name, system_catalog.default_database_name)) return error.InvalidCatalogRecord;
+        }
     }
     fn capturedRelationTableId(key: []const u8, group_id: u64) !?u64 {
         if (try system_catalog_storage.tableIdFromRecordKey(key, group_id)) |id| return id;
@@ -23425,14 +23573,77 @@ fn validateMetadataSnapshotRows(
     group_id: u64,
     rows: []const docstore.OwnedKVPair,
 ) !void {
-    var seen = std.StringHashMapUnmanaged(void).empty;
+    return validateMetadataSnapshotRowsCancelable(alloc, group_id, rows, null);
+}
+
+fn validateMetadataSnapshotRowsCancelable(alloc: std.mem.Allocator, group_id: u64, rows: []const docstore.OwnedKVPair, cancelled: ?*const std.atomic.Value(bool)) !void {
+    if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+    var seen = std.StringHashMapUnmanaged([]const u8).empty;
     defer seen.deinit(alloc);
     try seen.ensureTotalCapacity(alloc, @intCast(rows.len));
     for (rows) |row| {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
         if (!metadataSnapshotKeyBelongsToGroup(group_id, row.key)) return error.InvalidMetadataSnapshot;
         const result = try seen.getOrPut(alloc, row.key);
         if (result.found_existing) return error.InvalidMetadataSnapshot;
+        result.value_ptr.* = row.value;
     }
+    validateRelationSnapshotCut(alloc, group_id, rows, &seen, cancelled) catch |err| switch (err) {
+        error.OutOfMemory, error.SnapshotBuildCancelled => return err,
+        else => return error.InvalidMetadataSnapshot,
+    };
+}
+
+/// Validate outside the apply lock, using borrowed snapshot rows and one
+/// transient names-only table cut at a time. Every expected claim must match
+/// exactly; equal total cardinality then excludes unrelated injected claims.
+/// This is verification, never a repair or a hot-path catalog scan.
+fn validateRelationSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []const docstore.OwnedKVPair, values: *const std.StringHashMapUnmanaged([]const u8), cancelled: ?*const std.atomic.Value(bool)) !void {
+    const Reader = struct {
+        values: *const std.StringHashMapUnmanaged([]const u8),
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            return self.values.get(key) orelse error.NotFound;
+        }
+    };
+    var reader: Reader = .{ .values = values };
+    var buf: [160]u8 = undefined;
+    const writer = values.get(try RaftApplyStore.relationWriterKeyForGroup(&buf, group_id));
+    var received: usize = 0;
+    for (rows) |row| {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        if (try relation_names.Key.fromStorageKey(row.key, group_id) != null) {
+            _ = try relation_names.Owner.decode(row.value);
+            received += 1;
+        }
+    }
+    if (writer == null) {
+        if (received != 0) return error.InvalidMetadataSnapshot;
+        return;
+    }
+    if (!std.mem.eql(u8, writer.?, "AFRW01")) return error.InvalidMetadataSnapshot;
+    var registry: relation_names.Store(Reader) = .{ .txn = &reader, .alloc = alloc, .group_id = group_id };
+    var expected: usize = 0;
+    for (rows) |row| {
+        if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+        if (try system_catalog_storage.tableIdFromRecordKey(row.key, group_id)) |id| {
+            // A binding with no physical table must not disappear from a
+            // table-only scan and accidentally certify an incomplete cut.
+            _ = try reader.get(try tableKeyForGroup(&buf, group_id, id));
+            var binding = (try system_catalog_storage.getById(alloc, &reader, group_id, .table, id)) orelse return error.InvalidMetadataSnapshot;
+            defer binding.deinit();
+        }
+        const prefix = try tablePrefixForGroup(&buf, group_id);
+        if (!std.mem.startsWith(u8, row.key, prefix)) continue;
+        const id = (try RaftApplyStore.capturedRelationTableId(row.key, group_id)) orelse return error.InvalidMetadataSnapshot;
+        var table = try RaftApplyStore.relationSnapshot(alloc, &reader, group_id, id, true);
+        defer table.deinit();
+        for (table.claims()) |claim| {
+            const owner = (try registry.getClaim(claim.key)) orelse return error.InvalidMetadataSnapshot;
+            if (!owner.eql(claim.owner)) return error.InvalidMetadataSnapshot;
+        }
+        expected = std.math.add(usize, expected, table.claims().len) catch return error.InvalidMetadataSnapshot;
+    }
+    if (expected != received) return error.InvalidMetadataSnapshot;
 }
 
 fn metadataSnapshotKeyBelongsToGroup(group_id: u64, key: []const u8) bool {

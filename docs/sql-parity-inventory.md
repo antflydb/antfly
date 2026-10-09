@@ -1466,6 +1466,16 @@ binding and ownership records, not unrelated status/report payloads. A 256-KiB
 unrelated payload is overwritten under 16-KiB journal allocator headroom;
 filtered journals explicitly reject command-local rollback, requiring outer
 transaction abort on verification failure.
+Raft snapshots now retain both writer adoption and the exact relation claims
+through the exhaustive durable-projection registry. Export and install verify
+the complete cut from borrowed snapshot rows before publication: every expected
+claim must match, and equal cardinality excludes injected claims. Binding
+identities, physical names, namespace/database ancestry and protected default
+identities are verified with point reads. Missing/forged claims, orphan bindings,
+malformed markers and adoption downgrade attempts cannot replace local state
+or advance its checkpoint. Valid replacement removes stale local claims,
+preserves other groups and survives restart. Validation is outside the install
+apply lock, releases one table cut at a time and honors snapshot cancellation.
 FK publication and restore command envelopes use the same admission boundary,
 but pending-generation name reservations, initial adoption/checkpoint
 verification and full distributed publication fault coverage still require

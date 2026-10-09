@@ -93,6 +93,13 @@ pub const Key = struct {
         if (self.namespace_id == 0 or self.name.len == 0 or self.name.len > max_name_bytes or
             std.mem.indexOfScalar(u8, self.name, 0) != null or !std.unicode.utf8ValidateSlice(self.name)) return error.InvalidCatalogName;
     }
+    pub fn prefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+        if (group_id == 0) return error.InvalidCatalogRecord;
+        if (buf.len < key_prefix.len + 8) return error.NoSpaceLeft;
+        @memcpy(buf[0..key_prefix.len], key_prefix);
+        std.mem.writeInt(u64, buf[key_prefix.len..][0..8], group_id, .big);
+        return buf[0 .. key_prefix.len + 8];
+    }
     /// Length-delimited UTF-8 preserves quoted SQL names, including dots and
     /// colons. Namespace IDs already identify their parent database uniquely.
     pub fn storageKeyAlloc(self: Key, a: A, group_id: u64) ![]u8 {
