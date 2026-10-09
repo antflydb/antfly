@@ -2682,6 +2682,11 @@ const PointResultLifetime = enum {
     ) ![]const u8 {
         if (self == .snapshot_pinned) return value;
         const address = @intFromPtr(value.ptr);
+        if (!(builtin.is_test and test_duplicate_owned_point_results)) {
+            const buffer = held.copies.buffer;
+            const base = @intFromPtr(buffer.ptr);
+            if (buffer.len != 0 and address >= base and address - base <= held.copies.used and value.len <= held.copies.used - (address - base)) return value;
+        }
         const candidates = if (builtin.is_test and test_duplicate_owned_point_results) held.items[held.items.len..] else held.items[first_owned..];
         for (candidates) |owned| {
             const base = @intFromPtr(owned.ptr);
@@ -3107,7 +3112,7 @@ fn getOwnedDirectoryPoint(
     defer releaseHeldBlocks(&blocks, backend.allocator);
     var hint: ?BorrowedReadHint = null;
     const first_owned = held_values.items.len;
-    const value = try getFromDirectoryPoint(backend, directory, &.{}, &hint, &blocks, held_values, allocator, namespace, key);
+    const value = try getFromDirectoryPointWithLifetime(backend, directory, &.{}, &hint, &blocks, held_values, allocator, namespace, key, .transaction_owned);
     return PointResultLifetime.transaction_owned.retain(backend, allocator, held_values, first_owned, value);
 }
 
@@ -4017,11 +4022,22 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             // this short lease without changing allocator ownership.
             const value_allocator = if (lease) self.backend.allocator else self.allocator;
             const held_values = if (lease) &self.leased_values else &self.held_values;
+            const lifetime: PointResultLifetime = if (lease) .snapshot_pinned else .transaction_owned;
+            const first_owned = held_values.items.len;
+            // Legacy run-array hints can borrow keys from temporary blocks.
+            // Ordinary probes release those blocks at the end of this call.
+            if (!lease) self.read_hint = null;
+            defer if (!lease) {
+                self.read_hint = null;
+            };
+            var temporary_blocks: std.ArrayListUnmanaged(BlockPin) = .empty;
+            defer releaseHeldBlocks(&temporary_blocks, self.backend.allocator);
+            const blocks = if (lease) &self.held_blocks else &temporary_blocks;
             if (self.stable_point_view) {
                 if (self.read_view.?.version) |version| if (version.directory) |directory| {
                     self.backend.recordPointGet();
-                    const value = try getFromDirectoryPoint(self.backend, directory, &.{}, &self.read_hint, &self.held_blocks, held_values, value_allocator, self.namespace, key);
-                    if (!lease) return try self.ownValue(value);
+                    const value = try getFromDirectoryPointWithLifetime(self.backend, directory, &.{}, &self.read_hint, blocks, held_values, value_allocator, self.namespace, key, lifetime);
+                    if (!lease) return try lifetime.retain(self.backend, value_allocator, held_values, first_owned, value);
                     recordPointValueBorrow(self.backend);
                     return value;
                 };
@@ -4041,7 +4057,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     self.levels,
                     &self.last_l0_group_index,
                     &self.read_hint,
-                    &self.held_blocks,
+                    blocks,
                     held_values,
                     value_allocator,
                     self.namespace,
@@ -4049,7 +4065,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     false,
                     null,
                 );
-                if (!lease) return try self.ownValue(value);
+                if (!lease) return try lifetime.retain(self.backend, value_allocator, held_values, first_owned, value);
                 recordPointValueBorrow(self.backend);
                 return value;
             }
@@ -4081,7 +4097,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             defer if (!retain_layout) layout.deinitAfterUnlockedRead();
 
             const value = if (layout.read_view.version != null and layout.read_view.version.?.directory != null)
-                try getFromDirectoryPoint(self.backend, layout.read_view.version.?.directory.?, layout.immutable_memtables, &self.read_hint, &self.held_blocks, held_values, value_allocator, self.namespace, key)
+                try getFromDirectoryPointWithLifetime(self.backend, layout.read_view.version.?.directory.?, layout.immutable_memtables, &self.read_hint, blocks, held_values, value_allocator, self.namespace, key, lifetime)
             else
                 try getFromSnapshotRuns(
                     self.backend,
@@ -4092,7 +4108,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     layout.levels,
                     &self.last_l0_group_index,
                     &self.read_hint,
-                    &self.held_blocks,
+                    blocks,
                     held_values,
                     value_allocator,
                     self.namespace,
@@ -4101,8 +4117,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     null,
                 );
             if (!lease) {
-                recordPointValueCopy(self.backend);
-                return try self.ownValue(value);
+                return try lifetime.retain(self.backend, value_allocator, held_values, first_owned, value);
             }
             const needs_layout = layout.immutable_memtables.len != 0 or blk: {
                 if (layout.read_view.version) |version| if (version.directory) |directory| break :blk directory.memory_run_count != 0;
@@ -5493,6 +5508,21 @@ fn getFromDirectoryPoint(
     namespace: backend_types.Namespace,
     key: []const u8,
 ) ![]const u8 {
+    return getFromDirectoryPointWithLifetime(backend, directory, immutable_memtables, read_hint, held_blocks, held_values, value_allocator, namespace, key, .snapshot_pinned);
+}
+
+fn getFromDirectoryPointWithLifetime(
+    backend: anytype,
+    directory: *const @import("run_directory.zig").Directory,
+    immutable_memtables: []const *const State,
+    read_hint: *?BorrowedReadHint,
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_values: *PointResultValues,
+    value_allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    lifetime: PointResultLifetime,
+) ![]const u8 {
     read_hint.* = null;
     defer read_hint.* = null; // Candidate positions are local to this lookup.
     for (immutable_memtables) |state| if (state.findIndex(namespace, key)) |index| {
@@ -5508,7 +5538,7 @@ fn getFromDirectoryPoint(
     };
     defer if (admitted) |*budget| budget.deinit();
     const scratch = if (admitted) |*budget| budget.allocator() else value_allocator;
-    return getFromDirectoryPointCandidates(backend, directory, read_hint, held_blocks, held_values, scratch, value_allocator, namespace, key) catch |err| {
+    return getFromDirectoryPointCandidatesWithLifetime(backend, directory, read_hint, held_blocks, held_values, scratch, value_allocator, namespace, key, lifetime) catch |err| {
         if (admitted) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
         return err;
     };
@@ -5525,8 +5555,23 @@ fn getFromDirectoryPointCandidates(
     namespace: backend_types.Namespace,
     key: []const u8,
 ) ![]const u8 {
+    return getFromDirectoryPointCandidatesWithLifetime(backend, directory, read_hint, held_blocks, held_values, scratch, value_allocator, namespace, key, .snapshot_pinned);
+}
+
+fn getFromDirectoryPointCandidatesWithLifetime(
+    backend: anytype,
+    directory: *const @import("run_directory.zig").Directory,
+    read_hint: *?BorrowedReadHint,
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_values: *PointResultValues,
+    scratch: Allocator,
+    value_allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    lifetime: PointResultLifetime,
+) ![]const u8 {
     if (directory.supportsAsyncPoints()) {
-        if (try tryReadDirectoryPointAsync(backend, directory, held_blocks, held_values, value_allocator, namespace, key)) |result| switch (result) {
+        if (try tryReadDirectoryPointAsync(backend, directory, held_blocks, held_values, value_allocator, namespace, key, lifetime)) |result| switch (result) {
             .hit => |value| return value,
             .miss, .tombstone => return error.NotFound,
         };
@@ -6969,26 +7014,33 @@ fn tryReadDirectoryPointAsync(
     allocator: Allocator,
     namespace: backend_types.Namespace,
     key: []const u8,
+    lifetime: PointResultLifetime,
 ) !?AsyncPointLookupResult {
     if (backend.storage == null or backend.options.cache == null or backend.options.max_concurrent_point_block_reads < 2) return null;
     // One-run reads use the established block loader, which can adopt large
     // decoded buffers directly into short point leases. Async windows are
     // useful only when another overlapping run exists.
-    var lookahead = directory.readPoint(namespace.name, key);
-    if (lookahead.next() == null or lookahead.next() == null) return null;
+    var cursor = directory.readPoint(namespace.name, key);
+    const first = cursor.next() orelse return null;
+    const second = cursor.next() orelse return null;
+    const leading = [_]@import("run_directory.zig").Directory.Handle{ first, second };
+    var leading_index: usize = 0;
     const lease = acquirePointAsyncBatchLease(backend);
     defer releasePointAsyncBatchLease(backend, lease);
     if (lease.limit < 2) return null;
-    var cursor = directory.readPoint(namespace.name, key);
     var reads: [max_point_async_stack_reads]AsyncPointBlockRead = undefined;
-    var pins = AsyncPointResultPins.init(held_blocks);
+    var pins = AsyncPointResultPins.init(if (lifetime == .snapshot_pinned) held_blocks else null);
     while (true) {
         var count: usize = 0;
         var consumed: usize = 0;
         var issued: usize = 0;
         errdefer cleanupAsyncPointReads(reads[consumed..count]);
         while (count < lease.limit) {
-            const handle = cursor.next() orelse break;
+            const handle = if (leading_index < leading.len) blk: {
+                const handle = leading[leading_index];
+                leading_index += 1;
+                break :blk handle;
+            } else cursor.next() orelse break;
             backend.recordRunProbe();
             recordPointRunPrecheck(backend);
             var read = try prepareAsyncPointBlockRead(backend, &.{}, .{ .run_index = 0, .directory_run = handle.run }, namespace, key, null) orelse {
@@ -12223,4 +12275,92 @@ test "lsm async reuse single directory reads preserve tombstones namespaces and 
             for (3..66) |id| try directory.put(&fixture, .{ .id = id, .level = 0, .size_bytes = 1, .path = @constCast("/older.sst"), .smallest_namespace_name = @constCast("docs"), .largest_namespace_name = @constCast("docs"), .smallest_key = @constCast("a"), .largest_key = @constCast("d"), .entry_count = older.len, .bloom_filter = null, .state = null });
         }
     }
+}
+
+test "lsm async reuse ordinary probes own one copy without retaining blocks" {
+    const a = std.testing.allocator;
+    const B = @import("../lsm_backend.zig").Backend;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 16 * 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/ordinary-probe-ownership", .{
+        .storage = storage.storage(),
+        .cache = &cache,
+        .flush_threshold = 1,
+        .compact_threshold_runs = 100,
+        .l0_overlap_compact_threshold_runs = 100,
+        .table_block_compression = .none,
+        .max_concurrent_point_block_reads = 16,
+    });
+    defer backend.close();
+    var keys: [192][80]u8 = undefined;
+    for (&keys, 0..) |*key, i| {
+        @memset(key, 'k');
+        key[0] = @intCast(i);
+    }
+    const large: [8192]u8 = @splat('v');
+    for (0..2) |_| {
+        var write = try NamespaceWriteTxn(B).open(&backend);
+        errdefer write.abort();
+        for (&keys) |*key| try write.put(.{}, key, "v");
+        try write.put(.{}, "large", &large);
+        try write.commit();
+        while (try backend.runMaintenanceStep()) {}
+    }
+    try std.testing.expectEqual(@as(usize, 2), run_store.count(&backend));
+    for (0..6) |mode| {
+        if (mode == 3) {
+            backend.options.flush_threshold = 1000;
+            var write = try NamespaceWriteTxn(B).open(&backend);
+            errdefer write.abort();
+            try write.put(.{}, "pending", "mutable");
+            try write.commit();
+        }
+        if (mode % 3 != 1) for (0..run_store.count(&backend)) |i| {
+            const run = run_store.at(&backend, i);
+            var index = try loadRunTableIndexHandle(&backend, run);
+            defer index.release();
+            for (0..index.runTableIndex().blockCount()) |block_index| {
+                var block = try loadRunTableBlockHandle(&backend, run, index.runTableIndex(), index.runTableIndex().blockWindow(block_index), true);
+                block.release();
+            }
+        };
+        cache.pressure_target_bytes.store(if (mode % 3 == 2) cache.max_bytes else 0, .monotonic);
+        var probe = try BoundProbeTxn(B).open(&backend, .{});
+        defer probe.abort();
+        try std.testing.expectEqual(mode < 3, probe.stable_point_view);
+        const first = try probe.get(&keys[0]);
+        const second = try probe.get(&keys[1]);
+        const third = try probe.get(&keys[2]);
+        const wide = try probe.get("large");
+        try std.testing.expectEqual(@as(usize, 0), probe.held_blocks.items.len);
+        try std.testing.expectEqual(@as(usize, 2), probe.held_values.items.len);
+        try std.testing.expectEqual(@as(usize, 256), probe.held_values.items[0].len);
+        try std.testing.expectEqual(large.len, probe.held_values.items[1].len);
+        for (0..run_store.count(&backend)) |i| cache.invalidatePath(run_store.at(&backend, i).path.?);
+        try std.testing.expectEqual(@as(usize, 0), cache.currentBytes());
+        try std.testing.expectEqualStrings("v", first);
+        try std.testing.expectEqualStrings("v", second);
+        try std.testing.expectEqualStrings("v", third);
+        try std.testing.expectEqualStrings(&large, wide);
+        std.debug.print("\nordinary probe ownership: mode={d} pins=0 owned_bytes=8448 payload_buffers=2 cache_bytes_after_invalidation=0\n", .{mode});
+    }
+    cache.pressure_target_bytes.store(0, .monotonic);
+    // Short leases still opt into block borrowing, independently of ordinary
+    // probes, and remain valid after cache invalidation.
+    for (0..run_store.count(&backend)) |i| {
+        const run = run_store.at(&backend, i);
+        var index = try loadRunTableIndexHandle(&backend, run);
+        defer index.release();
+        var block = try loadRunTableBlockHandle(&backend, run, index.runTableIndex(), index.runTableIndex().blockWindow(0), true);
+        block.release();
+    }
+    var lease = try BoundProbeTxn(B).open(&backend, .{});
+    defer lease.abort();
+    const borrowed = try lease.getLeased(&keys[0]);
+    try std.testing.expect(lease.held_blocks.items.len != 0);
+    try std.testing.expectEqual(@as(usize, 0), lease.leased_values.items.len);
+    for (0..run_store.count(&backend)) |i| cache.invalidatePath(run_store.at(&backend, i).path.?);
+    try std.testing.expectEqualStrings("v", borrowed);
 }

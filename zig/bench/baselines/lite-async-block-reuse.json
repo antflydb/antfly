@@ -228,5 +228,53 @@
       "Result allocation ownership transfer resets source packing state",
       "Single-run reads retain cache allocator ownership and direct large-value lease adoption"
     ]
+  },
+  "ordinary_probe_ownership_followup": {
+    "merged_main_commit": "2964fe531a",
+    "review_comparison": {
+      "fixture": "Two overlapping L0 runs, 192 80-byte keys, one ordinary current-probe lookup returning one byte, warm uncompressed blocks; invalidate every run path while the probe is alive.",
+      "previous_commit": "4f8427650256e997629f2f3540f18691142a9ac9",
+      "reviewed_commit": "69ea9adfe1057aa73ee3ff2217070f6581140965",
+      "previous": {
+        "block_pins": 0,
+        "owned_payload_bytes": 82,
+        "cache_bytes_after_invalidation": 0
+      },
+      "reviewed": {
+        "block_pins": 1,
+        "owned_payload_bytes": 1,
+        "cache_bytes_after_invalidation": 18083
+      }
+    },
+    "fixed_production_fixture": {
+      "test": "lsm async reuse ordinary probes own one copy without retaining blocks",
+      "lookups_per_probe": 4,
+      "small_value_bytes": [
+        1,
+        1,
+        1
+      ],
+      "large_value_bytes": 8192,
+      "cases": [
+        "stable warm",
+        "stable cold",
+        "stable pressure",
+        "current warm",
+        "current cold",
+        "current pressure"
+      ],
+      "block_pins": 0,
+      "owned_payload_buffers": 2,
+      "owned_payload_bytes": 8448,
+      "cache_bytes_after_invalidation": 0,
+      "lease_control": "getLeased still borrows a retained cache block, owns no copied result buffer, and survives path invalidation."
+    },
+    "design": [
+      "Propagate explicit transaction-owned versus snapshot-pinned lifetime to single-key directory reads.",
+      "Use temporary block pins for ordinary probe fallback loaders and clear their borrowed legacy hints before releasing those pins.",
+      "Adopt decoder-owned results and recognize the active packed buffer in constant time, including reuse across lookups; inspect only new allocations for other interior slices.",
+      "Reuse one async directory cursor after lookahead by preserving its first two handles in a fixed-size leading window."
+    ],
+    "limitations": "Payload buffer counts exclude metadata and storage/cache construction. No standalone speedup is claimed for cursor reuse; timing samples vary and do not establish end-to-end throughput or soak behavior."
   }
 }
