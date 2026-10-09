@@ -752,6 +752,11 @@ pub const NodeOwner = struct {
 /// own ownership before sharing this capsule's adapter; it is not a gang lease.
 pub const Execution = struct {
     entry: ?Entry = null,
+    /// Trusted local adapter to an already admitted opaque owner. The adapter
+    /// and original owner outlive every physical borrower and joined child.
+    /// A root borrow's finish only retires the adapter; owned child adapters
+    /// retire their owner-produced token after the worker has physically joined.
+    borrowed: ?Borrow = null,
     child_pending: bool = false,
     quantum_start_ns: u64 = 0,
     checkpoints: u32 = 0,
@@ -759,13 +764,35 @@ pub const Execution = struct {
     /// authority checks across cooperative yields and resource/output waits.
     resume_generation: u64 = 0,
 
+    pub const Borrow = struct {
+        ptr: *anyopaque,
+        class: Class,
+        checkpoint: *const fn (*anyopaque) anyerror!void,
+        check_lifetime: *const fn (*anyopaque) anyerror!void,
+        park: *const fn (*anyopaque, State) anyerror!void,
+        enter: *const fn (*anyopaque, Class) anyerror!void,
+        reserve_child: *const fn (*anyopaque, std.Io, u64, *Execution) anyerror!void,
+        activate_child: *const fn (*anyopaque) anyerror!void,
+        finish: *const fn (*anyopaque) void,
+    };
+
+    pub fn bindBorrowed(self: *Execution, borrow: Borrow) !void {
+        if (self.entry != null or self.borrowed != null or self.child_pending) return error.InvalidRunnableTransition;
+        self.borrowed = borrow;
+    }
+
+    pub fn retainedClass(self: *const Execution) !Class {
+        if (self.borrowed) |borrow| return borrow.class;
+        return (self.entry orelse return error.InvalidRunnableTransition).class;
+    }
+
     pub fn start(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, class: Class) !void {
         try self.startWithSlots(scheduler, options, class, 1);
     }
     /// One stable capsule can account for a bounded CPU team. Its demand stays
     /// attached across yields and waits, independently of retained memory.
     pub fn startWithSlots(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, class: Class, slots: usize) !void {
-        std.debug.assert(self.entry == null);
+        std.debug.assert(self.entry == null and self.borrowed == null);
         const owner = scheduler orelse return;
         self.entry = .{ .options = options, .class = class, .slots = slots, .bytes = options.retained_bytes };
         errdefer self.finish();
@@ -785,10 +812,15 @@ pub const Execution = struct {
     /// Reserve before task publication without waiting for CPU on the parent
     /// coordinator. The independent worker activates after publication.
     pub fn reserveChild(self: *Execution, parent: *Execution, io: std.Io, retained_bytes: u64) !void {
-        if (self.entry != null or self == parent or parent.child_pending) return error.InvalidRunnableTransition;
+        if (self.entry != null or self.borrowed != null or self == parent or parent.child_pending) return error.InvalidRunnableTransition;
+        if (retained_bytes < @sizeOf(Execution)) return error.InvalidRunnableDemand;
+        if (parent.borrowed) |borrow| {
+            try borrow.reserve_child(borrow.ptr, io, retained_bytes, self);
+            self.child_pending = true;
+            return;
+        }
         const parent_entry = if (parent.entry) |*entry| entry else return error.InvalidRunnableTransition;
         const owner = try schedulerFor(parent_entry, true);
-        if (retained_bytes < @sizeOf(Execution)) return error.InvalidRunnableDemand;
         self.entry = .{ .options = parent_entry.options, .class = parent_entry.class, .bytes = retained_bytes };
         errdefer self.finish();
         try owner.submitChild(parent_entry, &self.entry.?, io);
@@ -798,6 +830,13 @@ pub const Execution = struct {
     /// Published task ownership survives rejected activation until physical
     /// join and owning finish. This cannot replay an already activated child.
     pub fn activateChild(self: *Execution) !void {
+        if (self.borrowed) |borrow| {
+            if (!self.child_pending) return error.InvalidRunnableTransition;
+            self.child_pending = false;
+            try borrow.activate_child(borrow.ptr);
+            self.resume_generation +%= 1;
+            return;
+        }
         const e = if (self.entry) |*entry| entry else return error.InvalidRunnableTransition;
         if (!self.child_pending or e.parent == null) {
             _ = try schedulerFor(e, false);
@@ -825,6 +864,7 @@ pub const Execution = struct {
     /// physical worker. This neither requires CPU nor observes the caller's
     /// thread-local IO cancellation, which must not stop a borrowed parent.
     pub fn checkLifetime(self: *const Execution) !void {
+        if (self.borrowed) |borrow| return borrow.check_lifetime(borrow.ptr);
         const e = if (self.entry) |*entry| entry else return error.InvalidRunnableTransition;
         const owner = e.scheduler orelse return error.InvalidRunnableTransition;
         const options = blk: {
@@ -846,6 +886,7 @@ pub const Execution = struct {
     pub fn resizeTeam(self: *Execution, slots: usize) !void {
         if (self.child_pending) return error.InvalidRunnableTransition;
         if (slots == 0) return error.InvalidRunnableDemand;
+        if (self.borrowed != null) return error.UnsupportedOperation;
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, true);
         try owner.checkAuthority(e);
@@ -857,6 +898,13 @@ pub const Execution = struct {
     }
     pub fn checkpoint(self: *Execution) !void {
         if (self.child_pending) return error.InvalidRunnableTransition;
+        if (self.borrowed) |borrow| {
+            try borrow.checkpoint(borrow.ptr);
+            // Opaque owners may yield on every checkpoint. Conservatively
+            // invalidate authority caches after each successful callback.
+            self.resume_generation +%= 1;
+            return;
+        }
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, true);
         try owner.checkAuthority(e);
@@ -871,12 +919,19 @@ pub const Execution = struct {
     }
     pub fn park(self: *Execution, reason: State) !void {
         if (self.child_pending) return error.InvalidRunnableTransition;
+        if (self.borrowed) |borrow| return borrow.park(borrow.ptr, reason);
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, false);
         try owner.block(e, reason);
     }
     pub fn enter(self: *Execution, class: Class) !void {
         if (self.child_pending) return error.InvalidRunnableTransition;
+        if (self.borrowed) |*borrow| {
+            try borrow.enter(borrow.ptr, class);
+            borrow.class = class;
+            self.resume_generation +%= 1;
+            return;
+        }
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, false);
         try owner.reclassifyBlocked(e, class);
@@ -944,6 +999,8 @@ pub const Execution = struct {
         self.checkpoints = 0;
     }
     pub fn finish(self: *Execution) void {
+        if (self.borrowed) |borrow| borrow.finish(borrow.ptr);
+        self.borrowed = null;
         if (self.entry) |*e| if (e.scheduler) |owner| owner.finish(e);
         self.entry = null;
         self.child_pending = false;

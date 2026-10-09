@@ -372,6 +372,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-local-child-owner-test", "Verify local SQL child receiver lifetime and independent worker execution")
         .dependOn(&b.addRunArtifact(local_child_tests).step);
+    const native_borrow_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_native_borrow.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    native_borrow_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    native_borrow_root.addImport("antfly_local_sources", inference_owner_sources);
+    const native_borrow_tests = b.addTest(.{
+        .name = "native-execution-borrow-tests",
+        .root_module = native_borrow_root,
+        .filters = &.{"native execution borrow"},
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-runnable-native-borrow-test", "Verify native read adapters retain opaque root and child execution ownership through physical joins")
+        .dependOn(&b.addRunArtifact(native_borrow_tests).step);
     const inference_owner_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/runnable_inference_test_root.zig"),
         .target = target,

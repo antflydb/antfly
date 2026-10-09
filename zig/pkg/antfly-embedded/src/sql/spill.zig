@@ -34,8 +34,7 @@ fn childWaitBegin(raw: *anyopaque) !void {
 }
 fn childWaitEnd(raw: *anyopaque) !void {
     const execution: *Runnable.Execution = @ptrCast(@alignCast(raw));
-    const entry = execution.entry orelse return error.InvalidRunnableTransition;
-    try execution.enter(entry.class);
+    try execution.enter(try execution.retainedClass());
 }
 pub fn childWait(execution: *Runnable.Execution) @import("execution_wait.zig").Boundary {
     return .{ .ptr = execution, .begin = childWaitBegin, .end = childWaitEnd };
