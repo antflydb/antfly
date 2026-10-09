@@ -181,18 +181,27 @@ const Execution = struct {
     fn vectorRequest(self: *Execution, req: types.SearchRequest) types.SearchRequest {
         var result = req;
         if (self.vector_include != null or self.vector_exclude != null) {
-            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey, .select_ordinals = selectSparseOrdinals };
+            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey, .select_constraints = selectSparseConstraints };
             result.filter_query_json = "";
             result.exclusion_query_json = "";
         }
         return result;
     }
-    fn selectSparseOrdinals(raw: *anyopaque, a: A, lookup: types.SparseOrdinalLookup) !?local.encoding_roaring.RoaringBitmap {
+    fn selectSparseConstraints(raw: *anyopaque, a: A, lookup: types.SparseOrdinalLookup) !?types.SparseOrdinalSelection {
         const self: *Execution = @ptrCast(@alignCast(raw));
-        const include = if (self.vector_include) |*set| set else return null;
+        var result: types.SparseOrdinalSelection = .{};
+        errdefer result.deinit();
+        if (self.vector_include) |*include| {
+            // Subtract in physical space before resolving a selective include;
+            // a broad exclusion need not be converted for one included row.
+            result.include = try self.selectSparseSet(a, lookup, include, if (self.vector_exclude) |*exclude| exclude else null);
+        } else if (self.vector_exclude) |*exclude| result.exclude = try self.selectSparseSet(a, lookup, exclude, null);
+        return result;
+    }
+    fn selectSparseSet(self: *Execution, a: A, lookup: types.SparseOrdinalLookup, selection_set: *const @import("lake_index_physical_set.zig").Set, subtract: ?*const @import("lake_index_physical_set.zig").Set) !local.encoding_roaring.RoaringBitmap {
         var result = local.encoding_roaring.RoaringBitmap.init(a);
         errdefer result.deinit();
-        var files = include.files.iterator();
+        var files = selection_set.files.iterator();
         while (files.next()) |file| {
             const digest = self.private_digests.get(file.key_ptr.*) orelse return error.ExternalLakeSnapshotMismatch;
             var blocks = file.value_ptr.iterator();
@@ -202,7 +211,8 @@ const Execution = struct {
                 const bytes_prefix = try std.fmt.bufPrint(&prefix, "lake2:{s}:{x:0>8}:", .{ digest, block.key_ptr.group });
                 var selection = try block.value_ptr.clone(a);
                 defer selection.deinit();
-                if (self.vector_exclude) |*exclude| if (exclude.files.getPtr(file.key_ptr.*)) |excluded_blocks| if (excluded_blocks.getPtr(block.key_ptr.*)) |excluded| selection.andNotWith(excluded);
+                if (subtract) |exclude| if (exclude.files.getPtr(file.key_ptr.*)) |excluded_blocks| if (excluded_blocks.getPtr(block.key_ptr.*)) |excluded| selection.andNotWith(excluded);
+                if (selection.isEmpty()) continue;
                 if (try lookup.block(lookup.ptr, a, bytes_prefix, block.key_ptr.high, &selection, &result)) continue;
                 var rows = selection.iterator();
                 var visited: usize = 0;
@@ -210,7 +220,6 @@ const Execution = struct {
                     if (visited % 256 == 0) try self.context.ensureActive();
                     visited += 1;
                     const row = (@as(u64, block.key_ptr.high) << 32) | low;
-                    if (self.vector_exclude) |*exclude| if (exclude.contains(file.key_ptr.*, block.key_ptr.group, row)) continue;
                     var key: [96]u8 = undefined;
                     const bytes = try std.fmt.bufPrint(&key, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, block.key_ptr.group, row });
                     if (try lookup.one(lookup.ptr, bytes)) |num| try result.add(num);

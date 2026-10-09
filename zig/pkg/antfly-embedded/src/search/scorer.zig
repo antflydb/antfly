@@ -364,6 +364,28 @@ pub const WANDScorer = struct {
         }
     }
 
+    /// Exact membership can jump over rejected ordinal runs before scoring.
+    /// The collector's lower bound is monotone; absence is represented by 2^32.
+    fn seekCandidate(self: *WANDScorer, collector: anytype, doc: u32) !bool {
+        if (comptime @hasDecl(@typeInfo(@TypeOf(collector)).pointer.child, "nextCandidate")) {
+            const target = collector.nextCandidate(doc);
+            if (target > std.math.maxInt(u32)) {
+                for (self.terms.items) |*term| {
+                    term.current = null;
+                    term.exhausted = true;
+                }
+                return true;
+            }
+            if (target > doc) {
+                for (self.terms.items) |*term| if (!term.exhausted and term.current.?.doc_id < target) {
+                    try self.advancePast(term, @intCast(target));
+                };
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Single-term Block-Max top-k does not need pivot ordering, cumulative
     /// bounds, or the generic multi-term front-interval sweep. Score the
     /// current posting directly and feed the raised threshold into the same
@@ -376,6 +398,7 @@ pub const WANDScorer = struct {
 
         while (!term.exhausted) {
             const hit = term.current orelse break;
+            if (try self.seekCandidate(collector, hit.doc_id)) continue;
             self.pivots_scored += 1;
             self.next_in_score += 1;
             try collector.collect(.{
@@ -438,6 +461,7 @@ pub const WANDScorer = struct {
                 }
             }
             if (min_doc == null) break;
+            if (try self.seekCandidate(collector, min_doc.?)) continue;
 
             // Score this document across all terms that contain it
             var score: f32 = 0;
@@ -495,6 +519,7 @@ pub const WANDScorer = struct {
                 sorted[insert_pos] = moving;
             }
 
+            if (try self.seekCandidate(collector, self.terms.items[sorted[0]].current.?.doc_id)) continue;
             if (try self.skipNonCompetitiveFrontBlock(collector, sorted)) {
                 collector.markLowerBound();
                 continue;

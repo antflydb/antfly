@@ -1007,7 +1007,7 @@ pub const IndexSnapshot = struct {
         alloc.destroy(self);
     }
 
-    fn bm25BoundTable(
+    pub fn bm25BoundTable(
         self: *const IndexSnapshot,
         avg_doc_len: f32,
         config: inverted.BM25Config,

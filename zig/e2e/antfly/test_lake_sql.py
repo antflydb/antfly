@@ -2721,6 +2721,15 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             "filter_query": broad,
         })
         assert len(sparse["hits"]["hits"]) == 3 and all(h["_source"]["amount"] >= 2 for h in sparse["hits"]["hits"]), sparse
+        for weight in (1, -1, 0):
+            exclusion_only = call("POST", "/tables/indexed_predicates/query", {
+                "embeddings": {"sparse_native": {"indices": [1], "values": [weight]}},
+                "indexes": ["sparse_native"], "fields": ["amount"], "limit": 3,
+                "exclusion_query": broad,
+            })
+            hits = exclusion_only["hits"]["hits"]
+            assert {h["_source"]["amount"] for h in hits} == {0, 1}, exclusion_only
+            assert all(h["_score"] == weight for h in hits), exclusion_only
         sparse_point = call("POST", "/tables/indexed_predicates/query", {
             "embeddings": {"sparse_native": {"indices": [1], "values": [1]}},
             "indexes": ["sparse_native"], "fields": ["amount"], "limit": 3,

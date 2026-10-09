@@ -1025,6 +1025,19 @@ pub const RoaringBitmap = struct {
         }
     }
 
+    /// First non-member at or after lower, or 2^32 when the suffix is full.
+    pub fn nextAbsent(self: *const RoaringBitmap, lower: u32) u64 {
+        if (!self.contains(lower)) return lower;
+        var lo: u64 = lower;
+        var hi: u64 = @as(u64, std.math.maxInt(u32)) + 1;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (mid == @as(u64, std.math.maxInt(u32)) + 1 or
+                self.rangeCardinality(lower, mid + 1) != mid + 1 - lower) hi = mid else lo = mid + 1;
+        }
+        return lo;
+    }
+
     /// Count a half-open range without materializing or enumerating members.
     pub fn rangeCardinality(self: *const RoaringBitmap, lower: u32, upper: u64) usize {
         std.debug.assert(upper <= 0x1_0000_0000 and upper >= lower);
@@ -2164,4 +2177,16 @@ test "fresh bitmap seeks jump dense containers and never rewind exhausted iterat
     try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), forward.seekTo(0));
     try std.testing.expectEqual(@as(?u32, null), forward.seekTo(0));
     try std.testing.expectEqual(@as(?u32, null), forward.seekTo(std.math.maxInt(u32)));
+}
+
+test "bitmap absent seeks skip dense runs holes and the u32 endpoint" {
+    var bitmap = RoaringBitmap.init(std.testing.allocator);
+    defer bitmap.deinit();
+    try bitmap.addRange(65000, 200000);
+    try bitmap.addRange(4294836224, @as(u64, std.math.maxInt(u32)) + 1);
+    try bitmap.prepareRead();
+    try std.testing.expectEqual(@as(u64, 42), bitmap.nextAbsent(42));
+    try std.testing.expectEqual(@as(u64, 200000), bitmap.nextAbsent(65000));
+    try std.testing.expectEqual(@as(u64, 200000), bitmap.nextAbsent(65535));
+    try std.testing.expectEqual(@as(u64, 4294967296), bitmap.nextAbsent(4294836224));
 }
