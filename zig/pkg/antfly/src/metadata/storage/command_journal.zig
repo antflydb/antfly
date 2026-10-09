@@ -55,6 +55,16 @@ pub const Journal = struct {
         self.arena.deinit();
         self.* = undefined;
     }
+    pub const BeforeReader = struct {
+        journal: *Journal,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            if (self.journal.originals.get(key)) |before| return before orelse error.NotFound;
+            return self.journal.txn.get(key);
+        }
+    };
+    pub fn beforeReader(self: *Journal) BeforeReader {
+        return .{ .journal = self };
+    }
     fn detach(self: *Journal) void {
         std.debug.assert(self.txn.mutation_capture == &self.capture);
         self.txn.mutation_capture = self.parent;

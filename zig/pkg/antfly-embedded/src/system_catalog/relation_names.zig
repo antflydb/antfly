@@ -159,7 +159,7 @@ pub const TableCut = struct {
         for (indexes) |index| {
             const name = index.name;
             const found = try names.getOrPut(scratch.allocator(), name);
-            if (found.found_existing) return error.InvalidCatalogRecord;
+            if (found.found_existing) return error.CatalogAlreadyExists;
             found.value_ptr.* = false;
             owner.kind = .index;
             try append(owned, &claims, definition.namespace_id, name, owner);
@@ -173,11 +173,11 @@ pub const TableCut = struct {
                 // with explicit index provenance: one relation, not two.
                 // Never infer provenance from its editable description.
                 const mirrored = names.getPtr(name) orelse return error.InvalidCatalogRecord;
-                if (mirrored.*) return error.InvalidCatalogRecord;
+                if (mirrored.*) return error.CatalogAlreadyExists;
                 mirrored.* = true;
             } else {
                 const found = try names.getOrPut(scratch.allocator(), name);
-                if (found.found_existing) return error.InvalidCatalogRecord;
+                if (found.found_existing) return error.CatalogAlreadyExists;
                 found.value_ptr.* = true;
                 owner.kind = .constraint_index;
                 try append(owned, &claims, definition.namespace_id, name, owner);
@@ -452,12 +452,22 @@ test "catalog table cuts skip unrelated schema payloads under bounded allocator 
 
 test "catalog table cuts reject ambiguous ownership and malformed declarations" {
     const a = std.testing.allocator;
-    for ([_][]const u8{
-        "[]",                                                                                                                                                     "{\"version\":null}",                                             "{\"version\":-1}",                                                    "{\"version\":4294967296}",
-        "{\"relational_indexes\":{}}",                                                                                                                            "{\"unique_constraints\":[null]}",                                "{\"relational_indexes\":[{\"name\":\"items\"}]}",                     "{\"relational_indexes\":[{\"name\":\"idx\"},{\"name\":\"idx\"}]}",
-        "{\"unique_constraints\":[{\"name\":\"idx\",\"origin\":\"index\"}]}",                                                                                     "{\"unique_constraints\":[{\"name\":\"idx\",\"origin\":false}]}", "{\"unique_constraints\":[{\"name\":\"idx\",\"origin\":\"future\"}]}", "{\"relational_indexes\":[{\"name\":\"idx\"}],\"unique_constraints\":[{\"name\":\"idx\"}]}",
-        "{\"relational_indexes\":[{\"name\":\"idx\"}],\"unique_constraints\":[{\"name\":\"idx\",\"origin\":\"index\"},{\"name\":\"idx\",\"origin\":\"index\"}]}",
-    }) |schema| try std.testing.expectError(error.InvalidCatalogRecord, TableCut.init(a, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = schema }));
+    const Case = struct { schema: []const u8, expected: anyerror };
+    for ([_]Case{
+        .{ .schema = "[]", .expected = error.InvalidCatalogRecord },
+        .{ .schema = "{\"version\":null}", .expected = error.InvalidCatalogRecord },
+        .{ .schema = "{\"version\":-1}", .expected = error.InvalidCatalogRecord },
+        .{ .schema = "{\"version\":4294967296}", .expected = error.InvalidCatalogRecord },
+        .{ .schema = "{\"relational_indexes\":{}}", .expected = error.InvalidCatalogRecord },
+        .{ .schema = "{\"unique_constraints\":[null]}", .expected = error.InvalidCatalogRecord },
+        .{ .schema = "{\"relational_indexes\":[{\"name\":\"items\"}]}", .expected = error.CatalogAlreadyExists },
+        .{ .schema = "{\"relational_indexes\":[{\"name\":\"idx\"},{\"name\":\"idx\"}]}", .expected = error.CatalogAlreadyExists },
+        .{ .schema = "{\"unique_constraints\":[{\"name\":\"idx\",\"origin\":\"index\"}]}", .expected = error.InvalidCatalogRecord },
+        .{ .schema = "{\"unique_constraints\":[{\"name\":\"idx\",\"origin\":false}]}", .expected = error.InvalidCatalogRecord },
+        .{ .schema = "{\"unique_constraints\":[{\"name\":\"idx\",\"origin\":\"future\"}]}", .expected = error.InvalidCatalogRecord },
+        .{ .schema = "{\"relational_indexes\":[{\"name\":\"idx\"}],\"unique_constraints\":[{\"name\":\"idx\"}]}", .expected = error.CatalogAlreadyExists },
+        .{ .schema = "{\"relational_indexes\":[{\"name\":\"idx\"}],\"unique_constraints\":[{\"name\":\"idx\",\"origin\":\"index\"},{\"name\":\"idx\",\"origin\":\"index\"}]}", .expected = error.CatalogAlreadyExists },
+    }) |case| try std.testing.expectError(case.expected, TableCut.init(a, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = case.schema }));
     try std.testing.expectError(error.InvalidCatalogName, TableCut.init(a, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = "{\"unique_constraints\":[{\"name\":\"\"}]}" }));
 }
 

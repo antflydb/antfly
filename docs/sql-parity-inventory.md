@@ -1435,10 +1435,26 @@ standby effect capture only after acceptance. Matching outcome checkpoints
 discard rejected reader notifications and topology deltas. Tests exercise
 rejection followed by acceptance and restart, allocation failure before a key
 overwrite, capture restoration and strict rejection of user-row keys. This
-journal is not a user-row savepoint, and its automatic per-command admission
-and publication integration remain required before enabling the registry.
-It still must be called by every table/schema writer, FK publication and restore
-path, with namespace binding and claims committed in the same metadata cut.
+journal is not a user-row savepoint. Under the durable writer-adoption marker,
+standalone and Raft table/schema/catalog commands now derive affected table IDs
+from captured physical-table and logical-binding writes. The before-reader
+retains each command's original values, while the final cut reads pending
+transaction values. Admission validates and publishes ownership with those
+same metadata writes; it does not scan unrelated tables. Rejected committed
+proposals restore their writes and outcome signals, retaining earlier and later
+accepted commands. Registry drift remains a hard error and cannot advance the
+checkpoint. Bulk standalone updates coalesce the entire logical/physical edit
+before admitting it, permitting atomic index-name swaps. Tests cover public
+standalone rejection, Raft batch rejection/restart, corruption fences, bulk
+swaps, logical binding rename/move and rejected unbinding without physical
+retirement. Strict affected-key classification rejects malformed IDs.
+
+The marker is not installed automatically and is not a serving capability.
+Verified bootstrap/migration must establish the authoritative ownership cut
+before adopting writers. FK publication and restore command envelopes use the
+same admission boundary, but pending-generation name reservations, standalone
+legacy standby/import paths and full distributed publication fault coverage
+still require activation work. No public unqualified index DDL is enabled.
 Rebuild/verification from authoritative bindings and table definitions, serving
 capability barriers, authorized point resolution, and DROP/REINDEX integration
 remain required before unqualified index DDL is enabled. The registry must not

@@ -563,7 +563,7 @@ pub fn loadState(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id
     return .{ .arena = arena, .meta = meta, .value = .{ .revision = meta.revision, .next_id = meta.next_id, .resources = resources, .settings = loaded_settings, .policies = loaded_policies, .policy_publications = loaded_publications } };
 }
 
-pub fn getById(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, kind: domain.Kind, id: u64) !?std.json.Parsed(domain.Resource) {
+pub fn getById(alloc: std.mem.Allocator, txn: anytype, group_id: u64, kind: domain.Kind, id: u64) !?std.json.Parsed(domain.Resource) {
     const key = try recordKeyAlloc(alloc, group_id, kind, id);
     defer alloc.free(key);
     const bytes = txn.get(key) catch |err| switch (err) {
@@ -574,6 +574,19 @@ pub fn getById(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: 
     errdefer parsed.deinit();
     if (parsed.value.kind != kind or parsed.value.id != id) return error.InvalidCatalogRecord;
     return parsed;
+}
+
+/// Identify table-binding writes without inspecting unrelated catalog rows.
+/// Canonical key validation belongs to the storage owner, not its consumers.
+pub fn tableIdFromRecordKey(key: []const u8, group_id: u64) !?u64 {
+    var prefix_buf: [160]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&prefix_buf, "\x00\x00__metadata__:system_catalog:{d}:record:table:", .{group_id});
+    if (!std.mem.startsWith(u8, key, prefix)) return null;
+    const suffix = key[prefix.len..];
+    for (suffix) |byte| if (byte < '0' or byte > '9') return error.InvalidCatalogRecord;
+    const id = std.fmt.parseInt(u64, suffix, 10) catch return error.InvalidCatalogRecord;
+    if (id == 0 or suffix.len == 0 or suffix[0] == '0' or suffix[0] == '+') return error.InvalidCatalogRecord;
+    return id;
 }
 
 pub fn find(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, kind: domain.Kind, parent: u64, name: []const u8) !?std.json.Parsed(domain.Resource) {
