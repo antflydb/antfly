@@ -232,3 +232,64 @@ func TestSQLSyntaxErrorAbortsTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSQLPoolUsesIndependentNativeConnections(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "pool.aflite")
+	db, err := sql.Open("antfly", "file:"+path+"?no_sync=1&busy_timeout_ms=5000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(2)
+	first, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if err := first.Raw(func(raw any) error {
+		return second.Raw(func(other any) error {
+			if raw.(*sqlConnection).db == other.(*sqlConnection).db {
+				t.Fatal("pooled connections share a native handle")
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.ExecContext(ctx, "CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := first.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "INSERT INTO items (id,name) VALUES (1, 'pending')"); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := second.QueryRowContext(ctx, "SELECT COUNT(*) FROM items").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("uncommitted rows visible: %d", count)
+	}
+	if _, err := second.ExecContext(ctx, "INSERT INTO items (id,name) VALUES (2, 'other')"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.QueryRowContext(ctx, "SELECT COUNT(*) FROM items").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("committed rows = %d, want 2", count)
+	}
+}

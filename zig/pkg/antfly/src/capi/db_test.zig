@@ -2363,7 +2363,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer antfly_db_close(concurrent_readonly_handle);
     try std.testing.expectEqual(db_mod.OpenOptions.OpenMode.query_readonly, asHandle(concurrent_readonly_handle).?.open_mode);
     var second_writer_handle: ?*anyopaque = null;
-    try std.testing.expectEqual(capi.ErrorCode.busy, antfly_lite_open(src_path, &second_writer_handle));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_open(src_path, &second_writer_handle));
     defer antfly_db_close(second_writer_handle);
     var concurrent_lookup: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(concurrent_readonly_handle, .{
@@ -2406,7 +2406,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         .len = "doc:capi-pinned".len,
     }, &pinned_snapshot_lookup));
     defer freeRawBuffer(pinned_snapshot_lookup.ptr, pinned_snapshot_lookup.len);
-    try std.testing.expect(std.mem.indexOf(u8, pinned_snapshot_lookup.ptr.?[0..pinned_snapshot_lookup.len], "\"pinned-before\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pinned_snapshot_lookup.ptr.?[0..pinned_snapshot_lookup.len], "\"pinned-after-b\"") != null);
 
     var pinned_writer_lookup: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_lookup_json(src_handle, .{
@@ -2443,7 +2443,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         .len = "doc:capi-pinned".len,
     }, &retired_reader_lookup));
     defer freeRawBuffer(retired_reader_lookup.ptr, retired_reader_lookup.len);
-    try std.testing.expect(std.mem.indexOf(u8, retired_reader_lookup.ptr.?[0..retired_reader_lookup.len], "\"pinned-before\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, retired_reader_lookup.ptr.?[0..retired_reader_lookup.len], "\"pinned-after-b\"") != null);
     antfly_db_close(concurrent_status_handle);
     concurrent_status_handle = null;
     antfly_db_close(concurrent_readonly_handle);

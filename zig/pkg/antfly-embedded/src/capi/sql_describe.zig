@@ -22,6 +22,10 @@ fn describe(handle: *h.Handle, request_json: []const u8) !h.capi.Buffer {
 pub export fn antfly_db_sql_describe_json(ptr: ?*anyopaque, request: h.capi.Slice, out: *h.capi.Buffer) h.capi.ErrorCode {
     out.* = .{};
     const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     if (guard.handle.parent_id != null) return .invalid_argument;
     out.* = describe(guard.handle, request.bytes()) catch |err| return @import("sql_cursor.zig").diagnostic(err, out);

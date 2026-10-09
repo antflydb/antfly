@@ -211,10 +211,10 @@ returns.
 `Database` is `Send + Sync` and safe for concurrent use from any thread,
 like `*sql.DB` in Go: share one handle rather than opening one per thread.
 `libantfly` runs in serialized threading mode
-(`threading_mode() == THREADING_SERIALIZED`): reads such as `search_json`,
-`lookup_json`, and `scan_json` run in parallel with each other and with
-writes, `batch` and transaction calls on one handle queue instead of failing
-with `Busy`, and schema or index changes wait for in-flight calls.
+(`threading_mode() == THREADING_SERIALIZED`). Lite calls queue on a connection
+and coordinate with other connections to the file. Streaming SQL cursors retain
+their original snapshots while other connections publish new commits. Schema
+or index changes wait for in-flight calls.
 
 `close` takes `&self`, not `self` by value, specifically so it can be called
 on a `Database` shared across threads (e.g. `Arc<Database>`) without every
@@ -231,9 +231,11 @@ hang under sustained concurrent read load. The internal gate instead blocks
 *new* reads once a close is requested (like Go's `sync.RWMutex`), guaranteeing
 close completes in bounded time.
 
-Only one writer handle may be open per file at a time, across processes. Set
-`OpenOptions::busy_timeout` to wait for another writer to close instead of
-failing immediately with `Busy`, like `sqlite3_busy_timeout`.
+Multiple writable Lite connections may remain open, including across processes.
+Connections queue within a process; a kernel writer lease serializes complete
+native operations across processes. `OpenOptions::busy_timeout` waits for an
+operation holding that lease, like `sqlite3_busy_timeout`. Closing a connection
+does not close another connection to the same file.
 
 ## API surface
 
@@ -317,11 +319,12 @@ let rows = sqlx::query::<Antfly>("SELECT id,name FROM people")
     .fetch_all(&mut connection).await?;
 ```
 
-libantfly allows one writer owner per file. A process that also uses a
-`Database` for documents, search, or inference shares that handle with
-`AntflyConnectOptions::new(path).with_database(Arc::clone(&database))`;
-opening the file a second time fails with `ANTFLY_BUSY`. Connections never
-close a shared handle.
+SQLx can open independent connections alongside a `Database` used for
+documents, search, or inference. Each path-opened SQLx connection owns a native
+handle and worker; its default busy timeout is five seconds. To use an existing
+handle and its settings, pass
+`AntflyConnectOptions::new(path).with_database(Arc::clone(&database))`.
+Connections never explicitly close a shared handle.
 
 `AntflyPool`, transactions, nested savepoints, `query`, `query_as`, streaming,
 prepare/describe, and SQLSTATE database errors use native SQL sessions.

@@ -4917,6 +4917,15 @@ pub const DB = struct {
         return collected;
     }
 
+    /// A connection retired this generation after another owner committed.
+    /// Its cached indexes must never flush over the newer durable generation.
+    pub fn closeImmutableSnapshot(self: *DB) void {
+        if (self.closed) return;
+        self.open_mode = .query_readonly;
+        self.core.discard_storage_writes = true;
+        self.close();
+    }
+
     pub fn close(self: *DB) void {
         if (self.closed) return;
         self.closed = true;
@@ -5384,7 +5393,7 @@ pub const DB = struct {
             .prepare = prepareEnrichmentReplacement,
             .restore = restoreEnrichmentPrevious,
             .publish = publishEnrichmentOwner,
-        }, cfg, options.start_replacement);
+        }, cfg, options.start_replacement and self.local_execution.optional_runtime_workers_enabled);
         if (!hook_present) self.setQueryVisibilityHook(null);
     }
     fn createEnrichmentReplacement(ptr: *anyopaque, cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
@@ -26920,6 +26929,9 @@ pub const DB = struct {
     }
 
     fn restartEnrichmentAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) !void {
+        // Manual hosts drive enrichment while holding their publication lease.
+        // Catalog changes must preserve the worker policy chosen at open.
+        if (!self.local_execution.optional_runtime_workers_enabled) return;
         self.async_context.enrichment_desired_running.store(true, .release);
         lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
         const runtime = self.async_context.enrichment_runtime orelse {

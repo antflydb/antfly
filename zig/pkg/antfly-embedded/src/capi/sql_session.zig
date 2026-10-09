@@ -138,7 +138,7 @@ pub const Session = struct {
             var found = false;
             for (result.items) |*prior| {
                 if (std.mem.eql(u8, prior.table.physical_name, entry.table.physical_name) and std.mem.eql(u8, prior.mutation.key, entry.mutation.key)) {
-                    if (prior.table.schema_version != entry.table.schema_version) return error.PreparedGenerationChanged;
+                    if (prior.table.id != entry.table.id or prior.table.schema_version != entry.table.schema_version) return error.PreparedGenerationChanged;
                     if (!entry.mutation.predicate_only) {
                         prior.mutation.row = entry.mutation.row;
                         prior.mutation.json_null_fields = entry.mutation.json_null_fields;
@@ -154,6 +154,13 @@ pub const Session = struct {
     }
 
     pub fn commitRequests(self: *Session, a: std.mem.Allocator) ![]d.api_distributed_txn_contract.TableCommitRequest {
+        for (self.entries.items) |entry| {
+            const database = @import("tables.zig").get(self.handle, entry.table.physical_name) catch |err| switch (err) {
+                error.UndefinedTable => return error.PreparedGenerationChanged,
+                else => return err,
+            };
+            if (database.core.identity_namespace.table_id != entry.table.id) return error.PreparedGenerationChanged;
+        }
         return requestsForEntries(a, self.entries.items);
     }
 
@@ -268,6 +275,10 @@ pub fn closeAll(handle: *h.Handle) void {
 pub export fn antfly_db_sql_session_open(ptr: ?*anyopaque, out: *u64) h.capi.ErrorCode {
     out.* = 0;
     const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if (handle.parent_id != null) return .invalid_argument;
@@ -289,7 +300,11 @@ pub export fn antfly_db_sql_session_open(ptr: ?*anyopaque, out: *u64) h.capi.Err
     return .ok;
 }
 pub export fn antfly_db_sql_session_close(ptr: ?*anyopaque, id: u64) h.capi.ErrorCode {
-    const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    const guard = api.enterHandlePinned(ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if (handle.parent_id != null) return .invalid_argument;

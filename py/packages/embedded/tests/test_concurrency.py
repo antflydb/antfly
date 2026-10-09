@@ -24,7 +24,10 @@ Close raise InvalidArgumentError.
 
 from __future__ import annotations
 
+import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -32,6 +35,7 @@ from pathlib import Path
 import pytest
 
 import antfly_embedded
+from antfly_embedded._sql import SQLStateError
 
 pytestmark = pytest.mark.usefixtures("require_native")
 
@@ -164,30 +168,256 @@ def test_close_races_in_flight_calls(tmp_path: Path) -> None:
         db.stats()
 
 
-def test_busy_timeout_waits_for_writer_lock(tmp_path: Path) -> None:
-    path = tmp_path / "busy-timeout.aflite"
-    first = antfly_embedded.create(path, no_sync=True)
-    try:
-        # Without a timeout the second writer fails immediately.
-        with pytest.raises(antfly_embedded.BusyError):
-            antfly_embedded.open(path, no_sync=True)
-
-        # With a short timeout it fails with Busy only after waiting.
-        start = time.monotonic()
-        with pytest.raises(antfly_embedded.BusyError):
-            antfly_embedded.open(path, no_sync=True, busy_timeout=0.15)
-        elapsed = time.monotonic() - start
-        assert elapsed >= 0.14, f"busy timeout returned after {elapsed:.3f}s, want about 0.15s"
-
-        # With a longer timeout it succeeds once the first writer closes.
-        def close_first_later() -> None:
-            time.sleep(0.1)
+@pytest.mark.parametrize("no_sync", [False, True])
+def test_independent_writable_connections(tmp_path: Path, no_sync: bool) -> None:
+    path = tmp_path / "connections.aflite"
+    with antfly_embedded.create(path, no_sync=no_sync) as first:
+        with antfly_embedded.open(path, no_sync=no_sync) as second:
+            first.batch_json({"inserts": {"first": {"body": "first"}}})
+            assert second.lookup("first")["body"] == "first"
+            second.batch_json({"inserts": {"second": {"body": "second"}}})
+            assert first.lookup("second")["body"] == "second"
             first.close()
+            second.batch_json({"inserts": {"after": {"body": "still open"}}})
+            assert second.lookup("first")["body"] == "first"
 
-        closer = threading.Thread(target=close_first_later)
-        closer.start()
-        second = antfly_embedded.open(path, no_sync=True, busy_timeout=10.0)
-        closer.join()
-        second.close()
+
+def test_readonly_connection_observes_new_commits(tmp_path: Path) -> None:
+    path = tmp_path / "readonly.aflite"
+    with antfly_embedded.create(path, no_sync=True) as writer:
+        writer.batch_json({"inserts": {"item": {"body": "before"}}})
+        with antfly_embedded.open(path, mode=antfly_embedded.OpenMode.READONLY) as reader:
+            assert reader.lookup("item")["body"] == "before"
+            writer.batch_json({"inserts": {"item": {"body": "after"}}})
+            assert reader.lookup("item")["body"] == "after"
+            writer.create_table("new_table", {})
+            assert "new_table" in reader.list_tables()
+
+
+def test_table_handle_rebinds_and_rejects_recreated_table(tmp_path: Path) -> None:
+    path = tmp_path / "table-connections.aflite"
+    with antfly_embedded.create(path, no_sync=True) as first:
+        first.create_table("items", {})
+        with first.open_table("items") as table:
+            with antfly_embedded.open(path, no_sync=True) as second:
+                with second.open_table("items") as other:
+                    other.batch_json({"inserts": {"item": {"body": "external"}}})
+                assert table.lookup("item")["body"] == "external"
+                table.batch_json({"inserts": {"local": {"body": "local"}}})
+                with second.open_table("items") as other:
+                    assert other.lookup("local")["body"] == "local"
+                second.drop_table("items")
+                second.create_table("items", {})
+                with pytest.raises(antfly_embedded.InvalidArgumentError):
+                    table.lookup("item")
+
+
+def test_idle_connections_allow_vacuum_and_refresh_replacement(tmp_path: Path) -> None:
+    path = tmp_path / "vacuum-connections.aflite"
+    with antfly_embedded.create(path, no_sync=True) as first:
+        first.batch_json({"inserts": {"item": {"body": "before"}}})
+        with antfly_embedded.open(path, no_sync=True) as second:
+            with antfly_embedded.open(path, mode=antfly_embedded.OpenMode.READONLY) as reader:
+                assert reader.lookup("item")["body"] == "before"
+                first.vacuum()
+                assert second.lookup("item")["body"] == "before"
+                second.batch_json({"inserts": {"item": {"body": "after"}}})
+                assert first.lookup("item")["body"] == "after"
+                assert reader.lookup("item")["body"] == "after"
+
+
+def _child_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).parent.parent / "src")
+    return env
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX kernel lock fixture")
+def test_busy_timeout_applies_to_operations_not_open(tmp_path: Path) -> None:
+    path = tmp_path / "busy-timeout.aflite"
+    with antfly_embedded.create(path, no_sync=True):
+        pass
+    locker = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            "import fcntl,sys; f=open(sys.argv[1], 'r+'); "
+            "fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); sys.stdin.readline()",
+            str(path) + ".lock",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert locker.stdout.readline().strip() == "locked"
+        with antfly_embedded.open(path, no_sync=True) as immediate:
+            with pytest.raises(antfly_embedded.BusyError):
+                immediate.batch_json({"inserts": {"blocked": {"body": "blocked"}}})
+        with antfly_embedded.open(path, no_sync=True, busy_timeout=0.15) as timed:
+            start = time.monotonic()
+            with pytest.raises(antfly_embedded.BusyError):
+                timed.batch_json({"inserts": {"blocked": {"body": "blocked"}}})
+            assert time.monotonic() - start >= 0.14
+        with antfly_embedded.open(path, no_sync=True, busy_timeout=5.0) as waiting:
+
+            def release() -> None:
+                time.sleep(0.1)
+                locker.stdin.write("release\n")
+                locker.stdin.flush()
+
+            release_thread = threading.Thread(target=release)
+            release_thread.start()
+            waiting.batch_json({"inserts": {"after": {"body": "committed"}}})
+            release_thread.join()
+            assert waiting.lookup("after")["body"] == "committed"
     finally:
-        first.close()
+        if locker.poll() is None:
+            locker.stdin.close()
+        locker.wait(timeout=5)
+
+
+def test_cross_process_connections_refresh_documents_and_search(tmp_path: Path) -> None:
+    path = tmp_path / "processes.aflite"
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=5.0) as parent:
+        parent.batch_json({"inserts": {"parent": {"body": "parent initial"}}})
+        script = (
+            "import antfly_embedded,sys; "
+            "db=antfly_embedded.open(sys.argv[1], no_sync=True, busy_timeout=5.0); "
+            "assert db.lookup('parent')['body']=='parent initial'; "
+            "db.batch_json({'inserts':{'child':{'body':'child publication'}}}); "
+            "db.run_until_idle(); db.close()"
+        )
+        subprocess.run([sys.executable, "-c", script, str(path)], env=_child_environment(), check=True, timeout=60)
+        assert parent.lookup("child")["body"] == "child publication"
+        parent.batch_json({"inserts": {"after": {"body": "parent after child"}}})
+        parent.run_until_idle()
+        assert parent.lookup("parent")["body"] == "parent initial"
+        assert parent.lookup("child")["body"] == "child publication"
+        result = parent.search({"full_text_search": {"match": {"field": "body", "text": "publication"}}, "limit": 10})
+        assert "child" in str(result)
+
+
+def test_cross_process_dense_checkpoints_refresh_search(tmp_path: Path) -> None:
+    path = tmp_path / "dense-processes.aflite"
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=5.0) as parent:
+        parent.add_index(
+            {
+                "name": "dv",
+                "kind": "dense_vector",
+                "config_json": '{"field":"embedding","dims":2,"metric":"l2_squared","external":true}',
+            }
+        )
+        parent.batch(
+            [antfly_embedded.WriteIntent(key="east", value=b'{"title":"east","_embeddings":{"dv":[1,0]}}')],
+            timestamp=1,
+        )
+        parent.run_until_idle()
+        script = (
+            "import antfly_embedded,sys; "
+            "db=antfly_embedded.open(sys.argv[1], no_sync=True, busy_timeout=5.0); "
+            "db.batch([antfly_embedded.WriteIntent(key='north', "
+            'value=b\'{"title":"north","_embeddings":{"dv":[0,1]}}\')],timestamp=2); '
+            "db.run_until_idle(); db.close()"
+        )
+        subprocess.run([sys.executable, "-c", script, str(path)], env=_child_environment(), check=True, timeout=60)
+        result = parent.search({"embeddings": {"dv": [0.1, 0.9]}, "indexes": ["dv"], "limit": 1})
+        assert "north" in str(result)
+        parent.batch(
+            [antfly_embedded.WriteIntent(key="middle", value=b'{"title":"middle","_embeddings":{"dv":[0.5,0.5]}}')],
+            timestamp=3,
+        )
+        parent.run_until_idle()
+        result = parent.search({"embeddings": {"dv": [0.5, 0.5]}, "indexes": ["dv"], "limit": 3})
+        assert all(key in str(result) for key in ("east", "north", "middle"))
+
+
+def test_cursors_retain_snapshots_across_external_commits_and_refresh(tmp_path: Path) -> None:
+    path = tmp_path / "cursor.aflite"
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=5.0) as first:
+        with antfly_embedded.open(path, no_sync=True, busy_timeout=5.0) as second:
+            first.sql("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT)")
+            first.sql("INSERT INTO items (id,name) VALUES (1, 'before'), (2, 'second')")
+            cursor = first.sql_cursor("SELECT id, name FROM items")
+            try:
+                second.sql("UPDATE items SET name = 'after' WHERE id = 1")
+                assert first.sql("SELECT name FROM items WHERE id = 1")["rows"] == [["after"]]
+                # first has reopened, but this cursor borrows its old runtime.
+                old_rows = cursor.fetch(1)["result"]["rows"]
+                assert len(old_rows) == 1
+                second.sql("INSERT INTO items (id,name) VALUES (3, 'new')")
+                old_rows.extend(cursor.fetch(10)["result"]["rows"])
+                assert sorted(old_rows) == [["1", "before"], ["2", "second"]]
+            finally:
+                cursor.close()
+            assert len(first.sql("SELECT id FROM items")["rows"]) == 3
+
+
+def test_sql_sessions_keep_uncommitted_rows_private_across_reopen(tmp_path: Path) -> None:
+    path = tmp_path / "transactions.aflite"
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=5.0) as first:
+        with antfly_embedded.open(path, no_sync=True, busy_timeout=5.0) as second:
+            first.sql("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT)")
+            session = first.sql_session()
+            try:
+                session.execute("BEGIN")
+                session.execute("INSERT INTO items (id,name) VALUES (1, 'pending')")
+                assert second.sql("SELECT id FROM items")["rows"] == []
+                second.sql("INSERT INTO items (id,name) VALUES (2, 'other')")
+                # Reopening first's cache must preserve its session postimages.
+                assert len(session.execute("SELECT id FROM items")["rows"]) == 2
+                session.execute("COMMIT")
+                assert len(second.sql("SELECT id FROM items")["rows"]) == 2
+                session.execute("BEGIN")
+                session.execute("INSERT INTO items (id,name) VALUES (3, 'aborted')")
+                session.execute("ROLLBACK")
+                assert len(second.sql("SELECT id FROM items")["rows"]) == 2
+            finally:
+                session.close()
+
+
+def test_session_cannot_commit_into_recreated_table(tmp_path: Path) -> None:
+    path = tmp_path / "session-identity.aflite"
+    with antfly_embedded.create(path, no_sync=True) as first:
+        with antfly_embedded.open(path, no_sync=True) as second:
+            first.sql("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT)")
+            session = first.sql_session()
+            try:
+                session.execute("BEGIN")
+                session.execute("INSERT INTO items (id,name) VALUES (1, 'old table')")
+                second.sql("DROP TABLE items")
+                second.sql("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT)")
+                with pytest.raises(SQLStateError) as error:
+                    session.execute("COMMIT")
+                assert error.value.sqlstate == "40001"
+                session.execute("ROLLBACK")
+                assert second.sql("SELECT id FROM items")["rows"] == []
+            finally:
+                session.close()
+
+
+def test_cross_process_writers_do_not_lose_each_others_rows(tmp_path: Path) -> None:
+    path = tmp_path / "writers.aflite"
+    with antfly_embedded.create(path, no_sync=True, busy_timeout=10.0) as parent:
+        script = """
+import antfly_embedded, sys
+with antfly_embedded.open(sys.argv[1], no_sync=True, busy_timeout=10.0) as db:
+    for i in range(8):
+        db.batch_json({'inserts': {f'{sys.argv[2]}:{i}': {'body': f'writer {sys.argv[2]} item {i}'}}})
+"""
+        workers = [
+            subprocess.Popen([sys.executable, "-c", script, str(path), str(i)], env=_child_environment())
+            for i in range(2)
+        ]
+        try:
+            for worker in workers:
+                assert worker.wait(timeout=90) == 0
+            for writer in range(2):
+                for i in range(8):
+                    assert parent.lookup(f"{writer}:{i}")["body"] == f"writer {writer} item {i}"
+        finally:
+            for worker in workers:
+                if worker.poll() is None:
+                    worker.terminate()
+                    worker.wait(timeout=5)

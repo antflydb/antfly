@@ -92,6 +92,10 @@ pub export fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.S
     out.* = .{};
     out_id.* = 0;
     const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     if (guard.handle.parent_id != null) return .invalid_argument;
     out_id.* = open(guard.handle, "default", request.bytes()) catch |err| return diagnostic(err, out);
@@ -99,7 +103,11 @@ pub export fn antfly_db_sql_open_cursor_json(ptr: ?*anyopaque, request: h.capi.S
 }
 pub export fn antfly_db_sql_fetch_cursor_json(ptr: ?*anyopaque, id: u64, rows: u32, out: *h.capi.Buffer) h.capi.ErrorCode {
     out.* = .{};
-    const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    const guard = api.enterHandlePinned(ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     if (rows == 0 or rows > 4096) return diagnostic(error.InvalidSqlLimit, out);
     const cursor = guard.handle.sql_cursors.get(id) orelse return .invalid_argument;
@@ -124,7 +132,11 @@ pub export fn antfly_db_sql_fetch_cursor_json(ptr: ?*anyopaque, id: u64, rows: u
     return .ok;
 }
 pub export fn antfly_db_sql_close_cursor(ptr: ?*anyopaque, id: u64) h.capi.ErrorCode {
-    const guard = api.enterHandle(ptr, .exclusive) orelse return .invalid_argument;
+    const guard = api.enterHandlePinned(ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const entry = guard.handle.sql_cursors.fetchRemove(id) orelse return .invalid_argument;
     entry.value.close();

@@ -190,6 +190,70 @@ fn sqlx_conformance_and_streaming() {
 }
 
 #[test]
+fn sqlx_pool_uses_independent_native_connections() {
+    let directory = std::env::temp_dir().join(format!(
+        "antfly-sqlx-pool-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let pool = sqlx_core::pool::PoolOptions::<Antfly>::new()
+                .min_connections(2)
+                .max_connections(2)
+                .connect_with(AntflyConnectOptions::new(directory.join("db.aflite")))
+                .await
+                .unwrap();
+            let mut first = pool.acquire().await.unwrap();
+            let mut second = pool.acquire().await.unwrap();
+            first
+                .execute("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT)".into_sql_str())
+                .await
+                .unwrap();
+            let mut transaction = first.begin().await.unwrap();
+            transaction
+                .execute("INSERT INTO items (id,name) VALUES (1, 'pending')".into_sql_str())
+                .await
+                .unwrap();
+            assert!(
+                query::<Antfly>("SELECT id FROM items".into_sql_str())
+                    .fetch_all(&mut *second)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            second
+                .execute("INSERT INTO items (id,name) VALUES (2, 'other')".into_sql_str())
+                .await
+                .unwrap();
+            transaction.commit().await.unwrap();
+            assert_eq!(
+                query::<Antfly>("SELECT id FROM items".into_sql_str())
+                    .fetch_all(&mut *second)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            first.close().await.unwrap();
+            second
+                .execute("INSERT INTO items (id,name) VALUES (3, 'after close')".into_sql_str())
+                .await
+                .unwrap();
+            drop(second);
+            pool.close().await;
+        });
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn sqlx_shares_an_open_database_with_the_document_api() {
     let directory = std::env::temp_dir().join(format!(
         "antfly-sqlx-shared-{}-{}",
@@ -214,19 +278,18 @@ fn sqlx_shares_an_open_database_with_the_document_api() {
             database
                 .batch_json(r#"{"inserts":{"doc":{"text":"document api"}}}"#)
                 .unwrap();
-            // A second writer owner on the same file is refused.
+            // Independent path-opened connections also work alongside documents.
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             runtime.block_on(async {
-                assert!(
-                    AntflyConnectOptions::new(&path)
-                        .no_sync(true)
-                        .connect()
-                        .await
-                        .is_err()
-                );
+                let independent = AntflyConnectOptions::new(&path)
+                    .no_sync(true)
+                    .connect()
+                    .await
+                    .unwrap();
+                independent.close().await.unwrap();
                 let options = AntflyConnectOptions::new(&path)
                     .with_database(std::sync::Arc::clone(&database));
                 let pool = sqlx_core::pool::PoolOptions::<Antfly>::new()

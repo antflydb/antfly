@@ -103,12 +103,10 @@ impl Drop for PendingResource {
 struct Worker {
     sender: Option<mpsc::Sender<Job>>,
     thread: Option<std::thread::JoinHandle<()>>,
-    no_sync: bool,
 }
 impl Drop for Worker {
     fn drop(&mut self) {
-        // Drain queued resource cleanup and release the writer lock before
-        // the last connection's close returns.
+        // Drain queued resource cleanup before closing the native connection.
         self.sender.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -120,12 +118,11 @@ impl fmt::Debug for Worker {
         f.debug_struct("NativeWorker").finish_non_exhaustive()
     }
 }
-static WORKERS: OnceLock<Mutex<HashMap<PathBuf, Weak<Worker>>>> = OnceLock::new();
 static SHARED_WORKERS: OnceLock<Mutex<HashMap<usize, Weak<Worker>>>> = OnceLock::new();
 impl Worker {
     fn open(options: &AntflyConnectOptions) -> Result<Arc<Self>, Error> {
         if let Some(database) = &options.database {
-            return Self::open_shared(database, options.no_sync);
+            return Self::open_shared(database);
         }
         let path = if options.path.is_absolute() {
             options.path.clone()
@@ -134,30 +131,11 @@ impl Worker {
                 .map_err(protocol)?
                 .join(&options.path)
         };
-        // Resolve existing file aliases, or the parent of a new database, so
-        // every connection to the same file shares its native writer owner.
-        let path = std::fs::canonicalize(&path)
-            .or_else(|error| match (path.parent(), path.file_name()) {
-                (Some(parent), Some(name)) => std::fs::canonicalize(parent).map(|p| p.join(name)),
-                _ => Err(error),
-            })
-            .unwrap_or(path);
-        let mut registry = WORKERS
-            .get_or_init(Default::default)
-            .lock()
-            .map_err(protocol)?;
-        if let Some(worker) = registry.get(&path).and_then(Weak::upgrade) {
-            if worker.no_sync != options.no_sync {
-                return Err(protocol(
-                    "database is already open with different no_sync settings",
-                ));
-            }
-            return Ok(worker);
-        }
         let (sender, receiver) = mpsc::channel::<Job>();
         let (started, start) = mpsc::sync_channel(1);
         let native_options = OpenOptions {
             no_sync: options.no_sync,
+            busy_timeout: Some(options.busy_timeout),
             ..Default::default()
         };
         let thread_path = path.clone();
@@ -167,9 +145,14 @@ impl Worker {
             .spawn(move || {
                 let database = match Database::open(&thread_path, &native_options) {
                     Ok(db) => Ok(db),
-                    Err(_e) if !thread_path.exists() => {
-                        Database::create(&thread_path, &native_options)
-                    }
+                    Err(crate::Error::NotFound) => Database::create(&thread_path, &native_options)
+                        .or_else(|error| {
+                            if thread_path.exists() {
+                                Database::open(&thread_path, &native_options)
+                            } else {
+                                Err(error)
+                            }
+                        }),
                     Err(e) => Err(e),
                 };
                 match database {
@@ -194,13 +177,11 @@ impl Worker {
         let worker = Arc::new(Worker {
             sender: Some(sender),
             thread: Some(thread),
-            no_sync: options.no_sync,
         });
-        registry.insert(path, Arc::downgrade(&worker));
         Ok(worker)
     }
     /// One worker per shared handle, so every pooled connection queues on it.
-    fn open_shared(database: &Arc<Database>, no_sync: bool) -> Result<Arc<Self>, Error> {
+    fn open_shared(database: &Arc<Database>) -> Result<Arc<Self>, Error> {
         let key = Arc::as_ptr(database) as usize;
         let mut registry = SHARED_WORKERS
             .get_or_init(Default::default)
@@ -223,7 +204,6 @@ impl Worker {
         let worker = Arc::new(Worker {
             sender: Some(sender),
             thread: Some(thread),
-            no_sync,
         });
         registry.insert(key, Arc::downgrade(&worker));
         Ok(worker)
@@ -280,6 +260,7 @@ impl Worker {
 pub struct AntflyConnectOptions {
     pub path: PathBuf,
     pub no_sync: bool,
+    pub busy_timeout: Duration,
     /// An already-open handle to run SQL on instead of opening `path`.
     database: Option<Arc<Database>>,
 }
@@ -288,6 +269,7 @@ impl AntflyConnectOptions {
         Self {
             path: path.into(),
             no_sync: false,
+            busy_timeout: Duration::from_secs(5),
             database: None,
         }
     }
@@ -295,11 +277,16 @@ impl AntflyConnectOptions {
         self.no_sync = value;
         self
     }
+    /// Maximum wait for another connection to finish a native operation.
+    pub fn busy_timeout(mut self, timeout: Duration) -> Self {
+        self.busy_timeout = timeout;
+        self
+    }
     /// Runs SQL on `database` instead of opening `path` (kept for the URL).
     ///
-    /// libantfly allows one writer owner per file, so a process that also
-    /// uses the document, search, or inference APIs on a [`Database`] must
-    /// share that handle here rather than open the file a second time.
+    /// Optional when mixing SQL with documents, search, or inference. Separate
+    /// path-opened connections are also supported; native calls coordinate
+    /// writer ownership at operation boundaries.
     /// Connections never close a shared handle; its owner does.
     pub fn with_database(mut self, database: Arc<Database>) -> Self {
         self.database = Some(database);
@@ -331,6 +318,9 @@ impl ConnectOptions for AntflyConnectOptions {
             match (name.as_ref(), value.as_ref()) {
                 ("no_sync", "1") => options.no_sync = true,
                 ("no_sync", "0") => {}
+                ("busy_timeout_ms", value) => {
+                    options.busy_timeout = Duration::from_millis(value.parse().map_err(protocol)?);
+                }
                 _ => return Err(protocol("unknown embedded SQL connection option")),
             }
         }
@@ -345,8 +335,18 @@ impl ConnectOptions for AntflyConnectOptions {
                 .join(&self.path)
         };
         let mut url = Url::from_file_path(path).expect("database path");
-        if self.no_sync {
-            url.set_query(Some("no_sync=1"))
+        {
+            let mut pairs = url.query_pairs_mut();
+            if self.no_sync {
+                pairs.append_pair("no_sync", "1");
+            }
+            pairs.append_pair(
+                "busy_timeout_ms",
+                &OpenOptions::new()
+                    .busy_timeout(self.busy_timeout)
+                    .busy_timeout_ms()
+                    .to_string(),
+            );
         }
         url
     }
