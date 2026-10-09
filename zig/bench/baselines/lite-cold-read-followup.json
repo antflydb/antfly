@@ -267,5 +267,37 @@
   "followup_comparison_commit": "cc48e4652c375181f3cfc2d7a540a75cf38848c5",
   "remaining_wins_comparison_commit": "6c2674dce1c6a498d047a1231cf7f847ae173c1a",
   "review_followup_comparison_commit": "4eb332cedfd147c13ed4088e1404fa6c5b1ac576",
-  "latest_review_comparison_commit": "73fbfacf315c6399312011d0d1c467bd38edd254"
+  "latest_review_comparison_commit": "73fbfacf315c6399312011d0d1c467bd38edd254",
+  "scratch_lifetime_comparison_commit": "79e3ef336fd605efdb1530a6c3ad75bb723372a3",
+  "scratch_lifetime_followup": {
+    "arena_results": {
+      "lookups": 64,
+      "selected_value_bytes": 64,
+      "snappy_decoded_bytes": 12672,
+      "before_backing_live_bytes": 1162744,
+      "after_backing_live_bytes": 2568,
+      "read_charge_after_return_bytes": 0,
+      "change": "mandatory decode/key scratch uses a reclaimable runtime allocator independently of the result allocator; resource admission remains in lsm_read_working_set"
+    },
+    "large_singleton_snappy": {
+      "selected_value_bytes": 1048576,
+      "decoded_bytes": 1048641,
+      "before_peak_bytes": 2097217,
+      "after_peak_bytes": 1048641,
+      "result_allocator_limit_bytes": 1572864,
+      "before_limit_result": "OutOfMemory",
+      "after_limit_result": "success",
+      "eligibility": "raw Snappy singleton above 64 KiB, value at least half the logical block, namespace and key fit a 4 KiB admission prefix",
+      "ownership": "decode directly into final caller storage; retain the full singleton row including its small header and key; complete stream validation before publication",
+      "fallback": "other shapes use reclaimable admitted scratch and selected-result copying"
+    },
+    "immutable_preclassification": {
+      "keys": 3,
+      "overlapping_disk_runs": 64,
+      "before_selected_runs": 64,
+      "after_selected_runs": 0,
+      "covers": "immutable values and tombstones, namespace separation; snapshot memtable precedence remains in the existing read path"
+    },
+    "validation_scope": "native fixtures; directory selection counts are not an end-to-end throughput benchmark; no new 2 GiB soak"
+  }
 }

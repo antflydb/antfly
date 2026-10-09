@@ -5605,10 +5605,10 @@ fn readManySortedDirectoryCandidates(
     var selected = std.ArrayListUnmanaged(Directory.Handle).empty;
     defer selected.deinit(scratch);
     // Classify each key once. Query the union using unresolved keys only,
-    // rather than revisiting every mutable hit for every overlapping run.
+    // rather than revisiting every memtable hit for every overlapping run.
     var unresolved = std.ArrayListUnmanaged([]const u8).empty;
     defer unresolved.deinit(scratch);
-    const planning_keys = try directoryUnresolvedKeys(scratch, mutable, namespace, keys, &unresolved);
+    const planning_keys = try directoryUnresolvedKeys(scratch, mutable, immutable_memtables, namespace, keys, &unresolved);
     var cursor = directory.sortedPoints(namespace.name, planning_keys);
     while (!cursor.done()) {
         var budget: usize = 16384;
@@ -5633,21 +5633,27 @@ fn readManySortedDirectoryCandidates(
 fn directoryUnresolvedKeys(
     allocator: Allocator,
     mutable: anytype,
+    immutable_memtables: []const *const State,
     namespace: backend_types.Namespace,
     keys: []const []const u8,
     unresolved: *std.ArrayListUnmanaged([]const u8),
 ) ![]const []const u8 {
-    if (mutable.entryCount() == 0) return keys;
+    if (mutable.entryCount() == 0 and immutable_memtables.len == 0) return keys;
     var first_resolved: ?usize = null;
     for (keys, 0..) |key, i| {
-        if (mutable.findIndex(namespace, key) != null) {
+        const resolved = found: {
+            if (mutable.findIndex(namespace, key) != null) break :found true;
+            for (immutable_memtables) |state| if (state.findIndex(namespace, key) != null) break :found true;
+            break :found false;
+        };
+        if (resolved) {
             if (first_resolved == null) {
                 first_resolved = i;
                 try unresolved.appendSlice(allocator, keys[0..i]);
             }
         } else if (first_resolved != null) try unresolved.append(allocator, key);
     }
-    // Cold batches with no mutable matches borrow the original key vector.
+    // Cold batches with no memtable matches borrow the original key vector.
     return if (first_resolved != null) unresolved.items else keys;
 }
 
@@ -6493,10 +6499,10 @@ fn consumeAsyncPointRead(
     // Misses and uncompressed pinned data need no temporary allocation.
     if (read.status == .known_miss or read.compression == .none) return consumeAsyncPointReadWithScratch(backend, read, read_hint, held_values, value_allocator, namespace, key, null, value_allocator);
     const resources = @import("../resource_manager.zig");
-    var budget: ?resources.BudgetedAllocator = if (backend.options.resource_manager) |manager| resources.BudgetedAllocator.init(manager, .lsm_read_working_set, value_allocator, 1) else null;
+    var budget: ?resources.BudgetedAllocator = if (backend.options.resource_manager) |manager| resources.BudgetedAllocator.init(manager, .lsm_read_working_set, runtimeScratchAllocator(backend.allocator), 1) else null;
     defer if (budget) |*admitted| admitted.deinit();
     if (budget) |*admitted| admitted.credit_quantum = 1;
-    const scratch = if (budget) |*admitted| admitted.allocator() else value_allocator;
+    const scratch = if (budget) |*admitted| admitted.allocator() else runtimeScratchAllocator(backend.allocator);
     return consumeAsyncPointReadWithScratch(backend, read, read_hint, held_values, value_allocator, namespace, key, null, scratch) catch |err| {
         if (err == error.OutOfMemory) if (budget) |*admitted| if (admitted.denied()) return error.ResourceBudgetExceeded;
         return err;
@@ -6532,6 +6538,53 @@ fn retainAsyncPointEntry(
     };
     backend.recordPointRunSurvivorHit();
     return .{ .hit = value };
+}
+
+// Large values are normally emitted as singleton raw Snappy blocks. Probe a
+// bounded header first, then decode into final result storage. The read charge
+// covers construction and is released when the buffer becomes an owned result,
+// just as for a copied value; no scratch allocation is stranded in its arena.
+fn retainLargeSingletonSnappy(
+    backend: anytype,
+    read: *AsyncPointBlockRead,
+    index: *const lsm_table_file.TableIndex,
+    payload: []const u8,
+    read_hint: ?*?BorrowedReadHint,
+    held_values: *std.ArrayListUnmanaged([]u8),
+    value_allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+) !?AsyncPointLookupResult {
+    if (read.compression != .snappy or read.logical_len <= BatchAsyncBlocks.max_decoded_block_bytes or index.blocks[read.block_index].entry_count != 1) return null;
+    const snappy = @import("../../encoding/snappy.zig");
+    if (try snappy.decodedLen(payload) != read.logical_len) return error.InvalidTableFile;
+    const name = namespace.name orelse "";
+    var header: [4096]u8 = undefined;
+    if (key.len > header.len - 13 or name.len > header.len - 13 - key.len) return null;
+    const prefix_len = 13 + name.len + key.len;
+    if (prefix_len > read.logical_len) return null;
+    const view: @import("../../segment_source.zig").View = .{ .source = .{ .contiguous = payload }, .offset = 0, .length = payload.len };
+    _ = try snappy.decodePrefixFromView(view, header[0..prefix_len]);
+    // Other shapes and misses use the ordinary decoder, which validates the
+    // complete stream before returning either a value or a miss.
+    if (header[0] != 0 or std.mem.readInt(u32, header[1..5], .little) != name.len or std.mem.readInt(u32, header[5..9], .little) != key.len) return null;
+    const value_len: usize = std.mem.readInt(u32, header[9..13], .little);
+    if (value_len != read.logical_len - prefix_len or value_len < read.logical_len / 2) return null;
+    if (!std.mem.eql(u8, header[13..][0..name.len], name) or !std.mem.eql(u8, header[13 + name.len ..][0..key.len], key)) return null;
+    const resources = @import("../resource_manager.zig");
+    var reservation: ?resources.Reservation = if (backend.options.resource_manager) |manager| try manager.reserveWithoutReclaim(.lsm_read_working_set, read.logical_len) else null;
+    defer if (reservation) |*charge| charge.release();
+    // Grow metadata before allocating arena-owned output so error cleanup of
+    // the large buffer remains LIFO even for an arena result allocator.
+    try held_values.ensureUnusedCapacity(value_allocator, 1);
+    const owned = try value_allocator.alloc(u8, read.logical_len);
+    errdefer value_allocator.free(owned);
+    try snappy.decodeInto(payload, owned);
+    const found = (try lsm_table_file.findExactEntryInBlock(index, owned, read.block_index, namespace.name, key)) orelse return error.InvalidTableFile;
+    held_values.appendAssumeCapacity(owned);
+    if (read_hint) |hint| hint.* = .{ .run_index = read.candidate.run_index, .namespace_name = namespace.name, .key = found.entry.key, .entry_index = found.index };
+    backend.recordPointRunSurvivorHit();
+    return .{ .hit = found.entry.value };
 }
 
 fn consumeAsyncPointReadWithScratch(
@@ -6575,6 +6628,7 @@ fn consumeAsyncPointReadWithScratch(
     // None borrows its pinned payload. Snappy scratch is freed before returning.
     const validated = if (read.shared_block) |owner| owner.checksum_validated else false;
     if (!validated) try lsm_table_file.validateBlockPayload(payload, read.checksum);
+    if (try retainLargeSingletonSnappy(backend, read, index, payload, read_hint, held_values, value_allocator, namespace, key)) |result| return result;
     const snappy = @import("../../encoding/snappy.zig");
     const decoded = switch (read.compression) {
         .none, .prefix => payload,
@@ -6795,10 +6849,10 @@ fn readManySortedPointFromSnapshotAsync(
     const resources = @import("../resource_manager.zig");
     var decode_budget: ?resources.BudgetedAllocator = if (backend.options.resource_manager) |manager| resources.BudgetedAllocator.init(manager, .lsm_in_memory_state, runtimeScratchAllocator(allocator), 1) else null;
     defer if (decode_budget) |*budget| budget.deinit();
-    var scratch_budget: ?resources.BudgetedAllocator = if (backend.options.resource_manager) |manager| resources.BudgetedAllocator.init(manager, .lsm_read_working_set, allocator, 1) else null;
+    var scratch_budget: ?resources.BudgetedAllocator = if (backend.options.resource_manager) |manager| resources.BudgetedAllocator.init(manager, .lsm_read_working_set, runtimeScratchAllocator(backend.allocator), 1) else null;
     defer if (scratch_budget) |*budget| budget.deinit();
     if (scratch_budget) |*budget| budget.credit_quantum = 1;
-    var shared: BatchAsyncBlocks = .{ .allocator = if (decode_budget) |*budget| budget.allocator() else runtimeScratchAllocator(allocator), .scratch_allocator = if (scratch_budget) |*budget| budget.allocator() else allocator, .limit = configured_limit };
+    var shared: BatchAsyncBlocks = .{ .allocator = if (decode_budget) |*budget| budget.allocator() else runtimeScratchAllocator(allocator), .scratch_allocator = if (scratch_budget) |*budget| budget.allocator() else runtimeScratchAllocator(backend.allocator), .limit = configured_limit };
     defer shared.deinit();
     var slots: [max_point_async_stack_reads]BatchAsyncPointSlot = undefined;
     for (slots[0..configured_limit]) |*slot| slot.* = .{};
@@ -9987,7 +10041,7 @@ test "lsm shared directory classification visits keys once and includes mutable 
     var unresolved: std.ArrayListUnmanaged([]const u8) = .empty;
     defer unresolved.deinit(std.testing.allocator);
     const keys = [_][]const u8{ "hit", "missing", "tombstone" };
-    const planned = try directoryUnresolvedKeys(std.testing.allocator, &mutable, .{}, &keys, &unresolved);
+    const planned = try directoryUnresolvedKeys(std.testing.allocator, &mutable, &.{}, .{}, &keys, &unresolved);
     try std.testing.expectEqual(@as(usize, 3), mutable.calls);
     try std.testing.expectEqual(@as(usize, 1), planned.len);
     try std.testing.expectEqualStrings("missing", planned[0]);
@@ -10229,7 +10283,7 @@ test "lsm shared single user snappy retains selected rows only" {
     try std.testing.expectEqual(@as(usize, 1), held.items[held.items.len - 1].len);
 }
 
-test "lsm shared mandatory snappy scratch respects allocation and resource budgets" {
+test "lsm shared mandatory snappy scratch respects resource and result budgets" {
     const a = std.testing.allocator;
     const B = @import("../lsm_backend.zig").Backend;
     var storage = storage_io.MemoryStorage.init(a);
@@ -10280,13 +10334,20 @@ test "lsm shared mandatory snappy scratch respects allocation and resource budge
     read.status = .shared;
     defer read.release();
     const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
-    var bounded = Budget{ .backing = a, .limit = 64 };
+    var bounded = Budget{ .backing = a, .limit = 0 };
     var held: std.ArrayListUnmanaged([]u8) = .empty;
     try held.ensureTotalCapacity(a, 8);
     defer releaseHeldValues(&held, a);
     try std.testing.expectError(error.OutOfMemory, consumeAsyncPointRead(&backend, &read, null, &held, bounded.allocator(), .{}, entries[0].key, null));
     try std.testing.expectEqual(@as(usize, 0), bounded.live);
     try std.testing.expectEqual(@as(usize, 0), held.items.len);
+    // The supplied allocator controls results, while mandatory scratch has
+    // independent reclaimable storage and resource admission.
+    bounded.limit = 64;
+    const small = (try consumeAsyncPointRead(&backend, &read, null, &held, bounded.allocator(), .{}, entries[0].key, null)).?;
+    try std.testing.expectEqualStrings("v", small.hit);
+    bounded.allocator().free(held.pop().?);
+    try std.testing.expectEqual(@as(usize, 0), bounded.live);
     const resources = @import("../resource_manager.zig");
     var budgets = resources.Options.defaultBudgets();
     budgets[@backingInt(resources.Slice.lsm_read_working_set)] = .{ .hard_limit_bytes = 1 };
@@ -10368,4 +10429,250 @@ test "lsm shared prefix scratch retention enforces per block and aggregate charg
     for (&pool.entries) |*entry| entry.users = 0;
     pool.deinit();
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+}
+
+test "lsm shared scratch is reclaimed with arena owned results" {
+    const a = std.testing.allocator;
+    const B = @import("../lsm_backend.zig").Backend;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/review-decode-budget", .{ .storage = storage.storage(), .cache = &cache });
+    defer backend.close();
+    var entries: [192]lsm_table_file.Entry = undefined;
+    var buffers: [192][80]u8 = undefined;
+    for (&entries, 0..) |*entry, i| entry.* = .{ .key = try std.fmt.bufPrint(&buffers[i], "long-shared-document-key-prefix-for-compression:{d:0>4}", .{i}), .value = "v" };
+    var filter = try lsm_table_file.buildFilterAlloc(a, &entries, lsm_table_file.default_filter_config);
+    defer filter.deinit(a);
+    const encoded = try lsm_table_file.encodeWithFilterAllocOptions(a, &entries, filter, .{ .block_compression = .none });
+    defer a.free(encoded);
+    const index = try lsm_table_file.decodeIndexAlloc(a, encoded);
+    const window = index.blockWindow(0);
+    try std.testing.expectEqual(@as(usize, 1), index.blocks.len);
+    const physical = encoded[index.entry_data_start + window.physicalRelativeOffset() ..][0..window.physicalLen()];
+    const prefix = try @import("../../encoding/snappy.zig").encode(a, physical);
+    defer a.free(prefix);
+    try std.testing.expectEqual(lsm_table_file.BlockCompression.none, window.compression);
+    var pool: BatchAsyncBlocks = .{ .allocator = a };
+    defer {
+        for (&pool.entries) |*entry| entry.users = 0;
+        pool.deinit();
+    }
+    const owner = pool.insert(.{
+        .candidate = .{ .run_index = 0 },
+        .path = "/block",
+        .run_id = 1,
+        .generation = 1,
+        .index_handle = try cache.putRunTableIndex("/block", 1, 1, index),
+        .block_index = 0,
+        .absolute_offset = 0,
+        .physical_len = @intCast(prefix.len),
+        .logical_len = window.len,
+        .compression = .snappy,
+        .checksum = @import("antfly_hash").Crc32.hash(prefix),
+        .status = .ready_handle,
+        .physical_handle = try cache.putTransientRunTablePhysicalBlock("/block", 1, 1, 0, @intCast(prefix.len), try a.dupe(u8, prefix)),
+    });
+    owner.users = 1;
+    var read = owner.read;
+    read.index_handle = owner.read.index_handle.?.retain();
+    read.physical_handle = null;
+    read.shared_block = owner;
+    read.status = .shared;
+    defer read.release();
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var backing = Budget{ .backing = a };
+    var arena = std.heap.ArenaAllocator.init(backing.allocator());
+    defer arena.deinit();
+    const va = arena.allocator();
+    var held: std.ArrayListUnmanaged([]u8) = .empty;
+    try held.ensureTotalCapacity(va, 64);
+    const resources = @import("../resource_manager.zig");
+    var manager = resources.ResourceManager.init(.{});
+    defer manager.deinit(a);
+    backend.options.resource_manager = &manager;
+    defer backend.options.resource_manager = null;
+    for (0..64) |_| {
+        const result = (try consumeAsyncPointRead(&backend, &read, null, &held, va, .{}, entries[0].key, null)).?;
+        try std.testing.expectEqualStrings("v", result.hit);
+    }
+    var retained: usize = 0;
+    for (held.items) |bytes| retained += bytes.len;
+    std.debug.print("\nLSM arena scratch decoded={d} results={d} backing_live={d} read_charge={d}\n", .{ window.len, retained, backing.live, manager.sliceStats(.lsm_read_working_set).used_bytes });
+    try std.testing.expectEqual(@as(usize, 64), retained);
+    try std.testing.expect(backing.live < 16 * 1024);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+}
+
+test "lsm shared large singleton snappy transfers decoded storage" {
+    const a = std.testing.allocator;
+    const B = @import("../lsm_backend.zig").Backend;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/review-decode-budget", .{ .storage = storage.storage(), .cache = &cache });
+    defer backend.close();
+    var entries: [1]lsm_table_file.Entry = undefined;
+    var buffers: [1][80]u8 = undefined;
+    for (&entries, 0..) |*entry, i| entry.* = .{ .key = try std.fmt.bufPrint(&buffers[i], "long-shared-document-key-prefix-for-compression:{d:0>4}", .{i}), .value = "v" };
+    const large = try a.alloc(u8, 1024 * 1024);
+    defer a.free(large);
+    @memset(large, 'v');
+    entries[0].value = large;
+    var filter = try lsm_table_file.buildFilterAlloc(a, &entries, lsm_table_file.default_filter_config);
+    defer filter.deinit(a);
+    const encoded = try lsm_table_file.encodeWithFilterAllocOptions(a, &entries, filter, .{ .block_compression = .none });
+    defer a.free(encoded);
+    const index = try lsm_table_file.decodeIndexAlloc(a, encoded);
+    const window = index.blockWindow(0);
+    try std.testing.expectEqual(@as(usize, 1), index.blocks.len);
+    const physical = encoded[index.entry_data_start + window.physicalRelativeOffset() ..][0..window.physicalLen()];
+    const prefix = try @import("../../encoding/snappy.zig").encode(a, physical);
+    defer a.free(prefix);
+    try std.testing.expectEqual(lsm_table_file.BlockCompression.none, window.compression);
+    var pool: BatchAsyncBlocks = .{ .allocator = a };
+    defer {
+        for (&pool.entries) |*entry| entry.users = 0;
+        pool.deinit();
+    }
+    const owner = pool.insert(.{
+        .candidate = .{ .run_index = 0 },
+        .path = "/block",
+        .run_id = 1,
+        .generation = 1,
+        .index_handle = try cache.putRunTableIndex("/block", 1, 1, index),
+        .block_index = 0,
+        .absolute_offset = 0,
+        .physical_len = @intCast(prefix.len),
+        .logical_len = window.len,
+        .compression = .snappy,
+        .checksum = @import("antfly_hash").Crc32.hash(prefix),
+        .status = .ready_handle,
+        .physical_handle = try cache.putTransientRunTablePhysicalBlock("/block", 1, 1, 0, @intCast(prefix.len), try a.dupe(u8, prefix)),
+    });
+    owner.users = 1;
+    var read = owner.read;
+    read.index_handle = owner.read.index_handle.?.retain();
+    read.physical_handle = null;
+    read.shared_block = owner;
+    read.status = .shared;
+    defer read.release();
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var bounded = Budget{ .backing = a, .limit = 1536 * 1024 };
+    var held: std.ArrayListUnmanaged([]u8) = .empty;
+    try held.ensureTotalCapacity(a, 8);
+    defer held.deinit(a);
+
+    const resources = @import("../resource_manager.zig");
+    var budgets = resources.Options.defaultBudgets();
+    budgets[@backingInt(resources.Slice.lsm_read_working_set)] = .{ .hard_limit_bytes = window.len };
+    var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    backend.options.resource_manager = &manager;
+    defer backend.options.resource_manager = null;
+    const result = (try consumeAsyncPointRead(&backend, &read, null, &held, bounded.allocator(), .{}, entries[0].key, null)).?;
+    try std.testing.expectEqualSlices(u8, large, result.hit);
+    std.debug.print("\nLSM singleton Snappy decoded={d} result={d} peak={d} live={d}\n", .{ window.len, result.hit.len, bounded.peak, bounded.live });
+    try std.testing.expectEqual(@as(usize, window.len), bounded.peak);
+    for (held.items) |bytes| bounded.allocator().free(bytes);
+    held.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), bounded.live);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+    try std.testing.expectError(error.CorruptInput, retainLargeSingletonSnappy(&backend, &read, read.index_handle.?.runTableIndex(), prefix[0 .. prefix.len - 1], null, &held, bounded.allocator(), .{}, entries[0].key));
+    try std.testing.expectEqual(@as(usize, 0), bounded.live);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+    try std.testing.expect((try consumeAsyncPointRead(&backend, &read, null, &held, bounded.allocator(), .{}, "absent", null)) == null);
+    try std.testing.expectEqual(@as(usize, 0), held.items.len);
+    const Fixture = struct {
+        fn run(alloc: Allocator, bck: *B, r: *AsyncPointBlockRead, k: []const u8) !void {
+            var values: std.ArrayListUnmanaged([]u8) = .empty;
+            defer releaseHeldValues(&values, alloc);
+            const found = (try consumeAsyncPointRead(bck, r, null, &values, alloc, .{}, k, null)).?;
+            try std.testing.expectEqual(@as(usize, 1024 * 1024), found.hit.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{ &backend, &read, entries[0].key });
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+}
+
+test "lsm shared directory classification excludes immutable values and tombstones" {
+    const a = std.testing.allocator;
+    const empty: State = .{};
+    var newest: State = .{};
+    defer newest.deinit(a);
+    var older: State = .{};
+    defer older.deinit(a);
+    try newest.appendUpsert(a, .{ .name = "docs" }, "deleted", "", true);
+    try newest.appendUpsert(a, .{ .name = "docs" }, "new", "v", false);
+    try older.appendUpsert(a, .{ .name = "docs" }, "deleted", "old", false);
+    try older.appendUpsert(a, .{ .name = "docs" }, "old", "v", false);
+    const keys = [_][]const u8{ "deleted", "missing", "new", "old" };
+    var unresolved: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer unresolved.deinit(a);
+    const planned = try directoryUnresolvedKeys(a, &empty, &.{ &newest, &older }, .{ .name = "docs" }, &keys, &unresolved);
+    try std.testing.expectEqual(@as(usize, 1), planned.len);
+    try std.testing.expectEqualStrings("missing", planned[0]);
+    unresolved.clearRetainingCapacity();
+    const other = try directoryUnresolvedKeys(a, &empty, &.{ &newest, &older }, .{ .name = "other" }, &keys, &unresolved);
+    try std.testing.expectEqual(@intFromPtr(&keys), @intFromPtr(other.ptr));
+}
+
+test "lsm shared immutable classification eliminates overlapping directory selection" {
+    const a = std.testing.allocator;
+    const Directory = @import("run_directory.zig").Directory;
+    const Fixture = struct {
+        allocator: Allocator,
+        pins: usize = 0,
+        pub fn retainRunSnapshotRef(self: *@This(), run: *Run) !void {
+            self.pins += 1;
+            run.version_ref_pinned = true;
+        }
+        pub fn releaseRunSnapshotRef(self: *@This(), run: *Run) void {
+            self.pins -= 1;
+            run.version_ref_pinned = false;
+        }
+    };
+    var fixture: Fixture = .{ .allocator = a };
+    const directory = try Directory.create(a);
+    defer directory.destroy(a);
+    for (0..64) |i| try directory.put(&fixture, .{
+        .id = i + 1,
+        .level = 0,
+        .size_bytes = 1024,
+        .path = @constCast("/classification/run.sst"),
+        .smallest_namespace_name = @constCast("docs"),
+        .smallest_key = @constCast("deleted"),
+        .largest_namespace_name = @constCast("docs"),
+        .largest_key = @constCast("old"),
+        .entry_count = 3,
+        .bloom_filter = null,
+        .state = null,
+    });
+    var immutable: State = .{};
+    defer immutable.deinit(a);
+    try immutable.appendUpsert(a, .{ .name = "docs" }, "deleted", "", true);
+    try immutable.appendUpsert(a, .{ .name = "docs" }, "new", "v", false);
+    try immutable.appendUpsert(a, .{ .name = "docs" }, "old", "v", false);
+    const empty: State = .{};
+    const keys = [_][]const u8{ "deleted", "new", "old" };
+    var unresolved: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer unresolved.deinit(a);
+    const planned = try directoryUnresolvedKeys(a, &empty, &.{&immutable}, .{ .name = "docs" }, &keys, &unresolved);
+    var before = directory.sortedPoints("docs", &keys);
+    var before_count: usize = 0;
+    while (!before.done()) {
+        var budget: usize = 16384;
+        while (before.next(&budget) != null) before_count += 1;
+    }
+    var after = directory.sortedPoints("docs", planned);
+    var after_count: usize = 0;
+    while (!after.done()) {
+        var budget: usize = 16384;
+        while (after.next(&budget) != null) after_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 64), before_count);
+    try std.testing.expectEqual(@as(usize, 0), after_count);
+    std.debug.print("\nLSM immutable classification keys={d} overlapping_runs={d} selected_before={d} selected_after={d}\n", .{ keys.len, directory.count(), before_count, after_count });
 }
