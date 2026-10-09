@@ -357,7 +357,7 @@
   },
   "recycled_scratch_followup": {
     "comparison_commit": "3467aac50b6c0fff0076a197037224fb1011a012",
-    "merged_main_commit": "bfbcb03eae",
+    "merged_main_commit": "4710eb5cdde61ee5466815624573f0aa80ebbb87",
     "fixtures": {
       "non_lifo_decoded_churn": {
         "blocks": 512,
@@ -450,5 +450,20 @@
       "Shared prefix key reconstruction and existing cache promotion/admission checks"
     ],
     "limitations": "Native Debug isolated production-helper fixtures; allocation/admission counts and parsed-row counts do not establish end-to-end QPS or 2 GiB soak behavior. The initial density probe can add one row for a two-key sparse workload. Size classes and ownership headers consume accounted memory. A batch may wait for one of four workspace slots."
+  },
+  "integrated_pr_1013": {
+    "head_commit": "2b3311ee32146e16ee74d9e2eaecd1e942ca8707",
+    "url": "https://github.com/antflydb/antfly/pull/1013",
+    "design": [
+      "Filter deleted postings before positional materialization and skip fully deleted framed chunks while preserving malformed-ID and framing validation.",
+      "Combine frozen bitmap membership and rank with an ordered container hint.",
+      "Reuse at most 512 bytes of mapping scratch per iterator; retain point reads for sparse file mappings.",
+      "Batch stored-document metadata within the existing 129-row bound using the known first row and predicted block length."
+    ],
+    "historical_measurement_artifacts": [
+      "zig/bench/baselines/lite-filter-metadata-followup.json",
+      "zig/bench/baselines/lite-mapping-batches-followup.json"
+    ],
+    "scope": "PR #1013 measurements remain historical ReleaseSafe helper fixtures. Combined branch reruns reader, artifact, Roaring, LSM and WASM validation; no new end-to-end throughput or soak result is claimed."
   }
 }
