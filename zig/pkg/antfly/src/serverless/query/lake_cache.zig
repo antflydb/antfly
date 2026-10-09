@@ -86,7 +86,7 @@ pub fn classifyArtifact(kind: artifact_ref.ArtifactKind) CacheClass {
         .row_fragment_stats => .row_fragment_stats,
         .algebraic_segment => .algebraic_segment,
         .external_base_source => .external_metadata,
-        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment => .search_sidecar,
+        .text_segment, .vector_segment, .sparse_segment, .graph_segment, .graph_metric_segment, .ordered_row_index => .search_sidecar,
         .doc_values, .stored_fields, .mutation_segment, .document_segment, .document_facts => .other,
     };
 }
@@ -128,6 +128,7 @@ test "lake cache accounting separates pinned metadata from payload bytes" {
         .{ .kind = .external_base_source, .artifact_id = "files-1", .byte_len = 20, .checksum = "len:20" },
         .{ .kind = .algebraic_segment, .artifact_id = "agg-1", .byte_len = 30, .checksum = "len:30" },
         .{ .kind = .vector_segment, .artifact_id = "vec-1", .byte_len = 40, .checksum = "len:40" },
+        .{ .kind = .ordered_row_index, .artifact_id = "ordered-1", .byte_len = 7, .checksum = "len:7" },
     };
 
     const accounting = try accountArtifacts(&artifacts, .{});
@@ -135,10 +136,10 @@ test "lake cache accounting separates pinned metadata from payload bytes" {
     try std.testing.expectEqual(@as(u64, 10), accounting.bytesForClass(.row_fragment_stats));
     try std.testing.expectEqual(@as(u64, 20), accounting.bytesForClass(.external_metadata));
     try std.testing.expectEqual(@as(u64, 30), accounting.bytesForClass(.algebraic_segment));
-    try std.testing.expectEqual(@as(u64, 40), accounting.bytesForClass(.search_sidecar));
+    try std.testing.expectEqual(@as(u64, 47), accounting.bytesForClass(.search_sidecar));
     try std.testing.expectEqual(@as(u64, 60), accounting.pinned_bytes);
-    try std.testing.expectEqual(@as(u64, 140), accounting.payload_bytes);
-    try std.testing.expectEqual(@as(u64, 200), accounting.total_bytes);
+    try std.testing.expectEqual(@as(u64, 147), accounting.payload_bytes);
+    try std.testing.expectEqual(@as(u64, 207), accounting.total_bytes);
 }
 
 test "lake cache accounting reports budget pressure by lane" {

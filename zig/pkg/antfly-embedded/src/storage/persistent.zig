@@ -344,8 +344,17 @@ const SegmentFileStore = struct {
             return err;
         };
 
-        if (self.storage.vtable.map_immutable_artifact) |map| return .fromMappedArtifact(try map(self.storage.ptr, self.allocator, path));
+        if (self.storage.vtable.open_leased_immutable_source != null or self.storage.vtable.map_immutable_artifact != null)
+            return self.openPublishedSource(path);
         return .fromOwnedHeap(try self.allocator.dupe(u8, bytes));
+    }
+
+    fn openPublishedSource(self: *SegmentFileStore, path: []const u8) !index_mod.SegmentData {
+        if (self.storage.vtable.open_leased_immutable_source) |open_source|
+            return .fromNative(try open_source(self.storage.ptr, self.allocator, path));
+        if (self.storage.vtable.map_immutable_artifact) |map|
+            return .fromMappedArtifact(try map(self.storage.ptr, self.allocator, path));
+        return error.Unsupported;
     }
 
     fn mapPublished(self: *SegmentFileStore, seg_id: u64) !index_mod.SegmentData {
@@ -2314,7 +2323,7 @@ pub const PersistentIndex = struct {
         else if (publication_admission) |*admission|
             .fromMapped(try admission.mapFile(path))
         else
-            .fromMappedArtifact(try store.storage.vtable.map_immutable_artifact.?(store.storage.ptr, self.alloc, path));
+            try store.openPublishedSource(path);
         segment_data.?.madviseAccessPattern();
         if (profile_enabled) map_segment_ns = platform_time.monotonicNs() - map_segment_start_ns;
         errdefer {
@@ -2988,7 +2997,7 @@ pub const PersistentIndex = struct {
             break :blk if (publication_admission) |*admission|
                 .fromMapped(try admission.mapFile(path))
             else
-                .fromMappedArtifact(try store.storage.vtable.map_immutable_artifact.?(store.storage.ptr, self.alloc, path));
+                try store.openPublishedSource(path);
         };
         errdefer if (data) |*segment_data| segment_data.deinit(self.alloc);
 
@@ -4018,9 +4027,10 @@ var persist_tmp_nonce: u64 = 0;
 
 fn persistTmpPath(buf: []u8) [*:0]const u8 {
     const base = "/tmp/antfly-persist-test-";
-    const ts = platform_time.monotonicNs();
+    var random: [16]u8 = undefined;
+    std.testing.io.random(&random);
     const nonce = @atomicRmw(u64, &persist_tmp_nonce, .Add, 1, .monotonic);
-    const slice = std.fmt.bufPrint(buf, "{s}{d}-{d}\x00", .{ base, ts, nonce }) catch unreachable;
+    const slice = std.fmt.bufPrint(buf, "{s}{x}-{d}\x00", .{ base, random, nonce }) catch unreachable;
     return @ptrCast(slice.ptr);
 }
 
@@ -5581,17 +5591,19 @@ fn persistentSimOptionsAtPath(path: [*:0]const u8, opts: PersistentIndexOptions)
 
 fn persistTmpPathWithSuffix(buf: []u8, suffix: []const u8) [*:0]const u8 {
     const base = "/tmp/antfly-persist-test-";
-    const ts = platform_time.monotonicNs();
+    var random: [16]u8 = undefined;
+    std.testing.io.random(&random);
     const nonce = @atomicRmw(u64, &persist_tmp_nonce, .Add, 1, .monotonic);
-    const slice = std.fmt.bufPrint(buf, "{s}{d}-{d}-{s}\x00", .{ base, ts, nonce, suffix }) catch unreachable;
+    const slice = std.fmt.bufPrint(buf, "{s}{x}-{d}-{s}\x00", .{ base, random, nonce, suffix }) catch unreachable;
     return @ptrCast(slice.ptr);
 }
 
 fn persistentReplayArtifactPath(buf: []u8, suffix: []const u8) []const u8 {
     const base = "/tmp/antfly-persistent-replay-";
-    const ts = platform_time.monotonicNs();
+    var random: [16]u8 = undefined;
+    std.testing.io.random(&random);
     const nonce = @atomicRmw(u64, &persist_tmp_nonce, .Add, 1, .monotonic);
-    return std.fmt.bufPrint(buf, "{s}{d}-{d}-{s}.fixture", .{ base, ts, nonce, suffix }) catch unreachable;
+    return std.fmt.bufPrint(buf, "{s}{x}-{d}-{s}.fixture", .{ base, random, nonce, suffix }) catch unreachable;
 }
 
 fn writePersistentReplayArtifactFile(path: []const u8, contents: []const u8) !void {
@@ -6392,7 +6404,7 @@ test "persistent rebuild page publication scaling benchmark" {
     }
 }
 
-test "lite persistent mapped publication merge recovery and retained snapshot ownership" {
+test "lite persistent owned publication merge recovery and retained snapshot ownership without mapping" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;
     const lite_docs = @import("lite/docstore.zig");
@@ -6405,11 +6417,66 @@ test "lite persistent mapped publication merge recovery and retained snapshot ow
     var docs_closed = false;
     defer if (!docs_closed) docs.close();
     var storage = lite_indexes.Store.init(a, &docs);
+    // Model a leased backend whose atomic writer only provides finish().
+    // Neither writer publication nor storage reopening has a mapping callback.
+    const PlainWriter = struct {
+        allocator: Allocator,
+        inner: storage_io.AtomicWriteSink,
+        const vtable: storage_io.AtomicWriteSink.VTable = .{
+            .len = len,
+            .append_slice = append,
+            .write_at = writeAt,
+            .crc32_prefix = prefix,
+            .crc32_range = range,
+            .finish = finish,
+            .abort = abort,
+        };
+        fn begin(ptr: *anyopaque, alloc: Allocator, output: []const u8) !storage_io.AtomicWriteSink {
+            const self = try alloc.create(@This());
+            errdefer alloc.destroy(self);
+            const original: *lite_indexes.Store = @ptrCast(@alignCast(ptr));
+            self.* = .{ .allocator = alloc, .inner = try original.storage().beginAtomicWrite(alloc, output) };
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+        fn get(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn len(ptr: *anyopaque) usize {
+            return get(ptr).inner.len();
+        }
+        fn append(ptr: *anyopaque, bytes: []const u8) !void {
+            try get(ptr).inner.appendSlice(bytes);
+        }
+        fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
+            try get(ptr).inner.writeAt(offset, bytes);
+        }
+        fn prefix(ptr: *anyopaque, length: usize) !u32 {
+            return get(ptr).inner.crc32Prefix(length);
+        }
+        fn range(ptr: *anyopaque, offset: usize, length: usize) !u32 {
+            return get(ptr).inner.crc32Range(offset, length);
+        }
+        fn finish(ptr: *anyopaque) !void {
+            const self = get(ptr);
+            defer self.allocator.destroy(self);
+            try self.inner.finish();
+        }
+        fn abort(ptr: *anyopaque) void {
+            const self = get(ptr);
+            defer self.allocator.destroy(self);
+            self.inner.abort();
+        }
+    };
+    var source_storage = storage.storage();
+    var source_vtable = source_storage.vtable.*;
+    source_vtable.map_immutable_artifact = null;
+    source_vtable.begin_atomic_write = PlainWriter.begin;
+    source_storage.vtable = &source_vtable;
     const opts = PersistentIndexOptions{
         .path = "/lite-text",
         .io = std.testing.io,
-        .main_lsm_storage = storage.storage(),
-        .wal_storage = storage.storage(),
+        .main_lsm_storage = source_storage,
+        .wal_storage = source_storage,
         .main_no_sync = true,
         .wal_no_sync = true,
     };

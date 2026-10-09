@@ -42,3 +42,9 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+
+// Force the action contract even when the discovery anchor is filtered out.
+comptime {
+    _ = transition_actions.TransitionAction;
+    _ = transition_actions.TransitionDecision;
+}

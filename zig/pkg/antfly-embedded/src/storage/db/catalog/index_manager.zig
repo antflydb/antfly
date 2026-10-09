@@ -1438,6 +1438,12 @@ pub const IndexManager = struct {
     retired_lsm_owner_labels_collapsed: [2]u64 = .{ 0, 0 },
     sparse_indexes: std.ArrayListUnmanaged(SparseIndex),
     graph_indexes: std.ArrayListUnmanaged(GraphIndex),
+    /// The DB-owned lazy metric runtime is notified only after a graph metric
+    /// configuration is installed. The callback must not take catalog_mutex.
+    graph_metric_notify: ?struct {
+        ptr: *anyopaque,
+        notify: *const fn (*anyopaque) void,
+    } = null,
     graph_ownership_cleanup_cursor: usize = 0,
     /// Lock-free cursors give bounded scheduler sweeps stable round-robin
     /// fairness while the catalog shared lock keeps the indexed slices stable.
@@ -2233,6 +2239,21 @@ pub const IndexManager = struct {
                 .published_count = certified_count,
             };
             return true;
+        }
+
+        pub fn certifiedEmptyNativeCheckpoint(self: *DenseIndex, checkpoint: apply_state.ProjectionCheckpoint) ?apply_state.ProjectionCheckpoint {
+            while (!self.serving_certificate_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.serving_certificate_mutex.unlock();
+            const verified = self.verified_serving_certificate orelse return null;
+            if (checkpoint.status != .clean or verified.capture_incarnation != self.capture_incarnation or
+                verified.published_count != 0 or verified.generation != checkpoint.generation or
+                verified.config_hash != checkpoint.config_hash or verified.applied_sequence > checkpoint.applied_sequence)
+                return null;
+            const snapshot = self.index.nativeServingSnapshot() orelse return null;
+            if (snapshot.active_count != 0 or snapshot.source_sequence < checkpoint.applied_sequence) return null;
+            var certified = checkpoint;
+            certified.published_count = 0;
+            return certified;
         }
 
         /// Status reads must never turn a previously failed certificate into
@@ -17579,6 +17600,20 @@ pub const IndexManager = struct {
         return self.graph_indexes.items.len > 0;
     }
 
+    pub fn hasConfiguredGraphMetrics(self: *IndexManager) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for (self.graph_indexes.items) |entry| {
+            if (entry.metric_configs.len != 0) return true;
+        }
+        return false;
+    }
+
+    fn notifyGraphMetricConfiguration(self: *IndexManager, configured: bool) void {
+        if (!configured) return;
+        if (self.graph_metric_notify) |hook| hook.notify(hook.ptr);
+    }
+
     pub fn graphRetirementAdmissionOpen(self: *const IndexManager) bool {
         if (self.graph_retirement_closed.load(.acquire)) return false;
         if (self.primary_store) |store| if (store.graphEndpointCleanupBlocksReads() catch true) return false;
@@ -20811,6 +20846,7 @@ pub const IndexManager = struct {
             .graph => |entry| {
                 self.waitForGraphMetricSchedulePins();
                 try self.graph_indexes.append(self.alloc, entry);
+                self.notifyGraphMetricConfiguration(entry.metric_configs.len != 0);
             },
             .algebraic => |entry| try self.algebraic_indexes.append(self.alloc, entry),
         }
@@ -23364,7 +23400,10 @@ pub const IndexManager = struct {
                 self.dense_indexes.appendAssumeCapacity(index);
             },
             .sparse_vector => |index| self.sparse_indexes.appendAssumeCapacity(index),
-            .graph => |index| self.graph_indexes.appendAssumeCapacity(index),
+            .graph => |index| {
+                self.graph_indexes.appendAssumeCapacity(index);
+                self.notifyGraphMetricConfiguration(index.metric_configs.len != 0);
+            },
             .algebraic => |index| self.algebraic_indexes.appendAssumeCapacity(index),
         }
         entry.* = undefined;
@@ -35124,21 +35163,24 @@ const IndexManagerSimRuntime = struct {
     backend_options: db_config.IndexBackendOptions,
     split_active: bool,
 
-    fn init(alloc: Allocator, source_path: [*:0]const u8, dest_path: [*:0]const u8) !IndexManagerSimRuntime {
-        return try initWithOptions(alloc, source_path, dest_path, .{
+    fn init(self: *IndexManagerSimRuntime, alloc: Allocator, source_path: [*:0]const u8, dest_path: [*:0]const u8) !void {
+        try self.initWithOptions(alloc, source_path, dest_path, .{
             .text_main_backend = .lsm,
             .dense_storage_backend = .lsm,
             .graph_reverse_backend = .lsm,
         });
     }
 
+    // Catalog loading binds primary-store handles to these fields. Initialize
+    // in the caller’s final storage so those borrowed addresses never move.
     fn initWithOptions(
+        runtime: *IndexManagerSimRuntime,
         alloc: Allocator,
         source_path: [*:0]const u8,
         dest_path: [*:0]const u8,
         backend_options: db_config.IndexBackendOptions,
-    ) !IndexManagerSimRuntime {
-        var runtime = IndexManagerSimRuntime{
+    ) !void {
+        runtime.* = .{
             .alloc = alloc,
             .source_path = source_path,
             .dest_path = dest_path,
@@ -35182,7 +35224,6 @@ const IndexManagerSimRuntime = struct {
             try runtime.dest_manager.addAllNoBackfill(&runtime.dest_store, &.{indexManagerSimTextConfig()});
         }
         runtime.updateRanges();
-        return runtime;
     }
 
     pub fn deinit(self: *IndexManagerSimRuntime) void {
@@ -35390,7 +35431,7 @@ pub const VoprHarness = struct {
             .graph_reverse_backend = .lsm,
             .graph_lsm_storage = self.modeled_device.storage(),
         };
-        self.runtime = try IndexManagerSimRuntime.initWithOptions(alloc, self.source_path, self.dest_path, self.backend_options);
+        try self.runtime.initWithOptions(alloc, self.source_path, self.dest_path, self.backend_options);
         self.actions = .empty;
         self.recovered = false;
         return self;
@@ -35645,7 +35686,8 @@ fn replayIndexManagerActionsAtPathsWithOptions(
     backend_options: db_config.IndexBackendOptions,
     actions: []const IndexManagerSimAction,
 ) !IndexManagerSimSummary {
-    var runtime = try IndexManagerSimRuntime.initWithOptions(alloc, source_path, dest_path, backend_options);
+    var runtime: IndexManagerSimRuntime = undefined;
+    try runtime.initWithOptions(alloc, source_path, dest_path, backend_options);
     defer runtime.deinit();
 
     for (actions, 0..) |action, step| {
@@ -35983,7 +36025,8 @@ fn replayModeledIndexManagerCrashFixture(
     crash_action: IndexManagerSimAction,
     modeled_device: *storage_sim.ModeledDevice,
 ) !IndexManagerSimCrashOutcome {
-    var runtime = try IndexManagerSimRuntime.initWithOptions(alloc, source_path, dest_path, backend_options);
+    var runtime: IndexManagerSimRuntime = undefined;
+    try runtime.initWithOptions(alloc, source_path, dest_path, backend_options);
     defer runtime.deinit();
 
     for (prelude_actions, 0..) |action, step| {
@@ -36124,7 +36167,8 @@ test "index manager split handoff preserves interleaved write and query summarie
         .graph_lsm_storage = modeled_device.storage(),
     };
 
-    var runtime = try IndexManagerSimRuntime.initWithOptions(alloc, source_path, dest_path, backend_options);
+    var runtime: IndexManagerSimRuntime = undefined;
+    try runtime.initWithOptions(alloc, source_path, dest_path, backend_options);
     defer runtime.deinit();
     for (actions, 0..) |action, step| {
         try runtime.applyReplayAction(action, step);

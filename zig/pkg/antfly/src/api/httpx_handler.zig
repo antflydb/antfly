@@ -1576,12 +1576,10 @@ pub const AntflyApiHandler = struct {
         body_data: []const u8,
         api: public_table_http.TableApi,
         handler: *const fn (std.mem.Allocator, []const u8, []const u8, public_table_http.TableApi) anyerror!public_table_http.OwnedResponse,
-        done: std.atomic.Value(bool) = .init(false),
         result: ?public_table_http.OwnedResponse = null,
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            defer self.done.store(true, .release);
             self.result = self.handler(
                 self.alloc,
                 self.table_name,
@@ -1608,14 +1606,13 @@ pub const AntflyApiHandler = struct {
 
     fn handleTableBatchOffEventLoop(
         ctx: *httpx.Context,
-        backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+        executor: ?std.Io,
         table_name: []const u8,
         body_data: []const u8,
         api: public_table_http.TableApi,
         handler: *const fn (std.mem.Allocator, []const u8, []const u8, public_table_http.TableApi) anyerror!public_table_http.OwnedResponse,
     ) !httpx.Response {
-        const runtime = backend_runtime orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
-        var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
+        const runtime_io = executor orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
         const job_alloc = std.heap.page_allocator;
         const owned_table_name = job_alloc.dupe(u8, table_name) catch |err| {
             std.log.warn("batch offload table-name allocation failed; executing inline err={s}", .{@errorName(err)});
@@ -1641,16 +1638,10 @@ pub const AntflyApiHandler = struct {
             std.log.warn("batch offload scheduling failed; executing inline err={s}", .{@errorName(err)});
             return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
         };
-        while (!job.done.load(.acquire)) {
-            // The borrowed request token is consumed only by post-commit
-            // visibility waits. Never cancel the whole future here: that
-            // could interrupt proposal before its durability is known.
-            if (ctx.isCancellationRequested()) {
-                break;
-            }
-            ctx.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
-        }
-        _ = future.await(runtime_io);
+        // Future.await can forward caller cancellation to its child. Protect
+        // this wait so proposal cannot be interrupted before durability is
+        // known. The batch's request token still controls visibility waits.
+        @import("protected_future.zig").wait(runtime_io, &future);
         if (job.err) |err| return err;
         var resp = job.result.?;
         return respondOwnedApiResponseWithAllocator(ctx, &resp, job_alloc);
@@ -5955,7 +5946,7 @@ pub const AntflyApiHandler = struct {
 
         // Never run a blocking catalog/row operation on the network executor,
         // including when the backend executor is absent or saturated.
-        const runtime = self.api_server.cfg.backend_runtime orelse {
+        const runtime_io = http_server_mod.ApiHttpServer.configuredDurableIo(self.api_server.cfg) orelse {
             if (mode != .statement) return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
             // A missing execution lane is a capacity failure for supported
             // statements, but preserve the useful 501 syntax/shape contract
@@ -5974,7 +5965,6 @@ pub const AntflyApiHandler = struct {
                 else => ctx.status(501).json(sql_wire.SQLDiagnostic{ .code = "0A000", .message = "SQL statement is not supported by this endpoint" }),
             };
         };
-        var runtime_io = runtime.io() orelse return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
         var job = SQLJob{
             .adapter = .{ .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
             .statement = statement,
@@ -5998,7 +5988,7 @@ pub const AntflyApiHandler = struct {
         // A canceled request must still join durable work, without repeatedly
         // hitting an already-canceled sleep and spinning until commit ends.
         job.done.waitUncancelable(ctx.io);
-        _ = future.await(runtime_io);
+        @import("protected_future.zig").wait(runtime_io, &future);
         if (job.failure) |err| {
             const diagnostic = sql_execution.diagnostic(err);
             if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("SQL execution internal failure err={s}", .{@errorName(err)});
@@ -6122,13 +6112,21 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid query request");
         };
         defer parsed_table.deinit();
-        var resp = try self.api_server.handleAdmittedPublicTableQueryWithContentTypeCancellation(
+        var delivery: QueryDelivery = .{ .ctx = ctx };
+        var resp = try self.api_server.handleAdmittedPublicTableQueryWithDelivery(
             parsed_table.table_name,
             body_data,
             ctx.header("content-type"),
             authenticated_identity,
             &cancellation,
+            delivery.sink(),
         );
+        if (delivery.writer) |*writer| {
+            defer resp.deinit(self.api_server.alloc);
+            if (resp.status != 200) return error.QueryDeliveryFailed;
+            try writer.close();
+            return ctx.response.build();
+        }
         return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 
@@ -7399,6 +7397,7 @@ pub const AntflyApiHandler = struct {
                     _ = ctx.status(409);
                     return ctx.text("initial foreign key generations require coordinated parent-owner publication; create the table without foreign keys, then add them through a schema update");
                 },
+                error.ObjectTablePlacementUnsupported => return textResponse(ctx, 400, "object tables do not accept num_shards or replication sources"),
                 error.InvalidTableStorageSettings, error.VectorStoreRequiresLocalSingleShardTable => {
                     _ = ctx.status(400);
                     return ctx.text("vector_store requires a fresh local single-shard standalone table without replication");
@@ -7610,6 +7609,23 @@ pub const AntflyApiHandler = struct {
         return ctx.text("");
     }
 
+    const QueryDelivery = struct {
+        ctx: *httpx.Context,
+        writer: ?httpx.Context.StreamWriter = null,
+        fn sink(self: *@This()) ?@import("antfly_local_sources").api_query_response.Delivery {
+            if (self.ctx.stream_delegate == null and self.ctx.h1_sock == null and self.ctx.h2 == null) return null;
+            return .{ .ptr = self, .start_fn = start, .write_fn = write };
+        }
+        fn start(raw: *anyopaque, _: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.writer = try self.ctx.streamResponseWithContentType(200, "application/json");
+        }
+        fn write(raw: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.writer.?.write(bytes);
+        }
+    };
+
     pub fn queryTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -7636,7 +7652,15 @@ pub const AntflyApiHandler = struct {
         };
         defer ctx.allocator.free(logical);
         var cancellation = requestCancellation(ctx);
-        var resp = try self.api_server.handleAdmittedPublicTableQueryWithContentTypeCancellation(logical, body_data, ctx.header("content-type"), authenticated_identity, &cancellation);
+        var delivery: QueryDelivery = .{ .ctx = ctx };
+        var resp = self.api_server.handleAdmittedPublicTableQueryWithDelivery(logical, body_data, ctx.header("content-type"), authenticated_identity, &cancellation, delivery.sink()) catch |err| return err;
+        if (delivery.writer) |*writer| {
+            defer resp.deinit(self.api_server.alloc);
+            // A post-commit error closes the stream; never send a second status.
+            if (resp.status != 200) return error.QueryDeliveryFailed;
+            try writer.close();
+            return ctx.response.build();
+        }
         return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
     }
 
@@ -7652,9 +7676,13 @@ pub const AntflyApiHandler = struct {
         };
         if (try self.acquirePublicOperation(ctx, "batchWrite")) |response| return response;
         defer self.releasePublicOperation("batchWrite");
+        if (try self.api_server.tryObjectTableRequest(decoded_table_name, .post, "batch", body_data, authenticated_identity, operationContext(ctx, authenticated_identity))) |value| {
+            var response = value;
+            return respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
+        }
         return try handleTableBatchOffEventLoop(
             ctx,
-            self.api_server.cfg.backend_runtime,
+            http_server_mod.ApiHttpServer.configuredDurableIo(self.api_server.cfg),
             decoded_table_name,
             body_data,
             self.api_server.tableApi(tableMutationContext(ctx, &authenticated_identity)),
@@ -7703,7 +7731,7 @@ pub const AntflyApiHandler = struct {
             .retire => public_table_http.handleRelationalConstraintRetirement,
             else => public_table_http.handleRelationalRowsMutation,
         };
-        return handleTableBatchOffEventLoop(ctx, self.api_server.cfg.backend_runtime, decoded_table_name, body, self.api_server.tableApi(request), handler);
+        return handleTableBatchOffEventLoop(ctx, http_server_mod.ApiHttpServer.configuredDurableIo(self.api_server.cfg), decoded_table_name, body, self.api_server.tableApi(request), handler);
     }
 
     pub fn linearMerge(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
@@ -7773,6 +7801,7 @@ pub const AntflyApiHandler = struct {
             },
             else => return err,
         };
+        if (!std.mem.eql(u8, response.status, "success")) _ = ctx.status(202);
         return ctx.openApiJson(response);
     }
 
@@ -7906,6 +7935,10 @@ pub const AntflyApiHandler = struct {
         }
         var local_schema_applied = false;
         var mutation = self.api_server.source.mutateSchema(alloc, decoded_table_name, .replace, supported_schema.?, expected_version) catch |err| switch (err) {
+            error.ObjectTableDefinitionConflict, error.ImmutableTableStorageSettings => {
+                _ = ctx.status(409);
+                return ctx.text("object document table definitions are immutable; use a new table and explicit migration");
+            },
             error.ForeignKeyPartialSupportIndexRequired, error.ForeignKeyPartialSupportIndexConflict => return witnessDDLError(ctx, err),
             error.GeneratedColumnRewriteRequired => {
                 _ = ctx.status(409);
@@ -8289,6 +8322,9 @@ pub const AntflyApiHandler = struct {
                 error.ResidentDbRetryRequired,
                 error.StorageReadTemporarilyUnavailable,
                 error.StorageKernelOwnerStaleDescriptor,
+                error.CatalogRoutingUnavailable,
+                error.CatalogProjectionRefreshRequired,
+                error.CatalogRoutingSnapshotTimeout,
                 error.ConcurrencyUnavailable,
                 error.GenerationTransitionActive,
                 => {
@@ -8329,6 +8365,10 @@ pub const AntflyApiHandler = struct {
                 error.RowPolicyAuthenticationRequired, error.RowPolicyDenied => return textResponse(ctx, 403, "row policy authentication required"),
                 error.RowPolicyCatalogChanged, error.RowPolicyReadersActive, error.RowPolicyTopologyUnsupported, error.RowPolicyUnsupported => return textResponse(ctx, 409, "row policy publication changed"),
                 error.RowPolicyAuthorityUnavailable => return textResponse(ctx, 503, "row policy authority unavailable"),
+                error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.CatalogRoutingSnapshotTimeout => {
+                    var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(ctx.allocator);
+                    return respondOwnedApiResponse(ctx, &response);
+                },
                 else => {},
             }
             std.log.warn("public document lookup failed table={s} err={s}", .{ table_name, @errorName(err) });
@@ -8375,6 +8415,14 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid read consistency");
         };
+        if (try self.api_server.tryObjectTableLookup(decoded_table_name, decoded_key, consistency, authenticated_identity, operationContext(ctx, authenticated_identity))) |value| {
+            var response = value;
+            if (row_policy_proof != null or lookup_opts.opts.fields.len != 0) {
+                response.deinit(self.api_server.alloc);
+                return textResponse(ctx, 400, "object document lookup does not support row policies or field projection");
+            }
+            return respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
+        }
 
         var result = (self.api_server.lookupWithReadinessRetry(
             alloc,
@@ -12538,6 +12586,49 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     try std.testing.expectEqualStrings("admin", me_body.value.username);
 }
 
+test "httpx SQL dispatch preserves imported executor authority including unavailable views" {
+    const Probe = struct {
+        attempts: usize = 0,
+        fn concurrent(raw: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.attempts += 1;
+            return error.ConcurrencyUnavailable;
+        }
+    };
+    var raw_probe: Probe = .{};
+    var imported_probe: Probe = .{};
+    var vtable = std.Io.failing.vtable.*;
+    vtable.concurrent = Probe.concurrent;
+    const raw_io: std.Io = .{ .userdata = &raw_probe, .vtable = &vtable };
+    const imported_io: std.Io = .{ .userdata = &imported_probe, .vtable = &vtable };
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = raw_io },
+    });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .backend_runtime = runtime.ptr(),
+        .imported_runtime_io = .{ .api = std.testing.io },
+    }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    for ([_]?std.Io{ null, imported_io }, 0..) |executor, i| {
+        server.cfg.imported_runtime_io.?.durable = executor;
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = "{\"statement\":\"SELECT id FROM docs\"}";
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.executeSQL(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expectEqual(@as(usize, 0), raw_probe.attempts);
+        try std.testing.expectEqual(i, imported_probe.attempts);
+    }
+}
+
 test "httpx SQL rejects unsupported shapes and releases dynamic admission" {
     const alloc = std.testing.allocator;
     var source = AuthStatusSource{};
@@ -14581,7 +14672,7 @@ test "httpx antfly reads preserve availability and terminal failures" {
 
     const alloc = std.testing.allocator;
     var status_source = LookupStatusSource{};
-    for ([_]anyerror{ error.TableNotFound, error.GenerationTransitionActive, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable, error.ReadIndexTimeout, error.DeadlineExceeded, error.CorruptInput }) |failure| {
+    for ([_]anyerror{ error.TableNotFound, error.GenerationTransitionActive, error.StorageBusy, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable, error.CatalogRoutingUnavailable, error.CatalogProjectionRefreshRequired, error.CatalogRoutingSnapshotTimeout, error.ReadIndexTimeout, error.DeadlineExceeded, error.CorruptInput }) |failure| {
         var reads = MissingTableReads{ .failure = failure };
         const missing = failure == error.TableNotFound;
         const deadline = failure == error.DeadlineExceeded;
@@ -15665,4 +15756,43 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "httpx lake query delivery requires a transport and forwards delegated JSON writes" {
+    const a = std.testing.allocator;
+    var request = try httpx.Request.init(a, .POST, "http://localhost/db/v1/tables/docs/query");
+    defer request.deinit();
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var delivery: AntflyApiHandler.QueryDelivery = .{ .ctx = &ctx };
+    try std.testing.expect(delivery.sink() == null);
+    const State = struct {
+        started: bool = false,
+        written: bool = false,
+        closed: bool = false,
+        fn start(raw: ?*anyopaque, status: u16, content_type: []const u8, _: *const httpx.Headers) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(@as(u16, 200), status);
+            try std.testing.expectEqualStrings("application/json", content_type);
+            self.started = true;
+        }
+        fn write(raw: ?*anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.started and !self.closed);
+            try std.testing.expectEqualStrings("{}", bytes);
+            self.written = true;
+        }
+        fn close(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.written);
+            self.closed = true;
+        }
+    };
+    var state: State = .{};
+    ctx.stream_delegate = .{ .ptr = &state, .start = State.start, .write = State.write, .close = State.close };
+    const sink = delivery.sink().?;
+    try sink.start_fn(sink.ptr, 2);
+    try sink.write_fn(sink.ptr, "{}");
+    try delivery.writer.?.close();
+    try std.testing.expect(state.closed);
 }

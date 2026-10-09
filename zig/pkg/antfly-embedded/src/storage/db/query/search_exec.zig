@@ -132,7 +132,18 @@ pub const PinnedTextSource = struct {
     }
 };
 
+pub const IndexedTextPredicate = struct {
+    bitmap: roaring.RoaringBitmap,
+    exact: bool = true,
+};
+
 pub const SearchTextQueryExecutor = struct {
+    /// Provider attests that its pinned snapshot already enforces primary row
+    /// visibility. Fully native counts can skip per-hit postprocessing.
+    native_count_visibility_exact: bool = false,
+    /// Exact provider predicates in this pinned snapshot's document-number space.
+    /// Null leaves the original predicate owed to residual evaluation.
+    resolve_indexed_filter: ?*const fn (?*anyopaque, Allocator, *const index_mod.IndexSnapshot, []const u8) anyerror!?IndexedTextPredicate = null,
     /// The provider maps public document IDs exactly into its native identity space.
     exact_doc_id_filters: bool = false,
     /// Project immutable producer identities before filtering, sorting, and paging.
@@ -2798,7 +2809,8 @@ fn lateVisibilityExactCandidateBudgetFromRaw(raw: ?[]const u8) u32 {
     return if (parsed == 0) std.math.maxInt(u32) else parsed;
 }
 
-fn lateVisibilityExactCandidateBudget() u32 {
+/// Shared ceiling for plans that leave exact predicate evaluation to candidates.
+pub fn lateVisibilityExactCandidateBudget() u32 {
     return lateVisibilityExactCandidateBudgetFromRaw(getenv("ANTFLY_TEXT_LATE_VISIBILITY_EXACT_CANDIDATE_BUDGET"));
 }
 
@@ -11168,9 +11180,9 @@ fn sortAndPageTextDocValueFilterAlloc(
     executor: SearchTextQueryExecutor,
     plan: SortExecutionPlan,
 ) !types.SearchResult {
-    const doc_nums = try snapshot.executeFilter(alloc, filter);
-    defer alloc.free(doc_nums);
-    return try sortAndPageTextDocValueDocNumsAlloc(alloc, req, snapshot, doc_nums, executor, plan);
+    var bitmap = try snapshot.executeFilterBitmap(alloc, filter);
+    defer bitmap.deinit();
+    return try sortAndPageTextDocValueCandidatesAlloc(alloc, req, snapshot, &.{}, &bitmap, executor, plan);
 }
 
 fn sortAndPageTextDocValueDocNumsAlloc(
@@ -11178,6 +11190,18 @@ fn sortAndPageTextDocValueDocNumsAlloc(
     req: types.SearchRequest,
     snapshot: *const index_mod.IndexSnapshot,
     doc_nums: []const u32,
+    executor: SearchTextQueryExecutor,
+    plan: SortExecutionPlan,
+) !types.SearchResult {
+    return sortAndPageTextDocValueCandidatesAlloc(alloc, req, snapshot, doc_nums, null, executor, plan);
+}
+
+fn sortAndPageTextDocValueCandidatesAlloc(
+    alloc: Allocator,
+    req: types.SearchRequest,
+    snapshot: *const index_mod.IndexSnapshot,
+    doc_nums: []const u32,
+    bitmap: ?*const roaring.RoaringBitmap,
     executor: SearchTextQueryExecutor,
     plan: SortExecutionPlan,
 ) !types.SearchResult {
@@ -11202,17 +11226,18 @@ fn sortAndPageTextDocValueDocNumsAlloc(
         var profile = SortCollectorProfile{};
         observeSortCandidateSource(if (collect_sort_profile) &profile else null, "text_postings");
         const visible_total = if (activeSortCursor(effective_req).len > 0)
-            try visibleTextDocNumCountAfterCursorAlloc(
+            try visibleTextCandidateCountAfterCursorAlloc(
                 alloc,
                 effective_req,
                 snapshot,
                 doc_nums,
+                bitmap,
                 executor,
                 plan,
                 if (collect_sort_profile) &profile else null,
             )
         else
-            try visibleTextDocNumCount(alloc, effective_req, snapshot, doc_nums, executor);
+            try visibleTextCandidateCount(alloc, effective_req, snapshot, doc_nums, bitmap, executor);
         if (collect_sort_profile and activeSortCursor(effective_req).len == 0) {
             profile.candidate_count = @intCast(visible_total);
         }
@@ -11235,8 +11260,8 @@ fn sortAndPageTextDocValueDocNumsAlloc(
     }
 
     const exact_candidate_budget = lateVisibilityExactCandidateBudget();
-    const candidate_count = boundedU32(doc_nums.len);
-    enforceLateVisibilityExactCandidateBudget(candidate_count, exact_candidate_budget) catch |err| {
+    const candidate_count = boundedU32(if (bitmap) |set| set.cardinality() else doc_nums.len);
+    if (effective_req.limit != 0 and !executor.native_count_visibility_exact) enforceLateVisibilityExactCandidateBudget(candidate_count, exact_candidate_budget) catch |err| {
         logExactSortBudgetRejection(
             "text",
             .text_field_sort_candidate_window,
@@ -11273,7 +11298,12 @@ fn sortAndPageTextDocValueDocNumsAlloc(
         .load = loadTextDocValueSortValue,
     };
     var visible_candidate_count: usize = 0;
-    for (doc_nums, 0..) |doc_num, i| {
+    var iterator = if (bitmap) |set| set.iterator() else null;
+    var position: usize = 0;
+    while (true) {
+        const i = position;
+        const doc_num = if (iterator) |*it| it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
+        position += 1;
         if (i % 1024 == 0) try checkSearchRequestDeadline(effective_req);
         identity_scratch.reset();
         const stored = .{ .id = (try snapshot.storedIdScoped(identity_scratch.allocator(), doc_num)) orelse return error.StoredDocMissing };
@@ -11283,7 +11313,7 @@ fn sortAndPageTextDocValueDocNumsAlloc(
         visible_candidate_count += 1;
         if (collect_sort_profile) profile.candidate_count += 1;
         const raw_hit = types.SearchHit{
-            .id = try alloc.dupe(u8, stored.id),
+            .id = if (executor.project_key) |project_key| try project_key(executor.ctx, alloc, stored.id) else try alloc.dupe(u8, stored.id),
             .doc_ordinal = try snapshot.docOrdinal(doc_num),
             .native_text_doc_id = doc_num,
             .score = 1.0,
@@ -11305,6 +11335,7 @@ fn sortAndPageTextDocValueDocNumsAlloc(
         if (collect_sort_profile) profile.decorate_ns += platform_time.monotonicNs() - decorate_start_ns;
 
         const allowed_by_cursor = try decoratedHitAllowedByCursor(effective_req, plan, decorated);
+        if (effective_req.limit == 0 and !allowed_by_cursor) visible_candidate_count -= 1;
         admitDecoratedSortHitIntoWindow(
             alloc,
             effective_req,
@@ -11378,11 +11409,12 @@ fn sortAndPageTextDocValueDocNumsAlloc(
     return out;
 }
 
-fn visibleTextDocNumCountAfterCursorAlloc(
+fn visibleTextCandidateCountAfterCursorAlloc(
     alloc: Allocator,
     req: types.SearchRequest,
     snapshot: *const index_mod.IndexSnapshot,
     doc_nums: []const u32,
+    bitmap: ?*const roaring.RoaringBitmap,
     executor: SearchTextQueryExecutor,
     plan: SortExecutionPlan,
     profile: ?*SortCollectorProfile,
@@ -11398,7 +11430,12 @@ fn visibleTextDocNumCountAfterCursorAlloc(
     };
 
     var visible_count: usize = 0;
-    for (doc_nums, 0..) |doc_num, i| {
+    var iterator = if (bitmap) |set| set.iterator() else null;
+    var position: usize = 0;
+    while (true) {
+        const i = position;
+        const doc_num = if (iterator) |*it| it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
+        position += 1;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         identity_scratch.reset();
         const stored = .{ .id = (try snapshot.storedIdScoped(identity_scratch.allocator(), doc_num)) orelse return error.StoredDocMissing };
@@ -11407,7 +11444,7 @@ fn visibleTextDocNumCountAfterCursorAlloc(
         }
         if (profile) |p| p.candidate_count += 1;
         const raw_hit = types.SearchHit{
-            .id = try alloc.dupe(u8, stored.id),
+            .id = if (executor.project_key) |project_key| try project_key(executor.ctx, alloc, stored.id) else try alloc.dupe(u8, stored.id),
             .doc_ordinal = try snapshot.docOrdinal(doc_num),
             .native_text_doc_id = doc_num,
             .score = 1.0,
@@ -11436,19 +11473,25 @@ fn visibleTextDocNumCountAfterCursorAlloc(
     return visible_count;
 }
 
-fn visibleTextDocNumCount(
+fn visibleTextCandidateCount(
     alloc: Allocator,
     req: types.SearchRequest,
     snapshot: *const index_mod.IndexSnapshot,
     doc_nums: []const u32,
+    bitmap: ?*const roaring.RoaringBitmap,
     executor: SearchTextQueryExecutor,
 ) !usize {
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
-    if (executor.is_expired_key == null) return doc_nums.len;
+    if (executor.is_expired_key == null) return if (bitmap) |set| set.cardinality() else doc_nums.len;
 
     var visible_count: usize = 0;
-    for (doc_nums, 0..) |doc_num, i| {
+    var iterator = if (bitmap) |set| set.iterator() else null;
+    var position: usize = 0;
+    while (true) {
+        const i = position;
+        const doc_num = if (iterator) |*it| it.next() orelse break else if (position < doc_nums.len) doc_nums[position] else break;
+        position += 1;
         if (i % 1024 == 0) try checkSearchRequestDeadline(req);
         identity_scratch.reset();
         const stored = .{ .id = (try snapshot.storedIdScoped(identity_scratch.allocator(), doc_num)) orelse return error.StoredDocMissing };
@@ -11529,7 +11572,34 @@ pub fn searchTextQuery(
     const snapshot = text_source.snapshot;
     const can_apply_live_all_docs = !chunk_backed or (try snapshot.hasDocOrdinalCoverage());
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
+    var indexed_include: ?IndexedTextPredicate = null;
+    defer if (indexed_include) |*predicate| predicate.bitmap.deinit();
+    var indexed_exclude: ?IndexedTextPredicate = null;
+    defer if (indexed_exclude) |*predicate| predicate.bitmap.deinit();
+    if (!suppress_native_resolved_doc_filter) {
+        if (executor.resolve_indexed_filter) |resolve| {
+            if (effective_req.filter_query_json.len != 0) indexed_include = try resolve(executor.ctx, alloc, snapshot, effective_req.filter_query_json);
+            if (effective_req.exclusion_query_json.len != 0) indexed_exclude = try resolve(executor.ctx, alloc, snapshot, effective_req.exclusion_query_json);
+            // An exclusion superset would discard valid rows. Keep it residual.
+            if (indexed_exclude) |*predicate| if (!predicate.exact) {
+                predicate.bitmap.deinit();
+                indexed_exclude = null;
+            };
+        }
+    }
+    if (indexed_include != null or indexed_exclude != null) {
+        const must = try arena_alloc.alloc(search_mod.SearchQuery, if (indexed_include != null) 2 else 1);
+        must[0] = base_search_query;
+        const exclusions = try arena_alloc.alloc(search_mod.SearchQuery, if (indexed_exclude != null) 1 else 0);
+        if (indexed_include) |*bitmap| must[1] = .{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap.bitmap, .boost = 0 } };
+        if (indexed_exclude) |*bitmap| exclusions[0] = .{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap.bitmap } };
+        base_search_query = .{ .bool_query = .{ .must = must, .must_not = exclusions } };
+    }
     var constraint_req = effective_req;
+    if (indexed_include) |predicate| if (predicate.exact) {
+        constraint_req.filter_query_json = "";
+    };
+    if (indexed_exclude != null) constraint_req.exclusion_query_json = "";
     constraint_req.resolved_doc_filter = null;
     constraint_req.full_text = null;
     if (suppress_native_resolved_doc_filter) {
@@ -11563,6 +11633,10 @@ pub fn searchTextQuery(
         .apply_live_all_docs = can_apply_live_all_docs,
     });
     defer native_constraints.deinit(alloc);
+    if (indexed_include) |predicate| if (predicate.exact) {
+        native_constraints.filter_query_json_resolved = true;
+    };
+    if (indexed_exclude != null) native_constraints.exclusion_query_json_resolved = true;
     const derive_constraints_ns = if (bench_query_profile) platform_time.monotonicNs() - constraints_start_ns else 0;
 
     const resolved_filter_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
@@ -11599,7 +11673,9 @@ pub fn searchTextQuery(
         native_constraints.exclusion_query_json_resolved,
     );
 
-    if (native_constraints.positive_filter and native_constraints.filter_doc_ids.len == 0 and native_constraints.filter_doc_nums.len == 0) {
+    if ((indexed_include != null and indexed_include.?.bitmap.cardinality() == 0) or
+        (native_constraints.positive_filter and native_constraints.filter_doc_ids.len == 0 and native_constraints.filter_doc_nums.len == 0))
+    {
         const score_profile = if (collect_score_profile) sortResultProfile(effective_req, .{
             .kind = .score_top_k,
         }, false, .{
@@ -11626,15 +11702,33 @@ pub fn searchTextQuery(
         native_constraints.positive_filter,
         effective_req.identity_read_generation,
     );
-    const full_candidate_limit = effectiveTextCandidateLimit(snapshot.liveDocCount(), native_constraints);
+    var full_candidate_limit = effectiveTextCandidateLimit(snapshot.liveDocCount(), native_constraints);
+    if (indexed_include) |predicate| full_candidate_limit = @min(full_candidate_limit, boundedU32(predicate.bitmap.cardinality()));
     const requires_field_sort = effective_req.order_by.len > 0;
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
+    if (executor.native_count_visibility_exact and effective_req.count_only and !unresolved_stored_filters and
+        !chunk_backed and !group_chunk_parents and effective_req.return_mode == .parent and effective_req.hierarchy_group_level == .source and
+        !effective_req.hierarchy_grouped_matches and effective_req.full_text_queries.len == 0 and
+        effective_req.dense_queries.len == 0 and effective_req.sparse_queries.len == 0 and
+        effective_req.authorization_filter_query_json.len == 0 and effective_req.filter_prefix.len == 0 and
+        effective_req.doc_filter_bindings.len == 0 and effective_req.query == .match_all and
+        !effective_req.hasHitEvaluation() and effective_req.evaluation_limit == 0 and effective_req.pruner == null and
+        effective_req.hierarchy_children == null and !effective_req.hierarchy_include_source and !effective_req.hierarchy_include_unit and
+        effective_req.graph_queries.len == 0 and effective_req.aggregations_json.len == 0 and executor.is_expired_key == null)
+    {
+        try checkSearchRequestDeadline(effective_req);
+        const total = try search_mod.countMatches(alloc, snapshot, search_query);
+        try checkSearchRequestDeadline(effective_req);
+        return .{ .alloc = alloc, .hits = &.{}, .total_hits = total, .total_hits_relation = .exact, .graph_results = &.{} };
+    }
     // The primary document store is the source of truth. Production text
     // segments retain compact keys for hit identity, but no longer duplicate
     // source bodies merely to project a result page.
     const load_stored_in_search_engine = false;
     var field_sort_plan = SortExecutionPlan{ .kind = .none };
     if (requires_field_sort) field_sort_plan = try planTextNativeSortFields(effective_req, snapshot, text_source.runtime_schema);
+    if (requires_field_sort and executor.project_key != null and field_sort_plan.sorted_segment_executor_available)
+        field_sort_plan = docValuesCollectorPlanForSelectiveFilter(field_sort_plan);
     if (requires_field_sort and executor.project_key == null and
         field_sort_plan.sorted_segment_executor_available and
         !chunk_backed and
@@ -11719,7 +11813,7 @@ pub fn searchTextQuery(
             return out;
         }
     }
-    if (requires_field_sort and executor.project_key == null and
+    if (requires_field_sort and (executor.project_key == null or executor.native_count_visibility_exact) and
         field_sort_plan.kind == .native_doc_values_top_n and
         !requestHasScoreSort(effective_req) and
         !chunk_backed and
@@ -11738,7 +11832,7 @@ pub fn searchTextQuery(
             else => return err,
         };
         if (doc_value_filter) |filter| {
-            return try sortAndPageTextDocValueFilterAlloc(
+            var out = try sortAndPageTextDocValueFilterAlloc(
                 alloc,
                 effective_req,
                 snapshot,
@@ -11746,6 +11840,21 @@ pub fn searchTextQuery(
                 executor,
                 field_sort_plan,
             );
+            errdefer out.deinit();
+            if (executor.project_key != null and out.hits.len != 0) {
+                // Membership/top-N is scoreless, but public _score still comes
+                // from the original query and the complete corpus statistics.
+                const selected = try arena_alloc.alloc(u32, out.hits.len);
+                for (out.hits, selected) |hit, *doc| doc.* = hit.native_text_doc_id orelse return error.InvalidData;
+                std.mem.sort(u32, selected, {}, std.sort.asc(u32));
+                var scored = try search_mod.execute(alloc, snapshot, .{ .query = search_query, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
+                defer scored.deinit();
+                var scores: std.AutoHashMapUnmanaged(u32, f32) = .empty;
+                defer scores.deinit(alloc);
+                for (scored.hits) |hit| try scores.put(alloc, hit.doc_id, hit.score);
+                for (out.hits) |*hit| hit.score = scores.get(hit.native_text_doc_id.?) orelse return error.StoredDocMissing;
+            }
+            return out;
         }
     }
     const exact_late_visibility_totals = late_visibility_paginate and
@@ -13271,6 +13380,7 @@ fn searchDenseInternal(
             .epsilon = resolved_epsilon,
             .rerank_factor = resolveRerankFactor(effort),
             .filter_prefix = req.filter_prefix,
+            .key_predicate = if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows } else null,
             .distance_over = req.distance_over,
             .distance_under = req.distance_under,
             .filter_ids = effective_filter_ids,
@@ -15377,6 +15487,7 @@ pub fn searchSparse(
             .exclude_doc_ids = native_constraints.exclude_doc_ids,
             .filter_doc_nums = native_constraints.filter_doc_nums,
             .exclude_doc_nums = native_constraints.exclude_doc_nums,
+            .key_predicate = if (req.native_key_predicate) |predicate| .{ .ptr = predicate.ptr, .allows = predicate.allows } else null,
             .cancellation = req.cancellation,
         });
         defer sparse_mod.SparseIndex.freeResults(alloc, raw_hits);
@@ -18791,6 +18902,7 @@ pub fn attachHighlightsWithIndexQueries(
             if (sources) |items| if (items[hit_index]) |source|
                 break :parsed std.json.parseFromSliceLeaky(std.json.Value, hit_arena, source, .{}) catch continue;
             if (hit.source_value) |value| break :parsed value;
+            if (hit.column_source) |source| break :parsed try source.value(&hit_arena_state);
             const stored = hit.stored_data orelse continue;
             break :parsed std.json.parseFromSliceLeaky(std.json.Value, hit_arena, stored, .{}) catch continue;
         };
@@ -25615,38 +25727,56 @@ test "text field sort uses exact native doc values filter path without index sor
     try std.testing.expectEqual(@as(usize, 2), profile.window_len);
     try std.testing.expectEqual(@as(usize, 2), profile.collector_heap_peak);
 
-    var zero_limit_result = try searchTextQuery(alloc, .{
-        .index_name = "ft",
-        .order_by = &order_by,
-        .include_stored = false,
-        .profile = true,
-        .limit = 0,
-    }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
-        .ctx = &harness,
-        .text_index_entry = Harness.textIndexEntry,
-        .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
-        .search_match_all = Harness.searchMatchAll,
-        .project_stored_search = Harness.projectStoredSearch,
-        .load_stored = Harness.loadStored,
-        .is_expired_key = Harness.isExpiredKey,
-        .postprocess = Harness.postprocess,
-    });
-    defer zero_limit_result.deinit();
+    // Count-only bitmap queries must retain late visibility and cursor
+    // semantics without allocating a sort window or decorating every hit.
+    const count_cursor = [_]std.json.Value{ .{ .integer = 1 }, .{ .string = "doc:a" } };
+    const count_cases = [_]struct {
+        expired_doc: ?[]const u8,
+        cursor: []const std.json.Value,
+        total: u32,
+        sort_reads: u64,
+    }{
+        .{ .expired_doc = null, .cursor = &.{}, .total = 3, .sort_reads = 0 },
+        .{ .expired_doc = "doc:c", .cursor = &.{}, .total = 2, .sort_reads = 0 },
+        .{ .expired_doc = null, .cursor = &count_cursor, .total = 2, .sort_reads = 3 },
+        .{ .expired_doc = "doc:c", .cursor = &count_cursor, .total = 1, .sort_reads = 2 },
+    };
+    for (count_cases) |case| {
+        var count_harness = Harness{ .text_entry = &text_entry, .expired_doc = case.expired_doc };
+        var zero_limit_result = try searchTextQuery(alloc, .{
+            .index_name = "ft",
+            .order_by = &order_by,
+            .search_after = case.cursor,
+            .include_stored = false,
+            .profile = true,
+            .limit = 0,
+        }, .{ .term = .{ .field = "body", .term = "alpha" } }, .{
+            .ctx = &count_harness,
+            .text_index_entry = Harness.textIndexEntry,
+            .text_index_is_chunk_backed = Harness.textIndexIsChunkBacked,
+            .search_match_all = Harness.searchMatchAll,
+            .project_stored_search = Harness.projectStoredSearch,
+            .load_stored = Harness.loadStored,
+            .is_expired_key = Harness.isExpiredKey,
+            .postprocess = Harness.postprocess,
+        });
+        defer zero_limit_result.deinit();
 
-    try std.testing.expectEqual(@as(usize, 0), zero_limit_result.hits.len);
-    try std.testing.expectEqual(types.TotalHitsRelation.exact, zero_limit_result.total_hits_relation);
-    try std.testing.expectEqual(@as(u32, 3), zero_limit_result.total_hits);
-    const zero_limit_profile = zero_limit_result.sort_profile orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("native_doc_values_top_n", zero_limit_profile.plan);
-    try std.testing.expectEqualStrings("doc_values_collector", zero_limit_profile.source);
-    try std.testing.expectEqualStrings("exact", zero_limit_profile.exactness);
-    try std.testing.expectEqual(@as(u64, 3), zero_limit_profile.candidate_count);
-    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.selected_count);
-    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.native_doc_value_hit_count);
-    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.stored_json_load_count);
-    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_capacity);
-    try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_len);
-    try std.testing.expectEqual(@as(usize, 0), harness.postprocess_count);
+        try std.testing.expectEqual(@as(usize, 0), zero_limit_result.hits.len);
+        try std.testing.expectEqual(types.TotalHitsRelation.exact, zero_limit_result.total_hits_relation);
+        try std.testing.expectEqual(case.total, zero_limit_result.total_hits);
+        const zero_limit_profile = zero_limit_result.sort_profile orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("native_doc_values_top_n", zero_limit_profile.plan);
+        try std.testing.expectEqualStrings("doc_values_collector", zero_limit_profile.source);
+        try std.testing.expectEqualStrings("exact", zero_limit_profile.exactness);
+        try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.selected_count);
+        try std.testing.expectEqual(case.sort_reads, zero_limit_profile.native_doc_value_hit_count);
+        try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.stored_json_load_count);
+        try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_capacity);
+        try std.testing.expectEqual(@as(u64, 0), zero_limit_profile.window_len);
+        try std.testing.expectEqual(@as(usize, 0), count_harness.postprocess_count);
+        try std.testing.expectEqual(@as(usize, 3), count_harness.expired_checks);
+    }
 
     var transformed_result = try searchTextQuery(alloc, .{
         .index_name = "ft",
@@ -26765,6 +26895,7 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
     var counter = NativeLoadCounter{
         .inner = .{ .snapshot = text_entry.persistent.snapshot() },
     };
+    defer counter.inner.deinit();
     const native_loader = NativeSortValueLoader{
         .ctx = &counter,
         .require_native = true,

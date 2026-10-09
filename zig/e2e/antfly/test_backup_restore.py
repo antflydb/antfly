@@ -3059,6 +3059,7 @@ def test_three_by_three_mixed_relational_restore_survives_coordinator_and_owner_
 @pytest.mark.parametrize("backend", ["s3", "gs"])
 def test_cluster_backup_restore_round_trip_remote_backend(backup_api, backend: str):
     location = _remote_backup_location(backend)
+    connection = f"{BACKUP_CONNECTION}-{backend}"
     table_a = f"cluster_{backend}_a_{time.time_ns()}"
     table_b = f"cluster_{backend}_b_{time.time_ns()}"
     backup_id = f"cluster-{backend}-backup-{time.time_ns()}"
@@ -3090,12 +3091,14 @@ def test_cluster_backup_restore_round_trip_remote_backend(backup_api, backend: s
             interval_s=1.0,
         )
 
-    backup = backup_api.cluster_backup(backup_id=backup_id, location=location)
+    backup = backup_api.cluster_backup(
+        backup_id=backup_id, location=location, connection=connection
+    )
     assert backup["backup_id"] == backup_id
     assert backup["status"] == "completed"
     assert {table["name"] for table in backup["tables"]} == {table_a, table_b}
 
-    listed = backup_api.list_backups(location=location)
+    listed = backup_api.list_backups(location=location, connection=connection)
     backups = listed["backups"]
     matched = [item for item in backups if item["backup_id"] == backup_id]
     assert len(matched) == 1
@@ -3110,6 +3113,7 @@ def test_cluster_backup_restore_round_trip_remote_backend(backup_api, backend: s
     restore = backup_api.cluster_restore(
         backup_id=backup_id,
         location=location,
+        connection=connection,
         restore_mode="fail_if_exists",
     )
     assert restore["status"] == "completed"

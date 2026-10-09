@@ -74,7 +74,10 @@ fn disposable(artifact: *std.Build.Step.Compile) bool {
 
 pub fn add(b: *std.Build, gate: *std.Build.Step) void {
     if (!(b.option(bool, "unit-test-cache-release", "Release completed unit outputs; requires a disposable cache retired before another build") orelse false)) return;
-    if (b.graph.host.result.os.tag != .linux) @panic("unit-test-cache-release requires Linux ELF outputs");
+    switch (b.graph.host.result.os.tag) {
+        .linux, .macos => {},
+        else => @panic("unit-test-cache-release requires a Unix host"),
+    }
     var steps = std.AutoHashMap(*std.Build.Step, void).init(b.allocator);
     collect(gate, &steps);
     var groups = std.StringHashMap(*std.Build.Step.Run).init(b.allocator);

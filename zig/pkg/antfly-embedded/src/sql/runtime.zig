@@ -3225,7 +3225,7 @@ test "SQL nested blocking result ownership unwinds allocation failures" {
             try std.testing.expectEqualStrings("5", result.output.rows[0][0].string);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }
 
 test "SQL joins consume native column batches without invoking the JSON cursor" {

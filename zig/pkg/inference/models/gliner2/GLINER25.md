@@ -9,6 +9,10 @@ and `antfly inference pull` withheld the `extract` task for every boundary
 checkpoint until a specific artifact was reviewed. This document records the
 first such review.
 
+See [GLINER25_FAMILY.md](GLINER25_FAMILY.md) for the multilingual boundary
+artifacts and the ModernBERT Decide-1B architecture, tokenizer contracts,
+backend limits, and reproducible family checks.
+
 ## Current status
 
 | Artifact | Backbone | Precision | Backend | Status |
@@ -18,14 +22,16 @@ first such review.
 | `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | native | Qualified (long-document windowing, up to 182,000 document bytes -- sections 9, 11) |
 | `fastino/gliner2.5-base-v1` (rev `72ac19b486cd4557424c8d61114e7530c243e9b0`) | base | fp32 (safetensors) | metal | Qualified (long-document windowing, up to 182,000 document bytes -- sections 9, 11) |
 | `fastino/gliner2.5-small-v1` | small | any | any | Not reviewed |
-| `fastino/gliner2.5-multi-v1` | multi | any | any | Not reviewed |
+| `fastino/gliner2.5-multi-v1` (rev `2ca71aafb3446d9014e1c55c7ff51c9bc7209c47`) | multi | fp32 | native, metal | Qualified measured single-window family profiles; see [family record](GLINER25_FAMILY.md) |
+| `fastino/GLiNER2.5-multi-Decide` (rev `a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f`) | multi | fp32 | native, metal | Qualified measured single-window extraction and public Decide profiles; see [family record](GLINER25_FAMILY.md) |
 | `fastino/gliner2.5-base-v1` (converted via `gliner25-convert`, same rev) | base | fp16_encoder | native, metal | Qualified (single-window -- section 15) and Qualified (long-document, up to the same 182,000-byte bound as fp32 -- section 15 follow-up); root-caused as fp16 weight-rounding noise (no code defect), plus a real (also root-caused, not a defect) cross-window merge-tie-break effect for long documents. Reviewed tolerances: `7.5e-4` (single-window), `2.5e-3` (long-document). **fp32 remains the default**: on Metal, fp16 is measured ~2.9x SLOWER than fp32 for the corpus-shaped long-document workload (0.94 vs 2.72 sections/s, section 15 follow-up) (root cause: fp16 is excluded from the Metal resident-weight `optimized_v2` fast path by design) |
 | Any other digest, revision, or precision of `gliner2.5-base-v1` | base | any | any | Not reviewed |
 
 `gliner_boundary.runtime_available` is now `true`, and
-`gliner_boundary_qualification.zig`'s production table carries exactly the
-eight rows above (fp32 and fp16_encoder, each single-window and
-long-document, each reviewed for native and Metal -- section 15).
+`gliner_boundary_qualification.zig`'s production table carries the eight
+base rows (fp32 and fp16_encoder, each single-window and long-document,
+each reviewed for native and Metal -- section 15), plus separate exact-byte
+multilingual profiles recorded in [GLINER25_FAMILY.md](GLINER25_FAMILY.md).
 Everything else --
 including a re-downloaded `gliner2.5-base-v1` whose upstream revision
 changes, or a quantized/GGUF conversion of it -- still fails closed with

@@ -1,0 +1,73 @@
+{
+  "format_version": 1,
+  "oracle_runtime_decide_1b": {
+    "python": "3.12.3",
+    "unicode": "15.0.0",
+    "isolated_packages": {
+      "annotated-doc": "0.0.5",
+      "anyio": "4.15.1",
+      "certifi": "2026.7.22",
+      "click": "8.5.0",
+      "filelock": "4.0.12",
+      "fsspec": "2026.9.0",
+      "h11": "0.16.0",
+      "hf-xet": "1.6.0",
+      "httpcore": "1.0.9",
+      "httpx": "0.28.1",
+      "huggingface-hub": "1.33.0",
+      "idna": "3.20",
+      "markdown-it-py": "4.2.0",
+      "mdurl": "0.1.2",
+      "numpy": "2.5.3",
+      "packaging": "26.3",
+      "pygments": "2.21.0",
+      "pyyaml": "6.0.3",
+      "regex": "2026.9.29",
+      "rich": "15.0.0",
+      "safetensors": "0.8.0",
+      "shellingham": "1.5.4",
+      "tokenizers": "0.23.2",
+      "tqdm": "4.70.1",
+      "transformers": "5.17.0",
+      "typer": "0.27.3",
+      "typing-extensions": "4.16.0"
+    },
+    "external_packages": {
+      "pydantic": "2.12.3",
+      "torch": "2.9.1"
+    },
+    "transformers_distribution": {
+      "filename": "transformers-5.17.0-py3-none-any.whl",
+      "sha256": "78ec1ce21579b38dfb83950a0658cd119f87212a2fcfdff478096ce9d6c03801",
+      "size_bytes": 12295140,
+      "source_repo": "https://github.com/huggingface/transformers",
+      "source_revision": "856157a2f3e9594954310df18fdccc31ffddebe9",
+      "installed_metadata_sha256": "cd295c5ad2c605e3c04456740df174e6a1bf5418eb2563788dc2163253f6d882",
+      "installed_record_sha256": "9abc15801d4bf3c6d5962bc03df670ae577967be4e5ac995c082c6255023910c"
+    },
+    "rope_contract": {
+      "head_dim": 64,
+      "layer_types": [
+        "full_attention",
+        "sliding_attention"
+      ],
+      "rope_theta": 160000.0,
+      "rope_type": "default",
+      "inv_freq_sha256_f32le": "adb41194debe8e6c185d47754f68cc2dd59960a03cb4ccbc71acd14b860c4604"
+    },
+    "compatibility": {
+      "gliner2_declared_transformers_range": "transformers>=4.38,<5",
+      "checkpoint_transformers_version": "5.17.0",
+      "status": "checkpoint_runtime_outside_upstream_declared_dependency_range"
+    },
+    "rejected_runtime_observation": {
+      "transformers_version": "4.55.4",
+      "full_attention_rope_theta": 160000.0,
+      "full_attention_inv_freq_sha256_f32le": "adb41194debe8e6c185d47754f68cc2dd59960a03cb4ccbc71acd14b860c4604",
+      "sliding_attention_rope_theta": 10000.0,
+      "sliding_attention_inv_freq_sha256_f32le": "734f9e6b629f7baccc4de81b7e8d2982035ee1b81f73f158e7d33a4dcf13fa0e",
+      "reason": "nested rope_parameters are retained as unknown metadata but ignored by the 4.55 ModernBERT per-layer constructor"
+    },
+    "runtime_tree_sha256": "6259dc40ff96d6bb7afaf079345be8e36bc3c3fd77194b9a88a6c635ba0f6969"
+  }
+}

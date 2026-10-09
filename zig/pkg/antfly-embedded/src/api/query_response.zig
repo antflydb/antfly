@@ -24,6 +24,9 @@ pub const QueryResponse = struct {
     pub const identity_read_generation_header = "X-Antfly-Identity-Read-Generation";
 
     json: []u8,
+    /// Present only after synchronous delivery to a caller-owned sink. JSON is
+    /// empty in that case; internal/group callers continue receiving owned JSON.
+    delivered_bytes: ?usize = null,
     identity_read_generation: ?u64 = null,
     /// Dialect admitted at the public graph boundary. This is transport
     /// metadata only: graph execution and storage always use the canonical IR.
@@ -33,4 +36,56 @@ pub const QueryResponse = struct {
         alloc.free(self.json);
         self.* = undefined;
     }
+};
+
+/// Synchronous delivery: the producer retains query state until the final write
+/// returns. start runs only after validation and exact byte counting, allowing
+/// transports to reject a response before committing headers. Backpressure and
+/// disconnects propagate through write; no background producer outlives a query.
+pub const Delivery = struct {
+    ptr: *anyopaque,
+    start_fn: *const fn (*anyopaque, usize) anyerror!void,
+    write_fn: *const fn (*anyopaque, []const u8) anyerror!void,
+    max_bytes: usize = std.math.maxInt(usize),
+    preparation_bytes: usize = 4 * 1024 * 1024,
+    spill_io: ?std.Io = null,
+    /// Public transport owns the result until completion. Once spooled, source
+    /// leases can be released eagerly; reusable/internal callers leave false.
+    consume_columns: bool = false,
+    /// Synchronous bounded preparation while the producer's snapshot is leased.
+    /// Only consumed/spooled delivery invokes this; reusable results stay eager.
+    hydrator: ?struct {
+        ptr: *anyopaque,
+        load: *const fn (*anyopaque, std.mem.Allocator, []@import("../storage/db/types.zig").SearchHit) anyerror!void,
+        release: *const fn (*anyopaque, []@import("../storage/db/types.zig").SearchHit) void,
+    } = null,
+    pub const Writer = struct {
+        sink: Delivery,
+        buffer: [16 * 1024]u8 = undefined,
+        writer: std.Io.Writer = undefined,
+        failure: ?anyerror = null,
+        pub fn init(self: *@This(), sink: Delivery) void {
+            self.sink = sink;
+            self.writer = .{ .vtable = &.{ .drain = drain }, .buffer = &self.buffer };
+        }
+        fn send(self: *@This(), bytes: []const u8) std.Io.Writer.Error!void {
+            self.sink.write_fn(self.sink.ptr, bytes) catch |err| {
+                self.failure = err;
+                return error.WriteFailed;
+            };
+        }
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("writer", w));
+            try self.send(w.buffered());
+            w.end = 0;
+            var count: usize = 0;
+            for (data[0 .. data.len - 1]) |bytes| {
+                try self.send(bytes);
+                count += bytes.len;
+            }
+            const pattern = data[data.len - 1];
+            for (0..splat) |_| try self.send(pattern);
+            return count + pattern.len * splat;
+        }
+    };
 };

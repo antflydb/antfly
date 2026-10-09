@@ -159,7 +159,7 @@ needed. From the repository root, use `make zig-test` or `make zig-unit-test`.
 Use `-Dtest-filter="pattern"` for compile-time selection; arguments after `--`
 are forwarded to the selected executable or runtime test runner.
 
-Linux unit CI uses `-Dunit-test-cache-release=true` to release each completed
+Linux unit CI uses `-Dunit-test-cache-release=true` (also supported for local macOS runs) to release each completed
 test artifact after every selected test run and inventory reader has exited.
 This retains Debug checks and symbols while bounding retained disk usage by
 live consumers. Use it only with the combined `zig build unit-test` invocation and a private

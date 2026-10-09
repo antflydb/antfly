@@ -27,27 +27,54 @@ const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
-pub const metadata_version: u16 = 5;
+pub const metadata_version: u16 = 8;
 pub const max_root_bytes = 4 * 1024 * 1024;
-pub const max_segments = 8192;
-pub const FileGroup = struct { file: state.File, segments: []const artifacts.ChunkRef };
+pub const max_segments = 262144;
+pub const physical = @import("lake_index_physical_ordinals.zig");
+pub const FileGroup = struct {
+    file: state.File,
+    segments: []const artifacts.ChunkRef,
+    rows: []const physical.Block = &.{},
+    pub fn validate(self: FileGroup, domain: [32]u8) !void {
+        if (self.segments.len > max_segments) return error.InvalidNativeLakeTextCorpus;
+        try state.validate(&.{self.file}, domain);
+        _ = try physical.validate(self.rows);
+        for (self.rows) |block| if (block.bitmap) |ref| {
+            const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+            if (!std.mem.eql(u8, &scope.domain, &domain)) return error.InvalidNativeLakeTextCorpus;
+        };
+        for (self.segments) |segment| {
+            if (segment.byte_len == 0 or segment.byte_len > 32 * 1024 * 1024) return error.InvalidNativeLakeTextCorpus;
+            try stores.validateSha256ArtifactIdentity(segment.artifact_id, segment.checksum);
+            const scope = (try stores.uploadScopeFromArtifactId(segment.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+            if (!std.mem.eql(u8, &scope.domain, &domain)) return error.InvalidNativeLakeTextCorpus;
+        }
+    }
+};
 pub const Root = struct {
     version: u16 = metadata_version,
     seekable: bool = false,
     domain: [32]u8,
     binding: local.serverless_segment_source_binding.Binding,
     config_json: []const u8,
-    segments: []const artifacts.ChunkRef,
+    segments: []const artifacts.ChunkRef = &.{},
     recipe: [32]u8 = @splat(0),
     file_groups: []const FileGroup = &.{},
+    manifests: []const artifacts.ChunkRef = &.{},
     pub fn validate(self: Root) !void {
         if (self.version != metadata_version or self.segments.len > max_segments or std.mem.allEqual(u8, &self.domain, 0) or self.config_json.len > 256 * 1024) return error.InvalidNativeLakeTextCorpus;
         try self.binding.validate();
         if (self.binding.sidecar_kind != .text) return error.InvalidNativeLakeTextCorpus;
         if (self.file_groups.len > 16384) return error.InvalidNativeLakeTextCorpus;
+        if (self.manifests.len > 16384) return error.InvalidNativeLakeTextCorpus;
+        for (self.manifests) |ref| {
+            try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
+            const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+            if (ref.byte_len == 0 or ref.byte_len > max_root_bytes or !std.mem.eql(u8, &scope.domain, &self.domain)) return error.InvalidNativeLakeTextCorpus;
+        }
         var segment_position: usize = 0;
         for (self.file_groups) |group| {
-            try state.validate(&.{group.file}, self.domain);
+            try group.validate(self.domain);
             for (group.segments) |segment| {
                 if (segment_position >= self.segments.len or (!std.mem.eql(u8, segment.artifact_id, self.segments[segment_position].artifact_id) or !std.mem.eql(u8, segment.checksum, self.segments[segment_position].checksum) or segment.byte_len != self.segments[segment_position].byte_len)) return error.InvalidNativeLakeTextCorpus;
                 segment_position += 1;
@@ -64,14 +91,48 @@ pub const Root = struct {
         }
     }
 };
-pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
+/// Read only the authenticated root directory; callers own child admission.
+pub fn loadRootDirectory(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
     if (ref.kind != .text_segment or ref.metadata_version != metadata_version or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, cache);
     defer a.free(bytes);
     const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
     try root.validate();
+    if (root.manifests.len != 0 and (root.segments.len != 0 or root.file_groups.len != 0)) return error.InvalidNativeLakeTextCorpus;
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
     if (!std.mem.eql(u8, &root.domain, &scope.domain)) return error.InvalidNativeLakeTextCorpus;
+    return root;
+}
+/// One independently admitted immutable file manifest. Share validation with
+/// serving while allowing GC to checkpoint between file jobs.
+pub fn loadFileManifest(a: A, store: stores.ArtifactStore, ref: artifacts.ChunkRef, domain: [32]u8, cancellation: Cancellation, cache: ?artifacts.CachedRead) !FileGroup {
+    if (ref.byte_len == 0 or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeTextCorpus;
+    const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+    if (!std.mem.eql(u8, &scope.domain, &domain)) return error.InvalidNativeLakeTextCorpus;
+    const bytes = try artifacts.readArtifact(a, store, ref, cancellation, cache);
+    defer a.free(bytes);
+    const group = try std.json.parseFromSliceLeaky(FileGroup, a, bytes, .{ .allocate = .alloc_always });
+    try group.validate(domain);
+    return group;
+}
+pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !Root {
+    var root = try loadRootDirectory(a, store, ref, cancellation, cache);
+    if (root.manifests.len != 0) {
+        var groups: std.ArrayList(FileGroup) = .empty;
+        var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+        var metadata_budget: u64 = 32 * 1024 * 1024;
+        for (root.manifests) |manifest| {
+            try cancellation.check();
+            try stores.chargeReadBudget(&metadata_budget, manifest.byte_len);
+            const group = try loadFileManifest(a, store, manifest, root.domain, cancellation, cache);
+            if (group.segments.len > max_segments -| segments.items.len) return error.InvalidNativeLakeTextCorpus;
+            try groups.append(a, group);
+            try segments.appendSlice(a, group.segments);
+        }
+        root.file_groups = groups.items;
+        root.segments = segments.items;
+        try root.validate();
+    }
     return root;
 }
 /// The serving cache supplies mapped, pinned native segment bytes. A bounded
@@ -146,7 +207,7 @@ pub fn loadWriter(a: A, store: stores.ArtifactStore, root: Root, cancellation: C
     var read_bytes: u64 = 512 * 1024 * 1024;
     for (root.segments, replacements, 0..) |segment, *replacement, ordinal| {
         try cancellation.check();
-        try stores.chargeReadBudget(&read_bytes, segment.byte_len);
+        if (loader == null and !root.seekable) try stores.chargeReadBudget(&read_bytes, segment.byte_len);
         const data = if (loader) |mapped| try mapped.load(mapped.ptr, a, segment, cancellation) else if (root.seekable) try @import("lake_index_seekable_text.zig").load(a, .{ .store = store, .cache = cache, .context = if (cache) |cached| cached.context else .{}, .cancellation = cancellation }, segment) else local.index.SegmentData.fromOwnedHeap(try artifacts.readArtifact(a, store, segment, cancellation, cache));
         replacement.* = .{ .id = ordinal + 1, .data = data };
         loaded += 1;
@@ -187,7 +248,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (paths, runtime.relational_columns) |*path, column| path.* = column.name;
             binding.column_bindings = paths;
         }
-        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v4:{s}", .{want.binding.index_config_hash});
+        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v6:{s}", .{want.binding.index_config_hash});
         const recipe = state.recipe(table, spec.config_json);
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;
@@ -225,16 +286,19 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
         var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
         var input_bytes: usize = 0;
-        var output_bytes: usize = 0;
         for (groups, plan.files, plan.changed, 0..) |*group, file, changed, file_ordinal| {
             group.* = .{ .file = file, .segments = &.{} };
             if (!changed) {
                 const previous_group = previous_groups.get(file.id) orelse return error.InvalidNativeLakeTextCorpus;
                 group.segments = previous_group.segments;
+                group.rows = previous_group.rows;
                 try segments.appendSlice(ca, group.segments);
                 continue;
             }
             const first_segment = segments.items.len;
+            var ordinals = physical.Builder.init(a, ca, store, cancellation);
+            defer ordinals.deinit();
+            var previous_id: ?[96]u8 = null;
             var input = provider.*;
             input.only_file = file_ordinal;
             input.only_files = null;
@@ -256,23 +320,49 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         if (value == .string) input_bytes +|= value.string.len;
                     }
                     const id = try plan.privateKey(ba, ref);
+                    if (previous_id) |last_id| if (std.mem.order(u8, &last_id, id) != .lt) return error.InvalidNativeLakeTextCorpus;
+                    previous_id = id[0..96].*;
                     input_bytes +|= id.len + 128;
+                    const before = builder.batch().docs.len;
                     try builder.appendSourceDoc(.{ .key = id, .root = root, .stored_data = "", .typed_source = null });
-                    if (builder.batch().docs.len >= 1024 or input_bytes >= 2 * 1024 * 1024) {
-                        try flush(a, ca, store, builder.batch(), analysis, &segments, &output_bytes, cancellation);
-                        _ = batch_arena.reset(.retain_capacity);
+                    if (builder.batch().docs.len != before) {
+                        if (ref != .external) return error.InvalidNativeLakeTextCorpus;
+                        try ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal);
+                    }
+                    if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
+                        try flush(a, ca, store, builder.batch(), analysis, &segments, cancellation);
+                        _ = batch_arena.reset(.free_all);
                         builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     }
                 }
             }
-            try flush(a, ca, store, builder.batch(), analysis, &segments, &output_bytes, cancellation);
+            try flush(a, ca, store, builder.batch(), analysis, &segments, cancellation);
+            try ordinals.flush();
+            group.rows = ordinals.blocks.items;
             group.segments = try ca.dupe(artifacts.ChunkRef, segments.items[first_segment..]);
-            _ = batch_arena.reset(.retain_capacity);
+            _ = batch_arena.reset(.free_all);
             builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
         }
-        const root: Root = .{ .seekable = true, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
+        var root: Root = .{ .seekable = true, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
+        try root.validate();
+        // Publish one immutable manifest per file. Large corpora do not put
+        // every native segment reference (twice) into the root artifact.
+        const manifests = try ca.alloc(artifacts.ChunkRef, groups.len);
+        for (groups, manifests) |group, *manifest| {
+            try cancellation.check();
+            const page = try std.json.Stringify.valueAlloc(a, group, .{});
+            defer a.free(page);
+            if (page.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
+            var page_upload = store.*;
+            page_upload.allocator = ca;
+            const ref = try page_upload.putWithCancellation(page, cancellation);
+            manifest.* = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
+        }
+        root.manifests = manifests;
+        root.file_groups = &.{};
+        root.segments = &.{};
         try root.validate();
         const bytes = try std.json.Stringify.valueAlloc(ca, root, .{});
         if (bytes.len > max_root_bytes) return error.NativeLakeTextCorpusTooLarge;
@@ -284,14 +374,18 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     }
     return declarations.toOwnedSlice(out);
 }
-fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), output_bytes: *usize, cancellation: Cancellation) !void {
+fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), cancellation: Cancellation) !void {
     try cancellation.check();
+    // Version 8 attests ascending producer identities inside each file group.
+    // Segment construction preserves input order; the predicate consumer may seek.
+    for (batch.docs, 0..) |doc, i| {
+        if (i != 0 and std.mem.order(u8, batch.docs[i - 1].id, doc.id) != .lt) return error.InvalidNativeLakeTextCorpus;
+    }
     const encoded = try mapper.buildTextSegmentsFromProjectionBatch(a, batch, analysis, .{ .target_segment_bytes = 8 * 1024 * 1024, .target_build_memory_bytes = 32 * 1024 * 1024, .store_document_source = false });
     defer mapper.freeTextSegments(a, encoded);
     for (encoded) |bytes| {
         try cancellation.check();
-        if (segments.items.len == max_segments or bytes.len > 32 * 1024 * 1024 or bytes.len > 512 * 1024 * 1024 -| output_bytes.*) return error.NativeLakeTextCorpusTooLarge;
-        output_bytes.* += bytes.len;
+        if (segments.items.len == max_segments or bytes.len > 32 * 1024 * 1024) return error.NativeLakeTextCorpusTooLarge;
         var upload = store.*;
         upload.allocator = out;
         const ref = try @import("lake_index_seekable_text.zig").publish(a, out, &upload, bytes, cancellation);
