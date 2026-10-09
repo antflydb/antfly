@@ -182,6 +182,26 @@ class Database:
         if handle is not None:
             self._lib.antfly_db_close(ctypes.c_void_p(handle))
 
+    def open_table(self, name: str) -> Database:
+        """Open a table-scoped document/schema/index/enrichment handle.
+
+        Close the table before dropping it. Database close invalidates all
+        table handles; a table handle cannot execute database-level SQL.
+        """
+        handle = self._acquire()
+        try:
+            out = ctypes.c_void_p()
+            encoded = encode_text(name)
+            name_slice, owner = _ffi.make_slice(encoded)
+            errors.raise_for_code(
+                self._lib.antfly_db_open_table(ctypes.c_void_p(handle), name_slice, ctypes.byref(out))
+            )
+            table = Database(out.value)
+            table._owner = self
+            return table
+        finally:
+            self._release()
+
     # -- low-level call helpers --------------------------------------------
 
     def _read_buffer(self, fn) -> bytes:
@@ -217,6 +237,37 @@ class Database:
     def _json_call(self, fn, request: JSONInput, *, raw: bool) -> Any:
         data = self._with_input_output(fn, encode_json_input(request))
         return decode_json_response(data, raw)
+
+    def sql(self, statement: str, parameters: Sequence[Any] = ()) -> Any:
+        from ._sql import call
+
+        data, keep = _ffi.make_slice(encode_json_input({"statement": statement, "parameters": list(parameters)}))
+        return call(self, self._lib.antfly_db_sql_json, data)
+
+    def sql_session(self):
+        from ._sql import SQLSession
+
+        return SQLSession(self)
+
+    def sql_cursor(self, statement: str, parameters: Sequence[Any] = ()):
+        from ._sql import SQLCursor
+
+        return SQLCursor(self, statement, parameters)
+
+    def create_table(self, name: str, schema: JSONInput) -> None:
+        handle = self._acquire()
+        try:
+            table, keep_table = _ffi.make_slice(encode_text(name))
+            data, keep_data = _ffi.make_slice(encode_json_input(schema))
+            errors.raise_for_code(self._lib.antfly_db_create_table_json(ctypes.c_void_p(handle), table, data))
+        finally:
+            self._release()
+
+    def drop_table(self, name: str) -> None:
+        self._with_input(self._lib.antfly_db_drop_table, encode_text(name))
+
+    def list_tables(self) -> list[str]:
+        return self._json_read(self._lib.antfly_db_list_tables_json, raw=False)
 
     # -- status / capabilities / maintenance -------------------------------
 
