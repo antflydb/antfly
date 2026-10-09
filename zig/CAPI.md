@@ -253,6 +253,9 @@ coordinator/participant recovery boundary. A competing process returns
 `ANTFLY_BUSY`, or waits up to `busy_timeout_ms`. Read-only calls use a shared
 lease. Calls on writable connections currently use an exclusive lease even
 for reads, a conservative policy that serializes those calls across processes.
+Read-only snapshots without a lock sidecar also open from read-only directories
+or media. Their calls use a shared inode fence when sidecar creation is denied;
+writers take the exclusive inode fence before installing a missing sidecar.
 
 After an external commit or atomic file replacement, a connection reopens its
 cached runtime before the next operation. Streaming SQL cursors retain the

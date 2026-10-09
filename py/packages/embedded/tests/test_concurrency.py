@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -192,6 +193,41 @@ def test_readonly_connection_observes_new_commits(tmp_path: Path) -> None:
             assert reader.lookup("item")["body"] == "after"
             writer.create_table("new_table", {})
             assert "new_table" in reader.list_tables()
+
+
+def test_readonly_snapshot_without_sidecar_in_readonly_directory(tmp_path: Path) -> None:
+    source = tmp_path / "source.aflite"
+    with antfly_embedded.create(source, no_sync=True) as db:
+        db.sql("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT)")
+        db.sql("INSERT INTO items (id,name) VALUES (1, 'before')")
+        db.run_until_idle()
+    directory = tmp_path / "readonly"
+    directory.mkdir()
+    snapshot = directory / "snapshot.aflite"
+    shutil.copyfile(source, snapshot)
+    directory.chmod(0o555)
+    try:
+        with antfly_embedded.open(snapshot, mode=antfly_embedded.OpenMode.READONLY) as reader:
+            assert reader.sql("SELECT name FROM items")["rows"] == [["before"]]
+            assert list(directory.iterdir()) == [snapshot]
+            cursor = reader.sql_cursor("SELECT name FROM items")
+            try:
+                # Installing a sidecar must respect existing inode readers
+                # when the snapshot subsequently becomes writable.
+                directory.chmod(0o755)
+                with antfly_embedded.open(snapshot, no_sync=True) as writer:
+                    with pytest.raises(antfly_embedded.BusyError):
+                        writer.sql("UPDATE items SET name = 'after' WHERE id = 1")
+                    assert cursor.fetch(10)["result"]["rows"] == [["before"]]
+                    cursor.close()
+                    reader.close()
+                    writer.sql("UPDATE items SET name = 'after' WHERE id = 1")
+                    with antfly_embedded.open(snapshot, mode=antfly_embedded.OpenMode.READONLY) as reopened:
+                        assert reopened.sql("SELECT name FROM items")["rows"] == [["after"]]
+            finally:
+                cursor.close()
+    finally:
+        directory.chmod(0o755)
 
 
 def test_table_handle_rebinds_and_rejects_recreated_table(tmp_path: Path) -> None:
@@ -393,6 +429,34 @@ def test_session_cannot_commit_into_recreated_table(tmp_path: Path) -> None:
                 assert error.value.sqlstate == "40001"
                 session.execute("ROLLBACK")
                 assert second.sql("SELECT id FROM items")["rows"] == []
+            finally:
+                session.close()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_session_cannot_read_staged_rows_into_recreated_table(tmp_path: Path, streaming: bool) -> None:
+    path = tmp_path / "session-read-identity.aflite"
+    with antfly_embedded.create(path, no_sync=True) as first:
+        with antfly_embedded.open(path, no_sync=True) as second:
+            first.sql("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT)")
+            session = first.sql_session()
+            try:
+                session.execute("BEGIN")
+                session.execute("INSERT INTO items (id,name) VALUES (1, 'old table')")
+                second.sql("DROP TABLE items")
+                second.sql("CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT)")
+                with pytest.raises(SQLStateError) as error:
+                    if streaming:
+                        cursor = session.open_cursor("SELECT id, name FROM items")
+                        try:
+                            cursor.fetch(10)
+                        finally:
+                            cursor.close()
+                    else:
+                        session.execute("SELECT id, name FROM items")
+                assert error.value.sqlstate == "40001"
+                session.execute("ROLLBACK")
+                assert session.execute("SELECT id, name FROM items")["rows"] == []
             finally:
                 session.close()
 

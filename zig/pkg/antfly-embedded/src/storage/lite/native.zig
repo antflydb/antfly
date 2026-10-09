@@ -8213,12 +8213,38 @@ pub fn lockReaderPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
         .lock = .shared,
         .lock_nonblocking = true,
     }) catch |err| switch (err) {
-        error.FileNotFound => try std.Io.Dir.cwd().createFile(io, lock_path, .{
-            .read = true,
-            .truncate = false,
-            .lock = .shared,
-            .lock_nonblocking = true,
-        }),
+        error.FileNotFound => blk: {
+            // A distributed snapshot may have no sidecar and live on read-only
+            // media. Fence its inode while checking/creating the sidecar; a
+            // writer must take the exclusive inode fence before creating one.
+            const data = try std.Io.Dir.cwd().openFile(io, path, .{
+                .mode = .read_only,
+                .lock = .shared,
+                .lock_nonblocking = true,
+            });
+            var keep_data = false;
+            defer if (!keep_data) data.close(io);
+            // A writer may have installed the sidecar before our inode fence.
+            if (std.Io.Dir.cwd().openFile(io, lock_path, .{
+                .mode = .read_only,
+                .lock = .shared,
+                .lock_nonblocking = true,
+            })) |existing| break :blk existing else |open_err| {
+                if (open_err != error.FileNotFound) return open_err;
+            }
+            break :blk std.Io.Dir.cwd().createFile(io, lock_path, .{
+                .read = true,
+                .truncate = false,
+                .lock = .shared,
+                .lock_nonblocking = true,
+            }) catch |create_err| switch (create_err) {
+                error.AccessDenied, error.ReadOnlyFileSystem => {
+                    keep_data = true;
+                    break :blk data;
+                },
+                else => return create_err,
+            };
+        },
         else => return err,
     };
     return .{ .io_impl = undefined, .borrowed_io = io, .file = file };
@@ -8257,6 +8283,25 @@ fn createDataFile(io: std.Io, path: []const u8, opts: CreateDataFileOptions) !st
 fn acquireWriterLock(allocator: Allocator, io: std.Io, path: []const u8) !LockFile {
     const lock_path = try writerLockPathAlloc(allocator, io, path);
     defer allocator.free(lock_path);
+    if (std.Io.Dir.cwd().openFile(io, lock_path, .{
+        .mode = .read_write,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    })) |existing| return .{ .file = existing } else |err| {
+        if (err != error.FileNotFound) return err;
+    }
+    // Readers of sidecar-free snapshots hold this inode shared. Exclude them
+    // before installing the sidecar so switching lock authorities cannot race
+    // a reader's header/catalog capture, even if directory permissions change.
+    const data = std.Io.Dir.cwd().openFile(io, path, .{
+        .mode = .read_only,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (data) |held| held.close(io);
     const file = std.Io.Dir.cwd().createFile(io, lock_path, .{
         .read = true,
         .truncate = false,
