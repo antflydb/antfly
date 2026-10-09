@@ -562,8 +562,9 @@ and exclusion producers share that candidate batch and retain their existing
 request-owned adaptive reverse-index probes and full-membership fallback.
 When adaptive probing materializes complete membership, a borrowed complete-set
 hook immediately enables ordinal seeks in the same scoring pass. Candidate-local
-answers never enter that hook. A pending batch can only delay the competitive
-cutoff, so block pruning remains conservative. Segment transitions flush before
+answers never enter that hook. Later score batches borrow the complete bitmap
+directly instead of copying full segment membership. A pending batch can only
+delay the competitive cutoff, so block pruning remains conservative. Segment transitions flush before
 changing ordinal offsets.
 
 Filtered minimum-one disjunctions use the native Block-Max WAND scorer with the

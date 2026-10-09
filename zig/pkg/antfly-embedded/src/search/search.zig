@@ -1726,12 +1726,18 @@ const FastTopK = struct {
         var candidates = roaring.RoaringBitmap.init(self.alloc);
         defer candidates.deinit();
         for (self.pending[0..self.pending_count]) |hit| try candidates.add(hit.doc_id - self.segment_offset);
-        var include = if (self.producers.include) |producer| try producer.produce(producer.ptr, self.alloc, self.segment_offset, self.segment_count, &candidates) else null;
+        // Complete global membership is immutable for the request. Borrow it
+        // directly instead of copying a full segment bitmap for every batch.
+        const include_global = complete(self.producers.include);
+        const exclude_global = complete(self.producers.exclude);
+        var include = if (include_global == null) if (self.producers.include) |producer| try producer.produce(producer.ptr, self.alloc, self.segment_offset, self.segment_count, &candidates) else null else null;
         defer if (include) |*bitmap| bitmap.deinit();
-        var exclude = if (self.producers.exclude) |producer| try producer.produce(producer.ptr, self.alloc, self.segment_offset, self.segment_count, &candidates) else null;
+        var exclude = if (exclude_global == null) if (self.producers.exclude) |producer| try producer.produce(producer.ptr, self.alloc, self.segment_offset, self.segment_count, &candidates) else null else null;
         defer if (exclude) |*bitmap| bitmap.deinit();
         for (self.pending[0..self.pending_count]) |hit| {
             const local_id = hit.doc_id - self.segment_offset;
+            if (include_global) |bitmap| if (!bitmap.contains(hit.doc_id)) continue;
+            if (exclude_global) |bitmap| if (bitmap.contains(hit.doc_id)) continue;
             if (include) |*bitmap| if (!bitmap.contains(local_id)) continue;
             if (exclude) |*bitmap| if (bitmap.contains(local_id)) continue;
             try self.collectAdmitted(hit);
@@ -6215,10 +6221,10 @@ test "external lake producer top k prunes common text without a complete members
         }
     }
     // Once adaptive probing switches to complete membership, the same scorer
-    // must seek to the sparse materialized answer instead of scanning onward.
+    // must seek to the sparse answer in a later segment instead of scanning onward.
     var point = roaring.RoaringBitmap.init(a);
     defer point.deinit();
-    try point.add(7001);
+    try point.add(15193);
     try point.prepareRead();
     const Materialized = struct {
         bitmap: *const roaring.RoaringBitmap,
@@ -6240,7 +6246,7 @@ test "external lake producer top k prunes common text without a complete members
     var sparse_answer = try execute(a, writer.snapshot(), .{ .query = .{ .bool_query = .{ .must = &.{ term, adaptive } } }, .k = 3, .include_stored = false });
     defer sparse_answer.deinit();
     try std.testing.expectEqual(@as(usize, 1), sparse_answer.hits.len);
-    try std.testing.expectEqual(@as(u32, 7001), sparse_answer.hits[0].doc_id);
+    try std.testing.expectEqual(@as(u32, 15193), sparse_answer.hits[0].doc_id);
     try std.testing.expectEqual(TotalHitsRelation.exact, sparse_answer.total_hits_relation);
-    try std.testing.expect(materialized.probed <= 65);
+    try std.testing.expectEqual(@as(usize, 64), materialized.probed);
 }
