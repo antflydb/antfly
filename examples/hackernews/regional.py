@@ -33,6 +33,31 @@ import uuid
 SDK_IMAGE = "gcr.io/google.com/cloudsdktool/google-cloud-cli@sha256:cde9dbd556000c21c08449d8e5828904ef91e690bec95207f71fa6a6685922c9"
 
 
+def compare_runs(reports):
+    """Compare exact results only when the measured source/query are identical."""
+    reference = reports[0]
+    expected = [
+        (hit["_source"]["hn_id"], hit["_score"])
+        for hit in reference["first_response"]["hits"]["hits"]
+    ]
+    for report in reports[1:]:
+        for field in ("source", "row_count", "query", "concurrency"):
+            if report[field] != reference[field]:
+                raise ValueError(f"Benchmark {field} differs between runs")
+        actual = [
+            (hit["_source"]["hn_id"], hit["_score"])
+            for hit in report["first_response"]["hits"]["hits"]
+        ]
+        if actual != expected:
+            raise ValueError("Ranked HN IDs/scores changed between runs")
+        expected_filters = reference["metadata_filters"]
+        if report["metadata_filters"].keys() != expected_filters.keys():
+            raise ValueError("Filter coverage differs between runs")
+        for name, result in expected_filters.items():
+            if report["metadata_filters"][name]["total"] != result["total"]:
+                raise ValueError(f"Exact filter total differs for {name}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -278,20 +303,7 @@ def main():
                     ),
                     flush=True,
                 )
-        expected = [
-            (hit["_source"]["hn_id"], hit["_score"])
-            for hit in reports[args.modes[0]][0]["first_response"]["hits"]["hits"]
-        ]
-        for cycles in reports.values():
-            for cycle in cycles:
-                actual = [
-                    (hit["_source"]["hn_id"], hit["_score"])
-                    for hit in cycle["first_response"]["hits"]["hits"]
-                ]
-                if actual != expected:
-                    raise RuntimeError(
-                        "Ranked HN IDs/scores changed between table modes or cycles"
-                    )
+        compare_runs([cycle for cycles in reports.values() for cycle in cycles])
         digest = hashlib.sha256()
         with args.binary.open("rb") as binary:
             for chunk in iter(lambda: binary.read(1048576), b""):
