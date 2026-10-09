@@ -13,12 +13,12 @@ pub const Leader = struct { term: u64, applied_index: u64 };
 pub const round_interval_ns = 250 * std.time.ns_per_ms;
 pub const publication_snapshot_lifetime_ns = 60 * std.time.ns_per_s;
 
-/// One owned bounded scan, serialized by the worker lane. Evidence is local,
+/// One owned bounded scan, serialized by its owner's lane. Evidence is local,
 /// never publication authority: the eventual write must recheck its proof.
 /// Scan is injected so resource ownership and scheduling are fault-testable.
 pub fn PublicationPreparation(comptime Scan: type, comptime Proof: type) type {
     return struct {
-        const Cut = struct { state: r.State, root: ?r.Generation, term: u64 };
+        const Cut = struct { state: r.State, root: ?r.Generation, fence: u64 };
         cut: ?Cut = null,
         scan: ?*Scan = null,
         proof: ?Proof = null,
@@ -52,9 +52,14 @@ pub fn PublicationPreparation(comptime Scan: type, comptime Proof: type) type {
             }
         }
         /// true consumes this round's work budget; no GC append should race
-        /// the in-progress proof. No scan may survive a term/source/root cut
-        /// change, failure, expiry or service teardown.
+        /// the in-progress proof. Changed cuts, failures and teardown discard
+        /// scans; physical snapshot expiry renews only an unchanged cut.
         pub fn step(self: *@This(), host: anytype, work: r.Work, leader: Leader, now_ns: u64) !bool {
+            return self.stepAtFence(host, work, leader.term, now_ns);
+        }
+        /// Leaders fence by term; replica-local preparation fences by the
+        /// pinned applied-log position. Both also bind the exact source/root.
+        pub fn stepAtFence(self: *@This(), host: anytype, work: r.Work, fence: u64, now_ns: u64) !bool {
             const state = work.current orelse {
                 self.cancel();
                 return false;
@@ -63,7 +68,7 @@ pub fn PublicationPreparation(comptime Scan: type, comptime Proof: type) type {
                 self.cancel();
                 return false;
             }
-            const next: Cut = .{ .state = state, .root = work.root, .term = leader.term };
+            const next: Cut = .{ .state = state, .root = work.root, .fence = fence };
             if (!std.meta.eql(self.cut, @as(?Cut, next))) {
                 self.cancel();
                 self.cut = next;
@@ -88,6 +93,111 @@ pub fn PublicationPreparation(comptime Scan: type, comptime Proof: type) type {
                 return false;
             }
             return true;
+        }
+    };
+}
+
+/// Replica-local bounded preparation, independent of leadership. Completed
+/// evidence is fixed-size; expensive pinned scans have a separate, smaller
+/// capacity. No active scan is evicted to admit another group. Call expire
+/// from the owner's control cadence and deinit before closing its database.
+pub fn PublicationProofPool(comptime Scan: type, comptime Proof: type, comptime max_slots: usize, comptime max_scans: usize) type {
+    if (max_slots == 0 or max_scans == 0 or max_scans > max_slots) @compileError("invalid publication preparation limits");
+    return struct {
+        const Preparation = PublicationPreparation(Scan, Proof);
+        const Slot = struct { group: u64, used_at_ns: u64, preparation: Preparation = .{} };
+        lane: std.Io.Mutex = .init,
+        slots: [max_slots]?Slot = @splat(null),
+        closed: bool = false,
+
+        pub fn deinit(self: *@This(), io: std.Io) void {
+            self.lane.lockUncancelable(io);
+            defer self.lane.unlock(io);
+            for (&self.slots) |*slot| {
+                if (slot.*) |*value| value.preparation.cancel();
+                slot.* = null;
+            }
+            self.closed = true;
+        }
+        pub fn cancel(self: *@This(), io: std.Io, group: u64) !void {
+            if (!self.lane.tryLock()) return error.ResourceTemporarilyUnavailable;
+            defer self.lane.unlock(io);
+            self.cancelGroup(group);
+        }
+        /// Teardown may wait for the current bounded page, unlike admission.
+        pub fn cancelBlocking(self: *@This(), io: std.Io, group: u64) void {
+            self.lane.lockUncancelable(io);
+            defer self.lane.unlock(io);
+            self.cancelGroup(group);
+        }
+        fn cancelGroup(self: *@This(), group: u64) void {
+            for (&self.slots) |*slot| if (slot.*) |*value| if (value.group == group) {
+                value.preparation.cancel();
+                slot.* = null;
+                return;
+            };
+        }
+        fn expireIdle(self: *@This(), now_ns: u64) void {
+            for (&self.slots) |*slot| if (slot.*) |*value| {
+                if (value.preparation.scan != null and now_ns -| value.used_at_ns >= publication_snapshot_lifetime_ns) {
+                    value.preparation.cancel();
+                    slot.* = null;
+                }
+            };
+        }
+        pub fn expire(self: *@This(), io: std.Io, now_ns: u64) !void {
+            if (!self.lane.tryLock()) return error.ResourceTemporarilyUnavailable;
+            defer self.lane.unlock(io);
+            if (self.closed) return error.CatalogPublicationScanClosed;
+            self.expireIdle(now_ns);
+            var failure: ?anyerror = null;
+            for (&self.slots) |*slot| if (slot.*) |*value| {
+                value.preparation.expire(now_ns) catch |err| {
+                    failure = failure orelse err;
+                };
+            };
+            if (failure) |err| return err;
+        }
+        pub fn step(self: *@This(), io: std.Io, host: anytype, work: r.Work, applied_index: u64, now_ns: u64) !?Proof {
+            if (!self.lane.tryLock()) return error.ResourceTemporarilyUnavailable;
+            defer self.lane.unlock(io);
+            if (self.closed) return error.CatalogPublicationScanClosed;
+            const state = work.current orelse return error.CatalogGenerationChanged;
+            if (work.epoch == null or !state.epoch.eql(work.epoch.?) or state.phase != .ready or state.failure != .none) return error.CatalogGenerationChanged;
+            if (work.root) |root| if (root.group_id != state.group_id) return error.InvalidCatalogRecord;
+            self.expireIdle(now_ns);
+            var selected: ?usize = null;
+            var available: ?usize = null;
+            var oldest: ?usize = null;
+            for (&self.slots, 0..) |*slot, index| {
+                if (slot.*) |*value| {
+                    if (value.group == state.group_id) {
+                        selected = index;
+                        break;
+                    }
+                    if (value.preparation.scan == null and (oldest == null or value.used_at_ns < self.slots[oldest.?].?.used_at_ns)) oldest = index;
+                } else available = index;
+            }
+            const index = selected orelse available orelse oldest orelse return error.ResourceTemporarilyUnavailable;
+            if (selected == null) {
+                if (self.slots[index]) |*old| old.preparation.cancel();
+                self.slots[index] = .{ .group = state.group_id, .used_at_ns = now_ns };
+            }
+            const slot = &self.slots[index].?;
+            if (slot.preparation.cut) |cut| if (cut.fence != applied_index or !std.meta.eql(cut.state, state) or !std.meta.eql(cut.root, work.root)) {
+                slot.preparation.cancel();
+            };
+            slot.used_at_ns = now_ns;
+            if (slot.preparation.scan == null and slot.preparation.proof == null and !slot.preparation.stopped and now_ns >= slot.preparation.retry_after_ns) {
+                var active: usize = 0;
+                for (self.slots) |other| if (other) |value| {
+                    if (value.preparation.scan != null) active += 1;
+                };
+                if (active == max_scans) return error.ResourceTemporarilyUnavailable;
+            }
+            _ = try slot.preparation.stepAtFence(host, work, applied_index, now_ns);
+            if (slot.preparation.stopped) return error.InvalidCatalogRecord;
+            return slot.preparation.proof;
         }
     };
 }
@@ -199,6 +309,8 @@ const Fake = struct {
 const epoch: r.Epoch = .{ .incarnation = @splat(1), .revision = 1 };
 
 const ScanHost = struct {
+    a: std.mem.Allocator = std.testing.allocator,
+    pages: usize = 2,
     begins: usize = 0,
     steps: usize = 0,
     closes: usize = 0,
@@ -221,14 +333,14 @@ const ScanHost = struct {
         }
         pub fn deinit(self: *@This()) void {
             self.owner.closes += 1;
-            std.testing.allocator.destroy(self);
+            self.owner.a.destroy(self);
         }
     };
     pub fn beginPublicationScan(self: *@This(), _: r.State) !*Scan {
         self.begins += 1;
         if (self.begin_error) |err| return err;
-        const scan = try std.testing.allocator.create(Scan);
-        scan.* = .{ .owner = self };
+        const scan = try self.a.create(Scan);
+        scan.* = .{ .owner = self, .remaining = self.pages };
         return scan;
     }
 };
@@ -313,6 +425,117 @@ test "relation reconciliation worker publication preparation bounds snapshot lif
         host.renew_error = null;
         try std.testing.expect(try preparation.step(&host, work, leader, preparation.retry_after_ns));
     }
+}
+
+fn poolWorkForTest(group: u64) !r.Work {
+    var work = try publicationWorkForTest();
+    work.current.?.group_id = group;
+    return work;
+}
+
+test "relation reconciliation worker publication pool bounds active scans and evicts only inactive evidence" {
+    const io = std.Options.debug_io;
+    var host: ScanHost = .{};
+    var pool: PublicationProofPool(ScanHost.Scan, u64, 3, 1) = .{};
+    defer pool.deinit(io);
+    const one = try poolWorkForTest(41);
+    const two = try poolWorkForTest(42);
+    const three = try poolWorkForTest(43);
+    const four = try poolWorkForTest(44);
+    try std.testing.expect((try pool.step(io, &host, one, 7, 0)) == null);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, pool.step(io, &host, two, 7, 1));
+    try std.testing.expectEqual(@as(usize, 1), host.steps);
+    try std.testing.expectEqual(@as(?u64, 42), try pool.step(io, &host, one, 7, 2));
+    try std.testing.expect((try pool.step(io, &host, two, 7, 3)) == null);
+    try std.testing.expectEqual(@as(?u64, 42), try pool.step(io, &host, two, 7, 4));
+    try std.testing.expect((try pool.step(io, &host, three, 7, 5)) == null);
+    try std.testing.expectEqual(@as(?u64, 42), try pool.step(io, &host, three, 7, 6));
+    try std.testing.expect((try pool.step(io, &host, four, 7, 7)) == null);
+    const steps = host.steps;
+    try std.testing.expectEqual(@as(?u64, 42), try pool.step(io, &host, two, 7, 8));
+    try std.testing.expectEqual(steps, host.steps);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, pool.step(io, &host, one, 7, 9));
+    try std.testing.expectEqual(@as(usize, 4), host.begins);
+    try std.testing.expectEqual(@as(?u64, 42), try pool.step(io, &host, four, 7, 10));
+    try std.testing.expect((try pool.step(io, &host, one, 7, 11)) == null);
+    try std.testing.expectEqual(@as(usize, 5), host.begins);
+    pool.deinit(io);
+    try std.testing.expectEqual(host.begins, host.closes);
+    try std.testing.expectError(error.CatalogPublicationScanClosed, pool.step(io, &host, one, 7, 12));
+}
+
+test "relation reconciliation worker publication pool fences cached cuts without oversubscribing changed proofs" {
+    const io = std.Options.debug_io;
+    var host: ScanHost = .{};
+    var pool: PublicationProofPool(ScanHost.Scan, u64, 3, 1) = .{};
+    defer pool.deinit(io);
+    var one = try poolWorkForTest(41);
+    const two = try poolWorkForTest(42);
+    try std.testing.expect((try pool.step(io, &host, one, 7, 0)) == null);
+    try std.testing.expect((try pool.step(io, &host, one, 8, 1)) == null);
+    try std.testing.expectEqual(@as(usize, 1), host.closes);
+    one.root = r.Generation.of(&one.current.?);
+    try std.testing.expect((try pool.step(io, &host, one, 8, 2)) == null);
+    try std.testing.expectEqual(@as(usize, 2), host.closes);
+    one.epoch.?.revision += 1;
+    one.current.?.epoch = one.epoch.?;
+    try std.testing.expect((try pool.step(io, &host, one, 8, 3)) == null);
+    try std.testing.expectEqual(@as(usize, 3), host.closes);
+    try std.testing.expectEqual(@as(?u64, 42), try pool.step(io, &host, one, 8, 4));
+    try std.testing.expect((try pool.step(io, &host, two, 8, 5)) == null);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, pool.step(io, &host, one, 9, 6));
+    try std.testing.expectEqual(@as(usize, 5), host.begins);
+    try pool.cancel(io, two.current.?.group_id);
+    try std.testing.expect((try pool.step(io, &host, one, 9, 7)) == null);
+    try std.testing.expectEqual(@as(usize, 6), host.begins);
+}
+
+test "relation reconciliation worker publication pool expires idle snapshots renews busy scans and bounds failures" {
+    const io = std.Options.debug_io;
+    var host: ScanHost = .{ .pages = 4 };
+    var pool: PublicationProofPool(ScanHost.Scan, u64, 2, 1) = .{};
+    defer pool.deinit(io);
+    const work = try poolWorkForTest(41);
+    try std.testing.expect((try pool.step(io, &host, work, 7, 0)) == null);
+    try std.testing.expect((try pool.step(io, &host, work, 7, publication_snapshot_lifetime_ns - 1)) == null);
+    try pool.expire(io, publication_snapshot_lifetime_ns);
+    try std.testing.expectEqual(@as(usize, 1), host.renewals);
+    try std.testing.expectEqual(@as(usize, 1), host.begins);
+    try pool.expire(io, 2 * publication_snapshot_lifetime_ns);
+    try std.testing.expectEqual(@as(usize, 1), host.closes);
+    host.begin_error = error.OutOfMemory;
+    const now = 3 * publication_snapshot_lifetime_ns;
+    try std.testing.expectError(error.OutOfMemory, pool.step(io, &host, work, 7, now));
+    const begins = host.begins;
+    host.begin_error = null;
+    try std.testing.expect((try pool.step(io, &host, work, 7, now + 1)) == null);
+    try std.testing.expectEqual(begins, host.begins);
+    host.step_error = error.InvalidCatalogRecord;
+    try std.testing.expectError(error.InvalidCatalogRecord, pool.step(io, &host, work, 7, now + std.time.ns_per_s));
+    const failed_begins = host.begins;
+    try std.testing.expectError(error.InvalidCatalogRecord, pool.step(io, &host, work, 7, now + 2 * std.time.ns_per_s));
+    try std.testing.expectEqual(failed_begins, host.begins);
+    host.step_error = null;
+    try std.testing.expect((try pool.step(io, &host, work, 8, now + 3 * std.time.ns_per_s)) == null);
+    try std.testing.expect(pool.lane.tryLock());
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, pool.step(io, &host, work, 8, now));
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, pool.cancel(io, work.current.?.group_id));
+    pool.lane.unlock(io);
+}
+
+test "relation reconciliation worker publication pool releases preparation on every allocation failure" {
+    const Fault = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const io = std.Options.debug_io;
+            var host: ScanHost = .{ .a = a };
+            var pool: PublicationProofPool(ScanHost.Scan, u64, 2, 1) = .{};
+            defer pool.deinit(io);
+            const work = try poolWorkForTest(41);
+            try std.testing.expect((try pool.step(io, &host, work, 7, 0)) == null);
+            try std.testing.expectEqual(@as(?u64, 42), try pool.step(io, &host, work, 7, 1));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fault.run, .{});
 }
 
 test "relation reconciliation worker budgets pending work and alternates GC" {

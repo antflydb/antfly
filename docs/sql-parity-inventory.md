@@ -2048,6 +2048,26 @@ The final gate passes all 172 native catalog tests, 22 linked storage tests and
 10 coordinator tests (63/63 build steps); the 53 reconciliation and 27 name
 component tests also succeed from cache. Inventory, control-catalog, formatting
 and whitespace checks pass with the original dispositions unchanged.
+Replica-local publication preparation now shares a fixed-capacity native pool:
+eight evidence slots and at most two active owned scans per store. Each call
+advances one bounded page outside the apply mutex; unrelated groups cannot
+evict active scans. Completed evidence is reused only at the same applied-log
+position, source epoch, ready state and root identity. Admission is nonblocking,
+idle snapshots close after sixty seconds, busy snapshots renew without losing
+their cursors, and teardown closes resources before the native store. Retryable
+failures back off; corrupt immutable cuts stop until invalidation. Service
+control rounds use this same pool instead of owning duplicate leader scans.
+Fake-host tests cover capacity, inactive-evidence eviction, cut changes, expiry,
+contention and allocation failures. The real seventy-target restore fixture
+checks bounded page advancement, progress-preserving snapshot renewal, idle
+release and completed-proof invalidation after index-only and source commits.
+This is preparation machinery, not root activation: decoder/producer capability
+barriers, receiver proof consumption and automatic publication remain unfinished.
+Public SQL resolution and the original parity dispositions are unchanged.
+The final-source gate passes 172 native catalog, 22 linked storage and 14
+coordinator/service tests (63/63 build steps), with no failures or leaks; pure
+name/reconciliation gates succeed from cache. Inventory integrity, control-catalog,
+formatting and whitespace checks pass. No original cases are reclassified.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,

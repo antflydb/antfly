@@ -29,6 +29,7 @@ const system_catalog_storage = @import("../../system_catalog/storage.zig");
 const relation_names = @import("antfly_local_sources").system_catalog_relation_names;
 const relation_reconciliation = @import("antfly_local_sources").system_catalog_relation_reconciliation;
 const relation_control = @import("../relation_reconciliation_command.zig");
+const relation_worker = @import("../relation_reconciliation_worker.zig");
 const command_journal = @import("command_journal.zig");
 const sql_settings = @import("antfly_local_sources").system_catalog_settings;
 const sql_policies = @import("antfly_local_sources").system_catalog_policies;
@@ -7112,6 +7113,39 @@ test "system catalog restore reconciliation authenticates source phases and cano
     try std.testing.expectEqual(@as(u64, 210), ready.expected.claims);
     const proof = try store.prepareRelationPublicationProof(a, ready);
     {
+        // The replica pool owns the actual native snapshots, not a second
+        // leader-only copy. Each call advances at most one page.
+        const lifetime = relation_worker.publication_snapshot_lifetime_ns;
+        try std.testing.expect((try store.stepRelationPublicationProof(ready, 0)) == null);
+        var slot_index: usize = 0;
+        while (store.relation_publication_pool.slots[slot_index] == null or store.relation_publication_pool.slots[slot_index].?.group != group) : (slot_index += 1) {}
+        const preparation = &store.relation_publication_pool.slots[slot_index].?.preparation;
+        try std.testing.expectEqual(@as(u64, 64), preparation.scan.?.verifier.state.pass.rows);
+        try std.testing.expect((try store.stepRelationPublicationProof(ready, lifetime - 1)) == null);
+        const before_renewal = preparation.scan.?.verifier.state;
+        try store.expireRelationPublicationProofs(lifetime);
+        try std.testing.expect(std.meta.eql(before_renewal, preparation.scan.?.verifier.state));
+        var now: u64 = lifetime;
+        var steps: usize = 2;
+        while (true) {
+            now += 1;
+            steps += 1;
+            if (try store.stepRelationPublicationProof(ready, now)) |finished| {
+                try std.testing.expect(std.meta.eql(proof, finished));
+                break;
+            }
+        }
+        try std.testing.expect(steps >= 4);
+        try std.testing.expect(preparation.scan == null);
+        try std.testing.expect(std.meta.eql(proof, (try store.stepRelationPublicationProof(ready, now + 1)).?));
+        try store.cancelRelationPublicationProof(group);
+        try std.testing.expect((try store.stepRelationPublicationProof(ready, now + 2)) == null);
+        try store.expireRelationPublicationProofs(now + 2 + lifetime);
+        for (store.relation_publication_pool.slots) |slot| if (slot) |value| {
+            try std.testing.expect(value.group != group);
+        };
+    }
+    {
         const scan = try store.beginRelationPublicationScan(a, ready);
         defer scan.deinit();
         try std.testing.expect((try scan.step(null)) == null);
@@ -7206,6 +7240,8 @@ test "system catalog restore reconciliation authenticates source phases and cano
     }
     for ([_]bool{ false, true }) |epoch_change| {
         const baseline = try store.prepareRelationPublicationProof(a, ready);
+        var pool_time: u64 = 0;
+        while ((try store.stepRelationPublicationProof(ready, pool_time)) == null) : (pool_time += 1) {}
         const scan = try store.beginRelationPublicationScan(a, ready);
         defer scan.deinit();
         try std.testing.expect((try scan.step(null)) == null);
@@ -7225,6 +7261,25 @@ test "system catalog restore reconciliation authenticates source phases and cano
             try txn.put(try RaftApplyStore.keyForGroup(&buf, group), &advanced);
         }
         try txn.commit();
+        pool_time += 1;
+        if (epoch_change) {
+            try std.testing.expectError(error.CatalogGenerationChanged, store.stepRelationPublicationProof(ready, pool_time));
+            for (store.relation_publication_pool.slots) |slot| if (slot) |value| {
+                try std.testing.expect(value.group != group);
+            };
+        } else {
+            // Even an index-only commit invalidates completed evidence. A
+            // fresh proof needs independent bounded source/candidate passes.
+            try std.testing.expect((try store.stepRelationPublicationProof(ready, pool_time)) == null);
+            while (true) {
+                pool_time += 1;
+                if (try store.stepRelationPublicationProof(ready, pool_time)) |fresh| {
+                    try std.testing.expectEqual(baseline.applied_index + 1, fresh.applied_index);
+                    try std.testing.expect(std.meta.eql(baseline.state, fresh.state));
+                    break;
+                }
+            }
+        }
         try std.testing.expectError(error.CatalogGenerationChanged, invalidated.renew());
         try std.testing.expect(!invalidated.open);
         try std.testing.expectError(error.CatalogPublicationScanClosed, invalidated.step(null));
@@ -9586,6 +9641,7 @@ pub const RaftApplyStore = struct {
     committed_key_listeners: std.ArrayListUnmanaged(RegisteredCommittedKeyListener) = .empty,
     next_lifecycle_listener_registration_id: u64 = 1,
     apply_mutex: std.Io.Mutex = .init,
+    relation_publication_pool: RelationPublicationPool = .{},
     active_outcome: ?*CommittedApplyOutcome = null,
     active_relation_page: ?*const relation_reconciliation.Page = null,
     active_relation_failure: ?*const relation_reconciliation.FailurePlan = null,
@@ -9654,6 +9710,7 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn deinit(self: *RaftApplyStore) void {
+        self.relation_publication_pool.deinit(self.io_impl.io());
         self.checkpoints.deinit(self.alloc);
         self.verified_catalog_groups.deinit(self.alloc);
         for (self.projected_placement_intents.items) |*entry| freePlacementIntent(self.alloc, entry.intent);
@@ -17476,6 +17533,50 @@ pub const RaftApplyStore = struct {
             return std.meta.eql(root, self.root);
         }
     };
+
+    // Keep completed cuts separately from expensive source/restore snapshots.
+    // Replica-local evidence survives leadership changes, but never a changed
+    // applied position, source epoch, ready seal or root identity.
+    pub const RelationPublicationPool = relation_worker.PublicationProofPool(RelationPublicationScan, RelationPublicationProof, 8, 2);
+
+    /// Advance at most one bounded source/candidate page, outside apply_mutex.
+    /// null is pending evidence, not publication authority. Final apply must
+    /// still fence the proof and decoder/producer capabilities atomically.
+    pub fn stepRelationPublicationProof(self: *RaftApplyStore, expected: relation_reconciliation.State, now_ns: u64) !?RelationPublicationProof {
+        _ = try expected.encode();
+        if (expected.phase != .ready or expected.failure != .none) return error.InvalidCatalogRecord;
+        var read = try self.store.beginReadTxn();
+        defer read.abort();
+        const observed = try PreparedRelationBatch.capture(&read, expected.group_id);
+        if (!std.meta.eql(observed.job, @as(?relation_reconciliation.State, expected)) or observed.epoch == null or !observed.epoch.?.eql(expected.epoch)) {
+            self.cancelRelationPublicationProof(expected.group_id) catch {};
+            return error.CatalogGenerationChanged;
+        }
+        const Host = struct {
+            store: *RaftApplyStore,
+            cut: RelationPublicationProof,
+            pub fn beginPublicationScan(self_host: *@This(), state: relation_reconciliation.State) !*RelationPublicationScan {
+                const scan = try self_host.store.beginRelationPublicationScan(self_host.store.alloc, state);
+                errdefer scan.deinit();
+                // The pool observation and owned scan use different reads.
+                // Never attach a newer snapshot to an older cached fence.
+                if (!std.meta.eql(scan.verifier.proof, self_host.cut)) return error.CatalogGenerationChanged;
+                return scan;
+            }
+        };
+        var host: Host = .{ .store = self, .cut = .{ .state = expected, .applied_index = observed.applied_index, .root = observed.root } };
+        const work: relation_reconciliation.Work = .{ .epoch = observed.epoch, .current = observed.job, .root = observed.root };
+        return self.relation_publication_pool.step(self.io_impl.io(), &host, work, observed.applied_index, now_ns);
+    }
+    pub fn cancelRelationPublicationProof(self: *RaftApplyStore, group: u64) !void {
+        try self.relation_publication_pool.cancel(self.io_impl.io(), group);
+    }
+    pub fn closeRelationPublicationProof(self: *RaftApplyStore, group: u64) void {
+        self.relation_publication_pool.cancelBlocking(self.io_impl.io(), group);
+    }
+    pub fn expireRelationPublicationProofs(self: *RaftApplyStore, now_ns: u64) !void {
+        try self.relation_publication_pool.expire(self.io_impl.io(), now_ns);
+    }
 
     pub fn prepareRelationPublicationProof(self: *RaftApplyStore, a: std.mem.Allocator, expected: relation_reconciliation.State) !RelationPublicationProof {
         const scan = try self.beginRelationPublicationScan(a, expected);

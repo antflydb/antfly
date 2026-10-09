@@ -45,7 +45,14 @@ const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const metadata_topology_protocol = @import("topology_protocol.zig");
 const metadata_storage = @import("storage/mod.zig");
-const RelationPublicationPreparation = relation_worker.PublicationPreparation(metadata_storage.RaftApplyStore.RelationPublicationScan, metadata_storage.RaftApplyStore.RelationPublicationProof);
+// The native store owns replica-local scan resources. This is only the
+// leader's latest observation, never a second independently prepared proof.
+const RelationPublicationPreparation = struct {
+    proof: ?metadata_storage.RaftApplyStore.RelationPublicationProof = null,
+    fn cancel(self: *@This()) void {
+        self.* = .{};
+    }
+};
 const platform_clock = @import("antfly_platform").clock;
 const process_memory_mod = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
@@ -4076,6 +4083,7 @@ fn closeRelationPublicationPreparation(service: anytype) void {
     defer service.relation_reconciliation_worker.lane.unlock(std.Options.debug_io);
     service.relation_reconciliation_worker.closing = true;
     service.relation_publication_preparation.cancel();
+    if (service.projectedStore()) |store| store.closeRelationPublicationProof(service.metadata_group_id);
 }
 
 fn runRelationReconciliationRound(service: anytype) !void {
@@ -4100,17 +4108,24 @@ fn runRelationReconciliationRound(service: anytype) !void {
         pub fn observe(self: *@This()) !@import("antfly_local_sources").system_catalog_relation_reconciliation.Work {
             return self.store.relationReconciliationWork(self.service.metadata_group_id);
         }
-        pub fn beginPublicationScan(self: *@This(), state: @import("antfly_local_sources").system_catalog_relation_reconciliation.State) !*metadata_storage.RaftApplyStore.RelationPublicationScan {
-            return self.store.beginRelationPublicationScan(self.service.alloc, state);
-        }
-        pub fn preparePublication(self: *@This(), work: @import("antfly_local_sources").system_catalog_relation_reconciliation.Work, leader_cut: relation_worker.Leader, now_ns: u64) !bool {
-            return self.service.relation_publication_preparation.step(self, work, leader_cut, now_ns);
+        pub fn preparePublication(self: *@This(), work: @import("antfly_local_sources").system_catalog_relation_reconciliation.Work, _: relation_worker.Leader, now_ns: u64) !bool {
+            self.service.relation_publication_preparation.cancel();
+            const state = work.current orelse {
+                try self.store.cancelRelationPublicationProof(self.service.metadata_group_id);
+                return false;
+            };
+            if (work.epoch == null or !state.epoch.eql(work.epoch.?) or state.phase != .ready or state.failure != .none) {
+                try self.store.cancelRelationPublicationProof(self.service.metadata_group_id);
+                return false;
+            }
+            self.service.relation_publication_preparation.proof = try self.store.stepRelationPublicationProof(state, now_ns);
+            return self.service.relation_publication_preparation.proof == null;
         }
         pub fn cancelPublication(self: *@This()) void {
             self.service.relation_publication_preparation.cancel();
         }
         pub fn expirePublication(self: *@This(), now_ns: u64) !void {
-            try self.service.relation_publication_preparation.expire(now_ns);
+            try self.store.expireRelationPublicationProofs(now_ns);
         }
         pub fn propose(self: *@This(), command: @import("relation_reconciliation_command.zig").Command, term: u64) !relation_worker.Receipt {
             const bytes = try command.encodeAlloc(self.service.alloc);
