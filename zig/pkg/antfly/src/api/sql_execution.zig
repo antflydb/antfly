@@ -803,11 +803,11 @@ pub const Adapter = struct {
             wrapper.* = .{ .alloc = alloc, .statement = statement };
             return .{ .ptr = wrapper, .next = SingleStatementCursor.next, .close = SingleStatementCursor.close };
         }
-        // An empty transaction buffer has nothing to merge. Keeping it on
-        // the overlay path unnecessarily forces every UPDATE/DELETE and
-        // session read into primary order, disabling ready native indexes.
+        // Predicate-only entries and writes to unrelated physical tables do
+        // not require merging this scan. Preserve native index selection
+        // while fencing matching schema epochs even on read-only entries.
         // Guarded isolation above still owns its separate proof admission.
-        if (self.staged != null and self.staged.?.tables.len != 0) {
+        if (self.staged != null and try @import("sql_session_overlay.zig").needsMerge(self.staged.?, table)) {
             const staged = self.staged.?;
             // A session SELECT needs one native statement snapshot. Multi-owner
             // sources without that guarantee remain explicitly unsupported.
@@ -1794,15 +1794,24 @@ test "SQL API empty transaction overlays preserve native index planning" {
     const request: catalog.Scan = .{ .fields = &.{"id"}, .limit = 8 };
     var staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
     var staged_table: @import("transactions.zig").TableCommitRequest = .{ .table_name = @constCast("physical") };
-    for (0..3) |step| {
+    for (0..5) |step| {
         adapter.staged = if (step == 0) null else &staged;
-        if (step == 2) staged.tables = (&staged_table)[0..1];
-        fake.auto_index = step != 2;
+        if (step >= 2) staged.tables = (&staged_table)[0..1];
+        if (step == 3) {
+            staged_table.table_name = @constCast("other");
+            staged_table.batch.deletes = @constCast(&[_][]const u8{"a"});
+        }
+        if (step == 4) staged_table.table_name = @constCast("physical");
+        fake.auto_index = step != 4;
         const cursor = (try Adapter.openScan(&adapter, std.testing.allocator, table, request)) orelse return error.MissingSqlCursor;
         cursor.close(cursor.ptr);
     }
-    try std.testing.expectEqual(@as(usize, 3), fake.opens);
+    try std.testing.expectEqual(@as(usize, 5), fake.opens);
     try std.testing.expectEqual(fake.opens, fake.closes);
+    staged_table.batch.deletes = &.{};
+    staged_table.schema_version = 8;
+    try std.testing.expectError(error.CatalogGenerationChanged, Adapter.openScan(&adapter, std.testing.allocator, table, request));
+    try std.testing.expectEqual(@as(usize, 5), fake.opens);
     staged.tables = &.{};
     adapter.staged = &staged;
     server.table_reads.?.vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined };

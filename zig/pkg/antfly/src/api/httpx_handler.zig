@@ -14027,6 +14027,7 @@ fn postgresNativeMutationCampaignsWithReadPolicy(comptime selected: []const []co
             try std.testing.expect(source.lookup_calls.load(.monotonic) > 0);
             if (indexed_selectors) {
                 try std.testing.expect(source.indexed_reads.load(.monotonic) > 0);
+                try std.testing.expect(source.normalization_views.load(.monotonic) > 0);
             } else try std.testing.expectEqual(@as(usize, 0), source.unbounded_reads.load(.monotonic));
             try std.testing.expectEqual(@as(usize, 0), source.captures);
         }

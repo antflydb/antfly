@@ -21,6 +21,21 @@ const catalog = @import("antfly_local_sources").sql_catalog;
 const transactions = @import("transactions.zig");
 const Json = std.json.Value;
 
+/// Read dependencies are not postimages. Only writes to this physical table
+/// require a primary-order merge, but every matching entry still fences the
+/// schema cut even when it contains predicates alone. Inspect the complete
+/// cut before returning so later stale entries cannot be hidden by a write.
+pub fn needsMerge(staged: *const transactions.OwnedTransactionCommitRequest, table: catalog.Table) !bool {
+    var writes = false;
+    for (staged.tables) |entry| {
+        if (!std.mem.eql(u8, staged.physicalName(entry.table_name), table.physical_name)) continue;
+        if (entry.schema_version != null and entry.schema_version != table.schema_version) return error.CatalogGenerationChanged;
+        if (entry.relational_schema_version != null and entry.relational_schema_version != table.schema_version) return error.CatalogGenerationChanged;
+        writes = writes or entry.batch.writes.len != 0 or entry.batch.deletes.len != 0 or entry.txn_writes.len != 0;
+    }
+    return writes;
+}
+
 pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, staged: *const transactions.OwnedTransactionCommitRequest, table: catalog.Table, request: catalog.Scan, row_filter_json: ?[]const u8) !catalog.Cursor {
     const cursor = try alloc.create(Cursor);
     cursor.* = .{ .alloc = alloc, .native = native, .arena = std.heap.ArenaAllocator.init(alloc), .page_arena = std.heap.ArenaAllocator.init(alloc) };
@@ -210,6 +225,34 @@ const Cursor = struct {
         self.alloc.destroy(self);
     }
 };
+
+test "SQL session overlay merge admission uses physical identity and validates every schema fence" {
+    const a = std.testing.allocator;
+    var staged: transactions.OwnedTransactionCommitRequest = .{};
+    defer staged.deinit(a);
+    try staged.bind(a, "logical", "physical");
+    const table: catalog.Table = .{ .id = 7, .physical_name = "physical", .schema_version = 9, .columns = &.{} };
+    var entries = [_]transactions.TableCommitRequest{
+        .{ .table_name = @constCast("logical"), .schema_version = 9, .relational_schema_version = 9 },
+        .{ .table_name = @constCast("other"), .schema_version = 1, .batch = .{ .deletes = @constCast(&[_][]const u8{"a"}) } },
+    };
+    staged.tables = &entries;
+    // Entries borrow stack memory; only the separately owned bindings are freed.
+    defer staged.tables = &.{};
+    try std.testing.expect(!try needsMerge(&staged, table));
+    entries[0].batch.deletes = entries[1].batch.deletes;
+    try std.testing.expect(try needsMerge(&staged, table));
+    entries[1].table_name = @constCast("physical");
+    try std.testing.expectError(error.CatalogGenerationChanged, needsMerge(&staged, table));
+    entries[1].schema_version = 9;
+    entries[1].relational_schema_version = 8;
+    try std.testing.expectError(error.CatalogGenerationChanged, needsMerge(&staged, table));
+    entries[1].relational_schema_version = 9;
+    try std.testing.expect(try needsMerge(&staged, table));
+    entries[0].batch.deletes = &.{};
+    entries[1].batch.deletes = &.{};
+    try std.testing.expect(!try needsMerge(&staged, table));
+}
 
 test "SQL session overlay owns typed array rows after native pages and cursor close" {
     const alloc = std.testing.allocator;

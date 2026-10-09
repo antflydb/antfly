@@ -62,6 +62,16 @@
       "cwd": ".",
       "timeout_seconds": 120
     },
+    "sql-native-unique-selectors": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages", "-Dtest-filter=SQL selector evidence permits only bounded normalization views", "-Dtest-filter=SQL API empty transaction overlays preserve native index planning", "-Dtest-filter=SQL session overlay"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
+    "sql-postgres-partial-mutation-reference": {
+      "command": ["uv", "run", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_postgres_reference.py", "mutation", "--constraint-profile", "partial-active-email", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_partial_mutation_postgres_reference.json"],
+      "cwd": ".",
+      "timeout_seconds": 120
+    },
     "sql-native-expression-arbiters": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL partial and expression arbiters", "-Dtest-filter=httpx SQL PostgreSQL inferred unique indexes", "-Dtest-filter=httpx SQL PostgreSQL UNIQUE arbiters"],
       "cwd": "zig",
@@ -14468,12 +14478,20 @@
     {
       "id": "sql-1509",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "Exact DML and parameters match PostgreSQL under an activated UNIQUE(email) index. Native evidence requires a digest-bearing equality index span, complete postimages and bounded schema-only normalization; no table capture is permitted. Original setup incorrectly validates an index as a constraint. Public catalog activation and the corrected complete setup remain unproven, so this is partial evidence only.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-native-unique-selectors"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1510",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "Exact DML and parameters match PostgreSQL under an activated partial UNIQUE(email) index WHERE status='active'. Native evidence requires a digest-bearing equality index span, complete postimages and bounded schema-only normalization; no table capture is permitted. Original setup incorrectly validates an index as a constraint. Public catalog activation and the corrected complete setup remain unproven, so this is partial evidence only.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-native-unique-selectors"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-postgres-partial-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1511",
@@ -14497,12 +14515,20 @@
     {
       "id": "sql-1514",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "Exact DELETE and parameters match PostgreSQL under an activated UNIQUE(email) index, with digest-bearing equality index reads and complete three-table postimages. Original setup incorrectly validates an index as a constraint. Public catalog activation and the corrected complete setup remain unproven, so this is partial evidence only.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-native-unique-selectors"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1515",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "Exact DELETE and parameters match PostgreSQL under an activated partial UNIQUE(email) index WHERE status='active', with digest-bearing equality index reads and complete three-table postimages. Original setup incorrectly validates an index as a constraint. Public catalog activation and the corrected complete setup remain unproven, so this is partial evidence only.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-native-unique-selectors"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL unique selectors use ready native index spans and preserve complete postimages","gate":"sql-postgres-partial-mutation-reference"}
+      ]
     },
     {
       "id": "sql-1516",

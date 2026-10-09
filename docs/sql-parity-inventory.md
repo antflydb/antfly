@@ -1431,6 +1431,24 @@ operation. Keep these cases unresolved until the intended PostgreSQL contract
 and its activated fixture are independently tested; a table scan against the
 baseline is not a substitute for unique-owner activation.
 
+Four selectors (`sql-1509`, `sql-1510`, `sql-1514`, `sql-1515`) now have
+independent PostgreSQL DML results and mounted native execution against their
+ordinary or status-filtered unique index owners. The native campaign builds
+indexes to durable ready state and requires exact equality index spans with
+primary content digests, full postimages and no full-table statement capture.
+UPDATE normalization may additionally open a one-key, zero-column view pinned
+to the schema version; this is not candidate discovery or a digest recheck.
+The fixture rejects broad ranges and projected reads on that auxiliary path.
+READ COMMITTED scans preserve native index selection for empty buffers,
+predicate-only entries and writes to unrelated physical tables. Every matching
+entry still validates both schema fences, including stale entries after a
+matching write. Actual staged overlays and stronger-isolation guards retain
+their protected paths. Multi-scan statement overlays remain conservative.
+All four cases remain unresolved because their original
+index-as-constraint validation setup and public catalog activation still need
+end-to-end adjudication. Expression-predicate and positive-amount selectors
+(`sql-1512`, `sql-1517`) still need their own owner profiles and access proof.
+
 JSONB path extraction now shares strict typed binding and immutable traversal
 between `jsonb_extract_path` and `jsonb_extract_path_text`. Missing components
 and SQL NULL do not skip evaluation of later arguments; JSON null remains a

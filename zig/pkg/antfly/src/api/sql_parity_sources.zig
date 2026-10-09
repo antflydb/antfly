@@ -40,6 +40,7 @@ pub fn Tables(comptime count: usize) type {
         // commit proofs or widen the capabilities of an owner-local source.
         require_indexed_reads: bool = false,
         indexed_reads: std.atomic.Value(usize) = .init(0),
+        normalization_views: std.atomic.Value(usize) = .init(0),
         ranges: []local.common_topology_records.RangeRecord = &.{},
 
         pub fn status(_: *anyopaque) !metadata.MetadataStatus {
@@ -135,13 +136,24 @@ pub fn Tables(comptime count: usize) type {
                 errdefer retained.deinit();
                 if (self.require_indexed_reads) {
                     const session: *db.DB.RelationalReadSession = @ptrCast(@alignCast(retained.ptr));
-                    const index = session.reader.index orelse return error.ExpectedNativeIndexRead;
-                    try std.testing.expect(index.generation != 0);
-                    try std.testing.expect(std.mem.order(u8, session.reader.lower, session.reader.upper) == .lt);
-                    // Mutation preimages must still come from primary rows;
-                    // an index-only result cannot supply their commit digest.
                     try std.testing.expect(!session.reader.index_only);
-                    _ = self.indexed_reads.fetchAdd(1, .monotonic);
+                    if (session.reader.index) |index| {
+                        try std.testing.expect(opts.include_content_hashes);
+                        try std.testing.expect(index.generation != 0);
+                        const prefix = try local.storage_db_relational_index_records.forwardPrefix(index.id());
+                        try std.testing.expect(session.reader.lower.len > prefix.len);
+                        try std.testing.expect(std.mem.startsWith(u8, session.reader.lower, &prefix));
+                        const end = (try local.storage_internal_keys.nextPrefixAlloc(a, session.reader.lower)) orelse return error.ExpectedNativeIndexRead;
+                        defer a.free(end);
+                        try std.testing.expectEqualSlices(u8, end, session.reader.upper);
+                        _ = self.indexed_reads.fetchAdd(1, .monotonic);
+                    } else {
+                        // Postimage normalization pins a schema through a
+                        // zero-column view at exactly [key,key+NUL). This is
+                        // not permission to discover candidates on primary.
+                        try expectExactNormalizationView(from, to, opts);
+                        _ = self.normalization_views.fetchAdd(1, .monotonic);
+                    }
                 }
             }
             return view;
@@ -156,4 +168,29 @@ pub fn Tables(comptime count: usize) type {
             return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .open_relational_read = openRead, .open_relational_statement = open, .scan = scan, .query = query } };
         }
     };
+}
+
+fn expectExactNormalizationView(from: []const u8, to: []const u8, opts: db.types.ScanOptions) !void {
+    const query = opts.relational_query orelse return error.ExpectedNativeIndexRead;
+    if (query.auto_index or query.index != null or query.conditions.len != 0 or
+        opts.include_content_hashes or query.fields.len != 0 or query.schema_version == null or opts.limit != 1 or
+        !opts.inclusive_from or !opts.exclusive_to or
+        from.len == 0 or to.len != from.len + 1 or to[to.len - 1] != 0 or
+        !std.mem.eql(u8, from, to[0..from.len])) return error.ExpectedNativeIndexRead;
+}
+
+test "SQL selector evidence permits only bounded normalization views" {
+    var opts: db.types.ScanOptions = .{ .relational_query = .{ .fields = &.{}, .schema_version = 1 }, .limit = 1, .inclusive_from = true, .exclusive_to = true };
+    try expectExactNormalizationView("a", "a\x00", opts);
+    try std.testing.expectError(error.ExpectedNativeIndexRead, expectExactNormalizationView("", "", opts));
+    try std.testing.expectError(error.ExpectedNativeIndexRead, expectExactNormalizationView("a", "b", opts));
+    try std.testing.expectError(error.ExpectedNativeIndexRead, expectExactNormalizationView("a", "a\x00\x00", opts));
+    opts.include_content_hashes = true;
+    try std.testing.expectError(error.ExpectedNativeIndexRead, expectExactNormalizationView("a", "a\x00", opts));
+    opts.include_content_hashes = false;
+    opts.relational_query.?.auto_index = true;
+    try std.testing.expectError(error.ExpectedNativeIndexRead, expectExactNormalizationView("a", "a\x00", opts));
+    opts.relational_query.?.auto_index = false;
+    opts.relational_query.?.fields = &.{"email"};
+    try std.testing.expectError(error.ExpectedNativeIndexRead, expectExactNormalizationView("a", "a\x00", opts));
 }
