@@ -352,6 +352,103 @@
       "Optional decode and small-key workspace exhaustion falls back to separately admitted mandatory scratch. Large keys retain existing scratch handling. Release shared block readers before resetting workspace.",
       "Rebind idle workspace backing/manager by releasing old buffers and admission credit outside the coordination lock."
     ],
-    "limitations": "Debug helper measurements do not establish end-to-end throughput or 2 GiB soak behavior. A batch may wait for one of four workspace slots. Arena non-LIFO churn can exhaust optional pooled capacity and use mandatory scratch; oversized batches may discard/reallocate excess capacity. Retained workspaces remain resource-accounted."
+    "limitations": "Debug helper measurements do not establish end-to-end throughput or 2 GiB soak behavior. A batch may wait for one of four workspace slots. Arena non-LIFO churn can exhaust optional pooled capacity and use mandatory scratch; oversized batches may discard/reallocate excess capacity. Retained workspaces remain resource-accounted.",
+    "measurement_commit": "3467aac50b6c0fff0076a197037224fb1011a012"
+  },
+  "recycled_scratch_followup": {
+    "comparison_commit": "3467aac50b6c0fff0076a197037224fb1011a012",
+    "merged_main_commit": "bfbcb03eae",
+    "fixtures": {
+      "non_lifo_decoded_churn": {
+        "blocks": 512,
+        "block_bytes": 16384,
+        "live_slots": 16,
+        "maximum_live_decoded_bytes": 262144,
+        "optional_fallbacks_before": 470,
+        "optional_fallbacks_after": 0,
+        "pooled_physical_charge_after": 263168
+      },
+      "tight_host_budget": {
+        "hard_limit_bytes": 409600,
+        "mandatory_decode_denials_before": 489,
+        "mandatory_decode_denials_after": 0,
+        "optional_fallbacks_after": 0
+      },
+      "oversized_mandatory_decode": {
+        "hard_limit_bytes": 131072,
+        "prior_idle_decoded_bytes": 16384,
+        "mandatory_decoded_bytes": 131072,
+        "idle_workspace_charge_before_mandatory_decode": 0,
+        "result": "success"
+      },
+      "sparse_indexed_points": {
+        "block_entries": 512,
+        "strides": [
+          16,
+          32,
+          64,
+          128,
+          256
+        ],
+        "keys": [
+          32,
+          16,
+          8,
+          4,
+          2
+        ],
+        "parsed_rows_binary_each_key": [
+          321,
+          161,
+          81,
+          41,
+          21
+        ],
+        "parsed_rows_previous_cursor": [
+          535,
+          265,
+          132,
+          null,
+          null
+        ],
+        "parsed_rows_adaptive_after": [
+          290,
+          149,
+          77,
+          41,
+          22
+        ]
+      },
+      "shared_decoded_scratch": {
+        "batches_after_warmup": 100,
+        "decoded_bytes_per_batch": 16384,
+        "unpooled_backend_allocations": 100,
+        "pooled_backend_allocations": 0,
+        "retained_bytes_before": 24638,
+        "retained_bytes_after": 16448
+      },
+      "shared_prefix_scratch": {
+        "batches_after_warmup": 100,
+        "keys_per_batch": 64,
+        "pooled_backend_allocations": 0,
+        "retained_bytes_before": 2420,
+        "retained_bytes_after": 2176
+      }
+    },
+    "design": [
+      "Use an exclusively leased recycling allocator for shared decoded blocks and prefix keys. Intrusive size-class free lists reuse arbitrary-order frees without a backing allocation; local decoders retain their existing arena.",
+      "Charge all physical buffers including ownership headers. Four classes per power-of-two octave bound rounding; exact-size retry preserves admission when optional spare capacity does not fit.",
+      "Trim idle buffers and return unused host admission credit on allocation pressure and before separately admitted mandatory decoding or key reconstruction. Live buffers never move or lose admission.",
+      "Retain at most 64 KiB physical memory per idle slot, including ownership headers; active per-workspace capacity remains bounded at 768 KiB.",
+      "Probe one row at unknown density, gallop at most eight rows after nearby hits, and disable forward probing after wide jumps. Retain binary lower-bound semantics and reuse the captured upper row."
+    ],
+    "coverage": [
+      "512 non-LIFO slot rotations with and without a 400 KiB aggregate host budget",
+      "Mandatory 128 KiB decoding after a smaller shared allocation becomes idle",
+      "Aligned buffer reuse, resize, exact-size admission, arbitrary free order and allocation-failure inventory",
+      "Dense, sparse, missing, backward, repeated and namespace lookup oracle comparisons, including 2048 randomized probes",
+      "Shared prefix key reconstruction and existing cache promotion/admission checks"
+    ],
+    "limitations": "Native Debug isolated production-helper fixtures; allocation/admission counts and parsed-row counts do not establish end-to-end QPS or 2 GiB soak behavior. The initial density probe can add one row for a two-key sparse workload. Size classes and ownership headers consume accounted memory. A batch may wait for one of four workspace slots."
   }
 }

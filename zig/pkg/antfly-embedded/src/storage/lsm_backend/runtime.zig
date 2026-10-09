@@ -6476,14 +6476,18 @@ const BatchAsyncBlocks = struct {
     }
 
     // Acquire lazily: warm decoded reads do not touch the workspace gate.
-    // Arena capacity bounds physical scratch even when non-LIFO frees cannot
-    // reclaim idle decodes. Optional decode exhaustion uses ordinary scratch.
+    // Physical scratch is bounded and arbitrary-order frees are reusable.
+    // Idle storage and spare credit are reclaimed before mandatory fallback.
     fn reusableAllocator(self: *@This()) Allocator {
         if (self.workspace_config) |config| {
-            if (self.workspace == null) self.workspace = config.pool.acquire(config.backing, config.manager, config.io, 3 * max_decoded_bytes, config.limit, 0);
+            if (self.workspace == null) self.workspace = config.pool.acquireRecycled(config.backing, config.manager, config.io, 3 * max_decoded_bytes, config.limit);
             return self.workspace.?.allocator();
         }
         return self.allocator;
+    }
+
+    fn reclaimIdleScratch(self: *@This()) void {
+        if (self.workspace) |*workspace| workspace.reclaimIdle();
     }
 
     fn prefixAllocator(self: *@This(), entry: *BatchAsyncBlock) Allocator {
@@ -6951,11 +6955,17 @@ fn consumeAsyncPointReadWithScratch(
             var reader = try pool.prefixReader(owner, decoded, block.first_entry_index, block.entry_count);
             // The result must be copied before a large key's scratch is freed.
             defer pool.finishPrefixRead(owner);
+            if (pool.workspace) |workspace| {
+                const prefix_allocator = pool.prefixAllocator(owner);
+                const recycled = workspace.allocator();
+                if (prefix_allocator.ptr != recycled.ptr or prefix_allocator.vtable != recycled.vtable) pool.reclaimIdleScratch();
+            }
             const found = (reader.find(pool.prefixAllocator(owner), namespace.name, key) catch |err| fallback: {
                 if (err != error.OutOfMemory or pool.workspace == null or owner.prefix_allocator.?.ptr != pool.workspace.?.allocator().ptr) return err;
                 pool.clearPrefixReader(owner);
                 reader = try pool.prefixReader(owner, decoded, block.first_entry_index, block.entry_count);
                 owner.prefix_allocator = scratch;
+                pool.reclaimIdleScratch();
                 break :fallback try reader.find(scratch, namespace.name, key);
             }) orelse {
                 backend.recordPointRunSurvivorMiss();
@@ -6971,6 +6981,7 @@ fn consumeAsyncPointReadWithScratch(
         return try retainAsyncPointEntry(backend, read, read_hint, held_values, value_allocator, namespace, found);
     };
 
+    if (shared) |pool| pool.reclaimIdleScratch();
     // The fallback decoder is mandatory scratch, never optional cache memory.
     // None borrows its pinned payload. Snappy scratch is freed before returning.
     const validated = if (read.shared_block) |owner| owner.checksum_validated else false;
@@ -12674,4 +12685,135 @@ test "lsm point followup shared prefix keys reuse workspace and failure cleanup"
     try std.testing.expectEqual(warm_calls, budget.alloc_calls);
     try std.testing.expect(budget.live <= LocalReader.retained_bytes_per_workspace + 128);
     std.debug.print("\nshared prefix scratch: batches=100 keys_per_batch=64 warm_backend_allocations=0 retained_bytes={d}\n", .{budget.live});
+}
+
+test "lsm point followup recycled scratch reuses non-LIFO freed blocks" {
+    const a = std.testing.allocator;
+    const raw: [16 * 1024]u8 = @splat('x');
+    const compressed = try @import("../../encoding/snappy.zig").encode(a, &raw);
+    defer a.free(compressed);
+    const read: AsyncPointBlockRead = .{ .candidate = .{ .run_index = 0 }, .path = "/review-churn", .run_id = 1, .generation = 1, .index_handle = null, .block_index = 0, .absolute_offset = 0, .physical_len = @intCast(compressed.len), .logical_len = raw.len, .compression = .snappy, .checksum = @import("antfly_hash").Crc32.hash(compressed), .status = .ready_handle };
+    for ([_]bool{ false, true }) |pooled| {
+        var pool: LocalReader = .{};
+        defer pool.deinit();
+        var shared: BatchAsyncBlocks = .{ .allocator = a, .limit = 16 };
+        if (pooled) shared.workspace_config = .{ .pool = &pool, .backing = a, .manager = null, .io = std.testing.io, .limit = 8 * 1024 * 1024 };
+        defer {
+            for (&shared.entries) |*entry| entry.users = 0;
+            shared.deinit();
+        }
+        var fallbacks: usize = 0;
+        var first_fallback: ?usize = null;
+        var peak_live: usize = 0;
+        for (0..512) |i| {
+            if (i >= 16) shared.entries[i % 16].users = 0;
+            shared.prepareInsert();
+            var candidate = read;
+            candidate.absolute_offset = i * 16384;
+            const block = shared.insert(candidate);
+            block.users = 1;
+            if (try shared.decodedPayload(block, compressed)) |decoded| {
+                try std.testing.expectEqualSlices(u8, &raw, decoded);
+            } else {
+                fallbacks += 1;
+                if (first_fallback == null) first_fallback = i;
+            }
+            peak_live = @max(peak_live, shared.decoded_bytes);
+        }
+        std.debug.print("\nrecycled scratch churn: pooled={} blocks=512 live_limit=262144 peak_live={d} decode_fallbacks={d} first_fallback={any}\n", .{ pooled, peak_live, fallbacks, first_fallback });
+        try std.testing.expect(peak_live <= BatchAsyncBlocks.max_decoded_bytes);
+        try std.testing.expectEqual(@as(usize, 0), fallbacks);
+    }
+}
+
+test "lsm point followup recycled scratch preserves mandatory budget" {
+    const a = std.testing.allocator;
+    const raw: [16 * 1024]u8 = @splat('x');
+    const compressed = try @import("../../encoding/snappy.zig").encode(a, &raw);
+    defer a.free(compressed);
+    const read: AsyncPointBlockRead = .{ .candidate = .{ .run_index = 0 }, .path = "/review-churn", .run_id = 1, .generation = 1, .index_handle = null, .block_index = 0, .absolute_offset = 0, .physical_len = @intCast(compressed.len), .logical_len = raw.len, .compression = .snappy, .checksum = @import("antfly_hash").Crc32.hash(compressed), .status = .ready_handle };
+    for ([_]bool{ false, true }) |pooled| {
+        const resources = @import("../resource_manager.zig");
+        var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 400 * 1024 } });
+        defer manager.deinit(a);
+        var decode_budget = resources.BudgetedAllocator.init(&manager, .lsm_in_memory_state, a, 1);
+        defer decode_budget.deinit();
+        var mandatory = resources.BudgetedAllocator.init(&manager, .lsm_read_working_set, a, 1);
+        defer mandatory.deinit();
+        var mandatory_denials: usize = 0;
+        var pool: LocalReader = .{};
+        defer pool.deinit();
+        var shared: BatchAsyncBlocks = .{ .allocator = decode_budget.allocator(), .limit = 16 };
+        if (pooled) shared.workspace_config = .{ .pool = &pool, .backing = a, .manager = &manager, .io = std.testing.io, .limit = 8 * 1024 * 1024 };
+        defer {
+            for (&shared.entries) |*entry| entry.users = 0;
+            shared.deinit();
+        }
+        var fallbacks: usize = 0;
+        var first_fallback: ?usize = null;
+        var peak_live: usize = 0;
+        for (0..512) |i| {
+            if (i >= 16) shared.entries[i % 16].users = 0;
+            shared.prepareInsert();
+            var candidate = read;
+            candidate.absolute_offset = i * 16384;
+            const block = shared.insert(candidate);
+            block.users = 1;
+            if (try shared.decodedPayload(block, compressed)) |decoded| {
+                try std.testing.expectEqualSlices(u8, &raw, decoded);
+            } else {
+                mandatory.budget_denied = false;
+                const bytes = @import("../../encoding/snappy.zig").decode(mandatory.allocator(), compressed) catch |err| denied: {
+                    if (err != error.OutOfMemory or !mandatory.denied()) return err;
+                    mandatory_denials += 1;
+                    break :denied null;
+                };
+                if (bytes) |decoded| mandatory.allocator().free(decoded);
+                _ = mandatory.releaseUnusedCredit();
+                fallbacks += 1;
+                if (first_fallback == null) first_fallback = i;
+            }
+            peak_live = @max(peak_live, shared.decoded_bytes);
+        }
+        std.debug.print("\nrecycled scratch churn: pooled={} blocks=512 live_limit=262144 peak_live={d} decode_fallbacks={d} first_fallback={any}\n", .{ pooled, peak_live, fallbacks, first_fallback });
+        try std.testing.expectEqual(@as(usize, 0), mandatory_denials);
+        std.debug.print("\nrecycled tight host budget: pooled={} hard_limit=409600 mandatory_decode_denials={d} pool_active_charge={d}\n", .{ pooled, mandatory_denials, manager.sliceStats(.lsm_read_working_set).used_bytes });
+        try std.testing.expect(peak_live <= BatchAsyncBlocks.max_decoded_bytes);
+        try std.testing.expectEqual(@as(usize, 0), fallbacks);
+    }
+}
+
+test "lsm point followup oversized mandatory decode reclaims idle workspace credit" {
+    const a = std.testing.allocator;
+    const resources = @import("../resource_manager.zig");
+    const snappy = @import("../../encoding/snappy.zig");
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 * 1024 } });
+    defer manager.deinit(a);
+    var mandatory = resources.BudgetedAllocator.init(&manager, .lsm_read_working_set, a, 1);
+    defer mandatory.deinit();
+    var pool: LocalReader = .{};
+    defer pool.deinit();
+    var shared: BatchAsyncBlocks = .{ .allocator = a, .workspace_config = .{ .pool = &pool, .backing = a, .manager = &manager, .io = std.testing.io, .limit = 8 * 1024 * 1024 } };
+    defer shared.deinit();
+    const small: [16 * 1024]u8 = @splat('x');
+    const compressed = try snappy.encode(a, &small);
+    defer a.free(compressed);
+    var read: AsyncPointBlockRead = .{ .candidate = .{ .run_index = 0 }, .path = "/oversized-fallback", .run_id = 1, .generation = 1, .index_handle = null, .block_index = 0, .absolute_offset = 0, .physical_len = @intCast(compressed.len), .logical_len = small.len, .compression = .snappy, .checksum = @import("antfly_hash").Crc32.hash(compressed), .status = .ready_handle };
+    const block = shared.insert(read);
+    try std.testing.expect(try shared.decodedPayload(block, compressed) != null);
+    shared.clear(block);
+    try std.testing.expect(manager.sliceStats(.lsm_read_working_set).used_bytes > 0);
+    const large: [128 * 1024]u8 = @splat('y');
+    const large_compressed = try snappy.encode(a, &large);
+    defer a.free(large_compressed);
+    read.logical_len = large.len;
+    read.physical_len = @intCast(large_compressed.len);
+    read.checksum = @import("antfly_hash").Crc32.hash(large_compressed);
+    const large_block = shared.insert(read);
+    try std.testing.expect(try shared.decodedPayload(large_block, large_compressed) == null);
+    shared.reclaimIdleScratch();
+    try std.testing.expectEqual(@as(usize, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+    const decoded = try snappy.decode(mandatory.allocator(), large_compressed);
+    defer mandatory.allocator().free(decoded);
+    try std.testing.expectEqualSlices(u8, &large, decoded);
 }
