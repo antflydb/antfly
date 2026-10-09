@@ -4785,6 +4785,8 @@ test "lite replay cleanup avoids external values and propagates allocation error
     const path = try testPath(a, tmp, "replay-key-only.aflite");
     defer a.free(path);
     var store = try Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
+    // Allocation ceilings describe foreground work, independently of retirement.
+    store.maintenance_start_suppressed = true;
     defer store.close();
     store.file.page_cache_enabled.store(false, .monotonic);
     const value = try a.alloc(u8, 4 * 1024 * 1024);
@@ -4944,6 +4946,8 @@ test "lite replay readers propagate allocation errors before and after callbacks
         const path = try testPath(a, tmp, "replay-read-errors.aflite");
         defer a.free(path);
         var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+        // Allocation ceilings describe foreground work, independently of retirement.
+        store.maintenance_start_suppressed = true;
         defer store.close();
         const large = try a.alloc(u8, 4 * 1024 * 1024);
         defer a.free(large);
@@ -5066,6 +5070,8 @@ test "lite transaction snapshot cache shares hits misses and sorted duplicate re
         const path = try testPath(a, tmp, "snapshot-read-cache.aflite");
         defer a.free(path);
         var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+        // Allocation ceilings describe foreground work, independently of retirement.
+        store.maintenance_start_suppressed = true;
         defer store.close();
         const value = try a.alloc(u8, 256 * 1024);
         defer a.free(value);
@@ -5215,6 +5221,8 @@ test "lite pending overwrites retain only borrowed versions" {
     defer a.free(path);
     var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
     var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = std.testing.io });
+    // Allocation ceilings describe foreground work, independently of retirement.
+    store.maintenance_start_suppressed = true;
     defer store.close();
     const value = try a.alloc(u8, 256 * 1024);
     defer a.free(value);
@@ -5749,4 +5757,33 @@ test "lite cached source teardown and retirement progress while publication is b
     locked = false;
     try std.testing.expect(callback_started);
     try std.testing.expectEqual(@as(u64, 0), registry.retired_bytes.load(.acquire));
+}
+
+test "lite budget allocator accounts concurrent allocation resize and cleanup" {
+    const a = std.testing.allocator;
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    const Worker = struct {
+        fn run(allocator: Allocator) anyerror!void {
+            for (0..1024) |i| {
+                var bytes = try allocator.alloc(u8, 256);
+                defer allocator.free(bytes);
+                @memset(bytes, 17);
+                bytes = try allocator.realloc(bytes, 64 + i % 128);
+                try std.testing.expectEqual(@as(u8, 17), bytes[0]);
+            }
+        }
+    };
+    var workers: [4]std.Io.Future(anyerror!void) = undefined;
+    var started: usize = 0;
+    defer for (workers[0..started]) |*worker| {
+        worker.await(std.testing.io) catch {};
+    };
+    for (&workers) |*worker| {
+        worker.* = try std.testing.io.concurrent(Worker.run, .{budget.allocator()});
+        started += 1;
+    }
+    for (&workers) |*worker| try worker.await(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    try std.testing.expect(budget.peak > 0);
+    try std.testing.expect(budget.alloc_calls >= 4 * 1024);
 }
