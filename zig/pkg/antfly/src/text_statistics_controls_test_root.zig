@@ -766,3 +766,270 @@ test "text statistics trusted controls cold native descriptor open retires succe
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     };
 }
+
+test "text statistics trusted controls asynchronous native read joins physical work before stopped ownership retires" {
+    const storage_io = sources.storage_lsm_backend_storage_io;
+    const hook = storage_io.NativeRangeReadTestControl;
+    const admission = sources.common_read_admission;
+    const Budget = sources.common_read_execution_budget.Budget(types.SearchRequest, checkReadBudget);
+    const Case = enum { success, cancel_join, expire_join, shutdown_join, cancel_before_join, explicit_cancel, io_failure, shutdown_and_io_failure };
+    const Probe = struct {
+        budget: *Budget,
+        pool: *storage_io.NativeStoragePool,
+        scheduler: *native.Scheduler,
+        canceled: *std.atomic.Value(bool),
+        case: Case,
+        begins: usize = 0,
+        ends: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.budget.checkpoint();
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            try self.budget.waitForProgress();
+        }
+        pub fn executionBoundary(self: *@This()) ?sources.common_execution_wait.Boundary {
+            return .{ .ptr = self, .begin = begin, .end = end };
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.budget.executionBoundary().?.beginWait();
+            self.begins += 1;
+            try std.testing.expect(hook.started.load(.acquire));
+            try std.testing.expect(!hook.completed.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), self.pool.snapshotStats().fd_admitted_descriptors);
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().resource_blocked);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), self.scheduler.stats().retained_bytes);
+            var control: native.Execution = .{};
+            defer control.finish();
+            try control.start(self.scheduler, .{ .io = std.testing.io }, .control);
+            control.finish();
+            switch (self.case) {
+                .cancel_join => self.canceled.store(true, .release),
+                .expire_join => try std.testing.io.sleep(.fromMilliseconds(100), .awake),
+                .shutdown_join, .shutdown_and_io_failure => self.scheduler.close(),
+                else => {},
+            }
+            hook.release.store(true, .release);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            try std.testing.expect(hook.completed.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), self.pool.snapshotStats().fd_admitted_descriptors);
+            try self.budget.executionBoundary().?.endWait();
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/asynchronous-statistics-read", .{tmp.sub_path});
+    defer a.free(path);
+    for ([_]native.Class{ .query, .inference }) |phase| for (std.enums.values(Case)) |case| {
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 4);
+        defer pool.deinit();
+        var storage = try storage_io.NativeStorage.initWithPool(a, .threaded, &pool);
+        var storage_alive = true;
+        defer if (storage_alive) storage.deinit();
+        const view = storage.storage();
+        try view.writeFileAbsolute(path, "alpha beta");
+        _ = try view.fileSize(path);
+        var worker_io: std.Io.Threaded = .init(a, .{ .async_limit = .limited(1), .concurrent_limit = .limited(1) });
+        defer worker_io.deinit();
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var canceled = std.atomic.Value(bool).init(false);
+        var parent: native.Execution = .{};
+        defer parent.finish();
+        const deadline = clock.monotonicNs() + (if (case == .expire_join) @as(u64, 50) else 60000) * std.time.ns_per_ms;
+        try parent.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+        var read: Read = .{ .execution = &parent, .allocator = a };
+        const team = try read.team();
+        var budget: Budget = .{ .controls = .{ .execution_runnable = team.borrow, .execution_deadline_ns = deadline, .cancellation = .{ .ptr = &canceled, .is_cancelled_fn = requested } }, .io = std.testing.io };
+        var probe: Probe = .{ .budget = &budget, .pool = &pool, .scheduler = &scheduler, .canceled = &canceled, .case = case };
+        var adapter = admission.Adapter(*Probe){ .budget = &probe };
+        const payload = adapter.payload();
+        const port = admission.Port.init(&payload);
+        hook.started.store(false, .release);
+        hook.release.store(false, .release);
+        hook.completed.store(false, .release);
+        hook.pause.store(true, .release);
+        defer {
+            hook.release.store(true, .release);
+            hook.pause.store(false, .release);
+        }
+        const physical_failure = case == .io_failure or case == .shutdown_and_io_failure;
+        var future = try view.beginReadFileRangeAllocWithAdmission(storage_io.ReadRuntime.init(worker_io.io()), a, path, 0, if (physical_failure) 11 else 10, port);
+        var future_alive = true;
+        defer if (future_alive) future.cancel();
+        const start = clock.monotonicNs();
+        while (!hook.started.load(.acquire)) {
+            if (clock.monotonicNs() - start > std.time.ns_per_s) return error.WorkerDidNotStart;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        // Retain the same inode and runtime even if the cache owner closes
+        // before the worker's physical read and the caller's completion join.
+        storage.deinit();
+        storage_alive = false;
+        try std.testing.expectEqual(@as(usize, 1), pool.snapshotStats().fd_admitted_descriptors);
+        if (case == .cancel_before_join) canceled.store(true, .release);
+        future_alive = false;
+        if (case == .explicit_cancel) {
+            future.cancel();
+        } else {
+            const result = future.waitWithAdmission(a, port);
+            switch (case) {
+                .success => {
+                    const bytes = try result;
+                    defer a.free(bytes);
+                    try std.testing.expectEqualStrings("alpha beta", bytes);
+                },
+                .cancel_join, .cancel_before_join => try std.testing.expectError(error.Canceled, result),
+                .expire_join => try std.testing.expectError(error.DeadlineExceeded, result),
+                .shutdown_join, .shutdown_and_io_failure => try std.testing.expectError(error.SchedulerClosed, result),
+                .io_failure => try std.testing.expectError(error.EndOfStream, result),
+                .explicit_cancel => unreachable,
+            }
+        }
+        try std.testing.expect(hook.completed.load(.acquire));
+        const joins: usize = if (case == .explicit_cancel or case == .cancel_before_join) 0 else 1;
+        try std.testing.expectEqual(joins, probe.begins);
+        try std.testing.expectEqual(joins, probe.ends);
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_cache_entries);
+        try std.testing.expectEqual(phase, try parent.retainedClass());
+        try std.testing.expectEqual(@as(?u64, deadline), parent.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
+
+test "text statistics trusted controls unconsumed async results release descriptor progress and inline fallback keeps exact bytes" {
+    const storage_io = sources.storage_lsm_backend_storage_io;
+    const admission = sources.common_read_admission;
+    const Budget = sources.common_read_execution_budget.Budget(types.SearchRequest, checkReadBudget);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const first_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/first-async-read", .{tmp.sub_path});
+    defer a.free(first_path);
+    const second_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/second-async-read", .{tmp.sub_path});
+    defer a.free(second_path);
+    for ([_]native.Class{ .query, .inference }) |phase| for ([_]usize{ 0, 1 }) |workers| {
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 1);
+        defer pool.deinit();
+        var storage = try storage_io.NativeStorage.initWithPool(a, .threaded, &pool);
+        defer storage.deinit();
+        const view = storage.storage();
+        // Setup does not use the deliberately one-descriptor read pool:
+        // native creation itself needs two transient descriptor permits.
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = first_path, .data = "first exact bytes" });
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = second_path, .data = "second exact bytes" });
+        var worker_io: std.Io.Threaded = .init(a, .{ .async_limit = .limited(workers), .concurrent_limit = .limited(workers) });
+        defer worker_io.deinit();
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var parent: native.Execution = .{};
+        defer parent.finish();
+        const deadline = clock.monotonicNs() + 2 * std.time.ns_per_s;
+        try parent.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23 }, phase);
+        var read: Read = .{ .execution = &parent, .allocator = a };
+        const team = try read.team();
+        var budget: Budget = .{ .controls = .{ .execution_runnable = team.borrow, .execution_deadline_ns = deadline }, .io = std.testing.io };
+        var adapter = admission.Adapter(*Budget){ .budget = &budget };
+        const payload = adapter.payload();
+        const port = admission.Port.init(&payload);
+        const io = storage_io.ReadRuntime.init(worker_io.io());
+        var first = try view.beginReadFileRangeAllocWithAdmission(io, a, first_path, 0, 17, port);
+        var first_alive = true;
+        defer if (first_alive) first.cancel();
+        // A completed first read still owns its output, but must not fence the
+        // only descriptor needed to prepare a second independent file read.
+        var second = try view.beginReadFileRangeAllocWithAdmission(io, a, second_path, 0, 18, port);
+        var second_alive = true;
+        defer if (second_alive) second.cancel();
+        first_alive = false;
+        const first_bytes = try first.waitWithAdmission(a, port);
+        defer a.free(first_bytes);
+        second_alive = false;
+        const second_bytes = try second.waitWithAdmission(a, port);
+        defer a.free(second_bytes);
+        try std.testing.expectEqualStrings("first exact bytes", first_bytes);
+        try std.testing.expectEqualStrings("second exact bytes", second_bytes);
+        const AllocationFixture = struct {
+            fn run(allocator: std.mem.Allocator, storage_view: storage_io.Storage, runtime_io: storage_io.ReadRuntime, read_path: []const u8, authority: admission.Port) !void {
+                var future = try storage_view.beginReadFileRangeAllocWithAdmission(runtime_io, allocator, read_path, 0, 17, authority);
+                const bytes = try future.waitWithAdmission(allocator, authority);
+                defer allocator.free(bytes);
+                try std.testing.expectEqualStrings("first exact bytes", bytes);
+            }
+        };
+        try std.testing.checkAllAllocationFailures(a, AllocationFixture.run, .{ view, io, first_path, port });
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admission_waiters);
+        try std.testing.expect(pool.snapshotStats().fd_admitted_descriptors <= 1);
+        try std.testing.expectEqual(phase, try parent.retainedClass());
+        try std.testing.expectEqual(@as(?u64, deadline), parent.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
+
+test "text statistics trusted controls legacy async descriptor wait remains cancellable before controlled consumption" {
+    const storage_io = sources.storage_lsm_backend_storage_io;
+    const admission = sources.common_read_admission;
+    const Budget = sources.common_read_execution_budget.Budget(types.SearchRequest, checkReadBudget);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/legacy-async-cancellation", .{tmp.sub_path});
+    defer a.free(path);
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 2);
+        defer pool.deinit();
+        var storage = try storage_io.NativeStorage.initWithPool(a, .threaded, &pool);
+        defer storage.deinit();
+        const view = storage.storage();
+        try view.writeFileAbsolute(path, "legacy bytes");
+        var worker_io: std.Io.Threaded = .init(a, .{ .async_limit = .limited(1), .concurrent_limit = .limited(1) });
+        defer worker_io.deinit();
+        try pool.reserveDescriptorsForTest(std.testing.io, 2);
+        defer pool.releaseDescriptorsForTest(std.testing.io, 2);
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var canceled = std.atomic.Value(bool).init(false);
+        var parent: native.Execution = .{};
+        defer parent.finish();
+        const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+        try parent.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+        var read: Read = .{ .execution = &parent, .allocator = a };
+        const team = try read.team();
+        var budget: Budget = .{ .controls = .{ .execution_runnable = team.borrow, .execution_deadline_ns = deadline, .cancellation = .{ .ptr = &canceled, .is_cancelled_fn = requested } }, .io = std.testing.io };
+        var adapter = admission.Adapter(*Budget){ .budget = &budget };
+        const payload = adapter.payload();
+        var future = try view.beginReadFileRangeAllocWithRuntime(storage_io.ReadRuntime.init(worker_io.io()), a, path, 0, 12);
+        var alive = true;
+        defer if (alive) future.cancel();
+        const start = clock.monotonicNs();
+        while (pool.snapshotStats().fd_admission_waiters == 0) {
+            if (clock.monotonicNs() - start > std.time.ns_per_s) return error.WorkerDidNotStart;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        canceled.store(true, .release);
+        alive = false;
+        try std.testing.expectError(error.Canceled, future.waitWithAdmission(a, admission.Port.init(&payload)));
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admission_waiters);
+        try std.testing.expectEqual(@as(usize, 2), pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_cache_entries);
+        try std.testing.expectEqual(phase, try parent.retainedClass());
+        try std.testing.expectEqual(@as(?u64, deadline), parent.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}

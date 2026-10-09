@@ -248,12 +248,28 @@ pub const RangeReadFuture = struct {
     pub const VTable = struct {
         wait: *const fn (*anyopaque) anyerror![]u8,
         cancel: *const fn (*anyopaque) void,
+        wait_with_admission: ?*const fn (*anyopaque, read_admission.Port) anyerror![]u8 = null,
     };
 
     /// Complete this one-shot read and transfer the returned bytes to the
     /// caller. After wait or cancel, the future must not be used again.
     pub fn wait(self: *RangeReadFuture) ![]u8 {
         return try self.vtable.wait(self.ptr);
+    }
+
+    /// Consume the one-shot future under the original synchronous authority.
+    /// The allocator must be the one used to begin the read. Compatibility
+    /// providers keep CPU charged; native providers loan it only for the join.
+    pub fn waitWithAdmission(self: *RangeReadFuture, allocator: Allocator, control: read_admission.Port) ![]u8 {
+        if (self.vtable.wait_with_admission) |wait_controlled| return wait_controlled(self.ptr, control);
+        control.checkpoint() catch |err| {
+            self.cancel();
+            return err;
+        };
+        const bytes = try self.wait();
+        errdefer allocator.free(bytes);
+        try control.checkpoint();
+        return bytes;
     }
 
     /// Best-effort cancellation. Synchronous/completed futures just release
@@ -297,9 +313,13 @@ const CompletedRangeReadFuture = struct {
     };
 
     fn create(storage: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
+        return createControlled(storage, allocator, path, offset, len, null);
+    }
+
+    fn createControlled(storage: Storage, allocator: Allocator, path: []const u8, offset: u64, len: usize, control: ?read_admission.Port) !RangeReadFuture {
         const self = try allocator.create(CompletedRangeReadFuture);
         self.* = .{ .allocator = allocator };
-        self.bytes = storage.readFileRangeAlloc(allocator, path, offset, len) catch |err| blk: {
+        self.bytes = (if (control) |budget| storage.readFileRangeAllocWithAdmission(allocator, path, offset, len, budget) else storage.readFileRangeAlloc(allocator, path, offset, len)) catch |err| blk: {
             self.err = err;
             break :blk null;
         };
@@ -587,6 +607,7 @@ pub const Storage = struct {
         read_file_range_alloc: *const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror![]u8,
         begin_read_file_range_alloc: ?*const fn (*anyopaque, Allocator, []const u8, u64, usize) anyerror!RangeReadFuture = null,
         begin_read_file_range_alloc_with_runtime: ?*const fn (*anyopaque, ?ReadRuntime, Allocator, []const u8, u64, usize) anyerror!RangeReadFuture = null,
+        begin_read_file_range_alloc_with_admission: ?*const fn (*anyopaque, ?ReadRuntime, Allocator, []const u8, u64, usize, read_admission.Port) anyerror!RangeReadFuture = null,
         read_file_range_into: ?*const fn (*anyopaque, []const u8, u64, []u8) anyerror!void = null,
         /// Native providers loan CPU only for the physical positional read.
         read_file_range_into_with_admission: ?*const fn (*anyopaque, []const u8, u64, []u8, read_admission.Port) anyerror!void = null,
@@ -701,6 +722,17 @@ pub const Storage = struct {
         defer allocator.free(loaded);
         if (loaded.len != out.len) return error.EndOfStream;
         @memcpy(out, loaded);
+    }
+
+    pub fn beginReadFileRangeAllocWithAdmission(self: Storage, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize, control: read_admission.Port) !RangeReadFuture {
+        try control.checkpoint();
+        var future = if (self.vtable.begin_read_file_range_alloc_with_admission) |begin|
+            try begin(self.ptr, read_runtime, allocator, path, offset, len, control)
+        else
+            try CompletedRangeReadFuture.createControlled(self, allocator, path, offset, len, control);
+        errdefer future.cancel();
+        try control.checkpoint();
+        return future;
     }
 
     pub fn readFileRangeAtMostInto(self: Storage, allocator: Allocator, path: []const u8, offset: u64, out: []u8) !usize {
@@ -2335,6 +2367,14 @@ pub const NativeFdPermit = struct {
     }
 };
 
+/// Deterministic physical-worker retirement probes, active only in tests.
+pub const NativeRangeReadTestControl = struct {
+    pub var pause: std.atomic.Value(bool) = .init(false);
+    pub var started: std.atomic.Value(bool) = .init(false);
+    pub var release: std.atomic.Value(bool) = .init(false);
+    pub var completed: std.atomic.Value(bool) = .init(false);
+};
+
 const NativeRangeReadFuture = if (!supports_native_storage or builtin.os.tag == .freestanding)
     struct {}
 else
@@ -2422,6 +2462,174 @@ else
         }
     };
 
+const ControlledNativeRangeReadFuture = if (!supports_native_storage or builtin.os.tag == .freestanding)
+    struct {}
+else
+    struct {
+        allocator: Allocator,
+        state: *NativeStorageState,
+        path: []u8,
+        offset: u64,
+        len: usize,
+        io: std.Io,
+        future: ?std.Io.Future(void) = null,
+        entry: if (supports_posix_fd_cache) ?*FdCache.Entry else void = if (supports_posix_fd_cache) null else {},
+        done: std.atomic.Value(bool) = .init(false),
+        bytes: ?[]u8 = null,
+        err: ?anyerror = null,
+
+        const vtable: RangeReadFuture.VTable = .{
+            .wait = wait,
+            .cancel = cancel,
+            .wait_with_admission = waitWithAdmission,
+        };
+
+        fn create(read_runtime: ReadRuntime, state: *NativeStorageState, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
+            return createControlled(read_runtime, state, allocator, path, offset, len, null);
+        }
+
+        fn createControlled(read_runtime: ReadRuntime, state: *NativeStorageState, allocator: Allocator, path: []const u8, offset: u64, len: usize, control: ?read_admission.Port) !RangeReadFuture {
+            const retained = try state.retain();
+            errdefer retained.release();
+            const self = try allocator.create(ControlledNativeRangeReadFuture);
+            errdefer allocator.destroy(self);
+            const path_copy = try allocator.dupe(u8, path);
+            errdefer allocator.free(path_copy);
+            self.* = .{ .allocator = allocator, .state = retained, .path = path_copy, .offset = offset, .len = len, .io = read_runtime.io };
+            // All native POSIX allocations and descriptor/cache preparation
+            // run on the charged caller. The worker receives only a retained
+            // FD and a fixed destination; it never borrows caller authority.
+            self.prepare(control) catch |err| {
+                self.err = err;
+                self.done.store(true, .release);
+                return .{ .ptr = self, .vtable = &vtable };
+            };
+            if (comptime supports_posix_fd_cache) if (len == 0) {
+                self.releaseEntry();
+                self.done.store(true, .release);
+                return .{ .ptr = self, .vtable = &vtable };
+            };
+            self.future = read_runtime.io.concurrent(run, .{self}) catch {
+                // No worker capacity: use the same prepared operation inline.
+                // Only the physical read releases the original runnable slot.
+                if (control) |budget| {
+                    if ((budget.executionWait() catch |err| failed: {
+                        self.err = err;
+                        break :failed null;
+                    })) |boundary| {
+                        boundary.run(perform, .{self}) catch |err| {
+                            self.err = err;
+                        };
+                    } else if (self.err == null) perform(self) catch |err| {
+                        self.err = err;
+                    };
+                } else perform(self) catch |err| {
+                    self.err = err;
+                };
+                self.releaseEntry();
+                self.done.store(true, .release);
+                return .{ .ptr = self, .vtable = &vtable };
+            };
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        fn prepare(self: *ControlledNativeRangeReadFuture, control: ?read_admission.Port) !void {
+            if (control) |budget| try budget.checkpoint();
+            if (comptime supports_posix_fd_cache) {
+                self.bytes = try self.allocator.alloc(u8, self.len);
+                self.entry = try self.state.fdCache().retainControlled(self.state.cache_namespace, self.state.threaded.io(), self.path, control);
+            }
+            if (control) |budget| try budget.checkpoint();
+        }
+
+        fn run(self: *ControlledNativeRangeReadFuture) void {
+            defer self.done.store(true, .release);
+            // Physical retirement releases descriptor use before a later
+            // prefetch needs capacity. Result buffers remain owned until join.
+            defer self.releaseEntry();
+            if (builtin.is_test and NativeRangeReadTestControl.pause.load(.acquire)) {
+                defer NativeRangeReadTestControl.completed.store(true, .release);
+                NativeRangeReadTestControl.started.store(true, .release);
+                while (!NativeRangeReadTestControl.release.load(.acquire)) {
+                    self.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                        self.err = err;
+                        return;
+                    };
+                }
+                perform(self) catch |err| {
+                    self.err = err;
+                };
+                return;
+            }
+            perform(self) catch |err| {
+                self.err = err;
+            };
+        }
+
+        fn perform(self: *ControlledNativeRangeReadFuture) !void {
+            if (comptime supports_posix_fd_cache) {
+                if (self.len != 0) try readAllAtOffset(self.entry.?.fd, self.bytes.?, self.offset);
+            } else {
+                self.bytes = try readFileRangeWithIo(self.io, self.allocator, self.path, self.offset, self.len);
+            }
+        }
+
+        fn join(self: *ControlledNativeRangeReadFuture) !void {
+            if (self.future) |*future| future.await(self.io);
+            self.future = null;
+        }
+
+        fn wait(ptr: *anyopaque) ![]u8 {
+            return waitControlled(ptr, null);
+        }
+
+        fn waitWithAdmission(ptr: *anyopaque, control: read_admission.Port) ![]u8 {
+            return waitControlled(ptr, control);
+        }
+
+        fn waitControlled(ptr: *anyopaque, control: ?read_admission.Port) ![]u8 {
+            const self: *ControlledNativeRangeReadFuture = @ptrCast(@alignCast(ptr));
+            defer self.retire();
+            if (control) |budget| try budget.checkpoint();
+            if (self.future != null) {
+                if (control) |budget| {
+                    if (!self.done.load(.acquire)) {
+                        if (try budget.executionWait()) |boundary| try boundary.run(join, .{self}) else try self.join();
+                    } else try self.join();
+                } else try self.join();
+            }
+            if (control) |budget| try budget.checkpoint();
+            if (self.err) |err| return err;
+            const bytes = self.bytes orelse return error.CanceledRangeRead;
+            self.bytes = null;
+            return bytes;
+        }
+
+        fn releaseEntry(self: *ControlledNativeRangeReadFuture) void {
+            if (comptime supports_posix_fd_cache) if (self.entry) |entry| {
+                self.state.fdCache().release(self.state.threaded.io(), entry);
+                self.entry = null;
+            };
+        }
+
+        fn retire(self: *ControlledNativeRangeReadFuture) void {
+            // Even a failed begin/checkpoint must physically join before
+            // releasing the buffer, descriptor, state or allocator owner.
+            if (self.future) |*future| future.cancel(self.io);
+            if (self.bytes) |bytes| self.allocator.free(bytes);
+            self.releaseEntry();
+            const allocator = self.allocator;
+            allocator.free(self.path);
+            self.state.release();
+            allocator.destroy(self);
+        }
+
+        fn cancel(ptr: *anyopaque) void {
+            const self: *ControlledNativeRangeReadFuture = @ptrCast(@alignCast(ptr));
+            self.retire();
+        }
+    };
+
 pub const NativeStorage = if (!supports_native_storage)
     struct {
         pub const Lease = struct {
@@ -2484,6 +2692,7 @@ else blk: {
                 .read_file_alloc_with_admission = readFileAllocWithAdmission,
                 .read_file_range_alloc = readFileRangeAlloc,
                 .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
+                .begin_read_file_range_alloc_with_admission = beginReadFileRangeAllocWithAdmission,
                 .read_file_range_into = readFileRangeInto,
                 .read_file_range_into_with_admission = readFileRangeIntoWithAdmission,
                 .read_file_range_at_most_into = readFileRangeAtMostInto,
@@ -2585,6 +2794,12 @@ else blk: {
                     .threaded => |*threaded| try readFileRangeWithIo(threaded.io(), allocator, path, offset, len),
                     .evented => |*evented| try readFileRangeWithIo(evented.io(), allocator, path, offset, len),
                 };
+            }
+
+            fn beginReadFileRangeAllocWithAdmission(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize, control: read_admission.Port) !RangeReadFuture {
+                const self: *NativeStorage = @ptrCast(@alignCast(ptr));
+                const runtime = read_runtime orelse return CompletedRangeReadFuture.createControlled(self.storage(), allocator, path, offset, len, control);
+                return ControlledNativeRangeReadFuture.createControlled(runtime, self.state, allocator, path, offset, len, control);
             }
 
             fn beginReadFileRangeAllocWithRuntime(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
@@ -2829,6 +3044,7 @@ else blk: {
             .read_file_alloc_with_admission = readFileAllocWithAdmission,
             .read_file_range_alloc = readFileRangeAlloc,
             .begin_read_file_range_alloc_with_runtime = beginReadFileRangeAllocWithRuntime,
+            .begin_read_file_range_alloc_with_admission = beginReadFileRangeAllocWithAdmission,
             .read_file_range_into = readFileRangeInto,
             .read_file_range_into_with_admission = readFileRangeIntoWithAdmission,
             .read_file_range_at_most_into = readFileRangeAtMostInto,
@@ -2950,6 +3166,13 @@ else blk: {
                 return try retained.fdCache().readRangeAlloc(retained.cache_namespace, retained.threaded.io(), allocator, path, offset, len);
             }
             return try readFileRangeWithIo(retained.threaded.io(), allocator, path, offset, len);
+        }
+
+        fn beginReadFileRangeAllocWithAdmission(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize, control: read_admission.Port) !RangeReadFuture {
+            const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
+            const sync_storage: Storage = .{ .ptr = state, .vtable = &threaded_only_vtable };
+            const runtime = read_runtime orelse return CompletedRangeReadFuture.createControlled(sync_storage, allocator, path, offset, len, control);
+            return ControlledNativeRangeReadFuture.createControlled(runtime, state, allocator, path, offset, len, control);
         }
 
         fn beginReadFileRangeAllocWithRuntime(ptr: *anyopaque, read_runtime: ?ReadRuntime, allocator: Allocator, path: []const u8, offset: u64, len: usize) !RangeReadFuture {
