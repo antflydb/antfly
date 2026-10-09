@@ -2773,6 +2773,34 @@ test "system catalog relation namespace transaction FK generation publication be
         try txn.put(try relation_reconciliation.candidateKey(&buf, &relation_state, pending.key), &(try forged.encode()));
         try std.testing.expectError(error.InvalidCatalogRecord, store.verifyReconciliationSourceOwnersTxn(&txn, group_id, &journal));
     }
+    // A second source may reserve a name that an earlier page already added.
+    // Such updates need the same durable-plan authority as fresh candidates.
+    {
+        const pending = for (relation_page.claims) |claim| {
+            if (claim.pending != null) break claim;
+        } else return error.TestExpectedPendingClaim;
+        var txn = try store.store.beginWriteTxn();
+        defer txn.abort();
+        var buf: [relation_reconciliation.max_cursor_bytes]u8 = undefined;
+        const key = try relation_reconciliation.candidateKey(&buf, &relation_state, pending.key);
+        const before: relation_names.Entry = .{ .active = pending.owner };
+        try txn.put(key, &(try before.encode()));
+        var journal = command_journal.Journal.initVerification(alloc, &txn, group_id, RaftApplyStore.relationSourceReplayBeforeKey);
+        defer journal.deinit();
+        try journal.attach();
+        const authentic = try pending.entry();
+        try txn.put(key, &(try authentic.encode()));
+        try std.testing.expect(journal.originals.get(key).? != null);
+        try store.verifyReconciliationSourceOwnersTxn(&txn, group_id, &journal);
+        var forged = authentic;
+        forged.pending.?.schema_digest[0] ^= 1;
+        try txn.put(key, &(try forged.encode()));
+        try std.testing.expectError(error.InvalidCatalogRecord, store.verifyReconciliationSourceOwnersTxn(&txn, group_id, &journal));
+        forged = authentic;
+        forged.pending.?.publication_id[0] ^= 1;
+        try txn.put(key, &(try forged.encode()));
+        try std.testing.expectError(error.InvalidCatalogRecord, store.verifyReconciliationSourceOwnersTxn(&txn, group_id, &journal));
+    }
     const status = try store.fkGenerationPublicationStatusJson(alloc, group_id, child.table_id);
     defer alloc.free(status);
     var publication = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, status, .{});
@@ -17084,7 +17112,7 @@ pub const RaftApplyStore = struct {
         if (record.group_id != group_id) return error.InvalidCatalogRecord;
         return true;
     }
-    /// New candidate claims must name an authoritative table/index cut, not
+    /// Changed candidate claims must name an authoritative table/index cut, not
     /// merely agree with a producer-supplied fingerprint. Point-derive each
     /// affected table once; aggregate names are bounded by the page contract.
     fn verifyReconciliationSourceOwnersTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, journal: *command_journal.Journal) !void {
@@ -17106,8 +17134,12 @@ pub const RaftApplyStore = struct {
         var entries = journal.originals.iterator();
         while (entries.next()) |entry| {
             const record = (try relation_reconciliation.classify(entry.key_ptr.*)) orelse continue;
-            if (record.kind != .candidate or entry.value_ptr.* != null) continue;
+            if (record.kind != .candidate) continue;
             const bytes = (try stagingGet(txn, entry.key_ptr.*)) orelse continue;
+            // A later source may add a reservation to a name created by an
+            // earlier page. Authenticate that update too; only byte-identical
+            // effects inherit the already verified predecessor's authority.
+            if (entry.value_ptr.*) |before| if (std.mem.eql(u8, before, bytes)) continue;
             const candidate = try relation_names.Entry.decode(bytes);
             const owner = candidate.active orelse candidate.pending orelse return error.InvalidCatalogRecord;
             if (!tables.contains(owner.table_id)) {

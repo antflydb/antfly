@@ -1757,6 +1757,19 @@ The final pure/native catalog gate passes 236 tests plus 22 linked storage tests
 without failures or leaks. Formatting, whitespace, source-catalog integrity and
 the original inventory check pass; the 902 unresolved original cases remain
 uncredited by this internal protocol work.
+Native authority verification now covers changed existing candidate entries as
+well as inserts. Adding a reserved owner to an active candidate cannot bypass
+the durable publication's exact schema and plan identity by carrying a matching
+candidate/job fingerprint. Byte-identical effects skip redundant derivation;
+changed entries retain the bounded per-table schema/name cache. A journal-backed
+native FK regression reproduces the previous acceptance of a forged pending
+schema digest, then checks that an authentic reservation update succeeds and
+forged schema or publication identities fail. This closes a replay-admission
+gap; it does not activate restore sources or credit original SQL parity cases.
+The regression fails against the previous insert-only check and passes with the
+fix. The final native catalog gate passes 166 tests plus 22 linked storage tests,
+with no failures or leaks; formatting, whitespace, source-catalog and inventory
+integrity checks also pass.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,
