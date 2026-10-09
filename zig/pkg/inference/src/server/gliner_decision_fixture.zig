@@ -22,10 +22,25 @@ pub fn comparisonValue(a: std.mem.Allocator, response: std.json.Value) !std.json
     if (answers == .object) return response; // Direct private-kernel reference.
     for (answers.array.items) |answer| {
         try std.testing.expectEqualStrings("typed", answer.object.get("decision_method").?.string);
+        const confidence_value = answer.object.get("confidence") orelse return error.InvalidDecideOutput;
+        const confidence: f64 = switch (confidence_value) {
+            .float => |value| value,
+            .integer => |value| @floatFromInt(value),
+            else => return error.InvalidDecideOutput,
+        };
+        try std.testing.expect(std.math.isFinite(confidence) and confidence >= 0 and confidence <= 1);
+        const method = answer.object.get("confidence_method") orelse return error.InvalidDecideOutput;
+        try std.testing.expect(method == .string);
+        try std.testing.expect(std.mem.eql(u8, method.string, "normalized_inverse_entropy") or std.mem.eql(u8, method.string, "max_probability"));
     }
     var lowered = try decisions.internalResponse(a, response);
     for (lowered.object.get("answers").?.object.values()) |*answer| {
         _ = answer.object.swapRemove("decision_method");
+        // These diagnostics belong to the public contract. The historical
+        // PyTorch captures contain only the learned decisions/distributions.
+        _ = answer.object.swapRemove("name");
+        _ = answer.object.swapRemove("confidence");
+        _ = answer.object.swapRemove("confidence_method");
     }
     return lowered;
 }
@@ -50,6 +65,8 @@ test "GLiNER captured decisions translate to the public contract and retain refe
     const normalized = try comparisonValue(a, response);
     const answers = normalized.object.get("answers").?.object;
     const risk = answers.get("risk").?.object;
+    try std.testing.expectEqual(@as(usize, 4), risk.count());
+    try std.testing.expectEqual(@as(usize, 2), answers.get("act").?.object.count());
     try std.testing.expectEqualStrings("Low", risk.get("legend").?.object.get("0").?.string);
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), risk.get("score").?.float, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 0.75), answers.get("act").?.object.get("noul").?.float, 1e-9);

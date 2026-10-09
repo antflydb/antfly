@@ -9200,7 +9200,7 @@ pub const Node = struct {
         return self.extractV2Span(scratch, decision.resolved_path, &request, true, .none, control, failure, response_limit, budget, working_bytes, allocation_failure, observer, decision.request);
     }
 
-    fn tryExtractLayaV2(self: *Node, scratch: std.mem.Allocator, request_json: []const u8, control: ?InferenceExecutionControl, response_limit: ?usize, failure: *extraction_v2.FailureContext, decision_execution: bool) !?[]u8 {
+    fn tryExtractLayaV2(self: *Node, scratch: std.mem.Allocator, request_json: []const u8, control: ?InferenceExecutionControl, response_limit: ?usize, failure: *extraction_v2.FailureContext, decision_execution: bool, working_bytes: usize) !?[]u8 {
         try extraction_v2.scanJsonEnvelope(request_json, .{});
         const parsed = try std.json.parseFromSlice(std.json.Value, scratch, request_json, .{ .duplicate_field_behavior = .@"error" });
         defer parsed.deinit();
@@ -9246,7 +9246,11 @@ pub const Node = struct {
         const mutex = loaded.targetInferenceExecutionMutex();
         if (mutex) |lock| try effective.lock(lock);
         defer if (mutex) |lock| lock.unlock();
-        const result = try @import("../pipelines/laya.zig").executeWithScratch(allocator, scratch, loaded.session, loaded.getTokenizer(), config, request.tasks, effective, contract.batch.max_input_tokens_per_item);
+        // Native forwards allocate their activations on the bounded request
+        // heap. Leave half of that heap for parsing, prepared sequences and
+        // results, and split large decision batches before allocating tensors.
+        const workspace_limit: ?usize = if (loaded.session.backend() == .native and !config.packing.enabled()) working_bytes / 2 else null;
+        const result = try @import("../pipelines/laya.zig").executeWithScratchLimit(allocator, scratch, loaded.session, loaded.getTokenizer(), config, request.tasks, effective, contract.batch.max_input_tokens_per_item, workspace_limit);
         const bytes = try laya.response(allocator, request, result, @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024));
         try effective.check();
         return try scratch.dupe(u8, bytes);
@@ -9275,7 +9279,7 @@ pub const Node = struct {
         // Keep each model adapter behind its own schema and capability gate.
         if (resolved_span_path == null and classification_compatibility == .none) {
             if (try self.tryExtractEmbeddingGemma2V2(scratch, request_json, control, response_limit, failure, observer)) |json| return json;
-            if (try self.tryExtractLayaV2(scratch, request_json, control, response_limit, failure, decision_execution)) |json| return json;
+            if (try self.tryExtractLayaV2(scratch, request_json, control, response_limit, failure, decision_execution, working_bytes)) |json| return json;
         }
         const regex = @import("../pipelines/extraction_regex.zig");
         var validators = regex.Context.init(scratch, .{
@@ -35454,6 +35458,32 @@ test "decisions public rejects extraction aliases before legacy HTTP dispatch" {
     }
 }
 
+fn expectDecisionJsonApprox(expected: std.json.Value, actual: std.json.Value) !void {
+    if ((expected == .float or expected == .integer) and (actual == .float or actual == .integer)) {
+        const want: f64 = if (expected == .float) expected.float else @floatFromInt(expected.integer);
+        const got: f64 = if (actual == .float) actual.float else @floatFromInt(actual.integer);
+        return std.testing.expectApproxEqAbs(want, got, 2e-4);
+    }
+    try std.testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+    switch (expected) {
+        .object => |obj| {
+            try std.testing.expectEqual(obj.count(), actual.object.count());
+            for (obj.keys(), obj.values()) |key, value|
+                try expectDecisionJsonApprox(value, actual.object.get(key) orelse return error.TestExpectedEqual);
+        },
+        .array => |values| {
+            try std.testing.expectEqual(values.items.len, actual.array.items.len);
+            for (values.items, actual.array.items) |want, got| try expectDecisionJsonApprox(want, got);
+        },
+        .float => |value| try std.testing.expectApproxEqAbs(value, actual.float, 2e-4),
+        .string => |value| try std.testing.expectEqualStrings(value, actual.string),
+        .integer => |value| try std.testing.expectEqual(value, actual.integer),
+        .bool => |value| try std.testing.expectEqual(value, actual.bool),
+        .null => {},
+        .number_string => unreachable,
+    }
+}
+
 test "laya decisions public API serves typed answers over HTTP and embedded calls" {
     const root = platform.env.getenv("ANTFLY_LAYA_QUALIFICATION") orelse platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -35533,11 +35563,9 @@ test "laya decisions public API serves typed answers over HTTP and embedded call
         const expanded_decisions = expanded_item.object.get("answers").?.array.items;
         try std.testing.expectEqual(decisions.len, expanded_decisions.len);
         for (decisions, expanded_decisions) |expected, actual| {
-            const expected_json = try std.json.Stringify.valueAlloc(a, expected, .{});
-            defer a.free(expected_json);
-            const actual_json = try std.json.Stringify.valueAlloc(a, actual, .{});
-            defer a.free(actual_json);
-            try std.testing.expectEqualStrings(expected_json, actual_json);
+            // Changing GEMM batch geometry can change F32 rounding. Preserve
+            // exact labels and structure with the pipeline parity tolerance.
+            try expectDecisionJsonApprox(expected, actual);
         }
     }
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
@@ -35547,6 +35575,76 @@ test "laya decisions public API serves typed answers over HTTP and embedded call
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
     const extraction = "{\"model\":\"model\",\"schema_version\":2,\"inputs\":[{\"content\":\"x\"}],\"schema\":{\"classifications\":[{\"name\":\"tool\",\"labels\":[\"a\",\"b\"]}]}}";
     try std.testing.expectError(error.UnsupportedExtractionModel, node.extractV2DirectJsonWithControl(a, extraction, null));
+}
+
+fn testGliner25Q8Classifications(comptime backend: backends_mod.BackendType) !void {
+    if (backend == .metal) {
+        if (comptime !@import("build_options").enable_metal or @import("builtin").os.tag != .macos) return error.SkipZigTest;
+        if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    }
+    const model_path = platform.env.getenv("ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR") orelse return error.SkipZigTest;
+    const model_name = std.fs.path.basename(model_path);
+    const models_dir = std.fs.path.dirname(model_path) orelse return error.InvalidDecisionTestModelPath;
+    const a = std.testing.allocator;
+    const gib: usize = 1024 * 1024 * 1024;
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .allow_unknown_models = true,
+        .max_concurrent_requests = 1,
+        .process_termination_available = true,
+        .generation_budget_overrides = .{ .host_limit_bytes = 6 * gib, .backend_limit_bytes = 12 * gib, .combined_limit_bytes = 18 * gib, .scratch_limit_bytes = 8 * gib },
+    });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    node.session_manager.required_backend = backend;
+    node.model_manager.session_manager.required_backend = backend;
+    const questions = try std.json.parseFromSlice(std.json.Value, a,
+        \\[{"name":"intent","type":"choice","instructions":"Classify the intent.","choices":[{"value":"refund"},{"value":"technical_support"},{"value":"sales"}]},
+        \\{"name":"urgency","type":"score","instructions":"Rate the urgency.","levels":[{"label":"low"},{"label":"medium"},{"label":"high"}]},
+        \\{"name":"refund_requested","type":"predicate","instructions":"The customer requests a refund."}]
+    , .{});
+    defer questions.deinit();
+    const body = try std.json.Stringify.valueAlloc(a, .{
+        .model = model_name,
+        .input = "Please refund the duplicate charge. I do not need technical help.",
+        .questions = questions.value,
+    }, .{});
+    defer a.free(body);
+    // The published Q8 bundle is reviewed for extraction/classification, not
+    // standalone typed decisions. Keep that production identity gate closed.
+    try std.testing.expectError(error.UnsupportedDecideModel, node.decideDirectJsonWithControl(a, body, null));
+    const extraction_body = try std.fmt.allocPrint(
+        a,
+        "{{\"model\":\"{s}\",\"schema_version\":2,\"inputs\":[{{\"content\":\"Please refund the duplicate charge. I do not need technical help.\"}}],\"schema\":{{\"classifications\":[{{\"name\":\"intent\",\"mode\":\"single\",\"labels\":[\"refund\",\"technical_support\",\"sales\"]}},{{\"name\":\"urgency\",\"mode\":\"single\",\"labels\":[\"low\",\"medium\",\"high\"]}}]}}}}",
+        .{model_name},
+    );
+    defer a.free(extraction_body);
+    var direct = try node.extractV2DirectJsonWithControl(a, extraction_body, null);
+    defer direct.deinit();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, direct.json, .{});
+    defer parsed.deinit();
+    const answers = parsed.value.object.get("data").?.array.items[0].object.get("classifications").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), answers.len);
+    try std.testing.expectEqualStrings("refund", answers[0].object.get("label").?.string);
+    try std.testing.expectEqualStrings("low", answers[1].object.get("label").?.string);
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
+    defer request.deinit();
+    request.body = extraction_body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.extractJSON(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expectEqualStrings(direct.json, response.body.?);
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+test "GLiNER2.5 Decide Q8 bundle native classifications direct and HTTP" {
+    try testGliner25Q8Classifications(.native);
+}
+
+test "GLiNER2.5 Decide Q8 bundle Metal classifications direct and HTTP" {
+    try testGliner25Q8Classifications(.metal);
 }
 
 test "Decide extraction v2 serves classifications through HTTP handler" {

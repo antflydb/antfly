@@ -9482,9 +9482,6 @@ fn loadSessionForPreferredBackends(
             resource_lease = null;
             defer loaded.deinit();
             if (control) |active| try active.check();
-            try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
-            try session_factory.prepareLayaResident(loaded.session, control);
-            if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             if (manager.admission_enabled) {
                 if (serving_floor) |floor| session_factory.configureReservedGenerationWorkspace(
                     &loaded.session,
@@ -9505,6 +9502,12 @@ fn loadSessionForPreferredBackends(
                     &man,
                 );
             }
+            // Resident preparation can populate the shared weight cache.
+            // Install its owner and hard limits while it is still empty,
+            // keeping the construction peak leased until preparation drains.
+            try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
+            try session_factory.prepareLayaResident(loaded.session, control);
+            if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             return loaded.take();
         } else |err| {
             std.log.warn("loadModel({s}) backend {s} failed: {s}", .{ model_dir, @tagName(backend), @errorName(err) });

@@ -874,6 +874,11 @@ test "gliner span v2 GLiNER2.5-Decide CountLSTM v1 entity head parity" {
     }
 }
 
+test "gliner span v2 GLiNER2.5-Decide Q8_0 bundle native parity" {
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR") orelse return error.SkipZigTest;
+    try testDecideParity(directory, false, 5e-2);
+}
+
 test "gliner span v2 GLiNER2.5-Decide Q8_0 bundle Metal parity" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
     const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR") orelse return error.SkipZigTest;
