@@ -1,5 +1,18 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import subprocess
 import sys
@@ -41,8 +54,10 @@ def test_numeric_parameters_and_type_categories(require_native, aflite_path):
         c = connection.cursor()
         c.execute("SELECT CAST(:1 AS BIGINT) AS n, ':2' AS literal -- :3\n", (9007199254740993,))
         assert c.fetchall() == [(9007199254740993, ":2")]
-        assert c.description[0][1] == dbapi.NUMBER
-        assert c.description[1][1] == dbapi.STRING
+        description = c.description
+        assert description is not None
+        assert description[0][1] == dbapi.NUMBER
+        assert description[1][1] == dbapi.STRING
         with pytest.raises(dbapi.DataError):
             c.execute("SELECT :1", (float("nan"),))
         with pytest.raises(dbapi.DataError):
@@ -260,6 +275,8 @@ c.close()
             text=True,
         )
         try:
+            assert process.stdout is not None
+            assert process.stderr is not None
             assert process.stdout.readline().strip() == "prepared", process.stderr.read()
             try:
                 process.communicate(timeout=delay)

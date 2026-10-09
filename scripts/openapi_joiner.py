@@ -199,7 +199,9 @@ def load_cached_yaml(cache: dict[Path, dict], path: Path) -> dict:
 def target_schema_name(source_path: Path, schema_name: str) -> str:
     if schema_path(source_path) == GO_SCHEMA_SPEC and schema_name == "AntflyType":
         return "schemas-AntflyType"
-    if schema_path(source_path) == schema_path(ROOT / "specs/openapi/ai/decision.yaml") and schema_name.startswith("Decide"):
+    if schema_path(source_path) == schema_path(
+        ROOT / "specs/openapi/ai/decision.yaml"
+    ) and schema_name.startswith("Decide"):
         return "Inference" + schema_name
     return schema_name
 
