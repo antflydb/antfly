@@ -43,6 +43,7 @@ const Owner = struct {
     request: catalog.Scan,
     context: operation.RequestContext,
     read_context: local.serverless_query_lake_read_context.Context,
+    saved_read_context: ?local.serverless_query_lake_read_context.Context = null,
     child: ?catalog.Cursor = null,
     child_exhausted: bool = false,
     window: std.heap.ArenaAllocator,
@@ -82,8 +83,25 @@ const Owner = struct {
     }
     fn canceled(raw: *const anyopaque) bool {
         const self: *const Owner = @ptrCast(@alignCast(raw));
-        self.read_context.ensureActive() catch return true;
+        self.read_context.checkLifetime() catch return true;
         return false;
+    }
+    fn bindCoordinator(raw: *anyopaque, execution: *local.common_request_admission.runnable_scheduler.Execution) !void {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        if (self.saved_read_context != null) return error.InvalidCoordinatorScanBinding;
+        try self.read_context.ensureActive();
+        try self.reader.bindExecution(execution);
+        self.saved_read_context = self.read_context;
+        self.read_context = self.read_context.withExecution(execution);
+    }
+    fn releaseCoordinator(raw: *anyopaque) void {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        const context = self.saved_read_context orelse return;
+        // Nested Parquet pulls retire their speculation before returning.
+        // Ordered tree and covering artifact reads are synchronous.
+        self.reader.releaseExecution();
+        self.read_context = context;
+        self.saved_read_context = null;
     }
     fn prepare(self: *Owner) !bool {
         try self.read_context.ensureActive();
@@ -122,7 +140,7 @@ const Owner = struct {
         if (self.covered) return self.nextCoveredRows(a, limit);
         if (self.cursor_header != null) return self.nextOrdered(a, limit);
         while (try self.prepare()) {
-            var page = try self.child.?.next(self.child.?.ptr, a, limit);
+            var page = try self.child.?.nextFor(self.read_context.execution, a, limit);
             self.child_exhausted = page.after == null;
             if (page.rows.len == 0) {
                 page.deinit();
@@ -165,7 +183,7 @@ const Owner = struct {
                 if (!try child.set_dynamic_filter.?(child.ptr, filter)) return error.InvalidSqlBackendResponse;
             }
             while (true) {
-                const page = try child.next(child.ptr, self.a, 256);
+                const page = try child.nextFor(self.read_context.execution, self.a, 256);
                 defer page.deinit();
                 for (page.rows) |row| {
                     const rank = ranks.get(row.id) orelse return error.InvalidNativeLakeRowIndex;
@@ -238,7 +256,7 @@ const Owner = struct {
                 self.cover_lease = owned;
                 break :cached_block owned.value.*;
             } else uncached: {
-                const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, self.artifacts, cover.block, self.reader.pages.cancellation, null);
+                const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifactFor(a, self.artifacts, cover.block, self.reader.pages.cancellation, null, self.read_context);
                 break :uncached try local.sql_spill.decodeColumnarBlockInArena(a, bytes, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
             };
             if (block.values.len != self.reader.root.cover.len or block.keys.len != 1) return error.InvalidNativeLakeRowIndex;
@@ -361,7 +379,7 @@ const Owner = struct {
                 var scratch = std.heap.ArenaAllocator.init(self.a);
                 defer scratch.deinit();
                 const sa = scratch.allocator();
-                const page = try child.next_columns.?(child.ptr, sa, 256);
+                const page = try child.columnsFor(self.read_context.execution, sa, 256);
                 try page.validate();
                 const cells = try sa.alloc(local.sql_scalar.Datum, request.fields.len);
                 for (page.selection, 0..) |physical, row| {
@@ -399,7 +417,7 @@ const Owner = struct {
         if (self.covered) return self.nextCovered(limit);
         if (self.request.order.len != 0 and self.cursor_header != null) return self.nextOrderedColumns(limit);
         while (try self.prepare()) {
-            var page = try self.child.?.next_columns.?(self.child.?.ptr, a, limit);
+            var page = try self.child.?.columnsFor(self.read_context.execution, a, limit);
             self.child_exhausted = page.after == null;
             if (page.selection.len == 0) continue;
             if (!self.reader.exhausted and page.after == null) {
@@ -882,7 +900,7 @@ fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table
         }
     }
     keep = true;
-    return .{ .order_satisfied = order_satisfied, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .set_dynamic_filter = Owner.setDynamicFilter, .close = Owner.close };
+    return .{ .order_satisfied = order_satisfied, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .set_dynamic_filter = Owner.setDynamicFilter, .coordinator_execution = .{ .bind = Owner.bindCoordinator, .release = Owner.releaseCoordinator }, .close = Owner.close };
 }
 
 pub fn prefixSuccessor(a: A, prefix: []const u8) !?[]const u8 {

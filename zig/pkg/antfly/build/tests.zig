@@ -2572,7 +2572,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     serverless_manifest_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const artifact_read_tests = b.addTest(.{
         .root_module = serverless_manifest_test_mod,
-        .filters = &.{ "artifact identities", "artifact store", "artifact reads", "verified empty artifacts", "external lake aggregate", "native aggregate", "external lake reader", "external lake native reader", "external lake cold reader", "external lake native text", "external lake packed text", "external lake physical", "external lake text", "external lake seekable text", "external lake required pack" },
+        .filters = &.{ "artifact identities", "artifact store", "artifact reads", "verified empty artifacts", "external lake aggregate", "native aggregate", "external lake reader", "external lake native reader", "external lake cold reader", "external lake native text", "external lake packed text", "external lake physical", "external lake text", "external lake seekable text", "external lake required pack", "external lake ordered" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-artifact-read-test", "Run artifact integrity and request-owned provider wait contracts").dependOn(&b.addRunArtifact(artifact_read_tests).step);
