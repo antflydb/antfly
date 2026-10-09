@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Native table binding, authorization and Iceberg catalog operations. File
 //! commits are explicit; ordinary row batch writes cannot bypass the lake policy.
@@ -10,7 +22,7 @@ const configured = @import("../serverless/configured_object_store_support.zig");
 const server_api = @import("http_server.zig");
 const operation = local.api_operation;
 const A = std.mem.Allocator;
-pub const Action = enum { load, create, commit, resolve, changes };
+pub const Action = enum { load, create, commit, resolve, changes, maintenance };
 pub const Request = struct {
     action: Action,
     body: []const u8 = "",
@@ -25,7 +37,7 @@ pub const Response = struct {
     }
 };
 pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, expected_id: ?u64, identity: ?server_api.AuthenticatedIdentity, context: operation.RequestContext, request: Request) !Response {
-    const mutation = request.action == .create or request.action == .commit or request.action == .changes;
+    const mutation = request.action == .create or request.action == .commit or request.action == .changes or request.action == .maintenance;
     if (identity) |value| {
         if (!server_api.permissionsAllow(value.permissions, .table, physical, if (mutation) .admin else .read)) return error.Forbidden;
         // Catalog writes are table-wide file commits, not row-policy mutations.
@@ -40,6 +52,12 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, physical: []const u8, ex
     if (source.binding.catalog == null) return error.InvalidLakeCatalog;
     const options: configured.BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
     const lake_context: catalog.types.Context = .{ .io = server.sharedApiNetworkIo(), .deadline_ns = context.deadline_ns, .cancellation = if (context.cancellation.ptr != null and context.cancellation.is_cancelled_fn != null) .{ .ptr = context.cancellation.ptr.?, .is_cancelled_fn = context.cancellation.is_cancelled_fn.? } else null };
+    if (request.action == .maintenance) {
+        const maintenance = @import("lake_maintenance.zig");
+        const result = try maintenance.execute(a, server, table.*, source.binding, options, lake_context, context, request.body);
+        if (result.mutated) server.notifyLakeCommit(physical) catch |err| std.log.warn("lake maintenance publication wakeup deferred table={s} err={s}", .{ physical, @errorName(err) });
+        return .{ .status = 200, .body = result.body };
+    }
     if (request.action == .changes) {
         const lsn = try @import("../serverless/lake_ingestion.zig").accept(a, source.binding, options, lake_context, request.body);
         server.notifyLakeCommit(physical) catch |err| std.log.warn("lake ingestion wakeup deferred table={s} err={s}", .{ physical, @errorName(err) });
@@ -102,10 +120,10 @@ fn encode(a: A, result: configured.CatalogResult, state: ?[]const u8, id: []cons
 }
 pub fn errorStatus(err: anyerror) u16 {
     return switch (err) {
-        error.Forbidden, error.LakeCatalogForbidden, error.ExternalLakeReadOnly, error.UnsupportedExternalLakeCredentialRef => 403,
+        error.Forbidden, error.LakeCatalogForbidden, error.ExternalLakeReadOnly, error.UnsupportedExternalLakeCredentialRef, error.LakeVacuumOwnershipRequired => 403,
         error.LakeTableNotFound, error.TableNotFound => 404,
-        error.TableGenerationChanged, error.LakeCommitConflict, error.LakeCommitIdReused, error.LakeRelocationRequired, error.WalIdempotencyConflict, error.LakeCheckpointConflict, error.LakeSourceConflict => 409,
-        error.InvalidLakeChangeBatch, error.InvalidLakeRow, error.UnsupportedLakeWriteType, error.LakeWriteTooLarge => 400,
+        error.TableGenerationChanged, error.LakeCommitConflict, error.LakeCommitIdReused, error.LakeRelocationRequired, error.WalIdempotencyConflict, error.LakeCheckpointConflict, error.LakeSourceConflict, error.LakeMaintenanceAlreadyStarted => 409,
+        error.InvalidLakeChangeBatch, error.InvalidLakeRow, error.UnsupportedLakeWriteType, error.LakeWriteTooLarge, error.InvalidLakeMaintenanceLimits => 400,
         error.InvalidLakeCatalog, error.InvalidLakeMetadata, error.InvalidLakeCommit, error.UnsupportedLakeRequirement, error.UnsupportedLakeUpdate, error.UnsupportedLakeFormatVersion, error.LakeMetadataTooLarge, error.UnexpectedToken, error.UnknownField, error.MissingField => 400,
         error.DeadlineExceeded, error.Timeout => 504,
         else => 503,

@@ -258,7 +258,8 @@ pub const Stream = struct {
             (if (self.source.partition_rules) |rules| @import("lake_partition_pruning.zig").mayMatch(rules.items, file, self.predicates) else true);
     }
 
-    pub fn init(alloc: Allocator, source: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, context: Context, limits: Limits) !Stream {
+    pub fn init(alloc: Allocator, source: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, parent: Context, limits: Limits) !Stream {
+        const context = source.protectContext(parent);
         try context.ensureActive();
         const cached_order = source.canonicalOrder();
         if (cached_order == null) try source.inventory.validate();

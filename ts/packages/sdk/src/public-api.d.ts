@@ -43,9 +43,31 @@ export interface paths {
         put?: never;
         /**
          * ingestLakeChanges
-         * @description Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and searchable index publication. Requires table admin permission and iceberg_writer policy.
+         * @description Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table admin permission and iceberg_writer policy.
          */
         post: operations["ingestLakeChanges"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/lake/maintenance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Maintain a writable Iceberg table
+         * @description Plan or execute bounded compaction, snapshot/file vacuum, or covered WAL cleanup. A stable operation ID resumes saved catalog intents after uncertainty. Defaults to dry run. Destructive file vacuum requires an explicit exclusive ownership and external-reader retention agreement; only native ownership proofs authorize object deletion. Current snapshots, named refs, native serving readers and durable snapshot pins remain protected. Compact and vacuum commits automatically schedule index publication.
+         */
+        post: operations["maintainLakeTable"];
         delete?: never;
         options?: never;
         head?: never;
@@ -21306,7 +21328,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Durable WAL acceptance; retry the same transaction after an ambiguous response. Query visibility follows automatic publication. */
+            /** @description Durable WAL acceptance; retry the same transaction after an ambiguous response. Native text search can compose a bounded accepted-WAL overlay before catalog/index publication; SQL reads follow committed snapshots. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -21349,6 +21371,103 @@ export interface operations {
                 content?: never;
             };
             /** @description Durable ingestion unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    maintainLakeTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    action: "compact" | "vacuum" | "wal_gc";
+                    operation_id: string;
+                    /** @default true */
+                    dry_run?: boolean;
+                    /** @default false */
+                    exclusive_ownership?: boolean;
+                    /**
+                     * Format: uint64
+                     * @default 16384
+                     */
+                    max_rows?: number;
+                    /**
+                     * Format: uint64
+                     * @default 33554432
+                     */
+                    max_bytes?: number;
+                    /**
+                     * Format: uint64
+                     * @default 604800000
+                     */
+                    retain_ms?: number;
+                    /** @default 2 */
+                    keep_latest?: number;
+                    /** @default 4096 */
+                    max_deleted?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description Bounded maintenance result; complete false requires another pass with the same operation ID. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Invalid maintenance limits */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing admin permission, writer policy or ownership agreement */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Conditional conflict or conflicting saved operation */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Maintenance unavailable or uncertain outcome; retry the same operation ID */
             503: {
                 headers: {
                     [name: string]: unknown;

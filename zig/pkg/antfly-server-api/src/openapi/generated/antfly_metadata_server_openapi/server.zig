@@ -1027,6 +1027,16 @@ pub const GetLakeCommitOutcomeParams = struct {
     request_hash: []const u8,
 };
 
+/// Maintain a writable Iceberg table
+pub const MaintainLakeTablePathParams = struct {
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for maintainLakeTable.
+pub fn parseMaintainLakeTableBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
 /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
 pub const LinearMergePathParams = struct {
     /// Name of the table
@@ -1450,6 +1460,7 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/tables/{tableName}/lake/changes", .operation_id = "ingestLakeChanges", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/lake/commits", .operation_id = "commitLakeCatalog", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/tables/{tableName}/lake/commits/{commitId}", .operation_id = "getLakeCommitOutcome", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/tables/{tableName}/lake/maintenance", .operation_id = "maintainLakeTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/merge", .operation_id = "linearMerge", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/tables/{tableName}/query", .operation_id = "queryTable", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/tables/{tableName}/repair/control-jobs", .operation_id = "startTableRepairControlJob", .request_body = .buffered, .streaming_response = false },
@@ -1611,6 +1622,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "ingestLakeChanges")) @compileError("ServerRouter: Impl missing required method 'ingestLakeChanges'");
         if (!@hasDecl(Impl, "commitLakeCatalog")) @compileError("ServerRouter: Impl missing required method 'commitLakeCatalog'");
         if (!@hasDecl(Impl, "getLakeCommitOutcome")) @compileError("ServerRouter: Impl missing required method 'getLakeCommitOutcome'");
+        if (!@hasDecl(Impl, "maintainLakeTable")) @compileError("ServerRouter: Impl missing required method 'maintainLakeTable'");
         if (!@hasDecl(Impl, "linearMerge")) @compileError("ServerRouter: Impl missing required method 'linearMerge'");
         if (!@hasDecl(Impl, "queryTable")) @compileError("ServerRouter: Impl missing required method 'queryTable'");
         if (!@hasDecl(Impl, "startTableRepairControlJob")) @compileError("ServerRouter: Impl missing required method 'startTableRepairControlJob'");
@@ -1770,6 +1782,7 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/tables/:tableName/lake/changes", httpx.Handler.bind(self.impl, ingestLakeChanges));
             try server.post("/tables/:tableName/lake/commits", httpx.Handler.bind(self.impl, commitLakeCatalog));
             try server.get("/tables/:tableName/lake/commits/:commitId", httpx.Handler.bind(self.impl, getLakeCommitOutcome));
+            try server.post("/tables/:tableName/lake/maintenance", httpx.Handler.bind(self.impl, maintainLakeTable));
             try server.post("/tables/:tableName/merge", httpx.Handler.bind(self.impl, linearMerge));
             try server.post("/tables/:tableName/query", httpx.Handler.bind(self.impl, queryTable));
             try server.post("/tables/:tableName/repair/control-jobs", httpx.Handler.bind(self.impl, startTableRepairControlJob));
@@ -2711,6 +2724,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.getLakeCommitOutcome(ctx, table_name, commit_id, query_params);
         }
 
+        /// Maintain a writable Iceberg table
+        /// POST /tables/{tableName}/lake/maintenance
+        fn maintainLakeTable(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.maintainLakeTable(ctx, table_name);
+        }
+
         /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
         /// POST /tables/{tableName}/merge
         fn linearMerge(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
@@ -3083,6 +3103,7 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn ingestLakeChanges(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn commitLakeCatalog(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn getLakeCommitOutcome(self: *Impl, ctx: *httpx.Context, table_name: []const u8, commit_id: []const u8, params: GetLakeCommitOutcomeParams) !httpx.Response
+//   fn maintainLakeTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn linearMerge(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn queryTable(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response
 //   fn startTableRepairControlJob(self: *Impl, ctx: *httpx.Context, table_name: []const u8) !httpx.Response

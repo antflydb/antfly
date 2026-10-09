@@ -1,5 +1,18 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Run with ANTFLY_NATIVE_BINARY=/absolute/path/to/antfly for wire qualification."""
 
 import hashlib
@@ -103,6 +116,13 @@ class RestAuthority(BaseHTTPRequestHandler):
             self.end_headers()
             return
         path = self.object_path()
+        if (
+            getattr(self.server, "block_native_data", False)
+            and path.name.startswith("antfly-")
+            and path.suffix == ".parquet"
+        ):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            return self.respond(503, {})
         if self.headers.get("If-None-Match") == "*" and path.exists():
             return self.respond(412, {})
         if expected := self.headers.get("If-Match"):
@@ -119,6 +139,17 @@ class RestAuthority(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Length", "0")
         self.send_header("ETag", '"' + hashlib.md5(data).hexdigest() + '"')
+        self.end_headers()
+
+    def do_DELETE(self):
+        path = self.object_path()
+        if path.exists():
+            etag = '"' + hashlib.md5(path.read_bytes()).hexdigest() + '"'
+            if self.headers.get("If-Match") and self.headers["If-Match"] != etag:
+                return self.respond(412, {})
+            path.unlink()
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self):
@@ -206,7 +237,7 @@ class RestAuthority(BaseHTTPRequestHandler):
 
 
 @pytest.mark.parametrize("mode", ["managed", "rest"])
-@pytest.mark.parametrize("native_rows", [False, True, "delete_first"])
+@pytest.mark.parametrize("native_rows", [False, True, "delete_first", "overlay"])
 def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows):
     binary = os.environ.get("ANTFLY_NATIVE_BINARY")
     if not binary:
@@ -415,6 +446,19 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                     tmp_path / "server.log"
                 ).read_text()[-5000:]
                 time.sleep(0.1)
+            cleared = call(
+                "POST",
+                "/tables/hn/lake/maintenance",
+                {
+                    "action": "compact",
+                    "operation_id": "delete-only-compaction",
+                    "dry_run": False,
+                },
+            )
+            assert cleared["committed"] and cleared["output_rows"] == 0, cleared
+            assert call("POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn"})[
+                "rows"
+            ] == [["0"]]
             table = catalog.load_table("hackernews.items")
         table.append(
             pa.table(
@@ -436,6 +480,33 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
         rows = call("POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn"})
         assert rows["rows"] == [["3"]]
         assert not (root / "hn" / "metadata" / "version-hint.text").exists()
+        if native_rows == "overlay":
+            deadline = time.monotonic() + 90
+            found = None
+            while True:
+                try:
+                    found = call(
+                        "POST",
+                        "/tables/hn/query",
+                        {
+                            "full_text_search": {"match": "original", "field": "body"},
+                            "fields": ["amount"],
+                            "limit": 10,
+                        },
+                    )
+                    hits = (
+                        found.get("responses", [found])[0]
+                        .get("hits", {})
+                        .get("hits", [])
+                    )
+                    if len(hits) == 3:
+                        break
+                except HTTPError as error:
+                    assert error.code in (409, 422, 503), error.read().decode()
+                if time.monotonic() >= deadline:
+                    pytest.fail(json.dumps(found))
+                time.sleep(0.1)
+            authority.block_native_data = True
         if native_rows:
             batch = {
                 "batch_id": "cdc-transaction-1",
@@ -465,6 +536,54 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
             # A caller restart immediately after acceptance must not strand WAL.
             stop()
             start()
+            if native_rows == "overlay":
+                before = call("GET", "/tables/hn/lake/catalog")
+                assert (
+                    before["metadata"]["properties"].get("antfly.wal.coverage", "0")
+                    == "0"
+                )
+                immediate = call(
+                    "POST",
+                    "/tables/hn/query",
+                    {
+                        "full_text_search": {"match": "comet", "field": "body"},
+                        "fields": ["amount", "body"],
+                        "highlight": {"fields": ["body"]},
+                        "limit": 10,
+                    },
+                )
+                hits = immediate.get("responses", [immediate])[0]["hits"]["hits"]
+                assert [hit["_source"]["amount"] for hit in hits] == [1], immediate
+                assert hits[0].get("_highlights", {}).get("body"), immediate
+                remaining = call(
+                    "POST",
+                    "/tables/hn/query",
+                    {
+                        "full_text_search": {"match": "original", "field": "body"},
+                        "fields": ["amount"],
+                        "limit": 10,
+                    },
+                )
+                hits = remaining.get("responses", [remaining])[0]["hits"]["hits"]
+                assert [hit["_source"]["amount"] for hit in hits] == [3], remaining
+                filtered = call(
+                    "POST",
+                    "/tables/hn/query",
+                    {
+                        "full_text_search": {"match": "comet", "field": "body"},
+                        "filter_query": {"term": {"path": "/amount", "value": 1}},
+                        "order_by": [{"field": "_score", "desc": True}],
+                        "fields": ["amount"],
+                        "limit": 10,
+                    },
+                )
+                assert (
+                    len(filtered.get("responses", [filtered])[0]["hits"]["hits"]) == 1
+                ), filtered
+                assert call("POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn"})[
+                    "rows"
+                ] == [["3"]]
+                authority.block_native_data = False
             deadline = time.monotonic() + 180
             while True:
                 loaded = call("GET", "/tables/hn/lake/catalog")
@@ -495,7 +614,7 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                         "POST",
                         "/tables/hn/query",
                         {
-                            "full_text_search": {"term": "comet", "field": "body"},
+                            "full_text_search": {"match": "comet", "field": "body"},
                             "fields": ["amount", "body"],
                             "limit": 10,
                         },
@@ -560,7 +679,7 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                         "POST",
                         "/tables/hn/query",
                         {
-                            "full_text_search": {"term": "comet", "field": "body"},
+                            "full_text_search": {"match": "comet", "field": "body"},
                             "fields": ["amount"],
                             "limit": 10,
                         },
@@ -579,6 +698,89 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
             assert call(
                 "POST", "/sql", {"statement": "SELECT amount FROM hn ORDER BY amount"}
             )["rows"] == [["3"], ["4"], ["5"]]
+        if native_rows:
+            maintenance = "/tables/hn/lake/maintenance"
+            planned = call(
+                "POST",
+                maintenance,
+                {
+                    "action": "compact",
+                    "operation_id": "wire-compaction",
+                    "dry_run": True,
+                },
+            )
+            assert planned["input_files"] >= 2, planned
+            compacted = call(
+                "POST",
+                maintenance,
+                {
+                    "action": "compact",
+                    "operation_id": "wire-compaction",
+                    "dry_run": False,
+                },
+            )
+            assert compacted["committed"], compacted
+            assert (
+                call(
+                    "POST",
+                    maintenance,
+                    {
+                        "action": "compact",
+                        "operation_id": "wire-compaction",
+                        "dry_run": False,
+                    },
+                )
+                == compacted
+            )
+            catalog.load_table("hackernews.items").metadata.model_dump()
+            assert call(
+                "POST", "/sql", {"statement": "SELECT amount FROM hn ORDER BY amount"}
+            )["rows"] == [["3"], ["4"], ["5"]]
+            dry_gc = call(
+                "POST", maintenance, {"action": "vacuum", "operation_id": "wire-vacuum"}
+            )
+            assert dry_gc["expired_snapshots"] == 0, dry_gc
+            with pytest.raises(HTTPError) as denied:
+                call(
+                    "POST",
+                    maintenance,
+                    {
+                        "action": "vacuum",
+                        "operation_id": "wire-vacuum",
+                        "dry_run": False,
+                    },
+                )
+            assert denied.value.code == 403
+            gc = call(
+                "POST",
+                maintenance,
+                {
+                    "action": "wal_gc",
+                    "operation_id": "wire-wal-gc",
+                    "dry_run": False,
+                    "max_deleted": 1,
+                },
+            )
+            for _ in range(8):
+                if gc["complete"]:
+                    break
+                gc = call(
+                    "POST",
+                    maintenance,
+                    {
+                        "action": "wal_gc",
+                        "operation_id": "wire-wal-gc",
+                        "dry_run": False,
+                        "max_deleted": 1,
+                    },
+                )
+            assert gc["complete"], gc
+            assert call("POST", "/tables/hn/lake/changes", batch) == accepted
+            stop()
+            start()
+            assert call("POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn"})[
+                "rows"
+            ] == [["3"]]
     finally:
         if process and process.poll() is None:
             stop()

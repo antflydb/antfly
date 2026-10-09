@@ -196,6 +196,9 @@ pub const SegmentData = union(enum) {
 pub const SegmentShared = struct {
     const deletion_writer_bit: u32 = 1 << 31;
 
+    /// Private visibility state may borrow an immutable physical reader.
+    physical_parent: ?*SegmentEntry = null,
+
     ref_count: u32,
     residency_mutex: std.atomic.Mutex = .unlocked,
     // One process-level accounting owner per physical mapping. The manager
@@ -658,6 +661,12 @@ pub const SegmentEntry = struct {
         const alloc = self.reader.alloc;
         const seg_id = self.id;
         const cleanup = self.shared.retired_cleanup;
+        if (self.shared.physical_parent) |parent| {
+            destroyShared(alloc, self.shared);
+            parent.releaseRef();
+            alloc.destroy(parent);
+            return;
+        }
         self.data.madviseDiscardCleanPages();
         self.reader.deinit();
         self.data.deinit(alloc);
@@ -1869,6 +1878,44 @@ pub const IndexWriter = struct {
         for (segments) |*segment| segment.retain();
         self.publishSnapshot(snapshot_ref);
         old.release();
+    }
+
+    /// Compose one corpus while giving each masked segment private tombstones.
+    /// Encoded bytes and physical readers stay shared; the source snapshot is
+    /// never mutated. Global BM25 uses this complete corpus, including its delta.
+    pub fn shareMaskedImmutableSegments(self: *IndexWriter, sources: []const ImmutableSegment, excluded: []const roaring.RoaringBitmap) !void {
+        if (sources.len != excluded.len) return error.InvalidSegment;
+        if (sources.len == 0) return;
+        var private = try IndexWriter.init(self.alloc);
+        defer private.deinit();
+        try private.shareImmutableSegments(sources);
+        const snapshot_ref = private.snapshot();
+        for (snapshot_ref.segments, excluded) |*segment, mask| {
+            if (mask.cardinality() == 0) continue;
+            if (segment.reader.doc_count == 0 or mask.rank(segment.reader.doc_count) != mask.cardinality()) return error.InvalidSegment;
+            const parent = try self.alloc.create(SegmentEntry);
+            errdefer self.alloc.destroy(parent);
+            parent.* = segment.*;
+            const shared = try SegmentEntry.createShared(self.alloc, segment.data, &segment.reader);
+            errdefer SegmentEntry.destroyShared(self.alloc, shared);
+            shared.deleted = try mask.clone(self.alloc);
+            shared.deleted_count.store(@intCast(mask.cardinality()), .release);
+            shared.physical_parent = parent;
+            // Transfer this snapshot's physical pin to parent; its new shared
+            // cell owns only visibility and metadata, never the encoded source.
+            segment.shared = shared;
+        }
+        // The temporary writer is the sole owner until all masks are admitted.
+        // Transfer the sealed snapshot into the destination atomically.
+        self.lockMutex();
+        defer self.mu.unlock();
+        if (self.snapshot().segments.len != 0) return error.InvalidSegment;
+        const next = private.acquireSnapshot();
+        const previous = self.current;
+        self.current = next;
+        self.next_epoch = private.next_epoch;
+        self.next_segment_id = private.next_segment_id;
+        previous.release();
     }
 
     /// Preserve the sealed corpus order when a fork retains readers from a
@@ -4003,4 +4050,56 @@ test "external lake range segment admission defers dictionary diagnostics across
     } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
     try std.testing.expect(unpublished[0].prepared_reader == null);
     try std.testing.expectEqual(@as(u64, 3), writer.snapshot().segments[0].id);
+}
+
+fn maskedImmutableCorpusScenario(a: Allocator) !void {
+    const bytes = try buildTestSegmentWithIds(a, &.{ .{ .id = "old", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} }, .{ .id = "kept", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} } });
+    defer a.free(bytes);
+    var archive = try IndexWriter.init(a);
+    defer archive.deinit();
+    try archive.addSegment(bytes);
+    const base = archive.acquireSnapshot();
+    defer base.release();
+    var mask = roaring.RoaringBitmap.init(a);
+    defer mask.deinit();
+    try mask.add(0);
+    var joined = try IndexWriter.init(a);
+    defer joined.deinit();
+    try joined.shareMaskedImmutableSegments(&.{.{ .snapshot = base, .ordinal = 0, .target_id = 1 }}, &.{mask});
+    const visible = joined.acquireSnapshot();
+    defer visible.release();
+    try std.testing.expectEqual(@as(u32, 2), base.liveDocCount());
+    try std.testing.expectEqual(@as(u32, 1), visible.liveDocCount());
+    try std.testing.expect(visible.segments[0].shared != base.segments[0].shared);
+    try std.testing.expect(visible.segments[0].data.bytes().ptr == base.segments[0].data.bytes().ptr);
+    // The scoring contract matches native Lucene-style immutable segment stats.
+    try std.testing.expectEqual(@as(u32, 2), visible.scoringDocCount());
+}
+test "external lake overlays mask shared archive readers without mutating other snapshots" {
+    try maskedImmutableCorpusScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, maskedImmutableCorpusScenario, .{});
+}
+
+test "external lake overlays reject private masks outside the physical corpus" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "kept", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} }});
+    defer a.free(bytes);
+    var archive = try IndexWriter.init(a);
+    defer archive.deinit();
+    try archive.addSegment(bytes);
+    const base = archive.acquireSnapshot();
+    defer base.release();
+    var mask = roaring.RoaringBitmap.init(a);
+    defer mask.deinit();
+    try mask.add(base.segments[0].reader.doc_count);
+    var joined = try IndexWriter.init(a);
+    defer joined.deinit();
+    try std.testing.expectError(error.InvalidSegment, joined.shareMaskedImmutableSegments(&.{.{ .snapshot = base, .ordinal = 0, .target_id = 1 }}, &.{mask}));
+    try std.testing.expectEqual(@as(u32, 1), base.liveDocCount());
+    try std.testing.expectEqual(@as(u32, 0), joined.snapshot().liveDocCount());
+    try mask.remove(base.segments[0].reader.doc_count);
+    try mask.add(base.segments[0].reader.doc_count - 1);
+    try joined.shareMaskedImmutableSegments(&.{.{ .snapshot = base, .ordinal = 0, .target_id = 1 }}, &.{mask});
+    try std.testing.expectEqual(@as(u32, 0), joined.snapshot().liveDocCount());
+    try std.testing.expectEqual(@as(u32, 1), base.liveDocCount());
 }

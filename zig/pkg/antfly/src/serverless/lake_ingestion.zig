@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
 //! Durable provider-neutral CDC admission and native WAL-to-Iceberg drain.
 //! Queue ownership is independent of a caller's lifetime. Source checkpoints
@@ -16,16 +28,16 @@ const Binding = local.serverless_external_source_catalog_binding.Binding;
 const Options = configured.BindingObjectStoreOpenOptions;
 const Context = catalog.types.Context;
 const Attempt = struct { id: []const u8, expected: []const u8, body: []const u8, timestamp_ms: i64 };
-fn openQueue(a: A, binding: Binding, options: Options) !local.serverless_object_store_support.OpenedObjectStore {
+pub fn openQueue(a: A, binding: Binding, options: Options) !local.serverless_object_store_support.OpenedObjectStore {
     if (binding.write_policy != .iceberg_writer or binding.catalog == null) return error.ExternalLakeReadOnly;
     return configured.openNativeArtifactObjectStoreAlloc(a, options.node_config orelse return error.NativeArtifactStorageRequired, options.secret_store, false);
 }
-fn prefix(a: A, base: []const u8, binding: Binding, options: Options) ![]u8 {
+pub fn prefix(a: A, base: []const u8, binding: Binding, options: Options) ![]u8 {
     const identity = try std.json.Stringify.valueAlloc(a, .{ .source = binding.source_uri, .catalog = binding.catalog }, .{});
     defer a.free(identity);
     return std.fmt.allocPrint(a, "{s}/lake-ingestion/{d}/{d}/{s}", .{ base, options.catalog_table_id, options.catalog_generation, catalog.types.digestHex(identity) });
 }
-fn coverage(a: A, table: catalog.types.Table) !u64 {
+pub fn coverage(a: A, table: catalog.types.Table) !u64 {
     var p = try std.json.parseFromSlice(V, a, table.metadata_json, .{});
     defer p.deinit();
     const properties = try catalog.metadata.get(p.value, "properties");
@@ -151,4 +163,33 @@ pub fn drain(a: A, binding: Binding, options: Options, context: Context) !bool {
     defer result.deinit(a);
     if (try coverage(a, result.table) != record.lsn) return error.LakeWalCoverageGap;
     return true;
+}
+
+pub const Pending = struct { lsn: u64, key_fields: []const []const u8, changes: []const Batch.Change };
+/// Caller arena owns the immutable WAL cut and its normalized final images.
+pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: u64) !Pending {
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context };
+    const suffix = try store.range(a, cut);
+    var changes: std.ArrayList(Batch.Change) = .empty;
+    var latest: std.StringHashMapUnmanaged(usize) = .empty;
+    var keys: []const []const u8 = &.{};
+    for (suffix.records) |record| {
+        const batch = try std.json.parseFromSliceLeaky(Batch, a, record.payload, .{ .allocate = .alloc_always });
+        if (keys.len == 0) keys = batch.key_fields else if (!keyFieldsEqual(keys, batch.key_fields)) return error.LakeSourceConflict;
+        for (batch.changes) |change| {
+            var values: std.ArrayList(V) = .empty;
+            for (keys) |field| try values.append(a, change.row.object.get(field) orelse return error.InvalidWal);
+            const identity = try std.json.Stringify.valueAlloc(a, values.items, .{});
+            const entry = try latest.getOrPut(a, identity);
+            if (entry.found_existing) changes.items[entry.value_ptr.*] = change else {
+                if (changes.items.len == 65536) return error.LakeOverlayTooLarge;
+                entry.value_ptr.* = changes.items.len;
+                try changes.append(a, change);
+            }
+        }
+    }
+    return .{ .lsn = suffix.lsn, .key_fields = keys, .changes = changes.items };
 }

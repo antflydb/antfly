@@ -984,6 +984,9 @@ from .lookup_key_response_200 import LookupKeyResponse200
 from .lookup_namespace_table_document_consistency import LookupNamespaceTableDocumentConsistency
 from .lookup_namespace_table_document_response_200 import LookupNamespaceTableDocumentResponse200
 from .lsm_storage_status import LsmStorageStatus
+from .maintain_lake_table_body import MaintainLakeTableBody
+from .maintain_lake_table_body_action import MaintainLakeTableBodyAction
+from .maintain_lake_table_response_200 import MaintainLakeTableResponse200
 from .match_all_query import MatchAllQuery
 from .match_all_query_match_all import MatchAllQueryMatchAll
 from .match_none_query import MatchNoneQuery
@@ -2418,6 +2421,9 @@ __all__ = (
     "LookupNamespaceTableDocumentConsistency",
     "LookupNamespaceTableDocumentResponse200",
     "LsmStorageStatus",
+    "MaintainLakeTableBody",
+    "MaintainLakeTableBodyAction",
+    "MaintainLakeTableResponse200",
     "MatchAllQuery",
     "MatchAllQueryMatchAll",
     "MatchNoneQuery",

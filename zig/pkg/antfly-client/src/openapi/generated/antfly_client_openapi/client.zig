@@ -3111,6 +3111,19 @@ pub const Client = struct {
         return ApiResponse(types.LakeCatalogResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// Maintain a writable Iceberg table
+    /// POST /db/v1/tables/{tableName}/lake/maintenance
+    pub fn maintainLakeTable(self: *@This(), table_name: []const u8, body: std.json.Value) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lake/maintenance", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(json_body);
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
     /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
     /// POST /db/v1/tables/{tableName}/merge
     pub fn linearMerge(self: *@This(), table_name: []const u8, body: types.LinearMergeRequest) !ApiResponse(types.LinearMergeResult) {

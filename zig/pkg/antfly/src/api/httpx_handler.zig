@@ -8378,6 +8378,10 @@ pub const AntflyApiHandler = struct {
         return self.lakeCatalogRequest(ctx, table_name, .{ .action = .changes, .body = (try ctx.body()) orelse "" });
     }
 
+    pub fn maintainLakeTable(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
+        return self.lakeCatalogRequest(ctx, table_name, .{ .action = .maintenance, .body = (try ctx.body()) orelse "" });
+    }
+
     pub fn getLakeCommitOutcome(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8, commit_id: []const u8, params: metadata_server_openapi.server.GetLakeCommitOutcomeParams) !httpx.Response {
         const id = (try decodePathParamOrBadRequest(ctx, commit_id)) orelse return ctx.response.build();
         defer ctx.allocator.free(id);

@@ -52,3 +52,10 @@ test {
     _ = @import("antfly_local_sources").serverless_query_lake_read_context;
     _ = @import("antfly_local_sources").serverless_query_lake_serving_cache;
 }
+
+comptime {
+    _ = @import("serverless/lake_snapshot_pins.zig");
+    _ = @import("serverless/lake_compaction.zig");
+    _ = @import("serverless/lake_vacuum.zig");
+    _ = @import("api/lake_search_overlay.zig");
+}

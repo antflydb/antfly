@@ -392,3 +392,40 @@ initializes an absent catalog with the HN schema. The producer persists one
 source epoch and chains opaque checkpoints. Switching a pending request to a
 different endpoint/table is rejected. Durable acceptance is distinct from
 search visibility; use catalog coverage and index readiness to observe progress.
+
+## Native recent search and maintenance
+
+`--native-rows` sends complete transactions to Antfly's durable lake WAL. Once a
+baseline text/predicate index is published, native text search also includes the
+accepted WAL suffix while Parquet/catalog/index publication catches up. Stable
+keys hide replaced/deleted archive rows before ranking. The overlay survives
+restart; SQL continues to read the committed Iceberg snapshot. Search cursors
+expire explicitly if their archive/WAL cut changes.
+
+Use the table admin maintenance endpoint for bounded jobs. Dry runs are the
+default; reuse an operation ID to resume the exact operation after interruption.
+Compaction commits automatically wake searchable publication.
+
+```sh
+ANTFLY_URL=http://localhost:8080/db/v1
+curl -fsS -X POST "$ANTFLY_URL/tables/hackernews/lake/maintenance" \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"compact","operation_id":"hn-compact-001","dry_run":false}'
+
+curl -fsS -X POST "$ANTFLY_URL/tables/hackernews/lake/maintenance" \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"wal_gc","operation_id":"hn-wal-gc-001","dry_run":false,"max_deleted":128}'
+
+curl -fsS -X POST "$ANTFLY_URL/tables/hackernews/lake/maintenance" \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"vacuum","operation_id":"hn-vacuum-plan-001"}'
+```
+
+File vacuum requires an explicit native-owned storage lifecycle and retention
+agreement for external readers before setting `exclusive_ownership: true` and
+`dry_run: false`. Antfly pins its own active readers and deletes only unreachable
+files with native ownership proofs. External/unmarked files remain untouched.
+The example bucket's eight-day lifecycle is independent of those pins, so it is
+unsuitable for durable deployment. See the
+[design's maintenance contracts](../../docs/plans/lake-ingestion-and-publication.md#compaction-and-garbage-collection)
+for bounds, snapshot retention and restart recovery.

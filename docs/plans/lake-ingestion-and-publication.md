@@ -2,7 +2,7 @@
 
 Status: architecture and implementation contracts, captured 2026-10-08. The
 native transaction ingestion section describes the implementation in PR #1025;
-recent overlays, compaction, and additional managed connectors remain proposed.
+recent text overlays and bounded compaction/GC are implemented; additional managed connectors remain proposed.
 Existing behavior remains documented in
 [LAKES.md](../../zig/LAKES.md), [REMOTE_TABLE_SERVING.md](../../zig/REMOTE_TABLE_SERVING.md),
 [CDC.md](../../zig/CDC.md), and [SERVERLESS.md](../../zig/SERVERLESS.md).
@@ -476,15 +476,96 @@ schema, index recipes, credential identity, artifact store, and native table
 incarnation. Upload completion alone never makes indexes ready.
 
 The acceptance response contains `state: accepted`, `wal_lsn`, and
-`searchable: false`. The catalog properties `antfly.wal.coverage` and
-`antfly.cdc.checkpoint` expose committed progress; existing index readiness/status
-reports searchable publication. This release does not advertise an immediately
-searchable recent overlay: queries use the committed lake snapshot and matching
-published indexes. Adding immediate overlay visibility still needs the unified
-key/tombstone, ranking, and cursor semantics specified above. File compaction,
-reader-safe WAL/snapshot retention, vendor-specific CDC adapters beyond existing
-PostgreSQL, and notification subscription provisioning remain explicit follow-on
-work, not implicit side effects of this endpoint.
+`searchable: false`: acceptance does not assert that an archive index already
+exists or that every search mode can serve the transaction. The catalog properties
+`antfly.wal.coverage` and `antfly.cdc.checkpoint` expose committed progress.
+
+### Immediate text search
+
+With a published baseline text/predicate index, a query pins the archive generation
+and accepted WAL tail. It resolves the suffix's stable keys against the archive
+predicate index, masks superseded rows with query-private tombstones, and builds
+native text segments for the last upsert per key. Archive readers and encoded
+bytes stay shared. One composed native corpus supplies BM25 and global top-K;
+this is not a merge of independently scored result lists. Immutable segment term
+statistics follow the ordinary native tombstone scoring contract. Filters, sorting,
+hydration and snippets use the same visibility cut. Deletes do not create hits.
+
+The suffix is bounded to 64 transactions, 32 MiB and 65,536 distinct changes.
+A query fails closed when coverage is unavailable or the bound is exceeded.
+The archive must be an ancestor of the current head through native WAL or
+compaction transitions: an unpublished external writer commit requires archive
+publication. Cursors bind both archive publication and accepted tail; a changed
+cut invalidates the cursor rather than silently moving pagination to newer rows.
+The overlay is reconstructed from durable WAL after restart. SQL continues to
+read a committed Iceberg snapshot. Vector searches with a pending text overlay
+are rejected until matching publication; no uncomputed embedding is fabricated.
+
+### Compaction and garbage collection
+
+`POST /tables/{tableName}/lake/maintenance` accepts `action` (`compact`, `vacuum`,
+`wal_gc`), a stable `operation_id`, and defaults to `dry_run: true`. Maintenance
+is explicitly invoked; it is not an automatically provisioned vendor scheduler.
+Run passes from an operator/job until complete. Publication is woken after a
+successful compaction commit.
+
+```json
+{"action":"compact","operation_id":"hn-compact-2026-10-08","dry_run":false}
+```
+
+Compaction scans delete-aware live rows from whole selected manifests in one
+pinned parent snapshot and writes standard native Parquet/manifests. Per-pass
+limits are 16,384 physical rows, 32 MiB input and 32 manifests; oversized external
+manifests/files are skipped. Oldest sequences are selected first. Untouched files
+retain their sequence numbers. Equality-delete manifests are removed only when
+all remaining data sequences prove those deletes obsolete; position deletes
+remain unless the full data inventory is rewritten. Exact durable catalog intents
+are replayed after interruptions, without rebasing ambiguous commits.
+
+Vacuum first expires unprotected Iceberg snapshots through the catalog CAS,
+then marks retained snapshot file graphs and sweeps only unreachable objects
+with native ownership proofs. Defaults retain seven days and the newest two
+snapshots; named refs, current/live index publications, and durable snapshot
+readers are roots. SQL scans, compaction and index construction hold renewable
+snapshot pins (two-minute leases, thirty-second renewals and thirty-second
+retirement grace). Hosts must keep clock skew within that grace, as with the
+existing publication-reader leases. Antfly deployments sharing a writable lake
+must share the durable artifact/pin authority; moving it requires a coordinated
+reader drain and retention migration. Snapshot readers need write access to
+that shared pin lane even when source data credentials are read-only. Renewal
+failures or expired readers fail
+closed, including during cached reads. A full reader mark pass precedes any
+shared-file deletion. Native ownership markers bind URI, content digest and
+ETag; deletes are conditional on that original ETag. Unmarked external files,
+legacy files, catalog history and orphan uploads outside retired snapshot graphs
+are retained. This is intentionally conservative migration behavior.
+
+Destructive file vacuum requires `exclusive_ownership: true`, acknowledging an
+exclusive native-owned file lifecycle and an external-reader retention contract.
+For a REST authority, this agreement also requires quiescing administrative and
+external metadata/ref writers for the lifetime of the vacuum job: the standard
+REST requirements do not provide a full-metadata CAS that can reject creation
+of a previously unknown named ref. Writers must not resurrect expired files.
+Antfly cannot observe leases of arbitrary external engines. Use a catalog's own
+maintenance integration when that authority owns shared-file cleanup.
+
+```json
+{"action":"vacuum","operation_id":"hn-vacuum-2026-10-08","dry_run":false,
+ "exclusive_ownership":true,"max_deleted":128}
+```
+
+Vacuum jobs persist their expired graphs before commitment and resume bounded
+sweeps after restart. WAL cleanup separately uses the minimum committed coverage
+of all current/live search publications. It retains the boundary header and newer
+suffix, publishes a monotonic GC floor, and persists a per-record delete cursor
+before deleting payloads and headers. `max_deleted` bounds objects for vacuum
+and transaction records for `wal_gc` (each record can remove multiple objects).
+Compact acceptance receipts preserve old
+batch-id idempotency proofs; legacy shared payloads are retained. Request receipts
+and catalog outcome proofs are not garbage-collected in this implementation.
+
+Vendor-specific CDC adapters beyond existing PostgreSQL, coordinated schema
+evolution and notification subscription provisioning remain follow-on work.
 
 The native formats follow the [Iceberg v2 specification](https://iceberg.apache.org/spec/)
 and [Parquet format definitions](https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift).

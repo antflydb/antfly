@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Immutable native row-delta construction. Data and equality deletes share
 //! one sequence number, so deletes suppress older data without deleting the
@@ -127,7 +139,7 @@ pub fn validate(a: A, metadata_json: []const u8, batch: Batch, context: types.Co
     const root = try m.parse(scratch, metadata_json);
     _ = try normalize(scratch, try schema(scratch, root), batch, context);
 }
-fn upload(a: A, files: Files, relative: []const u8, bytes: []const u8) ![]const u8 {
+pub fn upload(a: A, files: Files, relative: []const u8, bytes: []const u8) ![]const u8 {
     try files.context.ensureActive();
     const key = try std.fmt.allocPrint(a, "{s}/{s}", .{ files.prefix, relative });
     var client = files.client;
@@ -136,25 +148,45 @@ fn upload(a: A, files: Files, relative: []const u8, bytes: []const u8) ![]const 
             var existing = try client.getObject(files.bucket, key, .{ .cancellation = types.contextCancellation(&files.context) });
             defer existing.deinit(client.allocator);
             if (!std.mem.eql(u8, existing.body, bytes)) return error.LakeArtifactIdentityConflict;
-            return std.fmt.allocPrint(a, "{s}/{s}", .{ std.mem.trimEnd(u8, files.uri, "/"), relative });
+            return recordOwnership(a, files, relative, bytes, existing.metadata.etag);
         },
         else => return err,
     };
     defer result.deinit(client.allocator);
-    return std.fmt.allocPrint(a, "{s}/{s}", .{ std.mem.trimEnd(u8, files.uri, "/"), relative });
+    return recordOwnership(a, files, relative, bytes, result.etag);
 }
-fn read(a: A, files: Files, uri: []const u8) ![]const u8 {
+fn recordOwnership(a: A, files: Files, relative: []const u8, bytes: []const u8, etag: ?[]const u8) ![]const u8 {
+    const uri = try std.fmt.allocPrint(a, "{s}/{s}", .{ std.mem.trimEnd(u8, files.uri, "/"), relative });
+    const key = try std.fmt.allocPrint(a, "{s}/.antfly-owned/{s}.json", .{ files.prefix, types.digestHex(uri) });
+    const marker = try std.json.Stringify.valueAlloc(a, .{ .uri = uri, .sha256 = &types.digestHex(bytes), .etag = etag, .owner = "antfly-native-lake-v1" }, .{});
+    var client = files.client;
+    var stored = client.putObject(files.bucket, key, marker, .{ .if_none_match = true, .cancellation = types.contextCancellation(&files.context) }) catch |err| switch (err) {
+        error.PreconditionFailed, error.ObjectAlreadyExists => {
+            var existing = try client.getObject(files.bucket, key, .{ .cancellation = types.contextCancellation(&files.context) });
+            defer existing.deinit(client.allocator);
+            if (!std.mem.eql(u8, existing.body, marker)) return error.LakeArtifactIdentityConflict;
+            return uri;
+        },
+        else => return err,
+    };
+    stored.deinit(client.allocator);
+    return uri;
+}
+pub fn read(a: A, files: Files, uri: []const u8) ![]const u8 {
+    return readLimited(a, files, uri, 64 * 1024 * 1024);
+}
+pub fn readLimited(a: A, files: Files, uri: []const u8, max_bytes: usize) ![]const u8 {
     const root = try std.fmt.allocPrint(a, "{s}/", .{std.mem.trimEnd(u8, files.uri, "/")});
     if (!std.mem.startsWith(u8, uri, root)) return error.LakeArtifactOutsideTable;
     const relative = uri[root.len..];
     if (std.mem.indexOf(u8, relative, "..") != null) return error.LakeArtifactOutsideTable;
     const key = try std.fmt.allocPrint(a, "{s}/{s}", .{ files.prefix, relative });
     var client = files.client;
-    var result = try client.getObject(files.bucket, key, .{ .cancellation = types.contextCancellation(&files.context) });
+    var result = try client.getObject(files.bucket, key, .{ .cancellation = types.contextCancellation(&files.context), .max_response_bytes = max_bytes });
     defer result.deinit(client.allocator);
     return a.dupe(u8, result.body);
 }
-fn listEntry(a: A, entry: iceberg.ManifestListEntry) !V {
+pub fn listEntry(a: A, entry: iceberg.ManifestListEntry) !V {
     return json(a, .{ .manifest_path = entry.manifest_path, .manifest_length = entry.manifest_length, .partition_spec_id = entry.partition_spec_id, .content = @backingInt(entry.content), .sequence_number = entry.sequence_number orelse 0, .min_sequence_number = entry.min_sequence_number orelse 0, .added_snapshot_id = entry.added_snapshot_id orelse 0, .added_files_count = entry.added_files_count, .existing_files_count = entry.existing_files_count, .deleted_files_count = entry.deleted_files_count, .added_rows_count = entry.added_rows_count, .existing_rows_count = entry.existing_rows_count, .deleted_rows_count = entry.deleted_rows_count });
 }
 /// Allocations belong to a caller-owned attempt arena. The request identity
@@ -227,7 +259,7 @@ pub fn prepare(a: A, table: types.Table, files: Files, batch: Batch, wal_lsn: u6
     }
     const manifest_list = try avro.ocf(a, avro.list_schema, manifests.array.items, &.{ .{ .key = "format-version", .value = "2" }, .{ .key = "snapshot-id", .value = try std.fmt.allocPrint(a, "{d}", .{snapshot_id}) }, .{ .key = "sequence-number", .value = try std.fmt.allocPrint(a, "{d}", .{seq}) } });
     const list_uri = try upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-{s}-list.avro", .{digest}), manifest_list);
-    var snapshot = try json(a, .{ .@"snapshot-id" = snapshot_id, .@"sequence-number" = seq, .@"timestamp-ms" = timestamp_ms, .@"manifest-list" = list_uri, .@"schema-id" = try m.int(try m.get(root, "current-schema-id")), .summary = .{ .operation = "overwrite", .@"antfly.batch-id" = batch.batch_id } });
+    var snapshot = try json(a, .{ .@"snapshot-id" = snapshot_id, .@"sequence-number" = seq, .@"timestamp-ms" = timestamp_ms, .@"manifest-list" = list_uri, .@"schema-id" = try m.int(try m.get(root, "current-schema-id")), .summary = .{ .operation = "overwrite", .@"antfly.batch-id" = batch.batch_id, .@"antfly.wal.coverage" = try std.fmt.allocPrint(a, "{d}", .{wal_lsn}) } });
     if (parent != .null and try m.int(parent) != -1) try put(a, &snapshot, "parent-snapshot-id", parent);
     try append(&updates, try json(a, .{ .action = "add-snapshot", .snapshot = snapshot }));
     try append(&updates, try json(a, .{ .action = "set-snapshot-ref", .@"ref-name" = "main", .@"snapshot-id" = snapshot_id, .type = "branch" }));

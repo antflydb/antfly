@@ -25,6 +25,7 @@ const types = local.storage_db_types;
 const Context = local.serverless_query_lake_read_context.Context;
 const Store = @import("lake_index_store.zig").Store;
 const A = std.mem.Allocator;
+const overlay_api = @import("lake_search_overlay.zig");
 pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext) !?local.api_query.QueryResponse {
     return executeWithDelivery(a, server, table, req, request, null);
 }
@@ -32,8 +33,8 @@ pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local
     return executePinned(a, server, table, req, request, delivery) catch |err| switch (err) {
         error.ExternalLakeIndexNotPublished, error.ExternalLakeIndexUnavailable => error.IndexRebuilding,
         error.ExternalLakeIndexDefinitionChanged, error.ExternalLakeIndexStoreChanged, error.ExternalLakeIndexCredentialsChanged, error.ExternalLakeIndexSourceChanged, error.ExternalLakeSnapshotMismatch => error.CatalogGenerationChanged,
-        error.LakeIndexReaderLeaseExpired, error.NativeLakeTextCacheBusy, error.NativeLakeRuntimeCacheBusy => error.StorageReadTemporarilyUnavailable,
-        error.NativeLakeTextCorpusTooLarge => error.QueryCandidateBudgetExceeded,
+        error.LakeIndexReaderLeaseExpired, error.NativeLakeTextCacheBusy, error.NativeLakeRuntimeCacheBusy, error.LakeSnapshotReadLeaseExpired, error.LakeSnapshotRetired, error.LakeOverlayCoverageUnavailable => error.StorageReadTemporarilyUnavailable,
+        error.NativeLakeTextCorpusTooLarge, error.LakeOverlayTooLarge => error.QueryCandidateBudgetExceeded,
         error.IndexNotFound => error.InvalidQueryRequest,
         else => err,
     };
@@ -55,10 +56,33 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     defer lease.deinit();
     context = lease.readContext();
     try server.prepareLakeCache();
-    const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store };
-    var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = schema }, options.lakeOptions(), context, &server.lake_read_cache);
+    const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = server.cfg.node_config, .secret_store = server.cfg.secret_store, .catalog_table_id = table.table_id, .catalog_generation = table.object_storage_generation };
+    var overlay_arena = std.heap.ArenaAllocator.init(a);
+    defer overlay_arena.deinit();
+    const oa = overlay_arena.allocator();
+    var overlay: ?overlay_api.Overlay = null;
+    var source_schema = schema;
+    if (schema.binding.write_policy == .iceberg_writer and server.cfg.node_config != null and server.cfg.node_config.?.storage.artifacts.connection != null) {
+        const catalog = local.serverless_external_source_mod.lake_catalog;
+        var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, schema.binding, options, context, .load);
+        defer current.deinit(a);
+        const root = try catalog.metadata.parse(oa, current.table.metadata_json);
+        const base_id = publication.base_source.external_iceberg.snapshot_id;
+        const cut = try overlay_api.snapshotCoverage(root, base_id);
+        const pending = try @import("../serverless/lake_ingestion.zig").pending(oa, schema.binding, options, context, cut);
+        if (pending.changes.len != 0) {
+            try overlay_api.requireNativeAncestry(root, base_id);
+            overlay = try overlay_api.Overlay.init(oa, pending);
+            // The serving index defines the archive cut; later committed and
+            // uncommitted WAL rows share the same pinned suffix.
+            source_schema.binding.write_policy = .read_only;
+            source_schema.binding.snapshot_mode = if (std.mem.startsWith(u8, base_id, "empty:")) .current else .{ .snapshot_id = base_id };
+        }
+    }
+    var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = source_schema }, options.lakeOptions(), context, &server.lake_read_cache);
     defer source.deinit();
     try source.attachCache(&server.lake_read_cache, schema.binding, context);
+    context = source.protectContext(context);
     var store = try Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
     defer store.deinit();
     var arena = std.heap.ArenaAllocator.init(a);
@@ -75,6 +99,12 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     std.mem.writeInt(u64, &table_id, table.table_id, .little);
     snapshot_hash.update(&table_id);
     snapshot_hash.update(publication_bytes);
+    if (overlay) |value| {
+        var lsn_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &lsn_bytes, value.pending.lsn, .little);
+        snapshot_hash.update("accepted-wal-overlay-v1");
+        snapshot_hash.update(&lsn_bytes);
+    }
     snapshot_hash.update(table.schema_json);
     var snapshot_digest: [32]u8 = undefined;
     snapshot_hash.final(&snapshot_digest);
@@ -82,7 +112,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     if (req.remote_snapshot) |expected| {
         if (!std.mem.eql(u8, expected, &snapshot_token)) return error.CatalogGenerationChanged;
     } else if (req.search_after.len != 0 or req.search_before.len != 0) return error.CatalogGenerationChanged;
-    var owner: Execution = .{ .server = server, .table = sql_table, .source = &source, .store = &store, .domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.table_id, store.identity, selected.publication().namespace), .declarations = selected.publication().declarations, .context = context, .request = normalized, .schema_json = table.schema_json, .arena = ca, .result_allocator = a };
+    var owner: Execution = .{ .server = server, .table = sql_table, .source = &source, .store = &store, .domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(table.table_id, store.identity, selected.publication().namespace), .declarations = selected.publication().declarations, .context = context, .request = normalized, .schema_json = table.schema_json, .arena = ca, .result_allocator = a, .overlay = if (overlay != null) &overlay.? else null };
     defer owner.deinit();
     var proof: @import("lake_index_row_source.zig").Provider = .{ .source = &source, .context = context, .expected_delete_objects = selected.delete_objects };
     const metadata = try server.lake_search_metadata.acquire(snapshot_digest, &proof);
@@ -96,6 +126,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     const has_text = for (owner.declarations) |declaration| {
         if (declaration.artifact.kind == .text_segment) break true;
     } else false;
+    if (has_vectors and owner.overlay != null) return error.UnsupportedQueryRequest;
     if (has_vectors) {
         const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .server = server, .table = sql_table, .source = &source, .context = normalized, .store = store.artifactStore(), .store_identity = store.identity, .read_context = context, .pinned = .{ .artifacts = store.artifactStore(), .store_identity = store.identity, .domain = owner.domain, .declarations = owner.declarations, .read_context = context } };
         if (effective.filter_query_json.len != 0) {
@@ -108,7 +139,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
         }
     } else if (!has_text) try @import("lake_index_search_filter.zig").resolve(ca, sql_table, &source, request, &effective);
     owner.hydration_fields = try owner.planHydration(effective);
-    owner.typed_delivery = canDeliverTypedSource(effective);
+    owner.typed_delivery = owner.overlay == null and canDeliverTypedSource(effective);
     var execution_req = effective;
     // Retrieval/ranking for these requests needs identities and scores only.
     // Hydrate the final page once, after all result movement, into retained column pages.
@@ -138,6 +169,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
 }
 const Execution = struct {
     server: *server_api.ApiHttpServer,
+    overlay: ?*overlay_api.Overlay = null,
     table: local.sql_catalog.Table,
     source: *local.serverless_query_lake_serving.ServingSource,
     store: *Store,
@@ -195,6 +227,7 @@ const Execution = struct {
     }
     fn publicKey(raw: ?*anyopaque, a: A, key: []const u8) ![]u8 {
         const self = from(raw);
+        if (self.overlay) |overlay| if (overlay.row(key) != null) return a.dupe(u8, key);
         const position = try @import("lake_index_native_state.zig").coordinates(key);
         if (std.mem.startsWith(u8, key, "lake1:")) {
             if (!self.files.contains(key[6..70])) return error.ExternalLakeSnapshotMismatch;
@@ -241,6 +274,15 @@ const Execution = struct {
         var pin = try self.server.lake_text_corpora.acquire(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation);
         errdefer pin.deinit();
         const identities = try @import("lake_index_text_predicate.zig").Identities.init(self.arena, root, pin.snapshot);
+        if (self.overlay) |overlay| {
+            const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .allow_partial = false, .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+            var excluded = (try resolver.resolve(self.arena, overlay.key_filter)) orelse return error.UnsupportedQueryRequest;
+            defer excluded.bitmap.deinit();
+            if (!excluded.exact) return error.UnsupportedQueryRequest;
+            const joined = try overlay.compose(pin, &excluded.bitmap, self.context);
+            // compose consumed pin; the error cleanup must now own joined.
+            pin = joined;
+        }
         try self.text_identities.put(self.arena, @intFromPtr(pin.snapshot), identities);
         return pin;
     }
@@ -373,27 +415,47 @@ const Execution = struct {
     }
     fn scanIds(raw: ?*anyopaque, a: A, options: search.MatchAllCandidateCollectOptions, target: ?*anyopaque, visit: *const fn (?*anyopaque, []const u8) anyerror!local.storage_docstore.DocStore.ScanAction) !void {
         const self = from(raw);
+        if (self.overlay) |overlay| if (overlay.physical == null) {
+            const resolver: @import("lake_index_text_predicate.zig").PhysicalResolver = .{ .allow_partial = false, .server = self.server, .table = self.table, .source = self.source, .context = self.request, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
+            const excluded = (try resolver.resolve(self.arena, overlay.key_filter)) orelse return error.UnsupportedQueryRequest;
+            overlay.physical = excluded.bitmap;
+        };
         var request = self.request;
         request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
         const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = &.{}, .primary_order = true, .after = options.primary_key_start_after, .before = options.primary_key_stop_before, .limit = 256 }, request, self.source);
         defer cursor.close(cursor.ptr);
         var manager: local.sql_spill.Manager = .{ .alloc = a, .io = self.context.io.?, .context = self, .checkpoint = scanCheckpoint };
         defer manager.deinit();
-        var sort = local.sql_spill.Sort.init(a, &manager, &.{.{ .descending = true }}, 512 * 1024);
+        var sort = local.sql_spill.Sort.init(a, &manager, &.{.{ .descending = options.primary_key_reverse }}, 512 * 1024);
         defer sort.deinit();
         var ordinal: u64 = 0;
         while (true) {
             const page = try cursor.next(cursor.ptr, a, 256);
             defer page.deinit();
             for (page.rows) |row| {
-                if (options.primary_key_reverse) {
+                if (self.overlay) |overlay| {
+                    const position = try @import("lake_index_native_state.zig").coordinates(row.id);
+                    const file = self.files.get(row.id[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
+                    if (overlay.physical.?.contains(file, position.group, position.row)) continue;
+                }
+                if (options.primary_key_reverse or self.overlay != null) {
                     try sort.add(.{ .values = &.{}, .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = row.id })}, .ordinal = ordinal });
                     ordinal += 1;
                 } else if (try visit(target, row.id) == .stop) return;
             }
             if (page.after == null) break;
         }
-        if (options.primary_key_reverse) {
+        if (self.overlay) |overlay| {
+            var ids = overlay.rows.keyIterator();
+            while (ids.next()) |id| {
+                try self.context.ensureActive();
+                if (options.primary_key_start_after) |after| if (std.mem.order(u8, id.*, after) != .gt) continue;
+                if (options.primary_key_stop_before) |before| if (std.mem.order(u8, id.*, before) != .lt) continue;
+                try sort.add(.{ .values = &.{}, .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = id.* })}, .ordinal = ordinal });
+                ordinal += 1;
+            }
+        }
+        if (options.primary_key_reverse or self.overlay != null) {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();
             while (true) {
@@ -407,7 +469,30 @@ const Execution = struct {
         const self = from(raw);
         const identities = self.text_identities.get(@intFromPtr(snapshot)) orelse return null;
         const resolver: @import("lake_index_text_predicate.zig").Resolver = .{ .allow_partial = self.predicate_allow_partial and !std.mem.eql(u8, json, self.predicate_exclusion_json), .server = self.server, .table = self.table, .source = self.source, .context = self.request, .identities = identities, .store = self.store.artifactStore(), .store_identity = self.store.identity, .read_context = self.context, .pinned = .{ .artifacts = self.store.artifactStore(), .store_identity = self.store.identity, .domain = self.domain, .declarations = self.declarations, .read_context = self.context } };
-        return resolver.resolve(a, json);
+        var result = (try resolver.resolve(a, json)) orelse return null;
+        errdefer result.bitmap.deinit();
+        if (self.overlay) |overlay| {
+            if (!result.exact) {
+                result.bitmap.deinit();
+                return null;
+            }
+            const filter = try std.json.parseFromSliceLeaky(std.json.Value, self.arena, json, .{});
+            var offset: u32 = 0;
+            for (snapshot.segments, 0..) |segment, ordinal| {
+                if (ordinal < identities.offsets.len - 1) {
+                    offset = try std.math.add(u32, offset, segment.reader.doc_count);
+                    continue;
+                }
+                for (0..segment.reader.doc_count) |doc| {
+                    const id = try snapshot.storedIdScoped(self.arena, offset + @as(u32, @intCast(doc))) orelse continue;
+                    const row = overlay.row(id) orelse continue;
+                    try self.context.ensureActive();
+                    if (try local.storage_db_query_graph_exec.jsonDocMatchesPatternFilter(self.arena, id, row, filter)) try result.bitmap.add(offset + @as(u32, @intCast(doc)));
+                }
+                offset = try std.math.add(u32, offset, segment.reader.doc_count);
+            }
+        }
+        return result;
     }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
         const self = from(raw);
@@ -538,6 +623,40 @@ const Execution = struct {
             a.free(result);
         }
         if (keys.len == 0) return result;
+        if (self.overlay) |overlay| {
+            var archive: std.ArrayList([]const u8) = .empty;
+            defer archive.deinit(a);
+            var positions: std.ArrayList(usize) = .empty;
+            defer positions.deinit(a);
+            var recent: usize = 0;
+            for (keys, 0..) |key, position| {
+                if (overlay.row(key)) |row| {
+                    if (T == types.ColumnSource) return error.UnsupportedSqlExecution;
+                    var image: std.json.Value = .{ .object = .empty };
+                    defer types.deinitJsonValue(a, &image);
+                    var fields = row.object.iterator();
+                    while (fields.next()) |field| {
+                        const include = if (selected_fields) |selected| for (selected) |path| {
+                            if (std.mem.eql(u8, path, field.key_ptr.*)) break true;
+                        } else false else true;
+                        if (include) try image.object.put(a, try a.dupe(u8, field.key_ptr.*), try types.cloneJsonValue(a, field.value_ptr.*));
+                    }
+                    try image.object.put(a, try a.dupe(u8, "_id"), .{ .string = try a.dupe(u8, key) });
+                    try image.object.put(a, try a.dupe(u8, "_type"), .{ .string = try a.dupe(u8, "row") });
+                    if (T == std.json.Value) result[position] = try types.cloneJsonValue(a, image) else result[position] = try std.json.Stringify.valueAlloc(a, image, .{});
+                    recent += 1;
+                } else {
+                    try archive.append(a, key);
+                    try positions.append(a, position);
+                }
+            }
+            if (recent != 0) {
+                const values = try loadSelected(T, raw, a, archive.items, selected_fields);
+                defer a.free(values);
+                for (values, positions.items) |value, position| result[position] = value;
+                return result;
+            }
+        }
         // Small results keep one selection. Larger results use a bounded
         // external ordering pass, then visit physical windows in file/group/row
         // order. Window size never becomes a public result/candidate limit.

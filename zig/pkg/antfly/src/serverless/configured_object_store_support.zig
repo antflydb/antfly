@@ -63,7 +63,24 @@ pub fn openNativeArtifactObjectStoreAlloc(
 pub const BindingObjectStoreOpenOptions = struct {
     /// Borrowed options must outlive synchronous lake source opening.
     pub fn lakeOptions(self: *const @This()) @import("antfly_local_sources").serverless_lake_host.OpenOptions {
-        return .{ .file_bucket = self.file_bucket, .resolver = .{ .ptr = self, .open_fn = openLake }, .catalog_resolver = .{ .ptr = self, .load_fn = loadLakeCatalog } };
+        return .{ .file_bucket = self.file_bucket, .resolver = .{ .ptr = self, .open_fn = openLake }, .catalog_resolver = .{ .ptr = self, .load_fn = loadLakeCatalog }, .snapshot_pin_resolver = .{ .ptr = self, .acquire = acquireSnapshotPin } };
+    }
+    fn acquireSnapshotPin(raw: *const anyopaque, a: Allocator, source: catalog_binding.Binding, snapshot: []const u8, uuid: []const u8, context: lake_catalog.types.Context) anyerror!?@import("antfly_local_sources").serverless_lake_host.SnapshotPin {
+        _ = a;
+        const pin_alloc = @import("antfly_platform").allocator.processAllocator(std.heap.smp_allocator);
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        if (source.catalog == null or self.node_config == null or self.node_config.?.storage.artifacts.connection == null or snapshot.len == 0) return null;
+        const pins = @import("lake_snapshot_pins.zig");
+        var opened = try openNativeArtifactObjectStoreAlloc(pin_alloc, self.node_config.?, self.secret_store, false);
+        errdefer opened.deinit();
+        const prefix = try pins.namespace(pin_alloc, opened.prefix, source, uuid);
+        errdefer pin_alloc.free(prefix);
+        const id = try pin_alloc.dupe(u8, snapshot);
+        errdefer pin_alloc.free(id);
+        const owner = try pin_alloc.create(pins.Owner);
+        errdefer pin_alloc.destroy(owner);
+        owner.* = .{ .a = pin_alloc, .opened = opened, .prefix = prefix, .snapshot = id, .parent = context, .io = context.io orelse return error.LakeSnapshotReadLeaseExpired };
+        return try owner.start();
     }
     fn openLake(raw: *const anyopaque, alloc: Allocator, source: catalog_binding.Binding) anyerror!object_store_support.OpenedObjectStore {
         const self: *const @This() = @ptrCast(@alignCast(raw));

@@ -113,6 +113,7 @@ pub const SearchTextDispatcher = struct {
 /// their publication lease and immutable analysis/schema until release; query
 /// execution is independent of the segment's local or remote storage owner.
 pub const PinnedTextSource = struct {
+    read_context: ?*anyopaque = null,
     snapshot: *index_mod.IndexSnapshot,
     name: []const u8,
     text_analysis: @FieldType(index_manager_mod.IndexManager.TextIndex, "text_analysis"),

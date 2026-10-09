@@ -1930,8 +1930,9 @@ paths:
       summary: ingestLakeChanges
       description: Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable
         batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete
-        row images; deletes contain only key fields. Acceptance precedes catalog commitment and searchable
-        index publication. Requires table admin permission and iceberg_writer policy.
+        row images; deletes contain only key fields. Acceptance precedes catalog commitment and index
+        publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive
+        publication. Requires table admin permission and iceberg_writer policy.
       requestBody:
         required: true
         content:
@@ -1992,7 +1993,8 @@ paths:
       responses:
         '202':
           description: Durable WAL acceptance; retry the same transaction after an ambiguous response.
-            Query visibility follows automatic publication.
+            Native text search can compose a bounded accepted-WAL overlay before catalog/index publication;
+            SQL reads follow committed snapshots.
           content:
             application/json:
               schema:
@@ -2015,6 +2017,102 @@ paths:
           description: Source, predecessor checkpoint or batch identity conflict
         '503':
           description: Durable ingestion unavailable
+        '504':
+          description: Request deadline exceeded
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/lake/maintenance:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: maintainLakeTable
+      tags:
+        - table_management
+      summary: Maintain a writable Iceberg table
+      description: Plan or execute bounded compaction, snapshot/file vacuum, or covered WAL cleanup. A
+        stable operation ID resumes saved catalog intents after uncertainty. Defaults to dry run. Destructive
+        file vacuum requires an explicit exclusive ownership and external-reader retention agreement;
+        only native ownership proofs authorize object deletion. Current snapshots, named refs, native
+        serving readers and durable snapshot pins remain protected. Compact and vacuum commits automatically
+        schedule index publication.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - action
+                - operation_id
+              properties:
+                action:
+                  type: string
+                  enum:
+                    - compact
+                    - vacuum
+                    - wal_gc
+                operation_id:
+                  type: string
+                  minLength: 1
+                  maxLength: 256
+                dry_run:
+                  type: boolean
+                  default: true
+                exclusive_ownership:
+                  type: boolean
+                  default: false
+                max_rows:
+                  type: integer
+                  format: uint64
+                  minimum: 1
+                  maximum: 16384
+                  default: 16384
+                max_bytes:
+                  type: integer
+                  format: uint64
+                  minimum: 1
+                  maximum: 33554432
+                  default: 33554432
+                retain_ms:
+                  type: integer
+                  format: uint64
+                  minimum: 600000
+                  default: 604800000
+                keep_latest:
+                  type: integer
+                  minimum: 1
+                  maximum: 1024
+                  default: 2
+                max_deleted:
+                  type: integer
+                  minimum: 1
+                  maximum: 4096
+                  default: 4096
+      responses:
+        '200':
+          description: Bounded maintenance result; complete false requires another pass with the same
+            operation ID.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          description: Invalid maintenance limits
+        '403':
+          description: Missing admin permission, writer policy or ownership agreement
+        '404':
+          description: Table or catalog not found
+        '409':
+          description: Conditional conflict or conflicting saved operation
+        '503':
+          description: Maintenance unavailable or uncertain outcome; retry the same operation ID
         '504':
           description: Request deadline exceeded
       security:

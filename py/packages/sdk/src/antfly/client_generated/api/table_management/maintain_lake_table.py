@@ -6,21 +6,21 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
-from ...models.ingest_lake_changes_body import IngestLakeChangesBody
-from ...models.ingest_lake_changes_response_202 import IngestLakeChangesResponse202
+from ...models.maintain_lake_table_body import MaintainLakeTableBody
+from ...models.maintain_lake_table_response_200 import MaintainLakeTableResponse200
 from ...types import Response
 
 
 def _get_kwargs(
     table_name: str,
     *,
-    body: IngestLakeChangesBody,
+    body: MaintainLakeTableBody,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
     _kwargs: dict[str, Any] = {
         "method": "post",
-        "url": "/db/v1/tables/{table_name}/lake/changes".format(
+        "url": "/db/v1/tables/{table_name}/lake/maintenance".format(
             table_name=quote(str(table_name), safe=""),
         ),
     }
@@ -35,11 +35,11 @@ def _get_kwargs(
 
 def _parse_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Any | IngestLakeChangesResponse202 | None:
-    if response.status_code == 202:
-        response_202 = IngestLakeChangesResponse202.from_dict(response.json())
+) -> Any | MaintainLakeTableResponse200 | None:
+    if response.status_code == 200:
+        response_200 = MaintainLakeTableResponse200.from_dict(response.json())
 
-        return response_202
+        return response_200
 
     if response.status_code == 400:
         response_400 = cast(Any, None)
@@ -73,7 +73,7 @@ def _parse_response(
 
 def _build_response(
     *, client: AuthenticatedClient | Client, response: httpx.Response
-) -> Response[Any | IngestLakeChangesResponse202]:
+) -> Response[Any | MaintainLakeTableResponse200]:
     return Response(
         status_code=HTTPStatus(response.status_code),
         content=response.content,
@@ -86,26 +86,27 @@ def sync_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: IngestLakeChangesBody,
-) -> Response[Any | IngestLakeChangesResponse202]:
-    """ingestLakeChanges
+    body: MaintainLakeTableBody,
+) -> Response[Any | MaintainLakeTableResponse200]:
+    """Maintain a writable Iceberg table
 
-     Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID,
-    source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images;
-    deletes contain only key fields. Acceptance precedes catalog commitment and index publication.
-    Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication.
-    Requires table admin permission and iceberg_writer policy.
+     Plan or execute bounded compaction, snapshot/file vacuum, or covered WAL cleanup. A stable operation
+    ID resumes saved catalog intents after uncertainty. Defaults to dry run. Destructive file vacuum
+    requires an explicit exclusive ownership and external-reader retention agreement; only native
+    ownership proofs authorize object deletion. Current snapshots, named refs, native serving readers
+    and durable snapshot pins remain protected. Compact and vacuum commits automatically schedule index
+    publication.
 
     Args:
         table_name (str):
-        body (IngestLakeChangesBody):
+        body (MaintainLakeTableBody):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | IngestLakeChangesResponse202]
+        Response[Any | MaintainLakeTableResponse200]
     """
 
     kwargs = _get_kwargs(
@@ -124,26 +125,27 @@ def sync(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: IngestLakeChangesBody,
-) -> Any | IngestLakeChangesResponse202 | None:
-    """ingestLakeChanges
+    body: MaintainLakeTableBody,
+) -> Any | MaintainLakeTableResponse200 | None:
+    """Maintain a writable Iceberg table
 
-     Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID,
-    source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images;
-    deletes contain only key fields. Acceptance precedes catalog commitment and index publication.
-    Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication.
-    Requires table admin permission and iceberg_writer policy.
+     Plan or execute bounded compaction, snapshot/file vacuum, or covered WAL cleanup. A stable operation
+    ID resumes saved catalog intents after uncertainty. Defaults to dry run. Destructive file vacuum
+    requires an explicit exclusive ownership and external-reader retention agreement; only native
+    ownership proofs authorize object deletion. Current snapshots, named refs, native serving readers
+    and durable snapshot pins remain protected. Compact and vacuum commits automatically schedule index
+    publication.
 
     Args:
         table_name (str):
-        body (IngestLakeChangesBody):
+        body (MaintainLakeTableBody):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | IngestLakeChangesResponse202
+        Any | MaintainLakeTableResponse200
     """
 
     return sync_detailed(
@@ -157,26 +159,27 @@ async def asyncio_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: IngestLakeChangesBody,
-) -> Response[Any | IngestLakeChangesResponse202]:
-    """ingestLakeChanges
+    body: MaintainLakeTableBody,
+) -> Response[Any | MaintainLakeTableResponse200]:
+    """Maintain a writable Iceberg table
 
-     Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID,
-    source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images;
-    deletes contain only key fields. Acceptance precedes catalog commitment and index publication.
-    Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication.
-    Requires table admin permission and iceberg_writer policy.
+     Plan or execute bounded compaction, snapshot/file vacuum, or covered WAL cleanup. A stable operation
+    ID resumes saved catalog intents after uncertainty. Defaults to dry run. Destructive file vacuum
+    requires an explicit exclusive ownership and external-reader retention agreement; only native
+    ownership proofs authorize object deletion. Current snapshots, named refs, native serving readers
+    and durable snapshot pins remain protected. Compact and vacuum commits automatically schedule index
+    publication.
 
     Args:
         table_name (str):
-        body (IngestLakeChangesBody):
+        body (MaintainLakeTableBody):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Any | IngestLakeChangesResponse202]
+        Response[Any | MaintainLakeTableResponse200]
     """
 
     kwargs = _get_kwargs(
@@ -193,26 +196,27 @@ async def asyncio(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: IngestLakeChangesBody,
-) -> Any | IngestLakeChangesResponse202 | None:
-    """ingestLakeChanges
+    body: MaintainLakeTableBody,
+) -> Any | MaintainLakeTableResponse200 | None:
+    """Maintain a writable Iceberg table
 
-     Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID,
-    source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images;
-    deletes contain only key fields. Acceptance precedes catalog commitment and index publication.
-    Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication.
-    Requires table admin permission and iceberg_writer policy.
+     Plan or execute bounded compaction, snapshot/file vacuum, or covered WAL cleanup. A stable operation
+    ID resumes saved catalog intents after uncertainty. Defaults to dry run. Destructive file vacuum
+    requires an explicit exclusive ownership and external-reader retention agreement; only native
+    ownership proofs authorize object deletion. Current snapshots, named refs, native serving readers
+    and durable snapshot pins remain protected. Compact and vacuum commits automatically schedule index
+    publication.
 
     Args:
         table_name (str):
-        body (IngestLakeChangesBody):
+        body (MaintainLakeTableBody):
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Any | IngestLakeChangesResponse202
+        Any | MaintainLakeTableResponse200
     """
 
     return (

@@ -27045,7 +27045,7 @@ pub fn requiredPermissionForRequest(alloc: std.mem.Allocator, method: http_commo
         const remainder = path["/tables/".len..];
         if (std.mem.indexOfScalar(u8, remainder, '/')) |separator| {
             const suffix = remainder[separator + 1 ..];
-            if (std.mem.eql(u8, suffix, "lake/catalog") or std.mem.eql(u8, suffix, "lake/changes") or std.mem.eql(u8, suffix, "lake/commits") or std.mem.startsWith(u8, suffix, "lake/commits/")) {
+            if (std.mem.eql(u8, suffix, "lake/catalog") or std.mem.eql(u8, suffix, "lake/changes") or std.mem.eql(u8, suffix, "lake/maintenance") or std.mem.eql(u8, suffix, "lake/commits") or std.mem.startsWith(u8, suffix, "lake/commits/")) {
                 if (method == .GET or method == .POST) return try tablePermission(alloc, remainder[0..separator], if (method == .GET) .read else .admin);
             }
         }

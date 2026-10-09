@@ -138,9 +138,13 @@ The native transaction ingress now owns a segmented durable WAL, Parquet data
 and equality-delete files, Iceberg manifests, catalog commitment, and automatic
 matching index publication. See [the transaction envelope and recovery contracts](../plans/lake-ingestion-and-publication.md#native-transaction-ingestion-and-searchable-publication).
 Flat scalar schemas and one source epoch/key definition per table are supported.
-Vendor-specific CDC subscription adapters, compaction/garbage collection,
-coordinated schema evolution, and immediate recent-overlay search remain
-separate layers of the ingestion plan. Iceberg v3 encryption and view updates are not
+Immediate text overlays and bounded compaction, reader-safe snapshot/file vacuum
+and WAL cleanup are implemented through the native lake path and the
+`POST /tables/{tableName}/lake/maintenance` admin API. See
+[visibility and maintenance contracts](../plans/lake-ingestion-and-publication.md#immediate-text-search)
+for limits, ownership, retention and replay semantics. Vendor-specific CDC
+subscription adapters and coordinated schema evolution remain separate layers
+of the ingestion plan. Iceberg v3 encryption and view updates are not
 accepted by the managed v2 writer.
 
 The underlying protocol is the [Iceberg REST catalog specification](https://iceberg.apache.org/docs/latest/rest-protocol/),

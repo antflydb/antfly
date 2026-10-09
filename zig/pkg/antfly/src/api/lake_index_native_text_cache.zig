@@ -456,7 +456,7 @@ const Entry = struct {
         const lease = self.allocator.create(QueryLease) catch return error.NativeLakeTextCacheBusy;
         errdefer self.allocator.destroy(lease);
         lease.* = .{ .entry = self, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager } };
-        return .{ .snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .owner = lease, .release_owner = QueryLease.release };
+        return .{ .read_context = &lease.read, .snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .owner = lease, .release_owner = QueryLease.release };
     }
     fn releaseSource(raw: *anyopaque) void {
         const self: *Entry = @ptrCast(@alignCast(raw));
