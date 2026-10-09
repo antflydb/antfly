@@ -35,7 +35,7 @@ import (
 )
 
 // SupportedABIVersion is the Antfly C ABI version this binding expects.
-const SupportedABIVersion uint32 = 2
+const SupportedABIVersion uint32 = 3
 
 // OpenMode controls how an Antfly Lite file is opened.
 type OpenMode uint32
@@ -155,6 +155,7 @@ type DB struct {
 	// Close, so the handle is never freed under an in-flight call.
 	mu     sync.RWMutex
 	handle unsafe.Pointer
+	owner  *DB // Retains the owning database while a table handle is live.
 }
 
 // ThreadingSerialized is the only threading mode libantfly provides: any
@@ -731,23 +732,20 @@ func (db *DB) StatsJSON() ([]byte, error) {
 	})
 }
 
-// SQLJSON executes SQL against the single embedded table named tableName.
-// The request uses statement, parameters and limit from the public SQL API.
-// The returned body is retained even on error so callers can inspect SQLSTATE;
-// sessions and catalog DDL require the server API, not a single database handle.
-func (db *DB) SQLJSON(tableName string, request []byte) ([]byte, error) {
+// SQLJSON executes SQL against the database catalog.
+// The request contains statement, parameters and an optional result limit.
+// The returned body includes SQLSTATE diagnostics on failure.
+func (db *DB) SQLJSON(request []byte) ([]byte, error) {
 	handle, release, err := db.acquire()
 	if err != nil {
 		return nil, err
 	}
 	defer release()
 	defer runtime.KeepAlive(db)
-	table, freeTable := makeCStringSlice([]byte(tableName))
-	defer freeTable()
 	input, freeInput := makeCStringSlice(request)
 	defer freeInput()
 	var out C.antfly_buffer
-	code := C.antfly_db_sql_json((*C.antfly_db)(handle), table, input, &out)
+	code := C.antfly_db_sql_json((*C.antfly_db)(handle), input, &out)
 	return takeBuffer(out), check(code)
 }
 
