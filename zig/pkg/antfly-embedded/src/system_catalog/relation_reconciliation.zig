@@ -174,7 +174,7 @@ pub const State = struct {
         if (self.phase != .building and self.pass.claims > self.expected.claims) return error.InvalidCatalogRecord;
         if (self.phase == .ready and (self.cursor_len != 0 or !totalsEqual(self.pass, .{}))) return error.InvalidCatalogRecord;
     }
-    const magic = "AFRC03";
+    const magic = "AFRC04";
     pub const encoded_len = magic.len + 8 + 16 + 16 + 8 + 2 + 2 + max_cursor_bytes + 2 * (8 + 8 + 32 + 32);
     pub fn encode(self: *const State) ![encoded_len]u8 {
         try self.validate();
@@ -474,7 +474,7 @@ pub fn Verifier(comptime Reader: type) type {
                     if (try self.retirementFor(generation)) |retired| {
                         if (std.mem.order(u8, retired.cursor(), key) != .lt) return error.InvalidCatalogRecord;
                     } else {
-                        self.claims = std.math.add(u64, self.claims, 1) catch return error.InvalidCatalogRecord;
+                        self.claims = std.math.add(u64, self.claims, try claimCount(try names.Claim.fromEntry(logical, owner))) catch return error.InvalidCatalogRecord;
                         addClaimHash(&self.claim_hash, try claimHash(try names.Claim.fromEntry(logical, owner)));
                     }
                 },
@@ -603,10 +603,19 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
                     const owner = if (next) |bytes| try names.Entry.decode(bytes) else null;
                     if (prior) |value| if (owner) |final| if (value.eql(final)) return;
                     if (std.mem.eql(u8, &generation.job_id, &current.job_id)) {
-                        if (prior != null or owner == null) return error.InvalidCatalogRecord;
+                        if (owner == null) return error.InvalidCatalogRecord;
                         if (self.old) |before| if (std.mem.eql(u8, &before.job_id, &current.job_id) and before.phase != .building) return error.InvalidCatalogRecord;
-                        self.count = std.math.add(u64, self.count, 1) catch return error.InvalidCatalogRecord;
                         const logical = try decodeCandidateGenerationKey(key, generation);
+                        if (prior) |value| {
+                            // Building may add exactly one pending slot to a
+                            // previously contributed active predecessor.
+                            if (value.pending != null or value.active == null or owner.?.pending == null or
+                                !(names.Entry{ .active = value.active }).eql(.{ .active = owner.?.active })) return error.InvalidCatalogRecord;
+                            const claim = try names.Claim.fromEntry(logical, value);
+                            self.count = std.math.sub(u64, self.count, try claimCount(claim)) catch return error.InvalidCatalogRecord;
+                            subtractClaimHash(&self.hash, try claimHash(claim));
+                        }
+                        self.count = std.math.add(u64, self.count, try claimCount(try names.Claim.fromEntry(logical, owner.?))) catch return error.InvalidCatalogRecord;
                         addClaimHash(&self.hash, try claimHash(try names.Claim.fromEntry(logical, owner.?)));
                     } else {
                         if (prior == null or owner != null) return error.InvalidCatalogRecord;
@@ -796,6 +805,9 @@ pub const Page = struct {
         const owned = arena.allocator();
         var after = state;
         var claims: std.ArrayList(names.Claim) = .empty;
+        // Each admitted source row contributes at least one name. Reserve the
+        // common page once; arenas cannot reclaim geometric growth buffers.
+        try claims.ensureTotalCapacity(owned, max_tables_per_page);
         var bytes: usize = 0;
         var rows: usize = 0;
         while (rows < max_tables_per_page) {
@@ -819,7 +831,7 @@ pub const Page = struct {
             bytes += row_bytes;
             rows += 1;
             try appendSource(&after.pass, row);
-            for (row.claims) |claim| try claims.append(owned, .{ .key = .{ .namespace_id = claim.key.namespace_id, .name = try owned.dupe(u8, claim.key.name) }, .owner = claim.owner, .pending = claim.pending });
+            for (row.claims) |claim| try claims.append(owned, .{ .key = .{ .namespace_id = claim.key.namespace_id, .name = try owned.dupe(u8, claim.key.name) }, .owner = claim.owner, .pending = claim.pending, .reservation = claim.reservation });
             try after.setCursor(row.key);
         }
         // Reject duplicate names within this page before entering apply.
@@ -839,6 +851,7 @@ pub const Page = struct {
         const owned = arena.allocator();
         var after = state;
         var claims: std.ArrayList(names.Claim) = .empty;
+        try claims.ensureTotalCapacity(owned, max_tables_per_page);
         // Fixed cardinality/byte budgets guarantee yielding even on tiny rows.
         while (claims.items.len < max_tables_per_page) {
             const row: CandidateRow = (try source.nextAfter(after.cursor())) orelse {
@@ -851,7 +864,7 @@ pub const Page = struct {
             if (std.mem.order(u8, after.cursor(), row.key) != .lt or row.key.len > max_cursor_bytes) return error.InvalidCatalogRecord;
             const key = try decodeCandidateKey(row.key, &state);
             const owner = try names.Entry.decode(row.value);
-            after.pass.claims = std.math.add(u64, after.pass.claims, 1) catch return error.CatalogCommandTooLarge;
+            after.pass.claims = std.math.add(u64, after.pass.claims, try claimCount(try names.Claim.fromEntry(key, owner))) catch return error.CatalogCommandTooLarge;
             if (after.pass.claims > after.expected.claims) return error.InvalidCatalogRecord;
             const claim = try names.Claim.fromEntry(key, owner);
             addClaimHash(&after.pass.claim_hash, try claimHash(claim));
@@ -861,8 +874,9 @@ pub const Page = struct {
         transferred = true;
         return own(arena, state, after, claims.items);
     }
-    fn own(arena: std.heap.ArenaAllocator, before: State, after: State, claims: []const names.Claim) !Page {
-        return .{ .plan = try names.EntryPlan.takeClaims(arena, claims), .before = before, .after = after, .claims = claims };
+    fn own(arena: std.heap.ArenaAllocator, before: State, after: State, claims: []names.Claim) !Page {
+        const plan = try names.EntryPlan.takeClaims(arena, claims);
+        return .{ .plan = plan, .before = before, .after = after, .claims = plan.claims };
     }
 
     pub fn deinit(self: *Page) void {
@@ -888,6 +902,8 @@ pub const Page = struct {
         if (self.before.phase == .building) {
             var writer: CandidateWriter(@typeInfo(@TypeOf(txn)).pointer.child) = .{ .base = store };
             try self.plan.apply(&writer);
+        } else if (self.before.phase == .verifying_source) {
+            try self.plan.verifyContributions(&store);
         } else try self.plan.verifyPublished(&store);
         if (self.after.phase == .ready) {
             // Preparation observed EOF in a different pinned transaction.
@@ -975,19 +991,38 @@ fn finishSource(state: *State) !void {
     state.pass = .{};
     try state.setCursor("");
 }
-fn claimHash(claim: names.Claim) ![32]u8 {
+fn claimCount(claim: names.Claim) !u64 {
+    const entry = try claim.entry();
+    return @as(u64, @intFromBool(entry.active != null and !claim.reservation)) + @intFromBool(entry.pending != null);
+}
+fn ownerHash(key_value: names.Key, owner: names.Owner) ![32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update("antfly.relation-candidate.claim.v2");
+    hash.update("antfly.relation-candidate.slot.v3");
     var key: [10]u8 = undefined;
-    std.mem.writeInt(u64, key[0..8], claim.key.namespace_id, .big);
-    std.mem.writeInt(u16, key[8..10], @intCast(claim.key.name.len), .big);
+    std.mem.writeInt(u64, key[0..8], key_value.namespace_id, .big);
+    std.mem.writeInt(u16, key[8..10], @intCast(key_value.name.len), .big);
     hash.update(&key);
-    hash.update(claim.key.name);
-    const owner = try (try claim.entry()).encode();
-    hash.update(&owner);
+    hash.update(key_value.name);
+    hash.update(&(try owner.encode()));
     var digest: [32]u8 = undefined;
     hash.final(&digest);
     return digest;
+}
+fn claimHash(claim: names.Claim) ![32]u8 {
+    const entry = try claim.entry();
+    var sum: [32]u8 = @splat(0);
+    if (!claim.reservation) if (entry.active) |owner| addClaimHash(&sum, try ownerHash(claim.key, owner));
+    if (entry.pending) |owner| addClaimHash(&sum, try ownerHash(claim.key, owner));
+    return sum;
+}
+fn subtractClaimHash(sum: *[32]u8, value: [32]u8) void {
+    var borrow: u16 = 0;
+    for (sum, value) |*byte, sub| {
+        const amount = @as(u16, sub) + borrow;
+        const prior: u16 = byte.*;
+        byte.* = @truncate(prior + 256 - amount);
+        borrow = @intFromBool(prior < amount);
+    }
 }
 fn addClaimHash(sum: *[32]u8, value: [32]u8) void {
     var carry: u16 = 0;
@@ -999,9 +1034,8 @@ fn addClaimHash(sum: *[32]u8, value: [32]u8) void {
 }
 fn appendSource(totals: *Totals, row: SourceRow) !void {
     totals.rows = std.math.add(u64, totals.rows, 1) catch return error.CatalogCommandTooLarge;
-    totals.claims = std.math.add(u64, totals.claims, row.claims.len) catch return error.CatalogCommandTooLarge;
     var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update("antfly.relation-candidate.source.v2");
+    hash.update("antfly.relation-candidate.source.v3");
     hash.update(&totals.source_hash);
     var numbers: [26]u8 = undefined;
     std.mem.writeInt(u16, numbers[0..2], @intCast(row.key.len), .big);
@@ -1011,8 +1045,11 @@ fn appendSource(totals: *Totals, row: SourceRow) !void {
     hash.update(&numbers);
     hash.update(row.key);
     for (row.claims) |claim| {
+        totals.claims = std.math.add(u64, totals.claims, try claimCount(claim)) catch return error.CatalogCommandTooLarge;
         const digest = try claimHash(claim);
         hash.update(&digest);
+        hash.update(&.{@intFromBool(claim.reservation)});
+        hash.update(&(try (try claim.entry()).encode()));
         addClaimHash(&totals.claim_hash, digest);
     }
     hash.final(&totals.source_hash);
@@ -1185,6 +1222,119 @@ test "relation reconciliation compound candidates retain active visibility and v
     try std.testing.expect(try garbage.apply(&txn));
     try std.testing.expect(try reader.getEntry(claims[0].key) == null);
     try std.testing.expect(try reader.getEntry(claims[1].key) == null);
+}
+
+test "relation reconciliation merges independent reservation sources within and across bounded pages" {
+    const a = std.testing.allocator;
+    var cut = try names.TableCut.initSuccessor(a, .{ .namespace_id = 5, .table_id = 7, .name = "orders", .schema_json = "{\"version\":3}" }, .{ .namespace_id = 5, .table_id = 8, .name = "orders", .schema_json = "{\"version\":4,\"relational_indexes\":[{\"name\":\"new_idx\"}]}", .phase = .reserved, .publication_id = @splat(9) });
+    defer cut.deinit();
+    const active = try names.Claim.fromEntry(cut.claims[0].key, .{ .active = cut.claims[0].owner });
+    var reservations: [2]names.Claim = .{ cut.claims[0], cut.claims[1] };
+    for (&reservations) |*claim| claim.reservation = true;
+    const reservation_row: SourceRow = .{ .key = "z:restore", .table_id = 7, .pending_table_id = 8, .claims = &reservations };
+    {
+        var txn = TestTxn.init();
+        defer txn.deinit();
+        const state = try State.init(41, try nextJobId(null), test_epoch);
+        try start(&txn, &state, test_epoch, null);
+        var source: TestSource = .{ .rows = &.{reservation_row} };
+        var page = try Page.prepareSource(a, state, test_epoch, &source);
+        defer page.deinit();
+        try std.testing.expectError(error.CatalogGenerationChanged, page.apply(&txn, test_epoch));
+        var verifier = try Verifier(TestTxn).init(&txn, 41);
+        var entries = txn.values.iterator();
+        while (entries.next()) |entry| try verifier.feed(entry.key_ptr.*, entry.value_ptr.*);
+        try verifier.finish(); // Failed predecessor validation wrote no names.
+    }
+    const Stream = struct {
+        txn: *TestTxn,
+        state: *const State,
+        pub fn nextAfter(self: *@This(), after: []const u8) !?CandidateRow {
+            var prefix_buf: [max_cursor_bytes]u8 = undefined;
+            const prefix = try candidatePrefix(&prefix_buf, self.state);
+            var cursor = try self.txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(if (after.len == 0) prefix else after);
+            if (row) |value| if (std.mem.eql(u8, value.key, after)) {
+                row = try cursor.next();
+            };
+            if (row) |value| if (std.mem.startsWith(u8, value.key, prefix)) return value;
+            return null;
+        }
+    };
+    for ([_]usize{ 0, 63 }) |padding| {
+        var rows: [65]SourceRow = undefined;
+        var filler_keys: [63][32]u8 = undefined;
+        var fillers: [63]names.Claim = undefined;
+        rows[0] = .{ .key = "a:public", .table_id = 7, .claims = &.{active} };
+        for (0..padding) |i| {
+            const key = try std.fmt.bufPrint(&filler_keys[i], "b:{d:0>4}", .{i});
+            fillers[i] = active;
+            fillers[i].key.name = key;
+            rows[i + 1] = .{ .key = key, .table_id = 7, .claims = fillers[i..][0..1] };
+        }
+        rows[padding + 1] = reservation_row;
+        var source: TestSource = .{ .rows = rows[0 .. padding + 2] };
+        var txn = TestTxn.init();
+        defer txn.deinit();
+        var state = try State.init(41, try nextJobId(null), test_epoch);
+        try start(&txn, &state, test_epoch, null);
+        while (state.phase == .building or state.phase == .verifying_source) {
+            var prior = TestTxn.init();
+            defer prior.deinit();
+            var entries = txn.values.iterator();
+            while (entries.next()) |entry| try prior.put(entry.key_ptr.*, entry.value_ptr.*);
+            var page = try Page.prepareSource(a, state, test_epoch, &source);
+            defer page.deinit();
+            try page.apply(&txn, test_epoch);
+            var replay = try ReplayVerifier(TestTxn, TestTxn).init(a, &prior, &txn, 41);
+            defer replay.deinit();
+            entries = txn.values.iterator();
+            while (entries.next()) |entry| try replay.feed(entry.key_ptr.*);
+            try replay.finish();
+            state = page.after;
+            var verifier = try Verifier(TestTxn).init(&txn, 41);
+            entries = txn.values.iterator();
+            while (entries.next()) |entry| try verifier.feed(entry.key_ptr.*, entry.value_ptr.*);
+            try verifier.finish();
+        }
+        try std.testing.expectEqual(@as(u64, padding + 3), state.expected.claims);
+        var stream: Stream = .{ .txn = &txn, .state = &state };
+        while (state.phase == .verifying_candidate) {
+            var page = try Page.prepareCandidate(a, state, test_epoch, &stream);
+            defer page.deinit();
+            try page.apply(&txn, test_epoch);
+            state = page.after;
+        }
+        try std.testing.expectEqual(Phase.ready, state.phase);
+        var reader: CandidateStore(TestTxn) = .{ .txn = &txn, .state = &state };
+        try std.testing.expect((try reader.getClaim(active.key)).?.eql(active.owner));
+        try std.testing.expect(try reader.getClaim(reservations[1].key) == null);
+    }
+    const Probe = struct {
+        fn prepare(alloc: A, input: []const SourceRow) !void {
+            var source: TestSource = .{ .rows = input };
+            var page = try Page.prepareSource(alloc, try State.init(41, try nextJobId(null), test_epoch), test_epoch, &source);
+            defer page.deinit();
+        }
+    };
+    const rows = [_]SourceRow{ .{ .key = "a:public", .table_id = 7, .claims = &.{active} }, reservation_row };
+    try std.testing.checkAllAllocationFailures(a, Probe.prepare, .{&rows});
+    var stale = reservations;
+    stale[0].owner.schema_digest[0] ^= 1;
+    var invalid = rows;
+    invalid[1].claims = &stale;
+    try std.testing.expectError(error.CatalogGenerationChanged, Probe.prepare(a, &invalid));
+    const duplicate = [_]SourceRow{ rows[0], reservation_row, .{ .key = "zz:duplicate", .table_id = 7, .pending_table_id = 8, .claims = &reservations } };
+    try std.testing.expectError(error.CatalogAlreadyExists, Probe.prepare(a, &duplicate));
+    var left: Totals = .{};
+    var right: Totals = .{};
+    try appendSource(&left, reservation_row);
+    var changed = reservation_row;
+    changed.claims = &stale;
+    try appendSource(&right, changed);
+    try std.testing.expectEqualSlices(u8, &left.claim_hash, &right.claim_hash);
+    try std.testing.expect(!std.mem.eql(u8, &left.source_hash, &right.source_hash));
 }
 
 test "relation reconciliation requires source and independent candidate verification" {

@@ -248,12 +248,15 @@ pub const Claim = struct {
     key: Key,
     owner: Owner,
     pending: ?Owner = null,
+    /// Only the pending slot is contributed; active is an exact dependency.
+    reservation: bool = false,
     pub fn entry(self: @This()) !Entry {
         const value: Entry = if (self.owner.phase == .reserved) blk: {
             if (self.pending != null) return error.InvalidCatalogRecord;
             break :blk .{ .pending = self.owner };
         } else .{ .active = self.owner, .pending = self.pending };
         try value.validate();
+        if (self.reservation and value.pending == null) return error.InvalidCatalogRecord;
         return value;
     }
     pub fn fromEntry(key: Key, value: Entry) !@This() {
@@ -428,21 +431,37 @@ pub const EntryPlan = struct {
     /// Consume an arena whose claim names/array are already owned. Preparation
     /// transfers this arena exactly once, including on error, avoiding a
     /// second full-page copy of compound owners and namespace names.
-    pub fn takeClaims(input_arena: std.heap.ArenaAllocator, claims: []const Claim) !EntryPlan {
+    pub fn takeClaims(input_arena: std.heap.ArenaAllocator, claims: []Claim) !EntryPlan {
         var arena = input_arena;
         errdefer arena.deinit();
         if (claims.len > max_claims) return error.CatalogCommandTooLarge;
         const a = arena.allocator();
-        var seen: std.HashMapUnmanaged(Key, void, Context, 80) = .empty;
+        var seen: std.HashMapUnmanaged(Key, u16, Context, 80) = .empty;
         try seen.ensureTotalCapacity(a, @intCast(claims.len));
+        var count: usize = 0;
         for (claims) |claim| {
             try claim.key.validate();
-            if (seen.getOrPutAssumeCapacity(claim.key).found_existing) return error.CatalogAlreadyExists;
             _ = try claim.entry();
+            const found = seen.getOrPutAssumeCapacity(claim.key);
+            if (found.found_existing) {
+                const previous = claims[found.value_ptr.*];
+                if (previous.reservation == claim.reservation) return error.CatalogAlreadyExists;
+                const complete = if (claim.reservation) previous else claim;
+                const reserved = if (claim.reservation) claim else previous;
+                const base = try complete.entry();
+                const target = try reserved.entry();
+                if (base.pending != null) return error.CatalogAlreadyExists;
+                const merged = try base.reserve(.{ .predecessor = target.active, .successor = target.pending.? });
+                claims[found.value_ptr.*] = try Claim.fromEntry(claim.key, merged);
+            } else {
+                found.value_ptr.* = @intCast(count);
+                claims[count] = claim;
+                count += 1;
+            }
         }
         // Creation has an implicit empty before-cut; do not materialize two
         // optional compound owners per claim just to represent that absence.
-        return .{ .arena = arena, .changes = &.{}, .claims = claims };
+        return .{ .arena = arena, .changes = &.{}, .claims = claims[0..count] };
     }
     pub fn deinit(self: *EntryPlan) void {
         self.arena.deinit();
@@ -455,7 +474,14 @@ pub const EntryPlan = struct {
         return current;
     }
     pub fn validate(self: *const EntryPlan, reader: anytype) !void {
-        for (self.claims) |claim| if (!(try observed(reader, claim.key)).empty()) return error.CatalogAlreadyExists;
+        for (self.claims) |claim| {
+            const current = try observed(reader, claim.key);
+            if (claim.reservation) {
+                const target = try claim.entry();
+                if (current.pending != null) return error.CatalogAlreadyExists;
+                _ = try current.reserve(.{ .predecessor = target.active, .successor = target.pending.? });
+            } else if (!current.empty()) return error.CatalogAlreadyExists;
+        }
         for (self.changes) |change| {
             const current = try observed(reader, change.key);
             if (!current.eql(change.before)) return error.CatalogGenerationChanged;
@@ -473,6 +499,19 @@ pub const EntryPlan = struct {
     /// or repairs a mismatched generation under a new producer identity.
     pub fn verifyPublished(self: *const EntryPlan, reader: anytype) !void {
         for (self.claims) |claim| if (!(try observed(reader, claim.key)).eql(try claim.entry())) return error.CatalogGenerationChanged;
+        for (self.changes) |change| if (!(try observed(reader, change.key)).eql(change.after)) return error.CatalogGenerationChanged;
+    }
+    /// A public source contributes its active slot, not the absence of a
+    /// reservation supplied by another source. Candidate proofs remain exact.
+    pub fn verifyContributions(self: *const EntryPlan, reader: anytype) !void {
+        for (self.claims) |claim| {
+            const current = try observed(reader, claim.key);
+            const expected = try claim.entry();
+            if (!Entry.same(current.active, expected.active)) return error.CatalogGenerationChanged;
+            if (claim.reservation or expected.pending != null) {
+                if (!Entry.same(current.pending, expected.pending)) return error.CatalogGenerationChanged;
+            }
+        }
         for (self.changes) |change| if (!(try observed(reader, change.key)).eql(change.after)) return error.CatalogGenerationChanged;
     }
 };
@@ -571,7 +610,7 @@ pub const Plan = struct {
         const result = try a.alloc(Claim, claims.len);
         try map.ensureTotalCapacity(a, @intCast(claims.len));
         for (claims, result) |claim, *copy| {
-            if (claim.pending != null) return error.InvalidCatalogRecord;
+            if (claim.pending != null or claim.reservation) return error.InvalidCatalogRecord;
             try claim.key.validate();
             try claim.owner.validate();
             const key: Key = .{ .namespace_id = claim.key.namespace_id, .name = try a.dupe(u8, claim.key.name) };

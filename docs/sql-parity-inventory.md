@@ -1683,7 +1683,7 @@ failures. Failed generations cannot advance or have their reason/progress
 rewritten; authenticated replay and newer snapshot installation retain that
 terminal fence. New generations may reconcile corrected source epochs and
 retire failed partial candidates normally. The unpublished job format is now
-`AFRC03`, binding compound candidate fingerprints; no compatibility decoder is
+`AFRC04`, binding owner-slot candidate fingerprints; no compatibility decoder is
 added for this PR's unpublished format.
 Pure tests verify stale/failing writes, immutable failure replay, strict reason
 decoding and partial-candidate fingerprints. Native two-replica tests cover
@@ -1738,6 +1738,25 @@ Native replay rejects even correctly fingerprinted pending claims when no
 authoritative pending-plan source exists; the new proof is not self-authenticating.
 Writer admission and active-root serving remain unfinished. There is no fallback
 decoder or newly enabled public lookup.
+Independent sources can now contribute an active owner and a restore reservation
+to the same candidate name, either within a page or across page boundaries. The
+reservation binds its exact predecessor; missing or stale predecessors and
+duplicate reservations fail before page mutations. In-page normalization uses
+the transferred arena and a bounded key-to-offset map, not a second full cut.
+Counts and additive fingerprints track contributed owner slots independently;
+source fingerprints additionally bind the complete dependency and contribution
+mode. Public source verification tolerates separately proven pending slots,
+while the final candidate pass still verifies exact entries. Delta replay permits
+only an active-only to active-plus-pending transition with an unchanged active
+owner. Pure tests exercise both page shapes, missing/stale dependencies,
+duplicate reservations, source dependency tampering, snapshot/delta verification,
+allocation faults and the unchanged 64-KiB scratch limit. This is the reconciliation
+primitive, not restore activation: native restore source projection, reservation
+admission, lifecycle/capability barriers and root serving remain unfinished.
+The final pure/native catalog gate passes 236 tests plus 22 linked storage tests
+without failures or leaks. Formatting, whitespace, source-catalog integrity and
+the original inventory check pass; the 902 unresolved original cases remain
+uncredited by this internal protocol work.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,
