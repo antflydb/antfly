@@ -531,12 +531,13 @@ pub fn advanceTrackedSource(txn: anytype, group: u64) !void {
     if (try readSourceRevision(txn, group) != 0) try advanceSource(txn, group);
 }
 
-pub const RecordKind = enum { source, job, root, retirement, candidate };
+pub const RecordKind = enum { source, job, root, live, retirement, candidate };
 pub fn allGroupsPrefix(kind: RecordKind) []const u8 {
     return switch (kind) {
         .source => source_prefix,
         .job => job_prefix,
         .root => root_prefix,
+        .live => live_prefix,
         .retirement => retirement_prefix,
         .candidate => candidate_prefix,
     };
@@ -565,7 +566,7 @@ pub fn classify(key: []const u8) !?Record {
             const group = std.mem.readInt(u64, tail[0..8], .big);
             if (group == 0) return error.InvalidCatalogRecord;
             switch (kind) {
-                .source, .job, .root => {
+                .source, .job, .root, .live => {
                     if (tail.len != 8) return error.InvalidCatalogRecord;
                     return .{ .kind = kind, .group_id = group };
                 },
@@ -636,14 +637,17 @@ pub const Work = struct {
 
 /// A streaming consistency verifier shared by borrowed snapshot maps and
 /// pinned checkpoint transactions. It owns no catalog-size map or schema DOM.
-/// Candidate state remains immutable/unpublished: root activation and mutable
-/// active-generation verification must be wired before serving is enabled.
+/// Mutable published roots and immutable replacement candidates have separate
+/// totals. This proves physical integrity, not authoritative source ownership.
 pub fn Verifier(comptime Reader: type) type {
     return struct {
         reader: *Reader,
         group_id: u64,
         current: ?State,
         root: ?Generation,
+        live: ?LiveRoot,
+        live_claims: u64 = 0,
+        live_hash: [32]u8 = @splat(0),
         claims: u64 = 0,
         claim_hash: [32]u8 = @splat(0),
         pub fn init(reader: *Reader, group: u64) !@This() {
@@ -651,7 +655,13 @@ pub fn Verifier(comptime Reader: type) type {
             const current = if (try optionalGet(reader, try jobKey(&buf, group))) |bytes| try State.decode(bytes) else null;
             if (current) |state| if (state.group_id != group) return error.InvalidCatalogRecord;
             const root = if (try optionalGet(reader, try rootKey(&buf, group))) |bytes| try Generation.decode(bytes) else null;
-            var result: @This() = .{ .reader = reader, .group_id = group, .current = current, .root = root };
+            const live = if (try optionalGet(reader, try liveKey(&buf, group))) |bytes| try LiveRoot.decode(bytes) else null;
+            if (live) |value| {
+                if (root == null or current == null or !value.generation.eql(root.?) or
+                    !std.mem.eql(u8, &value.epoch.incarnation, &current.?.epoch.incarnation) or
+                    try readSourceRevision(reader, group) != value.epoch.revision) return error.InvalidCatalogRecord;
+            }
+            var result: @This() = .{ .reader = reader, .group_id = group, .current = current, .root = root, .live = live };
             if (root) |generation| {
                 if (generation.group_id != group) return error.InvalidCatalogRecord;
                 if (try result.retirementFor(generation)) |retired| {
@@ -684,6 +694,9 @@ pub fn Verifier(comptime Reader: type) type {
                 .root => {
                     if (self.root == null or !(try Generation.decode(value)).eql(self.root.?)) return error.InvalidCatalogRecord;
                 },
+                .live => {
+                    if (self.live == null or !std.meta.eql(try LiveRoot.decode(value), self.live.?)) return error.InvalidCatalogRecord;
+                },
                 .retirement => {
                     const retired = try Retirement.decode(value);
                     if (!retired.generation.eql(record.generation.?)) return error.InvalidCatalogRecord;
@@ -693,6 +706,12 @@ pub fn Verifier(comptime Reader: type) type {
                     const generation = record.generation.?;
                     const owner = try names.Entry.decode(value);
                     const logical = try decodeCandidateGenerationKey(key, generation);
+                    if (self.live) |live| if (live.generation.eql(generation)) {
+                        const claim = try names.Claim.fromEntry(logical, owner);
+                        self.live_claims = std.math.add(u64, self.live_claims, try claimCount(claim)) catch return error.InvalidCatalogRecord;
+                        addClaimHash(&self.live_hash, try claimHash(claim));
+                        return;
+                    };
                     if (try self.retirementFor(generation)) |retired| {
                         if (std.mem.order(u8, retired.cursor(), key) != .lt) return error.InvalidCatalogRecord;
                     } else {
@@ -703,6 +722,10 @@ pub fn Verifier(comptime Reader: type) type {
             }
         }
         pub fn finish(self: *const @This()) !void {
+            if (self.live) |live| {
+                if (self.live_claims != live.claims or !std.mem.eql(u8, &self.live_hash, &live.claim_hash)) return error.InvalidCatalogRecord;
+                if (self.current) |state| if (live.generation.eql(Generation.of(&state))) return;
+            }
             if (self.current) |state| {
                 const expected = if (state.phase == .building) state.pass else state.expected;
                 if (self.claims != expected.claims or !std.mem.eql(u8, &self.claim_hash, &expected.claim_hash)) return error.InvalidCatalogRecord;
@@ -723,6 +746,10 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
         old: ?State,
         current: ?State,
         root: ?Generation,
+        old_live: ?LiveRoot,
+        live: ?LiveRoot,
+        live_count: u64 = 0,
+        live_hash: [32]u8 = @splat(0),
         count: u64 = 0,
         hash: [32]u8 = @splat(0),
         records: usize = 0,
@@ -753,8 +780,37 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
             }
             // Checks root ancestry/readiness with point reads only. Full
             // candidate cardinality is checked by the delta below, not finish.
-            _ = try Verifier(After).init(after, group);
-            var result: @This() = .{ .arena = .init(a), .before = before, .after = after, .group_id = group, .old = old, .current = current, .root = root };
+            const verified = try Verifier(After).init(after, group);
+            const old_live = if (try optionalGet(before, try liveKey(&buf, group))) |bytes| try LiveRoot.decode(bytes) else null;
+            const live = verified.live;
+            if (old_live) |prior| {
+                if (old_root == null or !prior.generation.eql(old_root.?)) return error.InvalidCatalogRecord;
+                const next = live orelse return error.InvalidCatalogRecord;
+                if (!std.mem.eql(u8, &prior.epoch.incarnation, &next.epoch.incarnation) or next.epoch.revision < prior.epoch.revision) return error.InvalidCatalogRecord;
+                if (prior.generation.eql(next.generation)) {
+                    if (!std.meta.eql(prior, next)) {
+                        if (next.epoch.revision <= prior.epoch.revision or prior.sequence == std.math.maxInt(u64) or
+                            next.sequence != prior.sequence + 1) return error.InvalidCatalogRecord;
+                    }
+                }
+            }
+            if (live) |next| {
+                if (old_live == null or !old_live.?.generation.eql(next.generation)) {
+                    // A swap adopts an already sealed, previously verified
+                    // candidate. It cannot manufacture a fresh seal and root
+                    // in the same replay batch or reset an existing manifest.
+                    const prior = old orelse return error.InvalidCatalogRecord;
+                    const state = current orelse return error.InvalidCatalogRecord;
+                    if (!next.generation.eql(Generation.of(&prior)) or !std.meta.eql(prior, state) or
+                        !std.meta.eql(next, try LiveRoot.initial(prior))) return error.InvalidCatalogRecord;
+                }
+            }
+            var result: @This() = .{ .arena = .init(a), .before = before, .after = after, .group_id = group, .old = old, .current = current, .root = root, .old_live = old_live, .live = live };
+            if (live) |next| {
+                const base = if (old_live) |prior| if (prior.generation.eql(next.generation)) prior else next else next;
+                result.live_count = base.claims;
+                result.live_hash = base.claim_hash;
+            }
             if (old) |prior| if (current) |next| if (std.mem.eql(u8, &prior.job_id, &next.job_id)) {
                 const totals = if (prior.phase == .building) prior.pass else prior.expected;
                 result.count = totals.claims;
@@ -816,7 +872,7 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
                     const revision = try sourceRevision(value);
                     if (old) |bytes| if (revision < try sourceRevision(bytes)) return error.InvalidCatalogRecord;
                 },
-                .job, .root => {}, // Whole-record fences were checked by init.
+                .job, .root, .live => {}, // Whole-record fences were checked by init.
                 .retirement => try self.checkRetirement(record.generation.?),
                 .candidate => {
                     const current = self.current orelse return error.InvalidCatalogRecord;
@@ -824,6 +880,23 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
                     const prior = if (old) |bytes| try names.Entry.decode(bytes) else null;
                     const owner = if (next) |bytes| try names.Entry.decode(bytes) else null;
                     if (prior) |value| if (owner) |final| if (value.eql(final)) return;
+                    if (self.live) |live| if (live.generation.eql(generation)) {
+                        // Publication itself inherits the sealed generation;
+                        // only a previously live generation accepts deltas.
+                        if (self.old_live == null or !self.old_live.?.generation.eql(generation)) return error.InvalidCatalogRecord;
+                        const logical = try decodeCandidateGenerationKey(key, generation);
+                        if (prior) |value| {
+                            const claim = try names.Claim.fromEntry(logical, value);
+                            self.live_count = std.math.sub(u64, self.live_count, try claimCount(claim)) catch return error.InvalidCatalogRecord;
+                            subtractClaimHash(&self.live_hash, try claimHash(claim));
+                        }
+                        if (owner) |value| {
+                            const claim = try names.Claim.fromEntry(logical, value);
+                            self.live_count = std.math.add(u64, self.live_count, try claimCount(claim)) catch return error.InvalidCatalogRecord;
+                            addClaimHash(&self.live_hash, try claimHash(claim));
+                        }
+                        return;
+                    };
                     if (std.mem.eql(u8, &generation.job_id, &current.job_id)) {
                         if (owner == null) return error.InvalidCatalogRecord;
                         if (self.old) |before| if (std.mem.eql(u8, &before.job_id, &current.job_id) and before.phase != .building) return error.InvalidCatalogRecord;
@@ -853,9 +926,14 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
             }
         }
         pub fn finish(self: *@This()) !void {
+            if (self.live) |live| {
+                if (self.live_count != live.claims or !std.mem.eql(u8, &self.live_hash, &live.claim_hash)) return error.InvalidCatalogRecord;
+            }
             if (self.current) |current| {
-                const expected = if (current.phase == .building) current.pass else current.expected;
-                if (self.count != expected.claims or !std.mem.eql(u8, &self.hash, &expected.claim_hash)) return error.InvalidCatalogRecord;
+                if (self.live == null or !self.live.?.generation.eql(Generation.of(&current))) {
+                    const expected = if (current.phase == .building) current.pass else current.expected;
+                    if (self.count != expected.claims or !std.mem.eql(u8, &self.hash, &expected.claim_hash)) return error.InvalidCatalogRecord;
+                }
                 if (self.old) |old| if (!std.mem.eql(u8, &old.job_id, &current.job_id)) try self.checkRetirement(Generation.of(&old));
             } else if (self.count != 0) return error.InvalidCatalogRecord;
         }
@@ -1310,9 +1388,14 @@ fn seedLiveRootForTest(txn: *TestTxn, claims: []const names.Claim, job_id: [16]u
 }
 fn verifyLiveRootForTest(txn: *TestTxn, epoch: Epoch) !void {
     var verifier = try LiveVerifier(TestTxn).init(txn, 41, epoch);
+    var complete = try Verifier(TestTxn).init(txn, 41);
     var entries = txn.values.iterator();
-    while (entries.next()) |entry| try verifier.feed(entry.key_ptr.*, entry.value_ptr.*);
+    while (entries.next()) |entry| {
+        try verifier.feed(entry.key_ptr.*, entry.value_ptr.*);
+        try complete.feed(entry.key_ptr.*, entry.value_ptr.*);
+    }
     try verifier.finish();
+    try complete.finish();
 }
 const CountedLiveTxn = struct {
     base: *TestTxn,
@@ -1483,6 +1566,141 @@ test "relation live root publication and mutation unwind every allocation failur
     };
     var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fault.run, .{});
+}
+
+test "relation live root replay verifies publication and exact mutable deltas without scanning" {
+    const T = struct {
+        fn copy(original: *TestTxn) !TestTxn {
+            var result = TestTxn.init();
+            errdefer result.deinit();
+            var rows = original.values.iterator();
+            while (rows.next()) |row| try result.put(row.key_ptr.*, row.value_ptr.*);
+            return result;
+        }
+        fn check(before: *TestTxn, after: *TestTxn, keys: []const []const u8) !void {
+            var replay = try ReplayVerifier(TestTxn, TestTxn).init(std.testing.allocator, before, after, 41);
+            defer replay.deinit();
+            for (keys) |key| try replay.feed(key);
+            try replay.finish();
+        }
+    };
+    const a = std.testing.allocator;
+    var sealed = TestTxn.init();
+    defer sealed.deinit();
+    const ready = try seedLiveRootForTest(&sealed, &test_claims, try nextJobId(null), test_epoch);
+    var published = try T.copy(&sealed);
+    defer published.deinit();
+    const initial = try publishVerifiedRoot(&published, ready, test_epoch, null);
+    var root_buf: [128]u8 = undefined;
+    const root_key = try rootKey(&root_buf, 41);
+    var live_buf: [128]u8 = undefined;
+    const live_key = try liveKey(&live_buf, 41);
+    try std.testing.expectEqual(RecordKind.live, (try classify(live_key)).?.kind);
+    try std.testing.expectError(error.InvalidCatalogRecord, classify(live_key[0 .. live_key.len - 1]));
+    try T.check(&sealed, &published, &.{ root_key, live_key });
+    var changed = try T.copy(&published);
+    defer changed.deinit();
+    var store = (try LiveStore(TestTxn).open(&changed, 41)).?;
+    const renamed: names.Claim = .{ .key = .{ .namespace_id = 5, .name = "renamed" }, .owner = test_owner };
+    var plan = try names.Plan.init(a, &test_claims, &.{renamed});
+    defer plan.deinit();
+    var epoch = test_epoch;
+    epoch.revision += 1;
+    try advanceSource(&changed, 41);
+    try store.apply(&plan, epoch);
+    var source_buf: [128]u8 = undefined;
+    const source_key = try sourceKey(&source_buf, 41);
+    var old_buf: [max_cursor_bytes]u8 = undefined;
+    const old_key = try candidateKey(&old_buf, &ready, test_claims[0].key);
+    var next_buf: [max_cursor_bytes]u8 = undefined;
+    const next_key = try candidateKey(&next_buf, &ready, renamed.key);
+    try T.check(&published, &changed, &.{ source_key, old_key, next_key, live_key });
+    try std.testing.expectError(error.InvalidCatalogRecord, T.check(&published, &changed, &.{ source_key, old_key, live_key }));
+    try std.testing.expectEqual(@as(usize, 0), changed.cursor_seeks);
+    try std.testing.expectEqual(@as(usize, 0), changed.cursor_nexts);
+    try verifyLiveRootForTest(&changed, epoch);
+    // The initial root's immutable job seal must not be used for new bytes.
+    try changed.put(live_key, &(try initial.encode()));
+    try std.testing.expectError(error.InvalidCatalogRecord, T.check(&published, &changed, &.{ source_key, old_key, next_key, live_key }));
+    try changed.put(live_key, &(try store.root.encode()));
+    var forged = store.root;
+    forged.sequence += 1;
+    try changed.put(live_key, &(try forged.encode()));
+    try std.testing.expectError(error.InvalidCatalogRecord, T.check(&published, &changed, &.{ source_key, old_key, next_key, live_key }));
+    try changed.put(live_key, &(try store.root.encode()));
+    try changed.delete(live_key);
+    try std.testing.expectError(error.InvalidCatalogRecord, T.check(&published, &changed, &.{ source_key, old_key, next_key, live_key }));
+    // A producer cannot install a fabricated ready seal and publish it in the
+    // same journal; root publication inherits previously verified candidates.
+    var empty = TestTxn.init();
+    defer empty.deinit();
+    try std.testing.expectError(error.InvalidCatalogRecord, T.check(&empty, &published, &.{ root_key, live_key, old_key }));
+}
+
+test "relation live root verification separates published totals from replacement and retired generations" {
+    const T = struct {
+        fn copy(original: *TestTxn) !TestTxn {
+            var result = TestTxn.init();
+            errdefer result.deinit();
+            var rows = original.values.iterator();
+            while (rows.next()) |row| try result.put(row.key_ptr.*, row.value_ptr.*);
+            return result;
+        }
+        fn replay(before: *TestTxn, after: *TestTxn, keys: []const []const u8) !void {
+            var verifier = try ReplayVerifier(TestTxn, TestTxn).init(std.testing.allocator, before, after, 41);
+            defer verifier.deinit();
+            for (keys) |key| try verifier.feed(key);
+            try verifier.finish();
+        }
+    };
+    const a = std.testing.allocator;
+    var initial = TestTxn.init();
+    defer initial.deinit();
+    const ready = try seedLiveRootForTest(&initial, &test_claims, try nextJobId(null), test_epoch);
+    const root = try publishVerifiedRoot(&initial, ready, test_epoch, null);
+    var building = try T.copy(&initial);
+    defer building.deinit();
+    const next = try State.init(41, try nextJobId(&ready), test_epoch);
+    try start(&building, &next, test_epoch, &(try ready.encode()));
+    var job_buf: [128]u8 = undefined;
+    const job_key = try jobKey(&job_buf, 41);
+    var retirement_buf: [128]u8 = undefined;
+    const retirement_key = try retirementKey(&retirement_buf, root.generation);
+    try T.replay(&initial, &building, &.{ job_key, retirement_key });
+    try verifyLiveRootForTest(&building, test_epoch);
+    var source: TestSource = .{ .rows = &test_rows };
+    var page = try Page.prepareSource(a, next, test_epoch, &source);
+    defer page.deinit();
+    try page.apply(&building, test_epoch);
+    try verifyLiveRootForTest(&building, test_epoch);
+    var key_buf: [max_cursor_bytes]u8 = undefined;
+    const next_key = try candidateKey(&key_buf, &next, test_claims[0].key);
+    var forged = test_owner;
+    forged.schema_digest[0] ^= 1;
+    try building.put(next_key, &(try (names.Entry{ .active = forged }).encode()));
+    // The live root is intact; corruption belongs to the concurrent candidate.
+    try std.testing.expectError(error.InvalidCatalogRecord, verifyLiveRootForTest(&building, test_epoch));
+    try building.put(next_key, &(try (names.Entry{ .active = test_owner }).encode()));
+    const next_ready = try seedLiveRootForTest(&building, &test_claims, next.job_id, test_epoch);
+    var published = try T.copy(&building);
+    defer published.deinit();
+    _ = try publishVerifiedRoot(&published, next_ready, test_epoch, root);
+    var root_buf: [128]u8 = undefined;
+    var live_buf: [128]u8 = undefined;
+    try T.replay(&building, &published, &.{ try rootKey(&root_buf, 41), try liveKey(&live_buf, 41) });
+    try verifyLiveRootForTest(&published, test_epoch);
+    var collected = try T.copy(&published);
+    defer collected.deinit();
+    var old_key_buf: [max_cursor_bytes]u8 = undefined;
+    const old_key = try candidateKey(&old_key_buf, &ready, test_claims[0].key);
+    try collected.delete(old_key);
+    try collected.delete(retirement_key);
+    try T.replay(&published, &collected, &.{ old_key, retirement_key });
+    try verifyLiveRootForTest(&collected, test_epoch);
+    var wrong = (try LiveStore(TestTxn).open(&collected, 41)).?.root;
+    wrong.epoch.incarnation[0] ^= 1;
+    try collected.put(try liveKey(&live_buf, 41), &(try wrong.encode()));
+    try std.testing.expectError(error.InvalidCatalogRecord, Verifier(TestTxn).init(&collected, 41));
 }
 
 test "relation reconciliation binary state rejects unknown and noncanonical bytes" {

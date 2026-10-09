@@ -1988,6 +1988,35 @@ evaluation, mutation atomicity, allocation faults and request validation.
 Post-merge native validation also passes 170 catalog, 22 linked storage and
 10 coordinator tests (57/57 build steps), with inventory, control-catalog,
 formatting and whitespace checks passing on the merged tree.
+Published-generation primitives now use a separate canonical live manifest
+(`AFRL01`) carrying the source epoch, sequence and exact owner-slot count/hash.
+Publication performs four point reads and two writes for an initial root,
+without copying candidate names or walking terminal history. Prepared namespace
+plans mutate only affected generation keys and update the manifest in the same
+transaction; errors require abort. Active reads hide pending-only reservations,
+while full entries and integrity totals retain both active and pending owners.
+Exact root/manifest CAS rejects stale writers, and retirement GC remains blocked
+until the root swaps. Allocation-fault tests discard every failed transaction.
+The shared snapshot verifier now tracks the mutable root independently of a
+building/ready replacement candidate. Authenticated replay accounts for changed
+live entries by subtraction/addition over the previously verified manifest,
+rejects removed manifests, bad epoch/sequence transitions and missing deltas,
+and permits root swaps only to an unchanged, previously ready candidate seal.
+Source incarnation and revision are fenced. Root replacement followed by GC,
+count-preserving corruption and simultaneous root/candidate verification have
+component coverage. The pure reconciliation gate passes all 53 tests; the
+relation-name gate also succeeds from cache. Main's cold-decode/batch-planning
+changes through `755cb12a68` are merged without conflicts.
+These are shared storage primitives, not native activation authority. Native
+snapshot projection/authoritative live-owner validation, replay ownership for
+older live generations, capability/lifecycle barriers, production writer
+adoption and atomic root publication still need integration. Public SQL
+resolution is not enabled and no original case receives parity credit here.
+The final-source native regression gate passes 170 catalog, 22 linked storage
+and 10 coordinator tests (57/57 build steps), without failures or leaks.
+Inventory, control-catalog, formatting and whitespace checks also pass; the
+original inventory remains 475 implemented, 136 rejected, 73 superseded and
+902 unresolved.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,
