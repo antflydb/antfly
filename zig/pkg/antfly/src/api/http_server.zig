@@ -9487,6 +9487,7 @@ pub const ApiHttpServer = struct {
         defer query_req.deinit(alloc);
         query_req.req.execution_deadline_ns = context.deadline_ns;
         query_req.req.cancellation = context.cancellation;
+        query_req.req.execution_runnable = if (context.execution_team) |team| team.borrow else null;
         var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer catalog_arena.deinit();
         var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .execution_team = context.execution_team };
@@ -15613,6 +15614,7 @@ pub const ApiHttpServer = struct {
             return normalized;
         };
         defer query_req.deinit(alloc);
+        query_req.req.execution_runnable = if (execution_team) |team| team.borrow else null;
         if (request_deadline_ns) |deadline| {
             query_req.req.execution_deadline_ns = deadline;
             try ensureRequestDeadline(deadline);

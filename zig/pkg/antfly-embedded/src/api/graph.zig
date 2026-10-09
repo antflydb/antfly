@@ -51,6 +51,9 @@ pub fn executionDeadlineFromTimeoutMs(timeout_ms: ?u32) ?u64 {
 }
 
 pub const GraphExpandRequest = struct {
+    /// Invocation-local authority for this synchronous coordinator/child.
+    /// Wire encoders and parsers never reconstruct or serialize this grant.
+    execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
     name: []u8,
     index_name: []u8,
     frontier: []GraphFrontierItem,
@@ -173,6 +176,9 @@ pub const GraphExpandResponse = struct {
 };
 
 pub const GraphHydrateRequest = struct {
+    /// Invocation-local authority for this synchronous coordinator/child.
+    /// Wire encoders and parsers never reconstruct or serialize this grant.
+    execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
     keys: [][]u8,
     metric_index_name: []const u8 = "",
     metric_index_name_owned: bool = false,
@@ -250,6 +256,9 @@ pub const GraphHydrateResponse = struct {
 };
 
 pub const GraphEdgesRequest = struct {
+    /// Invocation-local authority for this synchronous coordinator/child.
+    /// Wire encoders and parsers never reconstruct or serialize this grant.
+    execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
     index_name: []u8,
     key: []u8,
     edge_types: [][]const u8 = &.{},

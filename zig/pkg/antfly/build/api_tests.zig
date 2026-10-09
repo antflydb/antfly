@@ -245,6 +245,40 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     }));
     inference_owner_sources.addImport("antfly_cancellation", antfly_imports.cancellation);
+    const fanout_owner_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_fanout_owner.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    fanout_owner_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    fanout_owner_root.addImport("antfly_local_sources", inference_owner_sources);
+    const fanout_owner_tests = b.addTest(.{
+        .name = "runnable-fanout-owner-tests",
+        .root_module = fanout_owner_root,
+        .filters = &.{"fanout owner retains joined result slots"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-runnable-fanout-owner-test", "Verify independent child result ownership and original phase through joining and rejected resumption")
+        .dependOn(&b.addRunArtifact(fanout_owner_tests).step);
+    const graph_fanout_owner_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/graph_fanout_owner_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configureConsumer(b, graph_fanout_owner_root);
+    graph_fanout_owner_root.addImport("antfly_source_root", graph_fanout_owner_root);
+    const graph_fanout_owner_tests = b.addTest(.{
+        .name = "graph-fanout-owner-tests",
+        .root_module = graph_fanout_owner_root,
+        .filters = &.{"distributed graph fans out per-group expand and hydrate with worker io"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const graph_fanout_owner_run = b.addRunArtifact(graph_fanout_owner_tests);
+    graph_fanout_owner_run.addArg("--require-no-skips");
+    b.step("antfly-graph-fanout-owner-test", "Verify production graph expand and hydrate fanout under one or two foreground CPU slots")
+        .dependOn(&graph_fanout_owner_run.step);
     const http_response_owner_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/runnable_http_response.zig"),
         .target = target,

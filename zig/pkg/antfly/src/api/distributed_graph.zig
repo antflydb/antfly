@@ -14,6 +14,8 @@
 // limitations.
 
 const std = @import("std");
+const runnable_fanout = @import("runnable_fanout_owner.zig");
+const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 const relationship_filter = @import("antfly_local_sources").graph_relationship_filter;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const raft_mod = struct {
@@ -127,6 +129,9 @@ pub const Worker = struct {
     cancellation: ?CancellationToken = null,
     lifecycle_hook: ?LifecycleHook = null,
     work_cost_port: ?WorkCostPort = null,
+    /// Synchronous coordinator or independent child authority. Parallel tasks
+    /// replace this with their owned slot's child; never share a mutable root.
+    runnable: ?runnable_abi.Borrowed = null,
 
     pub const VTable = struct {
         execute_graph_expand: *const fn (
@@ -184,6 +189,7 @@ pub const Worker = struct {
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
         controlled.cancellation = self.cancellation;
+        controlled.execution_runnable = self.runnable;
         var response = try self.vtable.execute_graph_expand(self.ptr, alloc, group_id, table_name, controlled, consistency);
         errdefer response.deinit(alloc);
         try self.ensureActive();
@@ -204,6 +210,7 @@ pub const Worker = struct {
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
         controlled.cancellation = self.cancellation;
+        controlled.execution_runnable = self.runnable;
         var response = try self.vtable.execute_graph_hydrate(self.ptr, alloc, group_id, table_name, controlled, consistency);
         errdefer response.deinit(alloc);
         try self.ensureActive();
@@ -225,6 +232,7 @@ pub const Worker = struct {
         var controlled = req;
         controlled.timeout_ms = try self.remainingTimeoutMs();
         controlled.cancellation = self.cancellation;
+        controlled.execution_runnable = self.runnable;
         var response = try func(self.ptr, alloc, group_id, table_name, controlled, consistency);
         errdefer response.deinit(alloc);
         try self.ensureActive();
@@ -290,6 +298,7 @@ pub const Worker = struct {
     }
 
     fn ensureActive(self: Worker) !void {
+        if (self.runnable) |borrow| try runnable_fanout.checked(borrow.checkpoint(borrow.context));
         if (self.cancellation) |value| {
             if (value.isCancelled()) return error.Cancelled;
         }
@@ -1501,6 +1510,7 @@ const GraphHydrateBatchEntry = struct {
 
 const GraphExpandFanoutSlot = struct {
     arena: std.heap.ArenaAllocator,
+    owner: runnable_fanout.Owner = .{},
     result: ?GraphExpandResponse = null,
     err: ?anyerror = null,
 
@@ -1510,12 +1520,14 @@ const GraphExpandFanoutSlot = struct {
 
     pub fn deinit(self: *GraphExpandFanoutSlot) void {
         self.arena.deinit();
+        self.owner.retire();
         self.* = undefined;
     }
 };
 
 const GraphHydrateFanoutSlot = struct {
     arena: std.heap.ArenaAllocator,
+    owner: runnable_fanout.Owner = .{},
     result: ?GraphHydrateResponse = null,
     err: ?anyerror = null,
 
@@ -1525,12 +1537,14 @@ const GraphHydrateFanoutSlot = struct {
 
     pub fn deinit(self: *GraphHydrateFanoutSlot) void {
         self.arena.deinit();
+        self.owner.retire();
         self.* = undefined;
     }
 };
 
 const GraphEdgesFanoutSlot = struct {
     arena: std.heap.ArenaAllocator,
+    owner: runnable_fanout.Owner = .{},
     result: ?GraphEdgesResponse = null,
     err: ?anyerror = null,
 
@@ -1540,6 +1554,7 @@ const GraphEdgesFanoutSlot = struct {
 
     pub fn deinit(self: *GraphEdgesFanoutSlot) void {
         self.arena.deinit();
+        self.owner.retire();
         self.* = undefined;
     }
 };
@@ -1841,6 +1856,7 @@ fn executeCrossRangeWithMatchAnchorsLifecycle(
     var request_worker = worker;
     request_worker.execution_deadline_ns = worker.budget().deadlineFrom(.{ .deadline_ns = req.execution_deadline_ns });
     request_worker.cancellation = req.cancellation;
+    request_worker.runnable = req.execution_runnable orelse worker.runnable;
     try request_worker.ensureActive();
     if (emit_source_snapshot) request_worker.reachLifecycle(.{
         .phase = .source_snapshot_acquired,
@@ -3008,7 +3024,13 @@ const DistributedEdgeReader = struct {
                         max_owned_bytes_inner: usize,
                         max_scanned_rows_inner: usize,
                     ) void {
-                        slot.result = reader.getEdgesFromGroup(
+                        var local_reader = reader;
+                        local_reader.worker.runnable = slot.owner.activate() catch |err| {
+                            slot.err = err;
+                            return;
+                        };
+                        defer slot.owner.park();
+                        slot.result = local_reader.getEdgesFromGroup(
                             slot.arena.allocator(),
                             table_name_inner,
                             table_state_inner,
@@ -3034,6 +3056,10 @@ const DistributedEdgeReader = struct {
                     const remaining_bytes = max_owned_bytes -| owned_bytes;
                     const fair_edges = @max(@as(usize, 1), std.math.divCeil(usize, remaining_edges, wave_len) catch 1);
                     const fair_bytes = @max(@as(usize, 1), std.math.divCeil(usize, remaining_bytes, wave_len) catch 1);
+                    for (slots[0..wave_len]) |*slot| {
+                        try slot.owner.reserve(self.worker.runnable, io, @as(u64, @sizeOf(GraphEdgesFanoutSlot)) +| key.len +| 1024);
+                    }
+                    const original_class = try runnable_fanout.parkCoordinator(self.worker.runnable);
                     var group: std.Io.Group = .init;
                     for (candidate_group_ids.items[start..end], 0..) |group_id, i| {
                         const group_direction: graph_mod.EdgeDirection = direction;
@@ -3051,7 +3077,8 @@ const DistributedEdgeReader = struct {
                             remaining_physical_rows,
                         });
                     }
-                    group.await(io) catch {};
+                    try group.await(io);
+                    try runnable_fanout.resumeCoordinator(self.worker.runnable, original_class);
 
                     // Balanced shards complete concurrently within a fair share
                     // of the remaining request budget. A skewed shard retries
@@ -7110,6 +7137,12 @@ fn executeGraphExpandBatchesParallel(
             allow_legacy_wire_fallback_inner: bool,
             consistency_inner: raft_mod.ReadConsistency,
         ) void {
+            var local_worker = worker_inner;
+            local_worker.runnable = slot.owner.activate() catch |err| {
+                slot.err = err;
+                return;
+            };
+            defer slot.owner.park();
             const arena = slot.arena.allocator();
             var step_req = makeGraphExpandRequestWithAlgebraicMode(
                 arena,
@@ -7129,7 +7162,7 @@ fn executeGraphExpandBatchesParallel(
             step_req.allow_legacy_wire_fallback = allow_legacy_wire_fallback_inner;
             step_req.max_scanned_rows = max_scanned_rows_inner;
             step_req.identity_read_generation = entry.identity_read_generation;
-            slot.result = worker_inner.executeGraphExpand(arena, entry.group_id, entry.table_name, step_req, consistency_inner) catch |err| {
+            slot.result = local_worker.executeGraphExpand(arena, entry.group_id, entry.table_name, step_req, consistency_inner) catch |err| {
                 slot.err = err;
                 return;
             };
@@ -7139,6 +7172,11 @@ fn executeGraphExpandBatchesParallel(
     var start: usize = 0;
     while (start < entries.len) : (start += width) {
         const end = @min(start + width, entries.len);
+        for (entries[start..end], start..end) |entry, i| {
+            const retained = @as(u64, @sizeOf(GraphExpandFanoutSlot)) +| entry.table_name.len +| @as(u64, entry.frontier_ids.len) *| @sizeOf(u32) +| 1024;
+            try slots[i].owner.reserve(worker.runnable, io, retained);
+        }
+        const original_class = try runnable_fanout.parkCoordinator(worker.runnable);
         var group: std.Io.Group = .init;
         for (entries[start..end], start..end) |entry, i| {
             group.async(io, Fiber.run, .{
@@ -7156,7 +7194,8 @@ fn executeGraphExpandBatchesParallel(
                 consistency,
             });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try runnable_fanout.resumeCoordinator(worker.runnable, original_class);
     }
 
     for (slots) |slot| {
@@ -7577,6 +7616,12 @@ fn hydrateHitsForKeys(
                 fields_inner: []const []const u8,
                 consistency_inner: raft_mod.ReadConsistency,
             ) void {
+                var local_worker = worker_inner;
+                local_worker.runnable = slot.owner.activate() catch |err| {
+                    slot.err = err;
+                    return;
+                };
+                defer slot.owner.park();
                 const arena = slot.arena.allocator();
                 const owned_keys = dupKeys(arena, entry.keys) catch |err| {
                     slot.err = err;
@@ -7594,7 +7639,7 @@ fn hydrateHitsForKeys(
                 req.fields = fields_inner;
                 req.resolved_doc_filter = resolved_doc_filter_inner;
                 req.resolved_doc_filter_wire_context = resolved_doc_filter_wire_context_inner;
-                slot.result = worker_inner.executeGraphHydrate(arena, entry.group_id, table_name_inner, req, consistency_inner) catch |err| {
+                slot.result = local_worker.executeGraphHydrate(arena, entry.group_id, table_name_inner, req, consistency_inner) catch |err| {
                     slot.err = err;
                     return;
                 };
@@ -7604,6 +7649,12 @@ fn hydrateHitsForKeys(
         var start: usize = 0;
         while (start < entries.len) : (start += graph_fanout_plan.width) {
             const end = @min(start + graph_fanout_plan.width, entries.len);
+            for (entries[start..end], start..end) |entry, i| {
+                var retained: u64 = @sizeOf(GraphHydrateFanoutSlot) + 1024;
+                for (entry.keys) |key| retained +|= key.len +| @sizeOf([]u8);
+                try slots[i].owner.reserve(worker.runnable, io, retained);
+            }
+            const original_class = try runnable_fanout.parkCoordinator(worker.runnable);
             var group: std.Io.Group = .init;
             for (entries[start..end], start..end) |entry, i| {
                 group.async(io, Fiber.run, .{ worker, &slots[i], table_name, entry, topology_epoch, filter_query_json, exclusion_query_json, resolved_doc_filter, resolved_doc_filter_wire_context, include_stored, include_all_fields, fields, consistency });
@@ -7613,7 +7664,8 @@ fn hydrateHitsForKeys(
                 .group_count = end - start,
                 .cancellation = worker.cancellation,
             });
-            group.await(io) catch {};
+            try group.await(io);
+            try runnable_fanout.resumeCoordinator(worker.runnable, original_class);
         }
         recordGraphParallelFanout(.hydrate, @intCast(platform_time.monotonicNs() - fanout_start_ns));
         for (slots) |slot| {
@@ -15422,14 +15474,33 @@ test "distributed graph stops after single retry on repeated topology churn" {
 }
 
 test "distributed graph fans out per-group expand and hydrate with worker io" {
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
     const TestState = struct {
         io_impl: *std.Io.Threaded,
+        scheduler: ?*native.Scheduler = null,
+        root_context: ?*anyopaque = null,
+
         expand_calls: std.atomic.Value(u32) = .init(0),
         hydrate_calls: std.atomic.Value(u32) = .init(0),
         expand_active: std.atomic.Value(u32) = .init(0),
         hydrate_active: std.atomic.Value(u32) = .init(0),
         max_expand_active: std.atomic.Value(u32) = .init(0),
         max_hydrate_active: std.atomic.Value(u32) = .init(0),
+
+        fn verifyChild(self: *@This(), borrow: ?runnable_abi.Borrowed) !void {
+            const scheduler = self.scheduler orelse {
+                try std.testing.expect(borrow == null);
+                return;
+            };
+            const grant = borrow orelse return error.TestMissingChildCapability;
+            try std.testing.expect(grant.context != self.root_context.?);
+            try grant.checkLifetime();
+            try std.testing.expectEqual(runnable_abi.Class.query, try grant.currentClass());
+            try std.testing.expectEqual(@as(usize, 1), grant.cpu_slots);
+            const stats = scheduler.stats();
+            try std.testing.expect(stats.operations >= 3);
+            try std.testing.expect(stats.runnable_slots <= scheduler.config.slots - scheduler.config.control_slots);
+        }
 
         fn updateMax(max_value: *std.atomic.Value(u32), current: u32) void {
             var observed = max_value.load(.monotonic);
@@ -15510,6 +15581,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expect(req.timeout_ms != null);
             try std.testing.expect(req.cancellation != null);
+            try state.verifyChild(req.execution_runnable);
             _ = state.expand_calls.fetchAdd(1, .monotonic);
             const active = state.expand_active.fetchAdd(1, .monotonic) + 1;
             defer _ = state.expand_active.fetchSub(1, .monotonic);
@@ -15556,6 +15628,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expect(req.timeout_ms != null);
             try std.testing.expect(req.cancellation != null);
+            try state.verifyChild(req.execution_runnable);
             _ = state.hydrate_calls.fetchAdd(1, .monotonic);
             const active = state.hydrate_active.fetchAdd(1, .monotonic) + 1;
             defer _ = state.hydrate_active.fetchSub(1, .monotonic);
@@ -15586,69 +15659,107 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
 
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
-    var state = TestState{ .io_impl = &io_impl };
-    var cancellation = std.atomic.Value(bool).init(false);
+    for ([_]usize{ 0, 2, 3 }) |capacity| {
+        var scheduler = try native.Scheduler.init(.{ .slots = @max(capacity, 2), .control_slots = 1 });
+        defer scheduler.close();
+        var parent: native.Execution = .{};
+        defer parent.finish();
+        var state = TestState{ .io_impl = &io_impl };
+        var cancellation = std.atomic.Value(bool).init(false);
 
-    const req = db_mod.types.SearchRequest{
-        .graph_queries = &[_]db_mod.types.NamedGraphQuery{
-            .{
-                .name = "walk",
-                .query = .{
-                    .query_type = .neighbors,
-                    .index_name = "graph_idx",
-                    .start_nodes = .{ .keys = &[_][]const u8{ "doc:a", "doc:n" } },
-                    .params = .{},
-                    .include_documents = true,
+        var req = db_mod.types.SearchRequest{
+            .graph_queries = &[_]db_mod.types.NamedGraphQuery{
+                .{
+                    .name = "walk",
+                    .query = .{
+                        .query_type = .neighbors,
+                        .index_name = "graph_idx",
+                        .start_nodes = .{ .keys = &[_][]const u8{ "doc:a", "doc:n" } },
+                        .params = .{},
+                        .include_documents = true,
+                    },
                 },
             },
-        },
-        .identity_read_generation = 77,
-        .execution_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s,
-        .cancellation = CancellationToken.fromAtomic(&cancellation),
-    };
-    const base_result = db_mod.types.SearchResult{
-        .alloc = std.testing.allocator,
-        .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
-        .total_hits = 0,
-        .graph_results = @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]),
-    };
+            .identity_read_generation = 77,
+            .execution_deadline_ns = platform_time.monotonicNs() + 5 * std.time.ns_per_s,
+            .cancellation = CancellationToken.fromAtomic(&cancellation),
+        };
+        var read: @import("runnable_local_read.zig").Read = .{ .execution = &parent, .allocator = std.testing.allocator };
+        var team: ?runnable_abi.Team = null;
+        if (capacity != 0) {
+            try parent.start(&scheduler, .{
+                .io = io_impl.io(),
+                .native_now_ns = platform_time.monotonicNs,
+                .deadline_ns = req.execution_deadline_ns,
+                .retained_bytes = 23,
+                .cancellation = .{ .ptr = &cancellation, .requested = struct {
+                    fn requested(raw: *const anyopaque) bool {
+                        return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+                    }
+                }.requested },
+            }, .query);
+            team = try read.team();
+            req.execution_runnable = team.?.borrow;
+            state.scheduler = &scheduler;
+            state.root_context = team.?.borrow.context;
+        }
+        const base_result = db_mod.types.SearchResult{
+            .alloc = std.testing.allocator,
+            .hits = @constCast((&[_]db_mod.types.SearchHit{})[0..]),
+            .total_hits = 0,
+            .graph_results = @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]),
+        };
 
-    const results = try executeCrossRange(
-        std.testing.allocator,
-        FakeCatalog.iface(),
-        FakeWorker.iface(&state),
-        "docs",
-        req,
-        base_result,
-        .read_index,
-    );
-    defer {
-        for (results) |*result| result.deinit(std.testing.allocator);
-        std.testing.allocator.free(results);
+        const results = try executeCrossRange(
+            std.testing.allocator,
+            FakeCatalog.iface(),
+            FakeWorker.iface(&state),
+            "docs",
+            req,
+            base_result,
+            .read_index,
+        );
+        defer {
+            for (results) |*result| result.deinit(std.testing.allocator);
+            std.testing.allocator.free(results);
+        }
+
+        try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
+        try std.testing.expectEqual(@as(u32, 2), state.hydrate_calls.load(.monotonic));
+        if (capacity == 2) {
+            try std.testing.expectEqual(@as(u32, 1), state.max_expand_active.load(.monotonic));
+            try std.testing.expectEqual(@as(u32, 1), state.max_hydrate_active.load(.monotonic));
+        } else {
+            try std.testing.expect(state.max_expand_active.load(.monotonic) >= 2);
+            try std.testing.expect(state.max_hydrate_active.load(.monotonic) >= 2);
+        }
+        if (capacity != 0) {
+            try parent.checkLifetime();
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        }
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqual(@as(usize, 2), results[0].nodes.len);
+        try std.testing.expectEqual(@as(usize, 2), results[0].hits.len);
+        for (results[0].hits) |hit| {
+            try std.testing.expect(hit.doc_ordinal == null);
+        }
+
+        cancellation.store(true, .release);
+        try std.testing.expectError(if (capacity == 0) error.Cancelled else error.Canceled, executeCrossRange(
+            std.testing.allocator,
+            FakeCatalog.iface(),
+            FakeWorker.iface(&state),
+            "docs",
+            req,
+            base_result,
+            .read_index,
+        ));
+        try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     }
-
-    try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
-    try std.testing.expectEqual(@as(u32, 2), state.hydrate_calls.load(.monotonic));
-    try std.testing.expect(state.max_expand_active.load(.monotonic) >= 2);
-    try std.testing.expect(state.max_hydrate_active.load(.monotonic) >= 2);
-    try std.testing.expectEqual(@as(usize, 1), results.len);
-    try std.testing.expectEqual(@as(usize, 2), results[0].nodes.len);
-    try std.testing.expectEqual(@as(usize, 2), results[0].hits.len);
-    for (results[0].hits) |hit| {
-        try std.testing.expect(hit.doc_ordinal == null);
-    }
-
-    cancellation.store(true, .release);
-    try std.testing.expectError(error.Cancelled, executeCrossRange(
-        std.testing.allocator,
-        FakeCatalog.iface(),
-        FakeWorker.iface(&state),
-        "docs",
-        req,
-        base_result,
-        .read_index,
-    ));
-    try std.testing.expectEqual(@as(u32, 2), state.expand_calls.load(.monotonic));
 }
 
 test "system catalog graph binding alone performs no admission hydration" {

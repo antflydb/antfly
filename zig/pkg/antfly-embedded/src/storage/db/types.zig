@@ -1818,6 +1818,10 @@ pub const SearchRequest = struct {
         return self.evaluation_limit > 0 and !self.evaluation_graph;
     }
 
+    /// Trusted local coordinator authority. Never serialized or reconstructed
+    /// from public JSON. Independent graph fanout tasks reserve owned children.
+    execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
+
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
