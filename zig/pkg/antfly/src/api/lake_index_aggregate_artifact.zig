@@ -34,11 +34,12 @@ pub fn readArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellati
         store: stores.ArtifactStore,
         ref: ChunkRef,
         cancellation: Cancellation,
+        context: local.serverless_query_lake_read_context.Context,
         fn load(raw: *anyopaque, alloc: A) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return self.store.getVerifiedAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation);
+            return self.store.getVerifiedAllocFor(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation, self.context);
         }
-    }{ .store = store, .ref = ref, .cancellation = cancellation };
+    }{ .store = store, .ref = ref, .cancellation = cancellation, .context = if (cached) |cache| cache.context else .{} };
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
     try cancellation.check();
     if (cached) |cache| return cache.cache.readImmutableAlloc(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), cache.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
@@ -51,12 +52,13 @@ pub fn readArtifactLease(a: A, store: stores.ArtifactStore, ref: ChunkRef, cance
         store: stores.ArtifactStore,
         ref: ChunkRef,
         cancellation: Cancellation,
+        context: local.serverless_query_lake_read_context.Context,
         fn load(raw: *anyopaque, alloc: A) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return self.store.getVerifiedAllocWithCancellationUsingAllocator(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation);
+            return self.store.getVerifiedAllocFor(alloc, self.ref.artifact_id, self.ref.byte_len, self.ref.checksum, self.cancellation, self.context);
         }
     };
-    var loader: Loader = .{ .store = store, .ref = ref, .cancellation = cancellation };
+    var loader: Loader = .{ .store = store, .ref = ref, .cancellation = cancellation, .context = if (cached) |cache| cache.context else .{} };
     try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
     try cancellation.check();
     if (cached) |cache| return cache.cache.readImmutableBlockLease(a, cache.scope, ref.artifact_id, std.math.cast(usize, ref.byte_len) orelse return error.ArtifactTooLarge, try stores.sha256DigestFromChecksum(ref.checksum), cache.context, .{ .ptr = &loader, .load = Loader.load });

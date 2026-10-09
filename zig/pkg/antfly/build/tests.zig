@@ -2570,6 +2570,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, serverless_manifest_test_mod, true, true);
     serverless_manifest_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const artifact_read_tests = b.addTest(.{
+        .root_module = serverless_manifest_test_mod,
+        .filters = &.{ "artifact identities", "artifact store", "artifact reads" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-artifact-read-test", "Run artifact integrity and request-owned provider wait contracts").dependOn(&b.addRunArtifact(artifact_read_tests).step);
     const serverless_manifest_tests = b.addTest(.{
         .root_module = serverless_manifest_test_mod,
         .filters = &.{

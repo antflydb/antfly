@@ -672,6 +672,7 @@ pub const sql_batch_hash = @import("sql/batch_hash.zig");
 pub const sql_column_spill = @import("sql/column_spill.zig");
 pub const sql_disk_rows = @import("sql/disk_rows.zig");
 pub const sql_dynamic_filter = @import("sql/dynamic_filter.zig");
+pub const sql_execution_wait = @import("sql/execution_wait.zig");
 pub const sql_execution_batch = @import("sql/execution_batch.zig");
 pub const sql_ordering_reuse = @import("sql/ordering_reuse.zig");
 pub const sql_parallel_aggregate = @import("sql/parallel_aggregate.zig");
