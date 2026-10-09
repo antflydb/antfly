@@ -2266,10 +2266,25 @@ including the new contract round trip and strict legacy decoding. Inventory
 integrity remains 475 implemented / 136 rejected / 73 superseded / 902 unresolved.
 Standalone qualification is tracked separately; its running build is not
 evidence of a completed standalone gate.
-The current linked standalone catalog gate completes all 66 build steps: 172
+The linked standalone catalog gate for the qualified point-read cut completes
+all 66 build steps: 172
 tests pass and one is skipped. This includes the qualified relation-owner
 contract and the production storage-provider linkage; it does not activate SQL
 index mutations or replace the required transactional ownership fence.
+Name-sensitive replacements now have a native transactional fence. The guarded
+wire tag requires decoder capability 33 and carries the exact active owner,
+authorized logical table and metadata incarnation. Apply resolves the current
+namespace/root/binding in the replacing transaction; stale replicated proposals
+are no-ops, while standalone admission reports the conflict without advancing
+its revision. An unrelated table's source revision does not conflict. Ordinary
+replacements retain their previous wire tag. Guard decoding is capped at 8 KiB,
+rejects trailing bytes and uses owned parsing/cloning rather than leaking partial
+JSON allocations. All 37 native relation-store tests pass, including rename
+races, mixed activation floors, exact wire round trips, every truncation and
+exhaustive allocation faults. The proposal-layer mixed-member gate is still
+running. Public index lowering, scoped SQL authorization/search-path binding,
+bootstrap and exact admitted-result handling remain unfinished; this internal
+fence receives no original-case credit.
 The first standalone gate exposed missing storage-owner cleanup symbols in its
 unlinked test composition. Its catalog tests now use a dedicated module linked
 to the production ABI providers, without changing unrelated restore roots or

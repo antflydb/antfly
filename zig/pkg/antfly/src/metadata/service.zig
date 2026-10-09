@@ -3258,6 +3258,8 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
+        return metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {
         const intent = @import("relation_reconciliation_command.zig").Command.decode(command.apply_relation_reconciliation) catch return metadata_topology_protocol.current_version;
         return intent.requiredDecoderVersion();
@@ -13155,6 +13157,17 @@ test "relational topology admission rejects lifecycle proposals before encoding 
         try std.testing.expectEqual(@as(usize, 1), service.appended);
     }
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .upsert_restore_job = .{ .key = "1", .value = "{}" } }));
+    const relation_mutation_command: metadata_storage.TransitionCommand = .{ .compare_and_replace_table = .{ .expected = plain, .replacement = plain, .relation_guard = .{ .target = .{ .name = "idx" }, .logical_table = plain.name, .owner = .{ .table_id = plain.table_id, .schema_version = 1, .schema_digest = @splat(1), .kind = .index }, .incarnation = @splat(1) } } };
+    const relation_version = metadata_topology_protocol.relation_mutation_version;
+    try std.testing.expectEqual(relation_version, transitionRequiredCoordinatedDecoderVersion(relation_mutation_command));
+    var relation_service: Fake = .{ .member_versions = &.{ relation_version, relation_version - 1, relation_version } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&relation_service, relation_mutation_command, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{relation_mutation_command}));
+    try std.testing.expectEqual(@as(usize, 0), relation_service.appended);
+    relation_service.member_versions = &.{ relation_version, relation_version, relation_version };
+    try ensureCoordinatedDecoderWithContext(&relation_service, relation_mutation_command, .{});
+    try relation_service.propose(&.{relation_mutation_command});
+    try std.testing.expectEqual(@as(usize, 1), relation_service.appended);
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .create_restore_job = .{ .key = "1", .value = "{}" } }));
     try std.testing.expect(!transitionRequiresCoordinatedDecoder(.{ .apply_extension_lifecycle_v2 = .{ .upsert_tables = &.{plain} } }));
     const root_bound_store: metadata_table_manager.StoreRecord = .{

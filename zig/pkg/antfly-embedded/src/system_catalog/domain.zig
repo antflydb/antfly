@@ -887,6 +887,41 @@ pub const ResolvedRelation = struct {
     }
 };
 
+/// Retain the authorized logical owner through the write transaction. Source
+/// revisions are not CAS preconditions: independent DDL must not conflict.
+pub const RelationMutationGuard = struct {
+    target: RelationTarget,
+    logical_table: []const u8,
+    owner: @import("relation_names.zig").Owner,
+    incarnation: [16]u8,
+
+    pub fn validate(self: @This()) !void {
+        try self.target.validate();
+        try (Target{ .database = self.target.database, .namespace = self.target.namespace, .table = self.logical_table }).validate();
+        try self.owner.validate();
+        if (self.owner.phase != .active or std.mem.allEqual(u8, &self.incarnation, 0)) return error.InvalidCatalogMutation;
+    }
+
+    pub fn deinitOwned(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.target.database);
+        alloc.free(self.target.namespace);
+        alloc.free(self.target.name);
+        alloc.free(self.logical_table);
+        self.* = undefined;
+    }
+
+    pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
+        try self.validate();
+        const database = try alloc.dupe(u8, self.target.database);
+        errdefer alloc.free(database);
+        const namespace = try alloc.dupe(u8, self.target.namespace);
+        errdefer alloc.free(namespace);
+        const name = try alloc.dupe(u8, self.target.name);
+        errdefer alloc.free(name);
+        return .{ .target = .{ .database = database, .namespace = namespace, .name = name }, .logical_table = try alloc.dupe(u8, self.logical_table), .owner = self.owner, .incarnation = self.incarnation };
+    }
+};
+
 pub const ResolveMany = struct {
     targets: []const Target = &.{},
     /// Internal reverse lookup for dependency authorization and schema output.

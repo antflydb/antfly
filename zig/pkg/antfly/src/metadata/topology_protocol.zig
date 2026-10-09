@@ -59,7 +59,10 @@ const std = @import("std");
 /// separate capabilities, never implied by this decoder floor.
 /// Version 32 decodes independently verified live relation-root publication
 /// and adopts every native namespace writer in the same durable transaction.
-pub const current_version: u16 = 32;
+/// Version 33 decodes name-sensitive table replacements carrying an exact
+/// relation-owner, logical-binding and metadata-incarnation mutation fence.
+pub const current_version: u16 = 33;
+pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
 pub const relation_reconciliation_version: u16 = 31;
 pub const object_table_engine_version: u16 = 30;

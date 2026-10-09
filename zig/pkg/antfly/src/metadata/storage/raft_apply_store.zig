@@ -282,6 +282,107 @@ test "system catalog relation namespace transaction bulk resolution requires a l
     defer legacy_response.deinit();
 }
 
+test "system catalog relation namespace transaction guarded replacements fence owners not unrelated DDL" {
+    const a = std.testing.allocator;
+    const group: u64 = 21;
+    const identity = "01010101010101010101010101010101".*;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/guarded-replacement", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = identity });
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "physical", .schema_json = "{\"version\":1,\"relational_indexes\":[{\"name\":\"owned_idx\"}]}" };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    _ = try adoptLiveRelationWriterForTest(&store, a, group);
+    const target: system_catalog.RelationTarget = .{ .name = "owned_idx" };
+    const resolved = try store.resolveSystemCatalogIdentities(a, group, .{ .relations = &.{target} });
+    defer resolved.deinit(a);
+    const guard: system_catalog.RelationMutationGuard = .{ .target = target, .logical_table = resolved.relations[0].?.logical_table, .owner = resolved.relations[0].?.owner, .incarnation = resolved.relation_epoch.?.incarnation };
+    var replacement = table;
+    replacement.description = "guarded";
+    var command: TransitionCommand = .{ .compare_and_replace_table = .{ .expected = table, .replacement = replacement, .relation_guard = guard } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.applyStandaloneCommand(group, command));
+    inline for (.{ topology_protocol.relation_publication_version, topology_protocol.relation_mutation_version }) |version| {
+        const activation: topology_protocol.Activation = .{ .version = version, .incarnation = identity, .member_count = 3, .membership_fingerprint = @splat(7) };
+        const bytes = try std.json.Stringify.valueAlloc(a, activation, .{});
+        defer a.free(bytes);
+        try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = bytes });
+        if (version < topology_protocol.relation_mutation_version) try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.applyStandaloneCommand(group, command));
+    }
+    const encoded = try encodeTransitionCommand(a, command);
+    defer a.free(encoded);
+    try std.testing.expectEqual(@backingInt(TransitionTag.compare_and_replace_relation_table), encoded[transition_magic.len]);
+    var decoded = (try decodeTransitionCommand(a, encoded)).?;
+    defer decoded.deinit(a);
+    try std.testing.expect(decoded.compare_and_replace_table.relation_guard.?.owner.eql(guard.owner));
+    const canonical = try encodeTransitionCommand(a, decoded);
+    defer a.free(canonical);
+    try std.testing.expectEqualSlices(u8, encoded, canonical);
+    const unguarded = try encodeTransitionCommand(a, .{ .compare_and_replace_table = .{ .expected = table, .replacement = replacement } });
+    defer a.free(unguarded);
+    try std.testing.expectEqual(@backingInt(TransitionTag.compare_and_replace_table), unguarded[transition_magic.len]);
+    var invalid = guard;
+    invalid.incarnation[0] ^= 1;
+    command.compare_and_replace_table.relation_guard = invalid;
+    const before = try store.standaloneRevision();
+    try std.testing.expectError(error.CatalogGenerationChanged, store.applyStandaloneCommand(group, command));
+    try std.testing.expectEqual(before, try store.standaloneRevision());
+    invalid = guard;
+    invalid.owner.kind = .constraint_index;
+    command.compare_and_replace_table.relation_guard = invalid;
+    try std.testing.expectError(error.CatalogGenerationChanged, store.applyStandaloneCommand(group, command));
+    invalid = guard;
+    invalid.logical_table = "not_authorized";
+    command.compare_and_replace_table.relation_guard = invalid;
+    try std.testing.expectError(error.CatalogGenerationChanged, store.applyStandaloneCommand(group, command));
+    command.compare_and_replace_table.relation_guard = guard;
+    // A new source revision on a different table must not serialize this DDL.
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "unrelated" } });
+    try store.applyStandaloneCommand(group, command);
+    {
+        const actual = (try store.getTable(a, group, table.table_id)).?;
+        defer metadata_table_manager.freeTable(a, actual);
+        try std.testing.expectEqualStrings("guarded", actual.description);
+    }
+    // Rename changes no schema version and leaves the index owner identical.
+    // Only the in-transaction logical binding fence detects this race.
+    try applySystemCatalogTestCommand(&store, 1, .{ .expected_revision = 0, .mutation = .{ .action = .rename, .kind = .table, .name = "physical", .new_name = "logical" } });
+    command.compare_and_replace_table.expected = replacement;
+    command.compare_and_replace_table.replacement.description = "must_not_apply";
+    try std.testing.expectError(error.CatalogGenerationChanged, store.applyStandaloneCommand(group, command));
+    const stale = try encodeTransitionCommand(a, command);
+    defer a.free(stale);
+    var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 1, .index = 2, .data = stale }});
+    defer outcome.deinit();
+    try std.testing.expectEqual(@as(u64, 2), try store.durableAppliedIndex(group));
+    const actual = (try store.getTable(a, group, table.table_id)).?;
+    defer metadata_table_manager.freeTable(a, actual);
+    try std.testing.expectEqualStrings("guarded", actual.description);
+}
+
+test "system catalog relation namespace transaction guarded codec rejects truncation and allocation faults" {
+    const Fixture = struct {
+        const table: metadata.TableRecord = .{ .table_id = 7, .name = "physical" };
+        const command: TransitionCommand = .{ .compare_and_replace_table = .{ .expected = table, .replacement = table, .relation_guard = .{ .target = .{ .name = "idx" }, .logical_table = "logical", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .index }, .incarnation = @splat(1) } } };
+        fn run(a: std.mem.Allocator) !void {
+            const bytes = try encodeTransitionCommand(a, command);
+            defer a.free(bytes);
+            var decoded = (try decodeTransitionCommand(a, bytes)).?;
+            defer decoded.deinit(a);
+            try std.testing.expectEqualStrings("logical", decoded.compare_and_replace_table.relation_guard.?.logical_table);
+        }
+    };
+    const bytes = try encodeTransitionCommand(std.testing.allocator, Fixture.command);
+    defer std.testing.allocator.free(bytes);
+    for (transition_magic.len + 1..bytes.len) |len| try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTransitionCommand(std.testing.allocator, bytes[0..len]));
+    const trailing = try std.mem.concat(std.testing.allocator, u8, &.{ bytes, "x" });
+    defer std.testing.allocator.free(trailing);
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTransitionCommand(std.testing.allocator, trailing));
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
 test "system catalog relation namespace transaction live writers pin roots recover and ignore obsolete registry bytes" {
     const a = std.testing.allocator;
     const group: u64 = 41;
@@ -5757,6 +5858,7 @@ pub const TransitionCommand = union(enum) {
     compare_and_replace_table: struct {
         expected: metadata.TableRecord,
         replacement: metadata.TableRecord,
+        relation_guard: ?system_catalog.RelationMutationGuard = null,
     },
     mutate_lake_index_lifecycle: struct {
         table_id: u64,
@@ -5878,6 +5980,7 @@ pub const TransitionCommand = union(enum) {
             .compare_and_replace_table => |*replacement| {
                 metadata_table_manager.freeTable(alloc, replacement.expected);
                 metadata_table_manager.freeTable(alloc, replacement.replacement);
+                if (replacement.relation_guard) |*guard| guard.deinitOwned(alloc);
             },
             .apply_table_topology => |*mutation| switch (mutation.*) {
                 .create => |*create| {
@@ -5990,6 +6093,10 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             )) return error.InvalidStoreReporterFence;
         },
         .compare_and_replace_table => |replacement| {
+            if (replacement.relation_guard) |guard| {
+                try guard.validate();
+                if (guard.owner.table_id != replacement.expected.table_id) return error.InvalidCatalogMutation;
+            }
             try metadata_table_manager.validateObjectTableMutation(std.heap.page_allocator, replacement.expected, replacement.replacement);
             if (replacement.expected.table_id == 0 or
                 replacement.replacement.table_id != replacement.expected.table_id or
@@ -11115,6 +11222,8 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn applyStandaloneCommand(self: *RaftApplyStore, group_id: u64, command: TransitionCommand) !void {
+        if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
+            try validateTransitionCommandDataGroupIds(command);
         var publication: ?RelationPublicationProof = null;
         var page: ?relation_reconciliation.Page = null;
         var failure: ?relation_reconciliation.FailurePlan = null;
@@ -11171,6 +11280,9 @@ pub const RaftApplyStore = struct {
         var committed = false;
         defer if (!committed) txn.abort();
         if (self.hasHotStandbyMirror()) txn.mutation_capture = &capture;
+        if (command == .compare_and_replace_table) if (command.compare_and_replace_table.relation_guard) |guard| {
+            try self.validateRelationMutationTxn(&txn, group_id, guard, command.compare_and_replace_table.expected);
+        };
         try self.applyTransitionCommandTxn(&txn, group_id, command);
         try advanceStandaloneRevision(&txn);
         try self.stageStandaloneHotStandby(&txn, &capture, group_id);
@@ -19982,6 +20094,10 @@ pub const RaftApplyStore = struct {
                 try self.applyTableUpsertTxn(txn, group_id, record);
             },
             .compare_and_replace_table => |replacement| {
+                if (replacement.relation_guard) |guard| self.validateRelationMutationTxn(txn, group_id, guard, replacement.expected) catch |err| switch (err) {
+                    error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.TableTopologyProtocolUpgradeRequired => return,
+                    else => return err,
+                };
                 try self.applyTableCompareAndReplaceTxn(
                     txn,
                     group_id,
@@ -22157,6 +22273,35 @@ pub const RaftApplyStore = struct {
             .table_name = table_name,
             .table_id = record.table_id,
         });
+    }
+
+    /// Validate name authorization in the same transaction that replaces the
+    /// table. A current root is required, but unrelated source revisions do
+    /// not invalidate an unchanged owner or logical binding.
+    fn validateRelationMutationTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        guard: system_catalog.RelationMutationGuard,
+        expected: metadata.TableRecord,
+    ) !void {
+        try guard.validate();
+        if (guard.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
+        const activation = try self.standbyRelationActivationTxn(txn, group_id);
+        if (activation.version < topology_protocol.relation_mutation_version) return error.TableTopologyProtocolUpgradeRequired;
+        const epoch = try relationSourceEpochTxn(txn, group_id);
+        if (!std.mem.eql(u8, &guard.incarnation, &epoch.incarnation)) return error.CatalogGenerationChanged;
+        var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id)) orelse return error.CatalogPublicationProofPending;
+        if (!live.root.epoch.eql(epoch)) return error.CatalogGenerationChanged;
+        const namespace_id = (try resolveSystemCatalogNamespaceTxn(self.alloc, txn, group_id, guard.target.database, guard.target.namespace)) orelse return error.CatalogGenerationChanged;
+        const owner = (try live.getClaim(.{ .namespace_id = namespace_id, .name = guard.target.name })) orelse return error.CatalogGenerationChanged;
+        if (!owner.eql(guard.owner)) return error.CatalogGenerationChanged;
+        var binding = try system_catalog_storage.getById(self.alloc, txn, group_id, .table, owner.table_id);
+        defer if (binding) |*value| value.deinit();
+        if (binding) |value| {
+            if (value.value.parent_id != namespace_id or !std.mem.eql(u8, value.value.name, guard.logical_table) or
+                !std.mem.eql(u8, value.value.storage_name, expected.name)) return error.CatalogGenerationChanged;
+        } else if (namespace_id != system_catalog.default_namespace_id or !std.mem.eql(u8, expected.name, guard.logical_table)) return error.CatalogGenerationChanged;
     }
 
     fn applyTableCompareAndReplaceTxn(
@@ -24562,6 +24707,7 @@ const TransitionTag = enum(u8) {
     admit_split_transition = 44,
     complete_restore_range = 46,
     compare_and_replace_table = 47,
+    compare_and_replace_relation_table = 77,
     claim_replication_source_cutover = 48,
     complete_replication_source_retirement = 49,
     apply_table_topology = 50,
@@ -24602,6 +24748,8 @@ fn readInitialPlacementProof(encoded: []const u8, pos: *usize) !fk_generation_pu
 }
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
+    if (command == .compare_and_replace_table and command.compare_and_replace_table.relation_guard != null)
+        try validateTransitionCommandDataGroupIds(command);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
 
@@ -24750,9 +24898,10 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try appendTableRecord(alloc, &out, record);
         },
         .compare_and_replace_table => |replacement| {
-            try out.append(alloc, @backingInt(TransitionTag.compare_and_replace_table));
+            try out.append(alloc, @backingInt(if (replacement.relation_guard != null) TransitionTag.compare_and_replace_relation_table else TransitionTag.compare_and_replace_table));
             try appendFramedTableRecord(alloc, &out, replacement.expected);
             try appendFramedTableRecord(alloc, &out, replacement.replacement);
+            if (replacement.relation_guard) |guard| try appendJsonRecord(alloc, &out, guard);
         },
         .mutate_lake_index_lifecycle => |mutation| {
             try out.append(alloc, @backingInt(TransitionTag.mutate_lake_index_lifecycle));
@@ -25187,13 +25336,19 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
         .upsert_table => .{
             .upsert_table = try readTableRecord(alloc, encoded, &pos),
         },
-        .compare_and_replace_table => blk: {
+        .compare_and_replace_table, .compare_and_replace_relation_table => blk: {
             const expected = try readFramedTableRecord(alloc, encoded, &pos);
             errdefer metadata_table_manager.freeTable(alloc, expected);
             const replacement = try readFramedTableRecord(alloc, encoded, &pos);
+            errdefer metadata_table_manager.freeTable(alloc, replacement);
+            var guard = if (tag == .compare_and_replace_relation_table) try readRelationMutationGuard(alloc, encoded, &pos) else null;
+            errdefer if (guard) |*value| value.deinitOwned(alloc);
+            if (pos != encoded.len) return error.InvalidMetadataTransitionEncoding;
+            if (guard) |value| if (value.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
             break :blk .{ .compare_and_replace_table = .{
                 .expected = expected,
                 .replacement = replacement,
+                .relation_guard = guard,
             } };
         },
         .mutate_lake_index_lifecycle => blk: {
@@ -28041,6 +28196,18 @@ fn readBackupCohortSeal(alloc: std.mem.Allocator, encoded: []const u8, pos: *usi
     var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").metadata_backup_cohort.SealReceipt, alloc, bytes, .{});
     defer parsed.deinit();
     return parsed.value;
+}
+
+fn readRelationMutationGuard(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !system_catalog.RelationMutationGuard {
+    const len = try readInt(encoded, pos, u32);
+    // Four bounded names, owner fields and JSON escaping fit within 8 KiB.
+    // Check before allocating or parsing, including hostile persisted frames.
+    if (len == 0 or len > 8192 or len > encoded.len - pos.*) return error.InvalidMetadataTransitionEncoding;
+    const json = encoded[pos.*..][0..len];
+    pos.* += len;
+    var parsed = try std.json.parseFromSlice(system_catalog.RelationMutationGuard, alloc, json, .{});
+    defer parsed.deinit();
+    return parsed.value.clone(alloc);
 }
 
 fn readJsonRecord(comptime T: type, alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !T {
