@@ -459,7 +459,7 @@ pub const Cache = struct {
         }
         defer if (claim) |active| self.finish(active, context.io.?);
         if (claim != null) if (try self.lookup(a, key)) |bytes| return bytes;
-        const disk_bytes = if (self.persistent) |*disk| try disk.readAlloc(a, key, length) else null;
+        const disk_bytes = if (self.persistent) |*disk| try disk.readAllocFor(a, key, length, context) else null;
         if (disk_bytes) |bytes| {
             var actual: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
@@ -735,7 +735,7 @@ pub const Reader = struct {
         // The credential-scoped, versioned key is identical in both tiers.
         // Disk corruption/missing entries are misses inside the persistent
         // cache; an allocation failure still belongs to this request.
-        const disk_bytes = if (self.cache.persistent) |*disk| try disk.readAlloc(alloc, key, read.range.len) else null;
+        const disk_bytes = if (self.cache.persistent) |*disk| try disk.readAllocFor(alloc, key, read.range.len, self.context) else null;
         const bytes = disk_bytes orelse try self.base.parquetReader().readPlannedAlloc(alloc, read);
         self.cache.recordRead(disk_bytes != null, bytes.len);
         errdefer alloc.free(bytes);
