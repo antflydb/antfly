@@ -13875,7 +13875,11 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expectEqual(@as(u64, 1), parked_stats.output_blocked);
             var page = try stream.next(stream.context, alloc, wire_request, 1);
             defer page.result.deinit();
-            try std.testing.expectEqualStrings("exact", page.result.rows[0][1].string);
+            try std.testing.expectEqual(@as(usize, 1), page.result.rowCount());
+            try std.testing.expectEqual(@as(usize, 2), page.result.columns.len);
+            const name = try page.result.cell(alloc, 0, 1);
+            try std.testing.expect(!name.sql_null);
+            try std.testing.expectEqualStrings("exact", name.value.string);
             try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().runnable_slots);
             try std.testing.expectEqual(@as(usize, 1), server.runnable_scheduler.?.stats().output_blocked);
             cancel.store(true, .release);
