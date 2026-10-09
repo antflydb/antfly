@@ -350,6 +350,50 @@ fn optionalGet(reader: anytype, key: []const u8) !?[]const u8 {
     };
 }
 
+/// Owned, bounded scheduler observation from one pinned authority. A caller
+/// must still use CAS intents: this is neither a reservation nor serving proof.
+/// There is only one protected root, so finding the oldest eligible retirement
+/// needs one seek and at most one successor, regardless of backlog size.
+pub const Work = struct {
+    epoch: ?Epoch,
+    current: ?State,
+    root: ?Generation,
+    garbage: ?Retirement = null,
+
+    pub fn read(reader: anytype, group: u64, epoch: ?Epoch) !Work {
+        const revision = try readSourceRevision(reader, group);
+        if (epoch) |value| {
+            if (value.revision == 0 or value.revision != revision or
+                std.mem.allEqual(u8, &value.incarnation, 0)) return error.InvalidCatalogRecord;
+        } else if (revision != 0) return error.InvalidCatalogRecord;
+        const verified = try Verifier(@TypeOf(reader.*)).init(reader, group);
+        if (revision == 0 and (verified.current != null or verified.root != null)) return error.InvalidCatalogRecord;
+        var result: Work = .{ .epoch = epoch, .current = verified.current, .root = verified.root };
+        var buf: [128]u8 = undefined;
+        const prefix = try retirementsForGroup(&buf, group);
+        var cursor = try reader.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |row| {
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            const record = (try classify(row.key)) orelse return error.InvalidCatalogRecord;
+            const retired = try Retirement.decode(row.value);
+            const current = result.current orelse return error.InvalidCatalogRecord;
+            if (record.kind != .retirement or record.group_id != group or
+                !retired.generation.eql(record.generation.?) or
+                std.mem.order(u8, &retired.generation.job_id, &current.job_id) != .lt) return error.InvalidCatalogRecord;
+            if (result.root) |root| if (root.eql(retired.generation)) {
+                if (retired.cursor_len != 0) return error.InvalidCatalogRecord;
+                entry = try cursor.next();
+                continue;
+            };
+            result.garbage = retired;
+            break;
+        }
+        return result;
+    }
+};
+
 /// A streaming consistency verifier shared by borrowed snapshot maps and
 /// pinned checkpoint transactions. It owns no catalog-size map or schema DOM.
 /// Candidate state remains immutable/unpublished: root activation and mutable
@@ -1111,6 +1155,73 @@ const TestTxn = struct {
         }
     };
 };
+
+test "relation reconciliation scheduler observation bounds backlog reads and skips the protected root" {
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    var buf: [128]u8 = undefined;
+    const empty = try Work.read(&txn, 41, null);
+    try std.testing.expect(empty.epoch == null and empty.current == null and empty.garbage == null);
+    for (0..test_epoch.revision) |_| try advanceSource(&txn, 41);
+    const current = try State.init(41, blk: {
+        var id: [16]u8 = undefined;
+        std.mem.writeInt(u128, &id, 129, .big);
+        break :blk id;
+    }, test_epoch);
+    try txn.put(try jobKey(&buf, 41), &(try current.encode()));
+    var protected: Generation = undefined;
+    for (1..129) |i| {
+        var id: [16]u8 = undefined;
+        std.mem.writeInt(u128, &id, i, .big);
+        const generation: Generation = .{ .group_id = 41, .job_id = id };
+        if (i == 1) protected = generation;
+        const retirement = Retirement.init(generation);
+        try txn.put(try retirementKey(&buf, generation), &(try retirement.encode()));
+    }
+    try txn.put(try rootKey(&buf, 41), &(try protected.encode()));
+    txn.cursor_seeks = 0;
+    txn.cursor_nexts = 0;
+    const work = try Work.read(&txn, 41, test_epoch);
+    try std.testing.expectEqual(@as(u128, 2), std.mem.readInt(u128, &work.garbage.?.generation.job_id, .big));
+    try std.testing.expect(std.meta.eql(current, work.current.?));
+    try std.testing.expect(work.root.?.eql(protected));
+    try std.testing.expectEqual(@as(usize, 1), txn.cursor_seeks);
+    try std.testing.expectEqual(@as(usize, 1), txn.cursor_nexts);
+    // The returned cut owns its bytes; later progress cannot alter it.
+    try txn.delete(try retirementKey(&buf, work.garbage.?.generation));
+    const next = try Work.read(&txn, 41, test_epoch);
+    try std.testing.expectEqual(@as(u128, 3), std.mem.readInt(u128, &next.garbage.?.generation.job_id, .big));
+    try std.testing.expectEqual(@as(u128, 2), std.mem.readInt(u128, &work.garbage.?.generation.job_id, .big));
+    try std.testing.expectError(error.InvalidCatalogRecord, Work.read(&txn, 41, null));
+    var moved = test_epoch;
+    moved.revision += 1;
+    try std.testing.expectError(error.InvalidCatalogRecord, Work.read(&txn, 41, moved));
+    // A syntactically valid retirement cannot smuggle another generation.
+    try txn.put(try retirementKey(&buf, next.garbage.?.generation), &(try work.garbage.?.encode()));
+    try std.testing.expectError(error.InvalidCatalogRecord, Work.read(&txn, 41, test_epoch));
+}
+
+test "relation reconciliation scheduler observation handles protected-only and orphaned retirement cuts" {
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    var buf: [128]u8 = undefined;
+    for (0..test_epoch.revision) |_| try advanceSource(&txn, 41);
+    const prior = try State.init(41, try nextJobId(null), test_epoch);
+    const current = try State.init(41, try nextJobId(&prior), test_epoch);
+    try txn.put(try jobKey(&buf, 41), &(try current.encode()));
+    const protected = Generation.of(&prior);
+    const retirement = Retirement.init(protected);
+    try txn.put(try retirementKey(&buf, protected), &(try retirement.encode()));
+    try txn.put(try rootKey(&buf, 41), &(try protected.encode()));
+    // An adjacent group is not part of this job's backlog.
+    const adjacent = Retirement.init(.{ .group_id = 42, .job_id = prior.job_id });
+    try txn.put(try retirementKey(&buf, adjacent.generation), &(try adjacent.encode()));
+    try std.testing.expect((try Work.read(&txn, 41, test_epoch)).garbage == null);
+    try txn.delete(try rootKey(&buf, 41));
+    try std.testing.expect((try Work.read(&txn, 41, test_epoch)).garbage.?.generation.eql(protected));
+    try txn.delete(try jobKey(&buf, 41));
+    try std.testing.expectError(error.InvalidCatalogRecord, Work.read(&txn, 41, test_epoch));
+}
 
 test "relation reconciliation seals only a transactionally verified candidate tail" {
     const a = std.testing.allocator;

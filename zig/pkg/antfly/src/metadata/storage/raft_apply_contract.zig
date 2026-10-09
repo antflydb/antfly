@@ -272,6 +272,7 @@ pub const CatalogProjectionRequest = union(enum) {
     catalog_write_validation: []const u8,
     catalog_write_validation_revision: void,
     relation_source_tracking: void,
+    relation_reconciliation_work: void,
     topology_activation: void,
     report_cursor: u64,
     read_control_stores: []const u64,

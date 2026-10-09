@@ -1633,6 +1633,19 @@ The committed-apply outcome registration now releases ownership before
 unlocking. Its deferred cleanup cannot clear the next writer's active outcome;
 a deterministic ownership-handoff regression covers successful and failing
 cleanup paths.
+Scheduler observation now crosses the storage-owner boundary as one owned,
+fixed-size cut from a pinned native transaction: actual source epoch, current
+job, root identity and oldest collectible retirement. It does not decode table
+schemas, acquire the apply mutex, or materialize a retirement list. Selection
+uses one retirement-prefix seek and at most one successor step to skip the
+single protected root, independent of backlog size. Pure read-budget tests
+cover 128 retirements, protected-only and adjacent-group cuts, malformed owner
+identities and orphan retirements; the native replica/restart trace consumes
+this production observation throughout. A compiled-owner regression exercises
+the opaque client/JSON projection through adoption, all empty-catalog phases,
+retirement, GC and reopen, retaining earlier owned cuts across mutations:
+`zig build antfly-storage-owner-test -Dstorage-owner-test-filter='opaque metadata relation reconciliation work'`.
+Observation does not adopt tracking, schedule work or publish a serving root.
 Leader scheduling, durable failure reporting and end-to-end coordinator
 retries remain to be wired. Pending-generation reservation sources, GC scheduling,
 capability barriers and atomic active-root publication still

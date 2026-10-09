@@ -3589,6 +3589,64 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
     }
 }
 
+test "opaque metadata relation reconciliation work retains owned cuts across progress and reopen" {
+    const a = std.testing.allocator;
+    const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
+    const control = @import("../metadata/relation_reconciliation_command.zig");
+    const protocol = @import("../metadata/topology_protocol.zig");
+    const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
+    const T = struct {
+        fn apply(store: *metadata_apply_client.RaftApplyStore, command: control.Command) !void {
+            const bytes = try command.encodeAlloc(a);
+            defer a.free(bytes);
+            try store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = bytes });
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var expected: r.Work = undefined;
+    {
+        var store = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+        defer store.deinit();
+        const empty = try store.relationReconciliationWork(group);
+        try std.testing.expect(empty.epoch == null and empty.current == null and empty.garbage == null);
+        const identity = "11111111111111111111111111111111".*;
+        const proof: protocol.Activation = .{ .version = protocol.relation_reconciliation_version, .incarnation = identity, .member_count = 1, .membership_fingerprint = @splat(7) };
+        const activation = try std.json.Stringify.valueAlloc(a, proof, .{});
+        defer a.free(activation);
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = identity });
+        try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+        try T.apply(&store, .{ .adopt = proof });
+        const tracked = try store.relationReconciliationWork(group);
+        try std.testing.expectEqual(@as(u64, 1), tracked.epoch.?.revision);
+        try std.testing.expect(tracked.current == null);
+        const initial = try r.State.init(group, try r.nextJobId(null), tracked.epoch.?);
+        try T.apply(&store, .{ .start = .{ .next = initial } });
+        const before = try store.relationReconciliationWork(group);
+        for (0..3) |_| {
+            const work = try store.relationReconciliationWork(group);
+            try T.apply(&store, .{ .advance = work.current.? });
+        }
+        const ready = (try store.relationReconciliationWork(group)).current.?;
+        try std.testing.expectEqual(r.Phase.ready, ready.phase);
+        try std.testing.expect(std.meta.eql(initial, before.current.?));
+        const next = try r.State.init(group, try r.nextJobId(&ready), ready.epoch);
+        try T.apply(&store, .{ .start = .{ .next = next, .prior = ready } });
+        const retired = try store.relationReconciliationWork(group);
+        try std.testing.expect(retired.garbage.?.generation.eql(r.Generation.of(&ready)));
+        try T.apply(&store, .{ .garbage = retired.garbage.? });
+        expected = try store.relationReconciliationWork(group);
+        try std.testing.expect(expected.garbage == null and expected.root == null);
+        try std.testing.expect(std.meta.eql(next, expected.current.?));
+        try std.testing.expect(retired.garbage != null);
+    }
+    var recovered = try metadata_apply_client.RaftApplyStore.init(a, .{ .root_dir = path, .no_sync = true });
+    defer recovered.deinit();
+    try std.testing.expect(std.meta.eql(expected, try recovered.relationReconciliationWork(group)));
+}
+
 test "opaque metadata apply owner preserves semantic error identity" {
     const path = "/tmp/antfly-storage-kernel-metadata-errors";
     cleanup(path);

@@ -839,10 +839,8 @@ test "system catalog relation namespace transaction page intents preserve replic
             return encodeTransitionCommand(a, .{ .apply_relation_reconciliation = bytes });
         }
         fn state(owner: *RaftApplyStore) !r.State {
-            var read = try owner.store.beginReadTxn();
-            defer read.abort();
-            var buf: [128]u8 = undefined;
-            return r.State.decode(try read.get(try r.jobKey(&buf, group)));
+            const work = try owner.relationReconciliationWork(group);
+            return work.current orelse error.InvalidCatalogRecord;
         }
         fn apply(owner: *RaftApplyStore, entries: []const raft_engine.core.Entry) !void {
             var outcome = try MetadataReplayTest.apply(owner, group, entries);
@@ -871,9 +869,15 @@ test "system catalog relation namespace transaction page intents preserve replic
         for ([_]*RaftApplyStore{ &owner, &peer }) |store| {
             try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = identity });
             try store.replaceStandaloneCatalog(group, try store.standaloneRevision(), tables, &.{}, "{}");
+            const untracked = try store.relationReconciliationWork(group);
+            try std.testing.expect(untracked.epoch == null and untracked.current == null and untracked.garbage == null);
             try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
             try T.control(store, .{ .adopt = proof });
             try T.control(store, .{ .start = .{ .next = initial } });
+            const observed = try store.relationReconciliationWork(group);
+            try std.testing.expect(observed.epoch.?.eql(initial.epoch));
+            try std.testing.expect(std.meta.eql(initial, observed.current.?));
+            try std.testing.expect(observed.root == null and observed.garbage == null);
         }
         var prepared = try owner.prepareRelationReconciliationPage(a, initial);
         defer prepared.deinit();
@@ -15701,6 +15705,14 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         return try relation_reconciliation.readSourceRevision(&txn, group_id) != 0;
+    }
+    /// Observe scheduler state in one pinned read without the apply mutex or
+    /// table/schema decoding. The returned fixed-size cut owns all its bytes.
+    pub fn relationReconciliationWork(self: *RaftApplyStore, group_id: u64) !relation_reconciliation.Work {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        const epoch = if (try relation_reconciliation.readSourceRevision(&txn, group_id) == 0) null else try relationSourceEpochTxn(&txn, group_id);
+        return relation_reconciliation.Work.read(&txn, group_id, epoch);
     }
     fn applyRelationControlTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         const command = try relation_control.Command.decode(bytes);
