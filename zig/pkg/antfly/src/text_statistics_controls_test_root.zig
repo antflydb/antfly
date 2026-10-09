@@ -287,6 +287,8 @@ test "text statistics trusted controls loan CPU only during native physical file
         defer storage.deinit();
         const view = storage.storage();
         try view.writeFileAbsolute(path, "alpha beta");
+        // Isolate the positional syscall from cold descriptor acquisition.
+        _ = try view.fileSize(path);
         var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
         defer scheduler.close();
         var canceled = std.atomic.Value(bool).init(false);
@@ -466,6 +468,8 @@ test "text statistics trusted controls pin metadata and whole file reads across 
         const view = storage.storage();
         try view.writeFileAbsolute(path, "old body end");
         try view.writeFileAbsolute(replacement, "replacement new");
+        // This fixture targets metadata/data retention on an already cached FD.
+        _ = try view.fileSize(path);
         var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
         defer scheduler.close();
         var canceled = std.atomic.Value(bool).init(false);
@@ -523,6 +527,240 @@ test "text statistics trusted controls pin metadata and whole file reads across 
         try std.testing.expectEqual(@as(?u64, deadline), parent.entry.?.options.deadline_ns);
         try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
         try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
+
+test "text statistics trusted controls descriptor FIFO preserves original native wait authority and unlinks rejected waiters" {
+    const storage_io = sources.storage_lsm_backend_storage_io;
+    const admission = sources.common_read_admission;
+    const Budget = sources.common_read_execution_budget.Budget(types.SearchRequest, checkReadBudget);
+    const Case = enum { fifo, cancel, expire, shutdown, wait_failure };
+    const Shape = enum { reservation, file_read };
+    const Probe = struct {
+        budget: *Budget,
+        pool: *storage_io.NativeStoragePool,
+        scheduler: *native.Scheduler,
+        canceled: *std.atomic.Value(bool),
+        case: Case,
+        waits: usize = 0,
+        remaining: usize = 2,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.budget.checkpoint();
+        }
+        pub fn executionBoundary(self: *@This()) ?sources.common_execution_wait.Boundary {
+            return self.budget.executionBoundary();
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            self.waits += 1;
+            try self.budget.executionBoundary().?.run(progress, .{self});
+        }
+        fn progress(self: *@This()) !void {
+            const stats = self.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 0), stats.runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), stats.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 1), stats.operations);
+            try std.testing.expectEqual(@as(u64, 23), stats.retained_bytes);
+            try std.testing.expectEqual(@as(usize, 1), self.pool.snapshotStats().fd_admission_waiters);
+            var control: native.Execution = .{};
+            defer control.finish();
+            try control.start(self.scheduler, .{ .io = std.testing.io }, .control);
+            control.finish();
+            switch (self.case) {
+                .fifo => {
+                    // A newcomer cannot pass the original FIFO head even
+                    // when sufficient capacity for the newcomer is available.
+                    self.pool.releaseDescriptorsForTest(std.testing.io, 1);
+                    self.remaining -= 1;
+                    const Parent = @TypeOf(self);
+                    const Tail = struct {
+                        parent: Parent,
+                        rejected: bool = false,
+                        waits: usize = 0,
+                        pub fn checkpoint(tail: *@This()) !void {
+                            if (tail.rejected) return error.Canceled;
+                        }
+                        pub fn waitForProgress(tail: *@This()) !void {
+                            tail.waits += 1;
+                            try std.testing.expectEqual(@as(usize, 2), tail.parent.pool.snapshotStats().fd_admission_waiters);
+                            try std.testing.expectEqual(@as(usize, 1), tail.parent.pool.snapshotStats().fd_admitted_descriptors);
+                            tail.parent.pool.releaseDescriptorsForTest(std.testing.io, 1);
+                            tail.parent.remaining -= 1;
+                            tail.rejected = true;
+                        }
+                    };
+                    var tail: Tail = .{ .parent = self };
+                    var adapter = admission.Adapter(*Tail){ .budget = &tail };
+                    const payload = adapter.payload();
+                    try std.testing.expectError(error.Canceled, self.pool.reserveDescriptorsWithAdmissionForTest(std.testing.io, 1, admission.Port.init(&payload)));
+                    try std.testing.expectEqual(@as(usize, 1), tail.waits);
+                    try std.testing.expectEqual(@as(usize, 1), self.pool.snapshotStats().fd_admission_waiters);
+                },
+                .cancel => self.canceled.store(true, .release),
+                .expire => try std.testing.io.sleep(.fromMilliseconds(100), .awake),
+                .shutdown => self.scheduler.close(),
+                .wait_failure => return error.TestWaitFailed,
+            }
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/saturated-statistics-read", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    for ([_]native.Class{ .query, .inference }) |phase| for (std.enums.values(Case)) |case| for (std.enums.values(Shape)) |shape| {
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
+        defer pool.deinit();
+        var storage = try storage_io.NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
+        defer storage.deinit();
+        try storage.storage().writeFileAbsolute(path, "alpha beta");
+        try pool.reserveDescriptorsForTest(std.testing.io, 2);
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var canceled = std.atomic.Value(bool).init(false);
+        var parent: native.Execution = .{};
+        defer parent.finish();
+        const deadline = clock.monotonicNs() + (if (case == .expire) @as(u64, 50) else 60000) * std.time.ns_per_ms;
+        try parent.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+        var read: Read = .{ .execution = &parent, .allocator = std.testing.allocator };
+        const team = try read.team();
+        var budget: Budget = .{ .controls = .{ .execution_runnable = team.borrow, .execution_deadline_ns = deadline, .cancellation = .{ .ptr = &canceled, .is_cancelled_fn = requested } }, .io = std.testing.io };
+        var probe: Probe = .{ .budget = &budget, .pool = &pool, .scheduler = &scheduler, .canceled = &canceled, .case = case };
+        defer if (probe.remaining > 0) pool.releaseDescriptorsForTest(std.testing.io, probe.remaining);
+        var adapter = admission.Adapter(*Probe){ .budget = &probe };
+        const payload = adapter.payload();
+        const port = admission.Port.init(&payload);
+        const result: anyerror!void = read_result: {
+            if (shape == .reservation) break :read_result pool.reserveDescriptorsWithAdmissionForTest(std.testing.io, 2, port);
+            const bytes = storage.storage().readFileRangeAllocWithAdmission(std.testing.allocator, path, 0, 10, port) catch |err| break :read_result err;
+            defer std.testing.allocator.free(bytes);
+            try std.testing.expectEqualStrings("alpha beta", bytes);
+            break :read_result {};
+        };
+        switch (case) {
+            .fifo => {
+                try result;
+                if (shape == .reservation) pool.releaseDescriptorsForTest(std.testing.io, 2);
+            },
+            .cancel => try std.testing.expectError(error.Canceled, result),
+            .expire => try std.testing.expectError(error.DeadlineExceeded, result),
+            .shutdown => try std.testing.expectError(error.SchedulerClosed, result),
+            .wait_failure => try std.testing.expectError(error.TestWaitFailed, result),
+        }
+        try std.testing.expectEqual(@as(usize, 1), probe.waits);
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admission_waiters);
+        const cached: usize = if (shape == .file_read and case == .fifo) 1 else 0;
+        try std.testing.expectEqual(cached, pool.snapshotStats().fd_cache_entries);
+        try std.testing.expectEqual(probe.remaining + cached, pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expectEqual(phase, try parent.retainedClass());
+        try std.testing.expectEqual(@as(?u64, deadline), parent.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}
+
+test "text statistics trusted controls cold native descriptor open retires successful handles under rejected resumption" {
+    const storage_io = sources.storage_lsm_backend_storage_io;
+    const admission = sources.common_read_admission;
+    const Budget = sources.common_read_execution_budget.Budget(types.SearchRequest, checkReadBudget);
+    const Case = enum { success, cancel, expire, shutdown, missing, shutdown_and_missing };
+    const Probe = struct {
+        budget: *Budget,
+        pool: *storage_io.NativeStoragePool,
+        scheduler: *native.Scheduler,
+        canceled: *std.atomic.Value(bool),
+        case: Case,
+        begins: usize = 0,
+        ends: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.budget.checkpoint();
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            try self.budget.waitForProgress();
+        }
+        pub fn executionBoundary(self: *@This()) ?sources.common_execution_wait.Boundary {
+            return .{ .ptr = self, .begin = begin, .end = end };
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.budget.executionBoundary().?.beginWait();
+            self.begins += 1;
+            try std.testing.expectEqual(@as(usize, 1), self.pool.snapshotStats().fd_admitted_descriptors);
+            try std.testing.expectEqual(@as(usize, if (self.begins == 1) 0 else 1), self.pool.snapshotStats().fd_cache_entries);
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().resource_blocked);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            var control: native.Execution = .{};
+            defer control.finish();
+            try control.start(self.scheduler, .{ .io = std.testing.io }, .control);
+            control.finish();
+            if (self.begins == 1) switch (self.case) {
+                .cancel => self.canceled.store(true, .release),
+                .expire => try std.testing.io.sleep(.fromMilliseconds(100), .awake),
+                .shutdown, .shutdown_and_missing => self.scheduler.close(),
+                else => {},
+            };
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            try std.testing.expectEqual(@as(usize, 1), self.pool.snapshotStats().fd_admitted_descriptors);
+            try self.budget.executionBoundary().?.endWait();
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const a = std.testing.allocator;
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cold-statistics-read", .{tmp.sub_path});
+    defer a.free(path);
+    const missing_path = try std.fmt.allocPrint(a, "{s}.missing", .{path});
+    defer a.free(missing_path);
+    for ([_]native.Class{ .query, .inference }) |phase| for (std.enums.values(Case)) |case| {
+        var pool = storage_io.NativeStoragePool.initWithCapacityForTest(a, 4);
+        defer pool.deinit();
+        var storage = try storage_io.NativeStorage.initWithPool(a, .threaded, &pool);
+        defer storage.deinit();
+        const view = storage.storage();
+        try view.writeFileAbsolute(path, "alpha beta");
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admitted_descriptors);
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var canceled = std.atomic.Value(bool).init(false);
+        var parent: native.Execution = .{};
+        defer parent.finish();
+        const deadline = clock.monotonicNs() + (if (case == .expire) @as(u64, 50) else 60000) * std.time.ns_per_ms;
+        try parent.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+        var read: Read = .{ .execution = &parent, .allocator = a };
+        const team = try read.team();
+        var budget: Budget = .{ .controls = .{ .execution_runnable = team.borrow, .execution_deadline_ns = deadline, .cancellation = .{ .ptr = &canceled, .is_cancelled_fn = requested } }, .io = std.testing.io };
+        var probe: Probe = .{ .budget = &budget, .pool = &pool, .scheduler = &scheduler, .canceled = &canceled, .case = case };
+        var adapter = admission.Adapter(*Probe){ .budget = &probe };
+        const payload = adapter.payload();
+        const missing = case == .missing or case == .shutdown_and_missing;
+        const result = view.readFileRangeAllocWithAdmission(a, if (missing) missing_path else path, 0, 10, admission.Port.init(&payload));
+        switch (case) {
+            .success => {
+                const bytes = try result;
+                defer a.free(bytes);
+                try std.testing.expectEqualStrings("alpha beta", bytes);
+            },
+            .cancel => try std.testing.expectError(error.Canceled, result),
+            .expire => try std.testing.expectError(error.DeadlineExceeded, result),
+            .shutdown, .shutdown_and_missing => try std.testing.expectError(error.SchedulerClosed, result),
+            .missing => try std.testing.expectError(error.FileNotFound, result),
+        }
+        try std.testing.expectEqual(@as(usize, if (case == .success) 2 else 1), probe.begins);
+        try std.testing.expectEqual(probe.begins, probe.ends);
+        try std.testing.expectEqual(@as(usize, if (case == .success) 1 else 0), pool.snapshotStats().fd_cache_entries);
+        try std.testing.expectEqual(@as(usize, if (case == .success) 1 else 0), pool.snapshotStats().fd_admitted_descriptors);
+        try std.testing.expectEqual(@as(usize, 0), pool.snapshotStats().fd_admission_waiters);
+        try std.testing.expectEqual(phase, try parent.retainedClass());
+        try std.testing.expectEqual(@as(?u64, deadline), parent.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
         parent.finish();
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);

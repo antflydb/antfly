@@ -1291,6 +1291,7 @@ const FdCache = if (!supports_posix_fd_cache)
         pub fn invalidateRename(_: *FdCache, _: u64, _: []const u8, _: []const u8) void {}
         pub fn invalidateNamespace(_: *FdCache, _: u64) void {}
         pub fn reserveDescriptors(_: *FdCache, _: std.Io, _: usize) !void {}
+        pub fn reserveDescriptorsWithAdmission(_: *FdCache, _: std.Io, _: usize, _: read_admission.Port) !void {}
         pub fn tryReserveDescriptors(_: *FdCache, _: std.Io, _: usize) bool {
             return false;
         }
@@ -1431,14 +1432,15 @@ else
 
         fn readRangeIntoWithAdmission(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, offset: u64, out: []u8, control: read_admission.Port) !void {
             try control.checkpoint();
-            const entry = try self.retain(namespace, io, path);
+            const entry = try self.retainControlled(namespace, io, path, control);
             defer self.release(io, entry);
             if (out.len == 0) {
                 try control.checkpoint();
                 return;
             }
-            // Descriptor/cache preparation and the destination allocation have
-            // already completed with CPU charged. Keep the FD use through end.
+            // Cache preparation and destination allocation run with CPU
+            // charged; only descriptor contention/open and this pread loan it.
+            // Keep the FD use through rejected resumption.
             if (try control.executionWait()) |boundary| {
                 try boundary.run(readAllAtOffset, .{ entry.fd, out, offset });
             } else try readAllAtOffset(entry.fd, out, offset);
@@ -1459,7 +1461,7 @@ else
 
         fn fileSizeWithAdmission(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, control: read_admission.Port) !u64 {
             try control.checkpoint();
-            const entry = try self.retain(namespace, io, path);
+            const entry = try self.retainControlled(namespace, io, path, control);
             defer self.release(io, entry);
             const size = if (try control.executionWait()) |boundary| try boundary.run(fileSizeFromFd, .{entry.fd}) else try fileSizeFromFd(entry.fd);
             try control.checkpoint();
@@ -1468,7 +1470,7 @@ else
 
         fn readFileAllocWithAdmission(self: *FdCache, namespace: u64, io: std.Io, allocator: Allocator, path: []const u8, max_bytes: usize, control: read_admission.Port) ![]u8 {
             try control.checkpoint();
-            const entry = try self.retain(namespace, io, path);
+            const entry = try self.retainControlled(namespace, io, path, control);
             defer self.release(io, entry);
             const size = if (try control.executionWait()) |boundary| try boundary.run(fileSizeFromFd, .{entry.fd}) else try fileSizeFromFd(entry.fd);
             try control.checkpoint();
@@ -1490,7 +1492,7 @@ else
 
         fn readTrailerAllocWithAdmission(self: *FdCache, namespace: u64, io: std.Io, allocator: Allocator, path: []const u8, len: usize, control: read_admission.Port) !FileTrailer {
             try control.checkpoint();
-            const entry = try self.retain(namespace, io, path);
+            const entry = try self.retainControlled(namespace, io, path, control);
             defer self.release(io, entry);
             // Both metadata and suffix bytes describe this one inode even if
             // pathname replacement or vacuum retires the cache owner between IOs.
@@ -1587,6 +1589,11 @@ else
         }
 
         fn retain(self: *FdCache, namespace: u64, io: std.Io, path: []const u8) !*Entry {
+            return self.retainControlled(namespace, io, path, null);
+        }
+
+        fn retainControlled(self: *FdCache, namespace: u64, io: std.Io, path: []const u8, control: ?read_admission.Port) !*Entry {
+            if (control) |budget| try budget.checkpoint();
             const path_hash = namespacedPathHash(namespace, path);
             const shard = self.shardForHash(path_hash);
             // Cache hits already own a stable filename and descriptor. Avoid
@@ -1594,7 +1601,7 @@ else
             // page-allocated pool) on every point read. Misses still allocate
             // outside the mutex and recheck both the entry and mutation epoch.
             {
-                const locked = lockAtomic(&shard.mutex);
+                const locked = try lockAtomicWithAdmission(&shard.mutex, control);
                 defer if (locked) shard.mutex.unlock();
                 if (self.findEntryLocked(shard, namespace, path_hash, path)) |existing| {
                     existing.ref_count += 1;
@@ -1609,7 +1616,7 @@ else
 
             while (true) {
                 var observed_invalidation_epoch: u64 = 0;
-                const locked = lockAtomic(&shard.mutex);
+                const locked = try lockAtomicWithAdmission(&shard.mutex, control);
                 if (self.findEntryLocked(shard, namespace, path_hash, path)) |existing| {
                     existing.ref_count += 1;
                     existing.last_access = self.nextAccessLocked();
@@ -1622,24 +1629,30 @@ else
                 observed_invalidation_epoch = shard.invalidation_epoch;
                 if (locked) shard.mutex.unlock();
 
-                try self.reserveDescriptors(io, 1);
+                if (control) |budget| try self.reserveDescriptorsWithAdmission(io, 1, budget) else try self.reserveDescriptors(io, 1);
                 var descriptor_reserved = true;
                 errdefer if (descriptor_reserved) self.releaseDescriptors(io, 1);
 
-                const fd = try std.posix.openatZ(std.posix.AT.FDCWD, owned_path, .{
-                    .ACCMODE = .RDONLY,
-                    .CLOEXEC = true,
-                }, 0);
+                // Open can return a new owned descriptor after authority has
+                // stopped. Discard it under the original owner before exposing
+                // a failed resumption; the reservation errdefer then retires.
+                const fd = if (control) |budget| opened: {
+                    if (try budget.executionWait()) |boundary| {
+                        break :opened try boundary.runOwned(openReadFd, .{owned_path}, closeFd, .{});
+                    }
+                    break :opened try openReadFd(owned_path);
+                } else try openReadFd(owned_path);
                 var fd_open = true;
                 errdefer if (fd_open) closeFd(fd);
 
                 if (builtin.is_test and test_fd_cache_pause_after_open.load(.acquire)) {
                     test_fd_cache_open_paused.store(true, .release);
                     while (!test_fd_cache_release_after_open.load(.acquire)) {
-                        io.sleep(.fromMilliseconds(1), .awake) catch {};
+                        if (control) |budget| try budget.waitForProgress() else io.sleep(.fromMilliseconds(1), .awake) catch {};
                     }
                 }
 
+                if (control) |budget| try budget.checkpoint();
                 const entry = try self.allocator.create(Entry);
                 var entry_active = true;
                 errdefer if (entry_active) self.allocator.destroy(entry);
@@ -1652,7 +1665,7 @@ else
                     .last_access = self.nextAccessLocked(),
                 };
 
-                const insertion_locked = lockAtomic(&shard.mutex);
+                const insertion_locked = try lockAtomicWithAdmission(&shard.mutex, control);
                 errdefer if (insertion_locked) shard.mutex.unlock();
 
                 if (self.findEntryLocked(shard, namespace, path_hash, owned_path)) |existing| {
@@ -1774,6 +1787,57 @@ else
                     return error.PersistentDescriptorAdmissionExhausted;
                 }
                 try self.admission_changed.wait(io, &self.admission_mutex);
+            }
+        }
+
+        fn reserveDescriptorsWithAdmission(self: *FdCache, io: std.Io, count: usize, control: read_admission.Port) !void {
+            try control.checkpoint();
+            if (count == 0) return;
+            if (count > self.capacity - self.persistent_reserve) return error.DescriptorAdmissionCapacityTooSmall;
+            try @import("../../common/bounded_mutex.zig").lock(&self.admission_mutex, io, control);
+            var locked = true;
+            defer if (locked) self.admission_mutex.unlock(io);
+            // Try-only eviction cannot suspend while holding admission. A
+            // controlled waiter joins the same weighted FIFO as legacy calls.
+            if (self.admission_head == null and self.makeCapacityAvailableWithoutWaiting(count)) {
+                _ = self.admitted_descriptors.fetchAdd(count, .acq_rel);
+                return;
+            }
+            var waiter = AdmissionWaiter{ .count = count };
+            self.enqueueAdmissionWaiter(&waiter);
+            _ = self.admission_waiters.fetchAdd(1, .acq_rel);
+            _ = self.admission_waits.fetchAdd(1, .monotonic);
+            var queued = true;
+            defer if (queued) {
+                // Mandatory retirement must unlink the stack-owned node even
+                // after authority rejection. It never requests a fresh grant.
+                if (!locked) {
+                    self.admission_mutex.lockUncancelable(io);
+                    locked = true;
+                }
+                self.removeAdmissionWaiter(&waiter);
+                _ = self.admission_waiters.fetchSub(1, .acq_rel);
+                self.admission_changed.broadcast(io);
+            };
+            while (true) {
+                try control.checkpoint();
+                if (self.admission_head == &waiter and self.makeCapacityAvailableWithoutWaiting(count)) {
+                    self.removeAdmissionWaiter(&waiter);
+                    queued = false;
+                    _ = self.admission_waiters.fetchSub(1, .acq_rel);
+                    _ = self.admitted_descriptors.fetchAdd(count, .acq_rel);
+                    self.admission_changed.broadcast(io);
+                    return;
+                }
+                if (self.admission_head == &waiter and self.persistentDescriptorsPreventTransientProgress(count)) {
+                    _ = self.persistent_admission_failures.fetchAdd(1, .monotonic);
+                    return error.PersistentDescriptorAdmissionExhausted;
+                }
+                self.admission_mutex.unlock(io);
+                locked = false;
+                try control.waitForProgress();
+                try @import("../../common/bounded_mutex.zig").lock(&self.admission_mutex, io, control);
+                locked = true;
             }
         }
 
@@ -2081,6 +2145,11 @@ pub const NativeStoragePool = struct {
     pub fn reserveDescriptorsForTest(self: *NativeStoragePool, io: std.Io, count: usize) !void {
         if (!builtin.is_test) unreachable;
         try self.fd_cache.reserveDescriptors(io, count);
+    }
+
+    pub fn reserveDescriptorsWithAdmissionForTest(self: *NativeStoragePool, io: std.Io, count: usize, control: read_admission.Port) !void {
+        if (!builtin.is_test) unreachable;
+        try self.fd_cache.reserveDescriptorsWithAdmission(io, count, control);
     }
 
     pub fn releaseDescriptorsForTest(self: *NativeStoragePool, io: std.Io, count: usize) void {
@@ -4218,6 +4287,18 @@ pub const MemoryStorage = struct {
         };
     }
 };
+
+fn openReadFd(path: [*:0]const u8) !std.posix.fd_t {
+    return std.posix.openatZ(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+}
+
+fn lockAtomicWithAdmission(mutex: *std.atomic.Mutex, control: ?read_admission.Port) !bool {
+    if (control) |budget| {
+        try @import("../../common/bounded_mutex.zig").lockAtomic(mutex, budget);
+        return true;
+    }
+    return lockAtomic(mutex);
+}
 
 fn lockAtomic(mutex: *std.atomic.Mutex) bool {
     if (builtin.os.tag == .freestanding) return false;
