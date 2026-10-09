@@ -172,7 +172,11 @@ pub fn classificationLogitsProfiled(
             cb.preferEagerQuantMirrors(true);
             break :blk try deberta_arch.forwardCtProfiled(cb, allocator, deberta, sample.input_ids, attention_mask, 1, seq_len, deberta_mod.glinerPrefersWeightMirrors(deberta), if (profile) |p| &p.encoder else null);
         },
-        .modern_bert => |modern| try modern_bert_arch.forwardCT(cb, allocator, modern, sample.input_ids, attention_mask, 1, seq_len),
+        .modern_bert => |modern| blk: {
+            var execution_config = modern;
+            execution_config.metal_f16_weight_mirrors = true;
+            break :blk try modern_bert_arch.forwardCT(cb, allocator, execution_config, sample.input_ids, attention_mask, 1, seq_len);
+        },
     };
     defer cb.free(hidden);
     if (profile) |p| {

@@ -168,6 +168,39 @@ pub const TensorStore = struct {
         return store.rawData();
     }
 
+    pub const GlinerGgufSnapshot = struct {
+        encoder: []const u8,
+        head: []const u8,
+        tensor_count: usize,
+        all_f32: bool,
+    };
+
+    /// Borrow both exact open GGUF artifacts. Never reopen a pathname to
+    /// establish the identity of an already loaded split GLiNER session.
+    pub fn glinerGgufSnapshot(self: TensorStore) ?GlinerGgufSnapshot {
+        if (self.vtable != &CompositeGlinerStore.vtable) return null;
+        const store: *const CompositeGlinerStore = @ptrCast(@alignCast(self.ptr));
+        const head = store.head_gguf orelse return null;
+        if (store.head_safetensors != null) return null;
+        var all_f32 = true;
+        for (store.encoder.parsed.tensors) |tensor| {
+            if (tensor.tensor_type != .known or tensor.tensor_type.known != .F32) all_f32 = false;
+            // Reject shadowing across the encoder and auxiliary head.
+            for (head.parsed.tensors) |other| {
+                if (std.mem.eql(u8, tensor.name, other.name)) return null;
+            }
+        }
+        for (head.parsed.tensors) |tensor| {
+            if (tensor.tensor_type != .known or tensor.tensor_type.known != .F32) all_f32 = false;
+        }
+        return .{
+            .encoder = store.encoder.rawData(),
+            .head = head.rawData(),
+            .tensor_count = store.encoder.parsed.tensors.len + head.parsed.tensors.len,
+            .all_f32 = all_f32,
+        };
+    }
+
     pub fn singleSafetensorsReader(self: TensorStore) ?*const @import("safetensors.zig").MMapReader {
         if (self.vtable != &SafetensorsStore.vtable) return null;
         const store: *const SafetensorsStore = @ptrCast(@alignCast(self.ptr));
@@ -1522,6 +1555,7 @@ test "open gguf tensor store from manifest" {
     defer store.deinit();
     try std.testing.expectEqual(StoreKind.gguf, store.kind());
     try std.testing.expect(store.ggufFile() != null);
+
     try std.testing.expect((try store.weightSource()) != null);
     var tensor_ref = try store.describeTensor(allocator, "tok_embeddings.weight");
     try std.testing.expectEqual(@as(usize, 8), tensor_ref.byte_len);
@@ -1738,6 +1772,20 @@ test "open split gliner gguf bundle from manifest" {
     defer store.deinit();
     try std.testing.expectEqual(StoreKind.gguf, store.kind());
     try std.testing.expect(store.ggufFile() != null);
+
+    const snapshot = store.glinerGgufSnapshot() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, gguf_data.items, snapshot.encoder);
+    try std.testing.expectEqualSlices(u8, head_data.items, snapshot.head);
+    try std.testing.expectEqual(@as(usize, 3), snapshot.tensor_count);
+    try std.testing.expect(!snapshot.all_f32);
+    try std.testing.expect(store.ggufArtifactBytes() == null);
+
+    const composite: *CompositeGlinerStore = @ptrCast(@alignCast(store.ptr));
+    const original_name = composite.head_gguf.?.parsed.tensors[0].name;
+    composite.head_gguf.?.parsed.tensors[0].name = composite.encoder.parsed.tensors[0].name;
+    const shadowed = store.glinerGgufSnapshot();
+    composite.head_gguf.?.parsed.tensors[0].name = original_name;
+    try std.testing.expect(shadowed == null);
 
     const source = (try store.weightSource()) orelse return error.TestUnexpectedResult;
     const names = try source.listNames(allocator);

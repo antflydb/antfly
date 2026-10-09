@@ -223,6 +223,24 @@ pub fn addGliner25(ctx: Context) *std.Build.Module {
     decide_bench.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
     decide_bench.root_module.link_libc = true;
     ctx.step("bench-gliner25-decide-build", "Build the loaded-model GLiNER2.5-Decide request benchmark").dependOn(&b.addInstallArtifact(decide_bench, .{}).step);
+    const decide_quant_bench = b.addExecutable(.{
+        .name = "antfly-inference-gliner-decide-quant-bench",
+        .max_rss = 8 * 1024 * 1024 * 1024,
+        .root_module = b.createModule(.{
+            .root_source_file = ctx.path("src/bench/gliner_decide_quant.zig"),
+            .target = ctx.target,
+            .optimize = ctx.optimize,
+        }),
+    });
+    decide_quant_bench.root_module.addImport("inference_internal", ctx.graph.inference_internal_mod);
+    decide_quant_bench.root_module.link_libc = true;
+    ctx.step("bench-gliner-decide-quant-build", "Build the offline ModernBERT GLiNER precision comparison").dependOn(&b.addInstallArtifact(decide_quant_bench, .{}).step);
+    const decide_quant_tests = b.addTest(.{
+        .max_rss = 6 * 1024 * 1024 * 1024,
+        .root_module = ctx.graph.inference_internal_mod,
+        .filters = &.{ "GLiNER Decide", "open split gliner gguf" },
+    });
+    ctx.step("test-gliner-decide-quant", "Test exact GLiNER Decide artifact identity and split GGUF snapshots").dependOn(&ctx.addRunArtifact(decide_quant_tests).step);
     // Use the shared optimize value for the entire dependency graph. The
     // worker refuses to compile unless that graph is ReleaseFast; forcing
     // only this executable root would leave imported kernels unoptimized.
