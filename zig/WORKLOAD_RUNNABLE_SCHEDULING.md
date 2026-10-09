@@ -1,11 +1,13 @@
 # Runnable workload scheduling
 
-Status: scheduler core, opt-in HTTP/pgwire SQL read integration, and private
-spill read/write suspension pass native and Nix/glibc Linux API qualification.
-Shared managed-policy/catalog resume fences pass focused checks on both platforms
-and both expanded API suites, with exact Linux artifacts rerun at 2 GiB.
-Runtime metrics endpoint checks, other backend waits, parallel child ownership,
-remote-attempt accounting, qualification and default selection remain required.
+Status: opt-in scheduling and independent execution scopes are implemented for
+vector kernels, spill sort/merge, grouped aggregate, partitioned join and capable
+ordered scan cursors. Focused ordered-scan tests pass on native and pinned
+Nix/glibc Linux; persistent lake cache wait tests and existing cache regressions
+pass on native. Independent lake metadata clients and nested prefetch ownership
+are under qualification. Full API/pgwire/routing gates, remaining backend
+ownership/waits, resource/performance qualification and default selection remain
+required.
 The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
@@ -80,15 +82,16 @@ integration work; the current tests do not prove those.
 
 The opt-in SQL adapter owns one capsule per operation. HTTP and pgwire reads use
 the node's shared scheduler; pgwire page streams park between pulls and retain
-their operation, snapshot and memory owners. Scheduled SQL currently uses serial
-backend execution because parallel children need independent runnable ownership
-before sharing an adapter. Serial execution retains a separate spill I/O
-capability: sorting, grouping and window continuations still spool to disk, while
-all spill CPU submissions pass through a manager gate that declines parallel
-work. The six-case continuation fixture passes in both serial and parallel modes
-on macOS and Nix/glibc GNU Linux. This temporary restriction must be resolved
-before selecting defaults. Ordinary mutations retain their existing admission path;
-only already verified protected controls use reserved runnable capacity.
+their operation, snapshot and memory owners. Pure CPU kernels and exclusive
+operator files use independent child executions reserved before publication and
+joined before metadata/result retirement. Ordered scan providers explicitly bind
+exclusive child cursor/reader state; providers lacking that ownership capability
+continue in the coordinator. Each producer uses its own queue, spill and provider
+wait callbacks. Nested prefetch requires its own reader and execution receiver.
+A denied worker activation must close its streaming queue so the consumer can
+join it. Original authority is rechecked before exposing results. Shared mutable
+API adapters and policy caches remain coordinator-owned. These focused contracts
+are not yet a claim of complete runtime/default qualification.
 
 No adapter may label a whole backend call resource-blocked just because it may
 perform I/O: it can also execute substantial CPU work. Releasing its runnable

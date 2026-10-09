@@ -821,6 +821,24 @@ pub const Execution = struct {
         if (needs_running and e.state != .running) return error.InvalidRunnableTransition;
         return owner;
     }
+    /// Read original explicit lifetime and retained family state from another
+    /// physical worker. This neither requires CPU nor observes the caller's
+    /// thread-local IO cancellation, which must not stop a borrowed parent.
+    pub fn checkLifetime(self: *const Execution) !void {
+        const e = if (self.entry) |*entry| entry else return error.InvalidRunnableTransition;
+        const owner = e.scheduler orelse return error.InvalidRunnableTransition;
+        const options = blk: {
+            owner.lock();
+            defer owner.mutex.unlock();
+            if (e.scheduler != owner) return error.InvalidRunnableTransition;
+            if (e.state == .stopped) return e.failure orelse error.InvalidRunnableTransition;
+            try owner.checkAncestorsLocked(e);
+            break :blk e.options;
+        };
+        if (options.cancellation) |token| if (token.requested(token.ptr)) return error.Canceled;
+        if (options.deadline_ns) |deadline| if (options.now() >= deadline) return error.DeadlineExceeded;
+    }
+
     /// Reserve bounded parallel CPU on this same execution before publishing
     /// child work. Children borrow the team grant and must all join before any
     /// resize, park, checkpoint or finish. Physical IO ownership and accepted

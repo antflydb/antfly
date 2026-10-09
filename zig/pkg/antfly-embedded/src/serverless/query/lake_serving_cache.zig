@@ -569,9 +569,23 @@ pub const Reader = struct {
     base: ObjectReader,
     scope: [32]u8,
     context: Context,
+    request_store: ?@import("lake_read_context.zig").Store = null,
     pending: [4]?@import("../../sql/parallel_scheduler.zig").Task(anyerror!void) = @splat(null),
     prefetch_bytes: usize = 0,
     prefetch_cancelled: std.atomic.Value(bool) = .init(false),
+    /// Bind only an exclusively owned reader before publishing it. The reader
+    /// stays at this address until every required/speculative physical join.
+    pub fn bindExecution(self: *Reader, execution: *@import("../../common/runnable_scheduler.zig").Execution) void {
+        const Store = @import("lake_read_context.zig").Store;
+        const provider = Store.provider(self.base.client);
+        const allocator = self.base.client.allocator;
+        self.context = self.context.withExecution(execution);
+        self.request_store = .{ .base = provider, .context = self.context };
+        self.base.client = self.request_store.?.client(allocator);
+        // The store now suspends the exact physical get/stat/list call. A range
+        // wrapper must not also park around the store's CPU checkpoints.
+        self.base.wait = null;
+    }
     /// One lookahead batch, four concurrent ranges, at most 32 MiB in flight.
     /// Workers use independent page allocations, never a SQL arena/quota.
     pub fn prefetch(self: *Reader, reads: []const ranges.RangeRead) !void {
@@ -599,13 +613,10 @@ pub const Reader = struct {
     }
     fn warmFor(self: *Reader, read: ranges.RangeRead, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
         var worker: Reader = .{ .cache = self.cache, .base = self.base, .scope = self.scope, .context = self.context };
-        if (execution) |child| {
-            worker.context = self.context.withExecution(child);
-            worker.base.wait = worker.context.wait;
-        }
         const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = prefetchCanceled };
         worker.context.cancellation = token;
         worker.base.cancellation = token;
+        if (execution) |child| worker.bindExecution(child);
         if (read.purpose == .parquet_footer) {
             const lease = try worker.footerRead(read);
             defer lease.release();

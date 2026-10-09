@@ -39,6 +39,7 @@ pub const Context = struct {
     pub fn checkLifetime(self: Context) !void {
         if (self.cancellation) |token| try token.check();
         if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        if (self.execution) |execution| try execution.checkLifetime();
     }
     pub fn ensureActive(self: Context) !void {
         try self.checkLifetime();
@@ -50,18 +51,35 @@ pub const Store = struct {
     base: storage.ObjectStorage,
     context: Context,
     pub fn client(self: *Store, alloc: Allocator) storage.ObjectStorage {
-        return .{ .allocator = alloc, .ptr = self, .vtable = &.{ .deinit = deinit, .bucket_exists = bucketExists, .make_bucket = makeBucket, .put_object = putObject, .get_object = getObject, .get_object_attributes = attributes, .stat_object = statObject, .stat_object_with_options = statObjectWithOptions, .delete_object = deleteObject, .list_objects = listObjects } };
+        return .{ .allocator = alloc, .ptr = self, .vtable = &vtable };
+    }
+    const vtable: storage.ObjectStorage.VTable = .{ .deinit = deinit, .bucket_exists = bucketExists, .make_bucket = makeBucket, .put_object = putObject, .get_object = getObject, .get_object_attributes = attributes, .stat_object = statObject, .stat_object_with_options = statObjectWithOptions, .delete_object = deleteObject, .list_objects = listObjects };
+    /// A new request owner replaces these lifetime wrappers; provider handles,
+    /// credentials and their physical owner remain borrowed through joining.
+    pub fn provider(base: storage.ObjectStorage) storage.ObjectStorage {
+        var current = base;
+        while (current.vtable == &vtable) current = from(current.ptr).base;
+        return current;
+    }
+    const Cancellation = struct {
+        store: *Store,
+        parent: ?storage.CancellationToken,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            self.store.context.checkLifetime() catch return true;
+            if (self.parent) |parent| parent.check() catch return true;
+            return false;
+        }
+        fn token(self: *const @This()) storage.CancellationToken {
+            return .{ .ptr = self, .is_cancelled_fn = canceled };
+        }
+    };
+    fn discard(value: anytype, alloc: Allocator) void {
+        var owned = value;
+        owned.deinit(alloc);
     }
     fn from(raw: *anyopaque) *Store {
         return @ptrCast(@alignCast(raw));
-    }
-    fn canceled(raw: *const anyopaque) bool {
-        const self: *const Store = @ptrCast(@alignCast(raw));
-        self.context.ensureActive() catch return true;
-        return false;
-    }
-    fn token(self: *Store) storage.CancellationToken {
-        return .{ .ptr = self, .is_cancelled_fn = canceled };
     }
     fn deinit(_: Allocator, _: *anyopaque) void {}
     fn makeBucket(_: *anyopaque, _: []const u8, _: storage.BucketOptions) !void {
@@ -77,8 +95,9 @@ pub const Store = struct {
         const self = from(raw);
         try self.context.ensureActive();
         var opts = options;
-        opts.cancellation = self.token();
-        const result = self.base.bucketExistsWithOptions(bucket, opts) catch |err| {
+        const cancellation: Cancellation = .{ .store = self, .parent = options.cancellation };
+        opts.cancellation = cancellation.token();
+        const result = @import("../../sql/execution_wait.zig").run(self.context.wait, storage.ObjectStorage.bucketExistsWithOptions, .{ &self.base, bucket, opts }) catch |err| {
             try self.context.ensureActive();
             return err;
         };
@@ -89,22 +108,12 @@ pub const Store = struct {
         const self = from(raw);
         try self.context.ensureActive();
         var opts = options;
-        const Combined = struct {
-            store: *Store,
-            parent: ?storage.CancellationToken,
-            fn canceled(raw_token: *const anyopaque) bool {
-                const value: *const @This() = @ptrCast(@alignCast(raw_token));
-                value.store.context.ensureActive() catch return true;
-                if (value.parent) |parent| parent.check() catch return true;
-                return false;
-            }
-        };
-        const combined: Combined = .{ .store = self, .parent = options.cancellation };
-        opts.cancellation = .{ .ptr = &combined, .is_cancelled_fn = Combined.canceled };
+        const cancellation: Cancellation = .{ .store = self, .parent = options.cancellation };
+        opts.cancellation = cancellation.token();
         try opts.cancellation.?.check();
         var base = self.base;
         base.allocator = alloc;
-        var result = base.getObject(bucket, key, opts) catch |err| {
+        var result = @import("../../sql/execution_wait.zig").runOwned(self.context.wait, storage.ObjectStorage.getObject, .{ &base, bucket, key, opts }, discard, .{alloc}) catch |err| {
             try self.context.ensureActive();
             return err;
         };
@@ -119,10 +128,11 @@ pub const Store = struct {
         const self = from(raw);
         try self.context.ensureActive();
         var opts = options;
-        opts.cancellation = self.token();
+        const cancellation: Cancellation = .{ .store = self, .parent = options.cancellation };
+        opts.cancellation = cancellation.token();
         var base = self.base;
         base.allocator = alloc;
-        var result = base.statObjectWithOptions(bucket, key, opts) catch |err| {
+        var result = @import("../../sql/execution_wait.zig").runOwned(self.context.wait, storage.ObjectStorage.statObjectWithOptions, .{ &base, bucket, key, opts }, discard, .{alloc}) catch |err| {
             try self.context.ensureActive();
             return err;
         };
@@ -135,7 +145,7 @@ pub const Store = struct {
         try self.context.ensureActive();
         var base = self.base;
         base.allocator = alloc;
-        var result = try base.getObjectAttributes(bucket, key);
+        var result = try @import("../../sql/execution_wait.zig").runOwned(self.context.wait, storage.ObjectStorage.getObjectAttributes, .{ &base, bucket, key }, discard, .{alloc});
         errdefer result.deinit(alloc);
         try self.context.ensureActive();
         return result;
@@ -144,10 +154,11 @@ pub const Store = struct {
         const self = from(raw);
         try self.context.ensureActive();
         var opts = options;
-        opts.cancellation = self.token();
+        const cancellation: Cancellation = .{ .store = self, .parent = options.cancellation };
+        opts.cancellation = cancellation.token();
         var base = self.base;
         base.allocator = alloc;
-        var result = base.listObjects(bucket, opts) catch |err| {
+        var result = @import("../../sql/execution_wait.zig").runOwned(self.context.wait, storage.ObjectStorage.listObjects, .{ &base, bucket, opts }, discard, .{alloc}) catch |err| {
             try self.context.ensureActive();
             return err;
         };
@@ -169,4 +180,153 @@ test "external lake object requests reject cancellation and expired deadlines be
     signal.store(false, .release);
     store.context.deadline_ns = 0;
     try std.testing.expectError(error.DeadlineExceeded, client.statObject("bucket", "part"));
+}
+
+test "lake SQL owned object requests suspend metadata and preserve owned results on denied resume" {
+    const Runnable = @import("../../common/runnable_scheduler.zig");
+    const Operation = enum { get, stat, attributes, list, bucket };
+    const Case = enum { success, resume_denied, canceled, deadline, caller_canceled };
+    const Clock = struct {
+        var now_ns: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return now_ns.load(.acquire);
+        }
+    };
+    const Fixture = struct {
+        scheduler: *Runnable.Scheduler,
+        execution: *Runnable.Execution,
+        signal: *std.atomic.Value(bool),
+        case: Case,
+        ends: usize = 0,
+        invalid: usize = 0,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.checkpoint();
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            const stats = self.scheduler.stats();
+            if (stats.runnable_slots != 0 or stats.resource_blocked != 1) self.invalid += 1;
+            var control: Runnable.Execution = .{};
+            try control.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            try control.checkpoint();
+            control.finish();
+            if (self.case == .canceled) self.signal.store(true, .release);
+            if (self.case == .deadline) Clock.now_ns.store(10, .release);
+            try self.execution.enter(.query);
+            if (self.case == .resume_denied) return error.Forbidden;
+        }
+        fn perform(client: *storage.ObjectStorage, operation: Operation, caller: ?storage.CancellationToken) !void {
+            const a = std.testing.allocator;
+            switch (operation) {
+                .get => {
+                    var result = try client.getObject("bucket", "part", .{ .cancellation = caller });
+                    defer result.deinit(a);
+                    try std.testing.expectEqualStrings("data", result.body);
+                },
+                .stat => {
+                    var result = try client.statObjectWithOptions("bucket", "part", .{ .cancellation = caller });
+                    defer result.deinit(a);
+                    try std.testing.expectEqual(@as(u64, 4), result.content_length);
+                },
+                .attributes => {
+                    var result = try client.getObjectAttributes("bucket", "part");
+                    defer result.deinit(a);
+                    try std.testing.expectEqual(@as(u64, 4), result.content_length);
+                },
+                .list => {
+                    var result = try client.listObjects("bucket", .{ .cancellation = caller });
+                    defer result.deinit(a);
+                    try std.testing.expectEqual(@as(usize, 1), result.entries.len);
+                },
+                .bucket => try std.testing.expect(try client.bucketExistsWithOptions("bucket", .{ .cancellation = caller })),
+            }
+        }
+    };
+    const a = std.testing.allocator;
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var raw_client = memory.client();
+    try raw_client.makeBucket("bucket");
+    var written = try raw_client.putObject("bucket", "part", "data", .{});
+    written.deinit(a);
+    for (std.enums.values(Operation)) |operation| for (std.enums.values(Case)) |case| {
+        if (operation == .attributes and case == .caller_canceled) continue;
+        Clock.now_ns.store(0, .release);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+        var execution: Runnable.Execution = .{};
+        defer execution.finish();
+        var signal: std.atomic.Value(bool) = .init(false);
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &signal, .requested = Fixture.requested } }, .query);
+        var fixture = Fixture{ .scheduler = &scheduler, .execution = &execution, .signal = &signal, .case = case };
+        var context = (Context{}).withExecution(&execution);
+        context.wait = .{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end };
+        var store = Store{ .base = raw_client, .context = context };
+        var client = store.client(a);
+        var caller_signal: std.atomic.Value(bool) = .init(case == .caller_canceled);
+        const result = Fixture.perform(&client, operation, storage.CancellationToken.fromAtomic(&caller_signal));
+        switch (case) {
+            .success => try result,
+            .resume_denied => try std.testing.expectError(error.Forbidden, result),
+            .canceled, .caller_canceled => try std.testing.expectError(error.Canceled, result),
+            .deadline => try std.testing.expectError(error.DeadlineExceeded, result),
+        }
+        try std.testing.expectEqual(@as(usize, if (case == .caller_canceled) 0 else 1), fixture.ends);
+        try std.testing.expectEqual(@as(usize, 0), fixture.invalid);
+    };
+}
+
+test "lake SQL borrowed lifetime polling ignores another worker IO cancellation and preserves original causes" {
+    const Runnable = @import("../../common/runnable_scheduler.zig");
+    const Fixture = struct {
+        var io_canceled: bool = false;
+        var io_checks: usize = 0;
+        var now_ns: u64 = 0;
+        fn checkIo(_: ?*anyopaque) std.Io.Cancelable!void {
+            io_checks += 1;
+            if (io_canceled) return error.Canceled;
+        }
+        fn now() u64 {
+            return now_ns;
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    Fixture.io_canceled = false;
+    Fixture.io_checks = 0;
+    Fixture.now_ns = 0;
+    var vtable = std.testing.io.vtable.*;
+    vtable.checkCancel = Fixture.checkIo;
+    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+    var execution: Runnable.Execution = .{};
+    defer execution.finish();
+    var signal: std.atomic.Value(bool) = .init(false);
+    try execution.start(&scheduler, .{ .io = io, .native_now_ns = Fixture.now, .deadline_ns = 10, .cancellation = .{ .ptr = &signal, .requested = Fixture.requested } }, .query);
+    try execution.park(.resource_blocked);
+    const context = (Context{}).withExecution(&execution);
+    const checks = Fixture.io_checks;
+    Fixture.io_canceled = true;
+    defer Fixture.io_canceled = false;
+    try context.checkLifetime();
+    try std.testing.expectEqual(checks, Fixture.io_checks);
+    try std.testing.expectEqual(Runnable.State.resource_blocked, scheduler.state(&execution.entry.?));
+    signal.store(true, .release);
+    try std.testing.expectError(error.Canceled, context.checkLifetime());
+    signal.store(false, .release);
+    Fixture.now_ns = 10;
+    try std.testing.expectError(error.DeadlineExceeded, context.checkLifetime());
+    Fixture.now_ns = 0;
+    Fixture.io_canceled = false;
+    try execution.enter(.query);
+    try execution.checkpoint();
+    try execution.park(.resource_blocked);
+    scheduler.close();
+    try std.testing.expectError(error.SchedulerClosed, context.checkLifetime());
 }

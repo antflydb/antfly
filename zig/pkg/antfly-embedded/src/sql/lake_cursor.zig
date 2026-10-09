@@ -426,8 +426,8 @@ const Owner = struct {
         const source = self.partition_source orelse return error.InvalidChildScanBinding;
         const reader = source.scanner.shared_reader orelse return error.InvalidChildScanBinding;
         self.stream.context = self.stream.context.withExecution(execution);
-        reader.context = reader.context.withExecution(execution);
-        reader.base.wait = reader.context.wait;
+        reader.bindExecution(execution);
+        source.scanner.object_reader = reader.base;
     }
     fn splitOrdered(raw: *anyopaque, a: Allocator, maximum: usize) !?[]catalog.Cursor {
         const self: *Owner = @ptrCast(@alignCast(raw));
@@ -658,6 +658,8 @@ const TestLake = struct {
         execution_owner: ?*@import("../common/runnable_scheduler.zig").Scheduler = null,
         parked_reads: std.atomic.Value(usize) = .init(0),
         control_reads: std.atomic.Value(usize) = .init(0),
+        parked_stats: std.atomic.Value(usize) = .init(0),
+        control_stats: std.atomic.Value(usize) = .init(0),
         mutex: std.atomic.Mutex = .unlocked,
         fn lock(self: *Meter) void {
             while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -675,6 +677,15 @@ const TestLake = struct {
             self.lock();
             self.stats += 1;
             self.mutex.unlock();
+            if (self.execution_owner) |scheduler| {
+                if (scheduler.stats().runnable_slots == 0 and scheduler.stats().resource_blocked >= 2)
+                    _ = self.parked_stats.fetchAdd(1, .monotonic);
+                var control: @import("../common/runnable_scheduler.zig").Execution = .{};
+                try control.start(scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                defer control.finish();
+                try control.checkpoint();
+                _ = self.control_stats.fetchAdd(1, .monotonic);
+            }
             return base.statObject(bucket, key);
         }
         fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
@@ -1624,6 +1635,12 @@ test "lake SQL scoped ordered cursors park physical object reads and retire inde
     const Parallel = @import("parallel_scheduler.zig");
     const Worker = struct {
         parent: *Runnable.Execution,
+        root_callbacks: usize = 0,
+        fn rootCheck(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.root_callbacks += 1;
+            return error.UnexpectedBorrowedParentCheckpoint;
+        }
         fn begin(raw: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.parent.checkpoint();
@@ -1638,7 +1655,18 @@ test "lake SQL scoped ordered cursors park physical object reads and retire inde
             try cursor.bind_execution.?(cursor.ptr, execution);
             const child: *Owner = @ptrCast(@alignCast(cursor.ptr));
             try std.testing.expect(child.stream.context.execution == execution);
-            try std.testing.expect(child.partition_source.?.scanner.shared_reader.?.context.execution == execution);
+            const reader = child.partition_source.?.scanner.shared_reader.?;
+            try std.testing.expect(reader.context.execution == execution);
+            try std.testing.expect(reader.request_store.?.context.execution == execution);
+            try std.testing.expect(reader.base.wait == null);
+            try std.testing.expect(child.partition_source.?.scanner.object_reader.client.ptr == reader.base.client.ptr);
+            const file = child.partition_source.?.fileAt(child.stream.files[0]);
+            const ranges = @import("../serverless/query/lake_range_io.zig");
+            try reader.prefetch(&.{try ranges.planParquetFooterRead(try ranges.objectRefForExternalFileUri(file), 64 * 1024)});
+            // Join the actual nested scope directly: speculative drain would
+            // otherwise hide an invalid borrowed receiver's failure.
+            if (reader.pending[0]) |*task| try task.await(std.testing.io) else return error.TestUnexpectedResult;
+            reader.pending[0] = null;
             var count: usize = 0;
             while (true) {
                 const page = try cursor.next(cursor.ptr, std.testing.allocator, 2);
@@ -1659,12 +1687,27 @@ test "lake SQL scoped ordered cursors park physical object reads and retire inde
     var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
     try lake.populate(a, 3, &.{ 1, 2, 3 });
     defer lake.deinit(a);
-    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
     var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 64 * 1024 * 1024 });
     var parent_execution: Runnable.Execution = .{};
     try parent_execution.start(&scheduler, .{ .io = std.testing.io }, .query);
     defer parent_execution.finish();
     var worker = Worker{ .parent = &parent_execution };
+    const RootContext = @import("../serverless/query/lake_read_context.zig");
+    const root_context: RootContext.Context = .{ .io = std.testing.io, .checkpoint = .{ .ptr = &worker, .check = Worker.rootCheck } };
+    var root_store = RootContext.Store{ .base = lake.meter.client(), .context = root_context };
+    lake.source.scanner.object_reader.client = root_store.client(a);
+    var schema = try @import("../serverless/query/lake_schema.zig").icebergSchema(a, "{\"current-schema-id\":7,\"schemas\":[{\"schema-id\":7,\"fields\":[{\"id\":1,\"name\":\"amount\",\"required\":true,\"type\":\"long\"}]}]}", null);
+    defer schema.deinit();
+    lake.source.iceberg_schema = schema;
+    lake.inventory.format = .iceberg;
+    lake.source.inventory = lake.inventory;
+    lake.source.scanner.inventory = lake.inventory;
+    lake.table.external_base_source.?.binding.format = .iceberg;
+    lake.source.lazy_versions = true;
+    lake.source.pinned_files = try a.alloc(bool, lake.inventory.files.len);
+    defer a.free(lake.source.pinned_files);
+    @memset(lake.source.pinned_files, false);
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, root_context);
     const scope = Parallel.ExecutionScope{ .execution = &parent_execution, .allocator = a, .io = std.testing.io, .wait = .{ .ptr = &worker, .begin = Worker.begin, .end = Worker.end } };
     const parent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 4 }, .{}, &lake.source);
     defer parent.close(parent.ptr);
@@ -1688,8 +1731,15 @@ test "lake SQL scoped ordered cursors park physical object reads and retire inde
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
         try std.testing.expect(lake.source.scanner.shared_reader.?.context.execution == null);
         try std.testing.expect(lake.source.scanner.shared_reader.?.context.wait == null);
+        try std.testing.expect(lake.source.scanner.shared_reader.?.request_store == null);
+        try std.testing.expect(lake.source.scanner.shared_reader.?.base.client.ptr == &root_store);
+        for (lake.source.pinned_files) |pinned| try std.testing.expect(!pinned);
     }
     try std.testing.expectEqual(@as(usize, 9), count);
     try std.testing.expect(lake.meter.parked_reads.load(.acquire) > 0);
     try std.testing.expectEqual(lake.meter.reads, lake.meter.control_reads.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 3), lake.meter.stats);
+    try std.testing.expectEqual(lake.meter.stats, lake.meter.parked_stats.load(.acquire));
+    try std.testing.expectEqual(lake.meter.stats, lake.meter.control_stats.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), worker.root_callbacks);
 }
