@@ -150,6 +150,45 @@ pub const WriteControl = struct {
         return result;
     }
 
+    /// Wait for an operation that transfers ownership. A successful result
+    /// belongs to this scope until the original request accepts resumption.
+    /// `discard` must physically retire the result without requiring a grant.
+    /// `rejected` distinguishes authority failures from retryable IO failures.
+    pub fn withOwnedWait(self: WriteControl, rejected: *bool, comptime function: anytype, args: anytype, comptime discard: anytype) anyerror!@typeInfo(@TypeOf(@call(.auto, function, args))).error_union.payload {
+        rejected.* = false;
+        self.check() catch |err| {
+            rejected.* = true;
+            return err;
+        };
+        const paired = self.wait_begin_fn != null;
+        if (paired != (self.wait_end_fn != null)) {
+            rejected.* = true;
+            return error.InvalidOutputWait;
+        }
+        if (self.wait_begin_fn) |begin| begin(self.ptr) catch |err| {
+            rejected.* = true;
+            return err;
+        };
+        const result = blk: {
+            self.check() catch |err| {
+                rejected.* = true;
+                break :blk @as(anyerror!@typeInfo(@TypeOf(@call(.auto, function, args))).error_union.payload, err);
+            };
+            break :blk @call(.auto, function, args);
+        };
+        if (self.wait_end_fn) |end| end(self.ptr) catch |err| {
+            rejected.* = true;
+            if (result) |owned| discard(owned, args) else |_| {}
+            return err;
+        };
+        self.check() catch |err| {
+            rejected.* = true;
+            if (result) |owned| discard(owned, args) else |_| {}
+            return err;
+        };
+        return result;
+    }
+
     fn sleep(io: Io, ms: u64) !void {
         try io.sleep(.fromMilliseconds(@intCast(ms)), .awake);
     }
@@ -337,6 +376,22 @@ pub const Socket = struct {
         };
     }
 
+    fn connectStream(addr: Address, io: Io) !net.Stream {
+        return addr.connect(io, .{ .mode = .stream });
+    }
+
+    fn discardStream(stream: net.Stream, args: anytype) void {
+        const io: Io = args[1];
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        stream.close(io);
+    }
+
+    pub fn connectControlled(addr: Address, io: Io, control: WriteControl, rejected: *bool) !Self {
+        const stream = try control.withOwnedWait(rejected, connectStream, .{ addr, io }, discardStream);
+        return .{ .handle = stream.socket.handle, .io = io, .native_timeouts = isThreadedNetworkIo(io) };
+    }
+
     /// Resolves a host and tries each concrete address in resolver order.
     ///
     /// This intentionally does not use `HostName.connect`: Zig 0.16 can race
@@ -349,18 +404,23 @@ pub const Socket = struct {
     };
 
     pub fn connectHostResolved(host: []const u8, port: u16, io: Io) !HostConnectResult {
+        var rejected = false;
+        return connectHostResolvedControlled(host, port, io, .{}, &rejected);
+    }
+
+    pub fn connectHostResolvedControlled(host: []const u8, port: u16, io: Io, control: WriteControl, rejected: *bool) !HostConnectResult {
         if (Address.resolve(io, host, port)) |addr| {
-            return .{ .socket = try connect(addr, io), .address = addr };
+            return .{ .socket = try connectControlled(addr, io, control, rejected), .address = addr };
         } else |_| {}
 
         const host_name = try HostName.init(host);
         var canonical_name_buffer: [HostName.max_len]u8 = undefined;
         var lookup_buffer: [32]HostName.LookupResult = undefined;
         var lookup_queue: Io.Queue(HostName.LookupResult) = .init(&lookup_buffer);
-        try HostName.lookup(host_name, io, &lookup_queue, .{
+        try control.withWait(HostName.lookup, .{ host_name, io, &lookup_queue, HostName.LookupOptions{
             .port = port,
             .canonical_name_buffer = &canonical_name_buffer,
-        });
+        } });
 
         var last_connect_error: ?anyerror = null;
         while (true) {
@@ -370,7 +430,8 @@ pub const Socket = struct {
             };
             switch (result) {
                 .address => |address| {
-                    const socket = connect(address, io) catch |err| {
+                    const socket = connectControlled(address, io, control, rejected) catch |err| {
+                        if (rejected.*) return err;
                         last_connect_error = err;
                         continue;
                     };
@@ -2632,4 +2693,139 @@ test "SocketIoWriter controlled drain preserves buffered vectors and splats" {
     try std.testing.expectEqualStrings("headerabcdcdcd", &received);
     try std.testing.expect(!state.parked);
     try std.testing.expectEqual(@as(usize, 5), state.waits);
+}
+
+test "Socket owned connect wait retires rejected descriptors before returning" {
+    if (is_windows) return error.SkipZigTest;
+    const State = struct {
+        mode: enum { success, begin_denied, end_denied, canceled_after_connect, unpaired },
+        parked: bool = false,
+        ended: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: ?*anyopaque) WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.mode == .canceled_after_connect and self.ended) return error.Canceled;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.begins += 1;
+            if (self.mode == .begin_denied) return error.ResumeDenied;
+            self.parked = true;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            self.ends += 1;
+            self.ended = true;
+            if (self.mode == .end_denied) return error.ResumeDenied;
+            self.parked = false;
+        }
+    };
+    var lane = Io.Threaded.init(std.testing.allocator, .{});
+    defer lane.deinit();
+    const io = lane.io();
+    for ([_]@FieldType(State, "mode"){ .success, .begin_denied, .end_denied, .canceled_after_connect, .unpaired }) |mode| {
+        var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var state = State{ .mode = mode };
+        const control = WriteControl{ .ptr = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = if (mode == .unpaired) null else State.end };
+        var rejected = false;
+        const result = Socket.connectControlled(listener.getLocalAddress(), io, control, &rejected);
+        switch (mode) {
+            .success => {
+                var socket = try result;
+                socket.close();
+            },
+            .begin_denied, .end_denied => try std.testing.expectError(error.ResumeDenied, result),
+            .canceled_after_connect => try std.testing.expectError(error.Canceled, result),
+            .unpaired => try std.testing.expectError(error.InvalidOutputWait, result),
+        }
+        try std.testing.expectEqual(mode != .success, rejected);
+        try std.testing.expectEqual(@as(usize, if (mode == .unpaired) 0 else 1), state.begins);
+        try std.testing.expectEqual(@as(usize, if (mode == .begin_denied or mode == .unpaired) 0 else 1), state.ends);
+        if (mode != .begin_denied and mode != .unpaired) {
+            var accepted = try listener.accept();
+            defer accepted.socket.close();
+            accepted.socket.enableNativeTimeouts();
+            try accepted.socket.setRecvTimeout(1000);
+            var byte: [1]u8 = undefined;
+            // Observe physical retirement through the actual peer, rather
+            // than treating a callback count as proof of descriptor closure.
+            try std.testing.expectEqual(@as(usize, 0), try accepted.socket.recv(&byte));
+        }
+    }
+}
+
+test "Socket owned wait discards successful resources without transition callbacks" {
+    const State = struct {
+        created: bool = false,
+        retired: usize = 0,
+        fn check(raw: ?*anyopaque) WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.created) return error.Timeout;
+        }
+        fn create(self: *@This()) !*@This() {
+            self.created = true;
+            return self;
+        }
+        fn discard(self: *@This(), _: anytype) void {
+            self.retired += 1;
+        }
+    };
+    var state = State{};
+    var rejected = false;
+    const control = WriteControl{ .ptr = &state, .check_fn = State.check };
+    try std.testing.expectError(error.Timeout, control.withOwnedWait(&rejected, State.create, .{&state}, State.discard));
+    try std.testing.expect(rejected);
+    try std.testing.expectEqual(@as(usize, 1), state.retired);
+}
+
+test "Socket controlled resolver opens localhost without retaining request controls" {
+    if (is_windows) return error.SkipZigTest;
+    var lane = Io.Threaded.init(std.testing.allocator, .{});
+    defer lane.deinit();
+    const io = lane.io();
+    var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var rejected = false;
+    var connection = try Socket.connectHostResolvedControlled("localhost", listener.getLocalAddress().getPort(), io, .{}, &rejected);
+    defer connection.socket.close();
+    try std.testing.expect(!rejected);
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+    try connection.socket.sendAll("x");
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try accepted.socket.recv(&byte));
+    try std.testing.expectEqualStrings("x", &byte);
+}
+
+test "Socket controlled resolver never retries an address after denied authority" {
+    if (is_windows) return error.SkipZigTest;
+    const State = struct {
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.begins += 1;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.ends += 1;
+            // DNS completes first. Reject the first concrete connect,
+            // whether it succeeded or returned a retryable transport error.
+            if (self.ends > 1) return error.ResumeDenied;
+        }
+    };
+    var lane = Io.Threaded.init(std.testing.allocator, .{});
+    defer lane.deinit();
+    const io = lane.io();
+    var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var state = State{};
+    var rejected = false;
+    try std.testing.expectError(error.ResumeDenied, Socket.connectHostResolvedControlled("localhost", listener.getLocalAddress().getPort(), io, .{ .ptr = &state, .wait_begin_fn = State.begin, .wait_end_fn = State.end }, &rejected));
+    try std.testing.expect(rejected);
+    try std.testing.expectEqual(@as(usize, 2), state.begins);
+    try std.testing.expectEqual(@as(usize, 2), state.ends);
 }

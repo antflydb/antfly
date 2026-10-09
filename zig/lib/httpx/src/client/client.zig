@@ -6847,12 +6847,16 @@ test "HTTPS request controls retire denied handshake and body waits without reta
     const Framing = enum { fixed, chunked, close_delimited };
     const State = struct {
         mode: Mode,
+        // This fixture uses a literal IP: pooling performs one controlled
+        // connect before TLS. Keep denial injection on the TLS transport so
+        // connect coverage does not replace handshake/body coverage.
+        connect_waits: usize = 0,
         parked: bool = false,
         begins: usize = 0,
         ends: usize = 0,
         fn check(raw: ?*anyopaque) socket_mod.WriteControl.Error!void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
-            if (self.mode == .canceled_read and self.ends >= 3) return error.Canceled;
+            if (self.mode == .canceled_read and self.ends >= self.connect_waits + 3) return error.Canceled;
         }
         fn begin(raw: ?*anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -6864,7 +6868,7 @@ test "HTTPS request controls retire denied handshake and body waits without reta
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             try std.testing.expect(self.parked);
             self.ends += 1;
-            if (self.mode == .denied_write or (self.mode == .denied_read and self.ends >= 3)) return error.DeadlineExceeded;
+            if ((self.mode == .denied_write and self.ends > self.connect_waits) or (self.mode == .denied_read and self.ends >= self.connect_waits + 3)) return error.DeadlineExceeded;
             self.parked = false;
         }
     };
@@ -6884,7 +6888,7 @@ test "HTTPS request controls retire denied handshake and body waits without reta
         const port = try std.fmt.parseUnsigned(u16, port_line, 10);
         const url = try std.fmt.allocPrint(alloc, "https://127.0.0.1:{d}/", .{port});
         defer alloc.free(url);
-        var state: State = .{ .mode = mode };
+        var state: State = .{ .mode = mode, .connect_waits = if (pooled) 1 else 0 };
         var completed_ends: usize = 0;
         {
             var client = Client.initWithConfig(alloc, io, .{ .keep_alive = pooled, .verify_ssl = false, .retry_policy = .{ .max_retries = 0 } });

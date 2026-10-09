@@ -112,10 +112,15 @@ pub const Connection = struct {
 
     /// Creates a new TCP connection (DNS resolve + TCP connect).
     pub fn createNew(allocator: Allocator, io: Io, host: []const u8, port: u16, _: void) !*Connection {
+        return createNewControlled(allocator, io, host, port, {}, null);
+    }
+
+    pub fn createNewControlled(allocator: Allocator, io: Io, host: []const u8, port: u16, _: void, control: ?socket_mod.WriteControl) !*Connection {
         const host_owned = try allocator.dupe(u8, host);
         errdefer allocator.free(host_owned);
 
-        var socket = try Socket.connectHost(host, port, io);
+        var rejected = false;
+        var socket = (try Socket.connectHostResolvedControlled(host, port, io, control orelse .{}, &rejected)).socket;
         errdefer socket.close();
         socket.setKeepAlive(true) catch {};
 
@@ -179,6 +184,10 @@ pub const TlsConnection = struct {
 
     /// Creates a new TLS connection (DNS resolve + TCP connect + TLS handshake).
     pub fn createNew(allocator: Allocator, io: Io, host: []const u8, port: u16, ctx: TlsPoolContext) !*TlsConnection {
+        return createNewControlled(allocator, io, host, port, ctx, null);
+    }
+
+    pub fn createNewControlled(allocator: Allocator, io: Io, host: []const u8, port: u16, ctx: TlsPoolContext, control: ?socket_mod.WriteControl) !*TlsConnection {
         const host_owned = try allocator.dupe(u8, host);
         errdefer allocator.free(host_owned);
 
@@ -186,7 +195,8 @@ pub const TlsConnection = struct {
         errdefer allocator.destroy(entry);
 
         // Resolve and connect the TCP socket.
-        entry.socket = try Socket.connectHost(host, port, io);
+        var rejected = false;
+        entry.socket = (try Socket.connectHostResolvedControlled(host, port, io, control orelse .{}, &rejected)).socket;
         errdefer entry.socket.close();
 
         // Initialize the TLS session.  The session stores internal pointers to
@@ -198,7 +208,24 @@ pub const TlsConnection = struct {
         errdefer entry.session.deinit();
 
         entry.session.attachSocket(&entry.socket);
-        try entry.session.handshake(host);
+        {
+            // The entry is still exclusive and unpublished. Only physical
+            // TLS transport waits loan execution; cryptography stays runnable.
+            // Clear borrowed callbacks before the connection can enter a pool.
+            var transport_scope = try entry.session.controlTransport(control);
+            defer transport_scope.deinit();
+            entry.session.handshake(host) catch |err| {
+                try entry.session.checkTransportError();
+                return err;
+            };
+            if (control) |original| original.check() catch |err| {
+                // A completed handshake is still unpublished. Prevent TLS
+                // teardown from sending close_notify after authority expires.
+                entry.socket.abortRequest();
+                entry.socket.shutdown();
+                return err;
+            };
+        }
 
         const now = milliTimestamp(io);
         entry.host = host_owned;
@@ -375,7 +402,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                 const current = milliTimestamp(self.io);
                 if (options.deadline_ms) |original| if (current >= original) return error.Timeout;
                 if (queued and current >= deadline) return error.Timeout;
-                const connection = self.getConnection(host, port) catch |err| switch (err) {
+                const connection = self.getConnectionControlled(host, port, options.execution_wait) catch |err| switch (err) {
                     error.PoolExhausted, error.PoolExhaustedForHost => {
                         self.mutex.lockUncancelable(self.io);
                         defer self.mutex.unlock(self.io);
@@ -402,6 +429,10 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         /// The returned pointer is heap-allocated and marked in-use.
         /// Callers must call `releaseConnection` or `evictConnection` when done.
         pub fn getConnection(self: *Self, host: []const u8, port: u16) !*Entry {
+            return self.getConnectionControlled(host, port, null);
+        }
+
+        fn getConnectionControlled(self: *Self, host: []const u8, port: u16, control: ?socket_mod.WriteControl) !*Entry {
             var key_buf: [280]u8 = undefined;
             const key = formatHostKey(&key_buf, host, port) orelse return error.InvalidUri;
 
@@ -490,7 +521,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                     self.allocator.free(removed.key);
                 }
             }
-            return self.createConnection(host, port) catch |err| {
+            return self.createConnection(host, port, control) catch |err| {
                 if (self.slots) |slots| slots.release();
                 return err;
             };
@@ -498,8 +529,11 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
 
         /// Creates a new connection via `Entry.createNew`, then inserts it
         /// into the pool after re-checking limits under the mutex.
-        fn createConnection(self: *Self, host: []const u8, port: u16) !*Entry {
-            const entry = try Entry.createNew(self.allocator, self.io, host, port, self.context);
+        fn createConnection(self: *Self, host: []const u8, port: u16, control: ?socket_mod.WriteControl) !*Entry {
+            const entry = if (@hasDecl(Entry, "createNewControlled"))
+                try Entry.createNewControlled(self.allocator, self.io, host, port, self.context, control)
+            else
+                try Entry.createNew(self.allocator, self.io, host, port, self.context);
             errdefer {
                 entry.close();
                 self.allocator.free(entry.host);
@@ -1042,4 +1076,53 @@ test "outbound pool acquisition retires a newly created connection after authori
     try std.testing.expectEqual(@as(usize, 0), pool_inst.stats().connecting);
     try std.testing.expectEqual(@as(usize, 0), pool_inst.waiters);
     try std.testing.expectEqual(@as(usize, 0), slots.used.load(.acquire));
+}
+
+test "outbound pool denied connect resume retires socket and reclaims physical capacity" {
+    const State = struct {
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.begins += 1;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.ends += 1;
+            return error.ResumeDenied;
+        }
+    };
+    var lane = Io.Threaded.init(std.testing.allocator, .{});
+    defer lane.deinit();
+    const io = lane.io();
+    var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var slots = ConnectionSlots{ .limit = 1 };
+    var pool_inst = ConnectionPool.init(std.testing.allocator, io, {});
+    defer pool_inst.deinit();
+    pool_inst.bindSlots(&slots);
+    var state = State{};
+    const options = @import("admission.zig").Options{ .execution_wait = .{ .ptr = &state, .wait_begin_fn = State.begin, .wait_end_fn = State.end } };
+    const port = listener.getLocalAddress().getPort();
+    try std.testing.expectError(error.ResumeDenied, pool_inst.getConnectionWait("127.0.0.1", port, options, 1, 1000));
+    try std.testing.expectEqual(@as(usize, 1), state.begins);
+    try std.testing.expectEqual(@as(usize, 1), state.ends);
+    try std.testing.expectEqual(@as(usize, 0), slots.used.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool_inst.stats().connecting);
+    try std.testing.expectEqual(@as(usize, 0), pool_inst.stats().total);
+    var rejected_peer = try listener.accept();
+    defer rejected_peer.socket.close();
+    rejected_peer.socket.enableNativeTimeouts();
+    try rejected_peer.socket.setRecvTimeout(1000);
+    var byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try rejected_peer.socket.recv(&byte));
+    // The same sole capacity slot remains usable after physical retirement.
+    const next = try pool_inst.getConnection("127.0.0.1", port);
+    defer pool_inst.releaseConnection(next);
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+    try next.socket.sendAll("x");
+    try std.testing.expectEqual(@as(usize, 1), try accepted.socket.recv(&byte));
+    try std.testing.expectEqualStrings("x", &byte);
+    try std.testing.expectEqual(@as(usize, 1), state.ends);
 }
