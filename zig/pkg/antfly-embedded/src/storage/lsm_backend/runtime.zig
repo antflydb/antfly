@@ -6591,6 +6591,20 @@ fn retainAsyncPointEntry(
     return .{ .hit = value };
 }
 
+// Share the physical owner's heat across point and batch readers. The result
+// is owned before optional promotion; follower slots never acquire a second
+// promotion lease or cancel the owner's physical handle.
+fn retainAsyncPrefixEntry(backend: anytype, read: *AsyncPointBlockRead, read_hint: ?*?BorrowedReadHint, held_values: *std.ArrayListUnmanaged([]u8), value_allocator: Allocator, namespace: backend_types.Namespace, positioned: lsm_table_file.BorrowedDecoded.PositionedEntry, records: []const u8) !AsyncPointLookupResult {
+    const result = try retainAsyncPointEntry(backend, read, read_hint, held_values, value_allocator, namespace, positioned);
+    const owner = if (read.shared_block) |shared_owner| &shared_owner.read else read;
+    if (namespace.retainDataBlocks()) if (owner.physical_handle) |*handle| if (handle.claimPointBlockPromotion(read.logical_len)) {
+        defer handle.finishPointBlockPromotion();
+        const index = try read.index();
+        try promoteCachedPrefixBlock(backend, read.path, read.run_id, read.generation, index.blockWindow(read.block_index), read.absolute_offset, handle.runTablePhysicalBlock(), records);
+    };
+    return result;
+}
+
 // Large values are normally emitted as singleton raw Snappy blocks. Probe a
 // bounded header first, then decode into final result storage. The read charge
 // covers construction and is released when the buffer becomes an owned result,
@@ -6674,7 +6688,7 @@ fn consumeAsyncPointReadWithScratch(
                 backend.recordPointRunSurvivorMiss();
                 return null;
             };
-            return try retainAsyncPointEntry(backend, read, read_hint, held_values, value_allocator, namespace, found);
+            return try retainAsyncPrefixEntry(backend, read, read_hint, held_values, value_allocator, namespace, found, decoded);
         } else try lsm_table_file.findExactEntryInBlock(index, decoded, read.block_index, namespace.name, key);
         const found = positioned orelse {
             backend.recordPointRunSurvivorMiss();
@@ -6710,7 +6724,7 @@ fn consumeAsyncPointReadWithScratch(
                 backend.recordPointRunSurvivorMiss();
                 return null;
             };
-            return try retainAsyncPointEntry(backend, read, read_hint, held_values, value_allocator, namespace, found);
+            return try retainAsyncPrefixEntry(backend, read, read_hint, held_values, value_allocator, namespace, found, decoded);
         },
         .none, .snappy => blk: {
             if (decoded.len != read.logical_len) return error.InvalidTableFile;
@@ -7452,21 +7466,19 @@ fn findExactEntryInCachedCompressedPrefixBlock(
     const found = (findExactEntryInCachedPrefixWithScratch(handle.runTablePhysicalBlock(), block, window, held_values, value_allocator, scratch.allocator(), namespace, key) catch |err| return scratch.failure(err)) orelse return null;
     if (namespace.retainDataBlocks() and handle.claimPointBlockPromotion(window.len)) {
         defer handle.finishPointBlockPromotion();
-        try promoteCachedPrefixBlock(backend, run, window, absolute_offset, handle.runTablePhysicalBlock());
+        try promoteCachedPrefixBlock(backend, run.path.?, run.id, backend.root_generation, window, absolute_offset, handle.runTablePhysicalBlock(), null);
     }
     return found;
 }
 
 /// Promotion is optional: admit construction independently of caller results,
-/// then let the shared cache charge retention. The physical owner elects one
+/// then hand its credit to shared cache retention without a second host charge. The physical owner elects one
 /// attempt; the normal decoded-load gate also coalesces with scan/batch loads.
-fn promoteCachedPrefixBlock(backend: anytype, run: *Run, window: lsm_table_file.EntryDataWindow, offset: u64, payload: []const u8) !void {
+fn promoteCachedPrefixBlock(backend: anytype, path: []const u8, run_id: u64, generation: u64, window: lsm_table_file.EntryDataWindow, offset: u64, payload: []const u8, prefix_records: ?[]const u8) !void {
     const cache = backend.options.cache orelse return;
-    const path = run.path orelse return error.RunStateUnavailable;
-    const generation = backend.root_generation;
-    if (!(cache.tryBeginLoadWithBlock(path, run.id, generation, .run_table_block, offset, window.physicalLen()) catch return)) return;
-    defer cache.finishLoadWithBlock(path, run.id, generation, .run_table_block, offset, window.physicalLen());
-    if (cache.retainRunTableBlock(path, run.id, generation, offset, window.physicalLen())) |retained| {
+    if (!(cache.tryBeginLoadWithBlock(path, run_id, generation, .run_table_block, offset, window.physicalLen()) catch return)) return;
+    defer cache.finishLoadWithBlock(path, run_id, generation, .run_table_block, offset, window.physicalLen());
+    if (cache.retainRunTableBlock(path, run_id, generation, offset, window.physicalLen())) |retained| {
         var winner = retained;
         winner.release();
         return;
@@ -7482,12 +7494,15 @@ fn promoteCachedPrefixBlock(backend: anytype, run: *Run, window: lsm_table_file.
     defer if (output_credit) |*credit| credit.release();
     var scratch = PointReadScratch.init(backend);
     defer scratch.deinit();
-    const decoded = lsm_table_file.decodeBlockPayloadWithScratchAlloc(cache.valueAllocator(), scratch.allocator(), window.compression, payload, window.len, window.checksum) catch |err| switch (err) {
+    const decoded = (if (prefix_records) |records| blk: {
+        try lsm_table_file.validateBlockPayload(payload, window.checksum);
+        break :blk lsm_table_file.expandValidatedPrefixRecordsAlloc(cache.valueAllocator(), records, window.len);
+    } else lsm_table_file.decodeBlockPayloadWithScratchAlloc(cache.valueAllocator(), scratch.allocator(), window.compression, payload, window.len, window.checksum)) catch |err| switch (err) {
         error.OutOfMemory => return,
         else => return err,
     };
     // put consumes decoded on every exit, including allocation failure.
-    var promoted = cache.putRunTableBlock(path, run.id, generation, offset, window.physicalLen(), decoded) catch return;
+    var promoted = cache.putRunTableBlockWithCredit(path, run_id, generation, offset, window.physicalLen(), decoded, if (output_credit) |*credit| credit else null) catch return;
     promoted.release();
 }
 
@@ -11228,4 +11243,160 @@ test "lsm shared async warm decoded blocks skip scratch and preserve pool owners
     cache.invalidatePath(run.path.?);
     try std.testing.expectEqualStrings("v", lookup.hit);
     try std.testing.expectEqualStrings(entries[0].key, hint.?.key);
+}
+
+test "lsm shared prefix promotion adopts construction credit under aggregate pressure" {
+    const a = std.testing.allocator;
+    const resources = @import("../resource_manager.zig");
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 20 * 1024 } });
+    defer manager.deinit(a);
+    const B = @import("../lsm_backend.zig").Backend;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/review-sync", .{ .storage = storage.storage(), .cache = &cache, .max_concurrent_point_block_reads = 1 });
+    defer backend.close();
+    var entries: [192]lsm_table_file.Entry = undefined;
+    var buffers: [192][80]u8 = undefined;
+    for (&entries, 0..) |*entry, i| entry.* = .{ .key = try std.fmt.bufPrint(&buffers[i], "long-shared-document-key-prefix-for-compression:{d:0>4}", .{i}), .value = "v" };
+    var filter = try lsm_table_file.buildFilterAlloc(a, &entries, lsm_table_file.default_filter_config);
+    defer filter.deinit(a);
+    const encoded = try lsm_table_file.encodeWithFilterAllocOptions(a, &entries, filter, .{ .block_compression = .snappy_adaptive });
+    defer a.free(encoded);
+    var index = try lsm_table_file.decodeIndexAlloc(a, encoded);
+    defer index.deinit(a);
+    try std.testing.expectEqual(lsm_table_file.BlockCompression.prefix_snappy, index.blockWindow(0).compression);
+    try storage.storage().writeFileAbsolute("/sync-block", encoded);
+    var run: Run = .{ .id = 1, .level = 0, .size_bytes = encoded.len, .path = @constCast("/sync-block"), .smallest_namespace_name = null, .largest_namespace_name = null, .smallest_key = @constCast(entries[0].key), .largest_key = @constCast(entries[entries.len - 1].key), .entry_count = entries.len, .bloom_filter = null, .state = null };
+    cache.attachResourceManager(&manager);
+    backend.options.resource_manager = &manager;
+    defer backend.options.resource_manager = null;
+    var sentinel = try cache.putRunTableBlock("sentinel", 99, 0, 0, 1024, try a.alloc(u8, 1024));
+    sentinel.release();
+    var held: std.ArrayListUnmanaged([]u8) = .empty;
+    defer releaseHeldValues(&held, a);
+    for (0..8) |_| {
+        var found = (try findExactEntryInCachedBlocks(&backend, &run, &index, &held, a, .{}, entries[0].key)).?;
+        defer if (found.handle) |*handle| handle.release();
+        try std.testing.expectEqualStrings("v", found.entry.value);
+    }
+    const offset = @as(u64, @intCast(index.entry_data_start)) + index.blockWindow(0).physicalRelativeOffset();
+    var promoted = cache.retainRunTableBlock(run.path.?, run.id, backend.root_generation, offset, index.blockWindow(0).physicalLen());
+    defer if (promoted) |*handle| handle.release();
+    var retained_sentinel = cache.retainRunTableBlock("sentinel", 99, 0, 0, 1024);
+    defer if (retained_sentinel) |*handle| handle.release();
+    try std.testing.expect(promoted != null);
+    try std.testing.expect(retained_sentinel != null);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 20 * 1024);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+    std.debug.print("\nLSM promotion admission: aggregate_limit=20480 decoded_bytes={d} promoted={} sentinel_survived={} peak_bytes={d}\n", .{ index.blockWindow(0).len, promoted != null, retained_sentinel != null, manager.snapshot().memory.peak_bytes });
+}
+
+test "lsm shared cold async hits promote and eliminate repeated decoder scratch" {
+    const a = std.testing.allocator;
+    const B = @import("../lsm_backend.zig").Backend;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/review-sync", .{ .storage = storage.storage(), .cache = &cache, .max_concurrent_point_block_reads = 1 });
+    defer backend.close();
+    var entries: [192]lsm_table_file.Entry = undefined;
+    var buffers: [192][80]u8 = undefined;
+    for (&entries, 0..) |*entry, i| entry.* = .{ .key = try std.fmt.bufPrint(&buffers[i], "long-shared-document-key-prefix-for-compression:{d:0>4}", .{i}), .value = "v" };
+    var filter = try lsm_table_file.buildFilterAlloc(a, &entries, lsm_table_file.default_filter_config);
+    defer filter.deinit(a);
+    const encoded = try lsm_table_file.encodeWithFilterAllocOptions(a, &entries, filter, .{ .block_compression = .snappy_adaptive });
+    defer a.free(encoded);
+    var index = try lsm_table_file.decodeIndexAlloc(a, encoded);
+    defer index.deinit(a);
+    try std.testing.expectEqual(lsm_table_file.BlockCompression.prefix_snappy, index.blockWindow(0).compression);
+    try storage.storage().writeFileAbsolute("/sync-block", encoded);
+    var run: Run = .{ .id = 1, .level = 0, .size_bytes = encoded.len, .path = @constCast("/sync-block"), .smallest_namespace_name = null, .largest_namespace_name = null, .smallest_key = @constCast(entries[0].key), .largest_key = @constCast(entries[entries.len - 1].key), .entry_count = entries.len, .bloom_filter = null, .state = null };
+    var warm_index = try loadRunTableIndexHandle(&backend, &run);
+    defer warm_index.release();
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var scratch = Budget{ .backing = std.heap.c_allocator };
+    var result = Budget{ .backing = std.heap.c_allocator };
+    var held: std.ArrayListUnmanaged([]u8) = .empty;
+    defer releaseHeldValues(&held, result.allocator());
+    try held.ensureTotalCapacity(result.allocator(), 1);
+    var runs = [_]Run{run};
+    const offset = @as(u64, @intCast(index.entry_data_start)) + index.blockWindow(0).physicalRelativeOffset();
+    for (0..2) |mode| {
+        const before = scratch.alloc_calls;
+        const started = platform_time.monotonicNs();
+        for (0..10000) |i| {
+            const key = entries[i % entries.len].key;
+            var read = (try prepareAsyncPointBlockRead(&backend, &runs, .{ .run_index = 0 }, .{}, key, null)).?;
+            defer read.release();
+            const lookup = (try consumeAsyncPointReadWithScratch(&backend, &read, null, &held, result.allocator(), .{}, key, null, scratch.allocator())).?;
+            try std.testing.expectEqualStrings("v", lookup.hit);
+            for (held.items) |bytes| result.allocator().free(bytes);
+            held.clearRetainingCapacity();
+        }
+        const elapsed = platform_time.monotonicNs() - started;
+        var decoded = cache.retainRunTableBlock(run.path.?, run.id, backend.root_generation, offset, index.blockWindow(0).physicalLen());
+        defer if (decoded) |*handle| handle.release();
+        try std.testing.expect(decoded != null);
+        try std.testing.expectEqual(@as(usize, if (mode == 0) 16 else 0), scratch.alloc_calls - before);
+        std.debug.print("\nLSM cold async promotion {d} lookups=10000 ns={d} scratch_allocations={d} decoded_block_cached={}\n", .{ mode, elapsed, scratch.alloc_calls - before, decoded != null });
+    }
+}
+
+test "lsm shared cold async batch promotes within a tight aggregate budget" {
+    const a = std.testing.allocator;
+    const resources = @import("../resource_manager.zig");
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 24 * 1024 } });
+    defer manager.deinit(a);
+    const B = @import("../lsm_backend.zig").Backend;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/review-sync", .{ .storage = storage.storage(), .cache = &cache, .max_concurrent_point_block_reads = 16 });
+    defer backend.close();
+    var entries: [192]lsm_table_file.Entry = undefined;
+    var buffers: [192][80]u8 = undefined;
+    for (&entries, 0..) |*entry, i| entry.* = .{ .key = try std.fmt.bufPrint(&buffers[i], "long-shared-document-key-prefix-for-compression:{d:0>4}", .{i}), .value = "v" };
+    var filter = try lsm_table_file.buildFilterAlloc(a, &entries, lsm_table_file.default_filter_config);
+    defer filter.deinit(a);
+    const encoded = try lsm_table_file.encodeWithFilterAllocOptions(a, &entries, filter, .{ .block_compression = .snappy_adaptive });
+    defer a.free(encoded);
+    var index = try lsm_table_file.decodeIndexAlloc(a, encoded);
+    defer index.deinit(a);
+    try std.testing.expectEqual(lsm_table_file.BlockCompression.prefix_snappy, index.blockWindow(0).compression);
+    try storage.storage().writeFileAbsolute("/sync-block", encoded);
+    const run: Run = .{ .id = 1, .level = 0, .size_bytes = encoded.len, .path = @constCast("/sync-block"), .smallest_namespace_name = null, .largest_namespace_name = null, .smallest_key = @constCast(entries[0].key), .largest_key = @constCast(entries[entries.len - 1].key), .entry_count = entries.len, .bloom_filter = null, .state = null };
+    cache.attachResourceManager(&manager);
+    backend.options.resource_manager = &manager;
+    defer backend.options.resource_manager = null;
+    var runs = [_]Run{run};
+    const groups = try buildL0RunGroups(a, &runs);
+    defer deinitRunGroups(a, groups);
+    const levels = try buildLowerLevels(a, &runs);
+    defer a.free(levels);
+    const empty: State = .{};
+    var keys: [16][]const u8 = undefined;
+    for (&keys, 0..) |*key, i| key.* = entries[i].key;
+    var values: [16]?[]const u8 = @splat(null);
+    var held: std.ArrayListUnmanaged([]u8) = .empty;
+    defer releaseHeldValues(&held, a);
+    const before = backend.snapshotReadStats().table_block_loads;
+    for (0..2) |_| {
+        const result = (try readManySortedPointFromSnapshotAsync(&backend, &empty, &.{}, &runs, groups, levels, a, &held, .{}, &keys, &values, false, .snapshot_pinned)).?;
+        try std.testing.expectEqual(@as(usize, 16), result.hits);
+        for (values) |value| try std.testing.expectEqualStrings("v", value.?);
+        const window = index.blockWindow(0);
+        const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+        var decoded = cache.retainRunTableBlock(run.path.?, run.id, backend.root_generation, offset, window.physicalLen());
+        defer if (decoded) |*handle| handle.release();
+        try std.testing.expect(decoded != null);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+    }
+    try std.testing.expectEqual(@as(u64, 1), backend.snapshotReadStats().table_block_loads - before);
+    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 24 * 1024);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
 }

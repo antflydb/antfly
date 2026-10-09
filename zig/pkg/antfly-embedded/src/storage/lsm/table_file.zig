@@ -2320,6 +2320,12 @@ fn commonPrefixLen(lhs: []const u8, rhs: []const u8) usize {
     return index;
 }
 
+/// Expand previously checksum-validated prefix records into immutable raw rows.
+/// The caller owns admission and the compressed source's integrity check.
+pub fn expandValidatedPrefixRecordsAlloc(allocator: std.mem.Allocator, records: []const u8, expected_len: usize) ![]u8 {
+    return decodePrefixCompressedBlockAlloc(allocator, allocator, records, expected_len);
+}
+
 pub fn decodeBlockPayloadAlloc(
     allocator: std.mem.Allocator,
     compression: BlockCompression,

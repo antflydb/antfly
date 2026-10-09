@@ -451,6 +451,13 @@ pub const Cache = struct {
         );
     }
 
+    /// Consume a decoded buffer and transfer its construction admission into
+    /// cache retention when both owners use the same ResourceManager.
+    pub fn putRunTableBlockWithCredit(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, block: []u8, credit: ?*resource_manager_mod.Reservation) !Handle {
+        errdefer self.allocator.free(block);
+        return self.putWithBlockCredit(path, run_id, generation, .{ .run_table_block = block }, estimateTableBlockCost(path, block), block_offset, block_len, false, credit);
+    }
+
     pub fn putTransientRunTableBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, block: []u8) !Handle {
         errdefer self.allocator.free(block);
         return try self.putWithBlock(
@@ -653,6 +660,10 @@ pub const Cache = struct {
     }
 
     fn putWithBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, value: Value, byte_cost: usize, block_offset: u64, block_len: u32, force_transient: bool) !Handle {
+        return self.putWithBlockCredit(path, run_id, generation, value, byte_cost, block_offset, block_len, force_transient, null);
+    }
+
+    fn putWithBlockCredit(self: *Cache, path: []const u8, run_id: u64, generation: u64, value: Value, byte_cost: usize, block_offset: u64, block_len: u32, force_transient: bool, credit: ?*resource_manager_mod.Reservation) !Handle {
         const kind = std.meta.activeTag(value);
         const key = makeKey(path, run_id, generation, kind, block_offset, block_len);
         const owned_path = try self.allocator.dupe(u8, path);
@@ -676,7 +687,7 @@ pub const Cache = struct {
         // Retention is optional. Reserve its aggregate budget before making
         // the entry visible; when the budget cannot be reclaimed, ownership
         // stays in a transient handle so the read still succeeds.
-        const retention_admitted = !force_transient and byte_cost <= self.effectiveMaxBytes() and self.admitResourceGrowth(byte_cost);
+        const retention_admitted = !force_transient and byte_cost <= self.effectiveMaxBytes() and (if (credit) |construction| self.admitResourceGrowthWithCredit(byte_cost, construction) else self.admitResourceGrowth(byte_cost));
         var reservation_active = retention_admitted;
         errdefer if (reservation_active) self.releaseResourceBytes(byte_cost);
 
@@ -921,6 +932,20 @@ pub const Cache = struct {
             if (locked) self.resource_accounting_mutex.unlock();
             return true;
         }
+    }
+
+    fn admitResourceGrowthWithCredit(self: *Cache, bytes: usize, credit: *resource_manager_mod.Reservation) bool {
+        const locked = lockAtomic(&self.resource_accounting_mutex);
+        const manager = self.resource_manager;
+        if (manager == null or manager.? != credit.manager) {
+            if (locked) self.resource_accounting_mutex.unlock();
+            return self.admitResourceGrowth(bytes);
+        }
+        defer if (locked) self.resource_accounting_mutex.unlock();
+        // Optional promotion never evicts other entries to rescue a failed
+        // transfer. The caller retains construction credit until transient free.
+        manager.?.adoptReservationUsage(credit, .lsm_block_table_cache, &self.resource_accounted_bytes, bytes) catch return false;
+        return true;
     }
 
     fn releaseResourceBytes(self: *Cache, bytes: usize) void {
@@ -1799,6 +1824,34 @@ test "lsm cache optional load gate skips busy owners and mutexes" {
             };
             try std.testing.expect(started);
             c.finishLoadWithBlock("optional", 1, 1, .run_table_block, 10, 20);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{});
+}
+
+test "lsm cache construction handoff cleans duplicate winners and allocation failures" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+            defer manager.deinit(std.testing.allocator);
+            defer std.debug.assert(manager.snapshot().memory.used_bytes == 0 and manager.snapshot().memory.accounting_errors == 0);
+            var cache = try Cache.initFallible(alloc, 1024 * 1024);
+            defer cache.deinit();
+            cache.attachResourceManager(&manager);
+            for (0..2) |_| {
+                var credit = try manager.reserveWithoutReclaim(.lsm_read_working_set, 1024);
+                defer credit.release();
+                const bytes = try alloc.alloc(u8, 1024);
+                @memset(bytes, 17);
+                var handle = try cache.putRunTableBlockWithCredit("handoff", 1, 0, 0, 1024, bytes, &credit);
+                defer handle.release();
+                try std.testing.expect(handle.isRetained());
+                try std.testing.expectEqual(@as(u64, 0), credit.bytes);
+                try std.testing.expectEqual(@as(u8, 17), handle.runTableBlock()[0]);
+                try std.testing.expectEqual(@as(u64, @intCast(cache.currentBytes())), manager.sliceStats(.lsm_block_table_cache).used_bytes);
+            }
+            try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
         }
     };
     try std.testing.checkAllAllocationFailures(a, Fixture.run, .{});

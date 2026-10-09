@@ -335,6 +335,60 @@
       "after_returned_while_gate_held": true,
       "after_cache_waits": 0,
       "scope": "Eighth successful synchronous prefix lookup while an existing decoded loader holds the pending gate. Optional gate tests also cover busy mutex and allocation failure publication cleanup."
+    },
+    "shared_prefix_construction_credit_handoff": {
+      "comparison_commit": "d2172feecdc2d7f64f4ab712c8567249044782a1",
+      "aggregate_limit_bytes": 20480,
+      "logical_block_bytes": 12672,
+      "unrelated_cached_payload_bytes": 1024,
+      "before": {
+        "promoted": false,
+        "unrelated_entry_survives": false
+      },
+      "after": {
+        "promoted": true,
+        "unrelated_entry_survives": true,
+        "accounted_peak_bytes": 18574,
+        "read_charge_on_return_bytes": 0,
+        "accounting_errors": 0
+      },
+      "scope": "Actual synchronous point promotion with an attached shared cache/resource manager. Construction credit becomes observed cache ownership under one manager lock; cache metadata remains admitted. Tests cover same-slice handoff, destination and aggregate rejection, observer identity OOM, duplicate publication and exhaustive cache allocation failures."
+    },
+    "shared_async_cold_prefix_promotion": {
+      "comparison_commit": "d2172feecdc2d7f64f4ab712c8567249044782a1",
+      "entries": 192,
+      "lookups": 10000,
+      "before": {
+        "lookup_ns": 245746000,
+        "decoder_scratch_allocations": 20000,
+        "decoded_block_cached": false
+      },
+      "after": {
+        "cold_lookup_ns_samples": [
+          63353000,
+          67503000,
+          68270000
+        ],
+        "cold_decoder_scratch_allocations": 16,
+        "warm_lookup_ns_samples": [
+          62637000,
+          68852000,
+          71916000
+        ],
+        "warm_decoder_scratch_allocations": 0,
+        "decoded_block_cached": true
+      },
+      "scope": "Native Debug standalone prepare/consume helper fixture, MemoryStorage, counted C decoder scratch. No manual warmup. The eighth successful hit promotes with existing bounds and the nonblocking gate, using already decoded prefix records. Owned async result copies remain required. Indicative helper timing, not end-to-end QPS or a soak."
+    },
+    "shared_async_cold_batch_promotion": {
+      "keys_per_batch": 16,
+      "batches": 2,
+      "aggregate_limit_bytes": 24576,
+      "physical_block_reads": 1,
+      "decoded_block_cached_after_first_batch": true,
+      "read_charge_on_return_bytes": 0,
+      "accounting_errors": 0,
+      "scope": "Production sorted async batch path, shared physical owner, attached cache/resource manager, cold first batch and warm second batch. Active prefix-reader/key lifetimes remain intact while future reads can reuse the decoded cache entry."
     }
   },
   "scope": "Deterministic allocation, directory traversal, admission, and isolated Debug timing fixtures, not query throughput or a 2 GiB soak. Caller-owned mutable values, captured read-layout pointer arrays, payload IO/cache ownership, and first-use overlay promotion still have costs. Directory planning and index metadata reuse bounded resource-charged arenas; async candidate metadata has fixed stack storage.",
