@@ -1,0 +1,82 @@
+{
+  "base_commit": "755cb12a68f8ed079dd8968814b8be48bb2850a3",
+  "comparison_review_commit": "b72700955e1e7eb1a8b051649f0f3b6842cbce8b",
+  "environment": {
+    "platform": "aarch64-macos",
+    "optimization": "Debug",
+    "storage": "MemoryStorage",
+    "zig": "0.17.0"
+  },
+  "raw_snappy_hot_points": {
+    "lookups": 10000,
+    "entries": 192,
+    "value_bytes": 16,
+    "before": {
+      "decoder_scratch_allocations": 10000,
+      "decoded_block_cached": false,
+      "elapsed_ns_samples": [
+        633358000,
+        424416000,
+        448309000
+      ]
+    },
+    "after": {
+      "decoder_scratch_allocations": 8,
+      "decoded_block_cached": true,
+      "elapsed_ns_samples": [
+        43279000,
+        44174000,
+        45023000,
+        44408000
+      ],
+      "warm_decoder_scratch_allocations": 0,
+      "warm_elapsed_ns_samples": [
+        41648000,
+        41536000,
+        44469000,
+        54464000
+      ]
+    },
+    "policy": "Existing eight-hit/256-hit retry, 64 KiB and 1/16 cache limits; already decoded raw rows copied once into cache storage with atomic construction-credit handoff."
+  },
+  "warm_sparse_snapshot_batches": {
+    "batches": 600,
+    "keys_per_batch": 16,
+    "hits": 9600,
+    "plan": "point (asserted by production planner)",
+    "before": {
+      "result_allocations": 9600,
+      "index_cache_hits": 9600,
+      "elapsed_ns_samples": [
+        92320000,
+        76731000,
+        95887000
+      ]
+    },
+    "after": {
+      "result_allocations": 0,
+      "index_cache_hits": 600,
+      "elapsed_ns_samples": [
+        43334000,
+        41426000,
+        43644000,
+        43480000
+      ]
+    },
+    "scope": "Warm shared decoded block; owner retains cache pins, results survive invalidation; output arrays and pin metadata warmed before counters."
+  },
+  "bounds": {
+    "result_pins_per_owner": 64,
+    "result_pin_bytes_per_owner": 1048576,
+    "index_owners_per_batch": 16,
+    "fallbacks": [
+      "owned-result callers",
+      "transient handles",
+      "pin metadata OOM",
+      "pin-count cap",
+      "pinned-byte cap"
+    ],
+    "codec_eligibility": "Borrow warm raw rows or values inside retained none/plain-prefix physical payloads. Temporary Snappy and prefix key storage never becomes a result owner."
+  },
+  "scope": "Isolated native Debug production helper fixtures with C result/scratch allocators. Deterministic allocation/admission counts; timing samples are indicative and do not establish end-to-end QPS or a 2 GiB soak."
+}
