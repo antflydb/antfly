@@ -671,6 +671,7 @@ pub const Owner = struct {
         execution_deadline_ns: ?u64 = null,
         cancellation_ctx: ?*anyopaque = null,
         cancellation_fn: ?abi.CancellationCheckFn = null,
+        execution_runnable: ?*const anyopaque = null,
         execution: abi.LocalQueryExecutionOptions = .{},
     };
 
@@ -681,10 +682,12 @@ pub const Owner = struct {
     pub fn queryJsonWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !QueryResponse {
         var response: QueryResponse = .{};
         var failure: abi.FailureIdentity = .{};
+        var control = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn);
+        control.execution_runnable = options.execution_runnable;
         const status = abi.antfly_storage_owner_query_json(
             self.handle,
             &.{
-                .control = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn),
+                .control = control,
                 .execution_options = options.execution,
             },
             &response.response,

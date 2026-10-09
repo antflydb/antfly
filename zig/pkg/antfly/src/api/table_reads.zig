@@ -8184,15 +8184,17 @@ const SearchFanoutSlot = struct {
     arena: std.heap.ArenaAllocator,
     result: ?db_mod.types.SearchResult = null,
     err: ?anyerror = null,
+    owner: @import("runnable_fanout_owner.zig").Owner = .{},
 
-    fn init() SearchFanoutSlot {
+    fn init(alloc: std.mem.Allocator) SearchFanoutSlot {
         return .{
-            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .arena = std.heap.ArenaAllocator.init(alloc),
         };
     }
 
     pub fn deinit(self: *SearchFanoutSlot) void {
         self.arena.deinit();
+        self.owner.retire();
         self.* = undefined;
     }
 };
@@ -8229,7 +8231,7 @@ fn deinitTextStatsFanoutSlots(alloc: std.mem.Allocator, slots: []TextStatsFanout
 fn initSearchFanoutSlots(alloc: std.mem.Allocator, count: usize) ![]SearchFanoutSlot {
     const slots = try alloc.alloc(SearchFanoutSlot, count);
     errdefer alloc.free(slots);
-    for (slots) |*slot| slot.* = .init();
+    for (slots) |*slot| slot.* = .init(alloc);
     return slots;
 }
 
@@ -8418,8 +8420,11 @@ fn queryProvisionedAcrossGroupsParallel(
 ) !db_mod.types.SearchResult {
     const start_ns = platform_time.monotonicNs();
     std.debug.assert(req.graph_queries.len == 0);
-    const slots = try initSearchFanoutSlots(alloc, group_ids.len);
-    defer deinitSearchFanoutSlots(alloc, slots);
+    var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+    fanout_memory.init(alloc, io, 64 << 20);
+    defer fanout_memory.deinit();
+    const slots = try initSearchFanoutSlots(fanout_memory.allocator(), group_ids.len);
+    defer deinitSearchFanoutSlots(fanout_memory.allocator(), slots);
 
     const Fiber = struct {
         fn run(
@@ -8433,6 +8438,11 @@ fn queryProvisionedAcrossGroupsParallel(
         ) void {
             const arena = slot.arena.allocator();
             var group_req = shard_req_inner.*;
+            group_req.execution_runnable = slot.owner.activate() catch |err| {
+                slot.err = err;
+                return;
+            };
+            defer slot.owner.park();
             _ = selectLookupKeysForGroup(arena, &group_req, group_id) catch |err| {
                 slot.err = err;
                 return;
@@ -8457,12 +8467,16 @@ fn queryProvisionedAcrossGroupsParallel(
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
         const end = @min(start + width, group_ids.len);
+        for (slots[start..end]) |*slot|
+            try slot.owner.reserve(req.execution_runnable, io, @as(u64, @sizeOf(SearchFanoutSlot)) +| table_name.len +| 1024);
+        const original_class = try @import("runnable_fanout_owner.zig").parkCoordinator(req.execution_runnable);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
             const required_generation = if (required_identity_generations) |generations| generations[i] else null;
             group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, shard_req, consistency, required_generation });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try @import("runnable_fanout_owner.zig").resumeCoordinator(req.execution_runnable, original_class);
         for (slots[start..end], start..end) |slot, i| {
             if (slot.err) |err| return err;
             const result = slot.result orelse return error.InvalidRemoteResponse;
@@ -8504,8 +8518,11 @@ fn queryHostedAcrossGroupsParallel(
     const routes = try resolveHostedShardRoutes(self, alloc, group_ids, consistency, .fromRequest(req));
     defer deinitHostedShardRoutes(alloc, routes);
 
-    const slots = try initSearchFanoutSlots(alloc, group_ids.len);
-    defer deinitSearchFanoutSlots(alloc, slots);
+    var fanout_memory: @import("../common/fanout_memory.zig").FanoutMemory = undefined;
+    fanout_memory.init(alloc, io, 64 << 20);
+    defer fanout_memory.deinit();
+    const slots = try initSearchFanoutSlots(fanout_memory.allocator(), group_ids.len);
+    defer deinitSearchFanoutSlots(fanout_memory.allocator(), slots);
 
     const Fiber = struct {
         fn run(
@@ -8520,6 +8537,11 @@ fn queryHostedAcrossGroupsParallel(
         ) void {
             const arena = slot.arena.allocator();
             var group_req = shard_req_inner.*;
+            group_req.execution_runnable = slot.owner.activate() catch |err| {
+                slot.err = err;
+                return;
+            };
+            defer slot.owner.park();
             _ = selectLookupKeysForGroup(arena, &group_req, group_id) catch |err| {
                 slot.err = err;
                 return;
@@ -8548,12 +8570,16 @@ fn queryHostedAcrossGroupsParallel(
     var start: usize = 0;
     while (start < group_ids.len) : (start += width) {
         const end = @min(start + width, group_ids.len);
+        for (slots[start..end]) |*slot|
+            try slot.owner.reserve(req.execution_runnable, io, @as(u64, @sizeOf(SearchFanoutSlot)) +| table_name.len +| 1024);
+        const original_class = try @import("runnable_fanout_owner.zig").parkCoordinator(req.execution_runnable);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
             const required_generation = if (required_identity_generations) |generations| generations[i] else null;
             group.async(io, Fiber.run, .{ self, &slots[i], routes[i], group_id, table_name, shard_req, consistency, required_generation });
         }
-        group.await(io) catch {};
+        try group.await(io);
+        try @import("runnable_fanout_owner.zig").resumeCoordinator(req.execution_runnable, original_class);
         for (slots[start..end], start..end) |slot, i| {
             if (slot.err) |err| return err;
             const result = slot.result orelse return error.InvalidRemoteResponse;
@@ -17323,11 +17349,19 @@ fn consumerTests() type {
                 }
             };
 
+            const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
             const Capture = struct {
+                scheduler: ?*native.Scheduler = null,
                 keys_seen: std.atomic.Value(usize) = .init(0),
                 calls: std.atomic.Value(usize) = .init(0),
                 fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
+                    if (self.scheduler) |scheduler| {
+                        const stats = scheduler.stats();
+                        try std.testing.expect(stats.operations >= 3);
+                        try std.testing.expect(stats.runnable_slots <= scheduler.config.slots - scheduler.config.control_slots);
+                        try std.testing.expect(stats.resource_blocked >= 1);
+                    }
                     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, req.body, .{});
                     defer parsed.deinit();
                     const keys = parsed.value.object.get("native_doc_id_constraints").?.object.get("include_doc_ids").?.array.items;
@@ -17342,23 +17376,39 @@ fn consumerTests() type {
                     return error.InvalidQueryRequest;
                 }
             };
-            FakeRouter.batch_calls = 0;
-            var capture = Capture{};
-            var routing = try table_catalog.RoutingSession.init(alloc, FakeCatalog.iface(), null);
-            defer routing.deinit();
-            var hosted = HostedProvisionedTableReadSource.init("unused", routing.catalog(), raft_mod.read_gate.alreadyReadSafeBarrier(), FakeRouter.iface(), .{ .ptr = &capture, .vtable = &.{ .execute = Capture.execute } });
-            _ = hosted.withIo(&io_impl);
-            const req: db_mod.types.SearchRequest = .{ .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "doc:a", "doc:z" }, .document_lookup_groups = &.{ 7, 8 }, .limit = 100 };
-            try std.testing.expect(planQueryFanout(hosted.io_impl, 2, req).parallel);
-            var generations = [_]?u64{ null, null };
-            try std.testing.expectError(error.InvalidQueryRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
-            try std.testing.expectEqual(@as(usize, 2), capture.calls.load(.monotonic));
-            try std.testing.expectEqual(@as(usize, 2), capture.keys_seen.load(.monotonic));
-            try std.testing.expectEqual(@as(usize, 1), FakeRouter.batch_calls);
-            // The sequential phase must also pin all routes before dispatch.
-            hosted.io_impl = null;
-            try std.testing.expectError(error.InvalidQueryRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
-            try std.testing.expectEqual(@as(usize, 2), FakeRouter.batch_calls);
+            for ([_]usize{ 0, 2, 3 }) |capacity| {
+                FakeRouter.batch_calls = 0;
+                var scheduler = try native.Scheduler.init(.{ .slots = @max(capacity, 2), .control_slots = 1 });
+                defer scheduler.close();
+                var parent: native.Execution = .{};
+                defer parent.finish();
+                if (capacity != 0) try parent.start(&scheduler, .{ .io = io_impl.io(), .retained_bytes = 23 }, .query);
+                var read: @import("runnable_local_read.zig").Read = .{ .execution = &parent, .allocator = alloc };
+                const team = if (capacity != 0) try read.team() else null;
+                var capture = Capture{ .scheduler = if (capacity != 0) &scheduler else null };
+                var routing = try table_catalog.RoutingSession.init(alloc, FakeCatalog.iface(), null);
+                defer routing.deinit();
+                var hosted = HostedProvisionedTableReadSource.init("unused", routing.catalog(), raft_mod.read_gate.alreadyReadSafeBarrier(), FakeRouter.iface(), .{ .ptr = &capture, .vtable = &.{ .execute = Capture.execute } });
+                _ = hosted.withIo(&io_impl);
+                const req: db_mod.types.SearchRequest = .{ .execution_runnable = if (team) |value| value.borrow else null, .filter_doc_ids_positive = true, .filter_doc_ids = &.{ "doc:a", "doc:z" }, .document_lookup_groups = &.{ 7, 8 }, .limit = 100 };
+                try std.testing.expect(planQueryFanout(hosted.io_impl, 2, req).parallel);
+                var generations = [_]?u64{ null, null };
+                try std.testing.expectError(error.InvalidQueryRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
+                try std.testing.expectEqual(@as(usize, 2), capture.calls.load(.monotonic));
+                try std.testing.expectEqual(@as(usize, 2), capture.keys_seen.load(.monotonic));
+                try std.testing.expectEqual(@as(usize, 1), FakeRouter.batch_calls);
+                if (capacity != 0) {
+                    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+                    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+                    try parent.checkLifetime();
+                }
+                // A sequential phase owns the root rather than two child slots.
+                capture.scheduler = null;
+                // The sequential phase must also pin all routes before dispatch.
+                hosted.io_impl = null;
+                try std.testing.expectError(error.InvalidQueryRequest, queryHostedAcrossGroupsPhase(&hosted, alloc, &.{ 7, 8 }, req, "docs", .read_index, &.{}, false, null, &generations));
+                try std.testing.expectEqual(@as(usize, 2), FakeRouter.batch_calls);
+            }
         }
         test "provisioned observed dynamic capability merge preserves ownership under allocation failure" {
             const Case = struct {

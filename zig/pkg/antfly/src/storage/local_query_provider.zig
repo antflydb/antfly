@@ -87,15 +87,7 @@ fn executeSearch(
     } catch |err| return fail(err, parseOperation(request.dialect), out_failure);
     defer owned.deinit(alloc);
 
-    @import("antfly_local_sources").storage_local_query_controls.applyExecutionOptions(&owned.req, request.execution_options);
-    if (request.has_execution_deadline != 0) {
-        owned.req.execution_deadline_ns = if (owned.req.execution_deadline_ns) |parsed_deadline|
-            @min(parsed_deadline, request.execution_deadline_ns)
-        else
-            request.execution_deadline_ns;
-    }
-    owned.req.cancellation = requestCancellationToken(request);
-    owned.req.execution_runnable = requestRunnable(request) catch |err|
+    applySearchControls(request, &owned.req) catch |err|
         return fail(err, .validate_request, out_failure);
     @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(owned.req) catch |err|
         return fail(err, executeOperation(request.dialect), out_failure);
@@ -318,6 +310,18 @@ fn executePreflight(
     return .ok;
 }
 
+fn applySearchControls(request: *const abi.LocalQueryRequest, search_request: *db_mod.types.SearchRequest) !void {
+    @import("antfly_local_sources").storage_local_query_controls.applyExecutionOptions(search_request, request.execution_options);
+    if (request.has_execution_deadline != 0) {
+        search_request.execution_deadline_ns = if (search_request.execution_deadline_ns) |parsed_deadline|
+            @min(parsed_deadline, request.execution_deadline_ns)
+        else
+            request.execution_deadline_ns;
+    }
+    search_request.cancellation = requestCancellationToken(request);
+    search_request.execution_runnable = try requestRunnable(request);
+}
+
 fn applyControls(request: *const abi.LocalQueryRequest, graph_request: anytype) !void {
     graph_request.execution_runnable = try requestRunnable(request);
     graph_request.execution_deadline_ns = if (request.has_execution_deadline != 0)
@@ -433,15 +437,23 @@ test "storage local graph controls preserve borrowed authority and reject malfor
     defer reparsed.deinit(std.testing.allocator);
     try std.testing.expect(reparsed.execution_runnable == null);
 
+    var search_request: db_mod.types.SearchRequest = .{ .execution_deadline_ns = deadline - std.time.ns_per_s };
+    try applySearchControls(&request, &search_request);
+    try std.testing.expect(search_request.execution_runnable.?.context == team.borrow.context);
+    try std.testing.expectEqual(@as(?u64, deadline - std.time.ns_per_s), search_request.execution_deadline_ns);
+    try local_query_contract.checkQueryDeadline(search_request);
+
     var malformed = team.borrow;
     malformed.version -= 1;
     request.execution_runnable = &malformed;
     try std.testing.expectError(error.UnsupportedVersion, applyControls(&request, &parsed));
+    try std.testing.expectError(error.UnsupportedVersion, applySearchControls(&request, &search_request));
     request.execution_runnable = &team.borrow;
     try applyControls(&request, &parsed);
     canceled.store(true, .release);
     try std.testing.expectError(error.Canceled, local_query_contract.checkQueryDeadline(local_query_contract.graphHydrateSearchRequest(parsed)));
     try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectError(error.Canceled, local_query_contract.checkQueryDeadline(search_request));
     request.execution_runnable = null;
     try applyControls(&request, &parsed);
     try std.testing.expect(parsed.execution_runnable == null);

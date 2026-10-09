@@ -4228,6 +4228,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .execution_deadline_ns = req.execution_deadline_ns,
             .cancellation_ctx = if (cancellation != null) @ptrCast(&cancellation.?) else null,
             .cancellation_fn = if (cancellation != null) cancellationTokenRequested else null,
+            .execution_runnable = if (req.execution_runnable) |*borrow| borrow else null,
             .execution = execution,
         });
         errdefer response.deinit();

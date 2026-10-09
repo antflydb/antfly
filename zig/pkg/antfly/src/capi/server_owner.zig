@@ -5990,8 +5990,14 @@ pub fn searchStorageKernelQueryJson(
 ) kernel_owner_abi.Status {
     out_failure.* = .{};
     const request_json: capi.Slice = .{ .ptr = request.control.request_json.ptr, .len = @intCast(request.control.request_json.len) };
+    const runnable = if (request.control.execution_runnable) |raw|
+        @import("antfly_runtime_abi").runnable_abi.Borrowed.read(@ptrCast(@alignCast(raw))) catch |err|
+            return storageOwnerQueryFailure(err, .validate_request, out_failure)
+    else
+        null;
     const controls: db_mod.types.SearchRequest = .{
         .execution_deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null,
+        .execution_runnable = runnable,
         .cancellation = ownerQueryCancellation(&request.control),
     };
     table_reads_api.checkQueryDeadline(controls) catch |err|
@@ -6009,6 +6015,7 @@ pub fn searchStorageKernelQueryJson(
             controls.execution_deadline_ns,
             request.control.cancellation_ctx,
             request.control.cancellation_fn,
+            request.control.execution_runnable,
             out_failure,
         ) catch |err| {
             // A valid provider failure already carries the exact envelope.
@@ -6039,6 +6046,7 @@ pub fn searchStorageKernelQueryJson(
         owned.req.execution_deadline_ns = if (owned.req.execution_deadline_ns) |parsed| @min(parsed, deadline) else deadline;
     }
     owned.req.cancellation = controls.cancellation;
+    owned.req.execution_runnable = controls.execution_runnable;
     antfly.local_query_controls.applyExecutionOptions(&owned.req, request.execution_options);
 
     stampSearchRequestIdentityGeneration(handle, &owned.req) catch |err|
