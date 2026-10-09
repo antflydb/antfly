@@ -385,13 +385,27 @@ fn captureGlinerDecisionIdentity(mf: *const manifest_mod.ModelManifest, store: t
     const encoder = mf.gliner_span_encoder_digest orelse return null;
     const tokenizer = mf.gliner_span_tokenizer_digest orelse return null;
     const tokenizer_config = mf.gliner_span_tokenizer_config_digest orelse return null;
-    const reader = store.singleSafetensorsReader() orelse return null;
-    var all_f32 = true;
-    var entries = reader.header.tensors.iterator();
-    while (entries.next()) |entry| if (entry.value_ptr.dtype != .f32) {
-        all_f32 = false;
-        break;
-    };
+    var inventory: gliner_decide_qualification.TensorInventory = undefined;
+    var weight: gliner_decide_qualification.Digest = undefined;
+    var companion: ?gliner_decide_qualification.Digest = null;
+    if (store.singleSafetensorsReader()) |reader| {
+        inventory = .{ .count = reader.header.tensors.count(), .all_f32 = true };
+        var entries = reader.header.tensors.iterator();
+        while (entries.next()) |entry| if (entry.value_ptr.dtype != .f32) {
+            inventory.all_f32 = false;
+            break;
+        };
+        weight = gliner_decide_qualification.Digest.of(reader.file_bytes);
+    } else if (store.glinerGgufSnapshot()) |snapshot| {
+        inventory = .{ .count = snapshot.tensor_count, .all_f32 = snapshot.all_f32 };
+        // GGUF stores start with random-access advice for sparse tensor loads.
+        // Authenticating both complete files is sequential; enable readahead
+        // rather than faulting each 4 KiB page independently.
+        c_file.MmapRegion.adviseBytesSequential(snapshot.encoder);
+        c_file.MmapRegion.adviseBytesSequential(snapshot.head);
+        weight = gliner_decide_qualification.Digest.of(snapshot.encoder);
+        companion = gliner_decide_qualification.Digest.of(snapshot.head);
+    } else return null;
     return .{
         .encoder_family = family,
         .geometry = .{
@@ -411,8 +425,9 @@ fn captureGlinerDecisionIdentity(mf: *const manifest_mod.ModelManifest, store: t
             .sep_struct = mf.gliner_token_sep_struct,
             .sep_text = mf.gliner_token_sep_text,
         },
-        .inventory = .{ .count = reader.header.tensors.count(), .all_f32 = all_f32 },
-        .weight = gliner_decide_qualification.Digest.of(reader.file_bytes),
+        .inventory = inventory,
+        .weight = weight,
+        .weight_companion = companion,
         .sidecars = .{
             .config = config,
             .encoder_config = encoder,
@@ -734,16 +749,20 @@ fn requiresModernBertSpanClassifier(manifest: manifest_mod.ModelManifest) bool {
         manifest.gliner_span_encoder_family == .modern_bert;
 }
 
-/// The declared ModernBERT span route uses the GLiNER CUDA encoder profile,
-/// whose default kernels require every uploaded weight to be F32.
-/// Reject a packed GGUF before constructing the intermediate native session;
-/// native and Metal keep their existing device-native quantized execution.
+/// Admit Q8_0 encoder storage with F32 norms and heads. Other packed formats
+/// fail before device allocation. Exact split-artifact identity is checked
+/// from the open store before constructing resident weights.
 fn ensureCudaGlinerModernBertGgufEligible(
     manifest: manifest_mod.ModelManifest,
     report: GgufInspectionReport,
 ) !void {
-    if (requiresModernBertSpanClassifier(manifest) and ggufReportHasQuantizedTensors(report)) {
-        return error.UnsupportedCudaQuantizedModernBertSpan;
+    if (!requiresModernBertSpanClassifier(manifest)) return;
+    for (report.all_tensor_types) |entry| {
+        if (!entry.tensor_type.isQuantized()) continue;
+        switch (entry.tensor_type) {
+            .known => |kind| if (kind != .Q8_0) return error.UnsupportedCudaQuantizedModernBertSpan,
+            else => return error.UnsupportedCudaQuantizedModernBertSpan,
+        }
     }
 }
 
@@ -851,6 +870,12 @@ pub fn createNativeSession(allocator: std.mem.Allocator, model_path: []const u8)
 }
 
 pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride) !Session {
+    return createNativeSessionForCudaUpload(allocator, model_path, override, false);
+}
+
+// CUDA borrows packed encoder storage from this temporary session. Ordinary
+// CPU loading keeps its existing execution policy.
+fn createNativeSessionForCudaUpload(allocator: std.mem.Allocator, model_path: []const u8, override: ?TaskOverride, retain_gliner_q8: bool) !Session {
     var direct_quant_enabled = directQuantEnabled();
     const cpu_plan_context = defaultPlanContextForBackend(.cpu);
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
@@ -889,6 +914,12 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
     }
     const boundary_identity = if (arch_config == .gliner_boundary) try captureBoundaryIdentity(&mf, store) else null;
     const gliner_decision_identity = try captureGlinerDecisionIdentity(&mf, store);
+    const keep_gliner_q8 = retain_gliner_q8 and requiresModernBertSpanClassifier(mf) and ggufEncoderHasQuantizedTensors(store);
+    if (keep_gliner_q8) {
+        const identity = gliner_decision_identity orelse return error.UnsupportedGlinerDecisionArtifact;
+        if (try gliner_decide_qualification.require(identity) != .decide_1b) return error.UnsupportedGlinerDecisionArtifact;
+        direct_quant_enabled = true;
+    }
     if (mf.usesGgufWeights()) {
         if (try buildGgufInspectionReport(allocator, arch_config, store, requiresModernBertSpanClassifier(mf))) |report| {
             defer {
@@ -1023,7 +1054,7 @@ pub fn createNativeSessionWithTaskOverride(allocator: std.mem.Allocator, model_p
             continue;
         }
 
-        if (direct_quant_enabled and try shouldKeepResidentWeightQuantizedOnly(allocator, store, arch_config, key, full_name)) {
+        if (direct_quant_enabled and ((keep_gliner_q8 and try storeTensorIsQuantized(allocator, store, full_name)) or try shouldKeepResidentWeightQuantizedOnly(allocator, store, arch_config, key, full_name))) {
             const tensor_ref = try store.describeTensor(allocator, full_name);
             defer {
                 var ref = tensor_ref;
@@ -1864,7 +1895,7 @@ fn createCudaSessionWithRequiredProfile(
 
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     if (debug_cuda_session) std.log.info("cuda-session: create native session start path={s}", .{model_path});
-    var native_session = try createNativeSessionWithTaskOverride(allocator, model_path, override);
+    var native_session = try createNativeSessionForCudaUpload(allocator, model_path, override, true);
     defer native_session.close();
     if (debug_cuda_session) std.log.info("cuda-session: create native session done path={s}", .{model_path});
     const native_impl: *ArchSession = @ptrCast(@alignCast(native_session.ptr));
@@ -1916,6 +1947,9 @@ fn createCudaSessionWithRequiredProfile(
     cuda_compute.gliner_encoder_attention = cuda_profile == .gliner25_modern_bert;
     cuda_compute.gliner_boundary_inference = cuda_profile == .gliner25_boundary;
     cuda_compute.gliner_mixed_attention = cuda_compute.gliner_encoder_attention and (gliner_precision == .fp16 or gliner_precision == .bf16);
+    cuda_compute.gliner_q8_f16_mirrors = cuda_compute.gliner_encoder_attention and
+        native_impl.gliner_decision_identity != null and !native_impl.gliner_decision_identity.?.inventory.all_f32 and
+        platform.env.getenvBool("ANTFLY_CUDA_GLINER_1B_Q8_F16_MIRRORS");
     cuda_compute.laya_optimizations = (cuda_profile == .laya or cuda_profile == .gliner25_modern_bert) and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_OPTIMIZATIONS", true);
     cuda_compute.laya_fusion = cuda_compute.laya_optimizations and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_FUSION", true);
     if (a4b_inference != null and
@@ -1987,6 +2021,9 @@ fn createCudaSessionWithRequiredProfile(
         }
     }
     if (debug_cuda_session) std.log.info("cuda-session: uploaded resident weights count={d}", .{resident_uploads.items.len});
+    if (cuda_compute.gliner_q8_f16_mirrors) {
+        std.log.info("cuda: attached {d} decoded Q8 FP16 projection mirrors; raw Q8 and F32 heads retained; ANTFLY_CUDA_GLINER_1B_Q8_F16_MIRRORS=0 disables", .{cuda_compute.gliner_boundary_f16_mirrors.count()});
+    }
     const upload_stats = cuda_compute.snapshotStats();
     if (upload_stats.bf16_mirror_weight_count > 0) {
         // The default-on prefill mirrors trade device memory for cuBLASLt
@@ -2023,6 +2060,11 @@ fn createCudaSessionWithRequiredProfile(
 }
 
 fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const LoadedWeight, precision: GlinerCudaPrecision) !void {
+    // Packed-only weights have no dense tensor shape. Check the requested
+    // policy before the rank gate so explicit mixed precision cannot silently
+    // execute the default Q8 route or change only attention precision.
+    if (precision != .auto and precision != .fp32 and (loaded.quantized or loaded.quantized_storage != null))
+        return error.UnsupportedGlinerCudaPrecision;
     // Preserve embeddings, normalization, biases and the decision head in FP32.
     // Only encoder matrix products use lower precision; accumulation and all
     // externally visible logits remain FP32.
@@ -2043,6 +2085,28 @@ fn uploadGlinerCudaWeight(compute: anytype, name: []const u8, loaded: *const Loa
     tensor.dtype = .f16;
     tensor.data = std.mem.sliceAsBytes(half);
     return compute.insertF16WeightFromTensor(name, &tensor);
+}
+
+test "GLiNER Decide CUDA mixed precision rejects packed-only weights before upload" {
+    const Compute = struct {
+        allocator: std.mem.Allocator,
+        fn insertWeightFromLoaded(_: *@This(), _: []const u8, _: *const LoadedWeight) !void {
+            return error.UnexpectedUpload;
+        }
+        fn insertBf16WeightFromF32Tensor(_: *@This(), _: []const u8, _: *const Tensor) !void {
+            return error.UnexpectedUpload;
+        }
+        fn insertF16WeightFromTensor(_: *@This(), _: []const u8, _: *const Tensor) !void {
+            return error.UnexpectedUpload;
+        }
+    };
+    var compute = Compute{ .allocator = std.testing.allocator };
+    var loaded = LoadedWeight{
+        .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = "", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false },
+        .quantized = true,
+    };
+    for ([_]GlinerCudaPrecision{ .fp16, .bf16 }) |precision|
+        try std.testing.expectError(error.UnsupportedGlinerCudaPrecision, uploadGlinerCudaWeight(&compute, "model.layers.0.attn.Wqkv.weight", &loaded, precision));
 }
 
 /// Materialize the immutable, pre-sharded expert payload consumed by the A4B
@@ -2214,7 +2278,7 @@ test "cuda support gate admits only supported model roles" {
     }
 }
 
-test "CUDA ModernBERT span GGUF eligibility rejects packed weights before upload" {
+test "GLiNER Decide CUDA GGUF eligibility admits Q8 and rejects other packed formats" {
     const modern_span = manifest_mod.ModelManifest{
         .allocator = std.testing.allocator,
         .model_type = .extractor,
@@ -2244,10 +2308,11 @@ test "CUDA ModernBERT span GGUF eligibility rejects packed weights before upload
     };
 
     try ensureCudaGlinerModernBertGgufEligible(modern_span, dense_report);
-    try std.testing.expectError(
-        error.UnsupportedCudaQuantizedModernBertSpan,
-        ensureCudaGlinerModernBertGgufEligible(modern_span, quantized_report),
-    );
+    dense_types[0].tensor_type = .{ .known = .F16 };
+    try ensureCudaGlinerModernBertGgufEligible(modern_span, dense_report);
+    try ensureCudaGlinerModernBertGgufEligible(modern_span, quantized_report);
+    quantized_types[1].tensor_type = .{ .known = .Q4_0 };
+    try std.testing.expectError(error.UnsupportedCudaQuantizedModernBertSpan, ensureCudaGlinerModernBertGgufEligible(modern_span, quantized_report));
 
     var deberta_span = modern_span;
     deberta_span.gliner_span_encoder_family = .deberta;
@@ -4654,6 +4719,18 @@ fn shouldLazyLoadWeight(store_kind: tensor_store_mod.StoreKind, arch_config: Arc
         .gpt => |cfg| cfg.usesMoe() and (std.mem.indexOf(u8, key, ".block_sparse_moe.experts.") != null or (cfg.family == .deepseek_v4 and std.mem.indexOf(u8, key, ".mlp.experts.") != null)),
         else => false,
     };
+}
+
+fn storeTensorIsQuantized(allocator: std.mem.Allocator, store: tensor_store_mod.TensorStore, name: []const u8) !bool {
+    var ref = try store.describeTensor(allocator, name);
+    defer ref.deinit(allocator);
+    return ref.quantized;
+}
+
+fn ggufEncoderHasQuantizedTensors(store: tensor_store_mod.TensorStore) bool {
+    const file = store.ggufFile() orelse return false;
+    for (file.tensors) |tensor| if (tensor.tensor_type.isQuantized()) return true;
+    return false;
 }
 
 fn shouldKeepResidentWeightQuantizedOnly(

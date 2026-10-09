@@ -442,6 +442,93 @@ worker matches all 1,600 documents across eight languages, including every
 token ID. The current replay oracle retains the corrected token IDs.
 Precision is part of both resident and in-flight model identity.
 
+The split Q8_0 Decide-1B bundle from
+[Metal PR #1033](https://github.com/antflydb/antfly/pull/1033) also has an
+offline CUDA route. Use the immutable
+[Hugging Face revision](https://huggingface.co/antflydb/gliner2.5-decide-1B-gguf/tree/5c61a1a39ad4c6865d0e0ff98a7ac507e8c35cef).
+Both GGUF files, all sidecars, the 199-tensor inventory and exact encoder
+geometry are authenticated before CUDA upload. Shadowed tensor names and
+other packed formats are rejected. The 113 encoder matrices (including token
+embeddings) retain Q8 storage; norms, classifier and auxiliary heads stay F32.
+Q8 tensor-core projections use FP16 operands and F32 accumulation/output.
+`ANTFLY_CUDA_QMATMUL_VARIANT=legacy` selects direct Q8/F32 arithmetic without
+the additional tensor-core weight packs. Missing optional tensor-core symbols
+retain the existing direct-Q8 compatibility path. Explicit diagnostic
+`fp16`/`bf16` upload precision is rejected for packed-only source weights.
+
+Reproduce the offline comparison without adding model files or large fixtures
+to Git (run from `zig/pkg/inference`):
+
+```sh
+MODEL=/tmp/gliner-decide-q8
+hf download antflydb/gliner2.5-decide-1B-gguf \
+  antfly_inference_bundle.json config.json encoder_config/config.json \
+  tokenizer.json tokenizer_config.json gliner2-encoder.Q8_0.gguf gliner_head.gguf \
+  benchmark-cases.json validation.json \
+  --revision 5c61a1a39ad4c6865d0e0ff98a7ac507e8c35cef --local-dir "$MODEL"
+python scripts/gliner25/prepare_decide_quant_capture.py \
+  --cases "$MODEL/benchmark-cases.json" --validation "$MODEL/validation.json" \
+  --output /tmp/gliner-decide-q8-cases.json
+zig build bench-gliner-decide-quant-build test-gliner-decide-quant \
+  -Dcuda=true -Dmetal=false -Donnx=false -Doptimize=fast -j1
+zig build test -Dtest-filter='GLiNER Decide CUDA' \
+  -Dcuda=true -Dmetal=false -Donnx=false -Doptimize=fast -j1
+ANTFLY_CUDA_DISPATCH_STATS=1 \
+  zig-out/bin/antfly-inference-gliner-decide-quant-bench \
+  --model-dir "$MODEL" --capture /tmp/gliner-decide-q8-cases.json \
+  --backend cuda --warmups 3 --reps 10 --tolerance 0.002
+```
+
+The capture builder preserves label order and binds published input IDs to
+the independently decoded Q8 oracle, rather than the original FP32 checkpoint.
+The benchmark verifies exact token IDs, finite logits and absolute errors on
+every run. It reports both the full loaded pipeline and the prepared
+encoder/classifier/completed-readback clock; HTTP and model load are separate.
+
+`ANTFLY_CUDA_GLINER_1B_Q8_F16_MIRRORS=1` enables an opt-in cached FP16
+projection candidate analogous to the Metal optimization. Only the 112 typed
+encoder projections receive mirrors. Raw Q8 tensors remain resident; token
+embedding lookup and F32 normalization, attention and task heads retain their
+existing routes. Host decoding uses a 16 KiB F32 tile and at most 26.25 MiB of
+FP16 staging per projection, checked for malformed blocks and finite FP16
+range. The mirror replaces the Q8 tensor-core pack rather than adding a third
+weight representation. Model teardown releases all mirrors. Disabling the
+candidate, or lacking its complete FP16 kernel/library capabilities, retains
+Q8 execution. Device residency includes all execution packs and mirrors.
+
+On an NVIDIA L4 with driver 580.159.03, all 14 published cases retain their
+Q8-reference selections. Maximum logit error is 0.00177 for packed tensor-core
+execution, 0.00140 with FP16 projection mirrors, and 0.00000477 for direct Q8.
+The original FP32 checkpoint also passes all 14 cases (maximum error 0.00000406).
+Projection mirrors use 3.61 GB of resident weights, versus 2.73 GB for Q8 plus
+tensor-core packs and 1.74 GB for direct Q8. Prepared-core diagnostic medians
+for the mirror profile and a decoded-Q8 PyTorch FP16 SDPA reference are:
+
+| Tokens, batch 1 | Native mirrors | PyTorch FP16 |
+|---|---:|---:|
+| 25 | 9.86 ms | 22.80 ms |
+| 83 | 13.79 ms | 24.74 ms |
+| 198 | 24.84 ms | 25.05 ms |
+| 512 | 70.58 ms | 30.53 ms |
+| 2,048 | 664.25 ms | 132.94 ms |
+
+These are sequential, unpaired diagnostic replays with three warmups and ten
+timed repetitions, not a release performance campaign. Both clocks include
+prepared CPU input upload and completed CPU logit readback. Python uses
+Torch 2.14.0/Transformers 5.17.0, SDPA, disabled TF32 and an FP16 encoder with
+an F32 classifier; native retains F32 embedding outputs, norms and attention. The
+Python resident model contains only the encoder and classifier, while native
+retains the complete bundle. The two synthetic capacity cases pass a 0.002
+logit tolerance against an independent decoded-Q8 F32 reference. Short-case
+competitiveness does not establish long-context parity: the 512/2,048-token
+cells remain slower, and qualifying tensor-core attention for this Q8 profile
+is follow-up work.
+
+CUDA validation is independent of public serving qualification. The exact
+Q8 bundle does not acquire CUDA `/decisions` qualification from the Metal PR
+or this offline benchmark. HTTP admission, cancellation/concurrency, broad
+holdouts and the complete capacity/performance matrix remain release checks.
+
 Build optimized workers from `zig/pkg/inference`:
 
 ```sh

@@ -15,6 +15,7 @@
 
 const build_options = @import("build_options");
 pub const gliner_boundary_export = @import("gliner_boundary_export.zig");
+pub const gliner_span_v2_executor = @import("extractors/gliner_span_v2_executor.zig");
 
 pub const platform = @import("antfly_platform");
 pub const backends = @import("backends/backends.zig");
@@ -120,6 +121,8 @@ pub const architectures = struct {
     pub const gliner_head_graph = @import("architectures/gliner_head_graph.zig");
 };
 pub const models = struct {
+    pub const gliner_decide_qualification = @import("models/gliner_decide_qualification.zig");
+    pub const tensor_store = @import("models/tensor_store.zig");
     pub const manifest = @import("models/manifest.zig");
     pub const gliner_boundary_bundle = @import("models/gliner_boundary_bundle.zig");
     pub const gliner_boundary = @import("models/gliner_boundary.zig");
@@ -142,3 +145,8 @@ pub const gguf = struct {
     pub const quant_codec = @import("gguf/quant_codec.zig");
     pub const tensor_types = @import("gguf/tensor_types.zig");
 };
+
+test "GLiNER Decide artifact test reachability" {
+    _ = models.gliner_decide_qualification;
+    _ = models.tensor_store;
+}

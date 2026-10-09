@@ -2167,6 +2167,9 @@ pub const CudaCompute = struct {
     /// Diagnostic boundary compute mirrors. Original artifact tensors retain
     /// their FP32 identity; these buffers are owned for the model lifetime.
     gliner_boundary_f16_mirrors: std.AutoHashMapUnmanaged(driver_mod.CUdeviceptr, buffer_mod.DeviceBuffer) = .{},
+    /// Opt-in decoded Q8 projection mirrors for the authenticated Decide-1B
+    /// bundle. Raw Q8 embeddings/weights and all F32 heads remain resident.
+    gliner_q8_f16_mirrors: bool = false,
     /// Frozen load-time contract for the qualified resident Gemma 4 A4B path.
     /// A non-null value is fail-closed: generic MoE fallback is not permitted.
     a4b_inference: ?backend_contracts.A4bInferenceConfig = null,
@@ -3373,7 +3376,7 @@ pub const CudaCompute = struct {
     }
 
     pub fn insertWeightFromLoaded(self: *CudaCompute, owned_key: []const u8, loaded: *const weight_source_mod.LoadedWeight) !void {
-        if (self.strict_f32_weights) {
+        if (self.strict_f32_weights and !glinerQ8EncoderWeight(self.gliner_encoder_attention, owned_key, loaded)) {
             if (loaded.quantized or loaded.quantized_storage != null) return error.UnsupportedTensorType;
             if (loaded.tensor.dtype == .f32) return self.insertWeightFromTensor(owned_key, &loaded.tensor);
             var converted = try weight_source_mod.convertToF32(self.allocator, &loaded.tensor);
@@ -3416,8 +3419,22 @@ pub const CudaCompute = struct {
             var device = try allocDeviceBuffer(self, storage.raw_bytes.len);
             errdefer device.free(&self.ctx);
             try copyFromHostTracked(self, device, storage.raw_bytes);
-            var tc_quant = try self.prepareTensorCoreQuantOnUpload(storage.tensor_type, storage.shape, device, storage.raw_bytes);
+            const gliner_f16 = self.gliner_q8_f16_mirrors and canUseF16TensorCoreWeights(self) and
+                glinerQ8ProjectionWeight(self.gliner_encoder_attention, owned_key, loaded);
+            var tc_quant = if (gliner_f16) null else try self.prepareTensorCoreQuantOnUpload(storage.tensor_type, storage.shape, device, storage.raw_bytes);
             errdefer if (tc_quant) |*packed_quant| releaseDeviceBuffer(self, &packed_quant.buffer);
+            var gliner_mirror = buffer_mod.DeviceBuffer{};
+            errdefer gliner_mirror.free(&self.ctx);
+            if (gliner_f16) {
+                try self.gliner_boundary_f16_mirrors.ensureUnusedCapacity(self.allocator, 1);
+                const half = try decodeGlinerQ8F16(self.allocator, storage);
+                defer self.allocator.free(half);
+                gliner_mirror = try allocDeviceBuffer(self, std.mem.sliceAsBytes(half).len);
+                try copyFromHostTracked(self, gliner_mirror, std.mem.sliceAsBytes(half));
+                // H2D is asynchronous: keep bounded host staging alive until
+                // its upload has completed, including on the mirror route.
+                try synchronizeAndDrainDeferredDeviceFrees(self);
+            }
             var bf16_mirror = buffer_mod.DeviceBuffer{};
             errdefer bf16_mirror.free(&self.ctx);
             if (cudaShouldAttachBf16MirrorToQ4Weight(self, owned_key, storage)) {
@@ -3447,6 +3464,7 @@ pub const CudaCompute = struct {
             }
             try synchronizeAndDrainDeferredDeviceFrees(self);
             self.stats.resident_weight_bytes += storage.raw_bytes.len;
+            if (tc_quant) |tc_buffer| self.stats.resident_weight_bytes += tc_buffer.bytes;
             errdefer self.allocator.free(owned_key);
             try self.resident_weights.put(self.allocator, owned_key, .{
                 .buffer = device,
@@ -3461,6 +3479,11 @@ pub const CudaCompute = struct {
                 .owns_bf16_mirror = false,
                 .owned_by_tensor = false,
             });
+            if (gliner_f16) {
+                // Capacity was reserved before transferring tensor ownership.
+                self.gliner_boundary_f16_mirrors.putAssumeCapacity(device.ptr, gliner_mirror);
+                self.stats.resident_weight_bytes += gliner_mirror.len;
+            }
             return;
         }
         if (loaded.quantized) return error.UnsupportedTensorType;
@@ -3512,7 +3535,7 @@ pub const CudaCompute = struct {
         const q4_0_tc = known == .Q4_0 and self.tuned_route_gates.q4_0_tc_hmma_prefill;
         if (q4_0_tc) {
             if (!isQ4_0TcHmmaShape(in_dim, out_dim)) return null;
-        } else if (!isTensorCoreQuantLinearShape(in_dim, out_dim)) {
+        } else if (!(isTensorCoreQuantLinearShape(in_dim, out_dim) or (known == .Q8_0 and isGliner1BQ8LinearShape(in_dim, out_dim)))) {
             return null;
         }
 
@@ -4824,6 +4847,99 @@ fn isApprovedQuantLinearShape(in_dim: usize, out_dim: usize) bool {
     return false;
 }
 
+// Exact bias-free Ettin projections; classifier and auxiliary heads stay F32.
+fn isGliner1BQ8LinearShape(in_dim: usize, out_dim: usize) bool {
+    return (in_dim == 1792 and (out_dim == 5376 or out_dim == 1792 or out_dim == 7680)) or
+        (in_dim == 3840 and out_dim == 1792);
+}
+
+fn glinerQ8EncoderWeight(enabled: bool, name: []const u8, loaded: *const weight_source_mod.LoadedWeight) bool {
+    if (!enabled) return false;
+    const storage = loaded.quantized_storage orelse return false;
+    if (knownQuantTensorType(storage.tensor_type) != .Q8_0 or storage.shape.len != 2) return false;
+    if (std.mem.eql(u8, name, "model.embeddings.tok_embeddings.weight"))
+        return std.mem.eql(i64, storage.shape, &.{ 50378, 1792 });
+    const prefix = "model.layers.";
+    if (!std.mem.startsWith(u8, name, prefix)) return false;
+    const suffix_start = std.mem.indexOfScalarPos(u8, name, prefix.len, '.') orelse return false;
+    const layer = std.fmt.parseInt(u32, name[prefix.len..suffix_start], 10) catch return false;
+    if (layer >= 28) return false;
+    const suffix = name[suffix_start..];
+    const shape: []const i64 = if (std.mem.eql(u8, suffix, ".attn.Wqkv.weight")) &.{ 5376, 1792 } else if (std.mem.eql(u8, suffix, ".attn.Wo.weight")) &.{ 1792, 1792 } else if (std.mem.eql(u8, suffix, ".mlp.Wi.weight")) &.{ 7680, 1792 } else if (std.mem.eql(u8, suffix, ".mlp.Wo.weight")) &.{ 1792, 3840 } else return false;
+    return std.mem.eql(i64, storage.shape, shape);
+}
+
+fn glinerQ8ProjectionWeight(enabled: bool, name: []const u8, loaded: *const weight_source_mod.LoadedWeight) bool {
+    return std.mem.startsWith(u8, name, "model.layers.") and glinerQ8EncoderWeight(enabled, name, loaded);
+}
+
+/// Bounded host staging: the largest 1B projection needs 26.25 MiB of half
+/// storage plus this 16 KiB decode tile, never a whole-model F32 expansion.
+fn decodeGlinerQ8F16(allocator: std.mem.Allocator, storage: weight_source_mod.QuantizedStorage) ![]f16 {
+    if (knownQuantTensorType(storage.tensor_type) != .Q8_0) return error.UnsupportedTensorType;
+    const count = try elementCountFromShape(storage.shape);
+    if (count == 0 or count % 32 != 0 or storage.raw_bytes.len != try checkedMul(count / 32, 34)) return error.InvalidShape;
+    if (try checkedMul(count, @sizeOf(f16)) > 64 * 1024 * 1024) return error.UnsupportedGlinerCudaPrecision;
+    const half = try allocator.alloc(f16, count);
+    errdefer allocator.free(half);
+    var tile: [4096]f32 = undefined;
+    var offset: usize = 0;
+    while (offset < count) {
+        const n = @min(tile.len, count - offset);
+        try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes[offset / 32 * 34 ..][0 .. n / 32 * 34], tile[0..n]);
+        for (tile[0..n], half[offset..][0..n]) |value, *reduced| {
+            reduced.* = @floatCast(value);
+            if (!std.math.isFinite(reduced.*)) return error.UnsupportedGlinerCudaPrecision;
+        }
+        offset += n;
+    }
+    return half;
+}
+
+test "GLiNER Decide CUDA Q8 upload keeps heads dense and binds encoder roles" {
+    var loaded = weight_source_mod.LoadedWeight{
+        .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = "", .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false },
+        .quantized = true,
+        .quantized_storage = .{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = &.{}, .shape = &.{ 5376, 1792 }, .allocator = std.testing.allocator },
+    };
+    try std.testing.expect(glinerQ8EncoderWeight(true, "model.layers.0.attn.Wqkv.weight", &loaded));
+    try std.testing.expect(!glinerQ8EncoderWeight(false, "model.layers.0.attn.Wqkv.weight", &loaded));
+    try std.testing.expect(!glinerQ8EncoderWeight(true, "model.layers.28.attn.Wqkv.weight", &loaded));
+    try std.testing.expect(!glinerQ8EncoderWeight(true, "model.layers.0.attn.Wo.weight", &loaded));
+    try std.testing.expect(!glinerQ8EncoderWeight(true, "classifier.0.weight", &loaded));
+    loaded.quantized_storage.?.tensor_type = .{ .known = .Q4_0 };
+    try std.testing.expect(!glinerQ8EncoderWeight(true, "model.layers.0.attn.Wqkv.weight", &loaded));
+    loaded.quantized_storage.?.tensor_type = .{ .known = .Q8_0 };
+    loaded.quantized_storage.?.shape = &.{ 50378, 1792 };
+    try std.testing.expect(glinerQ8EncoderWeight(true, "model.embeddings.tok_embeddings.weight", &loaded));
+    try std.testing.expect(!glinerQ8ProjectionWeight(true, "model.embeddings.tok_embeddings.weight", &loaded));
+    loaded.quantized_storage.?.shape = &.{1792};
+    try std.testing.expect(!glinerQ8EncoderWeight(true, "model.embeddings.norm.weight", &loaded));
+    for ([_][2]usize{ .{ 1792, 5376 }, .{ 1792, 1792 }, .{ 1792, 7680 }, .{ 3840, 1792 } }) |dims| {
+        try std.testing.expect(isGliner1BQ8LinearShape(dims[0], dims[1]));
+        // Q4 and existing encoder dispatch do not inherit the new shapes.
+        try std.testing.expect(!isTensorCoreQuantLinearShape(dims[0], dims[1]));
+    }
+    try std.testing.expect(!isGliner1BQ8LinearShape(1792, 3584));
+}
+
+test "GLiNER Decide CUDA Q8 half staging validates bytes and finite range" {
+    var raw: [34]u8 = @splat(0);
+    std.mem.writeInt(u16, raw[0..2], @bitCast(@as(f16, 0.125)), .little);
+    for (raw[2..], 0..) |*v, i| v.* = @bitCast(@as(i8, @intCast(i)) - 16);
+    var storage = weight_source_mod.QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = &raw, .shape = &.{ 1, 32 }, .allocator = std.testing.allocator };
+    const half = try decodeGlinerQ8F16(std.testing.allocator, storage);
+    defer std.testing.allocator.free(half);
+    for (half, 0..) |v, i| try std.testing.expectEqual(@as(f16, @floatFromInt(@as(i32, @intCast(i)) - 16)) * 0.125, v);
+    storage.raw_bytes = raw[0..33];
+    try std.testing.expectError(error.InvalidShape, decodeGlinerQ8F16(std.testing.allocator, storage));
+    storage.raw_bytes = &raw;
+    for ([_]f16{ std.math.inf(f16), std.math.nan(f16), 65504 }) |scale| {
+        std.mem.writeInt(u16, raw[0..2], @bitCast(scale), .little);
+        try std.testing.expectError(error.UnsupportedGlinerCudaPrecision, decodeGlinerQ8F16(std.testing.allocator, storage));
+    }
+}
+
 fn isTensorCoreQuantLinearShape(in_dim: usize, out_dim: usize) bool {
     if (out_dim == 1) return false;
     if (in_dim == 0 or in_dim % 256 != 0) return false;
@@ -4839,7 +4955,7 @@ fn isQ4_0TcHmmaShape(in_dim: usize, out_dim: usize) bool {
 }
 
 fn useMxbaiQ8TiledKernel(rows: usize, in_dim: usize, out_dim: usize) bool {
-    return cudaQ8TiledKernelsEnabled() and rows > 0 and in_dim % 256 == 0 and isApprovedQuantLinearShape(in_dim, out_dim);
+    return cudaQ8TiledKernelsEnabled() and rows > 0 and in_dim % 256 == 0 and (isApprovedQuantLinearShape(in_dim, out_dim) or isGliner1BQ8LinearShape(in_dim, out_dim));
 }
 
 fn mxbaiQ8Variant(rows: usize, in_dim: usize, out_dim: usize) ?kernels_mod.QMatmulVariant {
@@ -13652,19 +13768,50 @@ fn simtQMatmulFallbackVariant(variant: kernels_mod.QMatmulVariant) kernels_mod.Q
     return if (variant == .tc_hmma) .fast_r4c4 else variant;
 }
 
-// Read-only view: the mirror is model-owned and never changes the FP32
-// resident tensor used by extraction layouts, identity checks or task heads.
+// Read-only view: the mirror is model-owned and never changes the original
+// resident tensor used by identity checks, embeddings or task heads.
 fn boundaryMixedWeight(self: *CudaCompute, weight: *const CudaTensor) ?CudaTensor {
-    if (!self.gliner_boundary_inference or !self.gliner_mixed_attention or weight.dtype != .f32) return null;
+    const boundary = self.gliner_boundary_inference and self.gliner_mixed_attention and weight.dtype == .f32;
+    const q8 = self.gliner_q8_f16_mirrors and self.gliner_encoder_attention and isKnownQuant(weight, .Q8_0);
+    if (!boundary and !q8) return null;
     const mirror = self.gliner_boundary_f16_mirrors.get(weight.buffer.ptr) orelse return null;
     var view = weight.*;
     view.buffer = mirror;
     view.dtype = .f16;
+    view.quant_type = null;
+    view.tc_quant = null;
+    view.owns_tc_quant = false;
     view.bf16_mirror = .{};
+    view.owns_bf16_mirror = false;
     view.owns_buffer = false;
     view.owns_shape = false;
     view.owned_by_tensor = false;
     return view;
+}
+
+test "GLiNER Decide CUDA Q8 execution mirror is a borrowed dense view" {
+    var compute: CudaCompute = undefined;
+    compute.allocator = std.testing.allocator;
+    compute.gliner_boundary_inference = false;
+    compute.gliner_mixed_attention = false;
+    compute.gliner_encoder_attention = true;
+    compute.gliner_q8_f16_mirrors = true;
+    compute.gliner_boundary_f16_mirrors = .{};
+    defer compute.gliner_boundary_f16_mirrors.deinit(std.testing.allocator);
+    const mirror = buffer_mod.DeviceBuffer{ .ptr = 0x2000, .len = 64 };
+    try compute.gliner_boundary_f16_mirrors.put(std.testing.allocator, 0x1000, mirror);
+    var shape = [_]i64{ 1, 32 };
+    const weight = CudaTensor{ .buffer = .{ .ptr = 0x1000, .len = 34 }, .dtype = .u8, .shape = &shape, .elem_count = 32, .quant_type = .{ .known = .Q8_0 } };
+    const view = boundaryMixedWeight(&compute, &weight).?;
+    try std.testing.expectEqual(.f16, view.dtype);
+    try std.testing.expectEqualDeep(mirror, view.buffer);
+    try std.testing.expect(view.quant_type == null and view.tc_quant == null);
+    try std.testing.expect(!view.owns_buffer and !view.owns_shape and !view.owns_tc_quant and !view.owns_bf16_mirror);
+    try std.testing.expectEqual(@as(driver_mod.CUdeviceptr, 0x1000), weight.buffer.ptr);
+    try std.testing.expect(isKnownQuant(&weight, .Q8_0));
+    try std.testing.expect(boundaryMixedWeight(&compute, &view) == null);
+    compute.gliner_q8_f16_mirrors = false;
+    try std.testing.expect(boundaryMixedWeight(&compute, &weight) == null);
 }
 
 fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
