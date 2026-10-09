@@ -223,8 +223,8 @@ or a normal Antfly directory (`StorageDirectory`); every method works on
 either. `CreateWithOptions` only creates `.aflite` files; open a missing
 directory path to create one.
 
-Use `Backup` or `BackupToFile` to write a portable `.afb` archive from any
-handle. Use `Restore` or `RestoreFile` to create a new database from one
+Use `Backup` or `BackupToFile` to write a portable `.afb` archive of the entire
+database. Use `Restore` or `RestoreFile` to create a new database from one
 without publishing a partial target on failure; `RestoreOptions.Storage`
 selects a `.aflite` file (the default) or a directory, and a backup of either
 kind restores into either kind. `ImportBackup` imports into an empty open
@@ -235,3 +235,38 @@ Use `CopyStableSnapshot` or `CopyStableSnapshotFile` when you want a physical
 From the repository’s `zig` directory, `zig build lite` builds the Lite CLI
 and `libantfly`. Run `zig build lite-test` for the Lite checks, including the
 Go binding tests against the built library.
+
+## SQL and multiple tables
+
+Importing this package registers the `antfly` driver with `database/sql`:
+
+```go
+db, err := sql.Open("antfly", "file:/path/app.aflite")
+if err != nil { return err }
+defer db.Close()
+_, err = db.Exec("CREATE TABLE people (id BIGINT PRIMARY KEY, name TEXT)")
+_, err = db.Exec("INSERT INTO people (id,name) VALUES ($1,$2)", int64(1), "Ada")
+rows, err := db.Query("SELECT id,name FROM people")
+```
+
+Pooled connections have independent native SQL sessions and share the file's
+writer. `BeginTx` uses READ COMMITTED; stronger isolation returns an error.
+Rows use native streaming cursors, so queries continue beyond 128 rows. Signed
+64-bit integers remain `int64`; SQL NULL becomes nil. JSON parameters can use
+`json.RawMessage`, JSON results use `[]byte`, and byte parameters represent
+UTF-8 text. Errors expose `SQLState()` and an optional transaction receipt.
+
+The document API uses the same catalog: `CreateTableJSON`, `ListTablesJSON`,
+`OpenTable`, and `DropTable`. A table handle supports the existing document,
+schema, search, index, and enrichment methods. Close table handles before
+dropping them. Closing the database invalidates its table handles.
+
+Portable `.afb` archives back up the entire database: its table catalog,
+schemas, documents, indexes, enrichments, and constraint records. Call backup
+on the database handle. Restore publishes all tables together into either
+Lite or directory storage; import requires an empty database with no open
+table handles, SQL sessions, or cursors. Table handles cannot export or import
+backups.
+
+See [the native SQL contract](../../../zig/CAPI.md#database-sql) for
+transaction, savepoint, result-size, and commit-outcome behavior.
