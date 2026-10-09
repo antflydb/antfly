@@ -288,8 +288,8 @@ test "system catalog relation namespace transaction live replay authenticates pr
                 var buf: [128]u8 = undefined;
                 const ready = try relation_reconciliation.State.decode(try txn.get(try relation_reconciliation.jobKey(&buf, group)));
                 // Exclusive test fixture: obtain independent authority to
-                // demonstrate that native receiver activation is still gated,
-                // not merely rejected because of an invalid candidate seal.
+                // demonstrate that receiver activation requires its own
+                // membership capability, not just a valid candidate seal.
                 const proof = try RaftApplyStore.prepareRelationPublicationProofTxn(a, &txn, ready);
                 try std.testing.expect(try proof.matchesTxn(&txn));
                 const prior = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&txn, group)).?;
@@ -362,6 +362,7 @@ test "system catalog relation namespace transaction live replay authenticates pr
             try signals.register(&receiver);
             const expected = switch (variant) {
                 .missing_owner, .missing_delete, .forged => error.CatalogGenerationChanged,
+                .swap => error.TableTopologyProtocolUpgradeRequired,
                 else => error.InvalidCatalogRecord,
             };
             try std.testing.expectError(expected, T.replay(&receiver, invalid));
@@ -1425,6 +1426,249 @@ test "system catalog relation namespace transaction source epoch fences schema c
     defer txn.abort();
     try std.testing.expect(expected.eql(try RaftApplyStore.relationSourceEpochTxn(&txn, group)));
     try verifyReconciliationGroupTxn(&txn, group);
+}
+
+test "system catalog relation namespace transaction standby independently adopts publications resumes after restart and rejects forged effects" {
+    const a = std.testing.allocator;
+    const r = relation_reconciliation;
+    const group: u64 = 41;
+    const identity = "01010101010101010101010101010101".*;
+    const activation: topology_protocol.Activation = .{ .version = topology_protocol.relation_publication_version, .incarnation = identity, .member_count = 3, .membership_fingerprint = @splat(7) };
+    const primary_mod = @import("../../storage/hot_standby/primary.zig");
+    const standby_mod = @import("../../storage/hot_standby/standby.zig");
+    const Record = @import("antfly_local_sources").storage_db_replication_record.RecordView;
+    const T = struct {
+        const Fault = enum { missing_writer, marker_only, candidate, membership, source, local_candidate };
+        fn control(store: *RaftApplyStore, command: relation_control.Command) !void {
+            const bytes = try command.encodeAlloc(a);
+            defer a.free(bytes);
+            for (0..32) |_| {
+                store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = bytes }) catch |err| {
+                    if (err != error.CatalogPublicationProofPending) return err;
+                    continue;
+                };
+                return;
+            }
+            return error.TestExpectedBoundedProgress;
+        }
+        fn apply(ptr: *anyopaque, record: Record) !void {
+            const store: *RaftApplyStore = @ptrCast(@alignCast(ptr));
+            try store.applyHotStandbyRecord(record);
+        }
+        fn live(store: *RaftApplyStore) !r.LiveRoot {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            return (try r.LiveStore(docstore.DocStore.Txn).open(&read, group)).?.root;
+        }
+        fn pending(store: *RaftApplyStore, signals: *MetadataReplayTest.Capture) !void {
+            try std.testing.expect((try store.relationReconciliationWork(group)).root == null);
+            try std.testing.expectEqual(@as(usize, 0), signals.projections);
+            try std.testing.expectEqual(@as(usize, 0), signals.keys);
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect(!try RaftApplyStore.relationWriterEnabledTxn(&read, group));
+            try std.testing.expectError(error.NotFound, read.get(RaftApplyStore.metadata_hot_standby.sequence_key));
+            try std.testing.expectError(error.NotFound, read.get(RaftApplyStore.metadata_hot_standby.replay_key));
+            try std.testing.expectEqual(@as(u64, 10), try store.durableAppliedIndex(group));
+        }
+        fn replay(store: *RaftApplyStore, record: Record, signals: *MetadataReplayTest.Capture) !void {
+            for (0..32) |_| {
+                store.applyHotStandbyRecord(record) catch |err| {
+                    if (err != error.CatalogPublicationProofPending) return err;
+                    try pending(store, signals);
+                    continue;
+                };
+                return;
+            }
+            return error.TestExpectedBoundedProgress;
+        }
+        fn corruptCandidate(txn: *docstore.DocStore.Txn, generation: r.Generation) !void {
+            var buf: [r.max_cursor_bytes]u8 = undefined;
+            const key = try r.candidateGenerationKey(&buf, generation, .{ .namespace_id = system_catalog.default_namespace_id, .name = "t0001" });
+            var entry = try relation_names.Entry.decode(try txn.get(key));
+            entry.active.?.schema_digest[0] ^= 1;
+            try txn.put(key, &(try entry.encode()));
+        }
+        fn forge(store: *RaftApplyStore, effect: []const u8, state: r.State, fault: Fault) ![]u8 {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var capture = @import("antfly_local_sources").storage_txn_mutation_capture.Capture.init(a);
+            defer capture.deinit();
+            txn.mutation_capture = &capture;
+            var decoder = try RaftApplyStore.metadata_hot_standby.Decoder.init(effect);
+            while (try decoder.next()) |row| {
+                if (row.value) |value| try txn.put(row.key, value) else try txn.delete(row.key);
+            }
+            var buf: [160]u8 = undefined;
+            switch (fault) {
+                .missing_writer => try std.testing.expect(capture.keys.remove(try RaftApplyStore.relationWriterKeyForGroup(&buf, group))),
+                .marker_only => {
+                    capture.keys.clearRetainingCapacity();
+                    try capture.touch(try RaftApplyStore.relationWriterKeyForGroup(&buf, group));
+                },
+                .candidate => try corruptCandidate(&txn, r.Generation.of(&state)),
+                .membership => {
+                    var wrong = activation;
+                    wrong.membership_fingerprint[0] ^= 1;
+                    const raw = try std.json.Stringify.valueAlloc(a, wrong, .{});
+                    defer a.free(raw);
+                    try txn.put(try RaftApplyStore.topologyActivationKeyForGroup(&buf, group), raw);
+                },
+                .source => {
+                    const raw = try encodeTableRecord(a, .{ .table_id = 1, .name = "injected", .schema_json = "{}" });
+                    defer a.free(raw);
+                    try txn.put(try tableKeyForGroup(&buf, group, 1), raw);
+                    try r.advanceSource(&txn, group);
+                },
+                .local_candidate => {},
+            }
+            return RaftApplyStore.metadata_hot_standby.encode(a, &capture, &txn, .{ .source = decoder.header.source, .sequence = decoder.header.sequence, .group_id = group, .count = 0 });
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const root = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/standby-publication", .{tmp.sub_path});
+    try fs_paths.createDirPathPortable(std.testing.io, root);
+    const source_path = try std.fmt.allocPrint(scratch, "{s}/source", .{root});
+    const target_path = try std.fmt.allocPrint(scratch, "{s}/target", .{root});
+    const log_path = try std.fmt.allocPrintSentinel(scratch, "{s}/primary.log", .{root}, 0);
+    const slots_path = try std.fmt.allocPrintSentinel(scratch, "{s}/slots", .{root}, 0);
+    const receive_path = try std.fmt.allocPrintSentinel(scratch, "{s}/receive.log", .{root}, 0);
+    const progress_path = try std.fmt.allocPrintSentinel(scratch, "{s}/progress.log", .{root}, 0);
+    const stream_identity: standby_mod.Identity = .{ .cluster_id = 7, .timeline_id = 1, .epoch = 1 };
+    var primary = try primary_mod.Primary.open(a, log_path.ptr, slots_path.ptr, stream_identity, .{});
+    defer primary.close();
+    var source = try RaftApplyStore.init(a, .{ .root_dir = source_path });
+    defer source.deinit();
+    try source.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = identity });
+    for (1..71) |id| {
+        var name: [32]u8 = undefined;
+        try source.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = id, .name = try std.fmt.bufPrint(&name, "t{d:0>4}", .{id}), .schema_json = "{}" } });
+    }
+    const raw_activation = try std.json.Stringify.valueAlloc(scratch, activation, .{});
+    try source.applyStandaloneCommand(group, .{ .activate_topology_protocol = raw_activation });
+    var adopt = activation;
+    adopt.version = topology_protocol.relation_reconciliation_version;
+    try T.control(&source, .{ .adopt = adopt });
+    const work = try source.relationReconciliationWork(group);
+    const ready = try reconcileRestoreNamesForTest(&source, a, try r.State.init(group, try r.nextJobId(null), work.epoch.?));
+    const snapshot = try source.snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(snapshot);
+    try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{}));
+    try T.control(&source, .{ .publish = .{ .state = ready, .activation = activation } });
+    try std.testing.expectEqual(@as(u64, 1), primary.log.lastLsn());
+    var first = (try primary.log.entryAt(a, 1)).?;
+    defer first.deinit(a);
+    const first_frame = try RaftApplyStore.metadata_chunks.decodeFrame(first.record.payload);
+    try std.testing.expectEqual(@as(u32, 1), first_frame.descriptor.chunk_count);
+    for (std.enums.values(T.Fault)) |fault| {
+        const path = try std.fmt.allocPrint(scratch, "{s}/fault-{s}", .{ root, @tagName(fault) });
+        var target = try RaftApplyStore.init(a, .{ .root_dir = path });
+        defer target.deinit();
+        try RaftApplyStore.installSnapshotFromRaft(&target, a, group, 10, snapshot);
+        var signals: MetadataReplayTest.Capture = .{};
+        try signals.register(&target);
+        if (fault == .local_candidate) {
+            var txn = try target.store.beginWriteTxn();
+            errdefer txn.abort();
+            try T.corruptCandidate(&txn, r.Generation.of(&ready));
+            try txn.commit();
+        }
+        const effect = try T.forge(&source, first_frame.payload, ready, fault);
+        defer a.free(effect);
+        const descriptor = try RaftApplyStore.metadata_chunks.Descriptor.fromEffect(effect);
+        const frame = try RaftApplyStore.metadata_chunks.encodeFrame(a, descriptor, 0, effect);
+        defer a.free(frame);
+        var record = first.record;
+        record.payload = frame;
+        const expected = if (fault == .membership) error.TableTopologyProtocolUpgradeRequired else error.InvalidCatalogRecord;
+        try std.testing.expectError(expected, T.replay(&target, record, &signals));
+        try T.pending(&target, &signals);
+        if (fault == .local_candidate) continue;
+        try T.replay(&target, first.record, &signals);
+        try verifyRelationRecoveryForTest(&target, a, group);
+    }
+    {
+        var target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
+        defer target.deinit();
+        try RaftApplyStore.installSnapshotFromRaft(&target, a, group, 10, snapshot);
+        var standby = try standby_mod.Standby.open(a, receive_path.ptr, progress_path.ptr, stream_identity, .{});
+        defer standby.close();
+        _ = try standby.receive(first.record);
+        try std.testing.expectEqual(@as(usize, 0), try standby.applyAvailable(&target, T.apply));
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().received_lsn);
+        try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().safe_read_lsn);
+        try std.testing.expect((try target.relationReconciliationWork(group)).root == null);
+        try std.testing.expectError(error.PromotionRequiresForce, standby.promote(.{ .new_timeline_id = 2, .new_epoch = 2, .fencing_confirmed = true }));
+    }
+    {
+        var target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
+        defer target.deinit();
+        var standby = try standby_mod.Standby.open(a, receive_path.ptr, progress_path.ptr, stream_identity, .{});
+        defer standby.close();
+        var signals: MetadataReplayTest.Capture = .{};
+        try signals.register(&target);
+        var deferred: usize = 0;
+        for (0..32) |_| {
+            if (try standby.applyAvailable(&target, T.apply) != 0) break;
+            deferred += 1;
+            try T.pending(&target, &signals);
+            try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().safe_read_lsn);
+        }
+        try std.testing.expect(deferred >= 2);
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().safe_read_lsn);
+        try std.testing.expect((try T.live(&target)).generation.eql(r.Generation.of(&ready)));
+        try source.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "after", .schema_json = "{}" } });
+        var second = (try primary.log.entryAt(a, 2)).?;
+        defer second.deinit(a);
+        _ = try standby.receive(second.record);
+        try std.testing.expectEqual(@as(usize, 1), try standby.applyAvailable(&target, T.apply));
+        try std.testing.expectEqual(@as(u64, 2), (try T.live(&target)).sequence);
+        const next_work = try source.relationReconciliationWork(group);
+        const next = try r.State.init(group, try r.nextJobId(&ready), next_work.epoch.?);
+        try T.control(&source, .{ .start = .{ .next = next, .prior = ready } });
+        var next_ready: ?r.State = null;
+        for (0..64) |_| {
+            const current = (try source.relationReconciliationWork(group)).current.?;
+            if (current.phase == .ready) {
+                next_ready = current;
+                break;
+            }
+            try T.control(&source, .{ .advance = current });
+        }
+        try std.testing.expect(next_ready != null);
+        while (standby.currentProgress().received_lsn < primary.log.lastLsn()) {
+            var entry = (try primary.log.entryAt(a, standby.nextReceiveLsn())).?;
+            defer entry.deinit(a);
+            _ = try standby.receive(entry.record);
+            try std.testing.expectEqual(@as(usize, 1), try standby.applyAvailable(&target, T.apply));
+        }
+        try T.control(&source, .{ .publish = .{ .state = next_ready.?, .prior = r.Generation.of(&ready), .activation = activation } });
+        var swapped = (try primary.log.entryAt(a, standby.nextReceiveLsn())).?;
+        defer swapped.deinit(a);
+        _ = try standby.receive(swapped.record);
+        deferred = 0;
+        for (0..32) |_| {
+            if (try standby.applyAvailable(&target, T.apply) != 0) break;
+            deferred += 1;
+            try std.testing.expect((try T.live(&target)).generation.eql(r.Generation.of(&ready)));
+        }
+        try std.testing.expect(deferred >= 2);
+        try std.testing.expectEqual(primary.log.lastLsn(), standby.currentProgress().safe_read_lsn);
+        try std.testing.expect((try T.live(&target)).generation.eql(r.Generation.of(&next_ready.?)));
+        try std.testing.expectEqual(@as(u64, 1), (try T.live(&target)).sequence);
+        try verifyRelationRecoveryForTest(&target, a, group);
+    }
+    var target = try RaftApplyStore.init(a, .{ .root_dir = target_path });
+    defer target.deinit();
+    var standby = try standby_mod.Standby.open(a, receive_path.ptr, progress_path.ptr, stream_identity, .{});
+    defer standby.close();
+    try std.testing.expectEqual(primary.log.lastLsn(), standby.currentProgress().safe_read_lsn);
+    try std.testing.expectEqual(@as(usize, 0), try standby.applyAvailable(&target, T.apply));
+    try verifyRelationRecoveryForTest(&target, a, group);
 }
 
 test "system catalog relation namespace transaction publication verifies replicas fences batched sources and adopts live writers atomically" {
@@ -9715,7 +9959,27 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
         defer alloc.free(forged);
         var bad_record = fourth.record;
         bad_record.payload = forged;
-        try target.applyHotStandbyRecord(bad_record);
+        var resumed = false;
+        var deferred: u32 = 0;
+        for (0..16) |_| {
+            target.applyHotStandbyRecord(bad_record) catch |err| {
+                if (err != error.CatalogPublicationProofPending) return err;
+                deferred += 1;
+                // Reconstruct exactly one immutable prefix frame per retry.
+                // Preparation neither extends staging nor exposes any row.
+                try std.testing.expectEqual(deferred, target.standby_probe.?.next_frame);
+                const raw = try target.store.get(alloc, RaftApplyStore.metadata_pending_key);
+                defer alloc.free(raw);
+                try std.testing.expectEqual(@as(u32, 3), (try RaftApplyStore.MetadataPending.decode(raw)).next);
+                try std.testing.expect((try target.loadStandaloneCatalog(alloc)) == null);
+                try std.testing.expectError(error.NotFound, target.store.get(alloc, RaftApplyStore.metadata_hot_standby.replay_key));
+                continue;
+            };
+            resumed = true;
+            break;
+        }
+        try std.testing.expect(resumed);
+        try std.testing.expectEqual(@as(u32, 3), deferred);
         var lsn: u64 = 5;
         while (lsn <= final_lsn) : (lsn += 1) {
             var entry = (try primary.log.entryAt(alloc, lsn)).?;
@@ -9814,6 +10078,8 @@ pub const RaftApplyStore = struct {
     next_lifecycle_listener_registration_id: u64 = 1,
     apply_mutex: std.Io.Mutex = .init,
     relation_publication_pool: RelationPublicationPool = .{},
+    standby_probe_mutex: std.Io.Mutex = .init,
+    standby_probe: ?StandbyRelationProbe = null,
     active_outcome: ?*CommittedApplyOutcome = null,
     active_relation_page: ?*const relation_reconciliation.Page = null,
     active_relation_failure: ?*const relation_reconciliation.FailurePlan = null,
@@ -9908,6 +10174,11 @@ pub const RaftApplyStore = struct {
     const standalone_revision_key = "\x00\x00__metadata__:standalone_revision";
     const metadata_hot_standby = @import("../../storage/hot_standby/metadata_effects.zig");
     const metadata_chunks = @import("../../storage/hot_standby/metadata_effect_chunks.zig");
+    const StandbyRelationProbe = @import("../../storage/hot_standby/metadata_effect_probe.zig").PointProbe(2, 160, 2048);
+    const StandbyRelationPublication = struct {
+        proof: RelationPublicationProof,
+        activation: topology_protocol.Activation,
+    };
     const metadata_pending_key = metadata_hot_standby.prefix ++ "pending";
     const metadata_chunk_prefix = metadata_hot_standby.prefix ++ "chunk:";
     const legacy_catalog_digest_key = metadata_hot_standby.prefix ++ "legacy_catalog_digest";
@@ -10270,10 +10541,125 @@ pub const RaftApplyStore = struct {
         try txn.delete(metadata_pending_key);
     }
 
+    fn metadataReplaySequenceTxn(txn: *docstore.DocStore.Txn, descriptor: metadata_chunks.Descriptor) !u64 {
+        if (try stagingGet(txn, metadata_hot_standby.outbox_key) != null) return error.MetadataHAOutboxPending;
+        const source = try stagingGet(txn, metadata_hot_standby.source_key);
+        const sequence = try stagingGet(txn, metadata_hot_standby.sequence_key);
+        if (source != null and (source.?.len != 16 or !std.mem.eql(u8, source.?, &descriptor.source))) return error.MetadataHASourceChanged;
+        if ((source == null) != (sequence == null) or (sequence != null and sequence.?.len != 8)) return error.InvalidMetadataHAEffect;
+        const current = if (sequence) |bytes| std.mem.readInt(u64, bytes[0..8], .little) else 0;
+        if (descriptor.sequence > current +| 1) return error.MetadataHASequenceGap;
+        return current;
+    }
+
+    fn validateMetadataPendingFrame(pending: MetadataPending, record: @import("antfly_local_sources").storage_db_replication_record.RecordView, frame: metadata_chunks.Frame) !void {
+        try pending.descriptor.validate();
+        if (pending.next > pending.descriptor.chunk_count or pending.cluster_id != record.cluster_id or
+            !std.mem.eql(u8, &pending.descriptor.source, &frame.descriptor.source)) return error.MetadataHASourceChanged;
+        if (record.epoch > pending.epoch and frame.index == 0) {
+            if (pending.descriptor.sequence != frame.descriptor.sequence) return error.MetadataHASequenceGap;
+            return; // The locked transaction performs the actual supersession.
+        }
+        if (!pending.descriptor.eql(frame.descriptor)) return error.MetadataHAChunkConflict;
+        if (frame.index > pending.next or ((record.epoch != pending.epoch or record.timeline_id != pending.timeline_id) and frame.index >= pending.next))
+            return error.MetadataHAChunkSequenceGap;
+    }
+
+    fn standbyRelationActivationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group: u64) !topology_protocol.Activation {
+        var buf: [160]u8 = undefined;
+        const raw = (try stagingGet(txn, try topologyActivationKeyForGroup(&buf, group))) orelse return error.TableTopologyProtocolUpgradeRequired;
+        if (raw.len > 1024) return error.InvalidCatalogRecord;
+        var parsed = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, raw, .{});
+        defer parsed.deinit();
+        const activation = parsed.value;
+        if (activation.version < topology_protocol.relation_publication_version) return error.TableTopologyProtocolUpgradeRequired;
+        if (activation.version > topology_protocol.current_version or activation.member_count == 0 or
+            std.mem.allEqual(u8, &activation.membership_fingerprint, 0)) return error.InvalidCatalogRecord;
+        const identity_raw = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&buf, group))) orelse return error.TableTopologyProtocolUpgradeRequired;
+        if (!std.meta.eql((try decodeMetadataIncarnationRecord(identity_raw)).incarnation, activation.incarnation))
+            return error.TableTopologyProtocolUpgradeRequired;
+        return activation;
+    }
+
+    /// Inspect one frame and advance at most one local proof page before the
+    /// apply lock. The durable receive WAL owns the supplied record until the
+    /// callback succeeds; only earlier prefix frames need local staging. On
+    /// restart reconstruct one staged prefix per call, never an entire effect.
+    /// The cache owns fixed-size values only, not transactions or frame buffers.
+    fn prepareStandbyRelationPublication(self: *RaftApplyStore, record: @import("antfly_local_sources").storage_db_replication_record.RecordView, frame: metadata_chunks.Frame) !?StandbyRelationPublication {
+        if (!self.standby_probe_mutex.tryLock()) return error.CatalogPublicationProofPending;
+        defer self.standby_probe_mutex.unlock(self.io_impl.io());
+        var read = try self.store.beginReadTxn();
+        defer read.abort();
+        // Already applied effects have no staged prefix left. The locked path
+        // still checks exact source/digest and timeline before acknowledging.
+        if (frame.descriptor.sequence <= try metadataReplaySequenceTxn(&read, frame.descriptor)) return null;
+        const staged = if (try stagingGet(&read, metadata_pending_key)) |raw| try MetadataPending.decode(raw) else null;
+        if (staged) |pending| {
+            try validateMetadataPendingFrame(pending, record, frame);
+            if (pending.descriptor.eql(frame.descriptor) and frame.index < pending.next) {
+                const prior = (try stagingGet(&read, &metadataChunkKey(frame.index))) orelse return error.InvalidMetadataHAEffect;
+                if (!std.mem.eql(u8, prior, record.payload)) return error.MetadataHAChunkConflict;
+                if (record.epoch != pending.epoch or record.timeline_id != pending.timeline_id) return null;
+            }
+        } else if (frame.index != 0) return error.MetadataHAChunkSequenceGap;
+        if (self.standby_probe == null or self.standby_probe.?.failed or !self.standby_probe.?.descriptor.eql(frame.descriptor)) {
+            var root_buf: [160]u8 = undefined;
+            var live_buf: [160]u8 = undefined;
+            self.standby_probe = try StandbyRelationProbe.init(frame.descriptor, .{
+                try relation_reconciliation.rootKey(&root_buf, frame.descriptor.group_id),
+                try relation_reconciliation.liveKey(&live_buf, frame.descriptor.group_id),
+            });
+        }
+        const probe = &self.standby_probe.?;
+        if (probe.next_frame < frame.index) {
+            const pending = staged orelse return error.MetadataHAChunkSequenceGap;
+            if (!pending.descriptor.eql(frame.descriptor)) return error.MetadataHAChunkConflict;
+            if (frame.index > pending.next) return error.MetadataHAChunkSequenceGap;
+            if (probe.next_frame >= pending.next) return error.MetadataHAChunkSequenceGap;
+            const raw = (try stagingGet(&read, &metadataChunkKey(probe.next_frame))) orelse return error.InvalidMetadataHAEffect;
+            try probe.feed(try metadata_chunks.decodeFrame(raw));
+            return error.CatalogPublicationProofPending;
+        }
+        if (probe.next_frame == frame.index) try probe.feed(frame);
+        if (frame.index + 1 != frame.descriptor.chunk_count) return null;
+        const proposed_root = try probe.get(0);
+        const proposed_live = try probe.get(1);
+        if (proposed_root.kind == .missing and proposed_live.kind == .missing) return null;
+        if (proposed_root.kind == .deleted or proposed_live.kind == .deleted) return error.InvalidCatalogRecord;
+        var buf: [160]u8 = undefined;
+        const before_live = if (try stagingGet(&read, try relation_reconciliation.liveKey(&buf, frame.descriptor.group_id))) |raw|
+            try relation_reconciliation.LiveRoot.decode(raw)
+        else
+            null;
+        if (proposed_live.kind == .missing) {
+            const root = try relation_reconciliation.Generation.decode(proposed_root.value().?);
+            if (before_live == null or !before_live.?.generation.eql(root)) return error.InvalidCatalogRecord;
+            return null;
+        }
+        const live = try relation_reconciliation.LiveRoot.decode(proposed_live.value().?);
+        if (before_live) |previous| if (previous.generation.eql(live.generation)) return null;
+        if (proposed_root.kind != .value or !live.generation.eql(try relation_reconciliation.Generation.decode(proposed_root.value().?)))
+            return error.InvalidCatalogRecord;
+        const observed = try PreparedRelationBatch.capture(&read, frame.descriptor.group_id);
+        const state = observed.job orelse return error.InvalidCatalogRecord;
+        if (!std.meta.eql(live, try relation_reconciliation.LiveRoot.initial(state)) or observed.epoch == null or
+            !observed.epoch.?.eql(state.epoch)) return error.InvalidCatalogRecord;
+        if (observed.root) |root| {
+            if (before_live == null or !root.eql(before_live.?.generation) or std.mem.order(u8, &root.job_id, &live.generation.job_id) != .lt)
+                return error.InvalidCatalogRecord;
+        } else if (before_live != null) return error.InvalidCatalogRecord;
+        const activation = try self.standbyRelationActivationTxn(&read, state.group_id);
+        const proof = try self.requireRelationPublicationProof(state, platform_time.monotonicNs());
+        if (!std.meta.eql(proof.root, observed.root) or proof.applied_index != observed.applied_index) return error.CatalogPublicationProofPending;
+        return .{ .proof = proof, .activation = activation };
+    }
+
     fn applyHotStandbyChunk(self: *RaftApplyStore, record: @import("antfly_local_sources").storage_db_replication_record.RecordView) !void {
         if (record.kind != .metadata_mutation or record.payload_codec != .binary or record.table_id != 0 or record.shard_id != 0) return error.InvalidMetadataHAEffect;
         const frame = try metadata_chunks.decodeFrame(record.payload);
         const descriptor = frame.descriptor;
+        const publication = try self.prepareStandbyRelationPublication(record, frame);
         self.apply_mutex.lockUncancelable(self.io_impl.io());
         defer self.apply_mutex.unlock(self.io_impl.io());
         var outcome = CommittedApplyOutcome{ .alloc = self.alloc, .collect_transition_deltas = false };
@@ -10284,13 +10670,7 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginWriteTxn();
         var committed = false;
         defer if (!committed) txn.abort();
-        if (try stagingGet(&txn, metadata_hot_standby.outbox_key) != null) return error.MetadataHAOutboxPending;
-        const source = try stagingGet(&txn, metadata_hot_standby.source_key);
-        const sequence = try stagingGet(&txn, metadata_hot_standby.sequence_key);
-        if (source != null and (source.?.len != 16 or !std.mem.eql(u8, source.?, &descriptor.source))) return error.MetadataHASourceChanged;
-        if ((source == null) != (sequence == null) or (sequence != null and sequence.?.len != 8)) return error.InvalidMetadataHAEffect;
-        const current = if (sequence) |bytes| std.mem.readInt(u64, bytes[0..8], .little) else 0;
-        if (descriptor.sequence > current +| 1) return error.MetadataHASequenceGap;
+        const current = try metadataReplaySequenceTxn(&txn, descriptor);
         if (descriptor.sequence <= current) {
             if (descriptor.sequence == current) {
                 const digest = (try stagingGet(&txn, metadata_hot_standby.digest_key)) orelse return error.InvalidMetadataHAEffect;
@@ -10314,8 +10694,7 @@ pub const RaftApplyStore = struct {
             .epoch = record.epoch,
             .last_lsn = 0,
         };
-        try pending.descriptor.validate();
-        if (pending.next > pending.descriptor.chunk_count or pending.cluster_id != record.cluster_id or !std.mem.eql(u8, &pending.descriptor.source, &descriptor.source)) return error.MetadataHASourceChanged;
+        try validateMetadataPendingFrame(pending, record, frame);
         if (record.epoch > pending.epoch and frame.index == 0) {
             // The authenticated HA receiver admitted a newer timeline. Its
             // first frame may supersede only an uncommitted predecessor slot.
@@ -10340,6 +10719,11 @@ pub const RaftApplyStore = struct {
             return self.commitStandaloneTxn(&txn, &outcome, &committed);
         }
         if (!current_timeline or frame.index != pending.next or record.lsn <= pending.last_lsn) return error.MetadataHAChunkSequenceGap;
+        if (publication) |verified| {
+            if (!try verified.proof.matchesTxn(&txn)) return error.CatalogPublicationProofPending;
+            if (!std.meta.eql(verified.activation, try self.standbyRelationActivationTxn(&txn, descriptor.group_id)))
+                return error.TableTopologyProtocolUpgradeRequired;
+        }
         try txn.put(&metadataChunkKey(frame.index), record.payload);
         pending.next += 1;
         pending.last_lsn = record.lsn;
@@ -10378,6 +10762,8 @@ pub const RaftApplyStore = struct {
                 else => return err,
             };
         }
+        if (!relation_writer and try relationWriterEnabledTxn(&txn, descriptor.group_id) and publication == null)
+            return error.InvalidCatalogRecord;
         if (relation_writer) {
             if (!try relationWriterEnabledTxn(&txn, descriptor.group_id)) return error.InvalidCatalogRecord;
             var plan = try self.capturedRelationsPlanTxn(&txn, descriptor.group_id, &relation_journal, true);
@@ -10389,21 +10775,29 @@ pub const RaftApplyStore = struct {
             try plan.verifyPublished(&registry);
         }
         if (reconciliation_changed) {
-            // A ready fingerprint is not independent publication authority.
-            // Mutable-root effects are supported after a verified seed, but
-            // generation adoption needs the forthcoming receiver-side staged
-            // publication proof/capability protocol, never a scan under this
-            // serialized replay transaction or trust in the sender's seal.
+            // A ready seal alone is never authority. Only this receiver's
+            // independently prepared, still-fenced source/candidate proof can
+            // admit a new generation. Canonical replay below separately checks
+            // that adoption cannot mutate its sealed job or candidate rows.
             var buf: [128]u8 = undefined;
             const key = try relation_reconciliation.liveKey(&buf, descriptor.group_id);
             if (try stagingGet(&txn, key)) |bytes| {
                 var before = relation_journal.beforeReader();
-                const prior_bytes = before.get(key) catch |err| {
-                    if (err == error.NotFound) return error.InvalidCatalogRecord;
+                const prior_bytes = before.get(key) catch |err| blk: {
+                    if (err == error.NotFound) break :blk null;
                     return err;
                 };
-                const prior = try relation_reconciliation.LiveRoot.decode(prior_bytes);
-                if (!prior.generation.eql((try relation_reconciliation.LiveRoot.decode(bytes)).generation)) return error.InvalidCatalogRecord;
+                const prior = if (prior_bytes) |raw| try relation_reconciliation.LiveRoot.decode(raw) else null;
+                const live = try relation_reconciliation.LiveRoot.decode(bytes);
+                if (prior == null or !prior.?.generation.eql(live.generation)) {
+                    const verified = publication orelse return error.InvalidCatalogRecord;
+                    if (!std.meta.eql(live, try relation_reconciliation.LiveRoot.initial(verified.proof.state)) or
+                        !live.epoch.eql(try relationSourceEpochTxn(&txn, descriptor.group_id)) or
+                        try durableAppliedIndexTxn(&txn, descriptor.group_id) != verified.proof.applied_index or
+                        !try relationWriterEnabledTxn(&txn, descriptor.group_id)) return error.InvalidCatalogRecord;
+                    if (!std.meta.eql(verified.activation, try self.standbyRelationActivationTxn(&txn, descriptor.group_id)))
+                        return error.TableTopologyProtocolUpgradeRequired;
+                }
             }
         }
         if (reconciliation_changed) {

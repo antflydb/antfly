@@ -1145,6 +1145,10 @@ const LocalStandaloneMetadata = struct {
         defer self.mutex.unlock();
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
         store.applyHotStandbyRecord(record) catch |err| {
+            // Bounded preflight has not published any catalog effect. Keep the
+            // projection at the last acknowledged safe-read frontier while the
+            // receive WAL retains this record for a later control round.
+            if (err == error.CatalogPublicationProofPending) return err;
             // Sync can fail after the native transaction commits. No error
             // path may retain an apparently current but stale projection.
             self.durable_revision = 0;

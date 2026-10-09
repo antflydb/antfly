@@ -497,18 +497,20 @@ pub const Standby = struct {
         apply_fn: ApplyFn,
         options: ApplyOptions,
     ) !usize {
-        const from_lsn = self.progress_state.applied_lsn + 1;
-        const entries = try self.receive_log.iterateFrom(self.alloc, from_lsn);
-        defer replication_log.freeEntries(self.alloc, entries);
-
-        if (entries.len == 0) {
+        const last_lsn = self.receive_log.lastLsn();
+        if (self.progress_state.applied_lsn >= last_lsn) {
             if (self.progress_state.applied_lsn < self.progress_state.received_lsn) return error.MissingReceivedRecord;
             return 0;
         }
 
+        // The operation lease fixes the receive-log tail. Own just the next
+        // indexed record, not two complete copies of the remaining backlog.
+        // A deferred proof or exhausted window never reads its successors.
         var applied_count: usize = 0;
-        var expected_lsn = from_lsn;
-        for (entries) |entry| {
+        var expected_lsn = self.progress_state.applied_lsn + 1;
+        while (expected_lsn <= last_lsn) {
+            var entry = (try self.receive_log.entryAt(self.alloc, expected_lsn)) orelse return error.MissingReceivedRecord;
+            defer entry.deinit(self.alloc);
             if (entry.record.lsn != expected_lsn) return error.MissingReceivedRecord;
             try self.validateRecord(entry.record);
             apply_fn(ctx, entry.record) catch |err| switch (err) {
@@ -523,8 +525,8 @@ pub const Standby = struct {
             self.publishState(self.identity_state, next);
 
             applied_count += 1;
+            if (expected_lsn == last_lsn or applyWindowExhausted(applied_count, self.progress_wal.clock.nowNs(), options)) break;
             expected_lsn += 1;
-            if (applyWindowExhausted(applied_count, self.progress_wal.clock.nowNs(), options)) break;
         }
 
         return applied_count;
@@ -1439,6 +1441,66 @@ test "storage.hot_standby standby deferred publication preserves ordering progre
         try std.testing.expectEqual(@as(u64, 3), standby.currentProgress().safe_read_lsn);
         try std.testing.expectEqual(@as(usize, 0), try standby.applyAvailable(&deferred, Deferred.apply));
     }
+}
+
+test "storage.hot_standby standby retry and bounded apply own one record independent of backlog size" {
+    const alloc = std.testing.allocator;
+    const identity = Identity{ .cluster_id = 10, .timeline_id = 1, .epoch = 1 };
+    const paths = try testPaths(alloc, "bounded-backlog");
+    defer paths.deinit(alloc);
+    var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
+    defer standby.close();
+    const payload: [4096]u8 = @splat('x');
+    for (1..65) |lsn| _ = try standby.receive(baseRecord(identity, lsn, &payload));
+    const Apply = struct {
+        remaining: usize = 3,
+        calls: usize = 0,
+        applied: u64 = 0,
+        fn apply(ptr: *anyopaque, record: replication_record.RecordView) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(self.applied + 1, record.lsn);
+            try std.testing.expectEqual(@as(usize, 4096), record.payload.len);
+            if (self.remaining != 0) {
+                self.remaining -= 1;
+                return error.CatalogPublicationProofPending;
+            }
+            self.applied = record.lsn;
+        }
+    };
+    var context: Apply = .{};
+    // Replacing only the record-read allocator isolates owned replay buffers
+    // from the receive/progress WAL's independent storage implementation.
+    defer standby.alloc = alloc;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    standby.alloc = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, standby.applyAvailable(&context, Apply.apply));
+    try std.testing.expectEqual(@as(usize, 0), context.calls);
+    try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().safe_read_lsn);
+    var bytes: [8192]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+    standby.alloc = bounded.allocator();
+    for (0..3) |_| {
+        try std.testing.expectEqual(@as(usize, 0), try standby.applyAvailable(&context, Apply.apply));
+        try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
+        try std.testing.expectEqual(@as(u64, 64), standby.currentProgress().received_lsn);
+        try std.testing.expectEqual(@as(u64, 0), standby.currentProgress().safe_read_lsn);
+    }
+    try std.testing.expectEqual(@as(usize, 3), context.calls);
+    try standby.lockExclusive();
+    {
+        defer standby.unlockExclusive();
+        try std.testing.expectEqual(@as(usize, 1), try standby.applyAvailableLockedWithOptions(&context, Apply.apply, .{ .max_records = 1 }));
+        try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().safe_read_lsn);
+        try std.testing.expectEqual(@as(usize, 3), try standby.applyAvailableLockedWithOptions(&context, Apply.apply, .{ .max_records = 3 }));
+        try std.testing.expectEqual(@as(u64, 4), standby.currentProgress().safe_read_lsn);
+        try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
+    }
+    try std.testing.expectEqual(@as(usize, 60), try standby.applyAvailable(&context, Apply.apply));
+    try std.testing.expectEqual(@as(u64, 64), standby.currentProgress().safe_read_lsn);
+    try std.testing.expectEqual(@as(usize, 0), bounded.end_index);
+    try std.testing.expectEqual(@as(usize, 67), context.calls);
 }
 
 test "storage.hot_standby standby promotion requires fencing and appends timeline switch" {

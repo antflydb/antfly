@@ -2161,9 +2161,8 @@ root replacement, membership mismatch and reopen. Native publication passes
 47/47 build steps, 175 catalog tests and 22 linked tests. The expanded mixed-v31/
 v32 proposal and stale-admission checks pass with all 15 coordinator tests
 (50/50 build steps); inventory, formatting and whitespace checks also pass.
-Automatic coordinator publication remains deliberately
-unwired until independently prepared standby generation adoption is integrated;
-public SQL namespace resolution and its parity cases also remain unfinished.
+Automatic coordinator publication and public SQL namespace resolution, including
+their original parity cases, remain unfinished.
 Standby apply now treats only `CatalogPublicationProofPending` as a cooperative
 yield, retaining the unapplied record and its successors behind the durable
 applied/safe-read frontier. Unexpected corruption and ordinary apply failures
@@ -2178,11 +2177,35 @@ its admission API until both the effect footer and descriptor digest verify.
 Three focused tests cover large skipped values, missing/empty/deleted captures,
 transport-buffer retirement, split headers/keys/values/footers, duplicate target
 keys, capture overflow, private-key exclusion, and inner/outer integrity faults.
-This probe is preflight machinery, not publication authority or a replacement
-for canonical replay validation. Its connection to independent standby candidate
-proof preparation and generation adoption remains unfinished; automatic root
-publication stays guarded. No original corpus disposition changes from these
-infrastructure tests.
+This probe now drives progressive standby preflight, but is not publication
+authority or a replacement for canonical replay validation. A new generation
+requires the receiver's own bounded source/candidate proof, a preexisting ready
+job, the exact predecessor root/applied cut, and v32 membership/incarnation
+activation. Commit rechecks that cut and activation, enforces the initial live
+manifest, and atomically adopts native writers. Replay cannot change the sealed
+job/candidates in the same adoption effect or enable a writer marker without
+verified adoption. Pending preparation preserves the prior standalone projection.
+The receive WAL owns the final record while preparation yields; ordinary
+single-frame effects need no extra staging commit. After restart the probe
+reconstructs one staged prefix frame per retry without extending staging or
+exposing rows. The existing 9 MiB checkpoint/corruption regression now asserts
+that bound and retains exact source, timeline, gap and checksum diagnostics.
+A real primary-log/standby-WAL test exercises a 70-table publication, restart
+during proof preparation, promotion refusal, live producer writes, mirrored
+reconciliation, root replacement and another reopen. Six fault cases cover a
+missing writer, marker-only adoption, sender candidate mutation, changed
+membership, changed source and receiver-local candidate corruption; rejected
+effects publish neither rows nor receipts nor listener signals. The expanded
+catalog/opaque-owner gate passes 84/84 steps, including 182 catalog tests,
+10 opaque metadata-owner tests and 22 linked tests.
+Standby application now reads one indexed owned record at a time rather than
+materializing two copies of the whole receive backlog on each retry. An 8 KiB
+record-buffer budget covers 64 queued 4 KiB records, repeated deferral, one-/
+three-record windows, complete ordered drain and cleanup; real OOM remains a
+hard failure before callback or progress advancement. That regression passes
+with all 448 hot-standby tests. These are bounded-work/allocation proofs, not
+production throughput claims. No original corpus disposition changes from
+these infrastructure tests; automatic coordinator publication remains guarded.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,
