@@ -1491,6 +1491,18 @@ test "external lake native text owns required and speculative children through p
                 published += 1;
             };
             try std.testing.expectEqual(@as(usize, if (full) 0 else 1), published);
+            if (!full) {
+                // One query CPU slot is sufficient: polling itself owns no
+                // grant, and completion still retains the child until reap.
+                try execution.park(.resource_blocked);
+                for (&query.pending) |*slot| if (slot.*) |*task| {
+                    while (!task.isComplete()) std.atomic.spinLoopHint();
+                };
+                try execution.enter(.query);
+                source.prefetch(block_bytes * 4, block_bytes);
+                try std.testing.expect(query.pending[0] != null);
+                try std.testing.expectEqual(@as(u64, block_bytes * 4), query.offsets[0].?);
+            }
             query.drain(false);
         }
         const out = try a.alloc(u8, bytes.len);
@@ -1505,7 +1517,7 @@ test "external lake native text owns required and speculative children through p
             .canceled => try std.testing.expectError(error.Canceled, result),
             .expired => try std.testing.expectError(error.DeadlineExceeded, result),
         }
-        source.quiesce();
+        source.quiesceReadContext();
         source.close();
         open = false;
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().child_operations);
