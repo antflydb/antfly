@@ -541,3 +541,9 @@ the native reader suite passed 358 tests, sparse passed 62, bitmap encoding pass
 31, and lake integration passed 113 embedded and 98 API tests, with zero leaks.
 The overlapping-generation fixture retains its authenticated physical directory
 while selecting shared segments; production metadata validation remains strict.
+The optimized production server built successfully, and all 26 real Parquet/
+PyIceberg E2E cases passed in 135.65 seconds with `ANTFLY_E2E_FULL_LAKE=1` and
+normal filesystem disk safeguards. The two-file 100,003-row predicate fixture
+also checks rare-term inclusion/exclusion, exact counts and score parity across
+native segment offsets. License checks, both source-boundary audits, formatting
+and diff checks passed. Representative archive-scale latency remains unmeasured.
