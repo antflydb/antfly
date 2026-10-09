@@ -44,7 +44,12 @@ pub const CompileMemoryProfile = struct {
 /// Pinned Nix/glibc GNU ARM64 ReleaseSafe reached 17,479,122,944 bytes;
 /// 21 GiB supplies >25% measured compiler headroom, without changing runtimes.
 pub fn routedImplementationCompileMaxRss(profile: CompileMemoryProfile) usize {
-    if (profile.target.os.tag == .macos) return @as(usize, 12) << 30;
+    if (profile.target.os.tag == .macos) {
+        // Native ReleaseSafe routed write tests reached 15,716,696,064 bytes.
+        // Twenty GiB supplies >25% headroom above that measured peak.
+        const measured_macos = profile.host.os.tag == .macos and profile.optimize == .safe and !profile.sanitize_thread;
+        return @as(usize, if (measured_macos) 20 else 12) << 30;
+    }
     const measured = profile.host.os.tag == .linux and profile.host.cpu.arch == .aarch64 and
         profile.target.os.tag == .linux and profile.target.cpu.arch == .aarch64 and profile.target.abi == .gnu and
         profile.optimize == .safe and !profile.sanitize_thread;
@@ -262,5 +267,18 @@ test "routed implementation compiler claim covers measured native GNU ARM64 only
     try std.testing.expectEqual(@as(usize, 8) << 30, routedImplementationCompileMaxRss(other));
     other = profile;
     other.target = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
+    try std.testing.expectEqual(@as(usize, 12) << 30, routedImplementationCompileMaxRss(other));
+}
+
+test "native macOS routed ReleaseSafe claim covers the physical write owner peak" {
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const profile: CompileMemoryProfile = .{ .host = macos, .target = macos, .optimize = .safe, .strip = false, .cpu_inference = false };
+    const peak: usize = 15_716_696_064;
+    try std.testing.expect(routedImplementationCompileMaxRss(profile) >= peak + peak / 4);
+    var other = profile;
+    other.optimize = .fast;
+    try std.testing.expectEqual(@as(usize, 12) << 30, routedImplementationCompileMaxRss(other));
+    other = profile;
+    other.sanitize_thread = true;
     try std.testing.expectEqual(@as(usize, 12) << 30, routedImplementationCompileMaxRss(other));
 }

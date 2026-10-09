@@ -4465,6 +4465,10 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn sqlControlIo(self: *ApiHttpServer) !std.Io {
+        // An explicit foreign view is authoritative, including absence. Its
+        // owner supplies the executor vtable and wakeup/TLS identity.
+        if (self.cfg.imported_runtime_io) |views|
+            return views.durable orelse error.SqlWriteCapacityUnavailable;
         const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
         if (runtime.borrowed_io != null or runtime.lane_limits.worker_capacity < 10)
             return runtime.controlIo() orelse error.SqlWriteCapacityUnavailable;
@@ -4486,6 +4490,10 @@ pub const ApiHttpServer = struct {
     /// Own a bounded foreground SQL executor independent of durable/general
     /// completion and control lanes. Reserve it before publishing SQL work.
     pub fn sqlExecutionIo(self: *ApiHttpServer) !std.Io {
+        // An explicit foreign view is authoritative, including absence. Its
+        // owner supplies the executor vtable and wakeup/TLS identity.
+        if (self.cfg.imported_runtime_io) |views|
+            return views.durable orelse error.SqlWriteCapacityUnavailable;
         const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
         if ((self.cfg.query_waiting.max_wait_ms == 0 and self.runnableScheduler() == null) or runtime.borrowed_io != null or
             self.cfg.query_max_concurrent_requests == 0 or self.cfg.write_max_concurrent_requests == 0)

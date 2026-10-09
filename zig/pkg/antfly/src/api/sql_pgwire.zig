@@ -328,10 +328,17 @@ fn cloneSettingOverlay(alloc: std.mem.Allocator, entries: []const @import("antfl
     return result;
 }
 
+fn requestDeadlineNs(request: wire.Request) ?u64 {
+    if (request.deadline.raw.nanoseconds == std.math.maxInt(i96)) return null;
+    // A finite timestamp outside the native clock range remains a finite
+    // ceiling. It must neither trap nor become an absent deadline.
+    return std.math.cast(u64, @max(@as(i96, 0), request.deadline.raw.nanoseconds)) orelse std.math.maxInt(u64);
+}
+
 fn admissionOptions(request: wire.Request) @import("antfly_local_sources").common_bounded_admission.Options {
     return .{
         .io = request.io,
-        .deadline_ns = @intCast(@max(0, request.deadline.raw.nanoseconds)),
+        .deadline_ns = requestDeadlineNs(request),
         .cancellation = .{ .ptr = request.cancel_requested, .requested = struct {
             fn call(raw: *const anyopaque) bool {
                 const signal: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
@@ -1120,7 +1127,12 @@ test "SQL pgwire dispatch preserves imported executor authority including unavai
         var stream: StreamJob = .{ .adapter = &adapter, .alloc = std.testing.allocator, .credential = &credential, .request = request };
         try std.testing.expectError(error.SqlWriteCapacityUnavailable, stream.dispatch());
         try std.testing.expectEqual(@as(usize, 0), raw_probe.attempts);
-        try std.testing.expectEqual(i * 2, imported_probe.attempts);
+        var control_request = request;
+        control_request.statement = "ROLLBACK";
+        var control_job: Job = .{ .adapter = &adapter, .alloc = std.testing.allocator, .credential = &credential, .request = control_request, .kind = .execute };
+        try std.testing.expectError(error.SqlWriteCapacityUnavailable, adapter.dispatch(&control_job));
+        try std.testing.expectEqual(@as(usize, 0), raw_probe.attempts);
+        try std.testing.expectEqual(i * 3, imported_probe.attempts);
     }
 }
 
@@ -1929,7 +1941,7 @@ test "SQL query waiting pgwire preserves deadline cancellation and typed paramet
 fn nativeRequestContext(request: *const wire.Request) !operation.RequestContext {
     try request.check();
     const context: operation.RequestContext = .{
-        .deadline_ns = std.math.cast(u64, request.deadline.raw.nanoseconds) orelse return error.DeadlineExceeded,
+        .deadline_ns = requestDeadlineNs(request.*),
         .deadline_io = io_abi.Borrow.init(&request.io),
         .fanout_io = io_abi.Borrow.init(&request.io),
         .cancellation = operation.CancellationToken.fromAtomic(request.cancel_requested),
@@ -1948,8 +1960,17 @@ test "workload deadline normalizes pgwire clock before native metadata handoff" 
     try std.testing.expect(context.deadline_ns.? <= after + std.time.ns_per_s);
     try std.testing.expect(context.deadline_ns.? >= before);
     try context.ensureActive();
+    request.deadline.raw.nanoseconds = std.math.maxInt(i96);
+    const unlimited = try nativeRequestContext(&request);
+    try std.testing.expect(unlimited.deadline_ns == null);
+    try std.testing.expect(admissionOptions(request).deadline_ns == null);
+    request.deadline.raw.nanoseconds = @as(i96, std.math.maxInt(u64)) + 1;
+    const distant = try nativeRequestContext(&request);
+    try std.testing.expect(distant.deadline_ns != null);
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), admissionOptions(request).deadline_ns);
     canceled.store(true, .release);
     try std.testing.expectError(error.Canceled, context.ensureActive());
+    try std.testing.expectError(error.QueryCanceled, nativeRequestContext(&request));
 }
 
 test "SQL pgwire retained lease releases after detached capsule physical cleanup" {
@@ -2075,6 +2096,7 @@ test "SQL pgwire supervised cleanup retains native stream allocator root and par
     owner.stream.cursor = null;
     owner.stream.after = null;
     owner.stream.settings = null;
+    owner.stream.stream_manager = null;
     var pages: [2]*OwnedRead.PageOwner = undefined;
     for (&pages) |*page| {
         page.* = try alloc.create(OwnedRead.PageOwner);

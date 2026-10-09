@@ -2261,6 +2261,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&participant_team_run.step);
 
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
+    run_api_public_table_http_docid_tests.addArg("--require-no-skips");
     b.step("antfly-api-public-table-http-test", "Run public table HTTP response contracts").dependOn(&run_api_public_table_http_docid_tests.step);
     const mandatory_batch_response_tests = b.addTest(.{
         .name = "api-mandatory-batch-response-tests",
