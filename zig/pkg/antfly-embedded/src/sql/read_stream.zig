@@ -2464,7 +2464,7 @@ test "SQL scoped ordered scans own cursor callbacks preserve ordered quotas and 
     const a = std.testing.allocator;
     for (std.enums.values(Mode)) |mode| {
         Clock.now_ns.store(0, .release);
-        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .checkpoint_budget = 1, .max_operations = if (mode == .registry_full) 2 else 32 });
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 64 * 1024 * 1024, .checkpoint_budget = 1, .max_operations = if (mode == .registry_full) 2 else 32 });
         var cancel: std.atomic.Value(bool) = .init(false);
         var execution: Runnable.Execution = .{};
         try execution.start(&scheduler, .{ .io = std.testing.io, .deadline_ns = 100, .native_now_ns = Clock.now, .cancellation = .{ .ptr = &cancel, .requested = Owner.requested } }, .query);
@@ -2490,6 +2490,7 @@ test "SQL scoped ordered scans own cursor callbacks preserve ordered quotas and 
             const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .retained_bytes = 32 * 1024 * 1024 })).?;
             defer stream.close();
             var first = try stream.nextBatch(137);
+            try std.testing.expect((stream.parallel != null) == (mode != .registry_full));
             var first_owned = true;
             defer if (first_owned) first.deinit();
             try std.testing.expectEqual(@as(usize, 137), first.values.len());

@@ -1660,7 +1660,7 @@ test "lake SQL scoped ordered cursors park physical object reads and retire inde
     try lake.populate(a, 3, &.{ 1, 2, 3 });
     defer lake.deinit(a);
     try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
-    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 64 * 1024 * 1024 });
     var parent_execution: Runnable.Execution = .{};
     try parent_execution.start(&scheduler, .{ .io = std.testing.io }, .query);
     defer parent_execution.finish();
