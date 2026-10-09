@@ -134,8 +134,9 @@ pub fn open(alloc: std.mem.Allocator, native: catalog.Cursor, session: *Session,
     const entries = try session.merged(a);
     var rows: std.ArrayList(catalog.Row) = .empty;
     for (entries) |entry| {
-        if (!std.mem.eql(u8, entry.table.physical_name, table.physical_name) or entry.mutation.predicate_only) continue;
-        if (entry.table.schema_version != table.schema_version) return error.PreparedGenerationChanged;
+        if (!std.mem.eql(u8, entry.table.physical_name, table.physical_name)) continue;
+        if (entry.table.id != table.id or entry.table.schema_version != table.schema_version) return error.PreparedGenerationChanged;
+        if (entry.mutation.predicate_only) continue;
         const mutation = entry.mutation;
         try self.shadowed.put(a, try a.dupe(u8, mutation.key), {});
         const value = mutation.row orelse continue;

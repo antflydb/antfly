@@ -219,18 +219,18 @@ format, not JSON, and always return raw `bytes`.
 A `Database` is safe for concurrent use by multiple threads; share one
 handle rather than opening one per thread. `libantfly` runs in serialized
 threading mode (`antfly_embedded.threading_mode() ==
-antfly_embedded.THREADING_SERIALIZED`): reads such as `search()`, `lookup()`,
-and `scan()` run in parallel with each other and with writes, `batch()` and
-transaction calls on one handle queue instead of failing with `BusyError`,
-and schema or index changes wait for in-flight calls. `close()` waits for
+antfly_embedded.THREADING_SERIALIZED`). Lite calls queue on a connection and
+coordinate with other connections to the file. Streaming SQL cursors retain
+their original snapshots while other connections publish new commits. Schema
+or index changes wait for in-flight calls. `close()` waits for
 in-flight calls on other threads to finish; calls made after `close()`
 raise `InvalidArgumentError`. See `zig/CAPI.md`'s "Thread Safety" section
 for the full C ABI contract.
 
-Only one writer handle may be open per file at a time, across processes.
-Pass `busy_timeout=<seconds or datetime.timedelta>` to `create()`/`open()`
-to wait for another writer to close instead of failing immediately with
-`BusyError`, like `sqlite3_busy_timeout`.
+Multiple writable Lite connections may remain open, including across processes.
+Native operations queue within a process and take a kernel writer lease across
+processes. Pass `busy_timeout=<seconds or datetime.timedelta>` to `create()`/`open()`
+to wait for a competing operation. Closing one connection leaves others usable.
 
 ## Graph edges and index readiness
 
@@ -350,7 +350,7 @@ for row in cursor.execute("SELECT id,name FROM people"):
 connection.close()
 ```
 
-Connections share one native file owner and use READ COMMITTED transactions.
+Connections own independent native handles and use READ COMMITTED transactions.
 By default, the first data statement starts a transaction; `commit()` and
 `rollback()` finish it. `autocommit=True` executes statements independently.
 DDL outside an active transaction commits immediately. Closing a connection

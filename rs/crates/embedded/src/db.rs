@@ -75,9 +75,10 @@ pub fn validate_abi() -> Result<()> {
 ///
 /// `Database` is safe for concurrent use from multiple threads, like
 /// `*sql.DB` in the Go binding: libantfly runs in serialized threading mode
-/// (see [`threading_mode`]) -- reads run in parallel, writes on one handle
-/// queue behind each other instead of failing with `Busy`, and schema or
-/// index changes wait for in-flight calls. [`Database::close`] (and
+/// (see [`threading_mode`]). Lite calls queue on the connection and coordinate
+/// with other connections to the same file. Streaming SQL readers keep their
+/// pinned snapshots while other connections publish changes. Schema or index
+/// changes wait for in-flight calls. [`Database::close`] (and
 /// [`Drop`]) wait for in-flight calls to finish; calls made after close
 /// return [`Error::InvalidArgument`].
 pub struct Database {
@@ -91,11 +92,10 @@ pub struct Database {
 // SAFETY: libantfly's only threading mode is "serialized" (see
 // `antfly_threading_mode`, `ANTFLY_THREADING_SERIALIZED`, and
 // zig/CAPI.md "Thread Safety"): any thread may call any exported function on
-// any handle concurrently -- reads run in parallel, writes on one handle
-// queue behind each other, and schema/admin changes wait for in-flight
-// calls. `HandleGate` above only prevents calling into a handle after
-// `antfly_db_close` has returned (a use-after-free libantfly itself cannot
-// guard against); nothing about `*mut antfly_db` here is thread-affine.
+// any handle concurrently. Lite calls queue on their connection; managed
+// owners coordinate reads, writes, and admin calls inside the engine.
+// `HandleGate` above coordinates Rust close with in-flight calls; nothing
+// about `*mut antfly_db` here is thread-affine.
 unsafe impl Send for Database {}
 unsafe impl Sync for Database {}
 

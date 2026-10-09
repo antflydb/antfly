@@ -723,9 +723,36 @@ pub const HandleGuard = struct {
     parent_slot: ?*HandleRegistry.Slot = null,
     lock_handle: *Handle,
     access: HandleAccess,
+    connection: ?*@import("lite_connection.zig").Connection = null,
+    path_lease: ?lite_backend.native.PathWriterLock = null,
+    entry_error: ?capi.ErrorCode = null,
+    entry_sequence: u64 = 0,
+    pinned_store_readonly: ?bool = null,
 
     pub fn leave(self: HandleGuard) void {
         const io = handleLockIo();
+        if (self.connection) |connection| {
+            if (self.pinned_store_readonly) |was_readonly| {
+                const store = connection.current.?.owned_lite_backend.?.native_docstore.?;
+                store.read_only = was_readonly;
+                store.file.read_only = was_readonly;
+            }
+            if (self.entry_error == null and self.path_lease != null) {
+                if (connection.current) |root| {
+                    if (root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence != self.entry_sequence) connection.notifyMutation();
+                }
+            }
+            connection.collectRetired();
+            if (self.path_lease) |lease| {
+                var owned = lease;
+                owned.close();
+                connection.gate.mutex.unlock(io);
+            }
+            connection.mutex.unlock(io);
+            if (self.parent_slot) |slot| HandleRegistry.leave(slot);
+            HandleRegistry.leave(self.slot);
+            return;
+        }
         switch (self.access) {
             .read => self.lock_handle.api_lock.unlockShared(io),
             .write => {
@@ -748,6 +775,15 @@ pub const HandleGuard = struct {
 /// export, at entry: the lock is not reentrant, so internal helpers must not
 /// call it again.
 pub fn enterHandle(ptr: ?*anyopaque, access: HandleAccess) ?HandleGuard {
+    return enterHandleInternal(ptr, access, false);
+}
+
+/// Cursor continuation uses a previously pinned immutable generation.
+pub fn enterHandlePinned(ptr: ?*anyopaque, access: HandleAccess) ?HandleGuard {
+    return enterHandleInternal(ptr, access, true);
+}
+
+fn enterHandleInternal(ptr: ?*anyopaque, access: HandleAccess, pinned: bool) ?HandleGuard {
     const handle, const slot = handle_registry.enter(ptr) orelse return null;
     var parent_slot: ?*HandleRegistry.Slot = null;
     const lock_handle = if (handle.parent_id) |id| blk: {
@@ -758,6 +794,51 @@ pub fn enterHandle(ptr: ?*anyopaque, access: HandleAccess) ?HandleGuard {
         parent_slot = parent_entry;
         break :blk parent;
     } else handle;
+    if (lock_handle.lite_connection) |connection| {
+        connection.mutex.lockUncancelable(handleLockIo());
+        var guard: HandleGuard = .{ .handle = handle, .lock_handle = lock_handle, .parent_slot = parent_slot, .slot = slot, .access = access, .connection = connection };
+        if (!pinned) {
+            guard.path_lease = connection.acquire() catch |err| {
+                guard.entry_error = capi.mapError(err);
+                return guard;
+            };
+        }
+        const root = if (pinned) connection.current orelse {
+            guard.entry_error = .invalid_argument;
+            return guard;
+        } else connection.refresh() catch |err| {
+            guard.entry_error = capi.mapError(err);
+            return guard;
+        };
+        guard.handle = root;
+        if (pinned) {
+            // Fetch/close may release the final segment reader and invoke its
+            // cleanup callback. No pinned call owns a writer lease, so cleanup
+            // must queue its deletion for a later maintenance boundary.
+            const store = root.owned_lite_backend.?.native_docstore.?;
+            guard.pinned_store_readonly = store.read_only;
+            store.read_only = true;
+            store.file.read_only = true;
+        }
+        guard.entry_sequence = root.owned_lite_backend.?.native_docstore.?.file.activeCheckpoint().commit_sequence;
+        if (handle.parent_id != null) {
+            const database = @import("tables.zig").get(root, handle.selected_table_name orelse "default") catch |err| {
+                guard.entry_error = capi.mapError(err);
+                return guard;
+            };
+            if (database.core.identity_namespace.table_id != handle.selected_table_id) {
+                guard.entry_error = .invalid_argument;
+                return guard;
+            }
+            handle.selected_db = database;
+            handle.parent_handle = root;
+            guard.handle = handle;
+        }
+        if (!pinned) @import("sql_commit.zig").recover(root) catch |err| {
+            guard.entry_error = capi.mapError(err);
+        };
+        return guard;
+    }
     const effective_access = if (lock_handle.embedded_path != null) HandleAccess.exclusive else access;
     const io = handleLockIo();
     switch (effective_access) {
@@ -2214,6 +2295,8 @@ pub const LiteResolvedOpenOptions = struct {
     inference: lite_backend.InferenceOpenOptions = .{},
     generated_enrichment_replay: bool = false,
     busy_timeout_ms: u64 = 0,
+    /// Internal: the connection boundary owns the cross-process path lease.
+    externally_locked: bool = false,
 };
 
 pub fn optionFieldType(comptime Options: type, comptime field_name: []const u8) type {
@@ -2378,7 +2461,7 @@ pub fn openLiteHandleAlloc(
     resolved: LiteResolvedOpenOptions,
     create: bool,
 ) !*Handle {
-    return try openLiteHandleAllocWithRuntime(std.heap.c_allocator, path, resolved, create, null, null);
+    return try @import("lite_connection.zig").open(path, resolved, create);
 }
 
 /// Zig embedding seam behind the C ABI. It constructs the same opaque handle
@@ -2419,24 +2502,37 @@ pub fn openLiteHandleAllocWithRuntime(
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
 ) !*Handle {
     if (create and !liteOpenModeCanWrite(resolved.open_mode)) return error.InvalidArgument;
+    // Each cached generation owns its storage pool. Retired cursors may keep
+    // an older generation alive while the same index roots reopen in this one.
+    var owned_runtime: ?db_mod.background_runtime.BackendRuntimeHandle = if (resolved.externally_locked and backend_runtime == null)
+        try db_mod.background_runtime.BackendRuntimeHandle.initManualWithOwnedIo(alloc)
+    else
+        null;
+    errdefer if (owned_runtime) |*runtime| runtime.deinit();
     var backend = if (create)
         try lite_backend.Handle.createWithOptions(alloc, path, .{
+            .externally_locked = resolved.externally_locked,
             .exclusive = true,
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
         })
     else
         try lite_backend.Handle.open(alloc, path, .{
+            .externally_locked = resolved.externally_locked,
             .read_only = resolved.open_mode == .query_readonly or resolved.open_mode == .status_only,
             .no_sync = resolved.no_sync,
             .io = borrowed_io,
         });
     errdefer backend.deinit();
+    if (resolved.externally_locked) {
+        backend.native_docstore.?.file.externally_locked = true;
+        backend.native_docstore.?.maintenance_start_suppressed = true;
+    }
 
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,
         .external_derived_checkpoints = false,
-        .backend_runtime = backend_runtime,
+        .backend_runtime = if (owned_runtime) |runtime| runtime.runtime else backend_runtime,
     };
     if (resolved.map_size) |map_size| opts.map_size = map_size;
     opts.no_sync = resolved.no_sync;
@@ -2451,6 +2547,12 @@ pub fn openLiteHandleAllocWithRuntime(
         opts.text_merge = .{ .enabled = false };
         opts.sparse_compaction = .{ .enabled = false };
         opts.graph_metric_maintenance = .{ .start_background_loop = false };
+    }
+    if (resolved.externally_locked) {
+        // The connection worker drives maintenance while holding its path lease.
+        opts.executor = .{ .backend = .manual };
+        opts.start_optional_runtime_workers = false;
+        opts.start_resolver_workers = false;
     }
     try backend.configureDbOpenOptions(&opts);
 
@@ -2478,6 +2580,7 @@ pub fn openLiteHandleAllocWithRuntime(
         .db = db,
         .open_mode = resolved.open_mode,
         .owned_lite_backend = backend,
+        .owned_lite_runtime = owned_runtime,
         .embedded_path = try alloc.dupe(u8, path),
         .embedded_open_options = opts,
         .lite_profile = resolved.profile,
@@ -2517,7 +2620,7 @@ pub fn openLiteHandleAllocWithRuntime(
         stopLiteEmbeddedInference(handle);
         return err;
     };
-    handle.database().*.startQuarantineRetryWorkerIfNeeded();
+    if (!resolved.externally_locked) handle.database().*.startQuarantineRetryWorkerIfNeeded();
     return handle;
 }
 
@@ -2693,6 +2796,10 @@ pub fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
 pub export fn antfly_db_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const profile = handle.lite_profile orelse .native;
@@ -2713,6 +2820,10 @@ pub const directory_storage_status: lite_backend.StorageStatus = .{
 pub export fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const storage: lite_backend.StorageStatus = if (handle.owned_lite_backend) |*backend|
@@ -2743,6 +2854,10 @@ pub export fn antfly_db_status_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buf
 
 pub export fn antfly_db_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const out_buf_ptr = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = guard.handle;
@@ -2759,6 +2874,10 @@ pub export fn antfly_db_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) 
 
 pub export fn antfly_db_import_backup(handle_ptr: ?*anyopaque, backup: capi.Slice) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     @import("tables.zig").requireDatabase(handle) catch |err| return capi.mapError(err);
@@ -2876,6 +2995,10 @@ pub export fn antfly_restore_backup_file_json(
 pub export fn antfly_lite_check_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
@@ -2902,6 +3025,10 @@ pub export fn antfly_lite_copy_stable_snapshot_json(
 ) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
@@ -2942,6 +3069,10 @@ pub fn prepareLiteCompact(handle: *Handle) !void {
 pub export fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
@@ -2959,6 +3090,10 @@ pub export fn antfly_lite_compact_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.
 pub export fn antfly_lite_vacuum_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if (handle.owned_lite_backend) |*backend| {
@@ -2975,6 +3110,10 @@ pub const LiteReplayGeneratedEnrichmentsReport = struct {
 pub export fn antfly_db_replay_generated_enrichments_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const replayed = handle.database().*.replayGeneratedEnrichmentsFromStoredDocs(handle.alloc) catch |err| return capi.mapError(err);
@@ -3193,6 +3332,10 @@ pub export fn antfly_db_set_readable_lease_hook(
     callback: ?ReadableLeaseHookFn,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if (callback) |hook| {
@@ -3972,6 +4115,10 @@ pub export fn antfly_db_begin_transaction_with_id(
     participant_count: usize,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
@@ -3988,6 +4135,10 @@ pub export fn antfly_db_write_transaction(
     predicate_count: usize,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
@@ -4006,6 +4157,10 @@ pub export fn antfly_db_batch(
     sync_level: u8,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return .invalid_argument;
@@ -4019,6 +4174,10 @@ pub export fn antfly_db_batch_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     var owned = batch_api.parseBatchRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
@@ -4040,6 +4199,10 @@ pub export fn antfly_db_resolve_intents(
     commit_version: u64,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
@@ -4059,6 +4222,10 @@ pub export fn antfly_db_get_transaction_status(
     out_status: ?*u8,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const out = out_status orelse return .invalid_argument;
     out.* = 0;
@@ -4075,6 +4242,10 @@ pub export fn antfly_db_get_commit_version(
     out_commit_version: ?*u64,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const out = out_commit_version orelse return .invalid_argument;
     out.* = 0;
@@ -4090,6 +4261,10 @@ pub export fn antfly_db_get_timestamp(
     out_timestamp: *u64,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     out_timestamp.* = handle.database().*.getTimestamp(handle.alloc, key.bytes()) catch |err| return capi.mapError(err);
@@ -4102,6 +4277,10 @@ pub export fn antfly_db_lookup_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.prepareLookupRequest(key.bytes(), .{}) catch |err| return capi.mapError(err);
@@ -4120,6 +4299,10 @@ pub export fn antfly_db_get_raw(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const result = handle.database().*.get(handle.alloc, key.bytes()) catch |err| return capi.mapError(err);
@@ -4137,6 +4320,10 @@ pub export fn antfly_db_lookup_artifact_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.prepareLookupRequest(artifact_id_b64.bytes(), .{}) catch |err| return capi.mapError(err);
@@ -4177,6 +4364,10 @@ pub export fn antfly_db_get_schema_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if (handle.database().*.getSchemaJson(handle.alloc) catch |err| return capi.mapError(err)) |schema_json| {
@@ -4192,6 +4383,10 @@ pub export fn antfly_db_set_schema_json(
     schema_json: capi.Slice,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.setSchemaJson(handle.alloc, schema_json.bytes()) catch |err| return capi.mapError(err);
@@ -4200,6 +4395,10 @@ pub export fn antfly_db_set_schema_json(
 
 pub export fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.runUntilIdle() catch |err| return capi.mapError(err);
@@ -4212,6 +4411,10 @@ pub export fn antfly_db_run_until_idle_json(
 ) capi.ErrorCode {
     const out_buf = resetOutBuffer(out_buf_ptr) orelse return .invalid_argument;
     const guard = enterHandle(handle_ptr, .maintain) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.runUntilIdle() catch |err| {
@@ -4244,6 +4447,10 @@ pub export fn antfly_db_pending_work_stats_json(
 ) capi.ErrorCode {
     const out_buf = resetOutBuffer(out_buf_ptr) orelse return .invalid_argument;
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     out_buf.* = stringifyJson(handle.database().*.pendingWorkStats()) catch return .internal;
@@ -4256,6 +4463,10 @@ pub fn antflyDbExtractEnrichmentsJson(
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch return .invalid_argument;
@@ -4277,6 +4488,10 @@ pub fn antflyDbComputeEnrichmentsJson(
     out_buf: *capi.Buffer,
 ) callconv(.c) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const writes = decodeBatchWritesRequest(handle.alloc, request_json.bytes()) catch return .invalid_argument;
@@ -4298,6 +4513,10 @@ pub export fn antfly_db_update_range(
     end: capi.Slice,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.updateRange(.{
@@ -4312,6 +4531,10 @@ pub export fn antfly_db_get_range_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     var payload = JsonRange.init(handle.alloc, handle.database().*.getRange()) catch return .internal;
@@ -4325,6 +4548,10 @@ pub export fn antfly_db_get_split_state_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const state = handle.database().*.getSplitState(handle.alloc) catch |err| return capi.mapError(err);
@@ -4341,6 +4568,10 @@ pub export fn antfly_db_set_split_state_json(
     state_json: capi.Slice,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const ParsedState = struct {
@@ -4376,6 +4607,10 @@ pub export fn antfly_db_set_split_state_json(
 
 pub export fn antfly_db_clear_split_state(handle_ptr: ?*anyopaque) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.clearSplitState() catch |err| return capi.mapError(err);
@@ -4387,6 +4622,10 @@ pub export fn antfly_db_get_split_delta_seq(
     out_seq: *u64,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     out_seq.* = handle.database().*.getSplitDeltaSeq();
@@ -4398,6 +4637,10 @@ pub export fn antfly_db_get_split_delta_final_seq(
     out_seq: *u64,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     out_seq.* = handle.database().*.getSplitDeltaFinalSeq(handle.alloc) catch |err| return capi.mapError(err);
@@ -4409,6 +4652,10 @@ pub export fn antfly_db_set_split_delta_final_seq(
     seq: u64,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.setSplitDeltaFinalSeq(seq) catch |err| return capi.mapError(err);
@@ -4417,6 +4664,10 @@ pub export fn antfly_db_set_split_delta_final_seq(
 
 pub export fn antfly_db_clear_split_delta_final_seq(handle_ptr: ?*anyopaque) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.clearSplitDeltaFinalSeq() catch |err| return capi.mapError(err);
@@ -4429,6 +4680,10 @@ pub export fn antfly_db_list_split_delta_entries_after_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const entries = handle.database().*.listSplitDeltaEntriesAfter(handle.alloc, after_seq) catch |err| return capi.mapError(err);
@@ -4451,6 +4706,10 @@ pub export fn antfly_db_list_split_delta_entries_after_json(
 
 pub export fn antfly_db_clear_split_delta_entries(handle_ptr: ?*anyopaque) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.clearSplitDeltaEntries() catch |err| return capi.mapError(err);
@@ -4462,6 +4721,10 @@ pub export fn antfly_db_list_indexes_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const configs = handle.database().*.listIndexes(handle.alloc) catch |err| return capi.mapError(err);
@@ -4486,6 +4749,10 @@ pub export fn antfly_db_list_enrichments_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const configs = handle.database().*.listEnrichments(handle.alloc) catch |err| return capi.mapError(err);
@@ -4500,6 +4767,10 @@ pub export fn antfly_db_scan_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -4567,6 +4838,10 @@ pub export fn antfly_db_scan_hashes(
     out_result: *capi.ScanHashResult,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -4629,6 +4904,10 @@ pub export fn antfly_db_stats_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const bytes = dbStatsJsonAlloc(handle) catch |err| return capi.mapError(err);
@@ -4893,6 +5172,10 @@ pub fn searchPublicQueryJson(
 pub export fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out_buf: *capi.Buffer) capi.ErrorCode {
     out_buf.* = .{};
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if (handle.parent_id != null) return .invalid_argument;
@@ -5045,6 +5328,10 @@ pub export fn antfly_db_search_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if (requestLooksLikePublicQueryJson(request_json.bytes())) {
@@ -5213,6 +5500,10 @@ pub export fn antfly_db_search_dense(
     out_result: *capi.PackedDenseSearchResult,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if (vector_ptr == null or vector_len == 0) return .invalid_argument;
@@ -5240,6 +5531,10 @@ pub export fn antfly_db_search_dense_profile(
     out_profile: *capi.DenseSearchProfile,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     if (vector_ptr == null or vector_len == 0) return .invalid_argument;
@@ -5278,6 +5573,10 @@ pub export fn antfly_db_search_dense_profile(
 
 pub export fn antfly_db_dense_noop(handle_ptr: ?*anyopaque) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     _ = guard.handle;
     return .ok;
@@ -5288,6 +5587,10 @@ pub export fn antfly_db_dense_fixed_packed_result(
     out_result: *capi.PackedDenseSearchResult,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
 
@@ -5303,6 +5606,10 @@ pub export fn antfly_db_search_dense_wire(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
 
@@ -5331,6 +5638,10 @@ pub export fn antfly_db_search_dense_wire_profile(
     out_profile: *capi.DenseWireSearchProfile,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
 
@@ -5379,6 +5690,10 @@ pub export fn antfly_db_search_text_match(
     out_result: *capi.DenseSearchResult,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     var owned = searchTextMatchOwned(handle, index_name.bytes(), field.bytes(), text.bytes(), "", 1.0, limit, offset) catch |err| return capi.mapError(err);
@@ -5417,6 +5732,10 @@ pub export fn antfly_db_search_text_match_wire(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
 
@@ -5436,6 +5755,10 @@ pub export fn antfly_db_search_text_term_wire(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
 
@@ -5455,6 +5778,10 @@ pub export fn antfly_db_search_text_match_phrase_wire(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
 
@@ -5474,6 +5801,10 @@ pub export fn antfly_db_search_hits_json(
     out_result: *capi.DenseSearchResult,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -6057,6 +6388,10 @@ pub export fn antfly_db_execute_graph_queries_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -6128,6 +6463,10 @@ pub export fn antfly_db_aggregate_hits_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     var parsed = std.json.parseFromSlice(JsonAggregateHitsRequest, handle.alloc, request_json.bytes(), .{}) catch return .invalid_argument;
@@ -6388,6 +6727,10 @@ pub export fn antfly_db_add_index_json(
     config_json: capi.Slice,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -6473,6 +6816,10 @@ pub export fn antfly_db_delete_index(
     out_deleted: ?*bool,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const out = out_deleted orelse return .invalid_argument;
     out.* = false;
@@ -6486,6 +6833,10 @@ pub export fn antfly_db_add_enrichment_json(
     config_json: capi.Slice,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     var parsed = std.json.parseFromSlice(db_mod.types.EnrichmentConfig, handle.alloc, config_json.bytes(), .{
@@ -6504,6 +6855,10 @@ pub export fn antfly_db_delete_enrichment(
     out_deleted: ?*bool,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const out = out_deleted orelse return .invalid_argument;
     out.* = false;
@@ -6522,6 +6877,10 @@ pub export fn antfly_db_get_edges_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const dir: db_mod.types.GraphEdgeDirection = switch (direction) {
@@ -6552,6 +6911,10 @@ pub export fn antfly_db_traverse_edges_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -6614,6 +6977,10 @@ pub export fn antfly_db_get_neighbors_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const dir: db_mod.types.GraphEdgeDirection = switch (direction) {
@@ -6644,6 +7011,10 @@ pub export fn antfly_db_find_shortest_path_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -6701,6 +7072,10 @@ pub export fn antfly_db_find_k_shortest_paths_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const Request = struct {
@@ -6766,6 +7141,10 @@ pub export fn antfly_db_match_pattern_json(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const JsonPatternNodeFilter = struct {
@@ -6859,6 +7238,10 @@ pub export fn antfly_db_create_shadow_index_manager(
     original_range_end: capi.Slice,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.createShadowIndexManager(split_key.bytes(), original_range_end.bytes()) catch |err| return capi.mapError(err);
@@ -6867,6 +7250,10 @@ pub export fn antfly_db_create_shadow_index_manager(
 
 pub export fn antfly_db_close_shadow_index_manager(handle_ptr: ?*anyopaque) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.closeShadowIndexManager() catch |err| return capi.mapError(err);
@@ -6878,6 +7265,10 @@ pub export fn antfly_db_get_shadow_index_dir(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const dir = handle.database().*.getShadowIndexDir();
@@ -6891,6 +7282,10 @@ pub export fn antfly_db_find_median_key(
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .read) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     const key = handle.database().*.findMedianKey(handle.alloc) catch |err| return capi.mapError(err);
@@ -6909,6 +7304,10 @@ pub export fn antfly_db_split(
     prepare_only: bool,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.split(
@@ -6930,6 +7329,10 @@ pub export fn antfly_db_finalize_split(
     new_end: capi.Slice,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .exclusive) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     handle.database().*.finalizeSplit(.{
@@ -6945,6 +7348,10 @@ pub export fn antfly_db_snapshot(
     out_size: *u64,
 ) capi.ErrorCode {
     const guard = enterHandle(handle_ptr, .write) orelse return .invalid_argument;
+    if (guard.entry_error) |code| {
+        guard.leave();
+        return code;
+    }
     defer guard.leave();
     const handle = guard.handle;
     out_size.* = handle.database().*.snapshot(id.bytes()) catch |err| return capi.mapError(err);

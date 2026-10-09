@@ -122,9 +122,11 @@ func TestLiteOpenModeConcurrency(t *testing.T) {
 	}
 	defer writer.Close()
 
-	if _, err := Open(path); err != Busy {
-		t.Fatalf("second writer error = %v, want %v", err, Busy)
+	second, err := Open(path)
+	if err != nil {
+		t.Fatalf("open independent writer: %v", err)
 	}
+	defer second.Close()
 
 	readonly, err := OpenReadonly(path)
 	if err != nil {
@@ -745,8 +747,8 @@ func TestLiteCAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("copy pinned reader snapshot: %v", err)
 	}
-	if pinnedSnapshotReport.TailBytes == 0 {
-		t.Fatalf("pinned snapshot report did not observe writer tail: %#v", pinnedSnapshotReport)
+	if pinnedSnapshotReport.CheckpointSequence == 0 || pinnedSnapshotReport.PageCount == 0 {
+		t.Fatalf("snapshot report lacks a committed checkpoint: %#v", pinnedSnapshotReport)
 	}
 	pinnedSnapshotCheck, err := CheckFile(pinnedSnapshotPath)
 	if err != nil {
@@ -766,8 +768,8 @@ func TestLiteCAPI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lookup pinned snapshot: %v", err)
 	}
-	if !bytes.Contains(pinnedSnapshotLookup, []byte("pinned-before")) || bytes.Contains(pinnedSnapshotLookup, []byte("pinned-after")) {
-		t.Fatalf("pinned snapshot lookup JSON %q did not preserve reader checkpoint", pinnedSnapshotLookup)
+	if !bytes.Contains(pinnedSnapshotLookup, []byte("pinned-after-b")) {
+		t.Fatalf("snapshot lookup JSON %q did not observe the latest committed checkpoint", pinnedSnapshotLookup)
 	}
 	pinnedWriterLookup, err := db.LookupJSON("doc:go-pinned")
 	if err != nil {
