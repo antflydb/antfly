@@ -1911,6 +1911,25 @@ unchanged component gates on the final run). Inventory, control-catalog,
 formatting and whitespace checks pass. An initial combined compile exhausted
 local disk space; after removing only obsolete generated binaries/objects, the
 final native and component gates passed separately.
+Publication verification now has an owned resumable scan over one pinned
+metadata snapshot. Each step verifies at most one bounded source/candidate
+page; the existing synchronous helper shares that verifier rather than a
+second proof implementation. The handle has a stable address for borrowed
+prefixes/transaction references. Source cursors are released on phase handoff;
+completion, cancellation and errors close all remaining cursors and release
+the snapshot immediately. Completed proof reads are idempotent, while a
+canceled/failed scan cannot resume or expose partial evidence. Hosts must still
+bound idle scan lifetime, because pinned engine snapshots retain old pages.
+The 70-target regression checks yielding after 64 source rows, independent
+candidate verification, cancellation in both phases and an intervening commit.
+That commit cannot splice newer pages into the old scan; the resulting proof
+fails its write-transaction epoch fence. Actual admitted restore fixtures run
+exhaustive allocation failures through both borrowed-transaction verification
+and the owned snapshot handle. The final native gate passes 170 catalog and
+22 linked storage tests without failures/leaks; inventory, control-catalog,
+formatting and whitespace checks pass. Coordinator scan scheduling,
+capability/lifecycle barriers, automatic writer adoption and atomic root
+publication remain unfinished. No original SQL disposition is changed.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,

@@ -6866,6 +6866,38 @@ test "system catalog restore reconciliation authenticates source phases and cano
     try std.testing.expectEqual(@as(u64, 210), ready.expected.claims);
     const proof = try store.prepareRelationPublicationProof(a, ready);
     {
+        const scan = try store.beginRelationPublicationScan(a, ready);
+        defer scan.deinit();
+        try std.testing.expect((try scan.step(null)) == null);
+        try std.testing.expectEqual(@as(u64, 64), scan.verifier.state.pass.rows);
+        try std.testing.expect(scan.open);
+        var steps: usize = 1;
+        while (true) {
+            steps += 1;
+            if (try scan.step(null)) |finished| {
+                try std.testing.expect(std.meta.eql(proof, finished));
+                break;
+            }
+        }
+        try std.testing.expect(steps >= 4);
+        try std.testing.expect(!scan.open);
+        try std.testing.expect(std.meta.eql(proof, (try scan.step(null)).?));
+    }
+    // Both source and candidate phases release every cursor/owned plan on
+    // cancellation. No partial source seal can be returned as a proof.
+    for ([_]bool{ false, true }) |candidate_phase| {
+        const scan = try store.beginRelationPublicationScan(a, ready);
+        defer scan.deinit();
+        if (candidate_phase) while (scan.verifier.state.phase == .verifying_source) {
+            try std.testing.expect((try scan.step(null)) == null);
+        };
+        var cancelled = std.atomic.Value(bool).init(true);
+        try std.testing.expectError(error.CatalogPublicationScanCancelled, scan.step(&cancelled));
+        try std.testing.expect(!scan.open);
+        try std.testing.expectError(error.CatalogPublicationScanClosed, scan.step(null));
+        scan.cancel();
+    }
+    {
         var txn = try store.store.beginWriteTxn();
         defer txn.abort();
         try std.testing.expect(try proof.matchesTxn(&txn));
@@ -6921,6 +6953,24 @@ test "system catalog restore reconciliation authenticates source phases and cano
         try txn.put(key, &(try forged.encode()));
         try std.testing.expectError(error.InvalidCatalogRecord, store.verifyReconciliationSourceOwnersTxn(&txn, group, &journal));
         try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.prepareRelationPublicationProofTxn(a, &txn, ready));
+    }
+    {
+        const scan = try store.beginRelationPublicationScan(a, ready);
+        defer scan.deinit();
+        try std.testing.expect((try scan.step(null)) == null);
+        // New commits must not splice a later source page into this scan.
+        // Its final scalar proof remains fenced by the original epoch/index.
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try r.advanceSource(&txn, group);
+        try txn.commit();
+        while (true) if (try scan.step(null)) |finished| {
+            try std.testing.expect(std.meta.eql(proof, finished));
+            var current = try store.store.beginReadTxn();
+            defer current.abort();
+            try std.testing.expect(!try finished.matchesTxn(&current));
+            break;
+        };
     }
 }
 
@@ -7142,6 +7192,16 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         var read = try store.store.beginReadTxn();
         defer read.abort();
         const Probe = struct {
+            fn scan(a: std.mem.Allocator, owner: *RaftApplyStore, state: relation_reconciliation.State) !void {
+                const verification = try owner.beginRelationPublicationScan(a, state);
+                defer verification.deinit();
+                while (true) if (try verification.step(null)) |proof| {
+                    var txn = try owner.store.beginReadTxn();
+                    defer txn.abort();
+                    try std.testing.expect(try proof.matchesTxn(&txn));
+                    break;
+                };
+            }
             fn publication(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, state: relation_reconciliation.State) !void {
                 const proof = try RaftApplyStore.prepareRelationPublicationProofTxn(a, txn, state);
                 try std.testing.expect(try proof.matchesTxn(txn));
@@ -7163,7 +7223,10 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         var no_resize = std.testing.FailingAllocator.init(alloc, .{ .resize_fail_index = 0 });
         try std.testing.checkAllAllocationFailures(no_resize.allocator(), Probe.prepare, .{ &read, group });
         try Probe.publication(alloc, &read, namespace_ready);
-        if (cancel and !compound) try std.testing.checkAllAllocationFailures(no_resize.allocator(), Probe.publication, .{ &read, namespace_ready });
+        if (cancel and !compound) {
+            try std.testing.checkAllAllocationFailures(no_resize.allocator(), Probe.publication, .{ &read, namespace_ready });
+            try std.testing.checkAllAllocationFailures(no_resize.allocator(), Probe.scan, .{ &store, namespace_ready });
+        }
         break :blk try RaftApplyStore.relationSourceCutTxn(alloc, &read, group, 2);
     };
     const artifacts = [_]restore_staging.SourceArtifact{.{ .target_group_id = 401, .source_namespace = source.fence.namespace, .format = .portable, .snapshot_path = "cut/source.afb2", .artifact_size_bytes = 100, .artifact_sha256 = @splat(7), .rewrite = .{ .program_digest = @splat(6), .retained_pin = source.pin(), .snapshot_certificate = @splat(7), .retained_epoch = 1, .retained_start = 8, .source_applied_index = 20, .source_scope = source } }};
@@ -17115,49 +17178,127 @@ pub const RaftApplyStore = struct {
     };
 
     pub fn prepareRelationPublicationProof(self: *RaftApplyStore, a: std.mem.Allocator, expected: relation_reconciliation.State) !RelationPublicationProof {
-        var read = try self.store.beginReadTxn();
-        defer read.abort();
-        return prepareRelationPublicationProofTxn(a, &read, expected);
+        const scan = try self.beginRelationPublicationScan(a, expected);
+        defer scan.deinit();
+        while (true) if (try scan.step(null)) |proof| return proof;
     }
 
-    fn prepareRelationPublicationProofTxn(a: std.mem.Allocator, read: *docstore.DocStore.Txn, expected: relation_reconciliation.State) !RelationPublicationProof {
-        const r = relation_reconciliation;
-        _ = try expected.encode();
-        if (expected.phase != .ready or expected.failure != .none) return error.InvalidCatalogRecord;
-        const observed = try PreparedRelationBatch.capture(read, expected.group_id);
-        if (!std.meta.eql(observed.job, @as(?r.State, expected)) or observed.epoch == null or !observed.epoch.?.eql(expected.epoch)) return error.CatalogGenerationChanged;
-        // Root ancestry and retirement protection are independent of the
-        // candidate's source seal and must not be vouched for by that seal.
-        _ = try r.Verifier(docstore.DocStore.Txn).init(read, expected.group_id);
-        var buffers: RelationSourceBuffers = undefined;
-        var source = try relationTableSource(a, read, expected.group_id, &buffers);
-        defer source.deinit();
-        var state = expected;
-        state.phase = .verifying_source;
-        var candidate: r.CandidateStore(docstore.DocStore.Txn) = .{ .txn = read, .state = &expected };
-        // Each temporary plan owns at most one ordinary page. The source keeps
-        // one restore-plan projection, not a whole-catalog/name map.
-        while (state.phase == .verifying_source) {
-            var page = try r.Page.prepareSource(a, state, expected.epoch, &source);
-            defer page.deinit();
-            page.plan.verifyContributions(&candidate) catch |err| switch (err) {
-                // Both cuts are pinned here: an owner mismatch is corruption,
-                // not a concurrent writer that a caller should simply retry.
-                error.CatalogGenerationChanged => return error.InvalidCatalogRecord,
-                else => return err,
+    /// Stable-address owner of a pinned read snapshot and its lexical cursors.
+    /// Each step processes at most one ordinary bounded page. Callers must
+    /// bound the scan lifetime too: an idle snapshot can retain engine pages.
+    /// Completion, cancellation and errors release the snapshot immediately.
+    pub const RelationPublicationScan = struct {
+        a: std.mem.Allocator,
+        read: docstore.DocStore.Txn,
+        verifier: RelationPublicationVerifier,
+        open: bool = true,
+        proof: ?RelationPublicationProof = null,
+
+        pub fn deinit(self: *@This()) void {
+            const a = self.a;
+            self.cancel();
+            a.destroy(self);
+        }
+        pub fn cancel(self: *@This()) void {
+            if (!self.open) return;
+            self.verifier.deinit();
+            self.read.abort();
+            self.open = false;
+        }
+        /// null means another bounded step is required, never partial proof.
+        /// After an error/cancel the handle is closed and cannot be resumed.
+        pub fn step(self: *@This(), cancelled: ?*const std.atomic.Value(bool)) !?RelationPublicationProof {
+            if (self.proof) |proof| return proof;
+            if (!self.open) return error.CatalogPublicationScanClosed;
+            if (cancelled) |flag| if (flag.load(.acquire)) {
+                self.cancel();
+                return error.CatalogPublicationScanCancelled;
             };
-            state = page.after;
+            const proof = self.verifier.step() catch |err| {
+                self.cancel();
+                return err;
+            };
+            if (proof) |value| {
+                self.proof = value;
+                self.cancel();
+            }
+            return proof;
         }
-        var buf: [r.max_cursor_bytes]u8 = undefined;
-        var entries: RelationCursor = .{ .cursor = try read.openCursor(), .prefix = try r.candidatePrefix(&buf, &expected) };
-        defer entries.cursor.close();
-        while (state.phase == .verifying_candidate) {
-            var page = try r.Page.prepareCandidate(a, state, expected.epoch, &entries);
+    };
+
+    pub fn beginRelationPublicationScan(self: *RaftApplyStore, a: std.mem.Allocator, expected: relation_reconciliation.State) !*RelationPublicationScan {
+        const scan = try a.create(RelationPublicationScan);
+        errdefer a.destroy(scan);
+        scan.* = .{ .a = a, .read = try self.store.beginReadTxn(), .verifier = undefined };
+        errdefer scan.read.abort();
+        try scan.verifier.init(a, &scan.read, expected);
+        return scan;
+    }
+
+    /// Shared verifier for owned scans and tests against a caller's private
+    /// transaction. Initialize in place: source slices point into these buffers.
+    const RelationPublicationVerifier = struct {
+        a: std.mem.Allocator,
+        read: *docstore.DocStore.Txn,
+        proof: RelationPublicationProof,
+        state: relation_reconciliation.State,
+        buffers: RelationSourceBuffers = undefined,
+        candidate_buf: [relation_reconciliation.max_cursor_bytes]u8 = undefined,
+        source: ?RelationTableSource = null,
+        entries: ?RelationCursor = null,
+
+        fn init(self: *@This(), a: std.mem.Allocator, read: *docstore.DocStore.Txn, expected: relation_reconciliation.State) !void {
+            const r = relation_reconciliation;
+            _ = try expected.encode();
+            if (expected.phase != .ready or expected.failure != .none) return error.InvalidCatalogRecord;
+            const observed = try PreparedRelationBatch.capture(read, expected.group_id);
+            if (!std.meta.eql(observed.job, @as(?r.State, expected)) or observed.epoch == null or !observed.epoch.?.eql(expected.epoch)) return error.CatalogGenerationChanged;
+            // Ancestry/retirement are independent of the candidate source seal.
+            _ = try r.Verifier(docstore.DocStore.Txn).init(read, expected.group_id);
+            self.* = .{ .a = a, .read = read, .proof = .{ .state = expected, .applied_index = observed.applied_index, .root = observed.root }, .state = expected };
+            self.state.phase = .verifying_source;
+            self.source = try relationTableSource(a, read, expected.group_id, &self.buffers);
+        }
+        fn deinit(self: *@This()) void {
+            if (self.source) |*source| source.deinit();
+            if (self.entries) |*entries| entries.cursor.close();
+            self.source = null;
+            self.entries = null;
+        }
+        fn step(self: *@This()) !?RelationPublicationProof {
+            const r = relation_reconciliation;
+            if (self.state.phase == .ready) return self.proof;
+            if (self.state.phase == .verifying_source) {
+                var page = try r.Page.prepareSource(self.a, self.state, self.proof.state.epoch, &self.source.?);
+                defer page.deinit();
+                var candidate: r.CandidateStore(docstore.DocStore.Txn) = .{ .txn = self.read, .state = &self.proof.state };
+                page.plan.verifyContributions(&candidate) catch |err| switch (err) {
+                    // A disagreement inside this pinned cut is corruption.
+                    error.CatalogGenerationChanged => return error.InvalidCatalogRecord,
+                    else => return err,
+                };
+                self.state = page.after;
+                if (self.state.phase == .verifying_candidate) {
+                    self.source.?.deinit();
+                    self.source = null;
+                }
+                return null;
+            }
+            if (self.entries == null) self.entries = .{ .cursor = try self.read.openCursor(), .prefix = try r.candidatePrefix(&self.candidate_buf, &self.proof.state) };
+            var page = try r.Page.prepareCandidate(self.a, self.state, self.proof.state.epoch, &self.entries.?);
             defer page.deinit();
-            state = page.after;
+            self.state = page.after;
+            if (self.state.phase != .ready) return null;
+            if (!std.meta.eql(self.state, self.proof.state)) return error.InvalidCatalogRecord;
+            return self.proof;
         }
-        if (!std.meta.eql(state, expected)) return error.InvalidCatalogRecord;
-        return .{ .state = expected, .applied_index = observed.applied_index, .root = observed.root };
+    };
+
+    fn prepareRelationPublicationProofTxn(a: std.mem.Allocator, read: *docstore.DocStore.Txn, expected: relation_reconciliation.State) !RelationPublicationProof {
+        var verifier: RelationPublicationVerifier = undefined;
+        try verifier.init(a, read, expected);
+        defer verifier.deinit();
+        while (true) if (try verifier.step()) |proof| return proof;
     }
 
     const RelationSourceBuffers = struct {
