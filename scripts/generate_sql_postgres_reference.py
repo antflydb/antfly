@@ -566,10 +566,53 @@ def cursor_result(cursor, case, read):
     }
 
 
+INDEX_OWNER_PROFILES = {
+    "partial-active-email": (
+        "usage_records_active_email_key",
+        "CREATE UNIQUE INDEX usage_records_active_email_key ON usage_records (email) WHERE status = 'active'",
+    ),
+    "lower-email": (
+        "usage_records_lower_email_key",
+        "CREATE UNIQUE INDEX usage_records_lower_email_key ON usage_records (lower(email))",
+    ),
+    "tenant-lower-email": (
+        "usage_records_tenant_lower_email_key",
+        "CREATE UNIQUE INDEX usage_records_tenant_lower_email_key ON usage_records (tenant_id, lower(email))",
+    ),
+    "upper-email": (
+        "usage_records_upper_email_key",
+        "CREATE UNIQUE INDEX usage_records_upper_email_key ON usage_records (upper(email))",
+    ),
+}
+
+
 def mutation_profile(constraint_profile="base"):
     """Explicit owner preconditions, never inferred from a successful query."""
     profile = json.loads((FIXTURES / "sql_mutation_campaign_profile.json").read_text())
     if constraint_profile == "base":
+        return profile
+    if constraint_profile in INDEX_OWNER_PROFILES:
+        name, ddl = INDEX_OWNER_PROFILES[constraint_profile]
+        profile["description"] = (
+            "Explicit native index-owner activation with unchanged original "
+            "SQL, parameters and seed rows; complete three-table postimages."
+        )
+        profile["index_owner_profile"] = constraint_profile
+        profile["index_owner_ddl"] = ddl
+        profile["admission_probes"] = [
+            {
+                "sql": "INSERT INTO usage_records(id,tenant_id,email,status) VALUES ('index_probe','t1','a@example.test','active')",
+                "sqlstate": "23505",
+            },
+            {
+                "sql": f"INSERT INTO usage_records(id) VALUES ('index_probe') ON CONFLICT ON CONSTRAINT {name} DO NOTHING",
+                "sqlstate": "42704",
+            },
+            {
+                "sql": "INSERT INTO usage_records(id,email) VALUES ('index_probe','a@example.test') ON CONFLICT(email) DO NOTHING",
+                "sqlstate": "42P10",
+            },
+        ]
         return profile
     if constraint_profile != "unique-email":
         raise ValueError("unknown mutation constraint profile")
@@ -614,6 +657,19 @@ def mutation_reference(
         raise ValueError("invalid mutation reference row limit")
     if not 0 < byte_limit <= 64 * 1024 * 1024:
         raise ValueError("invalid mutation reference byte limit")
+    # These are declared fixture preconditions, not a user-supplied SQL hook.
+    # Keep the exact canonical DDL in the output for native compiler activation,
+    # and fail closed on missing, altered, or undeclared owner definitions.
+    owner_profile = profile.get("index_owner_profile")
+    owner_ddl = profile.get("index_owner_ddl")
+    if owner_profile is not None or owner_ddl is not None:
+        if (
+            not isinstance(owner_profile, str)
+            or owner_profile not in INDEX_OWNER_PROFILES
+            or owner_ddl != INDEX_OWNER_PROFILES[owner_profile][1]
+            or profile.get("unique")
+        ):
+            raise ValueError("invalid declared index owner profile")
 
     class StreamingMutationCursor(psycopg.RawCursor):
         terminal = None
@@ -720,6 +776,8 @@ def mutation_reference(
                         sql.SQL(",").join(map(sql.Identifier, columns)),
                     )
                 )
+        if owner_ddl is not None:
+            db.execute(owner_ddl)
         probes = profile.get("admission_probes", [])
         if len(probes) > 128:
             raise ValueError("mutation admission probes exceed the profile budget")
@@ -1205,17 +1263,27 @@ def main():
     )
     parser.add_argument(
         "--constraint-profile",
-        choices=["base", "unique-email"],
+        choices=["base", "unique-email", *INDEX_OWNER_PROFILES],
         default="base",
         help="explicit mutation constraint-owner profile (does not rewrite source SQL)",
     )
+    parser.add_argument(
+        "--only-id",
+        action="append",
+        default=[],
+        help="generate an explicit unchanged source cohort; cannot narrow a checked golden",
+    )
     args = parser.parse_args()
+    if args.only_id and (args.check or args.include):
+        parser.error("--only-id cannot narrow a checked golden")
     if args.constraint_profile != "base" and args.campaign != "mutation":
         parser.error("constraint profiles require the mutation campaign")
     if args.include and not args.check:
         parser.error("--include requires a checked baseline golden")
     manifest = json.loads((FIXTURES / f"sql_{args.campaign}_campaign.json").read_text())
     requested = [entry["id"] for entry in manifest["entries"]]
+    if args.only_id:
+        requested = args.only_id
     expected = json.loads(args.check.read_text()) if args.check else None
     if expected:
         requested = [entry["id"] for entry in expected["entries"]]

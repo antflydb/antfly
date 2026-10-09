@@ -62,6 +62,16 @@
       "cwd": ".",
       "timeout_seconds": 120
     },
+    "sql-native-expression-arbiters": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL partial and expression arbiters", "-Dtest-filter=httpx SQL PostgreSQL inferred unique indexes", "-Dtest-filter=httpx SQL PostgreSQL UNIQUE arbiters"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
+    "sql-schema-owner-lifetimes": {
+      "command": ["zig", "build", "antfly-schema-expression-test", "--cache-dir", ".zig-cache/sql-parity-evidence"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "sql-native-index-owner-boundary": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL inferred unique indexes", "-Dtest-filter=httpx SQL PostgreSQL UNIQUE arbiters", "-Dtest-filter=SQL schema cache"],
       "cwd": "zig",
@@ -14005,8 +14015,13 @@
     },
     {
       "id": "sql-1455",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes against canonical CREATE UNIQUE INDEX activation for its declared partial/expression owner. Exact PostgreSQL output metadata, SQL NULL provenance and complete three-table postimages match mounted native execution. Independent duplicate, named-index-alias and wrong-inference probes fail closed without mutation; point-owner lookup requires no unbounded reads or statement capture. Nested predicate/expression metadata survives source DOM retirement under allocation faults. No broader DDL namespace or distributed-fault completion is claimed.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL partial and expression arbiters preserve complete native postimages","gate":"sql-native-expression-arbiters"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL partial and expression arbiters preserve complete native postimages","gate":"sql-postgres-oracle-contracts"},
+        {"path":"zig/pkg/antfly-embedded/src/schema/table_schema_impl.zig","test":"relational declarations own nested unique predicates and expressions after source DOM retirement","gate":"sql-schema-owner-lifetimes"}
+      ]
     },
     {
       "id": "sql-1456",
@@ -14020,8 +14035,13 @@
     },
     {
       "id": "sql-1458",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes against canonical CREATE UNIQUE INDEX activation for its declared partial/expression owner. Exact PostgreSQL output metadata, SQL NULL provenance and complete three-table postimages match mounted native execution. Independent duplicate, named-index-alias and wrong-inference probes fail closed without mutation; point-owner lookup requires no unbounded reads or statement capture. Nested predicate/expression metadata survives source DOM retirement under allocation faults. No broader DDL namespace or distributed-fault completion is claimed.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL partial and expression arbiters preserve complete native postimages","gate":"sql-native-expression-arbiters"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL partial and expression arbiters preserve complete native postimages","gate":"sql-postgres-oracle-contracts"},
+        {"path":"zig/pkg/antfly-embedded/src/schema/table_schema_impl.zig","test":"relational declarations own nested unique predicates and expressions after source DOM retirement","gate":"sql-schema-owner-lifetimes"}
+      ]
     },
     {
       "id": "sql-1459",
@@ -14030,13 +14050,23 @@
     },
     {
       "id": "sql-1460",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes against canonical CREATE UNIQUE INDEX activation for its declared partial/expression owner. Exact PostgreSQL output metadata, SQL NULL provenance and complete three-table postimages match mounted native execution. Independent duplicate, named-index-alias and wrong-inference probes fail closed without mutation; point-owner lookup requires no unbounded reads or statement capture. Nested predicate/expression metadata survives source DOM retirement under allocation faults. No broader DDL namespace or distributed-fault completion is claimed.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL partial and expression arbiters preserve complete native postimages","gate":"sql-native-expression-arbiters"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL partial and expression arbiters preserve complete native postimages","gate":"sql-postgres-oracle-contracts"},
+        {"path":"zig/pkg/antfly-embedded/src/schema/table_schema_impl.zig","test":"relational declarations own nested unique predicates and expressions after source DOM retirement","gate":"sql-schema-owner-lifetimes"}
+      ]
     },
     {
       "id": "sql-1461",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes against canonical CREATE UNIQUE INDEX activation for its declared partial/expression owner. Exact PostgreSQL output metadata, SQL NULL provenance and complete three-table postimages match mounted native execution. Independent duplicate, named-index-alias and wrong-inference probes fail closed without mutation; point-owner lookup requires no unbounded reads or statement capture. Nested predicate/expression metadata survives source DOM retirement under allocation faults. No broader DDL namespace or distributed-fault completion is claimed.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL partial and expression arbiters preserve complete native postimages","gate":"sql-native-expression-arbiters"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL partial and expression arbiters preserve complete native postimages","gate":"sql-postgres-oracle-contracts"},
+        {"path":"zig/pkg/antfly-embedded/src/schema/table_schema_impl.zig","test":"relational declarations own nested unique predicates and expressions after source DOM retirement","gate":"sql-schema-owner-lifetimes"}
+      ]
     },
     {
       "id": "sql-1462",

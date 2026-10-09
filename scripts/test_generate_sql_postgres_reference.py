@@ -71,6 +71,9 @@ class ReferenceExtensionTest(unittest.TestCase):
             ["read", "--include", "sql-0561"],
             ["read", "--check", golden, "--include", "sql-not-a-case"],
             ["read", "--check", golden, "--include", "sql-0561"],
+            ["read", "--check", golden, "--only-id", "sql-0561"],
+            ["mutation", "--only-id", "sql-unknown"],
+            ["mutation", "--only-id", "sql-1455", "--only-id", "sql-1455"],
         ):
             with self.subTest(arguments=arguments):
                 with (
@@ -1919,6 +1922,59 @@ class PostgresReferenceTest(unittest.TestCase):
             {"usage_records", "archived_records", "source_records"},
             set(result["entries"][0]["final_tables"]),
         )
+
+    def test_original_partial_and_expression_arbiters_require_declared_index_owners(
+        self,
+    ):
+        import json
+        from generate_sql_postgres_reference import mutation_profile
+
+        inventory = json.loads((FIXTURES / "sql_parity_inventory.json").read_text())[
+            "entries"
+        ]
+        base = mutation_profile()
+        for owner, case_id, fixture in (
+            ("partial-active-email", "sql-1455", "partial"),
+            ("lower-email", "sql-1458", "lower"),
+            ("tenant-lower-email", "sql-1460", "mixed"),
+            ("upper-email", "sql-1461", "upper"),
+        ):
+            with self.subTest(owner=owner):
+                profile = mutation_profile(owner)
+                self.assertEqual(base["rows"], profile["rows"])
+                self.assertEqual(base["schema"], profile["schema"])
+                self.assertEqual(
+                    base["additional_tables"], profile["additional_tables"]
+                )
+                cases = [case for case in inventory if case["id"] == case_id]
+                self.assertEqual(1, len(cases))
+                result = mutation_reference(self.db, cases, profile)
+                self.assertEqual([], result["excluded"])
+                golden = json.loads(
+                    (
+                        FIXTURES / f"sql_{fixture}_mutation_postgres_reference.json"
+                    ).read_text()
+                )
+                self.assertEqual(profile, golden["profile"])
+                self.assertEqual(result["entries"], golden["entries"])
+                entry = result["entries"][0]
+                self.assertEqual([["u1", "new"]], entry["rows"])
+                self.assertEqual([25, 25], entry["column_oids"])
+                self.assertEqual(1, entry["affected"])
+                self.assertEqual(
+                    {"usage_records", "archived_records", "source_records"},
+                    set(entry["final_tables"]),
+                )
+                # No ordinary uniqueness may accidentally stand in for this
+                # partial/expression owner; its declaration is authoritative.
+                for changed in (
+                    {"index_owner_ddl": "SELECT 1"},
+                    {"index_owner_profile": "unknown"},
+                    {"index_owner_profile": None},
+                    {"unique": [["email"]]},
+                ):
+                    with self.assertRaisesRegex(ValueError, "declared index owner"):
+                        mutation_reference(self.db, cases, profile | changed)
 
     def test_unique_mutation_admission_probes_fail_closed(self):
         from generate_sql_postgres_reference import mutation_profile

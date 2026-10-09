@@ -2728,7 +2728,12 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
 
 fn parseRelationalDeclarations(comptime T: type, alloc: std.mem.Allocator, value: std.json.Value) !std.json.Parsed([]const T) {
     if (value != .array or value.array.items.len > 256) return error.InvalidSchemaUpdateRequest;
-    var parsed = std.json.parseFromValue([]const T, alloc, value, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+    // Dynamic expression/predicate operands borrow through parseFromValue,
+    // even with alloc_always. The schema epoch must own every nested value
+    // after the request DOM retires, just as index and CHECK declarations do.
+    const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(bytes);
+    var parsed = std.json.parseFromSlice([]const T, alloc, bytes, .{ .allocate = .alloc_always, .parse_numbers = false }) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return error.InvalidSchemaUpdateRequest,
     };
@@ -2751,6 +2756,32 @@ fn parseRelationalDeclarations(comptime T: type, alloc: std.mem.Allocator, value
         }
     }
     return parsed;
+}
+
+test "relational declarations own nested unique predicates and expressions after source DOM retirement" {
+    const Probe = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var declarations = blk: {
+                var input = try std.json.parseFromSlice(std.json.Value, a,
+                    \\[{"name":"partial","columns":["email"],"where":[{"column":"status","op":"eq","value":"act\u0069ve"},{"column":"amount","op":"eq","value":1e-1000}]},{"name":"expression","keys":[{"expression":{"op":"literal","type":"string","value":"NEEDLE"},"result_type":"string"}]}]
+                , .{ .allocate = .alloc_always, .parse_numbers = false });
+                defer input.deinit();
+                break :blk try parseRelationalDeclarations(relational_wire.RelationalUniqueConstraint, a, input.value);
+            };
+            defer declarations.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const schema: TableSchema = .{ .unique_constraints = declarations };
+            const native = try schema.relationalUniqueDefinitions(arena.allocator());
+            try std.testing.expectEqualStrings("\"active\"", native[0].where[0].value_json.?);
+            try std.testing.expectEqualStrings("1e-1000", native[0].where[1].value_json.?);
+            var expression = try std.json.parseFromSlice(std.json.Value, a, native[1].keys[0].expression_json.?, .{});
+            defer expression.deinit();
+            try std.testing.expectEqualStrings("NEEDLE", expression.value.object.get("value").?.string);
+        }
+    };
+    try Probe.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
 fn validateConstraintColumns(columns: []const []const u8) !void {

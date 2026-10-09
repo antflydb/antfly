@@ -1,7 +1,10 @@
 # Original SQL extraction parity inventory
 
-Current audited dispositions: **462 implemented / 136 rejected / 73 superseded /
-915 unresolved**. Eight original non-primary-key upserts now have exact native
+Current audited dispositions: **466 implemented / 136 rejected / 73 superseded /
+911 unresolved**. Four original partial/expression-index upserts now have exact
+PostgreSQL and native owner-activation evidence, including complete three-table
+postimages, independent admission probes and bounded point-owner resolution.
+Eight original non-primary-key upserts now have exact native
 and PostgreSQL evidence under activated UNIQUE(email), including independent
 duplicate-email rejection, complete three-table postimages and point-oriented
 ownership resolution without unbounded source reads or statement capture.
@@ -1389,8 +1392,9 @@ preserving object-key order, separators and decimal scale. PostgreSQL goldens
 and native tests cover these distinctions, and repeated point extraction
 borrows the original string under a zero-capacity allocator and shared work
 budget. These are component contracts, not original-case completion credit:
-generated document/index and partial/expression-arbiter owner profiles are still
-required before their historical cases can be activated. Ordinary UNIQUE(email)
+generated document/index owner profiles are still required before their
+historical cases can be activated. The four explicit partial/expression arbiter
+profiles and ordinary UNIQUE(email)
 upserts now have the explicit owner profile described below.
 
 Eight original UNIQUE(email) mutations (sql-1394, sql-1395, sql-1398, sql-1399,
@@ -1406,8 +1410,8 @@ of every table. Probes use the same streaming row/byte bounds as other oracle
 mutations, and wrong codes or unexpectedly accepted probes fail closed. Native
 read counters enforce no unbounded source reads or full statement capture for
 this cohort. Ambiguous unqualified conflict expressions, temporal profiles,
-partial/expression arbiters and distributed fault activation remain separate
-work; their historical entries have not been reclassified.
+broader partial-index implication and distributed fault activation remain
+separate work; their historical entries have not been reclassified.
 
 Unique-owner provenance is now an OpenAPI-generated `constraint`/`index`
 identity, retained in schema metadata rather than inferred from editable index
@@ -1423,7 +1427,28 @@ index-owned uniqueness, unchanged expected postimages and no unbounded source
 reads/capture; the named index alias must reject without a storage change.
 Unqualified PostgreSQL DROP INDEX still needs catalog
 owner resolution; the table-bound schema-builder tests do not claim that syntax
-or the partial/expression historical mutations are complete.
+is complete.
+
+Four original upserts (sql-1455, sql-1458, sql-1460 and sql-1461) now execute
+with their own partial, lower(email), mixed tenant/lower(email), and upper(email)
+unique-index declarations. Each profile preserves the base schema and all seed
+rows. The same canonical CREATE UNIQUE INDEX SQL is independently executed by
+PostgreSQL and compiled through native schema DDL, rather than replacing an
+expression or partial index with ordinary UNIQUE(email). Separate probes
+require duplicate rejection (23505), named-index-alias rejection (42704), and
+wrong inference-target rejection (42P10), without changing native storage.
+Complete RETURNING labels/types/NULL provenance and all three table postimages
+match PostgreSQL; native owner resolution uses point reads with no unbounded
+source reads or statement capture.
+
+This activation exposed borrowed nested JSON operands in uniqueness metadata:
+parseFromValue retained predicate/expression DOM storage after request cleanup.
+Relational declarations now use an owned token-stream parse, like index and
+CHECK definitions. Schema lifetime and exhaustive allocation-fault coverage
+verify escaped string predicates, nested expressions and exact numeric operands
+after source DOM retirement. This is schema-publication work, not extra parsing
+on the per-row execution path. Named partial/expression index aliases and global
+index namespace resolution remain uncredited.
 
 Quantified scalar children now retain correlated ORDER/LIMIT/OFFSET,
 group/aggregate, window and nested-derived boundaries in a typed Apply

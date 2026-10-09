@@ -13752,14 +13752,14 @@ test "httpx SQL PostgreSQL conflict assignments and defaults preserve complete n
 }
 
 fn postgresNativeMutationCampaigns(comptime selected: []const []const u8) !void {
-    try postgresNativeMutationCampaignsWithConstraints(selected, false, false);
+    try postgresNativeMutationCampaignsWithConstraints(selected, false, .constraint);
 }
 
 test "httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages" {
     try postgresNativeMutationCampaignsWithConstraints(&.{
         "sql-1394", "sql-1395", "sql-1398", "sql-1399",
         "sql-1400", "sql-1402", "sql-1406", "sql-1407",
-    }, true, false);
+    }, true, .constraint);
 }
 
 test "httpx SQL PostgreSQL inferred unique indexes preserve native owners and reject named constraint aliases" {
@@ -13769,14 +13769,22 @@ test "httpx SQL PostgreSQL inferred unique indexes preserve native owners and re
     try postgresNativeMutationCampaignsWithConstraints(&.{
         "sql-1394", "sql-1395", "sql-1398", "sql-1399",
         "sql-1400", "sql-1402", "sql-1406", "sql-1407",
-    }, true, true);
+    }, true, .index);
 }
 
-fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []const u8, comptime unique: bool, comptime index_owned: bool) !void {
+test "httpx SQL PostgreSQL partial and expression arbiters preserve complete native postimages" {
+    try postgresNativeMutationCampaignsWithConstraints(&.{"sql-1455"}, true, .expression);
+    try postgresNativeMutationCampaignsWithConstraints(&.{"sql-1458"}, true, .expression);
+    try postgresNativeMutationCampaignsWithConstraints(&.{"sql-1460"}, true, .expression);
+    try postgresNativeMutationCampaignsWithConstraints(&.{"sql-1461"}, true, .expression);
+}
+
+fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []const u8, comptime unique: bool, comptime index_owned: enum { constraint, index, expression }) !void {
     const alloc = std.testing.allocator;
     const parity = @import("sql_parity_reference.zig");
     const Source = @import("sql_parity_sources.zig").Tables(3);
-    for ([_]struct { bytes: []const u8, ids: []const []const u8, expected_captures: ?usize = null, unique: bool = false }{
+    var completed_campaigns: usize = 0;
+    for ([_]struct { bytes: []const u8, ids: []const []const u8, expected_captures: ?usize = null, unique: bool = false, expression: bool = false }{
         .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.mutation_postgres_reference, .ids = &.{
             "sql-0012", "sql-0013", "sql-0571", "sql-0572", "sql-0598", "sql-0599",
             "sql-0606", "sql-0607", "sql-0608", "sql-0609", "sql-0619", "sql-0620",
@@ -13785,8 +13793,18 @@ fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []c
         } },
         .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.correlated_mutation_postgres_reference, .ids = &.{ "sql-0600", "sql-0601", "sql-0602", "sql-0610", "sql-0611", "sql-0612" }, .expected_captures = 6 },
         .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.unique_mutation_postgres_reference, .ids = &.{}, .unique = true },
+        .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.partial_mutation_postgres_reference, .ids = &.{"sql-1455"}, .unique = true, .expression = true },
+        .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.lower_mutation_postgres_reference, .ids = &.{"sql-1458"}, .unique = true, .expression = true },
+        .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.mixed_mutation_postgres_reference, .ids = &.{"sql-1460"}, .unique = true, .expression = true },
+        .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.upper_mutation_postgres_reference, .ids = &.{"sql-1461"}, .unique = true, .expression = true },
     }) |campaign| {
         if (campaign.unique != unique) continue;
+        if (campaign.expression != (index_owned == .expression)) continue;
+        if (campaign.expression) {
+            var matches = false;
+            for (selected) |id| matches = matches or std.mem.eql(u8, id, campaign.ids[0]);
+            if (!matches) continue;
+        }
         if (selected.len != 0 and campaign.expected_captures != null) continue;
         const parsed = try std.json.parseFromSlice(parity.PostgresMutationReference, alloc, campaign.bytes, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
@@ -13817,7 +13835,7 @@ fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []c
                 try std.testing.expect(key.len != 0);
                 const owner_name = try std.fmt.allocPrint(a, "{s}_unique_{d}", .{ name, ordinal });
                 const Change = @import("antfly_local_sources").sql_ast.SchemaChange;
-                const change: Change = if (index_owned) index: {
+                const change: Change = if (index_owned == .index) index: {
                     const orders = try a.alloc(@import("antfly_local_sources").sql_ast.Order, key.len);
                     for (orders, key) |*order, column| order.* = .{ .field = column };
                     break :index .{ .create_index = .{ .name = owner_name, .keys = orders, .unique = true } };
@@ -13829,6 +13847,14 @@ fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []c
                     .schema_change = change,
                 }));
             }
+            if (std.mem.eql(u8, name, "usage_records")) if (profile.index_owner_ddl) |ddl| {
+                var compiled = try @import("antfly_local_sources").sql_compiler.compile(a, ddl, .{});
+                defer compiled.deinit();
+                const change = compiled.statement.catalog_ddl;
+                try std.testing.expectEqualStrings(name, change.name.table);
+                try std.testing.expect(change.schema_change.?.create_index.unique);
+                try std.testing.expect(try @import("antfly_local_sources").sql_schema_ddl.apply(a, &owned, change));
+            };
             schema.* = try std.json.Stringify.valueAlloc(a, owned, .{});
         }
         var databases: [3]db_mod.DB = undefined;
@@ -13855,7 +13881,7 @@ fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []c
         defer server.deinit();
         var handler = AntflyApiHandler{ .api_server = &server };
         var reference = parsed.value;
-        if (index_owned) {
+        if (index_owned == .index) {
             const probes = try a.alloc(parity.PostgresMutationReference.AdmissionProbe, profile.admission_probes.len + 1);
             @memcpy(probes[0..profile.admission_probes.len], profile.admission_probes);
             probes[profile.admission_probes.len] = .{
@@ -13865,6 +13891,7 @@ fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []c
             reference.profile.admission_probes = probes;
         }
         try parity.runPostgresMutations(alloc, &handler, &tables, &source.records, reference, if (selected.len != 0) selected else campaign.ids);
+        completed_campaigns += 1;
         if (unique) {
             // Logical UNIQUE ownership must resolve through native point
             // reads, not table-size-dependent statement capture or scans.
@@ -13875,6 +13902,7 @@ fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []c
         if (selected.len == 0) try std.testing.expect(source.captures != 0);
         if (campaign.expected_captures) |count| try std.testing.expectEqual(count, source.captures);
     }
+    try std.testing.expect(completed_campaigns != 0);
 }
 
 test "httpx SQL executes one relational page with exact integer parameters" {

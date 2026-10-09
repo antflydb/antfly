@@ -409,7 +409,7 @@ pub const PostgresMutationReference = struct {
         rows: []const []const Json,
         sql_nulls: []const []const bool,
     };
-    profile: struct { schema: Json, primary_key: []const []const u8 = &.{}, unique: []const []const []const u8 = &.{}, admission_probes: []const AdmissionProbe = &.{}, rows: []const Seed, additional_tables: []const Table },
+    profile: struct { schema: Json, primary_key: []const []const u8 = &.{}, unique: []const []const []const u8 = &.{}, index_owner_ddl: ?[]const u8 = null, admission_probes: []const AdmissionProbe = &.{}, rows: []const Seed, additional_tables: []const Table },
     entries: []const struct {
         id: []const u8,
         command_tag: []const u8,
