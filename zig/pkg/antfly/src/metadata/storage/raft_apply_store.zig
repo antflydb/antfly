@@ -575,6 +575,27 @@ test "system catalog relation namespace transaction reconciliation binary replay
     }
 }
 
+test "system catalog relation namespace transaction source fingerprints borrow schema without metadata copies" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    const schema = "{\"version\":1}";
+    const large = try a.alloc(u8, 1024 * 1024);
+    defer a.free(large);
+    @memset(large, 'x');
+    const encoded = try encodeTableRecord(a, .{ .table_id = 7, .name = "items", .schema_json = schema, .description = large });
+    defer a.free(encoded);
+    var buf: [160]u8 = undefined;
+    const key = try tableKeyForGroup(&buf, group, 7);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    const actual = try RaftApplyStore.relationSourceValueDigest(failing.allocator(), group, key, encoded);
+    const expected = RaftApplyStore.relationTableSourceDigest(7, "items", schema);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+    try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.relationSourceValueDigest(failing.allocator(), group, try tableKeyForGroup(&buf, group, 8), encoded));
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, RaftApplyStore.relationSourceValueDigest(failing.allocator(), group, key, encoded[0 .. encoded.len - 1]));
+    try std.testing.expect(!std.mem.eql(u8, &expected, &RaftApplyStore.relationTableSourceDigest(7, "items", "{\"version\":2}")));
+}
+
 test "system catalog relation namespace transaction source epoch fences schema changes without fencing job progress" {
     const a = std.testing.allocator;
     const r = relation_reconciliation;
@@ -625,6 +646,14 @@ test "system catalog relation namespace transaction source epoch fences schema c
         const initial = try r.State.init(group, try r.nextJobId(null), epoch);
         var page = try r.Page.prepareSource(a, initial, epoch, &rows);
         defer page.deinit();
+        // Descriptions and placement edits are genuine metadata changes, but
+        // cannot starve this immutable namespace page by replacing its epoch.
+        for (0..16) |i| {
+            var changed = table;
+            changed.description = "metadata-only update";
+            changed.desired_replica_count = if (i % 2 == 0) 2 else 3;
+            try store.applyStandaloneCommand(group, .{ .upsert_table = changed });
+        }
         {
             var txn = try store.store.beginWriteTxn();
             errdefer txn.abort();
@@ -667,14 +696,19 @@ test "system catalog relation namespace transaction source epoch fences schema c
             var journal = command_journal.Journal.initVerification(a, &write, group, RaftApplyStore.relationSourceReplayBeforeKey);
             defer journal.deinit();
             try journal.attach();
+            var metadata_key: [160]u8 = undefined;
+            const metadata_only = try encodeTableRecord(a, .{ .table_id = table.table_id, .name = "renamed", .schema_json = table.schema_json, .description = "replayed description" });
+            defer a.free(metadata_only);
+            try write.put(try tableKeyForGroup(&metadata_key, group, table.table_id), metadata_only);
+            try RaftApplyStore.verifyRelationSourceDeltaTxn(a, &write, group, &journal);
             const encoded = try encodeTableRecord(a, .{ .table_id = table.table_id, .name = "unpublished", .schema_json = table.schema_json });
             defer a.free(encoded);
             var buf: [160]u8 = undefined;
             // Model an authenticated producer that omitted its clock write.
             try write.put(try tableKeyForGroup(&buf, group, table.table_id), encoded);
-            try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.verifyRelationSourceDeltaTxn(&write, group, &journal));
+            try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.verifyRelationSourceDeltaTxn(a, &write, group, &journal));
             try r.advanceSource(&write, group);
-            try RaftApplyStore.verifyRelationSourceDeltaTxn(&write, group, &journal);
+            try RaftApplyStore.verifyRelationSourceDeltaTxn(a, &write, group, &journal);
             try journal.accept();
         }
         try verifyReconciliationGroupTxn(&txn, group);
@@ -707,6 +741,17 @@ test "system catalog relation namespace transaction source epoch fences schema c
         defer a.free(substituted);
         var table_buf: [160]u8 = undefined;
         const table_key = try tableKeyForGroup(&table_buf, group, table.table_id);
+        const metadata_only_snapshot = try encodeTableRecord(a, .{ .table_id = table.table_id, .name = "renamed", .schema_json = table.schema_json, .description = "snapshot description" });
+        defer a.free(metadata_only_snapshot);
+        for (snapshot_rows) |row| {
+            var copy = row;
+            if (std.mem.eql(u8, row.key, table_key)) copy.value = metadata_only_snapshot;
+            try selected.append(a, copy);
+        }
+        const equivalent = try encodeMetadataSnapshot(a, selected.items);
+        defer a.free(equivalent);
+        try RaftApplyStore.installSnapshotFromRaft(&store, a, group, 9, equivalent);
+        selected.clearRetainingCapacity();
         for (snapshot_rows) |row| {
             var copy = row;
             if (std.mem.eql(u8, row.key, table_key)) copy.value = substituted;
@@ -8771,7 +8816,7 @@ pub const RaftApplyStore = struct {
             try verifyReconciliationEpochTxn(&txn, descriptor.group_id, &relation_journal);
             try self.verifyReconciliationSourceOwnersTxn(&txn, descriptor.group_id, &relation_journal);
         }
-        if (relation_journal.attached) try verifyRelationSourceDeltaTxn(&txn, descriptor.group_id, &relation_journal);
+        if (relation_journal.attached) try verifyRelationSourceDeltaTxn(self.alloc, &txn, descriptor.group_id, &relation_journal);
         if (relation_journal.attached) try relation_journal.accept();
         var sequence_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &sequence_bytes, descriptor.sequence, .little);
@@ -15357,14 +15402,14 @@ pub const RaftApplyStore = struct {
         } else null;
         var incoming_source_cut: RelationSourceCut = .{};
         if (incoming_source != null) for (rows) |row| {
-            if (try relationSourceKey(group_id, row.key)) try incoming_source_cut.feed(row.key, row.value);
+            if (try relationSourceKey(group_id, row.key)) try incoming_source_cut.feed(alloc, group_id, row.key, row.value);
         };
         // Pin and stream the local source off the serialized apply path. A
         // locked point recheck below fences concurrent source mutations.
         const local_source_cut = blk: {
             var read = try self.store.beginReadTxn();
             defer read.abort();
-            break :blk try relationSourceCutTxn(&read, group_id, incoming_source);
+            break :blk try relationSourceCutTxn(alloc, &read, group_id, incoming_source);
         };
 
         const checkpoint = AppliedMetadataCheckpoint.fromInput(commit_index, .snapshot, encoded);
@@ -16208,15 +16253,16 @@ pub const RaftApplyStore = struct {
         revision: u64 = 0,
         rows: u64 = 0,
         fingerprint: u256 = 0,
-        fn feed(self: *@This(), key: []const u8, value: []const u8) !void {
+        fn feed(self: *@This(), a: std.mem.Allocator, group: u64, key: []const u8, value: []const u8) !void {
             var hash = std.crypto.hash.Blake3.init(.{});
-            hash.update("antfly.relation-source-cut.v1");
+            hash.update("antfly.relation-source-cut.v2");
+            const value_digest = try relationSourceValueDigest(a, group, key, value);
             var lengths: [16]u8 = undefined;
             std.mem.writeInt(u64, lengths[0..8], @intCast(key.len), .big);
-            std.mem.writeInt(u64, lengths[8..16], @intCast(value.len), .big);
+            std.mem.writeInt(u64, lengths[8..16], value_digest.len, .big);
             hash.update(&lengths);
             hash.update(key);
-            hash.update(value);
+            hash.update(&value_digest);
             var digest: [32]u8 = undefined;
             hash.final(&digest);
             // Commutative addition, not XOR: duplicate entries cannot cancel.
@@ -16227,7 +16273,33 @@ pub const RaftApplyStore = struct {
             return self.rows == other.rows and self.fingerprint == other.fingerprint;
         }
     };
-    fn relationSourceCutTxn(txn: *docstore.DocStore.Txn, group_id: u64, expected: ?u64) !RelationSourceCut {
+    /// Shared by writers, replay and equal-clock snapshots. Placement,
+    /// descriptions, read layouts and runtime progress are not namespace input.
+    fn relationTableSourceDigest(id: u64, name: []const u8, schema: []const u8) [32]u8 {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly.relation-table-source.v1");
+        var header: [24]u8 = undefined;
+        std.mem.writeInt(u64, header[0..8], id, .big);
+        std.mem.writeInt(u64, header[8..16], @intCast(name.len), .big);
+        std.mem.writeInt(u64, header[16..24], @intCast(schema.len), .big);
+        hash.update(&header);
+        hash.update(name);
+        hash.update(schema);
+        var digest: [32]u8 = undefined;
+        hash.final(&digest);
+        return digest;
+    }
+    fn relationSourceValueDigest(_: std.mem.Allocator, group: u64, key: []const u8, bytes: []const u8) ![32]u8 {
+        if (try capturedRelationTableId(key, group)) |id| {
+            const table = try borrowTableProjection(bytes, .schema);
+            if (table.table_id != id) return error.InvalidCatalogRecord;
+            return relationTableSourceDigest(id, table.name, table.query_definition.?.schema_json);
+        }
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+        return digest;
+    }
+    fn relationSourceCutTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, expected: ?u64) !RelationSourceCut {
         var result: RelationSourceCut = .{ .revision = try relation_reconciliation.readSourceRevision(txn, group_id) };
         if (result.revision == 0 or expected == null or expected.? != result.revision) return result;
         var table_buf: [160]u8 = undefined;
@@ -16241,7 +16313,7 @@ pub const RaftApplyStore = struct {
             var entry = try cursor.seekAtOrAfter(prefix);
             while (entry) |row| : (entry = try cursor.next()) {
                 if (!std.mem.startsWith(u8, row.key, prefix)) break;
-                try result.feed(row.key, row.value);
+                try result.feed(a, group_id, row.key, row.value);
             }
         }
         return result;
@@ -16266,7 +16338,7 @@ pub const RaftApplyStore = struct {
         };
         if (!state.epoch.eql(epoch)) return error.InvalidCatalogRecord;
     }
-    fn verifyRelationSourceDeltaTxn(txn: *docstore.DocStore.Txn, group_id: u64, journal: *command_journal.Journal) !void {
+    fn verifyRelationSourceDeltaTxn(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, journal: *command_journal.Journal) !void {
         var before = journal.beforeReader();
         const old = try relation_reconciliation.readSourceRevision(&before, group_id);
         const next = try relation_reconciliation.readSourceRevision(txn, group_id);
@@ -16283,7 +16355,10 @@ pub const RaftApplyStore = struct {
             if (!try relationSourceKey(group_id, entry.key_ptr.*)) continue;
             const prior = entry.value_ptr.*;
             const final = try stagingGet(txn, entry.key_ptr.*);
-            const changed = if (prior) |bytes| if (final) |value| !std.mem.eql(u8, bytes, value) else true else final != null;
+            const changed = if (prior) |bytes| if (final) |value|
+                !std.mem.eql(u8, bytes, value) and !std.mem.eql(u8, &(try relationSourceValueDigest(a, group_id, entry.key_ptr.*, bytes)), &(try relationSourceValueDigest(a, group_id, entry.key_ptr.*, value)))
+            else
+                true else final != null;
             if (changed and next <= old) return error.InvalidCatalogRecord;
         }
     }
@@ -19079,14 +19154,10 @@ pub const RaftApplyStore = struct {
         };
         const source_tracked = try relation_reconciliation.readSourceRevision(txn, group_id) != 0;
         var previous_digest: ?[32]u8 = null;
-        if (source_tracked) if (encoded_existing) |encoded| {
-            var digest: [32]u8 = undefined;
-            std.crypto.hash.Blake3.hash(encoded, &digest, .{});
-            previous_digest = digest;
-        };
         if (encoded_existing) |encoded| {
             const existing = try decodeTableRecord(self.alloc, encoded);
             defer metadata_table_manager.freeTable(self.alloc, existing);
+            if (source_tracked) previous_digest = relationTableSourceDigest(existing.table_id, existing.name, existing.schema_json);
             const lock_kind = if (!published_fk_generation and !metadata_table_manager.tableDefinitionsEqual(existing, record))
                 try self.fkTableLockKindTxn(txn, group_id, record.table_id)
             else
@@ -19120,8 +19191,7 @@ pub const RaftApplyStore = struct {
         const value = try encodeTableRecord(self.alloc, record);
         defer self.alloc.free(value);
         if (source_tracked) {
-            var digest: [32]u8 = undefined;
-            std.crypto.hash.Blake3.hash(value, &digest, .{});
+            const digest = relationTableSourceDigest(record.table_id, record.name, record.schema_json);
             if (previous_digest == null or !std.mem.eql(u8, &previous_digest.?, &digest)) try relation_reconciliation.advanceSource(txn, group_id);
         }
         try txn.put(key, value);
@@ -22424,13 +22494,30 @@ fn decodeTableQueryProjection(alloc: std.mem.Allocator, encoded: []const u8, inc
     return decodeTableProjection(alloc, encoded, if (include_definition) .query else .identity);
 }
 
-fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: enum { identity, schema, query }) !system_catalog.ResolvedTable {
+const TableProjectionMode = enum { identity, schema, query };
+const BorrowedTableProjection = struct {
+    table_id: u64,
+    name: []const u8,
+    query_definition: ?system_catalog.QueryDefinition,
+    fn clone(self: @This(), alloc: std.mem.Allocator) !system_catalog.ResolvedTable {
+        return (system_catalog.ResolvedTable{ .table_id = self.table_id, .name = self.name, .query_definition = self.query_definition }).clone(alloc);
+    }
+};
+fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: TableProjectionMode) !system_catalog.ResolvedTable {
+    return (try borrowTableProjection(encoded, mode)).clone(alloc);
+}
+
+/// The complete framing is validated, but every slice retains the encoded
+/// record's lifetime. Hashing pinned source rows needs no copies or allocator.
+fn borrowTableProjection(encoded: []const u8, mode: TableProjectionMode) !BorrowedTableProjection {
     var pos: usize = 0;
     const table_id = try readInt(encoded, &pos, u64);
     _ = try readInt(encoded, &pos, u16); // replicas
     _ = try readInt(encoded, &pos, u32); // minimum ranges
-    const name = try readRequiredString(alloc, encoded, &pos);
-    errdefer alloc.free(name);
+    const name_len = try readInt(encoded, &pos, u32);
+    if (name_len > encoded.len - pos) return error.InvalidMetadataTransitionEncoding;
+    const name = encoded[pos..][0..name_len];
+    pos += name_len;
     var fields: [8][]const u8 = undefined;
     var count: usize = 0;
     var storage: @import("antfly_local_sources").common_table_storage.Settings = .{};
@@ -22454,14 +22541,14 @@ fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: en
     // Legacy, read-schema, and restore-intent records respectively. Borrow all
     // framed fields to validate the encoding, but copy only query-owned data.
     if (count != 5 and count != 6 and count != 8) return error.InvalidMetadataTransitionEncoding;
-    return .{ .table_id = table_id, .name = name, .query_definition = if (mode != .identity) try (system_catalog.QueryDefinition{
+    return .{ .table_id = table_id, .name = name, .query_definition = if (mode != .identity) system_catalog.QueryDefinition{
         .table_id = table_id,
         .storage_engine = storage.engine,
         .schema_json = fields[1],
         .read_schema_json = if (mode == .schema or count == 5) "" else fields[2],
         .indexes_json = if (mode == .schema) "" else fields[if (count == 5) 2 else 3],
         .lake_index_catalog_json = if (mode == .query) lake_index_catalog_json else "",
-    }).clone(alloc) else null };
+    } else null };
 }
 
 fn decodeTableRecord(alloc: std.mem.Allocator, encoded: []const u8) !metadata.TableRecord {

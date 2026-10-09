@@ -1567,7 +1567,19 @@ consistency and active-source membership, not a complete-source adoption or
 serving capability proof; pending-generation sources remain unwired.
 A separate durable source clock now advances transactionally at native table
 write/delete, logical catalog delta and standalone import boundaries after
-explicit internal adoption. Exact table rewrites and job/GC progress do not
+explicit internal adoption. The physical-table contribution is the exact
+table identity, physical name and public schema bytes used by namespace claim
+derivation, not the entire mutable table envelope. Description, placement,
+read-layout and runtime-progress changes therefore cannot invalidate an
+otherwise valid namespace build. Writers hash their already-decoded definition;
+binary replay and equal-clock snapshot comparisons use the same identity/schema
+projection. Source hashing borrows validated encoded slices without copying
+schemas or unrelated fields; a 1-MiB description regression runs with an
+allocator that rejects every allocation and checks schema/identity fences.
+Metadata-only replay is permitted without a clock increment, while
+name/schema changes still require one. A native regression preserves a prepared
+page across 16 genuine metadata changes and checks both sides of replay and
+snapshot admission, including restart. Exact rewrites and job/GC progress do not
 advance it. Untracked document groups remain untracked: ordinary writers must
 not silently adopt a protocol before the metadata capability barrier. A pinned
 native source epoch combines this clock with the validated cluster incarnation;
