@@ -9,8 +9,8 @@ const Bits = @import("h264_bits.zig").Bits;
 const Budget = @import("decode_budget.zig").Budget;
 const PPS = struct { bytes: []u8, sps: usize };
 pub const Entry = struct { avcc: []u8, config: h264.Config, sps_hash: [32]u8 };
-pub const Epoch = struct { start: usize, end: usize, entry: usize };
-pub const Context = struct { session: *Session, base: usize };
+pub const Epoch = struct { start: usize, end: usize, entry: usize, independent: bool = false, max_refs: usize };
+pub const Context = struct { session: *Session, base: usize, independent_start: bool = false, max_refs: usize };
 pub const Session = struct {
     backing: std.mem.Allocator,
     budget: Budget,
@@ -136,16 +136,23 @@ pub const Session = struct {
                         var bits = try Bits.initSlice(allocator, nal, self.reader.input.control, true);
                         defer bits.deinit();
                         _ = try bits.ue();
-                        _ = try bits.ue();
+                        const slice_type = try bits.ue();
                         const index = try self.entry(try bits.ue());
                         if (selected) |previous| if (previous != index) return error.MixedVideoPictures;
                         selected = index;
-                        if (active == null or !std.mem.eql(u8, &self.entries.items[active.?].sps_hash, &self.entries.items[index].sps_hash)) {
-                            if (active != null and nal[0] & 31 != 5) return error.UnsupportedDynamicVideoConfig;
+                        const changed = active == null or !std.mem.eql(u8, &self.entries.items[active.?].sps_hash, &self.entries.items[index].sps_hash);
+                        const compatible = active != null and layoutCompatible(self.entries.items[active.?].config, self.entries.items[index].config);
+                        if (changed and (active == null or nal[0] & 31 == 5 or !compatible)) {
+                            const independent = active != null and nal[0] & 31 != 5;
+                            // Qualified non-IDR extension: incompatible storage starts
+                            // with a complete I picture and an empty prediction DPB.
+                            if (independent and slice_type % 5 != 2) return error.UnsupportedDynamicGeometry;
                             if (self.epochs.items.len != 0) self.epochs.items[self.epochs.items.len - 1].end = i;
                             try self.epochs.ensureTotalCapacityPrecise(allocator, self.epochs.items.len + 1);
-                            self.epochs.appendAssumeCapacity(.{ .start = if (active == null) 0 else i, .end = self.reader.packets.len, .entry = index });
+                            self.epochs.appendAssumeCapacity(.{ .start = if (active == null) 0 else i, .end = self.reader.packets.len, .entry = index, .independent = independent, .max_refs = self.entries.items[index].config.max_refs });
                         }
+                        const epoch = &self.epochs.items[self.epochs.items.len - 1];
+                        epoch.max_refs = @max(epoch.max_refs, self.entries.items[index].config.max_refs);
                         active = index;
                     },
                     else => {},
@@ -200,7 +207,7 @@ pub const Session = struct {
                 }
             };
             var capture = Capture{ .slots = slots[0..count], .context = context, .callback = callback };
-            var frame = try h264.decodeWithConfigurations(self.backing, &view, selected[0..count], options, &capture, Capture.publish, .{ .session = self, .base = epoch.start });
+            var frame = try h264.decodeWithConfigurations(self.backing, &view, selected[0..count], options, &capture, Capture.publish, .{ .session = self, .base = epoch.start, .independent_start = epoch.independent, .max_refs = epoch.max_refs });
             defer frame.deinit();
             stats.decoded_packets += frame.decoded_packets;
             stats.payload_bytes += frame.payload_bytes;
@@ -219,7 +226,7 @@ pub const Session = struct {
         var options = self.options;
         if (self.budget.peak >= options.max_decode_bytes) return error.ResourceLimitExceeded;
         options.max_decode_bytes -= self.budget.peak;
-        var frame = try h264.decodeWithConfigurations(self.backing, &view, &.{index - epoch.start}, options, null, null, .{ .session = self, .base = epoch.start });
+        var frame = try h264.decodeWithConfigurations(self.backing, &view, &.{index - epoch.start}, options, null, null, .{ .session = self, .base = epoch.start, .independent_start = epoch.independent, .max_refs = epoch.max_refs });
         frame.decode_high_water += self.budget.peak;
         return frame;
     }
@@ -232,4 +239,17 @@ fn nalSet(bytes: []const u8, cursor: *usize) ![]const u8 {
     const nal = bytes[cursor.*..][0..size];
     cursor.* += size;
     return nal;
+}
+
+/// Prediction storage/POC invariants. Other SPS tools (range, cropping, scaling,
+/// reference capacity) may change between complete pictures without reallocating
+/// reference samples. This is a qualified extension to CVS SPS activation rules.
+pub fn layoutCompatible(a: h264.Config, b: h264.Config) bool {
+    return a.coded_width == b.coded_width and a.coded_height == b.coded_height and
+        a.bit_depth == b.bit_depth and a.chroma_format == b.chroma_format and
+        a.separate_planes == b.separate_planes and a.frame_only == b.frame_only and
+        a.mbaff == b.mbaff and a.frame_bits == b.frame_bits and a.poc_type == b.poc_type and
+        a.poc_bits == b.poc_bits and a.poc_zero == b.poc_zero and a.poc_nonref == b.poc_nonref and
+        a.poc_bottom == b.poc_bottom and a.poc_cycle == b.poc_cycle and
+        std.mem.eql(i32, a.poc_offsets[0..a.poc_cycle], b.poc_offsets[0..b.poc_cycle]);
 }

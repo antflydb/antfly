@@ -1263,6 +1263,7 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
         if (dependency_count >= options.max_dependency_packets) return error.ResourceLimitExceeded;
         dependency_count += 1;
         if (reader.packets[start].size > options.max_packet_bytes) return error.ResourceLimitExceeded;
+        if (configurations) |epoch_context| if (epoch_context.independent_start and start == 0) break;
         if (reader.packets[start].sync or configurations != null) {
             var probe = try reader.readPacket(start);
             defer probe.deinit();
@@ -1280,13 +1281,13 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
     const sub_y: usize = if (cfg.chroma_format == 1) 2 else 1;
     const sub_x: usize = if (cfg.chroma_format == 3) 1 else 2;
     const chroma_pixels: usize = if (cfg.chroma_format == 0) 0 else coded_pixels / (sub_x * sub_y);
-    const output_size = (cfg.width * cfg.height + (if (cfg.chroma_format == 0) @as(usize, 0) else 2 * (cfg.width / sub_x) * (cfg.height / sub_y))) * @sizeOf(Sample);
+    const output_size = if (configurations != null) (coded_pixels + 2 * chroma_pixels) * @sizeOf(Sample) else (cfg.width * cfg.height + (if (cfg.chroma_format == 0) @as(usize, 0) else 2 * (cfg.width / sub_x) * (cfg.height / sub_y))) * @sizeOf(Sample);
     const planar_size = (coded_pixels + 2 * chroma_pixels) * @sizeOf(Sample);
     const count_size = (coded_pixels + 2 * chroma_pixels) / 16;
     const mode_size = coded_pixels / 16;
     const qp_size = coded_pixels / 256;
     const motion_size = coded_pixels / 16 * @sizeOf(@import("h264_motion.zig").Motion);
-    const reference_size = (planar_size + 2 * motion_size + qp_size * @sizeOf(@import("h264_entropy.zig").Meta) + @sizeOf(usize)) * @max(cfg.max_refs, @as(usize, @intFromBool(cfg.gaps_allowed)));
+    const reference_size = (planar_size + 2 * motion_size + qp_size * @sizeOf(@import("h264_entropy.zig").Meta) + @sizeOf(usize)) * @max(if (configurations) |epoch_context| epoch_context.max_refs else cfg.max_refs, @as(usize, @intFromBool(cfg.gaps_allowed or configurations != null)));
     const group_size = if (cfg.groups.count > 1 or configurations != null) qp_size else 0;
     const explicit_size = if (cfg.groups.explicit) |map| map.len else 0;
     const meta_size = group_size + explicit_size + qp_size * @sizeOf(@import("h264_entropy.zig").Meta);
@@ -1321,28 +1322,48 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
         defer input_packet.deinit();
         if (reader.packets[packet_index].size > options.max_packet_bytes) return error.ResourceLimitExceeded;
         if (configurations != null) try @import("avc.zig").validatePortablePacket(input_packet.bytes, reader.track.nal_length_bytes) else try @import("avc.zig").validatePacket(input_packet.bytes, reader.track.nal_length_bytes);
-        var partitions = try @import("h264_partitions.zig").Registry.init(allocator, input_packet.bytes, reader.track.nal_length_bytes, cfg.redundant, options.max_slices, reader.input.control);
+        var partition_span = try @import("h264_partition_span.zig").Span.init(allocator, reader, packet_index, start, input_packet.bytes, options);
+        defer partition_span.deinit();
+        const packet_bytes = partition_span.bytes;
+        if (partition_span.last >= end) end = partition_span.last + 1;
+        var partitions = try @import("h264_partitions.zig").Registry.init(allocator, packet_bytes, reader.track.nal_length_bytes, cfg.redundant, options.max_slices, reader.input.control);
         defer partitions.deinit();
         var cursor: usize = 0;
         var packet_picture: ?u32 = null;
-        while (cursor < input_packet.bytes.len) {
+        while (cursor < packet_bytes.len) {
             try reader.input.control.check();
             var size: usize = 0;
-            for (input_packet.bytes[cursor..][0..reader.track.nal_length_bytes]) |byte| size = (size << 8) | byte;
+            for (packet_bytes[cursor..][0..reader.track.nal_length_bytes]) |byte| size = (size << 8) | byte;
             cursor += reader.track.nal_length_bytes;
-            const nal = input_packet.bytes[cursor..][0..size];
+            const nal = packet_bytes[cursor..][0..size];
             cursor += size;
             switch (nal[0] & 31) {
                 1, 2, 5 => {
                     if (nal[0] & 31 == 5 and nal[0] & 0x60 == 0) return error.MalformedVideoPacket;
                     if (configurations) |registry| {
                         const plane = cfg.selected_plane;
-                        cfg = try registry.session.configAt(registry.base + packet_index);
-                        if (cfg.separate_planes) {
-                            cfg = cfg.independent(plane);
-                        }
+                        var next_cfg = try registry.session.configAt(registry.base + packet_index);
+                        if (next_cfg.separate_planes) next_cfg = next_cfg.independent(plane);
+                        if (!@import("h264_dynamic.zig").layoutCompatible(cfg, next_cfg)) return error.UnsupportedDynamicGeometry;
+                        for (workspaces) |slot| if (slot) |workspace| {
+                            if (workspace.active and cfg.id != next_cfg.id) return error.MixedVideoPictures;
+                        };
+                        cfg = next_cfg;
                     }
                     const prefix = try slicePrefix(allocator, cfg, nal, reader.input.control);
+                    if (configurations) |epoch_context| if (epoch_context.independent_start and packet_index == 0 and references.count == 0) {
+                        var first = try Bits.initSlice(allocator, nal, reader.input.control, cfg.cabac);
+                        defer first.deinit();
+                        _ = try first.ue();
+                        if (try first.ue() % 5 != 2) return error.MissingVideoReference;
+                        _ = try first.ue();
+                        if (cfg.separate_planes) _ = try first.read(2);
+                        _ = try first.read(cfg.frame_bits);
+                        if (!cfg.frame_only and try first.read(1) != 0) _ = try first.read(1);
+                        references.previous_num = prefix.frame_num;
+                        references.previous_reference_num = prefix.frame_num;
+                        if (cfg.poc_type == 0) references.previous_lsb = @intCast(try first.read(cfg.poc_bits.?));
+                    };
                     if (cfg.separate_planes and prefix.plane != cfg.selected_plane) continue;
                     var found: ?usize = null;
                     for (&workspaces, 0..) |*slot, i| if (slot.*) |*workspace| {
@@ -1386,14 +1407,17 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
                     packet_picture = workspace.id;
                     if (workspace.slices >= options.max_slices) return error.ResourceLimitExceeded;
                     workspace.slices += 1;
-                    for (indexes, 0..) |wanted, slot| if (wanted == packet_index) {
+                    for (indexes, 0..) |wanted, slot| if (wanted == packet_index or std.mem.indexOfScalar(usize, partition_span.members.items, wanted) != null) {
                         workspace.selected[slot] = true;
                     };
-                    const part = reader.packets[packet_index];
-                    const part_end = std.math.add(i64, part.pts, part.duration) catch return error.TimestampOverflow;
-                    const first_part = workspace.pts == null;
-                    workspace.pts = if (workspace.pts) |pts| @min(pts, part.pts) else part.pts;
-                    workspace.end = if (first_part) part_end else @max(workspace.end, part_end);
+                    const members = if (partition_span.partitioned) partition_span.members.items else &.{packet_index};
+                    for (members) |member| {
+                        const part = reader.packets[member];
+                        const part_end = std.math.add(i64, part.pts, part.duration) catch return error.TimestampOverflow;
+                        const first_part = workspace.pts == null;
+                        workspace.pts = if (workspace.pts) |pts| @min(pts, part.pts) else part.pts;
+                        workspace.end = if (first_part) part_end else @max(workspace.end, part_end);
+                    }
                     const planes = [3][]Sample{ workspace.planar[0..coded_pixels], workspace.planar[coded_pixels..][0..chroma_pixels], workspace.planar[coded_pixels + chroma_pixels ..] };
                     const counts = [3][]u8{ workspace.counts[0 .. coded_pixels / 16], workspace.counts[coded_pixels / 16 ..][0 .. chroma_pixels / 16], workspace.counts[coded_pixels / 16 + chroma_pixels / 16 ..] };
                     const prediction = workspace.snapshot orelse &references;
@@ -1417,7 +1441,7 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
                             };
                             workspace.complete = workspace.committed[0] and workspace.committed[1];
                         } else workspace.complete = true;
-                    } else if (prefix.field and !covered and workspace.snapshot == null) {
+                    } else if (!covered and workspace.snapshot == null and (prefix.field or partition_span.partitioned)) {
                         peak = try std.math.add(usize, peak, snapshot_size);
                         if (peak > options.max_decode_bytes) return error.ResourceLimitExceeded;
                         try transient.resize(.{ .host_bytes = peak - output_size - config_reservation.resources.host_bytes });
@@ -1434,14 +1458,14 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
             }
         }
         try partitions.finish();
-        decoded_packets += 1;
-        payload_bytes += reader.packets[packet_index].size;
+        decoded_packets += partition_span.last - packet_index + 1;
+        payload_bytes += reader.packets[packet_index].size + partition_span.extra_read_bytes;
         if (packet_picture == null) for (indexes) |wanted| if (wanted == packet_index) return error.UnsupportedVideoProfile;
         for (&workspaces) |*slot| if (slot.*) |*workspace| {
             if (!workspace.active) continue;
             if (!workspace.complete) {
                 const h = workspace.headers[0] orelse workspace.headers[1].?;
-                if (!h.field_pic) return error.IncompleteVideoPicture;
+                if (!h.field_pic and !partition_span.partitioned) return error.IncompleteVideoPicture;
                 if (workspace.wanted()) try extendAssembly(reader, start, packet_index, &end, &max_packet, &peak, &transient, output_size, config_reservation.resources.host_bytes, options);
                 continue;
             }
@@ -1467,7 +1491,8 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
                     @import("h264_pixels.zig").interleave(Sample, output[target_start..][0 .. width * 2 * @sizeOf(Sample)], planes[1][source_start..][0..width], planes[2][source_start..][0..width]);
                 }
                 if (callback) |publish| {
-                    const metadata_frame = Frame{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .allocator = budget.backing, .nv12 = output, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
+                    const picture_bytes = (cfg.width * cfg.height + (if (cfg.chroma_format == 0) @as(usize, 0) else 2 * (cfg.width / sub_x) * (cfg.height / sub_y))) * @sizeOf(Sample);
+                    const metadata_frame = Frame{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .allocator = budget.backing, .nv12 = output[0..picture_bytes], .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
                     for (workspace.selected, 0..) |wanted, request_slot| if (wanted) {
                         try publish(callback_context.?, request_slot, &metadata_frame);
                     };
@@ -1475,8 +1500,12 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
             }
             workspace.active = false;
         };
+        packet_index = partition_span.last;
     }
-    return .{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .reservation = reservation, .allocator = budget.backing, .nv12 = output, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
+    const picture_bytes = (cfg.width * cfg.height + (if (cfg.chroma_format == 0) @as(usize, 0) else 2 * (cfg.width / sub_x) * (cfg.height / sub_y))) * @sizeOf(Sample);
+    try reservation.resize(.{ .host_bytes = picture_bytes });
+    const final_output = if (output.len == picture_bytes) output else try allocator.realloc(output, picture_bytes);
+    return .{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .reservation = reservation, .allocator = budget.backing, .nv12 = final_output, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
 }
 
 /// Three independent monochrome prediction lanes. Each lane decodes the shared

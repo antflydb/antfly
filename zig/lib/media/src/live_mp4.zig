@@ -1,6 +1,6 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
-//! Incremental, caller-framed live fMP4 segments. Emitted readers own immutable
+//! Incremental fMP4 with automatic moof/mdat segment framing. Emitted readers own immutable
 //! init+segment snapshots, so later input cannot invalidate packet leases.
 const std = @import("std");
 const mp4 = @import("mp4.zig");
@@ -52,6 +52,11 @@ pub const Ingest = struct {
     next_decode_time: ?i64 = null,
     segments: usize = 0,
     ingested_bytes: u64 = 0,
+    ended: bool = false,
+    scan_cursor: usize = 0,
+    scan_boxes: usize = 0,
+    scan_fragment: bool = false,
+    scan_payload: bool = false,
     pub fn init(allocator: std.mem.Allocator, identity: []const u8, initialization: []const u8, options: Options) !Ingest {
         if (identity.len > options.max_identity_bytes) return error.ResourceLimitExceeded;
         var cursor: usize = 0;
@@ -76,10 +81,11 @@ pub const Ingest = struct {
         const reservation = if (options.stream.admission_pool) |pool| try pool.acquire(.{}) else admission.Token{};
         return .{ .allocator = allocator, .initialization = snapshot, .pending_reservation = reservation, .options = options, .ingested_bytes = initialization.len };
     }
-    /// Partial network reads may be supplied in any chunk size. Segment framing
-    /// is explicit: only finishSegment commits timeline state or publishes data.
+    /// Partial network reads may be supplied in any chunk size. Drain nextSegment
+    /// after arrivals; no transport segment envelope is needed.
     pub fn push(self: *Ingest, bytes: []const u8) !void {
         try self.options.stream.control.check();
+        if (self.ended) return error.MediaStreamEnded;
         if (self.segments >= self.options.max_segments or bytes.len > self.options.max_ingested_bytes -| self.ingested_bytes) return error.ResourceLimitExceeded;
         const size = try std.math.add(usize, self.pending.items.len, bytes.len);
         if (size > self.options.stream.max_bytes -| self.initialization.bytes.len) return error.ResourceLimitExceeded;
@@ -104,17 +110,67 @@ pub const Ingest = struct {
     /// A segment consists of complete moof/mdat boxes, using moof-relative
     /// addressing. Failed validation retains input for inspection/discard/retry.
     /// The returned value can move; its backing Source stays at a stable address.
+    /// Drain complete automatically framed segments. A following moof/styp ends
+    /// the preceding moof + one-or-more mdat sequence; final EOF closes the last.
+    /// Size-zero boxes need final EOF. Failed commits retain all pending bytes.
+    pub fn nextSegment(self: *Ingest, end_of_stream: bool) !?Segment {
+        try self.options.stream.control.check();
+        self.ended = self.ended or end_of_stream;
+        while (self.scan_cursor < self.pending.items.len) {
+            try self.options.stream.control.check();
+            const available = self.pending.items[self.scan_cursor..];
+            if (available.len < 8) return if (self.ended) error.IncompleteMediaSegment else null;
+            const size32 = std.mem.readInt(u32, available[0..4], .big);
+            const typ = std.mem.readInt(u32, available[4..8], .big);
+            // A boundary header suffices: its payload may still be arriving.
+            if (self.scan_fragment and (typ == iso.fourcc("moof") or typ == iso.fourcc("styp"))) {
+                if (!self.scan_payload) return error.IncompleteMediaSegment;
+                return try self.commitPrefix(self.scan_cursor);
+            }
+            var size: u64 = size32;
+            var header: usize = 8;
+            if (size32 == 1) {
+                if (available.len < 16) return if (self.ended) error.IncompleteMediaSegment else null;
+                size = std.mem.readInt(u64, available[8..16], .big);
+                header = 16;
+            } else if (size32 == 0) {
+                if (!self.ended) return null;
+                size = available.len;
+            }
+            if (size < header) return error.MalformedMedia;
+            if (size > self.options.stream.max_bytes -| self.initialization.bytes.len) return error.ResourceLimitExceeded;
+            if (size > available.len) return if (self.ended) error.IncompleteMediaSegment else null;
+            if (self.scan_boxes >= self.options.index.max_boxes) return error.ResourceLimitExceeded;
+            if (typ == iso.fourcc("moov") or typ == iso.fourcc("ftyp")) return error.UnsupportedDynamicVideoConfig;
+            if (typ == iso.fourcc("mdat") and !self.scan_fragment) return error.MalformedMedia;
+            if (typ == iso.fourcc("moof")) self.scan_fragment = true;
+            if (typ == iso.fourcc("mdat")) self.scan_payload = true;
+            self.scan_cursor += @intCast(size);
+            self.scan_boxes += 1;
+        }
+        if (!self.ended) return null;
+        if (self.scan_fragment) {
+            if (!self.scan_payload) return error.IncompleteMediaSegment;
+            return try self.commitPrefix(self.scan_cursor);
+        }
+        // Complete non-media trailer boxes do not publish an empty segment.
+        self.discardSegment();
+        return null;
+    }
     pub fn finishSegment(self: *Ingest) !Segment {
+        return self.commitPrefix(self.pending.items.len);
+    }
+    fn commitPrefix(self: *Ingest, prefix: usize) !Segment {
         try self.options.stream.control.check();
         if (self.segments >= self.options.max_segments) return error.ResourceLimitExceeded;
         var cursor: usize = 0;
         var fragment = false;
         var payload = false;
         var boxes: usize = 0;
-        while (cursor < self.pending.items.len) {
+        while (cursor < prefix) {
             if (boxes >= self.options.index.max_boxes) return error.ResourceLimitExceeded;
             boxes += 1;
-            const box = try iso.readBox(self.pending.items, cursor);
+            const box = try iso.readBox(self.pending.items[0..prefix], cursor);
             cursor = box.end;
             if (box.typ == iso.fourcc("moof")) fragment = true;
             if (box.typ == iso.fourcc("mdat")) payload = true;
@@ -128,7 +184,7 @@ pub const Ingest = struct {
         const owned_identity = try self.allocator.alloc(u8, identity_bytes);
         errdefer self.allocator.free(owned_identity);
         _ = try std.fmt.bufPrint(owned_identity, "{s}/segment/{d}", .{ self.initialization.input.identity, self.segments });
-        const snapshot = try stream.Snapshot.copy(self.allocator, owned_identity, &.{ self.initialization.bytes, self.pending.items }, self.options.stream);
+        const snapshot = try stream.Snapshot.copy(self.allocator, owned_identity, &.{ self.initialization.bytes, self.pending.items[0..prefix] }, self.options.stream);
         errdefer snapshot.deinit();
         var reader = try mp4.Reader.init(self.allocator, &snapshot.input, self.options.index);
         errdefer reader.deinit();
@@ -141,11 +197,21 @@ pub const Ingest = struct {
         self.next_decode_time = next;
         const ordinal = self.segments;
         self.segments += 1;
-        self.pending.clearRetainingCapacity();
+        const remaining = self.pending.items.len - prefix;
+        std.mem.copyForwards(u8, self.pending.items[0..remaining], self.pending.items[prefix..]);
+        self.pending.items.len = remaining;
+        self.resetScan();
         return .{ .backing = snapshot, .reader = reader, .ordinal = ordinal, .identity = owned_identity, .identity_reservation = identity_reservation };
+    }
+    fn resetScan(self: *Ingest) void {
+        self.scan_cursor = 0;
+        self.scan_boxes = 0;
+        self.scan_fragment = false;
+        self.scan_payload = false;
     }
     pub fn discardSegment(self: *Ingest) void {
         self.pending.clearRetainingCapacity();
+        self.resetScan();
     }
     pub fn deinit(self: *Ingest) void {
         self.pending.deinit(self.allocator);
@@ -241,4 +307,55 @@ test "live MP4 successive segments retain stable leases across bounded arrival c
         try std.testing.expectEqual(@as(usize, 0), ingest.pending.items.len);
     }
     try std.testing.expectEqual(admission.Resources{}, pool.snapshot());
+}
+
+test "live MP4 automatic framing handles every byte arrival and final EOF" {
+    const bytes = @embedFile("../testdata/fragmented.mp4");
+    var split: usize = 0;
+    var expected: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < bytes.len) {
+        const box = try iso.readBox(bytes, cursor);
+        if (box.typ == iso.fourcc("moof")) {
+            if (expected == 0) split = cursor;
+            expected += 1;
+        }
+        cursor = box.end;
+    }
+    const Harness = struct {
+        fn run(backing: std.mem.Allocator, init_bytes: []const u8, media_bytes: []const u8, expected_count: usize, chunk: usize) !void {
+            var no_resize = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+            const allocator = no_resize.allocator();
+            var pool = admission.Pool{ .limits = .{ .host_bytes = 1024 * 1024 } };
+            {
+                var ingest = try Ingest.init(allocator, "automatic-live", init_bytes, .{ .index = .{ .max_index_bytes = 256 * 1024 }, .stream = .{ .max_bytes = 65536, .admission_pool = &pool } });
+                defer ingest.deinit();
+                var count: usize = 0;
+                var pos: usize = 0;
+                while (pos < media_bytes.len) {
+                    const end = @min(pos + chunk, media_bytes.len);
+                    try ingest.push(media_bytes[pos..end]);
+                    pos = end;
+                    while (try ingest.nextSegment(false)) |value| {
+                        var segment = value;
+                        defer segment.deinit();
+                        try std.testing.expectEqual(count, segment.ordinal);
+                        count += 1;
+                    }
+                }
+                while (try ingest.nextSegment(true)) |value| {
+                    var segment = value;
+                    defer segment.deinit();
+                    try std.testing.expectEqual(count, segment.ordinal);
+                    count += 1;
+                }
+                try std.testing.expectEqual(expected_count, count);
+                try std.testing.expectError(error.MediaStreamEnded, ingest.push("x"));
+            }
+            try std.testing.expectEqual(admission.Resources{}, pool.snapshot());
+        }
+    };
+    try Harness.run(std.testing.allocator, bytes[0..split], bytes[split..], expected, 1);
+    try Harness.run(std.testing.allocator, bytes[0..split], bytes[split..], expected, bytes.len);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{ bytes[0..split], bytes[split..], expected, bytes.len });
 }
