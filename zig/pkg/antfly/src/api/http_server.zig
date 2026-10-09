@@ -21959,6 +21959,12 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
+    pub fn admitPublicMultiQueryRunnable(self: *ApiHttpServer, execution: *RunnableScheduler.Execution, table_name: []const u8, body: []const u8, cancellation: ?*const http_common.RequestCancellation) !?contextual_operations.OwnedResponse {
+        self.startPublicQueryRunnable(execution, table_name, body, cancellation, originalQueryDeadline(null, cancellation)) catch |err|
+            return try self.publicQueryOperationErrorResponse(table_name, body, err);
+        return null;
+    }
+
     pub fn handleAdmittedPublicTableQueryWithDelivery(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -21970,9 +21976,9 @@ pub const ApiHttpServer = struct {
     ) !contextual_operations.OwnedResponse {
         var execution: RunnableScheduler.Execution = .{};
         defer execution.finish();
-        if (!isNdjsonContentType(content_type)) {
-            if (try self.admitPublicQueryRunnable(&execution, table_name, body, cancellation)) |response| return response;
-        }
+        if (isNdjsonContentType(content_type)) {
+            if (try self.admitPublicMultiQueryRunnable(&execution, table_name, body, cancellation)) |response| return response;
+        } else if (try self.admitPublicQueryRunnable(&execution, table_name, body, cancellation)) |response| return response;
         return self.handleAdmittedPublicTableQueryWithRunnable(table_name, body, content_type, borrowed_identity, cancellation, delivery, &execution);
     }
 
@@ -21986,7 +21992,7 @@ pub const ApiHttpServer = struct {
         delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
         execution: *RunnableScheduler.Execution,
     ) !contextual_operations.OwnedResponse {
-        if (isNdjsonContentType(content_type)) return self.handlePublicTableMultiQueryWithCancellation(table_name, body, borrowed_identity, cancellation, null, null);
+        if (isNdjsonContentType(content_type)) return self.handlePublicTableMultiQueryWithRunnable(table_name, body, borrowed_identity, cancellation, null, null, execution);
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*owned| owned.deinit(self.alloc);
         const body_deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
@@ -22212,6 +22218,10 @@ pub const ApiHttpServer = struct {
         return try self.handlePublicTableMultiQueryWithCancellation(null, body, authenticated_identity, cancellation, null, null);
     }
 
+    pub fn handleAdmittedPublicGlobalMultiQueryWithRunnable(self: *ApiHttpServer, body: []const u8, authenticated_identity: ?AuthenticatedIdentity, cancellation: ?*const http_common.RequestCancellation, execution: *RunnableScheduler.Execution) !contextual_operations.OwnedResponse {
+        return self.handlePublicTableMultiQueryWithRunnable(null, body, authenticated_identity, cancellation, null, null, execution);
+    }
+
     fn publicQueryOperationErrorResponse(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -22426,14 +22436,30 @@ pub const ApiHttpServer = struct {
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
     ) !contextual_operations.OwnedResponse {
+        return self.handlePublicTableMultiQueryWithRunnable(route_table_name, body, authenticated_identity, cancellation, response_label, bound_join, null);
+    }
+
+    fn handlePublicTableMultiQueryWithRunnable(
+        self: *ApiHttpServer,
+        route_table_name: ?[]const u8,
+        body: []const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+        response_label: ?[]const u8,
+        bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
+        provided_execution: ?*RunnableScheduler.Execution,
+    ) !contextual_operations.OwnedResponse {
         // One ingress capsule retains the complete input and original request
         // authority across every sequential line and its physical child joins.
-        const request_deadline = originalQueryDeadline(null, cancellation);
-        var execution: RunnableScheduler.Execution = .{};
-        defer execution.finish();
-        self.startPublicQueryRunnable(&execution, route_table_name orelse "", body, cancellation, request_deadline) catch |err|
-            return self.publicQueryOperationErrorResponse(route_table_name orelse "", body, err);
-        var read: @import("runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = self.alloc };
+        var local_execution: RunnableScheduler.Execution = .{};
+        defer if (provided_execution == null) local_execution.finish();
+        const execution = provided_execution orelse &local_execution;
+        const request_deadline = if (execution.entry) |*entry| entry.options.deadline_ns else originalQueryDeadline(null, cancellation);
+        if (provided_execution == null) {
+            self.startPublicQueryRunnable(execution, route_table_name orelse "", body, cancellation, request_deadline) catch |err|
+                return self.publicQueryOperationErrorResponse(route_table_name orelse "", body, err);
+        }
+        var read: @import("runnable_local_read.zig").Read = .{ .execution = execution, .allocator = self.alloc };
         var team: ?@import("antfly_runtime_abi").runnable_abi.Team = if (execution.entry != null) try read.team() else null;
         var diagnostic_context: query_request_diagnostics.Context = .{};
         const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);

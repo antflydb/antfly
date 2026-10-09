@@ -6295,35 +6295,41 @@ pub const AntflyApiHandler = struct {
         // slow ingress and query compute cannot starve one another.
         if (try self.acquirePublicOperation(ctx, "globalQuery")) |response| return response;
         defer self.releasePublicOperation("globalQuery");
-        var cancellation = requestCancellation(ctx);
+        const owner = try @import("runnable_http_response.zig").Owner.create(ctx.allocator, requestCancellation(ctx));
+        defer owner.releaseUnlessTransferred();
+        const cancellation = &owner.cancellation;
+        const execution = &owner.execution;
         if (isNdjsonContentType(ctx.header("content-type"))) {
-            var resp = try self.api_server.handleAdmittedPublicGlobalMultiQueryWithCancellation(
+            if (try self.api_server.admitPublicMultiQueryRunnable(execution, "", body_data, cancellation)) |value| {
+                var response = value;
+                return self.respondOwnedQuery(ctx, &response, owner);
+            }
+            var resp = try self.api_server.handleAdmittedPublicGlobalMultiQueryWithRunnable(
                 body_data,
                 authenticated_identity,
-                &cancellation,
+                cancellation,
+                execution,
             );
-            return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
+            return self.respondOwnedQuery(ctx, &resp, owner);
         }
         var parsed_table = parseGlobalQueryTable(ctx.allocator, body_data) catch {
             _ = ctx.status(400);
             return ctx.text("invalid query request");
         };
         defer parsed_table.deinit();
-        var execution: http_server_mod.RunnableScheduler.Execution = .{};
-        defer execution.finish();
-        if (try self.api_server.admitPublicQueryRunnable(&execution, parsed_table.table_name, body_data, &cancellation)) |value| {
+        if (try self.api_server.admitPublicQueryRunnable(execution, parsed_table.table_name, body_data, cancellation)) |value| {
             var response = value;
-            return respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
+            return self.respondOwnedQuery(ctx, &response, owner);
         }
-        var delivery: QueryDelivery = .{ .ctx = ctx, .execution = &execution };
+        var delivery: QueryDelivery = .{ .ctx = ctx, .execution = execution };
         var resp = try self.api_server.handleAdmittedPublicTableQueryWithRunnable(
             parsed_table.table_name,
             body_data,
             ctx.header("content-type"),
             authenticated_identity,
-            &cancellation,
+            cancellation,
             delivery.sink(),
-            &execution,
+            execution,
         );
         if (delivery.writer != null) {
             defer resp.deinit(self.api_server.alloc);
@@ -6331,7 +6337,7 @@ pub const AntflyApiHandler = struct {
             try delivery.close();
             return ctx.response.build();
         }
-        return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
+        return self.respondOwnedQuery(ctx, &resp, owner);
     }
 
     pub fn evaluate(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -7813,6 +7819,15 @@ pub const AntflyApiHandler = struct {
         return ctx.text("");
     }
 
+    fn respondOwnedQuery(self: *AntflyApiHandler, ctx: *httpx.Context, response: *contextual_operations.OwnedResponse, owner: *@import("runnable_http_response.zig").Owner) !httpx.Response {
+        var result = try respondOwnedContextualResponse(ctx, response, self.api_server.alloc);
+        errdefer result.deinit();
+        // A standalone handler invocation has no physical buffered transport.
+        // Real H1/H2 writers retain the context until output has joined.
+        if (ctx.h1_sock != null or ctx.h2 != null) try owner.retainUntilContextRetires(ctx);
+        return result;
+    }
+
     const QueryDelivery = struct {
         ctx: *httpx.Context,
         execution: ?*http_server_mod.RunnableScheduler.Execution = null,
@@ -7861,17 +7876,20 @@ pub const AntflyApiHandler = struct {
             break :blk try ctx.allocator.dupe(u8, decoded);
         };
         defer ctx.allocator.free(logical);
-        var cancellation = requestCancellation(ctx);
-        var execution: http_server_mod.RunnableScheduler.Execution = .{};
-        defer execution.finish();
-        if (!isNdjsonContentType(ctx.header("content-type"))) {
-            if (try self.api_server.admitPublicQueryRunnable(&execution, logical, body_data, &cancellation)) |value| {
-                var response = value;
-                return respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
-            }
+        const owner = try @import("runnable_http_response.zig").Owner.create(ctx.allocator, requestCancellation(ctx));
+        defer owner.releaseUnlessTransferred();
+        const cancellation = &owner.cancellation;
+        const execution = &owner.execution;
+        const rejection = if (isNdjsonContentType(ctx.header("content-type")))
+            try self.api_server.admitPublicMultiQueryRunnable(execution, logical, body_data, cancellation)
+        else
+            try self.api_server.admitPublicQueryRunnable(execution, logical, body_data, cancellation);
+        if (rejection) |value| {
+            var response = value;
+            return self.respondOwnedQuery(ctx, &response, owner);
         }
-        var delivery: QueryDelivery = .{ .ctx = ctx, .execution = &execution };
-        var resp = self.api_server.handleAdmittedPublicTableQueryWithRunnable(logical, body_data, ctx.header("content-type"), authenticated_identity, &cancellation, delivery.sink(), &execution) catch |err| return err;
+        var delivery: QueryDelivery = .{ .ctx = ctx, .execution = execution };
+        var resp = self.api_server.handleAdmittedPublicTableQueryWithRunnable(logical, body_data, ctx.header("content-type"), authenticated_identity, cancellation, delivery.sink(), execution) catch |err| return err;
         if (delivery.writer != null) {
             defer resp.deinit(self.api_server.alloc);
             // A post-commit error closes the stream; never send a second status.
@@ -7879,7 +7897,7 @@ pub const AntflyApiHandler = struct {
             try delivery.close();
             return ctx.response.build();
         }
-        return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
+        return self.respondOwnedQuery(ctx, &resp, owner);
     }
 
     pub fn batchWrite(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {

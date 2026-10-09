@@ -2169,15 +2169,15 @@ fn readPrefixBlockEntryInPlace(
     key: *std.ArrayListUnmanaged(u8),
     max_key_bytes: usize,
 ) !Entry {
-    return readPrefixBlockEntryWithAdmission(allocator, encoded_entries, cursor, previous_key, current_key, null);
+    return readPrefixBlockEntryInPlaceWithAdmission(allocator, encoded_entries, cursor, key, max_key_bytes, null);
 }
 
-fn readPrefixBlockEntryWithAdmission(
+fn readPrefixBlockEntryInPlaceWithAdmission(
     allocator: std.mem.Allocator,
     encoded_entries: []const u8,
     cursor: *usize,
-    previous_key: []const u8,
-    current_key: *std.ArrayListUnmanaged(u8),
+    key: *std.ArrayListUnmanaged(u8),
+    max_key_bytes: usize,
     control: ?read_admission.Port,
 ) !Entry {
     if (control) |budget| try budget.checkpoint();
@@ -2199,7 +2199,7 @@ fn readPrefixBlockEntryWithAdmission(
     if (control) |budget| try budget.checkpoint();
     try key.ensureTotalCapacity(allocator, key_len);
     key.items.len = shared_len;
-    key.appendSliceAssumeCapacity(suffix);
+    try appendSliceWithAdmission(allocator, key, suffix, control);
     return .{ .namespace_name = if (namespace_len > 0) namespace else null, .key = key.items, .value = value, .tombstone = tombstone };
 }
 

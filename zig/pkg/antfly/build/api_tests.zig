@@ -228,6 +228,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     }));
+    inference_owner_sources.addImport("antfly_cancellation", antfly_imports.cancellation);
+    const http_response_owner_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_http_response.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    http_response_owner_root.addImport("httpx", antfly_imports.httpx);
+    http_response_owner_root.addImport("antfly_local_sources", inference_owner_sources);
+    const http_response_owner_tests = b.addTest(.{
+        .name = "http-response-owner-tests",
+        .root_module = http_response_owner_root,
+        .filters = &.{"HTTP response owner"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-http-response-owner-test", "Verify buffered response owners retain original authority until physical context retirement")
+        .dependOn(&b.addRunArtifact(http_response_owner_tests).step);
     const completion_task_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/runnable_completion_task_test_root.zig"),
         .target = target,

@@ -2170,10 +2170,6 @@ const PendingSync = if (supports_waitable_pending)
             };
         }
 
-        fn tryLock(self: *@This()) bool {
-            return std.c.pthread_mutex_trylock(&self.mutex) == .SUCCESS;
-        }
-
         fn lock(self: *@This()) void {
             if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
         }
