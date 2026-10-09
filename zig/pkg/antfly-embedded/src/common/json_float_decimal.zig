@@ -109,19 +109,32 @@ pub const Parts = struct {
 
 test "exact float decimal limbs match the fixed integer coefficient across binary64 exponents" {
     var buffer: [768]u8 = undefined;
+    var negative_buffer: [768]u8 = undefined;
     // Every finite exponent, both signs, and mantissa boundaries. The oracle
     // is independent wide multiplication; it never formats the wide integer.
     for (0..2047) |exponent| {
         for ([_]u64{ 0, 1, 0x5555555555555, 0xfffffffffffff }) |mantissa| {
-            for ([_]u64{ 0, @as(u64, 1) << 63 }) |sign| {
-                const bits = sign | (@as(u64, @intCast(exponent)) << 52) | mantissa;
-                const parts = try Parts.init(@bitCast(bits));
-                const text = try parts.coefficientText(&buffer);
-                try std.testing.expect(text.len <= 767);
-                try std.testing.expect(text.len == 1 or text[0] != '0');
-                try std.testing.expectEqual(parts.coefficient(), try std.fmt.parseInt(u4096, text, 10));
-                try std.testing.expectEqual(sign != 0 and bits & 0x7fffffffffffffff != 0, parts.negative);
+            const bits = (@as(u64, @intCast(exponent)) << 52) | mantissa;
+            const parts = try Parts.init(@bitCast(bits));
+            const text = try parts.coefficientText(&buffer);
+            try std.testing.expect(text.len <= 767);
+            try std.testing.expect(text.len == 1 or text[0] != '0');
+            // Parse native-sized chunks before widening: one checked wide
+            // multiply per nine digits, not one per byte. Both signs still
+            // exercise the codec; their shared magnitude needs one oracle.
+            const first = (text.len - 1) % 9 + 1;
+            var decoded: u4096 = try std.fmt.parseInt(u32, text[0..first], 10);
+            var at = first;
+            while (at < text.len) : (at += 9) {
+                decoded = decoded * 1_000_000_000 + try std.fmt.parseInt(u32, text[at..][0..9], 10);
             }
+            try std.testing.expectEqual(parts.coefficient(), decoded);
+            try std.testing.expect(!parts.negative);
+            const negative = try Parts.init(@bitCast(bits | (@as(u64, 1) << 63)));
+            try std.testing.expectEqual(parts.mantissa, negative.mantissa);
+            try std.testing.expectEqual(parts.binary_exponent, negative.binary_exponent);
+            try std.testing.expectEqual(bits != 0, negative.negative);
+            try std.testing.expectEqualStrings(text, try negative.coefficientText(&negative_buffer));
         }
     }
     const half = try Parts.init(0.5);

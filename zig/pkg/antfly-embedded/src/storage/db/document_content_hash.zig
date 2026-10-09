@@ -873,6 +873,30 @@ test "canonical JSON normalizes equivalent number spellings losslessly" {
     try std.testing.expectEqualStrings("1e999999999999999999999", canonical_huge);
 }
 
+test "canonical JSON retains exact native float bytes across strict token decoding" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { value: f64, expected: []const u8 }{
+        .{ .value = -0.0, .expected = "0" },
+        .{ .value = 0.5, .expected = "0.5" },
+        .{ .value = 0.1, .expected = "0.1000000000000000055511151231257827021181583404541015625" },
+        .{ .value = 1000000000000000128.0, .expected = "1000000000000000128" },
+    }) |case| {
+        const canonical = try canonicalJsonValueAlloc(alloc, .{ .float = case.value });
+        defer alloc.free(canonical);
+        try std.testing.expectEqualStrings(case.expected, canonical);
+    }
+    for ([_]f64{ @bitCast(@as(u64, 1)), -std.math.floatMin(f64), std.math.floatMax(f64) }) |value| {
+        const canonical = try canonicalJsonValueAlloc(alloc, .{ .float = value });
+        defer alloc.free(canonical);
+        var decoded = try std.json.parseFromSlice(std.json.Value, alloc, canonical, .{ .parse_numbers = false });
+        defer decoded.deinit();
+        const encoded = try canonicalJsonValueAlloc(alloc, decoded.value);
+        defer alloc.free(encoded);
+        try std.testing.expectEqualStrings(canonical, encoded);
+        try std.testing.expectEqual(@as(u64, @bitCast(value)), @as(u64, @bitCast(try std.fmt.parseFloat(f64, canonical))));
+    }
+}
+
 test "relational JSON semantic hash ignores number spelling" {
     const schema = runtime_schema.TableSchema{
         .version = 9,

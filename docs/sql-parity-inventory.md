@@ -2165,6 +2165,16 @@ spanning the finite exponent range in alternating execution order: the old wide
 formatter takes 1,366–1,419 ms versus 0.183–0.217 ms for decimal limbs across
 three samples. These are kernel measurements, not end-to-end query throughput.
 The change adds no original-case credit.
+The isolated `zig build sql-exact-float-test` gate is also a normal unit-suite
+dependency. Its debug oracle checks every exponent and both signs in 860 ms
+after replacing repeated per-byte wide parsing with native-sized decimal
+chunks; magnitude sharing does not remove any signed codec checks. The release
+variant (`-Doptimize=ReleaseFast`) runs the checksum-verified microbenchmark.
+All 13 selected canonical-content/hash tests pass, including exact native
+`0.1`, signed zero, wide integral floats, subnormals and maximum finite values
+through strict decimal-token decoding and byte-stable re-encoding. This is
+codec/persistence-boundary evidence, not a claim of new original SQL coverage
+or complete distributed restore qualification.
 Native relation publication now has a separate v32 command carrying the ready
 cut, exact predecessor generation and membership-bound activation, never a
 sender-authored publication proof. Replica preparation authenticates source and

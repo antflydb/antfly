@@ -286,6 +286,17 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_numeric_tests = @import("build_support/antfly/test_support.zig").addFilteredTestRunArtifact(b, numeric_tests);
     b.step("sql-numeric-test", "Run isolated exact NUMERIC arithmetic row and key contracts").dependOn(&run_numeric_tests.step);
 
+    const exact_float_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly-embedded/src/common/json_float_decimal.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_exact_float_tests = b.addRunArtifact(exact_float_tests);
+    b.step("sql-exact-float-test", "Verify exact binary64 decimal expansion across finite exponents and benchmark its codec")
+        .dependOn(&run_exact_float_tests.step);
+
     const lib_scraping_tests = b.addTest(.{
         .root_module = scraping_mod,
     });
@@ -698,6 +709,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const unit_test_step = owner_tests.unit_test_step;
     unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
+    unit_test_step.dependOn(&run_exact_float_tests.step);
     unit_test_step.dependOn(&run_pgwire_tests.step);
     unit_test_step.dependOn(&pdf_integration.run.step);
     // HTTP client lifecycle tests belong to lib-test; keep their focused target.
