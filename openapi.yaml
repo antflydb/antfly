@@ -22362,8 +22362,9 @@ components:
         remote_snapshot:
           type: string
           description: Opaque retained snapshot token returned by an ordered native or external-table
-            query. Echo with search_after or search_before. Native and lake cuts expire within 60 seconds;
-            missing, expired or incompatible generations return 409.
+            query. Echo with search_after or search_before. Native and lake cuts expire within the configured
+            retention period (default five minutes; maximum one hour); missing, expired or incompatible
+            generations return 409.
         evaluate:
           $ref: '#/components/schemas/QueryEvaluation'
         table_target:
@@ -23315,9 +23316,10 @@ components:
             source_cursor:
               type: string
               description: Opaque composed continuation retaining per-leaf native generations or archive
-                publications and accepted WAL cuts for up to 60 seconds from their creation. Publication
-                and restart preserve the cut. Authorization, policy, recipe, source and table incarnation
-                changes invalidate it. Leaf search_after/search_before tuples are unsupported.
+                publications and accepted WAL cuts for the configured retention period from their creation
+                (default five minutes; maximum one hour). Publication and restart preserve the cut. Authorization,
+                policy, recipe, source and table incarnation changes invalidate it. Leaf search_after/search_before
+                tuples are unsupported.
     Analyses:
       x-go-type-skip-optional-pointer: false
       type: object
@@ -24445,14 +24447,14 @@ components:
         next_source_cursor:
           type: string
           description: Opaque continuation for composed queries. Pass as source_cursor with the same query;
-            valid until the earliest retained leaf cut expires (at most 60 seconds). Publication and restart
-            preserve it; authorization and incarnation fences remain enforced.
+            valid until the earliest retained leaf cut expires (default five minutes; maximum one hour).
+            Publication and restart preserve it; authorization and incarnation fences remain enforced.
         remote_snapshot:
           type: string
           description: Opaque snapshot to echo with ordered pagination. Native tokens retain the complete
             physical generation; lake tokens retain the archive publication, metadata and accepted WAL
-            cut, for at most 60 seconds. Every use rechecks access, incarnation and recipe. Unavailable
-            retained generations return 409.
+            cut, for the configured retention period (default five minutes; maximum one hour). Every use
+            rechecks access, incarnation and recipe. Unavailable retained generations return 409.
         evaluation:
           type: object
           additionalProperties: true

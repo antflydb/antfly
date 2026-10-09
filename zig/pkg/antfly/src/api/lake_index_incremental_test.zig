@@ -119,6 +119,14 @@ test "external lake incremental native publication appends replaces removes and 
                     defer constrained.deinit();
                     try std.testing.expectEqual(expected, constrained.snapshot.liveDocCount());
                     try std.testing.expectEqual(@as(usize, 1), constrained_corpora.entries.count());
+                    if (phase == 0 and root.seekable) {
+                        var seekable_cache: @import("lake_index_native_text_cache.zig").Cache = .{ .max_bytes = 1, .max_seekable_bytes = encoded_bytes };
+                        defer seekable_cache.deinit();
+                        var seekable_pin = try seekable_cache.acquire(std.testing.io, store, declaration.artifact, root, schema_json, .{ .cache = &read_cache, .scope = @splat(1), .context = .{} }, .{}, .none);
+                        defer seekable_pin.deinit();
+                        try std.testing.expectEqual(expected, seekable_pin.snapshot.liveDocCount());
+                        try std.testing.expectEqual(encoded_bytes, seekable_cache.bytes);
+                    }
                     if (phase == 0) {
                         // Two active publication roots sharing all segments
                         // must fit in one corpus reservation plus two roots.

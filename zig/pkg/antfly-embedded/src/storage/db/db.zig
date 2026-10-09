@@ -19324,7 +19324,13 @@ pub const DB = struct {
         try token.check();
         var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
-        try @import("native_query_cut.zig").admit(self.alloc, io, self.core.path, request.id, token);
+        try @import("native_query_cut.zig").admit(self.alloc, io, self.core.path, request.id, if (self.backend_runtime.query_cut_repository) |repository| repository.limits else .{}, token);
+        const root = try @import("native_query_cut.zig").pathAlloc(self.alloc, self.core.path, request.id);
+        defer self.alloc.free(root);
+        const existed = try snapshotPathExists(io, root);
+        // A failed new capture must not consume the capacity reserved for
+        // usable cursors. The parent guard excludes readers of this new root.
+        errdefer if (!existed) std.Io.Dir.cwd().deleteTree(io, root) catch {};
         _ = self.snapshotInternal(request.id, true, token, deadline, null, false, request) catch |err| {
             try token.check();
             return switch (err) {
@@ -19334,6 +19340,10 @@ pub const DB = struct {
                 else => err,
             };
         };
+        try @import("native_query_cut.zig").admit(self.alloc, io, self.core.path, request.id, if (self.backend_runtime.query_cut_repository) |repository| repository.limits else .{}, token);
+        if (self.backend_runtime.query_cut_repository) |repository| {
+            try repository.publish(io, root, request, self.core.identity_namespace, token);
+        }
     }
     pub fn openQueryCut(self: *DB, request: @import("native_query_cut.zig").Request, cancellation: types.CancellationToken) !DB {
         const cut = @import("native_query_cut.zig");
@@ -19346,11 +19356,17 @@ pub const DB = struct {
         const expiry_deadline = monotonicTimeNs() +| (request.expires_ms -| cut.nowMs()) * std.time.ns_per_ms;
         const control: cut.Control = .{ .parent = cancellation, .deadline_ns = if (request.timeout_ms) |value| @min(monotonicTimeNs() +| value *| std.time.ns_per_ms, expiry_deadline) else expiry_deadline };
         var guard = try cut.lock(self.alloc, io, self.core.path, control.token());
-        var reader = cut.readLease(self.alloc, io, self.core.path, request.id, control.token()) catch |err| {
-            guard.deinit();
-            return err;
+        var guarded = true;
+        defer if (guarded) guard.deinit();
+        if (!try snapshotPathExists(io, path)) if (self.backend_runtime.query_cut_repository) |repository| {
+            try cut.admit(self.alloc, io, self.core.path, request.id, repository.limits, control.token());
+            try repository.recover(io, path, request, self.core.identity_namespace, control.token());
+            errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
+            try cut.admit(self.alloc, io, self.core.path, request.id, repository.limits, control.token());
         };
+        var reader = try cut.readLease(self.alloc, io, self.core.path, request.id, control.token());
         guard.deinit();
+        guarded = false;
         var transferred = false;
         defer if (!transferred) reader.deinit();
         try cut.validate(self.alloc, io, path, request, self.core.identity_namespace, control.token());

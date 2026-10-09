@@ -514,7 +514,8 @@ The suffix is bounded to 64 transactions, 32 MiB and 65,536 distinct changes.
 A query fails closed when coverage is unavailable or the bound is exceeded.
 The archive must be an ancestor of the current head through native WAL or
 compaction transitions: an unpublished external writer commit requires archive
-publication. Cursors retain both the archive publication and accepted tail for 60 seconds in
+publication. Cursors retain both the archive publication and accepted tail for the
+configured cursor retention period (five minutes by default, at most one hour) in
 object-store descriptors. Publication and restart preserve the original cut;
 recipe, policy and incarnation changes invalidate it.
 The overlay is reconstructed from durable WAL after restart. Direct SQL SELECT
@@ -599,3 +600,41 @@ The native formats follow the [Iceberg v2 specification](https://iceberg.apache.
 and [Parquet format definitions](https://github.com/apache/parquet-format/blob/master/src/main/thrift/parquet.thrift).
 Independent Arrow and PyIceberg readers qualify the emitted artifacts and catalog
 updates in the managed and REST HTTP tests.
+
+
+## Follow-up execution priorities (October 9)
+
+Implement native snapshot portability before public HN deployment. The repository
+adapter and retained-owner restoration described in [composed query sources](composed-query-sources.md)
+are under native and standalone qualification. The deployment must use durable
+artifact storage whose lifecycle exceeds cursor/chunk retention, independently of
+owner disks. Check restoration, cancellation, credential rotation, expiry cleanup,
+admission pressure and cold publication before deploying.
+
+The next source adapters are PostgreSQL CDC and S3/GCS notifications. Support both
+attach and managed provisioning with persisted ownership and reconciliation;
+notifications are wake-up hints, and authoritative catalog reconciliation repairs
+loss or duplication. PostgreSQL transaction positions become checkpoints only
+after durable Antfly acceptance. Provisioning must be idempotent and teardown
+must never remove resources that Antfly only attached to.
+
+Full-archive qualification is authorized in `antfly-dev-01` with a $150 incremental
+spend ceiling. The October 9 public dataset metadata reports 49,999,000 raw rows
+and 19,772,584,432 logical bytes. `examples/hackernews/export-full.sql` has a
+21,474,836,480-byte billing limit; its dry run estimates 19,372,806,880 bytes.
+The pinned October 9 export completed with 47,717,307 live story/comment rows,
+334 Parquet objects and 21,195,813,507 compressed bytes. This establishes source
+availability; full-archive index capacity and query latency still need qualification.
+Use fresh export/artifact prefixes, bounded pod lifetimes and cleanup, regional
+compute beside GCS, and record exact binary/source revisions. Qualify cold and
+warm filtered/ranked queries, cancellation, restart and owner relocation,
+archive overlays, pagination and concurrent pressure. A successful smaller sample
+is not evidence of full-archive capacity. Query/export preprocessing costs, pod
+resource time, GCS operations and temporary storage belong in the run ledger.
+
+After engine qualification, finish rolling-year routing and migration, public HN
+UI/deployment, scalable resumable maintenance, and the remaining composed query
+classes and SQL modes. The immutable HN cohorts currently documented are not a
+rolling-year production service. Aggregation/hierarchy/graph/analysis/stateful
+composition and broader SQL acceptance must retain the same visibility and cursor
+fences; do not replace exact archive semantics with a bounded candidate sample.

@@ -9,34 +9,93 @@ import socket
 import shutil
 import subprocess
 import time
+import uuid
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import pytest
+from object_store_fixture import S3Fixture
 
 
 @pytest.mark.parametrize("vector_storage", ["primary_lsm", "vector_store"])
+@pytest.mark.parametrize("artifact_provider", ["filesystem", "s3", "gcs"])
 def test_mutable_native_cursor_survives_updates_deletes_and_restart(
-    tmp_path, vector_storage
+    tmp_path, vector_storage, artifact_provider
 ):
     binary = os.environ.get("ANTFLY_NATIVE_BINARY")
     if not binary:
         pytest.skip("set ANTFLY_NATIVE_BINARY for native HTTP qualification")
+    bucket = os.environ.get("ANTFLY_NATIVE_CURSOR_GCS_BUCKET")
+    if artifact_provider == "gcs" and not bucket:
+        pytest.skip("set ANTFLY_NATIVE_CURSOR_GCS_BUCKET for opt-in GCS qualification")
+    cloud_prefix = "hn-poc/native-cursor-qualification/" + uuid.uuid4().hex
+    env = dict(os.environ)
+    s3 = S3Fixture(tmp_path / "s3") if artifact_provider == "s3" else None
+    settings = {
+        "storage": {
+            "engine": "local",
+            "local": {"base_dir": str(tmp_path / "data")},
+        }
+    }
+    if artifact_provider == "gcs":
+        env["HN_GCS_BEARER"] = subprocess.run(
+            ["gcloud", "auth", "print-access-token"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        settings["storage"]["artifacts"] = {
+            "connection": "cursor-artifacts",
+            "bucket": bucket,
+            "prefix": cloud_prefix,
+        }
+        settings["connections"] = {
+            "cursor-artifacts": {
+                "kind": "external_io",
+                "capabilities": ["storage.primary"],
+                "external_io": {
+                    "protocol": "gcs",
+                    "buckets": [bucket],
+                    "prefix": cloud_prefix,
+                    "bucket_provisioning": "require_existing",
+                    "credentials": {
+                        "source": "bearer_token",
+                        "bearer_token": "${secret:HN_GCS_BEARER}",
+                    },
+                },
+            }
+        }
+    if s3:
+        settings["storage"]["artifacts"] = {
+            "connection": "cursor-artifacts",
+            "bucket": "archive",
+            "prefix": cloud_prefix,
+        }
+        settings["connections"] = {
+            "cursor-artifacts": {
+                "kind": "external_io",
+                "capabilities": ["storage.primary"],
+                "external_io": {
+                    "protocol": "s3",
+                    "endpoint": s3.endpoint,
+                    "use_ssl": False,
+                    "addressing_style": "path",
+                    "buckets": ["archive"],
+                    "prefix": cloud_prefix,
+                    "credentials": {
+                        "source": "static",
+                        "access_key_id": "fixture",
+                        "secret_access_key": "fixture",
+                    },
+                },
+            }
+        }
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
     endpoint = f"http://127.0.0.1:{port}/db/v1"
     config = tmp_path / "config.json"
-    config.write_text(
-        json.dumps(
-            {
-                "storage": {
-                    "engine": "local",
-                    "local": {"base_dir": str(tmp_path / "data")},
-                }
-            }
-        )
-    )
+    config.write_text(json.dumps(settings))
     log_path = tmp_path / "server.log"
     log = log_path.open("w")
     process = None
@@ -78,6 +137,7 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
             ],
             stdout=log,
             stderr=log,
+            env=env,
         )
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -229,6 +289,16 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
             4,
         ], resumed
         stop()
+        if s3:
+            # Credential rotation must not change a retained cursor's location
+            # fence. The wire oracle accepts both fixture signing identities.
+            credentials = settings["connections"]["cursor-artifacts"]["external_io"][
+                "credentials"
+            ]
+            credentials.update(
+                access_key_id="rotated-fixture", secret_access_key="rotated-fixture"
+            )
+            config.write_text(json.dumps(settings))
         start()
         restarted = response(page)
         assert [hit["_source"]["amount"] for hit in restarted["hits"]["hits"]] == [
@@ -279,12 +349,42 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
                 )
             )
         assert implicit_unpinned.value.code == 409, implicit_unpinned.value.__notes__
-        # Losing an owner's retained files must never recreate the old cut
-        # from live rows, even though the server capability remains valid.
+        # Owner files are disposable caches. Recovery must preserve the old
+        # cut from durable artifacts rather than capture today's live rows.
         retained_files = list((tmp_path / "data").rglob("query-cut.json"))
         assert retained_files
         for manifest in retained_files:
             shutil.rmtree(manifest.parent)
+        recovered = response(page)
+        assert [hit["_source"]["amount"] for hit in recovered["hits"]["hits"]] == [
+            2,
+            3,
+            4,
+        ]
+        # Losing both copies fails closed while the public capability remains.
+        for manifest in (tmp_path / "data").rglob("query-cut.json"):
+            shutil.rmtree(manifest.parent)
+        if artifact_provider == "gcs":
+            subprocess.run(
+                [
+                    "gcloud",
+                    "storage",
+                    "rm",
+                    "--recursive",
+                    f"gs://{bucket}/{cloud_prefix}/native-query-generations/",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        else:
+            remote_root = s3.root if s3 else tmp_path / "data"
+            remote_manifests = list(
+                remote_root.rglob("native-query-generations/**/*.json")
+            )
+            assert remote_manifests
+            for manifest in remote_manifests:
+                manifest.unlink()
         with pytest.raises(HTTPError) as missing:
             response(page)
         assert missing.value.code == 409, missing.value.__notes__
@@ -293,3 +393,23 @@ def test_mutable_native_cursor_survives_updates_deletes_and_restart(
         if process is not None and process.poll() is None:
             stop()
         log.close()
+        if s3:
+            s3.close()
+            assert s3.signed_requests > 0
+        if artifact_provider == "gcs":
+            cleanup = subprocess.run(
+                [
+                    "gcloud",
+                    "storage",
+                    "rm",
+                    "--recursive",
+                    f"gs://{bucket}/{cloud_prefix}/",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if cleanup.returncode and "matched no objects" not in cleanup.stderr:
+                raise RuntimeError(
+                    f"GCS qualification cleanup failed: {cleanup.stderr}"
+                )

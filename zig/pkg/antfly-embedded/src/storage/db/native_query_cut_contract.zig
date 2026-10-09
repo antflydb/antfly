@@ -1,7 +1,8 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 const std = @import("std");
-pub const ttl_ms: u64 = 60_000;
+pub const ttl_ms: u64 = 300_000;
+pub const max_ttl_ms: u64 = std.time.ms_per_hour;
 pub const Request = struct {
     id: []const u8,
     table_id: u64,
@@ -16,6 +17,6 @@ pub const Request = struct {
     pub fn validate(self: Request, now: u64) !void {
         if (self.id.len != 64 or self.table_id == 0) return error.InvalidQueryRequest;
         for (self.id) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidQueryRequest;
-        if (self.expires_ms <= now or self.expires_ms > now +| ttl_ms) return error.CatalogGenerationChanged;
+        if (self.expires_ms <= now or self.expires_ms > now +| max_ttl_ms) return error.CatalogGenerationChanged;
     }
 };

@@ -3932,6 +3932,7 @@ pub const ApiHttpServer = struct {
     lake_gc_closing: std.atomic.Value(bool) = .init(false),
     lake_gc_last_schedule_ns: std.atomic.Value(u64) = .init(0),
     lake_gc_after: ?u64 = null,
+    native_query_gc_after: ?[]u8 = null,
     lake_gc_store_index: usize = 0,
     lake_gc_token: ?[16]u8 = null,
     lake_gc_token_table: u64 = 0,
@@ -4182,6 +4183,10 @@ pub const ApiHttpServer = struct {
             .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(owner_alloc, api_io, effective_query_embedding_cache),
             .sql_plan_cache = sql_plan_cache.Cache.init(owner_alloc, .{}),
             .sql_schema_cache = sql_schema_cache.Cache.init(owner_alloc),
+            .lake_text_corpora = .{
+                .max_seekable_bytes = if (cfg.node_config) |config| config.lake_indexes.text_cache.max_seekable_artifact_bytes else 64 * 1024 * 1024 * 1024,
+                .heap_budget = .{ .backing = platform.allocator.processAllocator(std.heap.smp_allocator), .limit = if (cfg.node_config) |config| config.lake_indexes.text_cache.max_heap_bytes else 256 * 1024 * 1024 },
+            },
             .lake_read_cache = @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache.initWithMemoryLimit(owner_alloc, if (cfg.node_config) |config| config.lake_cache.max_memory_bytes else 64 * 1024 * 1024),
             .embedding_provider_runtime = managed_embedder.ProviderRuntime.init(owner_alloc, api_io),
             .mcp_sessions = mcp.InMemorySessionStore.initWithOptions(owner_alloc, api_io, .{
@@ -4716,6 +4721,7 @@ pub const ApiHttpServer = struct {
         self.sql_schema_cache.deinit();
         self.lake_native_runtimes.deinit();
         self.lake_text_corpora.deinit();
+        if (self.native_query_gc_after) |value| self.alloc.free(value);
         self.lake_search_metadata.deinit();
         self.lake_reader_leases.deinit(self.embedding_provider_runtime.io);
         self.lake_read_cache.deinit();
@@ -5957,6 +5963,14 @@ pub const ApiHttpServer = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const a = arena.allocator();
+        if (!config.lake_indexes.artifact_gc.dry_run) {
+            var repository = try @import("native_query_repository.zig").Repository.init(a, config, self.cfg.secret_store, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
+            defer repository.deinit();
+            const control: @import("antfly_local_sources").storage_db_native_query_cut.Control = .{ .parent = cancel, .deadline_ns = request.deadline_ns.? };
+            const next = try repository.collectNext(self.alloc, self.native_query_gc_after, platform_time.realtimeNs() / std.time.ns_per_ms, @min(128, config.lake_indexes.artifact_gc.max_deleted), control.token());
+            if (self.native_query_gc_after) |value| self.alloc.free(value);
+            self.native_query_gc_after = next;
+        }
         const bytes = try self.source.systemCatalog(a, request, .{ .lake_index_lifecycle_work = self.lake_gc_after });
         const page = try std.json.parseFromSliceLeaky(@import("../metadata/lake_index_lifecycle.zig").WorkPage, a, bytes, .{ .allocate = .alloc_always });
         const item = page.item orelse {
@@ -9248,7 +9262,7 @@ pub const ApiHttpServer = struct {
             var store = try @import("lake_index_store.zig").Store.openNative(alloc, self.cfg.node_config, self.cfg.secret_store, true, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
             defer store.deinit();
             var artifacts = store.artifactStore();
-            const cut = try @import("native_retained_cut.zig").load(alloc, &artifacts, store.identity, token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, query_req.cancellation orelse .none);
+            const cut = try @import("native_retained_cut.zig").load(alloc, &artifacts, try @import("native_retained_cut.zig").storeIdentity(alloc, store.locator), token, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, query_req.cancellation orelse .none);
             query_req.native_query_cut = .{ .id = cut.id, .table_id = cut.table_id, .expires_ms = cut.expires_ms, .create = if (resolver) |cache| if (cache.native_capture_token) |minted| std.mem.eql(u8, minted, token) else false else false, .timeout_ms = if (query_req.execution_deadline_ns) |deadline| (deadline -| @import("antfly_platform").time.monotonicNs()) / std.time.ns_per_ms else null };
             const remaining = cut.expires_ms -| (@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
             const cut_deadline = @import("antfly_platform").time.monotonicNs() +| remaining * std.time.ns_per_ms;
@@ -15024,7 +15038,7 @@ pub const ApiHttpServer = struct {
                     var store = try @import("lake_index_store.zig").Store.openNative(resolver.arena, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
                     var artifacts = store.artifactStore();
-                    query_req.req.remote_snapshot = try @import("native_retained_cut.zig").save(alloc, &artifacts, store.identity, self.embedding_provider_runtime.io, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, context.cancellation);
+                    query_req.req.remote_snapshot = try @import("native_retained_cut.zig").saveWithRetention(alloc, &artifacts, try @import("native_retained_cut.zig").storeIdentity(alloc, store.locator), self.embedding_provider_runtime.io, table, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(self.cfg.node_config), context.cancellation);
                     resolver.native_capture_token = query_req.req.remote_snapshot;
                 }
             }
@@ -16367,7 +16381,7 @@ pub const ApiHttpServer = struct {
             std.log.warn("native recent vector collection deferred table={s} err={s}", .{ table.name, @errorName(err) });
         };
         var retained_artifacts = store.artifactStore();
-        @import("lake_retained_cut.zig").collect(&retained_artifacts, 0, store.identity, platform_time.realtimeNs() / std.time.ns_per_ms, cancel) catch {};
+        @import("lake_retained_cut.zig").collect(&retained_artifacts, 0, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), platform_time.realtimeNs() / std.time.ns_per_ms, cancel) catch {};
         @import("lake_retained_cut.zig").collect(&retained_artifacts, table.table_id, store.identity, platform_time.realtimeNs() / std.time.ns_per_ms, cancel) catch |err| {
             std.log.warn("native retained search cut collection deferred table={s} err={s}", .{ table.name, @errorName(err) });
         };
@@ -21701,7 +21715,7 @@ pub const ApiHttpServer = struct {
                             var store = try @import("lake_index_store.zig").Store.openNative(scratch, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                             defer store.deinit();
                             var artifacts = store.artifactStore();
-                            const token = try @import("native_retained_cut.zig").save(scratch, &artifacts, store.identity, runner.server.embedding_provider_runtime.io, bound.*, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, context.cancellation);
+                            const token = try @import("native_retained_cut.zig").saveWithRetention(scratch, &artifacts, try @import("native_retained_cut.zig").storeIdentity(scratch, store.locator), runner.server.embedding_provider_runtime.io, bound.*, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, @import("lake_retained_cut.zig").configuredTtl(runner.server.cfg.node_config), context.cancellation);
                             try request.object.put(scratch, "remote_snapshot", .{ .string = token });
                             resolver.native_capture_token = token;
                             native_query = try std.json.Stringify.valueAlloc(scratch, request, .{});
@@ -21737,7 +21751,7 @@ pub const ApiHttpServer = struct {
                     var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, false, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
                     var artifacts = store.artifactStore();
-                    return @import("lake_retained_cut.zig").saveCursor(a, &artifacts, store.identity, runner.server.embedding_provider_runtime.io, bytes, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| .{ .ptr = cancel, .is_cancelled_fn = cursorCancelled } else .none);
+                    return @import("lake_retained_cut.zig").saveCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), runner.server.embedding_provider_runtime.io, bytes, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| .{ .ptr = cancel, .is_cancelled_fn = cursorCancelled } else .none);
                 }
                 fn loadCursor(raw: *anyopaque, a: std.mem.Allocator, token: []const u8) ![]const u8 {
                     const runner: *@This() = @ptrCast(@alignCast(raw));
@@ -21745,7 +21759,7 @@ pub const ApiHttpServer = struct {
                     var store = try @import("lake_index_store.zig").Store.openNative(a, runner.server.cfg.node_config, runner.server.cfg.secret_store, true, runner.server.cfg.deployment_mode, runner.server.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
                     var artifacts = store.artifactStore();
-                    return @import("lake_retained_cut.zig").loadCursor(a, &artifacts, store.identity, token, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| .{ .ptr = cancel, .is_cancelled_fn = cursorCancelled } else .none);
+                    return @import("lake_retained_cut.zig").loadCursor(a, &artifacts, try @import("native_retained_cut.zig").storeIdentity(a, store.locator), token, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, if (runner.cancellation) |cancel| .{ .ptr = cancel, .is_cancelled_fn = cursorCancelled } else .none);
                 }
                 fn localDigest(bytes: []const u8) [64]u8 {
                     return @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.digestHex(bytes);

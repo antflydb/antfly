@@ -24,7 +24,11 @@ const stores = @import("../serverless/artifacts/store.zig");
 const ingestion = @import("../serverless/lake_ingestion.zig");
 const catalog = local.metadata_lake_index_catalog;
 const A = std.mem.Allocator;
-pub const ttl_ms: u64 = 60_000;
+pub const ttl_ms: u64 = 300_000;
+pub const max_ttl_ms: u64 = std.time.ms_per_hour;
+pub fn configuredTtl(config: ?*const local.common_config.Config) u64 {
+    return if (config) |value| value.lake_indexes.query_cursors.retention_ms else ttl_ms;
+}
 pub const max_bytes: usize = 40 * 1024 * 1024;
 pub const prefix = "lake2:";
 pub const Descriptor = struct {
@@ -76,7 +80,7 @@ pub fn load(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
     };
     defer store.allocator.free(bytes);
     const result = try std.json.parseFromSliceLeaky(Descriptor, a, bytes, .{ .allocate = .alloc_always });
-    if (result.version != 1 or result.expires_ms != scope.fencingToken() or result.expires_ms <= now or result.expires_ms > now +| ttl_ms or result.table_id != table.table_id or result.object_generation != table.object_storage_generation or !std.mem.eql(u8, &result.desired, &catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
+    if (result.version != 1 or result.expires_ms != scope.fencingToken() or result.expires_ms <= now or result.expires_ms > now +| max_ttl_ms or result.table_id != table.table_id or result.object_generation != table.object_storage_generation or !std.mem.eql(u8, &result.desired, &catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
     try result.publication.validate();
     return result;
 }
@@ -105,7 +109,7 @@ pub fn collect(store: *stores.ArtifactStore, table: u64, store_identity: catalog
 const CursorEnvelope = struct { version: u16 = 1, expires_ms: u64, payload: []const u8 };
 pub fn saveCursor(a: A, store: *stores.ArtifactStore, identity: catalog.Digest, io: std.Io, payload: []const u8, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) ![]const u8 {
     if (payload.len > 1024 * 1024) return error.QueryCandidateBudgetExceeded;
-    var expires = now +| ttl_ms;
+    var expires = now +| max_ttl_ms;
     const state = try std.json.parseFromSliceLeaky(std.json.Value, a, payload, .{});
     if (state != .object) return error.InvalidQueryRequest;
     const sources = state.object.get("sources") orelse return error.InvalidQueryRequest;
@@ -138,7 +142,7 @@ pub fn loadCursor(a: A, store: *stores.ArtifactStore, identity: catalog.Digest, 
     const bytes = try store.getVerifiedAllocWithCancellation(artifact, length, try stores.sha256ChecksumFromArtifactId(artifact), cancellation);
     defer store.allocator.free(bytes);
     const envelope = try std.json.parseFromSliceLeaky(CursorEnvelope, a, bytes, .{ .allocate = .alloc_always });
-    if (envelope.version != 1 or envelope.expires_ms != scope.fencingToken() or envelope.expires_ms <= now or envelope.expires_ms > now +| ttl_ms or envelope.payload.len > 1024 * 1024) return error.CatalogGenerationChanged;
+    if (envelope.version != 1 or envelope.expires_ms != scope.fencingToken() or envelope.expires_ms <= now or envelope.expires_ms > now +| max_ttl_ms or envelope.payload.len > 1024 * 1024) return error.CatalogGenerationChanged;
     return envelope.payload;
 }
 

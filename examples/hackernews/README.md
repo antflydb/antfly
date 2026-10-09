@@ -471,7 +471,7 @@ hits without a fixed archive-position horizon. Large overlay totals are lower
 bounds unless `count: true` explicitly streams an exact count. Pass
 `next_source_cursor` as `source_cursor` on the next request. Lake cuts retain the
 same archive publication and accepted WAL images across publication and restart
-for up to 60 seconds; authorization and incarnation are always rechecked. Read the
+for the configured cursor retention period; authorization and incarnation are always rechecked. Read the
 [composition contracts](../../docs/plans/composed-query-sources.md#implemented-contracts)
 before exposing all-time search over a full archive.
 
@@ -533,9 +533,42 @@ A mutable native current table can participate in the same saved union/overlay
 source. Ordered native queries return a `native2:` `remote_snapshot`; echo it with
 `_sort` as `search_after`/`search_before`. Composed continuation stores each native
 leaf capability automatically. Later writes/deletes and a daemon restart preserve
-that generation until its 60-second expiry. Both `primary_lsm` and `vector_store`
+that generation until its configured expiry (five minutes by default). Both `primary_lsm` and `vector_store`
 source-vector ownership are supported on filesystem-managed LSM owners. Missing
-owner files, expiry or catalog/recipe changes produce a conflict.
+authoritative artifacts, expiry or catalog/recipe changes produce a conflict.
 `tests/test_native_cursor_http.py` qualifies mutations and restart against the real
 standalone daemon for both storage settings. Full historical HN deployment and
 archive-scale latency still need operational qualification.
+
+
+### Native snapshot portability qualification
+
+Native ordered queries publish their complete retained document/vector generation
+through the artifact provider before admitting a cursor. Replacement owners can
+restore missing local cuts from filesystem, S3 or GCS artifacts while preserving
+the original query view. Missing authoritative data returns 409. Local cut files
+are a read cache, and credentials can rotate without changing native cursor scope.
+Set `lake_indexes.query_cursors.retention_ms` (default 300000, maximum 3600000),
+`max_native_cuts` (default 64) and `max_native_retained_bytes` (default 64 GiB).
+Shared immutable local extents count once; immutable remote chunks are reused
+across captures. Retention does not renew on pagination.
+
+The native HTTP fixture also supports opt-in qualification through a real GCS
+bucket. Each test uses a fresh prefix and removes its artifacts afterward:
+
+```sh
+ANTFLY_NATIVE_BINARY=/path/to/antfly \
+ANTFLY_NATIVE_CURSOR_GCS_BUCKET=colony-import-sources-antfly-dev-01 \
+  .venv/bin/python -m pytest -q tests/test_native_cursor_http.py
+```
+
+It uses the caller's existing `gcloud` credentials. The token is passed to the
+daemon through its environment and is never written to configuration or results.
+
+`export-full.sql` prepares full-archive search qualification in `antfly-dev-01`.
+The authorized incremental budget is $150; the dry run estimated 19,372,806,880
+bytes. The pinned October 9 export completed with 47,717,307 live story/comment
+rows in 334 Parquet objects (21,195,813,507 compressed bytes). Full-archive index
+and latency qualification and an HN public deployment are still outstanding.
+The first durable generation's transfer latency and automatic background warming
+must be qualified separately from ordinary unordered search latency.

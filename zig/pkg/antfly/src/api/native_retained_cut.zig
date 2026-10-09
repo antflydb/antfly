@@ -1,7 +1,7 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 //! Server-written native cursor capabilities; physical owners retain immutable
-//! generations. Credentials, incarnation and recipes are checked each page.
+//! generations. Store location, incarnation and recipes are checked each page.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const stores = @import("../serverless/artifacts/store.zig");
@@ -9,6 +9,15 @@ const A = std.mem.Allocator;
 const Digest = [32]u8;
 pub const prefix = "native2:";
 pub const Descriptor = struct { version: u16 = 1, expires_ms: u64, table_id: u64, desired: Digest, id: []const u8 };
+/// A generation belongs to its durable location, independently of rotating
+/// credentials or the process that happens to serve its next page.
+pub fn storeIdentity(a: A, locator: local.metadata_lake_index_catalog.StoreLocator) !Digest {
+    const bytes = try std.json.Stringify.valueAlloc(a, locator, .{});
+    defer a.free(bytes);
+    var digest: Digest = undefined;
+    std.crypto.hash.Blake3.hash(bytes, &digest, .{});
+    return digest;
+}
 fn domain(table: u64, identity: Digest) Digest {
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("native-retained-query-cuts-v1");
@@ -33,11 +42,15 @@ fn recipe(table: anytype) Digest {
     return digest;
 }
 pub fn save(a: A, store: *stores.ArtifactStore, identity: Digest, io: std.Io, table: anytype, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) ![]const u8 {
+    return saveWithRetention(a, store, identity, io, table, now, @import("lake_retained_cut.zig").ttl_ms, cancellation);
+}
+pub fn saveWithRetention(a: A, store: *stores.ArtifactStore, identity: Digest, io: std.Io, table: anytype, now: u64, retention_ms: u64, cancellation: @import("antfly_cancellation").CancellationToken) ![]const u8 {
+    if (retention_ms == 0 or retention_ms > @import("lake_retained_cut.zig").max_ttl_ms) return error.InvalidQueryRequest;
     try collect(store, table.table_id, identity, now, cancellation);
     var nonce: [32]u8 = undefined;
     try io.randomSecure(&nonce);
     const id = std.fmt.bytesToHex(nonce, .lower);
-    const descriptor: Descriptor = .{ .expires_ms = now +| @import("lake_retained_cut.zig").ttl_ms, .table_id = table.table_id, .desired = recipe(table), .id = &id };
+    const descriptor: Descriptor = .{ .expires_ms = now +| retention_ms, .table_id = table.table_id, .desired = recipe(table), .id = &id };
     const bytes = try std.json.Stringify.valueAlloc(a, descriptor, .{});
     defer a.free(bytes);
     const scope = try stores.UploadScope.forPublication(domain(table.table_id, identity), descriptor.expires_ms, io);
@@ -59,26 +72,32 @@ pub fn load(a: A, store: *stores.ArtifactStore, identity: Digest, token: []const
     };
     defer store.allocator.free(bytes);
     const descriptor = std.json.parseFromSliceLeaky(Descriptor, a, bytes, .{ .allocate = .alloc_always }) catch return error.CatalogGenerationChanged;
-    if (descriptor.version != 1 or descriptor.expires_ms != scope.fencingToken() or descriptor.expires_ms > now +| @import("lake_retained_cut.zig").ttl_ms or descriptor.table_id != table.table_id or !std.mem.eql(u8, &descriptor.desired, &recipe(table)) or descriptor.id.len != 64) return error.CatalogGenerationChanged;
+    if (descriptor.version != 1 or descriptor.expires_ms != scope.fencingToken() or descriptor.expires_ms > now +| @import("lake_retained_cut.zig").max_ttl_ms or descriptor.table_id != table.table_id or !std.mem.eql(u8, &descriptor.desired, &recipe(table)) or descriptor.id.len != 64) return error.CatalogGenerationChanged;
     return descriptor;
 }
 
 pub fn collect(store: *stores.ArtifactStore, table: u64, store_identity: Digest, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !void {
+    _ = try collectBounded(store, table, store_identity, now, 128, cancellation);
+}
+pub fn collectBounded(store: *stores.ArtifactStore, table: u64, store_identity: Digest, now: u64, limit: usize, cancellation: @import("antfly_cancellation").CancellationToken) !usize {
+    if (limit == 0) return 0;
     const Visitor = struct {
         store: *stores.ArtifactStore,
         now: u64,
+        limit: usize,
         deleted: usize = 0,
         fn visit(raw: *anyopaque, scope: stores.UploadScope, artifact_id: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (scope.fencingToken() +| 30_000 >= self.now) return;
-            if (self.deleted == 128) return error.RetainedCutCollectionBound;
+            if (self.deleted == self.limit) return error.RetainedCutCollectionBound;
             try self.store.delete(artifact_id);
             self.deleted += 1;
         }
     };
-    var visitor: Visitor = .{ .store = store, .now = now };
-    store.visitScopedUploads(domain(table, store_identity), .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_cutoff = now -| 30_000, .max_entries = 128 }, cancellation) catch |err| switch (err) {
-        error.RetainedCutCollectionBound => {},
+    var visitor: Visitor = .{ .store = store, .now = now, .limit = limit };
+    store.visitScopedUploads(domain(table, store_identity), .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_cutoff = now -| 30_000, .max_entries = limit }, cancellation) catch |err| switch (err) {
+        error.RetainedCutCollectionBound, error.ArtifactEnumerationPaused => {},
         else => return err,
     };
+    return visitor.deleted;
 }

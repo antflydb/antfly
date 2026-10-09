@@ -1654,6 +1654,7 @@ pub extern fn antfly_storage_context_attach_inference_provider(
 /// Borrows the runtime secret facade until context destruction. Configure before
 /// opening any table owner; the caller retains ownership and controls its lifetime.
 pub extern fn antfly_storage_context_configure_secrets(context: ?*anyopaque, store: ?*anyopaque) callconv(.c) Status;
+pub extern fn antfly_storage_context_configure_native_queries(context: ?*anyopaque, setup: BorrowedBytes) callconv(.c) Status;
 
 /// Replaces the context-owned remote-content security snapshot before any
 /// table owner opens. The payload is a ContentSecurityConfig JSON object.

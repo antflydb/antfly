@@ -10,8 +10,9 @@ const Namespace = @import("doc_identity_namespace.zig").Namespace;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const A = std.mem.Allocator;
-pub const ttl_ms = 60_000;
+pub const ttl_ms = @import("native_query_cut_contract.zig").ttl_ms;
 pub const max_cuts = 64;
+pub const Limits = struct { max_cuts: usize = 64, max_bytes: u64 = 64 * 1024 * 1024 * 1024 };
 pub const Request = @import("native_query_cut_contract.zig").Request;
 pub const Control = struct {
     parent: Cancellation,
@@ -46,8 +47,13 @@ pub fn finish(a: A, io: std.Io, root: []const u8, request: Request, namespace: N
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const pa = arena.allocator();
-    const files = try seal.inventoryAlloc(pa, io, root, cancellation);
-    const bytes = try std.json.Stringify.valueAlloc(pa, Manifest{ .request = request, .namespace = namespace, .sequence = sequence, .files = files }, .{});
+    const inventory = try seal.inventoryAlloc(pa, io, root, cancellation);
+    var files: std.ArrayList(seal.File) = .empty;
+    for (inventory) |file| {
+        if (std.mem.eql(u8, file.path, "query-cut.json") or std.mem.eql(u8, file.path, "query-remote.json")) continue;
+        try files.append(pa, file);
+    }
+    const bytes = try std.json.Stringify.valueAlloc(pa, Manifest{ .request = request, .namespace = namespace, .sequence = sequence, .files = files.items }, .{});
     if (bytes.len > backup.max_manifest_bytes) return error.QueryCandidateBudgetExceeded;
     _ = try backup.writeFileDurable(io, try std.fmt.allocPrint(pa, "{s}/query-cut.json", .{root}), bytes);
     try fs_paths.syncDirPortable(io, root);
@@ -116,13 +122,19 @@ pub fn lock(a: A, io: std.Io, db_path: []const u8, cancellation: Cancellation) !
 }
 /// Bounded admission and restart-safe expiry. Call under the store guard.
 /// Active readers hold a per-cut lease; GC never removes their files.
-pub fn admit(a: A, io: std.Io, db_path: []const u8, id: []const u8, cancellation: Cancellation) !void {
+pub fn admit(a: A, io: std.Io, db_path: []const u8, id: []const u8, limits: Limits, cancellation: Cancellation) !void {
     const parent = try std.fmt.allocPrint(a, "{s}.query-pins", .{db_path});
     defer a.free(parent);
     var dir = try std.Io.Dir.cwd().openDir(io, parent, .{ .iterate = true });
     defer dir.close(io);
     var iterator = dir.iterate();
     var retained: usize = 0;
+    var existing = false;
+    var bytes_retained: u64 = 0;
+    var metadata_bytes: usize = 0;
+    const Extent = struct { inode: u64, size: u64, mtime_ns: i128 };
+    var extents: std.AutoHashMapUnmanaged(Extent, void) = .empty;
+    defer extents.deinit(a);
     while (try iterator.next(io)) |entry| {
         try cancellation.check();
         if (entry.kind != .directory) continue;
@@ -135,13 +147,15 @@ pub fn admit(a: A, io: std.Io, db_path: []const u8, id: []const u8, cancellation
             continue;
         }
         if (entry.name.len != 64) continue;
-        if (std.mem.eql(u8, entry.name, id)) return;
+        if (std.mem.eql(u8, entry.name, id)) existing = true;
         const root = try std.fmt.allocPrint(a, "{s}/{s}", .{ parent, entry.name });
         defer a.free(root);
         const manifest = try std.fmt.allocPrint(a, "{s}/query-cut.json", .{root});
         defer a.free(manifest);
         const bytes = try backup.readFileAlloc(a, io, manifest, backup.max_manifest_bytes);
         defer a.free(bytes);
+        metadata_bytes = std.math.add(usize, metadata_bytes, bytes.len) catch return error.QueryCandidateBudgetExceeded;
+        if (metadata_bytes > 64 * 1024 * 1024) return error.QueryCandidateBudgetExceeded;
         var parsed = try std.json.parseFromSlice(Manifest, a, bytes, .{});
         defer parsed.deinit();
         if (parsed.value.request.expires_ms +| 30_000 < nowMs()) {
@@ -153,10 +167,22 @@ pub fn admit(a: A, io: std.Io, db_path: []const u8, id: []const u8, cancellation
                 defer lease.unlock(io);
                 try std.Io.Dir.cwd().deleteTree(io, root);
                 try std.Io.Dir.cwd().deleteFile(io, lease_path);
-            } else retained += 1;
-        } else retained += 1;
-        if (retained >= max_cuts) return error.QueryCandidateBudgetExceeded;
+                continue;
+            }
+        }
+        retained += 1;
+        if (parsed.value.files.len > seal.max_files) return error.QueryCandidateBudgetExceeded;
+        for (parsed.value.files) |file| {
+            try cancellation.check();
+            const extent: Extent = .{ .inode = file.inode, .size = file.size, .mtime_ns = file.mtime_ns };
+            if (extents.count() == 262144 and !extents.contains(extent)) return error.QueryCandidateBudgetExceeded;
+            const entry_extent = try extents.getOrPut(a, extent);
+            if (entry_extent.found_existing) continue;
+            bytes_retained = std.math.add(u64, bytes_retained, file.size) catch return error.QueryCandidateBudgetExceeded;
+            if (bytes_retained > limits.max_bytes) return error.QueryCandidateBudgetExceeded;
+        }
     }
+    if (retained > limits.max_cuts or (!existing and retained == limits.max_cuts)) return error.QueryCandidateBudgetExceeded;
 }
 
 test "retained native query identities reject expiration and path injection" {

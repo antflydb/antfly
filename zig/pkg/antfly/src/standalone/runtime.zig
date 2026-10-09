@@ -4606,10 +4606,22 @@ pub fn runFromIterator(
         defer alloc.free(security_json);
         try storage_kernel_context.configureRemoteContentSecurity(security_json);
         try storage_kernel_context.configureSecrets(&secret_store);
+        const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, if (loaded_config) |*cfg| cfg else null, .standalone, data_dir);
+        defer alloc.free(retained_setup);
+        try storage_kernel_context.configureNativeQueries(retained_setup);
     }
 
     var node_backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer node_backend_runtime.deinit();
+    var native_query_repository: ?@import("../api/native_query_repository.zig").Repository = null;
+    defer if (native_query_repository) |*repository| {
+        node_backend_runtime.ptr().query_cut_repository = null;
+        repository.deinit();
+    };
+    if (comptime !control_only_storage_sources) {
+        native_query_repository = try @import("../api/native_query_repository.zig").Repository.init(alloc, if (loaded_config) |*cfg| cfg else null, &secret_store, .standalone, data_dir);
+        node_backend_runtime.ptr().query_cut_repository = native_query_repository.?.capability();
+    }
     // The linked inference archive retains std.Io for its full node lifetime.
     // Keep the corresponding host lane lease until after node destruction.
     var inference_lane_lease = try node_backend_runtime.ptr().acquireInferenceLane();

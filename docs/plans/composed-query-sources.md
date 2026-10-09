@@ -36,7 +36,7 @@ not composed yet.
 Its server-written, content-addressed descriptor stores only per-leaf positions,
 retained snapshot capabilities and totals. Each leaf retains its original archive
 publication, Iceberg metadata, recent segment references and bounded WAL final
-images for 60 seconds. The composed cursor expires with the earliest leaf cut;
+images for the configured retention period. The composed cursor expires with the earliest leaf cut;
 paging does not extend that lifetime. Publication and process restart preserve
 that cut. Native durable reader leases and source snapshot pins protect archive
 artifacts; copied WAL images allow independent WAL retirement. Access, row-policy,
@@ -61,18 +61,43 @@ fences table/shard/range identity. A missing owner generation, incompatible stor
 backend, active vector migration or incomplete projection fails explicitly;
 resume never falls back to live data.
 
-Capabilities expire after 60 seconds, including across daemon restart, and pages
-do not renew them. Owners admit at most 64 cuts. Per-cut shared file leases
-protect active readers from expiry collection; subsequent captures reclaim
-expired cuts and interrupted staging under a separate parent guard. Native
-capability artifacts use their own bounded expiry collection domain. This first
-physical adapter requires filesystem-managed LSM roots and immutable native
-projection checkpoints. Retained cut directories belong to their physical owner;
-loss/relocation of that directory invalidates the cursor until a future provider
-can transfer the complete retained generation. Query capture briefly closes
-write admission while derivations converge and manifests are sealed; deadlines,
-cancellation and WAL-budget failures bound this work. The retained files never
-hold an apply lock across cursor pages.
+Capabilities expire after the configured `lake_indexes.query_cursors.retention_ms`
+(default five minutes; bounded to one hour), including across daemon restart;
+pages do not renew them. Composed cursors expire with their earliest leaf.
+Operators also bound native cut count and retained bytes; shared immutable inode
+extents count once. Per-cut shared file leases protect active readers from expiry
+collection; subsequent captures reclaim expired cuts and interrupted staging
+under a separate parent guard.
+
+Native owners borrow a durable query-generation repository from their runtime.
+Standalone uses its configured artifact provider or its local artifact directory;
+distributed owners use the configured artifact connection. The common provider
+supports filesystem, S3 and GCS. Capture seals the complete document, index and
+vector generation, transfers authenticated 4 MiB chunks, and conditionally commits
+one immutable manifest before returning a usable cursor. Table/shard/range identity,
+recipe, expiry and artifact location remain authoritative; credential rotation does
+not change native cursor identity. A replacement owner reconstructs a missing
+local generation from verified chunks into staging, seals its new local inventory,
+and atomically installs a disposable read cache. It never recaptures current rows.
+Missing or corrupt authoritative data fails with a catalog conflict.
+
+Immutable SST/vector extents reuse expiring chunk inventories across captures;
+new files and the bounded committed WAL suffix require transfer. Remote manifests
+and chunks have bounded expiry collection; file hints are reclaimed by epoch.
+A durable local commit marker avoids repeating provider checks for the same
+sealed generation. It is cache metadata and is excluded from snapshot inventories.
+Small remote owner registry records let the supervised collector discover expired
+generations after local owner loss or table deletion. Each pass handles one owner
+with a bounded deletion budget; registry records remain as discovery witnesses.
+This adapter still requires filesystem-managed LSM checkpoints and compatible
+native projection codecs. It provides relocation to a replacement owner with the
+same logical shard/range identity, rather than repartitioning a retained generation.
+Query capture briefly closes write admission while derivations converge and
+manifests are sealed; deadlines, cancellation and WAL/capacity admission bound
+this work. The retained files never hold an apply lock across cursor pages.
+A first durable publication can transfer a full generation: background prewarming,
+remote-native checkpoint references and measured cold-publication latency remain
+necessary qualification work before claiming that portability is latency-neutral.
 
 Overlay keys are flat integer, string or boolean fields; numeric/timestamp key
 normalization is not enabled yet. The changes input must retain one unique latest
@@ -282,7 +307,8 @@ Cursors bind the source expression, policies, table incarnations, pinned source
 snapshots, index publications, accepted-change cuts and ranking configuration.
 Retain these cuts for a declared cursor lifetime or explicitly expire the cursor
 when they are unavailable. Retained lake cuts preserve archive/WAL pagination across publication and restart
-within their fixed 60-second lifetime; policy, recipe and incarnation changes invalidate them.
+within their configured lifetime (five minutes by default, at most one hour);
+policy, recipe and incarnation changes invalidate them.
 
 ## Shared visibility for SQL and search
 

@@ -49,7 +49,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
     const retained_api = @import("lake_retained_cut.zig");
     // The cut lifetime begins at admission, so a slow query cannot extend a
     // recent segment or lake pin beyond the retention checked when binding it.
-    const cut_expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms +| retained_api.ttl_ms;
+    const cut_expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms +| retained_api.configuredTtl(server.cfg.node_config);
     var retained_arena = std.heap.ArenaAllocator.init(a);
     defer retained_arena.deinit();
     const ra = retained_arena.allocator();
