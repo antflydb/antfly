@@ -1179,6 +1179,10 @@ test "SQL scoped join workers preserve residual outer semantics and physically r
                 },
             }
         }
+        switch (mode) {
+            .prepared, .complete, .typed, .early_close, .registry_full => try execution.checkpoint(),
+            .canceled, .deadline, .revoked => {},
+        }
         try std.testing.expectEqual(@as(usize, 0), fixture.invalid_callbacks.load(.acquire));
         try std.testing.expectEqual(@as(usize, 0), manager.files);
         try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
