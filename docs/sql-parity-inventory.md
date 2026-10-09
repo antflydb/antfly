@@ -1955,6 +1955,29 @@ leaks, including the four new preparation/lifetime tests and the real service
 fixture. Inventory, control-catalog, formatting and whitespace checks pass.
 An earlier final compile exhausted local disk; only obsolete generated test
 binaries/objects were removed before the successful final run.
+Long scans now renew their physical read snapshot at the preparation deadline
+without discarding verified pages. Renewal first opens a fresh transaction and
+rechecks the exact original ready job, epoch, root and applied-log position.
+Only then are old decoded sources/cursors released and the old snapshot closed;
+owned lexical cursors and accumulated verification totals resume on the new
+snapshot. Source and candidate phases share the same renewal operation.
+Completed evidence never reopens a snapshot. Any renewal failure closes both
+transaction resources and invalidates the partial scan; resource/race failures
+retain the coordinator's bounded retry backoff. This removes the previous
+fixed-duration catalog-size limit for unchanged cuts while retaining physical
+snapshot lifetime bounds. It does not rebase progress across unrelated commits
+in the same metadata group: the existing applied-index fence remains strict.
+The 70-target regression renews between every source/candidate page, verifies
+unchanged accumulated state, and rejects both epoch-changing and index-only
+commits on renewal. An independently pinned scan still completes its old proof,
+which fails current-transaction admission. Actual restore allocation-fault
+tests include owned renewal, and coordinator tests cover successful deadline
+renewal plus stale/resource failures. Capability/lifecycle barriers, automatic
+writer adoption and atomic root publication remain unfinished; no original SQL
+case receives completion credit from this preparation work.
+The combined final gate passes 170 native catalog tests, 22 linked storage
+tests and all 10 coordinator tests without failures or leaks (57/57 build
+steps). Inventory, control-catalog, formatting and whitespace checks pass.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,

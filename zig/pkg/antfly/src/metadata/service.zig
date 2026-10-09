@@ -4109,8 +4109,8 @@ fn runRelationReconciliationRound(service: anytype) !void {
         pub fn cancelPublication(self: *@This()) void {
             self.service.relation_publication_preparation.cancel();
         }
-        pub fn expirePublication(self: *@This(), now_ns: u64) void {
-            self.service.relation_publication_preparation.expire(now_ns);
+        pub fn expirePublication(self: *@This(), now_ns: u64) !void {
+            try self.service.relation_publication_preparation.expire(now_ns);
         }
         pub fn propose(self: *@This(), command: @import("relation_reconciliation_command.zig").Command, term: u64) !relation_worker.Receipt {
             const bytes = try command.encodeAlloc(self.service.alloc);
@@ -4134,7 +4134,7 @@ fn runRelationReconciliationRound(service: anytype) !void {
     };
     var host: Host = .{ .service = service, .store = store };
     _ = service.relation_reconciliation_worker.step(&host, service.metadata_group_id, platform_time.monotonicNs()) catch |err| switch (err) {
-        error.NotLeader, error.TableTopologyProtocolUpgradeRequired, error.DeadlineExceeded, error.Canceled, error.ResourceTemporarilyUnavailable, error.MetadataMutationOutcomeUnknown, error.CatalogGenerationChanged, error.CatalogPublicationScanExpired => return,
+        error.NotLeader, error.TableTopologyProtocolUpgradeRequired, error.DeadlineExceeded, error.Canceled, error.ResourceTemporarilyUnavailable, error.MetadataMutationOutcomeUnknown, error.CatalogGenerationChanged => return,
         else => return err,
     };
 }

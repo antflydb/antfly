@@ -42,8 +42,14 @@ pub fn PublicationPreparation(comptime Scan: type, comptime Proof: type) type {
             self.stopped = err == error.InvalidCatalogRecord;
             self.retry_after_ns = now_ns +| std.time.ns_per_s;
         }
-        pub fn expire(self: *@This(), now_ns: u64) void {
-            if (self.scan != null and now_ns >= self.expires_at_ns) self.failed(error.CatalogPublicationScanExpired, now_ns);
+        pub fn expire(self: *@This(), now_ns: u64) !void {
+            if (self.scan != null and now_ns >= self.expires_at_ns) {
+                self.scan.?.renew() catch |err| {
+                    self.failed(err, now_ns);
+                    return err;
+                };
+                self.expires_at_ns = now_ns +| publication_snapshot_lifetime_ns;
+            }
         }
         /// true consumes this round's work budget; no GC append should race
         /// the in-progress proof. No scan may survive a term/source/root cut
@@ -71,10 +77,7 @@ pub fn PublicationPreparation(comptime Scan: type, comptime Proof: type) type {
                 };
                 self.expires_at_ns = now_ns +| publication_snapshot_lifetime_ns;
             }
-            if (now_ns >= self.expires_at_ns) {
-                self.failed(error.CatalogPublicationScanExpired, now_ns);
-                return error.CatalogPublicationScanExpired;
-            }
+            try self.expire(now_ns);
             const proof = self.scan.?.step(null) catch |err| {
                 self.failed(err, now_ns);
                 return err;
@@ -126,7 +129,7 @@ pub const Worker = struct {
         self.next_round_at_ns = now_ns +| round_interval_ns;
         // Expiry must not depend on successful leader/status observation.
         // A contended runtime lane cannot retain an old snapshot indefinitely.
-        host.expirePublication(now_ns);
+        try host.expirePublication(now_ns);
         const leader: Leader = (try host.leader()) orelse {
             self.pending = null;
             host.cancelPublication();
@@ -170,7 +173,7 @@ const Fake = struct {
     pub fn cancelPublication(self: *@This()) void {
         self.cancellations += 1;
     }
-    pub fn expirePublication(self: *@This(), _: u64) void {
+    pub fn expirePublication(self: *@This(), _: u64) !void {
         self.expirations += 1;
     }
     pub fn preparePublication(_: *@This(), _: r.Work, _: Leader, _: u64) !bool {
@@ -199,11 +202,17 @@ const ScanHost = struct {
     begins: usize = 0,
     steps: usize = 0,
     closes: usize = 0,
+    renewals: usize = 0,
     begin_error: ?anyerror = null,
     step_error: ?anyerror = null,
+    renew_error: ?anyerror = null,
     const Scan = struct {
         owner: *ScanHost,
         remaining: usize = 2,
+        pub fn renew(self: *@This()) !void {
+            self.owner.renewals += 1;
+            if (self.owner.renew_error) |err| return err;
+        }
         pub fn step(self: *@This(), _: ?*const std.atomic.Value(bool)) !?u64 {
             self.owner.steps += 1;
             if (self.owner.step_error) |err| return err;
@@ -278,11 +287,13 @@ test "relation reconciliation worker publication preparation bounds snapshot lif
     const work = try publicationWorkForTest();
     var leader: Leader = .{ .term = 7, .applied_index = 1 };
     try std.testing.expect(try preparation.step(&host, work, leader, 0));
-    try std.testing.expectError(error.CatalogPublicationScanExpired, preparation.step(&host, work, leader, publication_snapshot_lifetime_ns));
-    try std.testing.expect(preparation.scan == null and preparation.proof == null);
+    try std.testing.expect(!try preparation.step(&host, work, leader, publication_snapshot_lifetime_ns));
+    try std.testing.expect(preparation.scan == null and preparation.proof == 42);
+    try std.testing.expectEqual(@as(usize, 1), host.renewals);
+    try std.testing.expectEqual(@as(usize, 1), host.begins);
     try std.testing.expectEqual(@as(usize, 1), host.closes);
-    try std.testing.expect(!try preparation.step(&host, work, leader, publication_snapshot_lifetime_ns + 1));
-    const retry = preparation.retry_after_ns;
+    preparation.cancel();
+    const retry = publication_snapshot_lifetime_ns + 1;
     host.begin_error = error.OutOfMemory;
     try std.testing.expectError(error.OutOfMemory, preparation.step(&host, work, leader, retry));
     host.begin_error = null;
@@ -295,6 +306,13 @@ test "relation reconciliation worker publication preparation bounds snapshot lif
     leader.term += 1;
     try std.testing.expect(try preparation.step(&host, work, leader, preparation.retry_after_ns));
     try std.testing.expect(preparation.scan != null and !preparation.stopped);
+    for ([_]anyerror{ error.OutOfMemory, error.CatalogGenerationChanged }) |err| {
+        host.renew_error = err;
+        try std.testing.expectError(err, preparation.expire(preparation.expires_at_ns));
+        try std.testing.expect(preparation.scan == null and preparation.proof == null);
+        host.renew_error = null;
+        try std.testing.expect(try preparation.step(&host, work, leader, preparation.retry_after_ns));
+    }
 }
 
 test "relation reconciliation worker budgets pending work and alternates GC" {

@@ -6873,6 +6873,9 @@ test "system catalog restore reconciliation authenticates source phases and cano
         try std.testing.expect(scan.open);
         var steps: usize = 1;
         while (true) {
+            const prior = scan.verifier.state;
+            try scan.renew();
+            try std.testing.expect(std.meta.eql(prior, scan.verifier.state));
             steps += 1;
             if (try scan.step(null)) |finished| {
                 try std.testing.expect(std.meta.eql(proof, finished));
@@ -6881,6 +6884,7 @@ test "system catalog restore reconciliation authenticates source phases and cano
         }
         try std.testing.expect(steps >= 4);
         try std.testing.expect(!scan.open);
+        try scan.renew(); // Completed evidence never reopens a snapshot.
         try std.testing.expect(std.meta.eql(proof, (try scan.step(null)).?));
     }
     // Both source and candidate phases release every cursor/owned plan on
@@ -6954,18 +6958,32 @@ test "system catalog restore reconciliation authenticates source phases and cano
         try std.testing.expectError(error.InvalidCatalogRecord, store.verifyReconciliationSourceOwnersTxn(&txn, group, &journal));
         try std.testing.expectError(error.InvalidCatalogRecord, RaftApplyStore.prepareRelationPublicationProofTxn(a, &txn, ready));
     }
-    {
+    for ([_]bool{ false, true }) |epoch_change| {
+        const baseline = try store.prepareRelationPublicationProof(a, ready);
         const scan = try store.beginRelationPublicationScan(a, ready);
         defer scan.deinit();
         try std.testing.expect((try scan.step(null)) == null);
+        const invalidated = try store.beginRelationPublicationScan(a, ready);
+        defer invalidated.deinit();
+        try std.testing.expect((try invalidated.step(null)) == null);
         // New commits must not splice a later source page into this scan.
         // Its final scalar proof remains fenced by the original epoch/index.
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
-        try r.advanceSource(&txn, group);
+        if (epoch_change) {
+            try r.advanceSource(&txn, group);
+        } else {
+            var buf: [128]u8 = undefined;
+            var advanced: [8]u8 = undefined;
+            std.mem.writeInt(u64, &advanced, baseline.applied_index + 1, .little);
+            try txn.put(try RaftApplyStore.keyForGroup(&buf, group), &advanced);
+        }
         try txn.commit();
+        try std.testing.expectError(error.CatalogGenerationChanged, invalidated.renew());
+        try std.testing.expect(!invalidated.open);
+        try std.testing.expectError(error.CatalogPublicationScanClosed, invalidated.step(null));
         while (true) if (try scan.step(null)) |finished| {
-            try std.testing.expect(std.meta.eql(proof, finished));
+            try std.testing.expect(std.meta.eql(baseline, finished));
             var current = try store.store.beginReadTxn();
             defer current.abort();
             try std.testing.expect(!try finished.matchesTxn(&current));
@@ -7195,12 +7213,13 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
             fn scan(a: std.mem.Allocator, owner: *RaftApplyStore, state: relation_reconciliation.State) !void {
                 const verification = try owner.beginRelationPublicationScan(a, state);
                 defer verification.deinit();
+                try verification.renew();
                 while (true) if (try verification.step(null)) |proof| {
                     var txn = try owner.store.beginReadTxn();
                     defer txn.abort();
                     try std.testing.expect(try proof.matchesTxn(&txn));
                     break;
-                };
+                } else try verification.renew();
             }
             fn publication(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, state: relation_reconciliation.State) !void {
                 const proof = try RaftApplyStore.prepareRelationPublicationProofTxn(a, txn, state);
@@ -17189,6 +17208,7 @@ pub const RaftApplyStore = struct {
     /// Completion, cancellation and errors release the snapshot immediately.
     pub const RelationPublicationScan = struct {
         a: std.mem.Allocator,
+        owner: *RaftApplyStore,
         read: docstore.DocStore.Txn,
         verifier: RelationPublicationVerifier,
         open: bool = true,
@@ -17204,6 +17224,34 @@ pub const RaftApplyStore = struct {
             self.verifier.deinit();
             self.read.abort();
             self.open = false;
+        }
+        /// Release a long-lived engine snapshot without restarting verified
+        /// pages. Renewal is allowed only at the exact original metadata cut;
+        /// a changed apply position is not rebased from semantic equality.
+        /// Any failure closes the handle, just like a failed page step.
+        pub fn renew(self: *@This()) !void {
+            if (self.proof != null) return;
+            if (!self.open) return error.CatalogPublicationScanClosed;
+            self.renewSnapshot() catch |err| {
+                self.cancel();
+                return err;
+            };
+        }
+        fn renewSnapshot(self: *@This()) !void {
+            var next = try self.owner.store.beginReadTxn();
+            var owned = true;
+            defer if (owned) next.abort();
+            if (!try self.verifier.proof.matchesTxn(&next)) return error.CatalogGenerationChanged;
+            // Verify first, then close every old cursor/decoded source before
+            // releasing its snapshot. Resume uses owned lexical state/totals,
+            // never an engine pointer or a lookahead from the previous page.
+            self.verifier.deinit();
+            self.read.abort();
+            self.read = next;
+            owned = false;
+            self.verifier.read = &self.read;
+            if (self.verifier.state.phase == .verifying_source)
+                self.verifier.source = try relationTableSource(self.a, &self.read, self.verifier.proof.state.group_id, &self.verifier.buffers);
         }
         /// null means another bounded step is required, never partial proof.
         /// After an error/cancel the handle is closed and cannot be resumed.
@@ -17229,7 +17277,7 @@ pub const RaftApplyStore = struct {
     pub fn beginRelationPublicationScan(self: *RaftApplyStore, a: std.mem.Allocator, expected: relation_reconciliation.State) !*RelationPublicationScan {
         const scan = try a.create(RelationPublicationScan);
         errdefer a.destroy(scan);
-        scan.* = .{ .a = a, .read = try self.store.beginReadTxn(), .verifier = undefined };
+        scan.* = .{ .a = a, .owner = self, .read = try self.store.beginReadTxn(), .verifier = undefined };
         errdefer scan.read.abort();
         try scan.verifier.init(a, &scan.read, expected);
         return scan;
