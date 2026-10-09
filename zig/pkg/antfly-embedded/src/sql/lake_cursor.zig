@@ -1732,7 +1732,7 @@ test "lake SQL scoped ordered cursors park physical object reads and retire inde
         try std.testing.expect(lake.source.scanner.shared_reader.?.context.execution == null);
         try std.testing.expect(lake.source.scanner.shared_reader.?.context.wait == null);
         try std.testing.expect(lake.source.scanner.shared_reader.?.request_store == null);
-        try std.testing.expect(lake.source.scanner.shared_reader.?.base.client.ptr == &root_store);
+        try std.testing.expect(lake.source.scanner.shared_reader.?.base.client.ptr == @as(*anyopaque, @ptrCast(&root_store)));
         for (lake.source.pinned_files) |pinned| try std.testing.expect(!pinned);
     }
     try std.testing.expectEqual(@as(usize, 9), count);
