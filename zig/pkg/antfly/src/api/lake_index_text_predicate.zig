@@ -324,6 +324,11 @@ fn PredicateResolver(comptime Set: type) type {
                     }
                     self.materialized = resolved.bitmap;
                 } else self.materialized = try self.resolver.consume(self.a, &self.predicate);
+                try self.materialized.?.prepareRead();
+            }
+            fn completeMembership(raw: *anyopaque) ?*const Bitmap {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return if (self.materialized) |*bitmap| bitmap else null;
             }
             fn produce(raw: *anyopaque, a: A, offset: u32, count: u32, candidates: ?*const Bitmap) anyerror!Bitmap {
                 const self: *@This() = @ptrCast(@alignCast(raw));
@@ -394,7 +399,7 @@ fn PredicateResolver(comptime Set: type) type {
             const work_budget = @min(predicate.work, rows.predicateScanWork(self.source, copied) orelse std.math.maxInt(u64));
             const owner = try a.create(ProducerOwner);
             owner.* = .{ .a = a, .resolver = self, .predicate = predicate, .arena = owned, .conditions = copied, .work_budget = work_budget };
-            return .{ .bitmap = Bitmap.init(a), .producer = .{ .ptr = owner, .produce = ProducerOwner.produce }, .owner = owner, .close = ProducerOwner.close };
+            return .{ .bitmap = Bitmap.init(a), .producer = .{ .ptr = owner, .produce = ProducerOwner.produce, .materialized = ProducerOwner.completeMembership }, .owner = owner, .close = ProducerOwner.close };
         }
         fn value(self: Self, a: A, pa: A, input: Compiled, depth: usize, allow_scan: bool) anyerror!?PredicateResult {
             if (depth > 64) return null;

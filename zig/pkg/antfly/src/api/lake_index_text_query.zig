@@ -181,18 +181,35 @@ const Execution = struct {
     fn vectorRequest(self: *Execution, req: types.SearchRequest) types.SearchRequest {
         var result = req;
         if (self.vector_include != null or self.vector_exclude != null) {
-            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey, .select_ordinals = selectSparseOrdinals };
+            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey, .select_constraints = selectSparseConstraints };
             result.filter_query_json = "";
             result.exclusion_query_json = "";
         }
         return result;
     }
-    fn selectSparseOrdinals(raw: *anyopaque, a: A, lookup: types.SparseOrdinalLookup) !?local.encoding_roaring.RoaringBitmap {
+    fn selectSparseConstraints(raw: *anyopaque, a: A, lookup: types.SparseOrdinalLookup) !?types.SparseOrdinalSelection {
         const self: *Execution = @ptrCast(@alignCast(raw));
-        const include = if (self.vector_include) |*set| set else return null;
+        var result: types.SparseOrdinalSelection = .{};
+        errdefer result.deinit();
+        // Materialize only inexpensive masks. Broad constraints are checked
+        // against reached native identities inside bounded DAAT scoring.
+        if (self.vector_include) |*include| {
+            if (include.boundedCardinality(4096) == null) {
+                result.residual = true;
+                return result;
+            }
+            // Subtract in physical space before resolving a selective include;
+            // a broad exclusion need not be converted for one included row.
+            result.include = try self.selectSparseSet(a, lookup, include, if (self.vector_exclude) |*exclude| exclude else null);
+        } else if (self.vector_exclude) |*exclude| {
+            if (exclude.boundedCardinality(4096) == null) result.residual = true else result.exclude = try self.selectSparseSet(a, lookup, exclude, null);
+        }
+        return result;
+    }
+    fn selectSparseSet(self: *Execution, a: A, lookup: types.SparseOrdinalLookup, selection_set: *const @import("lake_index_physical_set.zig").Set, subtract: ?*const @import("lake_index_physical_set.zig").Set) !local.encoding_roaring.RoaringBitmap {
         var result = local.encoding_roaring.RoaringBitmap.init(a);
         errdefer result.deinit();
-        var files = include.files.iterator();
+        var files = selection_set.files.iterator();
         while (files.next()) |file| {
             const digest = self.private_digests.get(file.key_ptr.*) orelse return error.ExternalLakeSnapshotMismatch;
             var blocks = file.value_ptr.iterator();
@@ -202,7 +219,8 @@ const Execution = struct {
                 const bytes_prefix = try std.fmt.bufPrint(&prefix, "lake2:{s}:{x:0>8}:", .{ digest, block.key_ptr.group });
                 var selection = try block.value_ptr.clone(a);
                 defer selection.deinit();
-                if (self.vector_exclude) |*exclude| if (exclude.files.getPtr(file.key_ptr.*)) |excluded_blocks| if (excluded_blocks.getPtr(block.key_ptr.*)) |excluded| selection.andNotWith(excluded);
+                if (subtract) |exclude| if (exclude.files.getPtr(file.key_ptr.*)) |excluded_blocks| if (excluded_blocks.getPtr(block.key_ptr.*)) |excluded| selection.andNotWith(excluded);
+                if (selection.isEmpty()) continue;
                 if (try lookup.block(lookup.ptr, a, bytes_prefix, block.key_ptr.high, &selection, &result)) continue;
                 var rows = selection.iterator();
                 var visited: usize = 0;
@@ -210,7 +228,6 @@ const Execution = struct {
                     if (visited % 256 == 0) try self.context.ensureActive();
                     visited += 1;
                     const row = (@as(u64, block.key_ptr.high) << 32) | low;
-                    if (self.vector_exclude) |*exclude| if (exclude.contains(file.key_ptr.*, block.key_ptr.group, row)) continue;
                     var key: [96]u8 = undefined;
                     const bytes = try std.fmt.bufPrint(&key, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, block.key_ptr.group, row });
                     if (try lookup.one(lookup.ptr, bytes)) |num| try result.add(num);
@@ -1145,4 +1162,49 @@ test "external lake typed delivery separates final projection from residual pred
     req.hierarchy_include_source = false;
     req.evaluation_limit = 1;
     try std.testing.expect(!canDeliverTypedSource(req));
+}
+
+test "external lake sparse predicate planning defers broad masks and subtracts selective includes" {
+    const a = std.testing.allocator;
+    const Set = @import("lake_index_physical_set.zig").Set;
+    // Only the predicate-planning fields are needed; no HTTP/server is opened.
+    var execution: Execution = undefined;
+    execution.vector_include = null;
+    execution.vector_exclude = Set.init(a);
+    defer execution.vector_exclude.?.deinit();
+    execution.private_digests = .empty;
+    defer execution.private_digests.deinit(a);
+    execution.context = .{ .io = std.testing.io };
+    const digest: [64]u8 = @splat('0');
+    try execution.private_digests.put(a, "file", &digest);
+    try execution.vector_exclude.?.addBlock(.{ .file = "file", .group = 0, .base = 0, .selection = .{ .interval = .{ .lower = 0, .count = 100000 } } });
+    const Lookup = struct {
+        calls: usize = 0,
+        fn one(raw: *anyopaque, _: []const u8) !?u32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return 42;
+        }
+        fn block(_: *anyopaque, _: A, _: []const u8, _: u32, _: *const local.encoding_roaring.RoaringBitmap, _: *local.encoding_roaring.RoaringBitmap) !bool {
+            return false;
+        }
+    };
+    var lookup: Lookup = .{};
+    const native: types.SparseOrdinalLookup = .{ .ptr = &lookup, .one = Lookup.one, .block = Lookup.block };
+    var broad = (try Execution.selectSparseConstraints(&execution, a, native)).?;
+    defer broad.deinit();
+    try std.testing.expect(broad.residual and broad.include == null and broad.exclude == null);
+    try std.testing.expectEqual(@as(usize, 0), lookup.calls);
+    execution.vector_include = Set.init(a);
+    defer execution.vector_include.?.deinit();
+    try execution.vector_include.?.addRow("file", 0, 7);
+    var empty = (try Execution.selectSparseConstraints(&execution, a, native)).?;
+    defer empty.deinit();
+    try std.testing.expect(!empty.residual and empty.include.?.isEmpty());
+    try std.testing.expectEqual(@as(usize, 0), lookup.calls);
+    try execution.vector_include.?.addRow("file", 0, 150000);
+    var point = (try Execution.selectSparseConstraints(&execution, a, native)).?;
+    defer point.deinit();
+    try std.testing.expect(!point.residual and point.include.?.contains(42));
+    try std.testing.expectEqual(@as(usize, 1), lookup.calls);
 }

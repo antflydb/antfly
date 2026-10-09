@@ -547,3 +547,118 @@ normal filesystem disk safeguards. The two-file 100,003-row predicate fixture
 also checks rare-term inclusion/exclusion, exact counts and score parity across
 native segment offsets. License checks, both source-boundary audits, formatting
 and diff checks passed. Representative archive-scale latency remains unmeasured.
+
+
+## Filtered top-K and repeated pagination follow-up
+
+This follow-up to #1017 removes three remaining archive-sized serving paths.
+
+### Text scoring and exact metadata membership
+
+Simple term/match queries and supported same-field Boolean queries feed candidate
+scores directly into one bounded top-K collector. Deferred metadata membership
+receives at most 64 live candidates from one native segment per batch. Include
+and exclusion producers share that candidate batch and retain their existing
+request-owned adaptive reverse-index probes and full-membership fallback.
+When adaptive probing materializes complete membership, a borrowed complete-set
+hook immediately enables ordinal seeks in the same scoring pass. Candidate-local
+answers never enter that hook. Later score batches borrow the complete bitmap
+directly instead of copying full segment membership. A pending batch can only
+delay the competitive cutoff, so block pruning remains conservative. Segment transitions flush before
+changing ordinal offsets.
+
+Filtered minimum-one disjunctions use the native Block-Max WAND scorer with the
+same corpus document frequencies, field lengths, BM25 configuration and bound
+cache as unfiltered ranking. Query-wide statistics are resolved once. Filtered and
+unfiltered queries share segment-bound planning, scoring the strongest segments
+first on fragmented snapshots and pruning weaker segments with strict score
+bounds that preserve ordinal ties. Segment access leases cover scoring.
+Exact compressed include/exclude masks provide monotone ordinal lower bounds
+before scoring. Sparse includes jump directly to their next member. Word-level
+intersection-minus-exclusion inspects at most 64 words per seek, then yields to
+posting navigation and cancellation. This avoids both archive-wide alternating
+mask walks and scanning the gap before a selective include. Hit admission remains
+exact when navigation returns a conservative lower bound. Supported conjunctions retain
+block pruning with membership applied before a hit raises the cutoff.
+
+Exact counts still execute the authoritative filter path. Aggregations, cursor
+ranking, distributed statistics and unsupported Boolean/boost shapes retain their
+existing fallback semantics. Ranked totals are lower bounds when competitive
+blocks are skipped. No arbitrary query is promised to be LIMIT-bounded.
+
+### Sparse exclusion masks
+
+The same-transaction native ordinal interface now accepts independent optional
+include and exclusion masks. A missing include admits the universe; an empty
+include admits nothing. Physical selections of at most 4096 rows resolve to
+compressed native ordinals. Broader includes or exclusion-only selections retain
+an exact residual key predicate in the same pinned generation. Bounded
+document-at-a-time scoring resolves only reached candidate identities and shares
+compressed allow/deny decisions across terms. An independent reverse-key cursor
+releases identity scratch as it advances instead of retaining point-read payloads
+in the parent transaction; broad metadata masks are never
+translated in full merely to score a rare term. Legacy positive-only callbacks
+and callers without ordinal selectors use the same candidate path when complete
+native identities are proven.
+
+The scorer seeks with bounded word-level intersection/difference navigation and
+rejects fully excluded materialized block ranges before payload decoding. Both bounded and
+spill fallback paths apply the same masks, deletion/incarnation checks and direct
+constraints. Legacy positive-only callbacks remain supported. When an API query
+also has a positive physical selection, exclusions are subtracted before native
+ordinal conversion so a one-row include does not require translating a broad
+exclusion independently.
+
+### Snapshot-scoped public tie ordering
+
+Verified ordered metadata derives the public file permutation once. Cursor
+boundary file resolution uses binary search over that permutation. Participating
+files for a logical tie are sorted and stored in the existing bounded,
+singleflight decoded cache; reverse pagination traverses the same array backward.
+Cold scans retain the sequential directory cursor and its pending next-group
+record. Only groups estimated to span directory pages are cached. Warm cache hits
+seek past the group's directory entries. Both paths binary-search the participating file array at a
+pagination boundary instead of rejecting all preceding files individually.
+This preserves the read budget for high-cardinality sort keys.
+
+Cache keys bind the serving scope, immutable tie-tree identity, root domain and
+fingerprint, source, snapshot and logical tuple. Cache waits retain request
+deadlines and cancellation. Payloads own only file slots in the cache arena;
+cursors copy a bounded slot array before releasing the lease, so eviction cannot
+invalidate active pagination. The physical row trees and on-disk metadata format
+remain reusable across snapshot changes. A hit seeks past the tuple's directory
+entries instead of rescanning and sorting every participating file.
+
+Validation targets include exhaustive score/rank parity, exact counts, signed
+sparse weights, exclusion-only execution with a one-document accumulation budget,
+forward/backward tie pagination, scope fencing, eviction and reduced warm page
+reads. The real Parquet E2E archive fixture also exercises broad exclusion-only
+sparse queries with positive, negative and zero weights. Representative cold/warm
+archive latency measurements remain required; no end-to-end speedup is claimed.
+
+Review regressions cover a 5000-distinct-key ordered scan in both directions under
+the unchanged 256 MiB read budget, overlapping million-row masks with a bounded
+seek, direct sparse-include jumps to the u32 endpoint, fragmented segment pruning,
+and iterator ownership on failed WAND admission. The sparse API planning test
+proves a 100000-row exclusion performs no ordinal lookups, while a selective
+include subtracts it before resolving its remaining row. Signed/zero sparse weights
+retain exact results with a one-entry accumulation limit even for residual
+predicates. The shared WAND helper consumes its incoming iterator on success and
+failure so allocation failures release authenticated metadata owners.
+
+Validation of the review refinements on 2026-10-09: all 20 focused tests, 63 sparse
+tests, and 372 native reader tests pass without leaks after merging `origin/main`
+through `a202a18842`. The unchanged bitmap implementation also passes all 33
+standalone tests. The 5000-distinct-key scan succeeds forward and backward under
+the existing read budget. License headers, Apache and embedded source boundaries,
+formatting and whitespace checks pass.
+
+Both Debug and ReleaseFast server builds pass at `c11d61de61` (main through
+`bfbcb03eae`). All 26 real Parquet/PyIceberg E2E cases pass against that optimized
+binary in 91 seconds with unchanged fixture limits, including the 100003-row
+predicate archive. These server/E2E results precede the final upstream merge;
+the focused, sparse and reader checks above were rerun afterward. A diagnostic
+Debug E2E run passed 25 cases but exceeded the archive fixture's 300-second
+index-publication deadline before its query assertions. No fixture deadline or
+production limit was relaxed. Representative archive throughput remains
+unmeasured.
