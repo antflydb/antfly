@@ -109,8 +109,10 @@
     "async_candidate_planning": {
       "overlapping_runs": 1024,
       "after_heap_allocations": 0,
-      "after_bytes_per_slot": 88,
-      "scope": "Candidate state only; fixed in-flight slots replace per-key state, resolution flags, and materialized key/run pairs. Payload IO and cache handles retain their existing costs."
+      "after_bytes_per_slot": 32,
+      "scope": "Candidate state only; fixed in-flight slots replace per-key state, resolution flags, and materialized key/run pairs. Payload IO and cache handles retain their existing costs.",
+      "intermediate_bytes_per_slot": 88,
+      "hint_removal_comparison_commit": "73fbfacf31"
     },
     "directory_all_mutable_overlapping_runs": {
       "keys": 128,
@@ -125,7 +127,12 @@
       "before_physical_loads": 16,
       "after_physical_loads": 1,
       "shared_decode_per_block_cap_bytes": 65536,
-      "shared_decode_total_cap_bytes": 262144
+      "shared_decode_total_cap_bytes": 262144,
+      "verified_batch_sizes": [
+        16,
+        64,
+        256
+      ]
     },
     "overlay_promotion_retry": {
       "entries": 8,
@@ -159,13 +166,106 @@
       "selected_value_bytes": 64,
       "logical_block_bytes": 12672,
       "before_result_retained_bytes": 811008,
-      "after_result_retained_bytes": 3392,
+      "after_result_retained_bytes": 64,
       "after_batch_decode_bytes": 12672,
-      "scope": "selected ownership includes 52-byte key and one-byte value; batch decode released at batch cleanup; direct fallback also retains selected row only"
+      "scope": "Owned result payload only: 64 one-byte values; batch cache and descriptor arrays are separate. Single-point callers that retain key hints still own rows; async batches do not retain keys or namespaces.",
+      "intermediate_row_owned_result_retained_bytes": 3392,
+      "value_only_comparison_commit": "73fbfacf31"
+    },
+    "mandatory_async_decode_budget": {
+      "comparison_commit": "73fbfacf31",
+      "logical_snappy_bytes": 12672,
+      "supplied_allocator_limit_bytes": 64,
+      "read_working_set_hard_limit_bytes": 1,
+      "before": "lookup succeeds through an uncharged C allocation",
+      "after_allocator_denial": "OutOfMemory before publishing a result",
+      "after_resource_denial": "ResourceBudgetExceeded; read-working-set usage returns to zero",
+      "admitted_read_budget_bytes": 32768,
+      "admitted_result_owned_bytes": 1,
+      "checks": [
+        "checksum failures stay corruption errors",
+        "admitted fallback succeeds and releases scratch",
+        "actual shared-prefix batch rejects required key scratch when read budget is exhausted",
+        "optional decode-cache denial still permits an admitted direct reader"
+      ]
+    },
+    "prefix_reader_reuse": {
+      "rows": 256,
+      "batches": 1000,
+      "comparison": "independent prefix point lookups owning encoded rows versus production PrefixPointReader reuse with value-only results",
+      "backing": "native C allocator with allocation counters",
+      "samples": [
+        {
+          "keys": 2,
+          "independent_elapsed_ns": 10324000,
+          "reused_elapsed_ns": 9515000,
+          "independent_backing_allocations": 4000,
+          "reused_backing_allocations": 3000,
+          "independent_peak_bytes": 272,
+          "reused_peak_bytes": 207
+        },
+        {
+          "keys": 16,
+          "independent_elapsed_ns": 85522000,
+          "reused_elapsed_ns": 14451000,
+          "independent_backing_allocations": 32000,
+          "reused_backing_allocations": 17000,
+          "independent_peak_bytes": 272,
+          "reused_peak_bytes": 207
+        },
+        {
+          "keys": 256,
+          "independent_elapsed_ns": 1287201000,
+          "reused_elapsed_ns": 218805000,
+          "independent_backing_allocations": 512000,
+          "reused_backing_allocations": 257000,
+          "independent_peak_bytes": 272,
+          "reused_peak_bytes": 207
+        }
+      ],
+      "scope": "Decoder and result-ownership microbenchmark. Times are Debug samples, not end-to-end throughput. Sparse requests use restart jumps; dense requests advance through their interval.",
+      "validation_repeat_samples": [
+        {
+          "keys": 2,
+          "independent_elapsed_ns": 10630000,
+          "reused_elapsed_ns": 9551000,
+          "independent_backing_allocations": 4000,
+          "reused_backing_allocations": 3000,
+          "independent_peak_bytes": 272,
+          "reused_peak_bytes": 207
+        },
+        {
+          "keys": 16,
+          "independent_elapsed_ns": 84258000,
+          "reused_elapsed_ns": 14152000,
+          "independent_backing_allocations": 32000,
+          "reused_backing_allocations": 17000,
+          "independent_peak_bytes": 272,
+          "reused_peak_bytes": 207
+        },
+        {
+          "keys": 256,
+          "independent_elapsed_ns": 1264172000,
+          "reused_elapsed_ns": 215136000,
+          "independent_backing_allocations": 512000,
+          "reused_backing_allocations": 257000,
+          "independent_peak_bytes": 272,
+          "reused_peak_bytes": 207
+        }
+      ]
+    },
+    "prefix_key_scratch_retention": {
+      "per_block_cap_bytes": 65536,
+      "per_batch_cap_bytes": 262144,
+      "resource_slice": "lsm_read_working_set",
+      "exceptional_keys": "temporary admitted key allocation; reader is discarded before reuse",
+      "decode_cache_caps_separate": true,
+      "allocation_failure_retry": "restart from the index; preserve bounded capacity"
     }
   },
   "scope": "Deterministic allocation, directory traversal, admission, and isolated Debug timing fixtures, not query throughput or a 2 GiB soak. Caller-owned mutable values, captured read-layout pointer arrays, payload IO/cache ownership, and first-use overlay promotion still have costs. Directory planning and index metadata reuse bounded resource-charged arenas; async candidate metadata has fixed stack storage.",
   "followup_comparison_commit": "cc48e4652c375181f3cfc2d7a540a75cf38848c5",
   "remaining_wins_comparison_commit": "6c2674dce1c6a498d047a1231cf7f847ae173c1a",
-  "review_followup_comparison_commit": "4eb332cedfd147c13ed4088e1404fa6c5b1ac576"
+  "review_followup_comparison_commit": "4eb332cedfd147c13ed4088e1404fa6c5b1ac576",
+  "latest_review_comparison_commit": "73fbfacf315c6399312011d0d1c467bd38edd254"
 }

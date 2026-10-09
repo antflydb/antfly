@@ -2153,8 +2153,99 @@ fn prefixRestartEntry(view: PrefixBlockView, restart_index: usize) !Entry {
     return .{ .namespace_name = if (namespace_len > 0) namespace else null, .key = key, .value = value, .tombstone = tombstone };
 }
 
-// Looks up already decompressed prefix records. The parser and restart reader
-// validate the record structure; callers must validate the physical checksum.
+/// A borrowed prefix-block reader. Payload bytes must remain pinned until
+/// deinit; returned keys remain valid only until the next find or deinit.
+/// Monotone lookups reuse their current restart interval, while sparse jumps
+/// and backwards lookups seek through the restart index instead of replaying
+/// the whole block. All key storage uses the caller's scratch allocator.
+pub const PrefixPointReader = struct {
+    view: PrefixBlockView,
+    first_entry_index: usize,
+    max_result_bytes: usize,
+    key_bytes: std.ArrayListUnmanaged(u8) = .empty,
+    current: ?BorrowedDecoded.PositionedEntry = null,
+    cursor: usize = 0,
+    next_entry_index: usize = 0,
+    interval_end_index: usize = 0,
+    interval_end_cursor: usize = 0,
+    upper_restart: ?Entry = null,
+
+    pub fn init(payload: []const u8, first_entry_index: usize, max_result_bytes: usize) !@This() {
+        const view = try parsePrefixBlockPayload(payload);
+        if (view.entry_count == 0 and view.encoded_entries.len != 0) return error.InvalidTableFile;
+        _ = std.math.add(usize, first_entry_index, view.entry_count) catch return error.InvalidTableFile;
+        return .{ .view = view, .first_entry_index = first_entry_index, .max_result_bytes = max_result_bytes };
+    }
+
+    pub fn entryCount(self: *const @This()) usize {
+        return self.view.entry_count;
+    }
+
+    pub fn retainedBytes(self: *const @This()) usize {
+        return self.key_bytes.capacity;
+    }
+
+    pub fn deinit(self: *@This(), scratch: std.mem.Allocator) void {
+        self.key_bytes.deinit(scratch);
+        self.* = undefined;
+    }
+
+    fn seek(self: *@This(), namespace_name: ?[]const u8, key: []const u8) !void {
+        var lo: usize = 0;
+        var hi = self.view.restart_count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (compareEntryTo(try prefixRestartEntry(self.view, mid), namespace_name, key) != .gt) lo = mid + 1 else hi = mid;
+        }
+        const restart = if (lo == 0) 0 else lo - 1;
+        self.current = null;
+        self.key_bytes.clearRetainingCapacity();
+        self.cursor = try self.view.restartOffset(restart);
+        self.next_entry_index = restart * self.view.restart_interval;
+        self.interval_end_index = self.next_entry_index + @min(self.view.restart_interval, self.view.entry_count - self.next_entry_index);
+        self.interval_end_cursor = if (restart + 1 < self.view.restart_count) try self.view.restartOffset(restart + 1) else self.view.encoded_entries.len;
+        self.upper_restart = if (restart + 1 < self.view.restart_count) try prefixRestartEntry(self.view, restart + 1) else null;
+        if (self.cursor > self.interval_end_cursor) return error.InvalidTableFile;
+    }
+
+    pub fn find(self: *@This(), scratch: std.mem.Allocator, namespace_name: ?[]const u8, key: []const u8) !?BorrowedDecoded.PositionedEntry {
+        // A failed allocation may leave the byte cursor advanced. Retry from
+        // the restart index, preserving only the reusable key capacity.
+        errdefer self.current = null;
+        if (self.view.entry_count == 0) return null;
+        if (self.current) |current| {
+            switch (compareEntryTo(current.entry, namespace_name, key)) {
+                .eq => {
+                    if (try tableEntryEncodedLen(current.entry) > self.max_result_bytes) return error.InvalidTableFile;
+                    return current;
+                },
+                .gt => try self.seek(namespace_name, key),
+                .lt => if (self.upper_restart) |upper| {
+                    if (compareEntryTo(upper, namespace_name, key) != .gt) try self.seek(namespace_name, key);
+                },
+            }
+        } else try self.seek(namespace_name, key);
+        while (self.next_entry_index < self.interval_end_index) {
+            const entry = try readPrefixBlockEntryInPlace(scratch, self.view.encoded_entries, &self.cursor, &self.key_bytes, self.max_result_bytes);
+            self.next_entry_index += 1;
+            if (self.cursor > self.interval_end_cursor or (self.next_entry_index == self.interval_end_index and self.cursor != self.interval_end_cursor)) return error.InvalidTableFile;
+            const current: BorrowedDecoded.PositionedEntry = .{ .index = self.first_entry_index + self.next_entry_index - 1, .entry = entry };
+            self.current = current;
+            switch (compareEntryTo(entry, namespace_name, key)) {
+                .eq => {
+                    if (try tableEntryEncodedLen(entry) > self.max_result_bytes) return error.InvalidTableFile;
+                    return current;
+                },
+                .gt => return null,
+                .lt => {},
+            }
+        }
+        return null;
+    }
+};
+
+// The physical checksum must be validated by the caller. The reader checks
+// prefix structure and declared result bounds before publishing a borrowed row.
 pub fn findExactEntryInPrefixPayloadAlloc(
     allocator: std.mem.Allocator,
     scratch: std.mem.Allocator,
@@ -2164,53 +2255,17 @@ pub fn findExactEntryInPrefixPayloadAlloc(
     namespace_name: ?[]const u8,
     key: []const u8,
 ) !?OwnedPositionedEntry {
-    const view = try parsePrefixBlockPayload(payload);
-    if (view.entry_count == 0) return null;
-
-    var lo: usize = 0;
-    var hi: usize = view.restart_count;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        const entry = try prefixRestartEntry(view, mid);
-        if (compareEntryTo(entry, namespace_name, key) != .gt) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-
-    const restart_index = if (lo == 0) 0 else lo - 1;
-    var entries_cursor = try view.restartOffset(restart_index);
-    const end_cursor = if (restart_index + 1 < view.restart_count)
-        try view.restartOffset(restart_index + 1)
-    else
-        view.encoded_entries.len;
-
-    var current_key = std.ArrayListUnmanaged(u8).empty;
-    defer current_key.deinit(scratch);
-    var entry_index = first_entry_index + restart_index * view.restart_interval;
-    while (entries_cursor < end_cursor and entry_index < first_entry_index + view.entry_count) : (entry_index += 1) {
-        const entry = try readPrefixBlockEntryInPlace(scratch, view.encoded_entries, &entries_cursor, &current_key, max_result_bytes);
-        const order = compareEntryTo(entry, namespace_name, key);
-        if (order == .eq) {
-            const size = try tableEntryEncodedLen(entry);
-            if (size > max_result_bytes) return error.InvalidTableFile;
-            var out = std.ArrayListUnmanaged(u8).empty;
-            errdefer out.deinit(allocator);
-            try out.ensureTotalCapacityPrecise(allocator, size);
-            try appendEntryBytesToList(allocator, &out, entry);
-            const bytes = out.toOwnedSliceAssert();
-            errdefer allocator.free(bytes);
-            return .{
-                .index = entry_index,
-                .entry = try parseEntryAt(bytes, 0),
-                .bytes = bytes,
-            };
-        }
-        if (order == .gt) return null;
-    }
-    if (entries_cursor != end_cursor) return error.InvalidTableFile;
-    return null;
+    var reader = try PrefixPointReader.init(payload, first_entry_index, max_result_bytes);
+    defer reader.deinit(scratch);
+    const positioned = try reader.find(scratch, namespace_name, key) orelse return null;
+    const entry = positioned.entry;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacityPrecise(allocator, try tableEntryEncodedLen(entry));
+    try appendEntryBytesToList(allocator, &out, entry);
+    const bytes = out.toOwnedSliceAssert();
+    errdefer allocator.free(bytes);
+    return .{ .index = positioned.index, .entry = try parseEntryAt(bytes, 0), .bytes = bytes };
 }
 
 pub fn findExactEntryInCompressedBlockPayloadAlloc(
@@ -4002,4 +4057,160 @@ test "table file prefix point lookup borrows restart keys and reconstructs in pl
         const entry = try readPrefixBlockEntryInPlace(a, encoded.items, &offset, &buffer, 64);
         try std.testing.expectEqualStrings(expected, entry.key);
     }
+}
+
+test "prefix point reader reuses intervals and handles namespace misses duplicates and backwards seeks" {
+    const a = std.testing.allocator;
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw.deinit(a);
+    var entries: [96]Entry = undefined;
+    var keys: [96][40]u8 = undefined;
+    for (&entries, 0..) |*entry, i| {
+        entry.* = .{ .namespace_name = if (i < 48) "docs" else "graph", .key = try std.fmt.bufPrint(&keys[i], "shared-key:{d:0>4}", .{i % 48}), .value = if (i % 7 == 0) "" else "payload", .tombstone = i % 7 == 0 };
+        try appendEntryBytesToList(a, &raw, entry.*);
+    }
+    const payload = try encodePrefixCompressedBlockAlloc(a, raw.items);
+    defer a.free(payload);
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var backing = Budget{ .backing = a };
+    var reader = try PrefixPointReader.init(payload, 700, raw.items.len);
+    defer reader.deinit(backing.allocator());
+    for (entries, 0..) |entry, i| {
+        const found = (try reader.find(backing.allocator(), entry.namespace_name, entry.key)).?;
+        try std.testing.expectEqual(700 + i, found.index);
+        try std.testing.expectEqualStrings(entry.key, found.entry.key);
+        try std.testing.expectEqualStrings(entry.value, found.entry.value);
+        try std.testing.expectEqual(entry.tombstone, found.entry.tombstone);
+        const calls = backing.alloc_calls;
+        const duplicate = (try reader.find(backing.allocator(), entry.namespace_name, entry.key)).?;
+        try std.testing.expectEqual(found.index, duplicate.index);
+        try std.testing.expectEqual(calls, backing.alloc_calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), backing.alloc_calls);
+    for ([_]usize{ 95, 0, 83, 5, 48, 16, 47 }) |i| {
+        const found = (try reader.find(backing.allocator(), entries[i].namespace_name, entries[i].key)).?;
+        try std.testing.expectEqual(700 + i, found.index);
+    }
+    try std.testing.expect(try reader.find(backing.allocator(), "docs", "shared-key:0005~") == null);
+    try std.testing.expectEqual(@as(usize, 706), (try reader.find(backing.allocator(), "docs", entries[6].key)).?.index);
+    try std.testing.expect(try reader.find(backing.allocator(), "aaa", "shared-key:0001") == null);
+    try std.testing.expect(try reader.find(backing.allocator(), "zzz", "shared-key:0001") == null);
+    try std.testing.expectEqual(@as(usize, 795), (try reader.find(backing.allocator(), "graph", entries[95].key)).?.index);
+}
+
+test "prefix point reader retries failed key growth and unwinds every allocation failure" {
+    const a = std.testing.allocator;
+    const large_key: [128 * 1024]u8 = @splat('z');
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw.deinit(a);
+    try appendEntryBytesToList(a, &raw, .{ .key = "a", .value = "small" });
+    try appendEntryBytesToList(a, &raw, .{ .key = &large_key, .value = "large" });
+    const payload = try encodePrefixCompressedBlockAlloc(a, raw.items);
+    defer a.free(payload);
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    var backing = Budget{ .backing = a, .limit = 1024 };
+    var reader = try PrefixPointReader.init(payload, 0, raw.items.len);
+    defer reader.deinit(backing.allocator());
+    try std.testing.expectError(error.OutOfMemory, reader.find(backing.allocator(), null, &large_key));
+    try std.testing.expect(reader.current == null);
+    backing.limit = std.math.maxInt(usize);
+    const found = (try reader.find(backing.allocator(), null, &large_key)).?;
+    try std.testing.expectEqualStrings("large", found.entry.value);
+    try std.testing.expectEqual(@as(usize, 1), found.index);
+    const Fixture = struct {
+        fn run(scratch: std.mem.Allocator, prefix: []const u8, max_bytes: usize, target: []const u8) !void {
+            var r = try PrefixPointReader.init(prefix, 0, max_bytes);
+            defer r.deinit(scratch);
+            _ = (try r.find(scratch, null, "a")).?;
+            _ = (try r.find(scratch, null, target)).?;
+            _ = (try r.find(scratch, null, "a")).?;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{ payload, raw.items.len, &large_key });
+}
+
+test "prefix point reader rejects malformed restart boundaries and index overflow" {
+    const a = std.testing.allocator;
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw.deinit(a);
+    try appendEntryBytesToList(a, &raw, .{ .key = "a", .value = "value" });
+    const payload = try encodePrefixCompressedBlockAlloc(a, raw.items);
+    defer a.free(payload);
+    try std.testing.expectError(error.InvalidTableFile, PrefixPointReader.init(payload, std.math.maxInt(usize), raw.items.len));
+    var bounded = try PrefixPointReader.init(payload, 0, 1);
+    defer bounded.deinit(a);
+    try std.testing.expectError(error.InvalidTableFile, bounded.find(a, null, "a"));
+    const corrupted = try a.dupe(u8, payload);
+    defer a.free(corrupted);
+    // A trailing byte inside the final interval contradicts its entry count.
+    std.mem.writeInt(u32, corrupted[8..12], 2, .little);
+    var invalid = try PrefixPointReader.init(corrupted, 0, raw.items.len);
+    defer invalid.deinit(a);
+    try std.testing.expectError(error.InvalidTableFile, invalid.find(a, null, "z"));
+}
+
+test "prefix point reader dense and sparse allocation measurement" {
+    const a = std.testing.allocator;
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw.deinit(a);
+    var entries: [256]Entry = undefined;
+    var keys: [256][80]u8 = undefined;
+    for (&entries, 0..) |*entry, i| {
+        entry.* = .{ .key = try std.fmt.bufPrint(&keys[i], "long-shared-document-key-prefix-for-compression:{d:0>4}", .{i}), .value = "v" };
+        try appendEntryBytesToList(a, &raw, entry.*);
+    }
+    const payload = try encodePrefixCompressedBlockAlloc(a, raw.items);
+    defer a.free(payload);
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    // Use the native backing allocator so test allocator stack tracking does
+    // not dominate decoder timing. Bytes/counts are deterministic; time is not.
+    const native = if (@import("builtin").link_libc) std.heap.c_allocator else a;
+    for ([_]usize{ 2, 16, 256 }) |requested| {
+        var independent = Budget{ .backing = native };
+        var reused = Budget{ .backing = native };
+        const iterations = 1000;
+        const before = @import("antfly_platform").time.monotonicNs();
+        for (0..iterations) |_| for (0..requested) |n| {
+            const i = if (requested == 2 and n == 1) 255 else n;
+            const found = (try findExactEntryInPrefixPayloadAlloc(independent.allocator(), independent.allocator(), raw.items.len, payload, 0, null, entries[i].key)).?;
+            try std.testing.expectEqualStrings("v", found.entry.value);
+            independent.allocator().free(found.bytes);
+        };
+        const independent_ns = @import("antfly_platform").time.monotonicNs() - before;
+        const after = @import("antfly_platform").time.monotonicNs();
+        for (0..iterations) |_| {
+            var reader = try PrefixPointReader.init(payload, 0, raw.items.len);
+            defer reader.deinit(reused.allocator());
+            for (0..requested) |n| {
+                const i = if (requested == 2 and n == 1) 255 else n;
+                const found = (try reader.find(reused.allocator(), null, entries[i].key)).?;
+                const value = try reused.allocator().dupe(u8, found.entry.value);
+                try std.testing.expectEqualStrings("v", value);
+                reused.allocator().free(value);
+            }
+        }
+        const reused_ns = @import("antfly_platform").time.monotonicNs() - after;
+        try std.testing.expectEqual(@as(usize, 0), independent.live);
+        try std.testing.expectEqual(@as(usize, 0), reused.live);
+        try std.testing.expectEqual(iterations * (requested + 1), reused.alloc_calls);
+        try std.testing.expectEqual(iterations * requested * 2, independent.alloc_calls);
+        std.debug.print("prefix reader production: rows=256 keys={d} batches=1000 independent_ns={d} reused_ns={d} independent_allocations={d} reused_allocations={d} independent_peak={d} reused_peak={d}\n", .{ requested, independent_ns, reused_ns, independent.alloc_calls, reused.alloc_calls, independent.peak, reused.peak });
+    }
+}
+
+test "prefix point reader bounds selected results without rejecting skipped values" {
+    const a = std.testing.allocator;
+    const large_value: [4096]u8 = @splat('v');
+    var raw: std.ArrayListUnmanaged(u8) = .empty;
+    defer raw.deinit(a);
+    try appendEntryBytesToList(a, &raw, .{ .key = "a", .value = &large_value });
+    try appendEntryBytesToList(a, &raw, .{ .key = "b", .value = "small" });
+    const payload = try encodePrefixCompressedBlockAlloc(a, raw.items);
+    defer a.free(payload);
+    var reader = try PrefixPointReader.init(payload, 0, 128);
+    defer reader.deinit(a);
+    const found = (try reader.find(a, null, "b")).?;
+    try std.testing.expectEqualStrings("small", found.entry.value);
+    try std.testing.expectError(error.InvalidTableFile, reader.find(a, null, "a"));
+    try std.testing.expectEqualStrings("small", (try reader.find(a, null, "b")).?.entry.value);
 }
