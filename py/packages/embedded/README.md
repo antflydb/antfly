@@ -273,7 +273,7 @@ inventory; retry until it is `true` or your own deadline expires.
   settings: storage kind, map size, TTL cleanup, inference resource
   budgets, busy timeout).
 - **Data**: `batch()`, `batch_json()`, `lookup()`, `get_raw()`, `scan()`,
-  `search()`, `stats()`, `aggregate_hits()`, `lookup_artifact()`,
+  `search()`, `sql_json()`, `stats()`, `aggregate_hits()`, `lookup_artifact()`,
   `get_schema()`/`set_schema()`, `extract_enrichments()`,
   `compute_enrichments()`.
 - **Indexes/enrichments**: `list_indexes()`, `add_index()`,

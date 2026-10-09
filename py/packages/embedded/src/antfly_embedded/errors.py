@@ -133,7 +133,11 @@ class AntflyError(Exception):
     Attributes:
         code: the stable numeric antfly_error_code.
         name: the stable symbolic name, e.g. "ANTFLY_BUSY".
+        body: diagnostics the call returned alongside the error code, e.g.
+            the SQL error JSON from Database.sql_json; empty otherwise.
     """
+
+    body: str = ""
 
     CODE: ClassVar[int | None] = None
 

@@ -291,6 +291,9 @@ export interface NativeLibrary {
   dbScanJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   dbStatsJson: KoffiFunc<(handle: unknown, out: object) => number>;
   dbSearchJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  dbSqlJson: KoffiFunc<
+    (handle: unknown, tableName: object, request: object, out: object) => number
+  >;
   dbSearchDenseWire: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   dbSearchTextMatchWire: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
   dbSearchTextTermWire: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
@@ -564,6 +567,12 @@ function buildNative(): NativeLibrary {
     dbStatsJson: f("antfly_db_stats_json", "uint32_t", [PAntflyDb, PAntflyBufferOut]),
     dbSearchJson: f("antfly_db_search_json", "uint32_t", [
       PAntflyDb,
+      AntflySlice,
+      PAntflyBufferOut,
+    ]),
+    dbSqlJson: f("antfly_db_sql_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
       AntflySlice,
       PAntflyBufferOut,
     ]),

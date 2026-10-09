@@ -336,6 +336,33 @@ class Database:
     def search(self, request: JSONInput, *, raw: bool = False) -> Any:
         return self._json_call(self._lib.antfly_db_search_json, request, raw=raw)
 
+    def sql_json(self, table: str, request: JSONInput, *, raw: bool = False) -> Any:
+        """Execute one SQL statement against the embedded table `table`.
+
+        `request` is an SQLRequest (`statement`, `parameters`, `limit`).
+        Embedded SQL is single-table and autocommit: sessions, DDL, qualified
+        catalog names and managed owners are rejected. On failure the raised
+        AntflyError carries the SQL diagnostics JSON in `body`.
+        """
+        handle = self._acquire()
+        try:
+            table_slice, _keep_table = _ffi.make_slice(encode_text(table))
+            request_slice, _keep_request = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            code = self._lib.antfly_db_sql_json(ctypes.c_void_p(handle), table_slice, request_slice, ctypes.byref(out))
+            # The SQL runtime writes diagnostics into `out` even on error, and
+            # the ABI requires freeing it either way.
+            data = _ffi.take_buffer(out)
+        finally:
+            self._release()
+        if code != errors.OK:
+            exc = errors.error_class_for_code(code)(code)
+            exc.body = data.decode("utf-8", errors="replace")
+            if exc.body:
+                exc.args = (f"{exc}: {exc.body}",)
+            raise exc
+        return decode_json_response(data, raw)
+
     def dense_search_wire(self, request: bytes) -> bytes:
         """Execute a packed dense-vector wire search request. Wire format,
         not JSON: always returns raw bytes."""

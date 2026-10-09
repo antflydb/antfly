@@ -336,6 +336,7 @@ _FUNCTIONS: list[tuple[str, list[object], object]] = [
     ("antfly_db_scan_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_stats_json", [_VOID_P, _BUF_P], _ERR),
     ("antfly_db_search_json", [_VOID_P, AntflySlice, _BUF_P], _ERR),
+    ("antfly_db_sql_json", [_VOID_P, AntflySlice, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_search_dense_wire", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_search_text_match_wire", [_VOID_P, AntflySlice, _BUF_P], _ERR),
     ("antfly_db_search_text_term_wire", [_VOID_P, AntflySlice, _BUF_P], _ERR),

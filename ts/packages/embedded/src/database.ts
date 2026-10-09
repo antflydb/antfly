@@ -16,7 +16,7 @@
 import * as fsp from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { validateAbi } from "./abi.js";
-import { checkCode, InvalidArgumentError } from "./errors.js";
+import { type AntflyError, checkCode, errorFromCode, InvalidArgumentError } from "./errors.js";
 import {
   callAsync,
   type DecodedBuffer,
@@ -412,6 +412,34 @@ export class Database implements AsyncDisposable {
     return parseJson(await this.searchRaw(request));
   }
 
+  /**
+   * Executes one SQL statement against the embedded table `tableName` using
+   * an SQLRequest (`statement`, `parameters`, `limit`). Embedded SQL is
+   * single-table and autocommit: sessions, DDL, qualified catalog names and
+   * managed owners are rejected. On failure the thrown AntflyError's `.body`
+   * is the parsed SQL diagnostics ({"error": {"code": SQLSTATE, ...}}).
+   */
+  sqlJsonRaw(tableName: string, request: JsonInput): Promise<Buffer> {
+    return this.#run(async (handle) => {
+      const out: DecodedBuffer = newBufferOut();
+      const code = await callAsync(
+        this.#native.dbSqlJson,
+        handle,
+        stringSlice(tableName),
+        jsonSlice(request),
+        out
+      );
+      // The SQL runtime writes diagnostics into `out` even on error, and the
+      // ABI requires freeing it either way.
+      const body = takeBuffer(this.#native, out);
+      if (code !== 0) throw sqlError(code, body);
+      return body;
+    });
+  }
+  async sqlJson(tableName: string, request: JsonInput): Promise<unknown> {
+    return parseJson(await this.sqlJsonRaw(tableName, request));
+  }
+
   // --- Packed wire searches (binary wire format, never JSON: request/response are raw bytes) ---
 
   denseSearchWire(request: Uint8Array): Promise<Buffer> {
@@ -702,4 +730,29 @@ export async function createHosted(path: string): Promise<Database> {
   const code = await callAsync(native.liteCreateHosted, path, outHandle);
   checkCode(code);
   return new Database(native, outHandle[0]);
+}
+
+/** Folds an SQL diagnostics body ({"error": {"code", "message", ...}}) into the thrown error. */
+function sqlError(code: number, body: Buffer): AntflyError {
+  let parsed: unknown;
+  if (body.length > 0) {
+    try {
+      parsed = JSON.parse(body.toString("utf8"));
+    } catch {
+      parsed = body.toString("utf8");
+    }
+  }
+  let message: string | undefined;
+  const detail =
+    parsed && typeof parsed === "object" ? (parsed as { error?: unknown }).error : undefined;
+  if (detail && typeof detail === "object") {
+    const d = detail as Record<string, unknown>;
+    const sqlState = typeof d.code === "string" ? d.code : undefined;
+    const msg = typeof d.message === "string" ? d.message : undefined;
+    message =
+      [sqlState, msg].filter((part): part is string => Boolean(part)).join(": ") || undefined;
+  }
+  const err = errorFromCode(code, message);
+  err.body = parsed;
+  return err;
 }

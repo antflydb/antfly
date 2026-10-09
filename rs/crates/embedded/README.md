@@ -242,7 +242,8 @@ failing immediately with `Busy`, like `sqlite3_busy_timeout`.
   `create_hosted` convenience constructors.
 - Raw `*_json` methods take `impl AsRef<[u8]>` and return `Vec<u8>`, matching
   the C ABI's JSON contract 1:1: `batch_json`, `lookup_json`, `get_raw`,
-  `scan_json`, `search_json`, the packed wire search variants, schema/index/
+  `scan_json`, `search_json`, `sql_json` (failures return `SqlError` with the
+  SQL diagnostics body), the packed wire search variants, schema/index/
   enrichment administration, graph queries, transactions, and maintenance
   (backup/export/import, check, compact, vacuum, stable snapshots).
 - With the default `serde` feature, typed convenience methods

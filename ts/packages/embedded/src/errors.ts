@@ -104,10 +104,10 @@ export class AntflyError extends Error {
   readonly code: number;
   readonly codeName: string;
   /**
-   * Parsed JSON error body, when the failing call returned one. Currently
-   * only Inference calls populate this (embed/rerank/.../pull): libantfly
-   * always fills their antfly_buffer output with {"error": ..., "message":
-   * ...} on failure, even though the call also returns a non-OK error code.
+   * Parsed JSON error body, when the failing call returned one: Inference
+   * calls (embed/rerank/.../pull) fill their antfly_buffer output with
+   * {"error": ..., "message": ...}, and Database.sqlJson with SQL
+   * diagnostics, even though the call also returns a non-OK error code.
    */
   body?: unknown;
 

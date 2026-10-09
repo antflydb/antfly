@@ -332,7 +332,8 @@ Mirrors `go/pkg/embedded`'s surface idiomatically:
   `OpenOptions` (including `storage`), `Storage`, `OpenMode`, `Profile`,
   `TxnStatus`, `GraphDirection`, `InferenceMode`, `THREADING_SERIALIZED`.
 - **`Database`**: `close()`, `[Symbol.asyncDispose]`; `batch`/`batchJson`;
-  `lookup`/`lookupRaw`/`getRaw`; `scan`/`search`/`stats`; `status`,
+  `lookup`/`lookupRaw`/`getRaw`; `scan`/`search`/`stats`; `sqlJson`/
+  `sqlJsonRaw` (SQL diagnostics on the thrown error's `.body`); `status`,
   `capabilities`, `check`, `pendingWorkStats`, `runUntilIdle` /
   `runUntilIdleStatus`, `replayGeneratedEnrichments`; `getSchema`/
   `setSchema`; `listIndexes`/`addIndex`/`deleteIndex` (returns `boolean`);
