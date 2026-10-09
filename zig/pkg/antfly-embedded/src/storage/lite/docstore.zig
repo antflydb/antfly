@@ -2804,14 +2804,25 @@ pub const Txn = struct {
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+            return self.getManySortedControlled(keys, values, null);
+        }
+
+        pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+            return self.getManySortedControlled(keys, values, control);
+        }
+
+        fn getManySortedControlled(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: ?read_admission.Port) !void {
             if (keys.len != values.len) return error.InvalidBatch;
             @memset(values, null);
             errdefer @memset(values, null);
+            if (control) |budget| try budget.checkpoint();
             for (keys, 0..) |key, i| {
+                if (control) |budget| try budget.checkpoint();
                 if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
             }
             var unique_count: usize = 0;
             for (keys, 0..) |key, i| {
+                if (control) |budget| try budget.checkpoint();
                 if (i == 0 or !std.mem.eql(u8, keys[i - 1], key)) unique_count += 1;
             }
             const alloc = self.scratch.allocator();
@@ -2821,8 +2832,11 @@ pub const Txn = struct {
             var count: usize = 0;
             var i: usize = 0;
             while (i < keys.len) {
+                if (control) |budget| try budget.checkpoint();
                 var end = i + 1;
-                while (end < keys.len and std.mem.eql(u8, keys[i], keys[end])) : (end += 1) {}
+                while (end < keys.len and std.mem.eql(u8, keys[i], keys[end])) : (end += 1) {
+                    if (control) |budget| try budget.checkpoint();
+                }
                 const full = if (self.parent.prefix.len == 0) keys[i] else try std.mem.concat(alloc, u8, &.{ self.parent.prefix, keys[i] });
                 if (self.parent.pending_tree.getEntryFor(full).node) |node| {
                     if (self.parent.pending.items[pendingNode(node).ordinal].value) |value| @memset(values[i..end], try alloc.dupe(u8, value));
@@ -2833,13 +2847,20 @@ pub const Txn = struct {
                 }
                 i = end;
             }
-            if (count == 0) return;
-            try (try self.parent.readFile()).getDocumentsAtCheckpointAlloc(alloc, self.parent.checkpoint, pending_keys[0..count], loaded[0..count]);
+            if (count == 0) {
+                if (control) |budget| try budget.checkpoint();
+                return;
+            }
+            try (try self.parent.readFile()).getDocumentsAtCheckpointAllocWithAdmission(alloc, self.parent.checkpoint, pending_keys[0..count], loaded[0..count], control);
             for (loaded[0..count], positions[0..count]) |value, position| {
+                if (control) |budget| try budget.checkpoint();
                 var end = position + 1;
-                while (end < keys.len and std.mem.eql(u8, keys[position], keys[end])) : (end += 1) {}
+                while (end < keys.len and std.mem.eql(u8, keys[position], keys[end])) : (end += 1) {
+                    if (control) |budget| try budget.checkpoint();
+                }
                 @memset(values[position..end], value);
             }
+            if (control) |budget| try budget.checkpoint();
         }
 
         /// Invalidates all previously returned values, retaining bounded scratch.
@@ -2882,10 +2903,20 @@ pub const Txn = struct {
     }
 
     pub fn getManySorted(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
+        return self.getManySortedControlled(keys, values, null);
+    }
+
+    pub fn getManySortedWithAdmission(self: *Txn, keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+        return self.getManySortedControlled(keys, values, control);
+    }
+
+    fn getManySortedControlled(self: *Txn, keys: []const []const u8, values: []?[]const u8, control: ?read_admission.Port) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         errdefer @memset(values, null);
+        if (control) |budget| try budget.checkpoint();
         for (keys, 0..) |key, i| {
+            if (control) |budget| try budget.checkpoint();
             if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
         }
         const alloc = self.allocator;
@@ -2898,8 +2929,11 @@ pub const Txn = struct {
         defer positions.deinit(alloc);
         var i: usize = 0;
         while (i < keys.len) {
+            if (control) |budget| try budget.checkpoint();
             var end = i + 1;
-            while (end < keys.len and std.mem.eql(u8, keys[i], keys[end])) : (end += 1) {}
+            while (end < keys.len and std.mem.eql(u8, keys[i], keys[end])) : (end += 1) {
+                if (control) |budget| try budget.checkpoint();
+            }
             const full = try self.prefixedKey(keys[i]);
             defer if (self.prefix.len > 0) alloc.free(full);
             if (self.pending_tree.getEntryFor(full).node) |node| {
@@ -2917,20 +2951,34 @@ pub const Txn = struct {
             }
             i = end;
         }
-        if (misses.items.len == 0) return;
+        if (misses.items.len == 0) {
+            if (control) |budget| try budget.checkpoint();
+            return;
+        }
         // Reserve all cache slots before acquiring payloads. Once the batch
         // succeeds, transferring key/value ownership cannot fail.
         try self.snapshot_reads.ensureUnusedCapacity(alloc, std.math.cast(u32, misses.items.len) orelse return error.RecordTooLarge);
         const loaded = try alloc.alloc(?[]const u8, misses.items.len);
         defer alloc.free(loaded);
-        try (try self.readFile()).getDocumentsAtCheckpointAlloc(alloc, self.checkpoint, misses.items, loaded);
+        try (try self.readFile()).getDocumentsAtCheckpointAllocWithAdmission(alloc, self.checkpoint, misses.items, loaded, control);
+        // NativeFile retires all output on failure. After success, retire only
+        // the suffix not yet transferred to the transaction's snapshot cache.
+        var transferred: usize = 0;
+        defer for (loaded[transferred..]) |value| {
+            if (value) |bytes| alloc.free(bytes);
+        };
         for (misses.items, loaded, positions.items) |*key, value, position| {
+            if (control) |budget| try budget.checkpoint();
             self.snapshot_reads.putAssumeCapacity(key.*, value);
             key.* = "";
+            transferred += 1;
             var end = position + 1;
-            while (end < keys.len and std.mem.eql(u8, keys[position], keys[end])) : (end += 1) {}
+            while (end < keys.len and std.mem.eql(u8, keys[position], keys[end])) : (end += 1) {
+                if (control) |budget| try budget.checkpoint();
+            }
             @memset(values[position..end], value);
         }
+        if (control) |budget| try budget.checkpoint();
     }
 
     pub fn put(self: *Txn, key: []const u8, value: []const u8) !void {
@@ -6032,5 +6080,89 @@ test "lite snapshot admission preserves original cancellation while the backend 
                 try std.testing.expectEqual(@as(usize, 0), store.read_generation.?.references);
             }
         }
+    }
+}
+
+/// Exercises production transaction adapters with a publication newer than the
+/// pinned checkpoint, plus write overlays and duplicate result ownership.
+pub fn qualifyControlledReadBatch(control: read_admission.Port, mode: enum { transaction, scope, overlay }) !void {
+    if (!@import("builtin").is_test) @compileError("test fixture only");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "controlled-read-batch.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    {
+        var write = try Txn.openWriteWithPrefix(&store, "ns\x00");
+        errdefer write.abort();
+        try write.put("a", "old-a");
+        try write.put("b", "old-b");
+        try write.put("d", "old-d");
+        try write.commit();
+    }
+    var pinned = try Txn.openReadWithPrefix(&store, "ns\x00");
+    var read = backend_erased.readTxnFrom(a, pinned) catch |err| {
+        pinned.abort();
+        return err;
+    };
+    defer read.abort();
+    {
+        var write = try Txn.openWriteWithPrefix(&store, "ns\x00");
+        errdefer write.abort();
+        try write.put("a", "new-a");
+        try write.put("c", "new-c");
+        try write.commit();
+    }
+    store.file.page_cache_enabled.store(false, .release);
+    // The pinned generation owns another NativeFile; disable its page cache too.
+    pinned.read_generation.?.file.page_cache_enabled.store(false, .release);
+    const keys: []const []const u8 = &.{ "a", "a", "b", "c", "d", "d" };
+    var values: [6]?[]const u8 = @splat(null);
+    if (mode == .overlay) {
+        var write = try Txn.openWriteWithPrefix(&store, "ns\x00");
+        defer write.abort();
+        try write.put("a", "pending");
+        try write.delete("b");
+        var scope = try write.openReadScope(a);
+        defer scope.close();
+        scope.getManySortedWithAdmission(keys, &values, control) catch |err| {
+            for (values) |value| try std.testing.expect(value == null);
+            return err;
+        };
+        try std.testing.expectEqualStrings("pending", values[0].?);
+        try std.testing.expect(values[2] == null);
+        try std.testing.expectEqualStrings("new-c", values[3].?);
+        // A later mutation cannot invalidate scope-owned copies.
+        try write.put("a", "later");
+        try std.testing.expectEqualStrings("pending", values[0].?);
+        try std.testing.expectEqualStrings("old-d", values[4].?);
+        try std.testing.expectEqual(values[0].?.ptr, values[1].?.ptr);
+        try std.testing.expectEqual(values[4].?.ptr, values[5].?.ptr);
+    } else if (mode == .scope) {
+        var scope = try read.openReadScope(a);
+        defer scope.close();
+        scope.getManySortedWithAdmission(keys, &values, control) catch |err| {
+            for (values) |value| try std.testing.expect(value == null);
+            return err;
+        };
+        try std.testing.expectEqualStrings("old-a", values[0].?);
+        try std.testing.expectEqualStrings("old-b", values[2].?);
+        try std.testing.expect(values[3] == null);
+        try std.testing.expectEqualStrings("old-d", values[4].?);
+        try std.testing.expectEqual(values[0].?.ptr, values[1].?.ptr);
+        try std.testing.expectEqual(values[4].?.ptr, values[5].?.ptr);
+    } else {
+        read.getManySortedWithAdmission(keys, &values, control) catch |err| {
+            for (values) |value| try std.testing.expect(value == null);
+            return err;
+        };
+        try std.testing.expectEqualStrings("old-a", values[0].?);
+        try std.testing.expectEqualStrings("old-b", values[2].?);
+        try std.testing.expect(values[3] == null);
+        try std.testing.expectEqualStrings("old-d", values[4].?);
+        try std.testing.expectEqual(values[0].?.ptr, values[1].?.ptr);
+        try std.testing.expectEqual(values[4].?.ptr, values[5].?.ptr);
     }
 }

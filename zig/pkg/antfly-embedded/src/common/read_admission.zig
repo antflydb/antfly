@@ -138,3 +138,40 @@ test "transaction routing control port cursor scope rejects reentry without rele
     guard.deinit();
     try std.testing.expect(scope.control == null);
 }
+
+/// Bounded in-place CPU work under the original synchronous authority.
+/// Preserve the ordinary sort when no controlled caller is present.
+pub fn sort(comptime T: type, items: []T, context: anytype, comptime less: anytype, control: ?Port) !void {
+    const std = @import("std");
+    const budget = control orelse {
+        std.mem.sort(T, items, context, less);
+        return;
+    };
+    try budget.checkpoint();
+    var start = items.len / 2;
+    while (start > 0) {
+        start -= 1;
+        try sift(T, items, context, less, start, budget);
+    }
+    var end = items.len;
+    while (end > 1) {
+        try budget.checkpoint();
+        end -= 1;
+        std.mem.swap(T, &items[0], &items[end]);
+        try sift(T, items[0..end], context, less, 0, budget);
+    }
+    try budget.checkpoint();
+}
+
+fn sift(comptime T: type, items: []T, context: anytype, comptime less: anytype, start: usize, budget: Port) !void {
+    const std = @import("std");
+    var root = start;
+    while (root < items.len / 2) {
+        try budget.checkpoint();
+        var child = root * 2 + 1;
+        if (child + 1 < items.len and less(context, items[child], items[child + 1])) child += 1;
+        if (!less(context, items[root], items[child])) return;
+        std.mem.swap(T, &items[root], &items[child]);
+        root = child;
+    }
+}

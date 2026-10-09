@@ -1177,3 +1177,156 @@ test "text statistics trusted controls generic batch adapters reject missing aut
     }
     try std.testing.expectEqual(@as(usize, 2), provider.retired);
 }
+
+test "text statistics trusted controls Lite native and transaction batches loan only physical reads and retire stopped output" {
+    const admission = sources.common_read_admission;
+    const Case = enum { success, cancel, shutdown };
+    const Budget = struct {
+        parent: *native.Execution,
+        scheduler: *native.Scheduler,
+        canceled: *std.atomic.Value(bool),
+        phase: native.Class,
+        mode: Case,
+        loans: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.parent.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+        pub fn executionBoundary(self: *@This()) sources.common_execution_wait.Boundary {
+            return .{ .ptr = self, .begin = begin, .end = end };
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.parent.checkpoint();
+            try self.parent.park(.resource_blocked);
+            self.loans += 1;
+            try std.testing.expectEqual(@as(usize, 0), self.scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), self.scheduler.stats().retained_bytes);
+            var control: native.Execution = .{};
+            defer control.finish();
+            try control.start(self.scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs }, .control);
+            try control.checkpoint();
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.mode == .cancel) self.canceled.store(true, .release);
+            if (self.mode == .shutdown) self.scheduler.close();
+            try self.parent.enter(self.phase);
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        for (0..4) |fixture| {
+            for ([_]Case{ .success, .cancel, .shutdown }) |mode| {
+                var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+                defer scheduler.close();
+                var canceled = std.atomic.Value(bool).init(false);
+                var parent: native.Execution = .{};
+                defer parent.finish();
+                const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+                try parent.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+                var budget = Budget{ .parent = &parent, .scheduler = &scheduler, .canceled = &canceled, .phase = phase, .mode = mode };
+                var adapter = admission.Adapter(*Budget){ .budget = &budget };
+                const payload = adapter.payload();
+                const port = admission.Port.init(&payload);
+                const result = switch (fixture) {
+                    0 => sources.storage_lite_native.qualifyControlledBatch(port),
+                    1 => sources.storage_lite_docstore.qualifyControlledReadBatch(port, .transaction),
+                    2 => sources.storage_lite_docstore.qualifyControlledReadBatch(port, .scope),
+                    else => sources.storage_lite_docstore.qualifyControlledReadBatch(port, .overlay),
+                };
+                switch (mode) {
+                    .success => try result,
+                    .cancel => try std.testing.expectError(error.Canceled, result),
+                    .shutdown => try std.testing.expectError(error.SchedulerClosed, result),
+                }
+                try std.testing.expect(budget.loans > 0);
+                try std.testing.expectEqual(phase, parent.entry.?.class);
+                try std.testing.expectEqual(@as(?u64, deadline), parent.entry.?.options.deadline_ns);
+                try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+                parent.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+            }
+        }
+    }
+}
+
+test "text statistics trusted controls Lite batch checkpoints retire partial cache and scope results" {
+    const admission = sources.common_read_admission;
+    const Budget = struct {
+        parent: *native.Execution,
+        canceled: *std.atomic.Value(bool),
+        stop: usize,
+        calls: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls == self.stop) self.canceled.store(true, .release);
+            try self.parent.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        for (0..3) |fixture| {
+            for ([_]usize{ 1, 8, 16, 24, 32, 48, 64, 96, std.math.maxInt(usize) }) |stop| {
+                var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+                defer scheduler.close();
+                var canceled = std.atomic.Value(bool).init(false);
+                var parent: native.Execution = .{};
+                defer parent.finish();
+                try parent.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+                var budget = Budget{ .parent = &parent, .canceled = &canceled, .stop = stop };
+                var adapter = admission.Adapter(*Budget){ .budget = &budget };
+                const payload = adapter.payload();
+                const port = admission.Port.init(&payload);
+                const result = switch (fixture) {
+                    0 => sources.storage_lite_docstore.qualifyControlledReadBatch(port, .transaction),
+                    1 => sources.storage_lite_docstore.qualifyControlledReadBatch(port, .scope),
+                    else => sources.storage_lite_docstore.qualifyControlledReadBatch(port, .overlay),
+                };
+                if (budget.calls >= stop) try std.testing.expectError(error.Canceled, result) else try result;
+                try std.testing.expect(budget.calls > 0);
+                try std.testing.expectEqual(phase, parent.entry.?.class);
+                try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+                parent.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            }
+        }
+    }
+}
+
+test "text statistics trusted controls bounded sort preserves duplicate ordering and stops" {
+    const admission = sources.common_read_admission;
+    const Budget = struct {
+        stop: usize = std.math.maxInt(usize),
+        calls: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls >= self.stop) return error.Canceled;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var budget = Budget{};
+    var adapter = admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    const port = admission.Port.init(&payload);
+    var items: [300]u64 = undefined;
+    for (&items, 0..) |*item, i| item.* = @intCast((299 - i) % 19);
+    var expected = items;
+    std.mem.sort(u64, &expected, {}, std.sort.asc(u64));
+    try admission.sort(u64, &items, {}, std.sort.asc(u64), port);
+    try std.testing.expectEqualSlices(u64, &expected, &items);
+    try admission.sort(u64, items[0..0], {}, std.sort.asc(u64), port);
+    try admission.sort(u64, items[0..1], {}, std.sort.asc(u64), port);
+    try admission.sort(u64, &items, {}, std.sort.asc(u64), port);
+    try std.testing.expectEqualSlices(u64, &expected, &items);
+    budget.calls = 0;
+    budget.stop = 4;
+    try std.testing.expectError(error.Canceled, admission.sort(u64, &items, {}, std.sort.asc(u64), port));
+}
