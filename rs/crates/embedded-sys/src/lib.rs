@@ -670,9 +670,43 @@ unsafe extern "C" {
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;
+    pub fn antfly_db_open_table(
+        db: *mut antfly_db,
+        name: antfly_slice,
+        out: *mut *mut antfly_db,
+    ) -> antfly_error_code;
+    pub fn antfly_db_create_table_json(
+        db: *mut antfly_db,
+        name: antfly_slice,
+        schema: antfly_slice,
+    ) -> antfly_error_code;
+    pub fn antfly_db_drop_table(db: *mut antfly_db, name: antfly_slice) -> antfly_error_code;
+    pub fn antfly_db_list_tables_json(
+        db: *mut antfly_db,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_sql_describe_json(
+        db: *mut antfly_db,
+        request: antfly_slice,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_sql_session_open(db: *mut antfly_db, out: *mut u64) -> antfly_error_code;
+    pub fn antfly_db_sql_session_close(db: *mut antfly_db, id: u64) -> antfly_error_code;
+    pub fn antfly_db_sql_open_cursor_json(
+        db: *mut antfly_db,
+        request: antfly_slice,
+        id: *mut u64,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_sql_fetch_cursor_json(
+        db: *mut antfly_db,
+        id: u64,
+        rows: u32,
+        out: *mut antfly_buffer,
+    ) -> antfly_error_code;
+    pub fn antfly_db_sql_close_cursor(db: *mut antfly_db, id: u64) -> antfly_error_code;
     pub fn antfly_db_sql_json(
         db: *mut antfly_db,
-        table_name: antfly_slice,
         request_json: antfly_slice,
         out: *mut antfly_buffer,
     ) -> antfly_error_code;

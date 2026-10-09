@@ -52,6 +52,7 @@ fn expectStableSortProfileContract(comptime SortProfile: type) !void {
     try std.testing.expect(@hasField(SortProfile, "sort_lifecycle_state"));
     try std.testing.expect(@hasField(SortProfile, "index_sort_coverage"));
     try std.testing.expect(@hasField(SortProfile, "candidate_count"));
+    try std.testing.expect(@hasField(SortProfile, "ordered_scanned_count"));
     try std.testing.expect(@hasField(SortProfile, "cursor_rejected_count"));
     try std.testing.expect(@hasField(SortProfile, "selected_count"));
     try std.testing.expect(@hasField(SortProfile, "total_us"));

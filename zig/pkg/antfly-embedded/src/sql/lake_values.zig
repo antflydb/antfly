@@ -23,7 +23,7 @@ pub fn comparisonValue(a: std.mem.Allocator, raw: Json, kind: @import("ast.zig")
     const ns: i128 = switch (raw) {
         .integer => |value| value,
         .number_string => |text| std.fmt.parseInt(i128, text, 10) catch return error.InvalidSqlDateTime,
-        .string => |text| @import("../datetime.zig").parseDateTimeToSignedNs(text) orelse return error.InvalidSqlDateTime,
+        .string => |text| @import("../datetime.zig").rangeNanoseconds(raw) orelse @import("../datetime.zig").parseDateTimeToSignedNs(text) orelse return error.InvalidSqlDateTime,
         else => return error.SqlTypeMismatch,
     };
     return if (std.math.cast(i64, ns)) |value| .{ .integer = value } else .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{ns}) };

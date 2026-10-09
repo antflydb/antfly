@@ -2509,3 +2509,103 @@ func TestLiteNativeStandaloneAssetEnrichmentDrainsWithoutOwningIndex(t *testing.
 		t.Fatalf("standalone asset enrichment did not drain cleanly: %#v", enrichmentStats)
 	}
 }
+
+func TestNamedTableReopensManagedEmbeddingProviders(t *testing.T) {
+	for _, restore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("restore=%v", restore), func(t *testing.T) {
+			const dims = 4
+			server, calls := newFakeAntflyEmbedServer(t, dims)
+			options := OpenOptions{Mode: OpenModeWriter, Profile: ProfileNative, RemoteProviderConfigured: true, NoSync: true}
+			path := filepath.Join(t.TempDir(), "source.aflite")
+			db, err := CreateWithOptions(path, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if db != nil {
+					_ = db.Close()
+				}
+			}()
+			if err = db.CreateTableJSON("named", []byte(`{}`)); err != nil {
+				t.Fatal(err)
+			}
+			table, err := db.OpenTable("named")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if table != nil {
+					_ = table.Close()
+				}
+			}()
+			config, err := json.Marshal(map[string]any{"field": "body", "dims": dims, "metric": "l2_squared", "embedder": map[string]any{"provider": "antfly", "model": "fake-embedder", "api_url": server.URL}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			index, err := json.Marshal(map[string]any{"name": "automatic", "kind": "dense_vector", "config_json": string(config)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = table.AddIndexJSON(index); err != nil {
+				t.Fatal(err)
+			}
+			if err = table.Batch([]WriteIntent{{Key: "before", Value: []byte(`{"body":"before reopen"}`)}}, 1); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = table.RunUntilIdleStatus(); err != nil {
+				t.Fatal(err)
+			}
+			before := atomic.LoadInt32(calls)
+			if before == 0 {
+				t.Fatal("initial embedding provider was not configured")
+			}
+			if err = table.Close(); err != nil {
+				t.Fatal(err)
+			}
+			table = nil
+			backup, err := db.Backup()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db = nil
+			if restore {
+				path = filepath.Join(t.TempDir(), "restored.aflite")
+				if err = Restore(path, backup, RestoreOptions{Storage: StorageLite}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			db, err = OpenWithOptions(path, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			table, err = db.OpenTable("named")
+			if err != nil {
+				t.Fatal(err)
+			}
+			const text = "generated after reopen"
+			if err = table.Batch([]WriteIntent{{Key: "after", Value: []byte(fmt.Sprintf(`{"body":%q}`, text))}}, 2); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = table.RunUntilIdleStatus(); err != nil {
+				t.Fatal(err)
+			}
+			if atomic.LoadInt32(calls) <= before {
+				t.Fatal("reopened table did not call its embedding provider")
+			}
+			query, err := json.Marshal(map[string]any{"embeddings": map[string]any{"automatic": fakeRemoteEmbeddingVector(text, dims)}, "indexes": []string{"automatic"}, "limit": 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := table.SearchJSON(query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(result, []byte(`"_id":"after"`)) {
+				t.Fatalf("new document has no searchable generated vector: %s", result)
+			}
+		})
+	}
+}

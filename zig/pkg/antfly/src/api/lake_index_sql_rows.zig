@@ -35,10 +35,11 @@ const Owner = struct {
     lease: ?*@import("lake_index_reader_lease.zig").Handle = null,
     reader: ordered.Reader = undefined,
     reader_open: bool = false,
+    public_order: ?@import("lake_index_public_order.zig").Cursor = null,
     predicate_lower: []const u8 = "",
     predicate_upper: ?[]const u8 = null,
     predicate_count: u64 = 0,
-    metadata: ?@import("lake_index_decoded_metadata.zig").Owned(ordered.Root) = null,
+    metadata: ?@import("lake_index_decoded_metadata.zig").Owned(ordered.VerifiedRoot) = null,
     table: catalog.Table,
     request: catalog.Scan,
     context: operation.RequestContext,
@@ -69,6 +70,7 @@ const Owner = struct {
     fn close(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (self.child) |child| child.close(child.ptr);
+        if (self.public_order) |*cursor| cursor.deinit();
         if (self.reader_open) self.reader.deinit();
         if (self.metadata) |owned| owned.release();
         if (self.lease) |lease| lease.deinit();
@@ -419,6 +421,7 @@ const Owner = struct {
 pub const Predicate = struct {
     cursor: catalog.Cursor,
     scan: bool = false,
+    complete_order: bool = false,
     work: u64 = 0,
     pub fn deinit(self: *Predicate) void {
         self.cursor.close(self.cursor.ptr);
@@ -427,6 +430,21 @@ pub const Predicate = struct {
         if (self.scan) return std.math.maxInt(u64);
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         return owner.predicate_count;
+    }
+    pub fn hasMembership(self: Predicate) bool {
+        if (self.scan) return false;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        return owner.reader.root.reverse != null;
+    }
+    pub fn canProbeMembership(self: Predicate) bool {
+        if (self.scan) return false;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        return owner.reader.canProbeMembership();
+    }
+    pub fn contains(self: *Predicate, ref: local.storage_rowsource_types.RowRef) !bool {
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        return owner.reader.containsPhysical(ref, owner.predicate_lower, owner.predicate_upper);
     }
     pub fn hasBlocks(self: Predicate) bool {
         if (self.scan) return false;
@@ -458,6 +476,10 @@ pub const Predicate = struct {
         };
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         try owner.read_context.ensureActive();
+        if (owner.public_order) |*cursor| {
+            if (owner.reader.exhausted) return &.{};
+            return cursor.next(a, count);
+        }
         return owner.reader.next(a, count);
     }
 };
@@ -576,25 +598,35 @@ fn predicateIndexWork(candidates: u64, metadata_bytes: u64, resident_metadata: b
     return (candidates +| 7) / 8 +| (if (resident_metadata) @as(u64, 8) else 64 +| (metadata_bytes +| 1023) / 1024);
 }
 
+pub fn compatibleSearchConditions(a: A, table: catalog.Table, conditions: []const catalog.Condition) !bool {
+    const definitions = table.external_indexes orelse return false;
+    var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
+    defer parsed.deinit(a);
+    const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
+    defer local.storage_schema.freeSchema(a, runtime);
+    return searchConditionsCompatible(runtime, conditions);
+}
+
 fn searchConditionsCompatible(runtime: local.storage_schema.TableSchema, conditions: []const catalog.Condition) bool {
     for (conditions) |condition| {
         const kind = for (runtime.relational_columns) |column| {
             if (std.mem.eql(u8, column.name, condition.column)) break column.column_type;
         } else return false;
         const compatible = switch (kind) {
-            .string => condition.value == .string and (condition.op == .eq or blk: {
-                // The shared standard-range evaluator interprets RFC3339
-                // bounds chronologically; a lexical tuple index cannot prove it.
-                _ = local.storage_db_query_graph_exec.jsonDateNsFromValue(condition.value) catch break :blk true;
-                break :blk false;
-            }),
+            // RFC3339 ranges use signed chronological order, including dates
+            // before the epoch; lexical string indexes cannot prove that order.
+            .string => condition.value == .string and (condition.op == .eq or
+                local.storage_db_query_graph_exec.jsonTemporalNsFromValue(condition.value) == null),
             .integer => condition.value == .integer,
             .number => condition.value == .float or (condition.value == .integer and blk: {
                 const rounded: f64 = @floatFromInt(condition.value.integer);
                 break :blk (@as(i128, @intFromFloat(rounded)) == condition.value.integer);
             }),
             .boolean => condition.value == .bool,
-            .datetime => false,
+            .datetime => if (condition.op == .eq)
+                condition.value == .integer
+            else
+                local.storage_db_query_graph_exec.jsonTemporalNsFromValue(condition.value) != null,
             else => false,
         };
         if (!compatible) return false;
@@ -618,8 +650,133 @@ pub fn openPinned(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
     return (try openWithPolicy(a, server, table, request, context, source, .required, null, false)) orelse error.ExternalLakeIndexUnavailable;
 }
 
+// Combine predicate and inclusive cursor bounds before access proof. Keeping a
+// weaker duplicate would either disable seeking or widen the physical walk.
+fn appendStrongBound(a: A, conditions: *std.ArrayList(catalog.Condition), next: catalog.Condition) !void {
+    const lower = next.op == .gt or next.op == .gte;
+    const upper = next.op == .lt or next.op == .lte;
+    for (conditions.items) |*previous| {
+        if (!std.mem.eql(u8, previous.column, next.column)) continue;
+        const previous_lower = previous.op == .gt or previous.op == .gte;
+        const previous_upper = previous.op == .lt or previous.op == .lte;
+        if (!(lower and previous_lower) and !(upper and previous_upper)) continue;
+        const order = try local.sql_scalar.compare(next.value, previous.value);
+        if ((lower and order == .gt) or (upper and order == .lt) or
+            (order == .eq and (next.op == .gt or next.op == .lt))) previous.* = next;
+        return;
+    }
+    try conditions.append(a, next);
+}
+
+/// Ordered identity-only consumption proves deletes, tuple bounds and ordering
+/// from the pinned publication. Membership enforces other required predicates;
+/// this path must never open a Parquet cursor to recheck an index key.
+pub const SearchOrder = struct {
+    values: []const std.json.Value = &.{},
+    id_descending: bool = false,
+};
+pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, reverse: bool, search_order: SearchOrder) !?Predicate {
+    const definitions = table.external_indexes orelse return null;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
+    defer parsed.deinit(a);
+    const indexes = (try parsed.relationalIndexDefinitions(ca)) orelse return null;
+    var best: ?catalog.Cursor = null;
+    errdefer if (best) |cursor| cursor.close(cursor.ptr);
+    var best_cost: u64 = std.math.maxInt(u64);
+    var best_complete = false;
+    for (indexes) |index| {
+        var conditions: std.ArrayList(catalog.Condition) = .empty;
+        for (request.conditions) |condition| for (index.keys) |key| {
+            if (key.expression_json == null and std.mem.eql(u8, key.column, condition.column)) {
+                var normalized = condition;
+                normalized.value = try local.sql_lake_values.comparisonValue(ca, condition.value, (try table.column(condition.column)).type);
+                try appendStrongBound(ca, &conditions, normalized);
+                break;
+            }
+        };
+        var candidate = request;
+        candidate.conditions = conditions.items;
+        const indexed = (try chooseAccess(ca, &.{index}, candidate)) orelse continue;
+        var cost: u64 = 0;
+        const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost, true)) orelse continue;
+        if (!cursor.order_satisfied) {
+            cursor.close(cursor.ptr);
+            continue;
+        }
+        const complete = preparePublicOrder(a, cursor, index, parsed, candidate, reverse, search_order) catch |err| {
+            cursor.close(cursor.ptr);
+            return err;
+        };
+        if (cost < best_cost) {
+            if (best) |prior| prior.close(prior.ptr);
+            best = cursor;
+            best_cost = cost;
+            best_complete = complete;
+        } else cursor.close(cursor.ptr);
+    }
+    if (best) |cursor| {
+        if (reverse and !best_complete) {
+            const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+            const replacement = try @import("../serverless/graph_segment/page_tree.zig").Cursor.initReverse(a, owner.reader.pages.store(), owner.reader.root.page, owner.predicate_lower, owner.predicate_upper);
+            owner.reader.cursor.?.deinit();
+            owner.reader.cursor = replacement;
+        }
+        return .{ .cursor = cursor, .complete_order = best_complete };
+    }
+    return null;
+}
+
+fn preparePublicOrder(a: A, cursor: catalog.Cursor, definition: local.storage_relational_index.RelationalIndexDefinition, parsed: anytype, request: catalog.Scan, reverse: bool, search_order: SearchOrder) !bool {
+    const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+    if (owner.reader.root.tie_version != 1) return false;
+    var equal: usize = 0;
+    for (definition.keys) |key| {
+        const constant = for (request.conditions) |condition| {
+            if (condition.op == .eq and condition.value != .null and std.mem.eql(u8, key.column, condition.column)) break true;
+        } else false;
+        if (!constant) break;
+        equal += 1;
+    }
+    // Extra nonconstant index keys would precede the public-ID suffix.
+    if (equal + request.order.len != definition.keys.len) return false;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var boundary: ?[]const u8 = null;
+    var id: ?[]const u8 = null;
+    if (search_order.values.len != 0) {
+        if (search_order.values.len != request.order.len + 1 or search_order.values[search_order.values.len - 1] != .string) return false;
+        id = search_order.values[search_order.values.len - 1].string;
+        const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
+        defer local.storage_schema.freeSchema(a, runtime);
+        var layout = try local.storage_db_algebraic_relational_row_codec.PhysicalLayout.init(a, runtime);
+        defer layout.deinit();
+        var tuple = try local.storage_db_relational_index_keys.TuplePlan.init(a, runtime, &layout, definition.keys);
+        defer tuple.deinit();
+        const values = try ca.alloc(std.json.Value, definition.keys.len);
+        for (definition.keys, values, 0..) |key, *value, i| {
+            const wire = if (i < equal) for (request.conditions) |condition| {
+                if (condition.op == .eq and std.mem.eql(u8, condition.column, key.column)) break condition.value;
+            } else return false else search_order.values[i - equal];
+            value.* = local.sql_lake_values.comparisonValue(ca, wire, (try owner.table.column(key.column)).type) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return false,
+            };
+        }
+        boundary = try boundKey(ca, tuple, values);
+    }
+    owner.public_order = @import("lake_index_public_order.zig").Cursor.init(a, &owner.reader, owner.predicate_lower, owner.predicate_upper, boundary, id, search_order.id_descending, reverse) catch |err| switch (err) {
+        error.InvalidRelationalIndexBound => return false,
+        else => return err,
+    };
+    return true;
+}
+
 pub fn tryOpenAuto(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !?catalog.Cursor {
-    if (request.index_range != null or request.primary_order or request.row_refs != null or request.primary_key != null) return null;
+    if (request.index_range != null or request.primary_order or request.row_refs != null or request.physical_selection != null or request.primary_key != null) return null;
     if (request.index_equality != null) return openWithPolicy(a, server, table, request, context, source, .automatic, null, false);
     const definitions = table.external_indexes orelse return null;
     if (definitions.schema_json.len == 0 or server.source.lakeIndexLifecycleAuthority(context) == null) return null;
@@ -708,7 +865,7 @@ fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
 }
 fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool, pinned: ?PredicateContext) !?catalog.Cursor {
     const index_name = if (request.index_range) |range| range.name else if (request.index_equality) |equality| equality.name else return error.ExternalLakeIndexUnavailable;
-    if (request.primary_order or request.row_refs != null) return error.UnsupportedSqlExecution;
+    if (request.primary_order or request.row_refs != null or request.physical_selection != null) return error.UnsupportedSqlExecution;
     const definitions = table.external_indexes orelse return error.ExternalLakeIndexUnavailable;
     const authority = server.source.lakeIndexLifecycleAuthority(context) orelse return if (policy == .automatic) null else error.ExternalLakeIndexUnavailable;
     const normalized = try context.platformDeadline();
@@ -803,9 +960,9 @@ fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table
         if (decl.artifact.kind == .ordered_row_index and std.mem.eql(u8, decl.name, name)) break decl;
     } else return if (policy == .automatic) null else error.ExternalLakeRowIndexNotPublished;
     const cancel: operation.CancellationToken = .{ .ptr = owner, .is_cancelled_fn = Owner.canceled };
-    const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.Root, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, declaration.artifact) else false;
-    owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.Root, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, owner.artifacts, declaration.artifact, cancel, ordered.loadRoot);
-    const root = owner.metadata.?.value.*;
+    const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, declaration.artifact) else false;
+    owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, owner.artifacts, declaration.artifact, cancel, ordered.VerifiedRoot.load);
+    const root = owner.metadata.?.value.value;
     if (identities_only and (!std.mem.eql(u8, root.source, source.inventory.source_id) or !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id))) return error.ExternalLakeSnapshotMismatch;
     const domain = if (pinned) |shared| shared.domain else @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, owner.store_identity, selected.?.publication().namespace);
     if (!std.mem.eql(u8, &root.domain, &domain)) return error.InvalidNativeLakeRowIndex;
@@ -831,7 +988,7 @@ fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table
     if (upper) |end| {
         if (std.mem.order(u8, lower, end) != .lt) empty_range = true;
     }
-    try owner.reader.initCached(a, &owner.artifacts, root, expected, lower, upper, cancel, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context });
+    try owner.reader.initVerified(a, &owner.artifacts, owner.metadata.?.value.*, expected, lower, upper, cancel, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context });
     if (empty_range) owner.reader.exhausted = true;
     owner.reader_open = true;
     owner.covered = root.cover.len != 0;
@@ -1058,4 +1215,39 @@ test "external lake covering batch preserves dictionary identity across reordere
         try std.testing.expectEqual(std.meta.activeTag(expected.value), std.meta.activeTag(actual.value));
         if (expected.value == .string) try std.testing.expectEqualStrings(expected.value.string, actual.value.string);
     }
+}
+
+test "external lake temporal index admission rejects lexical pre-epoch bounds" {
+    const columns = [_]local.storage_schema.RelationalColumn{
+        .{ .name = "text", .path = "/text", .column_type = .string },
+        .{ .name = "ts", .path = "/ts", .column_type = .datetime },
+    };
+    const schema: local.storage_schema.TableSchema = .{ .relational_columns = &columns };
+    for ([_][]const u8{ "1969-12-31T23:59:59.999999999Z", "1970-01-01T01:00:00+01:00" }) |bound| {
+        try std.testing.expect(!searchConditionsCompatible(schema, &.{.{ .column = "text", .op = .gte, .value = .{ .string = bound } }}));
+        try std.testing.expect(searchConditionsCompatible(schema, &.{.{ .column = "ts", .op = .gte, .value = .{ .string = bound } }}));
+        try std.testing.expect(searchConditionsCompatible(schema, &.{.{ .column = "text", .op = .eq, .value = .{ .string = bound } }}));
+        try std.testing.expect(!searchConditionsCompatible(schema, &.{.{ .column = "ts", .op = .eq, .value = .{ .string = bound } }}));
+    }
+    try std.testing.expect(searchConditionsCompatible(schema, &.{.{ .column = "text", .op = .gte, .value = .{ .string = "plain" } }}));
+    try std.testing.expect(!searchConditionsCompatible(schema, &.{.{ .column = "ts", .op = .gte, .value = .{ .string = "malformed" } }}));
+}
+
+test "external lake ordered cursor bounds retain strongest direction and inclusivity" {
+    const a = std.testing.allocator;
+    var conditions: std.ArrayList(catalog.Condition) = .empty;
+    defer conditions.deinit(a);
+    for ([_]catalog.Condition{
+        .{ .column = "amount", .op = .gte, .value = .{ .integer = 10 } },
+        .{ .column = "amount", .op = .gte, .value = .{ .integer = 9 } },
+        .{ .column = "amount", .op = .gt, .value = .{ .integer = 10 } },
+        .{ .column = "amount", .op = .lte, .value = .{ .integer = 30 } },
+        .{ .column = "amount", .op = .lt, .value = .{ .integer = 20 } },
+        .{ .column = "amount", .op = .lte, .value = .{ .integer = 20 } },
+    }) |condition| try appendStrongBound(a, &conditions, condition);
+    try std.testing.expectEqual(@as(usize, 2), conditions.items.len);
+    try std.testing.expectEqual(catalog.Condition.Op.gt, conditions.items[0].op);
+    try std.testing.expectEqual(@as(i64, 10), conditions.items[0].value.integer);
+    try std.testing.expectEqual(catalog.Condition.Op.lt, conditions.items[1].op);
+    try std.testing.expectEqual(@as(i64, 20), conditions.items[1].value.integer);
 }

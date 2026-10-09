@@ -16,7 +16,7 @@
 import { defineConfig } from "tsup";
 
 export default defineConfig({
-  entry: ["src/index.ts"],
+  entry: ["src/index.ts", "src/kysely.ts"],
   format: ["cjs", "esm"],
   // Preserve import.meta syntax in CJS; discovery uses native __filename there.
   shims: true,
@@ -25,5 +25,5 @@ export default defineConfig({
   platform: "node",
   target: "node24",
   // koffi ships prebuilt native bindings and its own loader; never bundle it.
-  external: ["koffi"],
+  external: ["koffi", "kysely"],
 });

@@ -34567,6 +34567,44 @@ pub const DB = struct {
         try self.refreshPortableImportedGenerationLocked(target_identity);
     }
 
+    /// Imports the primary image of a complete embedded database namespace.
+    /// Its owner must discard the unpublished generation on any failure. Unlike
+    /// a table transfer, the database archive retains every constraint owner
+    /// and the original namespace IDs, so claims and references remain valid.
+    pub fn importEmbeddedImageIntoUnpublishedEmpty(
+        self: *DB,
+        alloc: Allocator,
+        reader: anytype,
+        target_identity: doc_identity.Namespace,
+    ) !void {
+        if (self.open_mode != .writer) return error.UnsupportedOperation;
+        lockApply(self);
+        defer self.core.unlockApply();
+        if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
+        // Keep archive-sized data file-backed; only one bounded transaction's
+        // borrowed key/value spans live in the import heap at a time.
+        var entries: std.ArrayList(docstore_mod.KVPair) = .empty;
+        defer entries.deinit(alloc);
+        var bytes: usize = 0;
+        while (try reader.next()) |entry| {
+            try entries.append(alloc, entry);
+            bytes += entry.key.len + entry.value.len;
+            if (bytes >= 1024 * 1024 or entries.items.len >= 1024) {
+                try self.core.store.putBatch(entries.items, &.{});
+                entries.clearRetainingCapacity();
+                bytes = 0;
+            }
+        }
+        if (entries.items.len != 0) try self.core.store.putBatch(entries.items, &.{});
+        try portable_backup.validateCompleteEmbeddedDatabaseImageAlloc(alloc, self.core.store);
+        // An untouched default table has no persisted identity rows. Its
+        // identity is still part of the database manifest and must be admitted
+        // before the restored runtime can create its first document.
+        const namespace = try doc_identity.loadOrInitNamespace(self.core.store, target_identity, true);
+        if (!namespace.eql(target_identity)) return error.IdentityNamespaceMismatch;
+        try self.refreshPortableImportedGenerationLocked(target_identity);
+    }
+
     pub const restoreStagingStatus = local_mutation.restoreStagingStatus;
 
     pub fn restoreGenerationAdmissionReceipt(self: *DB) !?@import("restore_staging_contract.zig").GenerationAdmissionReceipt {
@@ -37161,6 +37199,17 @@ pub const DB = struct {
     /// ALL earlier fences before retrying: a prepared transaction may need one
     /// of those owners to finish resolution. Never drain it under this fence.
     pub fn tryStatementReadFence(self: *DB) !?StatementReadFence {
+        return self.tryPrimaryReadFence(false);
+    }
+
+    /// A complete embedded backup excludes native intents and captures only
+    /// the committed primary state. It need not wait for an open transaction
+    /// to finish, while still excluding primary and replay mutation races.
+    pub fn tryEmbeddedBackupReadFence(self: *DB) !?StatementReadFence {
+        return self.tryPrimaryReadFence(true);
+    }
+
+    fn tryPrimaryReadFence(self: *DB, allow_unresolved: bool) !?StatementReadFence {
         var primary = self.core.snapshot_admission.tryAcquireCapture() orelse return null;
         errdefer primary.release();
         var replay = self.core.snapshot_replay_admission.tryAcquireCapture() orelse {
@@ -37173,7 +37222,7 @@ pub const DB = struct {
         // would incorrectly reject ordinary SQL on such tables.
         var manager = try self.core.initTxnManager();
         defer manager.deinit();
-        if (try manager.hasUnresolvedWriteIntents()) {
+        if (!allow_unresolved and try manager.hasUnresolvedWriteIntents()) {
             replay.release();
             primary.release();
             return null;
@@ -39073,6 +39122,10 @@ pub const DB = struct {
         return storedPatternWrappedPredicate(alloc, name, .{ .object = std.json.ObjectMap.empty });
     }
 
+    fn storedPatternJsonTimestamp(a: Allocator, ns: i128) !std.json.Value {
+        return if (std.math.cast(i64, ns)) |v| .{ .integer = v } else .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{ns}) };
+    }
+
     fn storedPatternJsonU64(value: u64) std.json.Value {
         if (value <= std.math.maxInt(i64)) return .{ .integer = @intCast(value) };
         // Stored-pattern date_range compares numerically; values this large
@@ -39126,8 +39179,8 @@ pub const DB = struct {
                 if (range.start_ns == null and range.end_ns == null) return error.UnsupportedQueryRequest;
                 var body = std.json.ObjectMap.empty;
                 try body.put(alloc, "field", .{ .string = range.field });
-                if (range.start_ns) |ns| try body.put(alloc, "start_ns", storedPatternJsonU64(ns));
-                if (range.end_ns) |ns| try body.put(alloc, "end_ns", storedPatternJsonU64(ns));
+                if (range.start_ns) |ns| try body.put(alloc, "start_ns", try storedPatternJsonTimestamp(alloc, ns));
+                if (range.end_ns) |ns| try body.put(alloc, "end_ns", try storedPatternJsonTimestamp(alloc, ns));
                 try body.put(alloc, "inclusive_start", .{ .bool = range.inclusive_start });
                 try body.put(alloc, "inclusive_end", .{ .bool = range.inclusive_end });
                 break :blk try storedPatternWrappedPredicate(alloc, "date_range", .{ .object = body });
@@ -40260,6 +40313,7 @@ pub const DB = struct {
         if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
         const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const result = try db_query_search.searchSparse(alloc, algebraic_filter.req, sparse, .{
+            .score_spill = if (self.backend_runtime.filesystemIo()) |io| .{ .io = io, .directory = "/tmp", .resource_manager = self.core.index_manager.resource_manager } else null,
             .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,

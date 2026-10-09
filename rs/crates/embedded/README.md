@@ -299,3 +299,45 @@ Some conformance/concurrency cases (full-text search under concurrent write
 pressure) need substantially more native stack than a typical fixed-size OS
 thread gets by default; these tests run their bodies on an explicitly
 large-stack thread rather than relying on the test harness's default.
+
+## SQLx and multiple tables
+
+Enable `sqlx` and `libantfly` for the SQLx 0.9 driver (Rust 1.94 or newer):
+
+```rust
+use antfly_embedded::sqlx::{Antfly, AntflyConnectOptions};
+use sqlx::ConnectOptions;
+
+let mut connection = AntflyConnectOptions::new("app.aflite").connect().await?;
+sqlx::query::<Antfly>("CREATE TABLE people (id BIGINT PRIMARY KEY, name TEXT)")
+    .execute(&mut connection).await?;
+sqlx::query::<Antfly>("INSERT INTO people (id,name) VALUES ($1,$2)")
+    .bind(1_i64).bind("Ada").execute(&mut connection).await?;
+let rows = sqlx::query::<Antfly>("SELECT id,name FROM people")
+    .fetch_all(&mut connection).await?;
+```
+
+`AntflyPool`, transactions, nested savepoints, `query`, `query_as`, streaming,
+prepare/describe, and SQLSTATE database errors use native SQL sessions.
+Native work runs on a dedicated worker with the required native stack,
+keeping FFI calls off Tokio executor threads. File owners are shared across
+pooled connections. Integer bindings and decoding preserve signed 64-bit
+values. Byte parameters represent UTF-8 text; JSON uses `serde_json::Value`.
+The upstream `query!` macro does not register custom database drivers; use
+runtime queries and the driver's describe support.
+
+With `serde`, `Database` provides `create_table_json`, `list_tables_json`,
+`drop_table`, and database-level `sql_json`. `open_table` returns a table
+handle borrowing its database; existing document, schema, index, enrichment,
+and search methods operate on that table. Close handles before dropping
+their tables.
+
+Portable `.afb` archives back up the entire database: its table catalog,
+schemas, documents, indexes, enrichments, and constraint records. Call backup
+on the database handle. Restore publishes all tables together into either
+Lite or directory storage; import requires an empty database with no open
+table handles, SQL sessions, or cursors. Table handles cannot export or import
+backups.
+
+See [the native SQL contract](../../../zig/CAPI.md#database-sql) for
+READ COMMITTED, transactional DDL restrictions, and commit outcomes.
