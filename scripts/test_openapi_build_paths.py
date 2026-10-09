@@ -47,9 +47,17 @@ class OpenApiBuildPathsTest(unittest.TestCase):
         self.assertNotIn("state", request["properties"])
         self.assertNotIn("decisions", schemas["ExtractionObject"]["properties"])
         self.assertNotIn("embedding", schemas["ExtractionOptions"]["properties"])
-        self.assertNotIn("similarity_thresholds", schemas["ExtractionClassificationSchema"]["properties"])
-        self.assertNotIn("similarity", schemas["ExtractionClassification"]["properties"])
-        self.assertEqual(schemas["ExtractionClassificationSchema"]["properties"]["mode"]["enum"], ["single", "multi"])
+        self.assertNotIn(
+            "similarity_thresholds",
+            schemas["ExtractionClassificationSchema"]["properties"],
+        )
+        self.assertNotIn(
+            "similarity", schemas["ExtractionClassification"]["properties"]
+        )
+        self.assertEqual(
+            schemas["ExtractionClassificationSchema"]["properties"]["mode"]["enum"],
+            ["single", "multi"],
+        )
         acceptance = schemas["EmbeddingDecisionAcceptance"]["properties"]
         self.assertIn("calibration_id", acceptance)
         self.assertIn("second-highest", acceptance["min_margin"]["description"])
