@@ -99,6 +99,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lake_store_opening_run.addArg("--require-no-skips");
     b.step("antfly-lake-store-opening-test", "Verify lake provider and partial allocation ownership on opening failure")
         .dependOn(&lake_store_opening_run.step);
+    const lake_text_retirement_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_text_retirement_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configureConsumer(b, lake_text_retirement_root);
+    lake_text_retirement_root.addImport("antfly_source_root", lake_text_retirement_root);
+    const lake_text_retirement_tests = b.addTest(.{
+        .name = "lake-text-retirement-tests",
+        .root_module = lake_text_retirement_root,
+        .filters = &.{"external lake native text owns required and speculative children through physical retirement"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const lake_text_retirement_run = b.addRunArtifact(lake_text_retirement_tests);
+    lake_text_retirement_run.addArg("--require-no-skips");
+    b.step("antfly-lake-text-retirement-test", "Verify real packed text IO and physical speculative joins with independent control progress")
+        .dependOn(&lake_text_retirement_run.step);
     const physical_metadata_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/physical_resource_metadata_test_root.zig"),
         .target = target,

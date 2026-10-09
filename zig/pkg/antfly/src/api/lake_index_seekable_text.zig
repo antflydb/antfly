@@ -1423,6 +1423,27 @@ test "external lake native text owns required and speculative children through p
         controls: std.atomic.Value(usize) = .init(0),
         children: std.atomic.Value(bool) = .init(false),
         control_mutex: std.atomic.Mutex = .unlocked,
+        control_requested: std.Io.Event = .unset,
+        control_done: std.Io.Event = .unset,
+        control_stop: std.atomic.Value(bool) = .init(false),
+        control_failure: ?anyerror = null,
+        fn controlWorker(self: *@This()) void {
+            while (true) {
+                self.control_requested.waitUncancelable(std.testing.io);
+                self.control_requested.reset();
+                if (self.control_stop.load(.acquire)) return;
+                self.control_failure = self.probeControl() catch |err| err;
+                self.control_done.set(std.testing.io);
+            }
+        }
+        fn probeControl(self: *@This()) !?anyerror {
+            var control: Execution = .{};
+            try control.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            defer control.finish();
+            try control.checkpoint();
+            _ = self.controls.fetchAdd(1, .acq_rel);
+            return null;
+        }
         fn range(raw: *anyopaque, a: A, id: []const u8, offset: u64, len: usize, token: Cancellation) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const stats = self.scheduler.stats();
@@ -1432,12 +1453,14 @@ test "external lake native text owns required and speculative children through p
             {
                 @import("antfly_platform").sync.lockYielding(&self.control_mutex);
                 defer self.control_mutex.unlock();
-                var control: Execution = .{};
-                try control.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
-                try control.checkpoint();
-                control.finish();
+                // A speculative IO task may be canceled while its physical
+                // callback runs. Health must use an independent task's IO
+                // cancellation state, as the production control lane does.
+                self.control_done.reset();
+                self.control_requested.set(std.testing.io);
+                self.control_done.waitUncancelable(std.testing.io);
+                if (self.control_failure) |err| return err;
             }
-            _ = self.controls.fetchAdd(1, .acq_rel);
             const bytes = try self.base.getRangeAllocWithCancellationUsingAllocator(a, id, offset, len, token);
             switch (self.case) {
                 .canceled => self.signal.store(true, .release),
@@ -1474,6 +1497,12 @@ test "external lake native text owns required and speculative children through p
         var cache = ServingCache.init(std.heap.page_allocator);
         defer cache.deinit();
         var fixture: Fixture = .{ .base = base, .scheduler = &scheduler, .signal = &signal, .case = case };
+        var control_task = try std.testing.io.concurrent(Fixture.controlWorker, .{&fixture});
+        defer {
+            fixture.control_stop.store(true, .release);
+            fixture.control_requested.set(std.testing.io);
+            control_task.await(std.testing.io);
+        }
         var vtable = base.vtable.*;
         vtable.get_range_alloc_with_cancellation = Fixture.range;
         const store: stores.ArtifactStore = .{ .allocator = a, .ptr = &fixture, .vtable = &vtable };
