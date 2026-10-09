@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 
 from fix_generated_client import (
-    FILES,
     EMBED_REQUEST,
+    FILES,
     NDJSON_HEADER,
     NDJSON_RESPONSE,
     RELATIONAL_QUERY,
