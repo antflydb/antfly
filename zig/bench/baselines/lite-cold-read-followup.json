@@ -134,6 +134,34 @@
       "before_retry_copied_value_bytes": 4096,
       "after_failure_assigned_accounts": 0,
       "after_retry_copied_value_bytes": 0
+    },
+    "shared_decode_optional_oom_fallback": {
+      "comparison_commit": "b243d836a7",
+      "entries": 192,
+      "logical_block_bytes": 12672,
+      "optional_decode_budget_bytes": 512,
+      "before": "point fails OutOfMemory despite successful direct lookup",
+      "after": "direct lookup succeeds; optional decode retry disabled; checksum failures preserved"
+    },
+    "shared_sparse_prefix_decode": {
+      "comparison_commit": "b243d836a7",
+      "plain_prefix_expansion_allocations_before": 1,
+      "plain_prefix_expansion_allocations_after": 0,
+      "prefix_snappy_strategy_after": "decode prefix records once, reuse restart lookup; no full raw-row expansion",
+      "scope": "two distant points; optional cache bounded to 64 KiB per block and 256 KiB per batch",
+      "fixture_logical_block_bytes": 12672,
+      "prefix_snappy_retained_prefix_bytes_after": 4350,
+      "prefix_snappy_retained_raw_bytes_before": 12672
+    },
+    "single_user_snappy_result_retention": {
+      "comparison_commit": "b243d836a7",
+      "points": 64,
+      "selected_value_bytes": 64,
+      "logical_block_bytes": 12672,
+      "before_result_retained_bytes": 811008,
+      "after_result_retained_bytes": 3392,
+      "after_batch_decode_bytes": 12672,
+      "scope": "selected ownership includes 52-byte key and one-byte value; batch decode released at batch cleanup; direct fallback also retains selected row only"
     }
   },
   "scope": "Deterministic allocation, directory traversal, admission, and isolated Debug timing fixtures, not query throughput or a 2 GiB soak. Caller-owned mutable values, captured read-layout pointer arrays, payload IO/cache ownership, and first-use overlay promotion still have costs. Directory planning and index metadata reuse bounded resource-charged arenas; async candidate metadata has fixed stack storage.",

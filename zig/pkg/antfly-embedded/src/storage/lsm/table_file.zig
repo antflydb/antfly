@@ -2153,7 +2153,9 @@ fn prefixRestartEntry(view: PrefixBlockView, restart_index: usize) !Entry {
     return .{ .namespace_name = if (namespace_len > 0) namespace else null, .key = key, .value = value, .tombstone = tombstone };
 }
 
-fn findExactEntryInPrefixPayloadAlloc(
+// Looks up already decompressed prefix records. The parser and restart reader
+// validate the record structure; callers must validate the physical checksum.
+pub fn findExactEntryInPrefixPayloadAlloc(
     allocator: std.mem.Allocator,
     scratch: std.mem.Allocator,
     max_result_bytes: usize,
