@@ -246,7 +246,7 @@ full-model numerical qualification. CUDA rejects quantized ModernBERT span
 weights before upload because its current execution profile requires FP32.
 The existing DeBERTa Decide Q8_0 exporter retains ordinary `/extract`
 classification and strips the reserved `decide` task and `typed_decisions`
-capability; that converted artifact does not inherit public `/decide`
+capability; that converted artifact does not inherit public `/decisions`
 qualification from its FP32 source.
 
 The 1B tokenizer is byte-level BPE with NFC normalization. Composed and

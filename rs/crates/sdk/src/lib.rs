@@ -691,6 +691,7 @@ pub fn antfly_embedder(model: impl Into<String>) -> types::IndexEmbedderConfig {
     types::IndexEmbedderConfig::AntflyEmbedderConfig(types::AntflyEmbedderConfig {
         api_url: None,
         model: model.into(),
+        model_identity: None,
         provider: types::AntflyEmbedderConfigProvider::Antfly,
         retrieval: None,
     })

@@ -79,7 +79,6 @@ type ExtractionV2Response struct {
 	} `json:"usage"`
 }
 type ExtractionV2Object struct {
-	Decisions         []oapi.ExtractionDecision                  `json:"decisions,omitempty"`
 	ID                *string                                    `json:"id,omitempty"`
 	OffsetUnit        oapi.ExtractionOffsetUnit                  `json:"offset_unit"`
 	Entities          []ExtractionV2Entity                       `json:"entities,omitempty"`
@@ -97,6 +96,13 @@ func (o *ExtractionV2Object) UnmarshalJSON(data []byte) error {
 	data = bytes.TrimSpace(data)
 	if len(data) == 0 || data[0] != '{' {
 		return fmt.Errorf("extraction v2 response item must be an object")
+	}
+	var removed map[string]json.RawMessage
+	if err := json.Unmarshal(data, &removed); err != nil {
+		return err
+	}
+	if _, ok := removed["decisions"]; ok {
+		return fmt.Errorf("standalone decisions use /decisions")
 	}
 	type object ExtractionV2Object
 	var wire struct {
