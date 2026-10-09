@@ -46,6 +46,8 @@ const platform_time = @import("antfly_platform").time;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const SharedBytes = @import("lsm_backend/shared_bytes.zig").SharedBytes;
+const read_admission = @import("../common/read_admission.zig");
+const bounded_mutex = @import("../common/bounded_mutex.zig");
 const LocalReader = @import("lsm_backend/local_reader.zig").Pool;
 const RunSourceLease = @import("lsm_backend/source_lease.zig").Lease;
 const native_artifact_sink = @import("native_artifact_sink.zig");
@@ -7325,13 +7327,32 @@ pub const Backend = struct {
     /// Lease exactly the immutable artifact roots, not the whole checkpoint.
     /// A bounded LRU avoids unbounded catalog leases and descriptor residency.
     pub fn readRunRangeAlloc(self: *Backend, a: Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
+        return self.readRunRangeAllocWithAdmission(a, path, offset, len, null);
+    }
+
+    pub fn readRunRangeAllocWithAdmission(self: *Backend, a: Allocator, path: []const u8, offset: u64, len: usize, control: ?read_admission.Port) ![]u8 {
+        if (control) |budget| try budget.checkpoint();
         const storage = self.storage.?;
-        if (storage.vtable.open_leased_immutable_source == null) return storage.readFileRangeAlloc(a, path, offset, len);
-        const lease = try self.retainRunSource(path);
+        if (storage.vtable.open_leased_immutable_source == null) {
+            const bytes = try storage.readFileRangeAlloc(a, path, offset, len);
+            errdefer a.free(bytes);
+            if (control) |budget| try budget.checkpoint();
+            return bytes;
+        }
+        const lease = try self.retainRunSourceWithAdmission(path, control);
         defer lease.release();
         const bytes = try a.alloc(u8, len);
         errdefer a.free(bytes);
-        try lease.source.readInto(offset, bytes);
+        // Keep the physical source use until every chunk has returned. A
+        // cancelled read frees its buffer before returning the use and lease.
+        var position: usize = 0;
+        while (position < bytes.len) {
+            if (control) |budget| try budget.checkpoint();
+            const end = position + @min(bytes.len - position, 64 * 1024);
+            try lease.source.readInto(std.math.add(u64, offset, position) catch return error.InvalidArgument, bytes[position..end]);
+            position = end;
+        }
+        if (control) |budget| try budget.checkpoint();
         return bytes;
     }
 
@@ -7388,11 +7409,19 @@ pub const Backend = struct {
     }
 
     fn retainRunSource(self: *Backend, path: []const u8) !*RunSourceLease {
+        return self.retainRunSourceWithAdmission(path, null);
+    }
+
+    fn retainRunSourceWithAdmission(self: *Backend, path: []const u8, control: ?read_admission.Port) !*RunSourceLease {
         while (true) {
-            platform.sync.lockYielding(&self.run_source_mutex);
+            if (control) |budget| try bounded_mutex.lockAtomic(&self.run_source_mutex, budget) else platform.sync.lockYielding(&self.run_source_mutex);
             const cached = self.findRunSourceAssumeLocked(path) orelse break;
             self.run_source_mutex.unlock();
-            if (cached.activateHeld()) return cached;
+            if (cached.activateHeld()) {
+                errdefer cached.release();
+                if (control) |budget| try budget.checkpoint();
+                return cached;
+            }
             // Keep metadata alive while removing an expired cache owner. No
             // provider callbacks or descriptor cleanup run under this lock.
             platform.sync.lockYielding(&self.run_source_mutex);
@@ -7411,7 +7440,10 @@ pub const Backend = struct {
             flight.refs += 1;
             self.run_source_mutex.unlock();
             defer self.releaseSourceOpen(flight);
-            if (flight.io) |io| flight.done.waitUncancelable(io) else {
+            if (control) |budget| {
+                while (!flight.completed.load(.acquire)) try budget.waitForProgress();
+                try budget.checkpoint();
+            } else if (flight.io) |io| flight.done.waitUncancelable(io) else {
                 while (!flight.completed.load(.acquire)) platform_time.yieldBriefly();
             }
             if (flight.failure) |err| return err;
@@ -7435,7 +7467,10 @@ pub const Backend = struct {
         };
         self.run_source_mutex.unlock();
         defer self.releaseSourceOpen(flight);
-        const opened = self.openRunSource(flight);
+        const opened = blk: {
+            if (control) |budget| budget.checkpoint() catch |err| break :blk @as(anyerror!*RunSourceLease, err);
+            break :blk self.openRunSource(flight);
+        };
         platform.sync.lockYielding(&self.run_source_mutex);
         if (opened) |lease| flight.result = lease else |err| flight.failure = err;
         for (self.run_source_opens.items, 0..) |pending, i| if (pending == flight) {
@@ -7446,6 +7481,7 @@ pub const Backend = struct {
         if (flight.io) |io| flight.done.set(io);
         self.run_source_mutex.unlock();
         if (flight.failure) |err| return err;
+        if (control) |budget| try budget.checkpoint();
         return flight.result.?.retain().?;
     }
 
@@ -26759,5 +26795,157 @@ test "lsm local transient reads preserve hot cache and reuse compressed point sc
         for (backend.local_reader.slots) |slot| if (slot.initialized) {
             try std.testing.expect(slot.cap.live <= LocalReader.retained_bytes_per_workspace + @sizeOf(usize) * 4);
         };
+    }
+}
+
+test "lsm routing cursor local decoder admission rejects exhausted workspace and flights with original scope" {
+    for ([_]bool{ false, true }) |exhaust_flights| {
+        for ([_]anyerror{ error.Canceled, error.DeadlineExceeded }) |failure| {
+            var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+            defer memory.deinit();
+            var backend = try Backend.open(std.testing.allocator, "/local-decoder-admission", .{
+                .storage = memory.storage(),
+                .wal_enabled = false,
+                .flush_threshold = 1,
+                .compact_threshold_runs = 10000,
+                .table_block_compression = .snappy_adaptive,
+            });
+            defer backend.close();
+            try std.testing.expect(backend.localBlockCacheEnabled());
+            try std.testing.expect(backend.options.cache == null);
+            var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+            defer runtime.deinit();
+            var write = try runtime.beginWrite();
+            const value: [1024]u8 = @splat('v');
+            try write.put("doc:a", &value);
+            try write.commit();
+            try std.testing.expectEqual(@as(usize, 0), backend.run_block_cache.items.len);
+            var read = try runtime.beginRead();
+            defer read.abort();
+            var cursor = try read.openCursor();
+            var cursor_open = true;
+            defer if (cursor_open) cursor.close();
+            var workspaces: [LocalReader.workspace_count]LocalReader.Workspace = undefined;
+            var tickets: [LocalReader.flight_count]LocalReader.Ticket = undefined;
+            var held: usize = 0;
+            defer {
+                for (0..held) |i| {
+                    if (exhaust_flights) {
+                        backend.local_reader.finish(tickets[i].flight, error.TestHeldFlight);
+                        backend.local_reader.releaseFlight(tickets[i].flight);
+                    } else workspaces[i].release();
+                }
+            }
+            if (exhaust_flights) {
+                for (&tickets, 0..) |*ticket, i| {
+                    ticket.* = try backend.local_reader.begin(std.testing.allocator, null, "other-block", i + 100, 0, 64, true);
+                    held += 1;
+                }
+            } else {
+                for (&workspaces) |*workspace| {
+                    workspace.* = backend.local_reader.acquire(std.testing.allocator, null, null, 64, backend.options.local_decode_working_bytes, 0);
+                    held += 1;
+                }
+            }
+            const Budget = struct {
+                failure: anyerror,
+                failed: bool = false,
+                waits: usize = 0,
+                pub fn checkpoint(self: *@This()) !void {
+                    if (self.failed) return self.failure;
+                }
+                pub fn waitForProgress(self: *@This()) !void {
+                    self.waits += 1;
+                    self.failed = true;
+                }
+            };
+            var budget = Budget{ .failure = failure };
+            var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+            const payload = adapter.payload();
+            try std.testing.expectError(failure, cursor.seekAtOrAfterWithAdmission("doc:a", .init(&payload)));
+            try std.testing.expectEqual(@as(usize, 1), budget.waits);
+            cursor.close();
+            cursor_open = false;
+            const original_checks = budget.waits;
+            for (0..held) |i| {
+                if (exhaust_flights) {
+                    backend.local_reader.finish(tickets[i].flight, error.TestHeldFlight);
+                    backend.local_reader.releaseFlight(tickets[i].flight);
+                } else workspaces[i].release();
+            }
+            held = 0;
+            for (&backend.local_reader.flights) |*flight| try std.testing.expectEqual(@as(usize, 0), flight.refs);
+            try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+            var retry = try read.openCursor();
+            defer retry.close();
+            const found = try retry.seekAtOrAfter("doc:a");
+            try std.testing.expect(found != null);
+            try std.testing.expectEqualStrings(&value, found.?.value);
+            try std.testing.expectEqual(original_checks, budget.waits);
+        }
+    }
+}
+
+test "lsm routing cursor local decoder admission cancels cold compressed decode and retries correct rows" {
+    for ([_]bool{ false, true }) |local_cache| {
+        var memory = storage_io.MemoryStorage.init(std.testing.allocator);
+        defer memory.deinit();
+        var backend = try Backend.open(std.testing.allocator, "/local-decode-checkpoints", .{
+            .storage = memory.storage(),
+            .wal_enabled = false,
+            .flush_threshold = 1,
+            .compact_threshold_runs = 10000,
+            .table_block_compression = .snappy_adaptive,
+            .local_block_cache_enabled = local_cache,
+        });
+        defer backend.close();
+        var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+        defer runtime.deinit();
+        var write = try runtime.beginWrite();
+        const value: [16384]u8 = @splat('v');
+        try write.put("doc:a", &value);
+        try write.commit();
+        const Budget = struct {
+            checks: usize = 0,
+            fail_at: usize,
+            pub fn checkpoint(self: *@This()) !void {
+                self.checks += 1;
+                if (self.checks >= self.fail_at) return error.Canceled;
+            }
+            pub fn waitForProgress(_: *@This()) !void {
+                return error.TestUnexpectedResult;
+            }
+        };
+        var late_failure = false;
+        var completed = false;
+        for (1..256) |fail_at| {
+            while (backend.run_block_cache.items.len != 0) _ = backend.evictOldestLocalBlock();
+            var read = try runtime.beginRead();
+            defer read.abort();
+            var cursor = try read.openCursor();
+            var budget = Budget{ .fail_at = fail_at };
+            var adapter = read_admission.Adapter(*Budget){ .budget = &budget };
+            const payload = adapter.payload();
+            const result = cursor.seekAtOrAfterWithAdmission("doc:a", .init(&payload));
+            if (result) |found| {
+                try std.testing.expect(found != null);
+                try std.testing.expectEqualStrings(&value, found.?.value);
+                completed = true;
+            } else |err| {
+                try std.testing.expectEqual(error.Canceled, err);
+                if (fail_at > 32) late_failure = true;
+            }
+            const checks = budget.checks;
+            cursor.close();
+            try std.testing.expectEqual(checks, budget.checks);
+            try std.testing.expectEqual(@as(usize, 0), backend.local_reader.active);
+            for (&backend.local_reader.flights) |*flight| try std.testing.expectEqual(@as(usize, 0), flight.refs);
+            if (completed) break;
+        }
+        try std.testing.expect(late_failure);
+        try std.testing.expect(completed);
+        var read = try runtime.beginRead();
+        defer read.abort();
+        try std.testing.expectEqualStrings(&value, try read.get("doc:a"));
     }
 }

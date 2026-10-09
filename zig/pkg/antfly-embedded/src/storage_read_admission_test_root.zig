@@ -6,6 +6,7 @@
 pub const antfly_sources = struct {};
 pub const consumer_tests_only = true;
 test {
+    @import("std").testing.refAllDecls(@import("storage/lsm_backend/local_reader.zig"));
     @import("std").testing.refAllDecls(@import("storage/lite/docstore.zig"));
     @import("std").testing.refAllDecls(@import("storage/lsm_backend.zig"));
 }

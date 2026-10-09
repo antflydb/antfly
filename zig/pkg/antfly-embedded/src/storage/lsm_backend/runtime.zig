@@ -2358,18 +2358,21 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 self.source_blocks[source_index] = .{ .cached = handle };
                 break :blk block;
             } else if (localBlockCacheEnabled(self.backend)) blk: {
-                const payload = try loadLocalBlockLease(self.backend, run, index, window, self.backend_locked, self.namespace.retainDataBlocks());
+                const payload = try loadLocalBlockLeaseWithAdmission(self.backend, run, index, window, self.backend_locked, self.namespace.retainDataBlocks(), self.admission.control);
                 self.source_blocks[source_index] = .{ .local = payload };
                 break :blk payload.bytes;
             } else blk: {
-                const owned = try loadOwnedBlockForWindowAllocMaybeLocked(
-                    self.backend,
-                    self.backend.allocator,
-                    run,
-                    index,
-                    window,
-                    self.backend_locked,
-                );
+                const owned = if (self.admission.control) |control|
+                    try loadDecodedLocalBlockWithAdmission(self.backend, self.backend.allocator, run.path orelse return error.RunStateUnavailable, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window, control)
+                else
+                    try loadOwnedBlockForWindowAllocMaybeLocked(
+                        self.backend,
+                        self.backend.allocator,
+                        run,
+                        index,
+                        window,
+                        self.backend_locked,
+                    );
                 self.source_blocks[source_index] = .{ .owned = .{ .allocator = self.backend.allocator, .bytes = owned } };
                 break :blk owned;
             };
@@ -6959,8 +6962,18 @@ fn loadRunTableIndexWithStats(backend: anytype, allocator: Allocator, path: []co
 }
 
 fn loadRunTableBlockWithStats(backend: anytype, allocator: Allocator, path: []const u8, absolute_offset: u64, len: usize) ![]u8 {
+    return loadRunTableBlockWithStatsAndAdmission(backend, allocator, path, absolute_offset, len, null);
+}
+
+fn loadRunTableBlockWithStatsAndAdmission(backend: anytype, allocator: Allocator, path: []const u8, absolute_offset: u64, len: usize, control: ?read_admission.Port) ![]u8 {
     const start_ns = backend.readStatsNowNs();
-    const loaded = if (@hasDecl(@TypeOf(backend.*), "readRunRangeAlloc")) backend.readRunRangeAlloc(allocator, path, absolute_offset, len) else backend.storage.?.readFileRangeAlloc(allocator, path, absolute_offset, len);
+    const loaded = if (@hasDecl(@TypeOf(backend.*), "readRunRangeAllocWithAdmission")) backend.readRunRangeAllocWithAdmission(allocator, path, absolute_offset, len, control) else blk: {
+        if (control) |budget| try budget.checkpoint();
+        const bytes = try (if (@hasDecl(@TypeOf(backend.*), "readRunRangeAlloc")) backend.readRunRangeAlloc(allocator, path, absolute_offset, len) else backend.storage.?.readFileRangeAlloc(allocator, path, absolute_offset, len));
+        errdefer allocator.free(bytes);
+        if (control) |budget| try budget.checkpoint();
+        break :blk bytes;
+    };
     const elapsed_ns = backend.readStatsElapsedNs(start_ns);
     if (loaded) |bytes| backend.recordTableBlockLoad(bytes.len, elapsed_ns) else |_| backend.recordTableBlockLoad(len, elapsed_ns);
     return try loaded;
@@ -7193,11 +7206,12 @@ fn loadRunTableBlockHandleAtOffsetControlled(
         backend.recordSharedBlockCacheMiss();
         const Reader = struct {
             backend: @TypeOf(backend),
+            control: ?read_admission.Port,
             pub fn readFileRangeAlloc(self: @This(), allocator: Allocator, block_path: []const u8, offset: u64, len: usize) ![]u8 {
-                return loadRunTableBlockWithStats(self.backend, allocator, block_path, offset, len);
+                return loadRunTableBlockWithStatsAndAdmission(self.backend, allocator, block_path, offset, len, self.control);
             }
         };
-        var decoded = try cache.loadRunTableBlockWithAdmission(Reader{ .backend = backend }, path, absolute_offset, physical_len, compression, logical_len, checksum, control);
+        var decoded = try cache.loadRunTableBlockWithAdmission(Reader{ .backend = backend, .control = control }, path, absolute_offset, physical_len, compression, logical_len, checksum, control);
         defer decoded.deinit();
         return checkedCacheHandle(try decoded.publish(run.id, generation, retain_block, control), control);
     }
@@ -7610,9 +7624,14 @@ fn finishLocalBlockPromotion(backend: anytype, run: *Run, index: *const lsm_tabl
 }
 
 fn retainLocalCachedBlock(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool) ?*SharedBytes {
+    return retainLocalCachedBlockWithAdmission(backend, run, index, window, backend_locked, null) catch unreachable;
+}
+
+fn retainLocalCachedBlockWithAdmission(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, control: ?read_admission.Port) !?*SharedBytes {
+    if (control) |budget| try budget.checkpoint();
     const path = run.path orelse return null;
     const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-    const locked = if (backend_locked) false else lockBackend(@TypeOf(backend.*), backend);
+    const locked = if (backend_locked) false else if (control) |budget| try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget) else lockBackend(@TypeOf(backend.*), backend);
     defer unlockBackend(@TypeOf(backend.*), backend, locked);
     if (backend.retainCachedRunBlock(path, run.id, offset, window.physicalLen())) |lease| {
         backend.recordLocalBlockCacheHit();
@@ -7628,25 +7647,36 @@ fn localDecodeWorkingBytes(window: lsm_table_file.EntryDataWindow) !usize {
 }
 
 fn localWorkspace(backend: anytype, window: lsm_table_file.EntryDataWindow) !LocalReader.Workspace {
-    return backend.local_reader.acquire(backend.allocator, backend.options.resource_manager, backend.manifestCoordinationIo(), try localDecodeWorkingBytes(window), backend.options.local_decode_working_bytes, window.len + @sizeOf(SharedBytes));
+    return localWorkspaceWithAdmission(backend, window, null);
+}
+
+fn localWorkspaceWithAdmission(backend: anytype, window: lsm_table_file.EntryDataWindow, control: ?read_admission.Port) !LocalReader.Workspace {
+    return backend.local_reader.acquireWithAdmission(backend.allocator, backend.options.resource_manager, backend.manifestCoordinationIo(), try localDecodeWorkingBytes(window), backend.options.local_decode_working_bytes, window.len + @sizeOf(SharedBytes), control);
 }
 
 fn loadDecodedLocalBlock(backend: anytype, allocator: Allocator, path: []const u8, offset: u64, window: lsm_table_file.EntryDataWindow) ![]u8 {
-    if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
-        var work = try localWorkspace(backend, window);
-        defer work.release();
-        const scratch = work.allocator();
-        const payload = try loadRunTableBlockWithStats(backend, scratch, path, offset, window.physicalLen());
-        return lsm_table_file.decodeBlockPayloadWithScratchAlloc(allocator, scratch, window.compression, payload, window.len, window.checksum);
-    }
-    return loadRunTableDecodedBlockWithStats(backend, allocator, path, offset, window.physicalLen(), window.compression, window.len, window.checksum);
+    return loadDecodedLocalBlockWithAdmission(backend, allocator, path, offset, window, null);
 }
 
-fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool) !*SharedBytes {
+fn loadDecodedLocalBlockWithAdmission(backend: anytype, allocator: Allocator, path: []const u8, offset: u64, window: lsm_table_file.EntryDataWindow, control: ?read_admission.Port) ![]u8 {
+    if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
+        var work = try localWorkspaceWithAdmission(backend, window, control);
+        defer work.release();
+        const scratch = work.allocator();
+        const payload = try loadRunTableBlockWithStatsAndAdmission(backend, scratch, path, offset, window.physicalLen(), control);
+        return lsm_table_file.decodeBlockPayloadWithScratchAllocWithAdmission(allocator, scratch, window.compression, payload, window.len, window.checksum, control);
+    }
+    const payload = try loadRunTableBlockWithStatsAndAdmission(backend, allocator, path, offset, window.physicalLen(), control);
+    defer allocator.free(payload);
+    return lsm_table_file.decodeBlockPayloadAllocWithAdmission(allocator, window.compression, payload, window.len, window.checksum, control);
+}
+
+fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool, control: ?read_admission.Port) !*SharedBytes {
+    if (control) |budget| try budget.checkpoint();
     const path = run.path orelse return error.RunStateUnavailable;
     const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
     const len = window.physicalLen();
-    if (retainLocalCachedBlock(backend, run, index, window, backend_locked)) |lease| return lease;
+    if (try retainLocalCachedBlockWithAdmission(backend, run, index, window, backend_locked, control)) |lease| return lease;
     backend.recordLocalBlockCacheMiss();
     // Release decoder admission before taking the writer mutex to publish.
     // A writer may wait for a workspace, but never for a cache publisher.
@@ -7655,13 +7685,16 @@ fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_
     else
         null;
     defer if (read_credit) |*credit| credit.release();
-    const bytes = try loadDecodedLocalBlock(backend, backend.allocator, path, offset, window);
-    errdefer backend.allocator.free(bytes);
-    const lease = try SharedBytes.create(backend.allocator, bytes);
+    const lease = blk: {
+        const bytes = try loadDecodedLocalBlockWithAdmission(backend, backend.allocator, path, offset, window, control);
+        errdefer backend.allocator.free(bytes);
+        break :blk try SharedBytes.create(backend.allocator, bytes);
+    };
     lease.reservation = read_credit;
     read_credit = null;
     lease.result_pins_allowed = backend.options.resource_manager == null;
-    const locked = if (backend_locked) false else lockBackend(@TypeOf(backend.*), backend);
+    errdefer lease.release();
+    const locked = if (backend_locked) false else if (control) |budget| try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget) else lockBackend(@TypeOf(backend.*), backend);
     defer unlockBackend(@TypeOf(backend.*), backend, locked);
     if (backend.retainCachedRunBlock(path, run.id, offset, len)) |winner| {
         lease.release();
@@ -7683,24 +7716,31 @@ fn joinLocalBlockDecode(backend: anytype, run: *Run, index: *const lsm_table_fil
 }
 
 fn loadLocalBlockLease(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool) !*SharedBytes {
-    if (retainLocalCachedBlock(backend, run, index, window, backend_locked)) |lease| return lease;
+    return loadLocalBlockLeaseWithAdmission(backend, run, index, window, backend_locked, admit, null);
+}
+
+fn loadLocalBlockLeaseWithAdmission(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool, control: ?read_admission.Port) !*SharedBytes {
+    if (try retainLocalCachedBlockWithAdmission(backend, run, index, window, backend_locked, control)) |lease| return lease;
     if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
         // Joining a publisher while holding the writer mutex would deadlock.
         // Locked callers decode independently through the same bounded pool.
         if (!backend_locked) {
             const path = run.path orelse return error.RunStateUnavailable;
             const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-            const ticket = backend.local_reader.begin(backend.allocator, backend.manifestCoordinationIo(), path, run.id, offset, window.physicalLen(), admit) catch null;
+            const ticket = backend.local_reader.beginWithAdmission(backend.allocator, backend.manifestCoordinationIo(), path, run.id, offset, window.physicalLen(), admit, control) catch |err| blk: {
+                if (control != null) return err;
+                break :blk null;
+            };
             if (ticket) |owned| {
                 defer backend.local_reader.releaseFlight(owned.flight);
-                if (!owned.leader) return backend.local_reader.wait(owned.flight);
-                const payload = loadLocalBlockCandidate(backend, run, index, window, false, admit);
+                if (!owned.leader) return backend.local_reader.waitWithAdmission(owned.flight, control);
+                const payload = loadLocalBlockCandidate(backend, run, index, window, false, admit, control);
                 backend.local_reader.finish(owned.flight, payload);
                 return payload;
             }
         }
     }
-    return loadLocalBlockCandidate(backend, run, index, window, backend_locked, admit);
+    return loadLocalBlockCandidate(backend, run, index, window, backend_locked, admit, control);
 }
 
 fn loadOwnedBlockForWindowAlloc(
