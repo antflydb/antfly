@@ -155,6 +155,10 @@ pub const ClientConfig = struct {
     /// How long to wait for a PING ACK before declaring the connection dead (ms).
     /// Similar to Go's http2.Transport.PingTimeout. Only used when read_idle_timeout > 0.
     h2_ping_timeout_ms: u64 = 15_000,
+    /// Finite transport envelope captured by each H2 connection before it is
+    /// published. Cleanup activation starts one deadline across lock and wire
+    /// output; this does not supply scheduler CPU/cleanup authority.
+    h2_cleanup_timeout_ms: u32 = 1_000,
 };
 
 /// Per-request options.
@@ -519,7 +523,8 @@ const RequestInterrupt = struct {
 
     fn cancelH2Locked(_: *RequestInterrupt, entry: *H2PoolEntry, stream_id: u31, io: Io) void {
         const h2 = &entry.h2;
-        h2.write_mutex.lockUncancelable(io);
+        var budget = H2CleanupBudget.init(io, entry.cleanup_timeout_ms);
+        const can_reset = budget.lock(entry);
         const stream = h2.stream_manager.getStream(stream_id) orelse {
             h2.write_mutex.unlock(io);
             return;
@@ -533,13 +538,9 @@ const RequestInterrupt = struct {
         stream.stream_error = error.Cancelled;
         stream.completed = true;
         stream.reset();
-        if (entry.is_tls) {
-            if (entry.session.getWriter()) |writer|
-                h2.sendRstStream(writer, stream_id, .cancel) catch {}
-            else |_| {}
-        } else {
-            h2.sendRstStream(&entry.socket, stream_id, .cancel) catch {};
-        }
+        if (can_reset) budget.resetLocked(entry, stream_id) catch {
+            H2CleanupBudget.retire(entry, io);
+        };
         // Posting while still holding write_mutex is paired with waiter
         // teardown below: a woken owner must acquire this mutex to unregister
         // its pointer before destroying it, so no producer can retain a raw
@@ -667,7 +668,59 @@ const H2PoolEntry = struct {
     /// Client config for timeout values (set during creation).
     read_idle_timeout_ms: u64 = 0,
     ping_timeout_ms: u64 = 15_000,
+    cleanup_timeout_ms: u32 = 1_000,
     io: Io = undefined,
+};
+
+const H2CleanupBudget = struct {
+    io: Io,
+    deadline_ns: i128,
+
+    fn init(io: Io, ms: u32) H2CleanupBudget {
+        return .{ .io = io, .deadline_ns = Io.Clock.awake.now(io).nanoseconds + @as(i128, ms) * std.time.ns_per_ms };
+    }
+    fn remaining(raw: ?*anyopaque) socket_mod.WriteControl.Error!?u64 {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        const ns = self.deadline_ns - Io.Clock.awake.now(self.io).nanoseconds;
+        if (ns <= 0) return error.Timeout;
+        return @intCast(@divTrunc(ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+    }
+    fn control(self: *@This()) socket_mod.WriteControl {
+        return .{ .ptr = self, .remaining_ms_fn = remaining };
+    }
+    fn retire(entry: *H2PoolEntry, io: Io) void {
+        entry.broken = true;
+        entry.socket.shutdown();
+        entry.h2.send_window_event.set(io);
+    }
+    fn lock(self: *@This(), entry: *H2PoolEntry) bool {
+        self.control().lock(&entry.h2.write_mutex, self.io) catch {
+            // Wake a blocked connection writer before waiting for its physical
+            // lock handoff. Keep the descriptor owned until worker joining.
+            retire(entry, self.io);
+            entry.h2.write_mutex.lockUncancelable(self.io);
+            return false;
+        };
+        return true;
+    }
+    fn resetLocked(self: *@This(), entry: *H2PoolEntry, stream_id: u31) !void {
+        const control_value = self.control();
+        if (entry.is_tls) {
+            const net_out = if (entry.session.net_out) |*writer| writer else return error.NotConnected;
+            // All H2 writers hold write_mutex. Do not install callbacks on
+            // the shared TLS reader or retain this stack budget in the entry.
+            const previous = net_out.control;
+            net_out.control = control_value;
+            defer net_out.control = previous;
+            net_out.last_write_error = null;
+            const writer = try entry.session.getWriter();
+            try entry.h2.sendRstStream(writer, stream_id, .cancel);
+            try entry.session.flush();
+        } else {
+            var writer = socket_mod.ControlledWriter{ .socket = &entry.socket, .control = control_value };
+            try entry.h2.sendRstStream(&writer, stream_id, .cancel);
+        }
+    }
 };
 
 const TlsSessionIoReader = struct {
@@ -2454,6 +2507,7 @@ pub const Client = struct {
         entry.last_frame_ts = common.milliTimestamp(self.io);
         entry.read_idle_timeout_ms = self.config.h2_read_idle_timeout_ms;
         entry.ping_timeout_ms = self.config.h2_ping_timeout_ms;
+        entry.cleanup_timeout_ms = self.config.h2_cleanup_timeout_ms;
         errdefer entry.h2.deinit();
 
         // Perform h2 handshake: preface + SETTINGS exchange.
@@ -2980,17 +3034,12 @@ pub const Client = struct {
         allocator: Allocator,
     ) void {
         const h2 = &entry.h2;
-        h2.write_mutex.lockUncancelable(io);
+        var budget = H2CleanupBudget.init(io, entry.cleanup_timeout_ms);
+        const can_reset = budget.lock(entry);
         const cancel_peer = prepareH2StreamCleanupLocked(h2, stream_id, data_event, headers_sent);
-        if (cancel_peer) {
-            if (entry.is_tls) {
-                if (entry.session.getWriter()) |writer|
-                    h2.sendRstStream(writer, stream_id, .cancel) catch {}
-                else |_| {}
-            } else {
-                h2.sendRstStream(&entry.socket, stream_id, .cancel) catch {};
-            }
-        }
+        if (cancel_peer and can_reset) budget.resetLocked(entry, stream_id) catch {
+            H2CleanupBudget.retire(entry, io);
+        };
         h2.stream_manager.removeStream(stream_id);
         h2.write_mutex.unlock(io);
 
@@ -7009,4 +7058,102 @@ test "H2 completion waits reject publication and preserve the shared connection"
         state.finished.set(io);
         try server.await(io);
     }
+}
+
+test "H2 cleanup lock deadline wakes the physical holder before retirement" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+    defer listener.deinit();
+    var socket = try Socket.connect(listener.getLocalAddress(), io);
+    defer socket.close();
+    var accepted = try listener.accept();
+    defer accepted.socket.close();
+    var entry: H2PoolEntry = .{ .socket = socket, .session = undefined, .h2 = H2Connection.initClient(alloc, io), .is_tls = false, .io = io, .cleanup_timeout_ms = 30 };
+    defer entry.h2.deinit();
+    var held: Io.Event = .unset;
+    const Worker = struct {
+        fn run(target: *H2PoolEntry, ready: *Io.Event) !void {
+            target.h2.write_mutex.lockUncancelable(target.io);
+            defer target.h2.write_mutex.unlock(target.io);
+            ready.set(target.io);
+            var byte: [1]u8 = undefined;
+            _ = target.socket.recv(&byte) catch |err| switch (err) {
+                error.RecvFailed => return,
+                else => return err,
+            };
+        }
+    };
+    var holder = try io.concurrent(Worker.run, .{ &entry, &held });
+    defer holder.cancel(io) catch {};
+    try held.wait(io);
+    var budget = H2CleanupBudget.init(io, entry.cleanup_timeout_ms);
+    const started = Io.Clock.awake.now(io).nanoseconds;
+    try std.testing.expect(!budget.lock(&entry));
+    defer entry.h2.write_mutex.unlock(io);
+    try holder.await(io);
+    const elapsed = Io.Clock.awake.now(io).nanoseconds - started;
+    try std.testing.expect(elapsed >= 20 * std.time.ns_per_ms and elapsed < std.time.ns_per_s);
+    try std.testing.expect(entry.broken);
+    try std.testing.expect(entry.h2.send_window_event.isSet());
+}
+
+test "H2 cleanup reset has one finite wire budget under backpressure" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |blocked| {
+        var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var socket = try Socket.connect(listener.getLocalAddress(), io);
+        defer socket.close();
+        var accepted = try listener.accept();
+        defer accepted.socket.close();
+        if (!socket.native_timeouts) return error.SkipZigTest;
+        if (blocked) {
+            const receive_size: u32 = 4096;
+            try std.posix.setsockopt(accepted.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&receive_size));
+            try socket.setSendTimeout(10);
+            var payload: [64 * 1024]u8 = @splat('b');
+            var saturated = false;
+            for (0..4096) |_| {
+                _ = socket.send(&payload) catch |err| {
+                    if (err != error.Timeout) return err;
+                    saturated = true;
+                    break;
+                };
+            }
+            try std.testing.expect(saturated);
+            try socket.setSendTimeout(0);
+        }
+        var entry: H2PoolEntry = .{ .socket = socket, .session = undefined, .h2 = H2Connection.initClient(alloc, io), .is_tls = false, .io = io, .cleanup_timeout_ms = 30 };
+        defer entry.h2.deinit();
+        const stream = try entry.h2.stream_manager.createStream();
+        const stream_id = stream.id;
+        stream.state = .open;
+        const started = Io.Clock.awake.now(io).nanoseconds;
+        Client.cleanupH2Stream(&entry, stream_id, null, true, io, alloc);
+        const elapsed = Io.Clock.awake.now(io).nanoseconds - started;
+        try std.testing.expect(elapsed < std.time.ns_per_s);
+        try std.testing.expectEqual(blocked, entry.broken);
+        try std.testing.expectEqual(@as(usize, 0), entry.h2.stream_manager.activeStreamCount());
+        if (!blocked) {
+            try accepted.socket.setRecvTimeout(500);
+            var frame: [13]u8 = undefined;
+            var received: usize = 0;
+            while (received < frame.len) received += try accepted.socket.recv(frame[received..]);
+            try std.testing.expectEqual(@as(u8, 3), frame[3]); // RST_STREAM
+            try std.testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, frame[9..13], .big)); // CANCEL
+        }
+    }
+}
+
+test "H2 cleanup never renews the reserved transport deadline" {
+    const io = std.testing.io;
+    var budget = H2CleanupBudget.init(io, 20);
+    const original = budget.deadline_ns;
+    try std.testing.expect((try budget.control().timeout(100)).? <= 20);
+    try io.sleep(.fromMilliseconds(25), .awake);
+    for (0..3) |_| try std.testing.expectError(error.Timeout, budget.control().check());
+    try std.testing.expectEqual(original, budget.deadline_ns);
 }
