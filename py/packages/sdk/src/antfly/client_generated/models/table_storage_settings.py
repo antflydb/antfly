@@ -21,11 +21,12 @@ class TableStorageSettings:
 
         Attributes:
             engine (TableStorageSettingsEngine | Unset): Durable table engine, independent of deployment. local uses the
-                hosting process's local or Lite backend and normal shard placement. object uses external lake data with durable sidecars, or an Antfly-
-                owned object WAL and published generations. Object tables do not allocate data Raft groups; omit num_shards and
-                replication_sources. Metadata remains authoritative for table lifetime. Configure the shared destination through
-                storage.artifacts. Writable object document tables initially require immutable schema and index definitions;
-                changes require a new table and explicit migration. Default: TableStorageSettingsEngine.LOCAL.
+                hosting process's local or Lite backend and normal shard placement. object uses external lake data with durable
+                sidecars, or an Antfly-owned object WAL and published generations. Object tables do not allocate data Raft
+                groups; omit num_shards and replication_sources. Metadata remains authoritative for table lifetime. Configure
+                the shared destination through storage.artifacts. Writable object document tables initially require immutable
+                schema and index definitions; changes require a new table and explicit migration. Default:
+                TableStorageSettingsEngine.LOCAL.
             dense_embeddings (TableStorageSettingsDenseEmbeddings | Unset): Explicit ownership choice. vector_store requires
                 a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps
                 primary_lsm; omit the storage object to use the deployment default. Default:

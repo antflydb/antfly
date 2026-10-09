@@ -10188,6 +10188,8 @@ export interface components {
             } | string[];
         };
         QueryRequest: {
+            /** @description Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409. */
+            remote_snapshot?: string;
             evaluate?: components["schemas"]["QueryEvaluation"];
             table_target?: components["schemas"]["CatalogTableTarget"];
             /**
@@ -11479,6 +11481,8 @@ export interface components {
         };
         /** @description Fields shared by canonical and stateful query result envelopes. */
         QueryResultBase: {
+            /** @description Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication. */
+            remote_snapshot?: string;
             /** @description Function evaluation scope, population, usage, and scoped aggregations. */
             evaluation?: {
                 [key: string]: unknown;
@@ -13646,10 +13650,20 @@ export interface components {
             algebraic_planning?: components["schemas"]["GraphAlgebraicPlanningConfig"];
             resolvers?: components["schemas"]["GraphResolverConfig"][];
         };
-        /** @description Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned. */
+        AlgebraicAggregateConfig: {
+            name: string;
+            /** @enum {string} */
+            op: "count" | "sum" | "avg" | "min" | "max";
+            group_by?: string[];
+            /** @description Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values. */
+            measure?: string;
+        };
+        /** @description Schema-derived algebraic index capabilities with optional declarative aggregate recipes. Physical materialization state remains engine-owned. */
         AlgebraicIndexConfig: {
-            /** @description When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API. */
+            /** @description When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned. */
             derive_from_schema?: boolean;
+            /** @description Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning. */
+            aggregates?: components["schemas"]["AlgebraicAggregateConfig"][];
         };
         /** @enum {string} */
         RelationalExpressionOp: "literal" | "column" | "add" | "subtract" | "multiply" | "divide" | "negate" | "concat" | "coalesce" | "lower_ascii" | "upper_ascii" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "and" | "or" | "not";
@@ -13889,6 +13903,12 @@ export interface components {
              * @enum {string}
              */
             write_policy?: "read_only";
+            /**
+             * @description Set immutable only when data files are never replaced at an existing URI. Allows authenticated provider-version proofs from retained index generations to be reused for unchanged data files. Metadata and delete files are still verified.
+             * @default mutable
+             * @enum {string}
+             */
+            object_mutability?: "mutable" | "immutable";
             credentials?: components["schemas"]["ExternalLakeCredentialRef"];
             snapshot?: components["schemas"]["ExternalLakeSnapshotSelector"];
         };
@@ -23908,7 +23928,10 @@ export interface operations {
                  * @description Read consistency for the lookup. The default `read_index` routes to
                  *     the primary for linearizable reads. `stale` allows a hot standby to
                  *     serve the lookup at its safe-read LSN.
-                 *     Owned object document tables support only explicit `stale` reads of published generations. The default `read_index` and `leader_lease` are rejected with HTTP 400. Use `sync_level=full_index` on writes to wait for publication before a stale lookup.
+                 *     Owned object document tables support only explicit `stale` reads of
+                 *     published generations. The default `read_index` and `leader_lease`
+                 *     are rejected with HTTP 400. Use `sync_level=full_index` on writes to
+                 *     wait for publication before a stale lookup.
                  */
                 consistency?: "read_index" | "leader_lease" | "stale";
             };
