@@ -90,6 +90,11 @@
       "cwd": ".",
       "timeout_seconds": 120
     },
+    "sql-postgres-regex-reference": {
+      "command": ["uv", "run", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_regex_scalar_reference.py", "--check", "zig/pkg/antfly-embedded/src/sql/testdata/regex-postgres.json"],
+      "cwd": ".",
+      "timeout_seconds": 120
+    },
     "sql-postgres-text-contracts": {
       "command": [
         "zig",
@@ -99,7 +104,12 @@
         ".zig-cache/sql-parity-evidence",
         "-Dtest-filter=SQL PostgreSQL text",
         "-Dtest-filter=SQL UTF8 text",
-        "-Dtest-filter=SQL prepared Unicode translation"
+        "-Dtest-filter=SQL prepared Unicode translation",
+        "-Dtest-filter=SQL PostgreSQL scalar kernels",
+        "-Dtest-filter=SQL JSON cardinality",
+        "-Dtest-filter=SQL initcap",
+        "-Dtest-filter=SQL scalar regex",
+        "-Dtest-filter=compiler preserves PostgreSQL expression labels"
       ],
       "cwd": "zig",
       "timeout_seconds": 600
@@ -1728,8 +1738,9 @@
     },
     {
       "id": "sql-0195",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original SQL and parameters execute through the native HTTP endpoint with PostgreSQL result labels, int4 identity, SQL NULL provenance and a complete peer frontier for LIMIT ties. JSON cardinality reads the immutable parsed array length without allocation or element scans.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-mounted-read-shapes"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL PostgreSQL scalar kernels preserve JSON cardinality text casing signatures and errors","gate":"sql-postgres-text-contracts"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL PostgreSQL scalar kernels preserve JSON cardinality text casing signatures and errors","gate":"sql-postgres-text-reference"}]
     },
     {
       "id": "sql-0196",
@@ -1941,8 +1952,9 @@
     },
     {
       "id": "sql-0214",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original regex predicates and parameters execute through native HTTP with complete PostgreSQL-backed results. Ordinary regex operators lower to the bounded prepared ARE session, preserving case flags, negation, SQL NULL, operator precedence and PostgreSQL projection labels; regex-array quantifiers are not certified here.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-mounted-read-shapes"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL scalar regex functions preserve PostgreSQL values OIDs NULLs and errors","gate":"sql-postgres-text-contracts"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL scalar regex functions preserve PostgreSQL values OIDs NULLs and errors","gate":"sql-postgres-regex-reference"}]
     },
     {
       "id": "sql-0215",
@@ -1951,8 +1963,9 @@
     },
     {
       "id": "sql-0216",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original regexp_count projection, parameterized predicate and ordering execute through native HTTP with complete PostgreSQL-backed values, int4 result identity and SQL NULL provenance. Shared regex contracts additionally verify Unicode positions, flags, empty matches, invalid overloads and errors.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-mounted-read-shapes"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL scalar regex functions preserve PostgreSQL values OIDs NULLs and errors","gate":"sql-postgres-text-contracts"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL scalar regex functions preserve PostgreSQL values OIDs NULLs and errors","gate":"sql-postgres-regex-reference"}]
     },
     {
       "id": "sql-0217",
@@ -1961,8 +1974,9 @@
     },
     {
       "id": "sql-0218",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original regexp_instr projection, parameterized predicate and ordering execute through native HTTP with complete PostgreSQL-backed values, int4 result identity and SQL NULL provenance. Shared regex contracts additionally verify Unicode positions, occurrences, captures, NULLs and errors.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-mounted-read-shapes"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL scalar regex functions preserve PostgreSQL values OIDs NULLs and errors","gate":"sql-postgres-text-contracts"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL scalar regex functions preserve PostgreSQL values OIDs NULLs and errors","gate":"sql-postgres-regex-reference"}]
     },
     {
       "id": "sql-0219",
@@ -2442,8 +2456,9 @@
     },
     {
       "id": "sql-0244",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original regexp_replace projection, global replacement predicate, parameters and ordering execute through native HTTP with complete PostgreSQL-backed text results. Shared prepared regex contracts verify first/global replacement, captures, NULLs, bounded admission and errors.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-mounted-read-shapes"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL scalar regex functions preserve PostgreSQL values OIDs NULLs and errors","gate":"sql-postgres-text-contracts"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL scalar regex functions preserve PostgreSQL values OIDs NULLs and errors","gate":"sql-postgres-regex-reference"}]
     },
     {
       "id": "sql-0245",
@@ -2737,8 +2752,9 @@
     },
     {
       "id": "sql-0256",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact original initcap projection, predicate, parameter and ordering execute through native HTTP with PostgreSQL C-collation results and text identity. The shared kernel uses one bounded output allocation, polls cancellation, and has allocation-fault, NULL and strict-signature contracts.",
+      "evidence": [{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-mounted-read-shapes"},{"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL executes one relational page with exact integer parameters","gate":"sql-postgres-read-reference"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL PostgreSQL scalar kernels preserve JSON cardinality text casing signatures and errors","gate":"sql-postgres-text-contracts"},{"path":"zig/pkg/antfly-embedded/src/sql/scalar.zig","test":"SQL PostgreSQL scalar kernels preserve JSON cardinality text casing signatures and errors","gate":"sql-postgres-text-reference"}]
     },
     {
       "id": "sql-0257",

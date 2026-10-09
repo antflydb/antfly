@@ -46,6 +46,25 @@ from generate_sql_postgres_reference import (
 
 
 class ReferenceExtensionTest(unittest.TestCase):
+    def test_clock_functions_require_a_dedicated_native_clock_contract(self):
+        for expression in (
+            "now()",
+            "NOW ()",
+            "transaction_timestamp()",
+            "statement_timestamp()",
+            "clock_timestamp()",
+            "timeofday()",
+            "CURRENT_TIMESTAMP(6)",
+            "CURRENT_DATE",
+        ):
+            # Reject before touching a connection: a wall-clock sample
+            # must never become an apparently deterministic PG golden.
+            with (
+                self.subTest(expression=expression),
+                self.assertRaisesRegex(ValueError, "clock profile required"),
+            ):
+                execute(None, {"sql": f"SELECT {expression}"}, read=True)
+
     def test_extension_rejects_missing_baseline_unknown_and_duplicate_ids(self):
         golden = str(FIXTURES / "sql_read_campaign_reference.json")
         for arguments in (

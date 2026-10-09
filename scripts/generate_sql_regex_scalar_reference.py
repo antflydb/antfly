@@ -9,6 +9,19 @@ import psycopg
 from generate_sql_postgres_reference import postgres
 
 CASES = [
+    ("operator-match", "'abc' ~ 'a'"),
+    ("operator-imatch", "'abc' ~* 'A'"),
+    ("operator-not-match", "'abc' !~ 'A'"),
+    ("operator-not-imatch", "'abc' !~* 'A'"),
+    ("operator-null-left", "NULL !~ '['"),
+    ("operator-null-right", "'abc' ~ NULL"),
+    ("operator-not-precedence", "NOT 'abc' ~ 'z'"),
+    ("operator-concat-precedence", "'a' || 'bc' ~ '^abc$'"),
+    ("operator-comparison-precedence", "'abc' ~ 'a' = true"),
+    ("operator-invalid-regex", "'abc' ~ '['"),
+    ("operator-wrong-type", "42 ~ 'a'"),
+    ("operator-lazy-and", "false AND 'abc' ~ '['"),
+    ("operator-inline-flags", "'abc' ~ '(?i)A'"),
     ("like", "regexp_like('雪ABC😀','abc','i')"),
     ("like-miss", "regexp_like('abc','z')"),
     ("like-null", "regexp_like(NULL,'[','z')"),

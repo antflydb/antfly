@@ -3,6 +3,97 @@
   "collation": "C",
   "entries": [
     {
+      "id": "operator-match",
+      "expression": "'abc' ~ 'a'",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-imatch",
+      "expression": "'abc' ~* 'A'",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-not-match",
+      "expression": "'abc' !~ 'A'",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-not-imatch",
+      "expression": "'abc' !~* 'A'",
+      "value": false,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-null-left",
+      "expression": "NULL !~ '['",
+      "value": null,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-null-right",
+      "expression": "'abc' ~ NULL",
+      "value": null,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-not-precedence",
+      "expression": "NOT 'abc' ~ 'z'",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-concat-precedence",
+      "expression": "'a' || 'bc' ~ '^abc$'",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-comparison-precedence",
+      "expression": "'abc' ~ 'a' = true",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-invalid-regex",
+      "expression": "'abc' ~ '['",
+      "value": null,
+      "oid": null,
+      "sqlstate": "2201B"
+    },
+    {
+      "id": "operator-wrong-type",
+      "expression": "42 ~ 'a'",
+      "value": null,
+      "oid": null,
+      "sqlstate": "42883"
+    },
+    {
+      "id": "operator-lazy-and",
+      "expression": "false AND 'abc' ~ '['",
+      "value": false,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
+      "id": "operator-inline-flags",
+      "expression": "'abc' ~ '(?i)A'",
+      "value": true,
+      "oid": 16,
+      "sqlstate": null
+    },
+    {
       "id": "like",
       "expression": "regexp_like('雪ABC😀','abc','i')",
       "value": true,

@@ -717,6 +717,21 @@ const Parser = struct {
                 continue;
             }
             const current = self.tokens[self.pos];
+            if (minimum <= 4 and (current.kind == .regex_match or current.kind == .regex_imatch or current.kind == .regex_not_match or current.kind == .regex_not_imatch)) {
+                self.pos += 1;
+                const right = try self.scalar(depth + 1, 5);
+                const insensitive = current.kind == .regex_imatch or current.kind == .regex_not_imatch;
+                const flags = try self.scalarNode(.{ .literal = .{ .string = if (insensitive) "i" else "c" } });
+                const matched = try self.scalarNode(.{ .call = .{ .name = "$regex_operator", .args = try self.alloc.dupe(*const ast.Scalar, &.{ left, right, flags }) } });
+                // Ordinary PostgreSQL regex operators share the prepared ARE
+                // session and admission of regexp_like, rather than a second
+                // regex implementation or per-row parser. NOT preserves NULL.
+                left = if (current.kind == .regex_not_match or current.kind == .regex_not_imatch)
+                    try self.scalarNode(.{ .unary = .{ .op = .not, .operand = matched } })
+                else
+                    matched;
+                continue;
+            }
             if ((current.kind == .at_contains or current.kind == .range_overlap or current.kind == .question or current.kind == .question_any or current.kind == .question_all) and minimum <= 4) {
                 self.pos += 1;
                 const right = try self.scalar(depth + 1, 5);
@@ -1657,7 +1672,7 @@ const Parser = struct {
         // Keep the original PostgreSQL function/CASE label before lowering
         // replaces expressions with internal columns or aggregate slots.
         const label = alias orelse switch (expression.*) {
-            .call => |call| if (std.mem.startsWith(u8, call.name, "$")) null else call.name,
+            .call => |call| if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else call.name,
             .case_when => "case",
             else => null,
         };
@@ -3046,6 +3061,10 @@ test "compiler incomplete catalog definitions report EOF and release partial all
 }
 
 test "compiler preserves PostgreSQL expression labels before relational lowering" {
+    var operators = try compile(std.testing.allocator, "SELECT status ~ 'x', status ~* 'x', status !~ 'x', status !~* 'x' FROM usage_records", .{});
+    defer operators.deinit();
+    for (operators.statement.select.columns[0..2]) |projection| try std.testing.expectEqualStrings("?column?", projection.alias.?);
+    for (operators.statement.select.columns[2..]) |projection| try std.testing.expect(projection.alias == null);
     var statement = try compile(std.testing.allocator, "SELECT lower(name), jsonb_typeof(metadata), CASE WHEN enabled THEN 1 ELSE 0 END, upper(name) AS display FROM usage_records", .{});
     defer statement.deinit();
     for (statement.statement.select.columns, [_][]const u8{ "lower", "jsonb_typeof", "case", "display" }) |projection, label| try std.testing.expectEqualStrings(label, projection.alias.?);

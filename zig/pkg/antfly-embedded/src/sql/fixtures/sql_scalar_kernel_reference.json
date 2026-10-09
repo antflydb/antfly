@@ -1,0 +1,30 @@
+{
+  "reference": "PostgreSQL exact SQL",
+  "collation": "C",
+  "entries": [
+    {"sql":"initcap('active ready')","value":"Active Ready","oid":25},
+    {"sql":"initcap('hELLO wORLD 1FOO foo_bar foo’BAR')","value":"Hello World 1foo Foo_Bar Foo’Bar","oid":25},
+    {"sql":"initcap('héLLO wÖRLD éABC')","value":"HéLlo WÖRld éAbc","oid":25},
+    {"sql":"initcap('a😀b éABC')","value":"A😀B éAbc","oid":25},
+    {"sql":"initcap('')","value":"","oid":25},
+    {"sql":"initcap(NULL)","value":null,"oid":25},
+    {"sql":"initcap(42)","error":"42883"},
+    {"sql":"initcap(true)","error":"42883"},
+    {"sql":"initcap(ARRAY['a'])","error":"42883"},
+    {"sql":"initcap('a','b')","error":"42883"},
+    {"sql":"jsonb_array_length('[]')","value":0,"oid":23},
+    {"sql":"jsonb_array_length('[null,[1,2],{\"k\":3},true]')","value":4,"oid":23},
+    {"sql":"jsonb_array_length('[1,2,3]'::jsonb)","value":3,"oid":23},
+    {"sql":"jsonb_array_length(NULL)","value":null,"oid":23},
+    {"sql":"jsonb_array_length('null')","error":"22023"},
+    {"sql":"jsonb_array_length('{}'::jsonb)","error":"22023"},
+    {"sql":"jsonb_array_length('\"text\"'::jsonb)","error":"22023"},
+    {"sql":"jsonb_array_length('1'::jsonb)","error":"22023"},
+    {"sql":"jsonb_array_length('true'::jsonb)","error":"22023"},
+    {"sql":"jsonb_array_length('not-json')","error":"22P02"},
+    {"sql":"jsonb_array_length(ARRAY[1,2])","error":"42883"},
+    {"sql":"jsonb_array_length(1)","error":"42883"},
+    {"sql":"jsonb_array_length('[]'::text)","error":"42883"},
+    {"sql":"jsonb_array_length()","error":"42883"}
+  ]
+}

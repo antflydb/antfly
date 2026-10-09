@@ -1,7 +1,9 @@
 # Original SQL extraction parity inventory
 
-Current audited dispositions: **448 implemented / 136 rejected / 73 superseded /
-929 unresolved**. Eleven original aggregate cases now have mounted native
+Current audited dispositions: **454 implemented / 136 rejected / 73 superseded /
+923 unresolved**. Six original JSON/regex/string reads now have exact
+PostgreSQL and mounted native endpoint evidence, backed by shared bounded
+scalar kernels. Eleven original aggregate cases now have mounted native
 public-HTTP and independent PostgreSQL evidence for escaped patterns, nullable
 filters, text lengths and regex aggregate inputs. A twelfth already-implemented
 MIN/MAX case gained the same PostgreSQL gate without duplicate credit. Grouped
@@ -20,6 +22,39 @@ execution. Original plan fingerprints, endpoint behavior, authorization, diagnos
 and deliberate rejections must be distinguished.
 
 ## Provenance and scope
+
+### Parsed JSON cardinality, C-collation casing and regex operators
+
+`jsonb_array_length` reads the immutable parsed array's cardinality directly,
+without scanning or copying elements. It preserves SQL NULL separately from
+JSON null and rejects non-array JSON with PostgreSQL's SQLSTATE. Strict function
+resolution rejects text-typed and SQL-array arguments rather than silently
+converting them. A zero-capacity allocator verifies 10,000 reads of a
+16,384-element parsed array under a 16-unit invocation budget.
+
+`initcap` follows PostgreSQL C-collation word and case semantics, including
+digits and UTF-8 word boundaries. It allocates exactly one input-sized output,
+charges shared work in bounded chunks, and frees unpublished output on
+cancellation. Tests cover exact-size allocation, real OOM versus output
+admission, cancellation and allocation-fault sweeps. This is not support for
+arbitrary locale-dependent collations.
+
+Ordinary `~`, `~*`, `!~` and `!~*` operators lower to the existing prepared ARE
+session. They share pattern caching, work admission and cancellation instead
+of introducing another regex engine. Independent PostgreSQL contracts verify
+precedence, flags, negation, NULLs, errors and lazy Boolean evaluation; native
+projection tests preserve PostgreSQL's unnamed operator label. Boolean VM
+results retain their explicit builtin type identity. Regex-array quantifiers
+and unrelated temporal/durable-expression gaps remain uncertified.
+
+The oracle verifies 78 text/JSON scalar contracts and 61 regex contracts. The
+mounted read golden now contains 91 exact original contracts, including
+sql-0195, sql-0214, sql-0216, sql-0218, sql-0244 and sql-0256. The JSON-cardinality
+LIMIT case compares the full peer frontier rather than pinning one arbitrary
+five-row tie selection. Only these six originals gained disposition credit;
+their source SQL, parameters and profile rows are unchanged. Clock functions
+such as `now()` require a dedicated clock contract and cannot become sampled
+values in deterministic goldens.
 
 ### Durable ARRAY constructor architecture
 
@@ -48,9 +83,9 @@ their independent capability 24 contract. Generated public clients retain
 constructor identity and explicit literal NULL values.
 
 Dynamic JSONB scalar construction, element-changing durable array casts, and
-array-valued ordered index keys remain guarded. These architectural and
-component proofs do not activate original corpus cases or change the audited
-448 implemented / 136 rejected / 73 superseded / 929 unresolved dispositions.
+array-valued ordered index keys remain guarded. Those architectural and
+component proofs did not activate original corpus cases: at that stage the
+audit remained 448 implemented / 136 rejected / 73 superseded / 929 unresolved.
 
 ### Shared scalar work and cancellation ownership
 
@@ -929,7 +964,7 @@ guard prevents regeneration from silently removing them. The array-result
 original `sql-0561` is independently reconciled using PostgreSQL binary results,
 preserving dimensions, lower bounds, exact element OIDs and SQL NULL flags.
 The oracle rejects unsupported array element types instead of flattening them.
-The read golden now verifies 85 exact original contracts. `--include` can extend
+The read golden now verifies 91 exact original contracts. `--include` can extend
 a checked golden only when every existing contract still matches; unknown or
 duplicate IDs and rejected originals fail closed. Broader array architecture
 tests do not independently grant original-case disposition credit.

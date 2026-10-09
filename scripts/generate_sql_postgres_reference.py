@@ -53,6 +53,7 @@ ROW_LIMIT = 4096
 # expose the entire eligible peer frontier, so LIMIT cannot make PostgreSQL's
 # arbitrary tie selection into a false requirement for the native engine.
 ORDER_OBSERVERS = {
+    "sql-0195": "SELECT id, jsonb_array_length(metadata->'flags') AS flag_count, jsonb_array_length(metadata->'flags') AS order_key FROM usage_records WHERE jsonb_array_length(metadata->'flags') > 0 ORDER BY order_key DESC",
     "sql-0205": "SELECT id, created_at AS order_key FROM usage_records ORDER BY created_at DESC OFFSET 2",
     "sql-0206": "SELECT id, created_at AS order_key FROM usage_records ORDER BY created_at DESC",
     "sql-0233": "SELECT id, ceil(least(amount,quantity,100)) AS order_key FROM usage_records WHERE floor(round(abs(amount-quantity))) > $1 ORDER BY order_key",
@@ -489,7 +490,7 @@ def execute(db, case, read=False):
     import psycopg
 
     if re.search(
-        r"\b(CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|random|randomblob)\b",
+        r"\b(CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|random|randomblob)\b|\b(now|transaction_timestamp|statement_timestamp|clock_timestamp|timeofday)\s*\(",
         case["sql"],
         re.IGNORECASE,
     ):

@@ -214,7 +214,7 @@ pub const EvalLimits = struct {
     regex_checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
     regex_context: ?*anyopaque = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat, jsonb_exists_any, jsonb_exists_all, regexp_like, regexp_count, regexp_instr, regexp_substr, regexp_replace, jsonb_array_length, initcap };
 
 fn regexFunction(function: Function) ?regex_functions.Function {
     return switch (function) {
@@ -1580,6 +1580,7 @@ pub fn statementConstant(node: *const ast.Scalar) bool {
 }
 
 fn functionId(name: []const u8) !Function {
+    if (std.mem.eql(u8, name, "$regex_operator")) return .regexp_like;
     inline for (@typeInfo(Function).@"enum".field_names, @typeInfo(Function).@"enum".field_values) |reflected_name, field_value| if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(field_value);
     if (std.mem.eql(u8, name, "char_length") or std.mem.eql(u8, name, "character_length")) return .length;
     if (std.mem.eql(u8, name, "ceiling")) return .ceil;
@@ -1980,7 +1981,7 @@ fn arity(function: Function, count: usize) !void {
         .jsonb_set => count == 3 or count == 4,
         .@"$array" => true,
         .@"$array_quantified" => count == 4,
-        .cardinality, .array_ndims => count == 1,
+        .cardinality, .array_ndims, .jsonb_array_length, .initcap => count == 1,
         .array_length, .array_lower, .array_upper => count == 2,
         .ai_decide, .ai_probability => count == 3,
         .ai_choice, .ai_score => count == 4,
@@ -1998,7 +1999,7 @@ fn arity(function: Function, count: usize) !void {
         .coalesce, .greatest, .least => count > 0,
         .concat => count > 0,
     };
-    if (!valid) return if (arrayCompatibleFunction(function) or function == .jsonb_exists_any or function == .jsonb_exists_all) error.SqlUndefinedFunction else error.InvalidSqlParameters;
+    if (!valid) return if (arrayCompatibleFunction(function) or function == .jsonb_exists_any or function == .jsonb_exists_all or function == .jsonb_array_length or function == .initcap) error.SqlUndefinedFunction else error.InvalidSqlParameters;
 }
 
 const Binder = struct {
@@ -2140,7 +2141,7 @@ const Binder = struct {
                     .not, .is_true, .is_not_true, .is_false, .is_not_false, .is_unknown, .is_not_unknown => if (input.kind != null and input.kind != .boolean) return error.SqlTypeMismatch,
                     else => {},
                 }
-                break :blk .{ .kind = .boolean, .nullable = unary.op == .not and input.nullable };
+                break :blk .{ .kind = .boolean, .element_type = .boolean, .nullable = unary.op == .not and input.nullable };
             },
             .binary => |binary| blk: {
                 if (try self.arrayConcatenation(binary, depth)) |call| break :blk try self.infer(call, depth + 1);
@@ -2170,7 +2171,7 @@ const Binder = struct {
                     .@"and", .@"or" => if (merged.kind != null and merged.kind != .boolean) return error.SqlTypeMismatch,
                     else => {},
                 }
-                break :blk .{ .kind = if (binary.op == .concat) .string else .boolean, .nullable = if (binary.op == .is_distinct or binary.op == .is_not_distinct) false else merged.nullable };
+                break :blk .{ .kind = if (binary.op == .concat) .string else .boolean, .element_type = if (binary.op == .concat) .text else .boolean, .nullable = if (binary.op == .is_distinct or binary.op == .is_not_distinct) false else merged.nullable };
             },
             .call => |call| blk: {
                 if (call.subquery != null or call.window != null or call.star or call.distinct or call.filter != null or call.within_group != null) return error.UnsupportedSqlShape;
@@ -2181,6 +2182,14 @@ const Binder = struct {
                 }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
+                if (function == .jsonb_array_length or function == .initcap) {
+                    const arg = call.args[0];
+                    const actual = try self.infer(arg, depth + 1);
+                    const desired: ast.ColumnType = if (function == .initcap) .string else .json;
+                    const unknown = arg.* == .literal and arg.literal == .string;
+                    if (actual.kind != null and actual.kind != desired and !unknown) return error.SqlUndefinedFunction;
+                    break :blk .{ .kind = if (function == .initcap) .string else .integer, .element_type = if (function == .initcap) .text else .int32, .nullable = actual.nullable };
+                }
                 if (arrayCompatibleFunction(function)) {
                     const element = try self.arrayCompatibleElement(call, function, depth);
                     break :blk .{ .kind = if (function == .array_position) .integer else .array, .element_type = if (function == .array_position or function == .array_positions) .int32 else element, .nullable = true };
@@ -2664,7 +2673,8 @@ const Binder = struct {
                         .@"$array_pattern_quantified" => if (i == 0) .string else if (i == 1) .array else .boolean,
                         .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with, .strpos, .bit_length, .reverse, .translate, .ascii => .string,
                         .concat_ws => if (i == 0) .string else null,
-                        .jsonb_typeof => .json,
+                        .jsonb_typeof, .jsonb_array_length => .json,
+                        .initcap => .string,
                         .substring, .repeat, .left, .right => if (i == 0) .string else .integer,
                         .split_part => if (i == 2) .integer else .string,
                         .overlay => if (i < 2) .string else .integer,
@@ -2678,6 +2688,12 @@ const Binder = struct {
                         else => kind.kind,
                     };
                     const actual = try self.infer(arg, depth + 1);
+                    if (function == .jsonb_array_length and arg.* == .literal and arg.literal == .string) {
+                        const coercion = try self.alloc.create(ast.Scalar);
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = .json, .element_type = .jsonb } };
+                        out.* = try self.compileArrayContext(coercion, .json, .jsonb, depth + 1);
+                        continue;
+                    }
                     if (((function == .jsonb_set and i < 3) or function == .jsonb_exists_any or function == .jsonb_exists_all) and arg.* == .literal and arg.literal == .string) {
                         const coercion = try self.alloc.create(ast.Scalar);
                         coercion.* = .{ .cast = .{ .operand = arg, .type = desired.?, .element_type = if (i == 1) .text else null } };
@@ -3375,6 +3391,16 @@ const Evaluator = struct {
                         const changed = try @import("json_path_update.zig").set(self.alloc, target.value, path.array orelse return error.SqlTypeMismatch, replacement.value, create.value.bool, self.limits.output_bytes -| self.bytes, &work);
                         try self.charge(changed.allocated_bytes);
                         break :blk Datum.json(changed.value);
+                    },
+                    .jsonb_array_length => {
+                        const datum = try self.runDatum(call.args[0], depth + 1);
+                        if (datum.sql_null) break :blk .{};
+                        // JSON null is a scalar error, not SQL NULL. The
+                        // immutable parsed array already owns its cardinality;
+                        // neither contents nor nested arrays need scanning.
+                        if (datum.array != null or datum.value != .array) return error.InvalidSqlParameters;
+                        const count = std.math.cast(i32, datum.value.array.items.len) orelse return error.SqlNumericOutOfRange;
+                        break :blk Datum.json(.{ .integer = count });
                     },
                     .jsonb_typeof => {
                         const datum = try self.runDatum(call.args[0], depth + 1);
@@ -4237,6 +4263,26 @@ const Evaluator = struct {
                 const position = std.mem.indexOf(u8, text_value, values[1].string) orelse break :blk .{ .integer = 0 };
                 break :blk .{ .integer = @intCast((std.unicode.utf8CountCodepoints(text_value[0..position]) catch return error.SqlTypeMismatch) + 1) };
             },
+            .initcap => blk: {
+                try self.charge(text_value.len);
+                const output = try self.alloc.alloc(u8, text_value.len);
+                errdefer self.alloc.free(output);
+                var in_word = false;
+                var offset: usize = 0;
+                while (offset < text_value.len) {
+                    const end = offset + @min(256, text_value.len - offset);
+                    try self.workOwner().charge(end - offset);
+                    // PostgreSQL C collation uses ASCII word characters.
+                    // UTF-8 bytes remain unchanged and form word boundaries;
+                    // digits continue words but have no case.
+                    for (text_value[offset..end], output[offset..end]) |byte, *out| {
+                        out.* = if (in_word) std.ascii.toLower(byte) else std.ascii.toUpper(byte);
+                        in_word = std.ascii.isAlphanumeric(byte);
+                    }
+                    offset = end;
+                }
+                break :blk .{ .string = output };
+            },
             .lower, .upper => blk: {
                 try self.charge(text_value.len);
                 const output = try self.alloc.dupe(u8, text_value);
@@ -4599,6 +4645,98 @@ test "SQL PostgreSQL text reference preserves Unicode slicing replacement and er
             try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(arena.allocator(), expected, .{}), try std.json.Stringify.valueAlloc(arena.allocator(), actual.value, .{}));
         }
     }
+}
+
+test "SQL PostgreSQL scalar kernels preserve JSON cardinality text casing signatures and errors" {
+    const a = std.testing.allocator;
+    const Golden = struct { entries: []const struct { sql: []const u8, value: Json = .null, oid: ?u32 = null, @"error": ?[]const u8 = null } };
+    const fixture = try std.json.parseFromSlice(Golden, a, @embedFile("fixtures/sql_scalar_kernel_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    for (fixture.value.entries) |case| {
+        errdefer std.debug.print("scalar kernel fixture: {s}\n", .{case.sql});
+        var compiled = @import("compiler.zig").compileScalar(a, case.sql, .{}) catch |err| {
+            try std.testing.expectEqualStrings(case.@"error" orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        defer compiled.deinit();
+        var program = bind(a, compiled.expression, &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(case.@"error" orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const actual = program.evaluate(arena.allocator(), &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(case.@"error" orelse return err, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        try std.testing.expect(case.@"error" == null);
+        try std.testing.expectEqual(if (case.oid.? == 23) arrays.ElementType.int32 else .text, program.output_type.element_type.?);
+        try std.testing.expectEqual(case.value == .null, actual.sql_null);
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(arena.allocator(), case.value, .{}), try std.json.Stringify.valueAlloc(arena.allocator(), actual.value, .{}));
+    }
+}
+
+test "SQL JSON cardinality reads parsed arrays without allocation or element work" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "jsonb_array_length(doc)", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "doc", .type = .json, .element_type = .jsonb }}, &.{}, .{});
+    defer program.deinit();
+    var cells: [16 * 1024]Json = @splat(.null);
+    const input = Datum.json(.{ .array = .fromOwnedSlice(a, &cells) });
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    for (0..10000) |_| {
+        const result = try program.evaluate(none.allocator(), &.{input}, &.{}, .{ .steps = 16 });
+        try std.testing.expectEqual(@as(i64, cells.len), result.value.integer);
+    }
+    try std.testing.expectEqual(@as(usize, 0), none.end_index);
+    const missing = try program.evaluate(none.allocator(), &.{.{}}, &.{}, .{});
+    try std.testing.expect(missing.sql_null);
+    try std.testing.expectError(error.InvalidSqlParameters, program.evaluate(none.allocator(), &.{Datum.json(.null)}, &.{}, .{}));
+}
+
+test "SQL initcap uses one bounded output allocation with cancellation and OOM cleanup" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "initcap(s)", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "s", .type = .string }}, &.{}, .{});
+    defer program.deinit();
+    const input = "hELLO 1FOO éABC";
+    var bytes: [input.len]u8 = undefined;
+    var output = std.heap.FixedBufferAllocator.init(&bytes);
+    const result = try program.evaluate(output.allocator(), &.{Datum.json(.{ .string = input })}, &.{}, .{});
+    try std.testing.expectEqualStrings("Hello 1foo éAbc", result.value.string);
+    try std.testing.expectEqual(input.len, output.end_index);
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    try std.testing.expectError(error.OutOfMemory, program.evaluate(none.allocator(), &.{Datum.json(.{ .string = input })}, &.{}, .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(none.allocator(), &.{Datum.json(.{ .string = input })}, &.{}, .{ .output_bytes = input.len - 1 }));
+    const Control = struct {
+        calls: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            if (self.calls == 2) return error.QueryCanceled;
+        }
+    };
+    const wide: [4096]u8 = @splat('A');
+    var control: Control = .{};
+    // Use the leak-checking allocator directly: cancellation must release the
+    // unpublished output rather than relying on an arena being discarded.
+    try std.testing.expectError(error.QueryCanceled, program.evaluate(a, &.{Datum.json(.{ .string = &wide })}, &.{}, .{ .checkpoint = Control.check, .checkpoint_context = &control }));
+    try std.testing.expectEqual(@as(usize, 2), control.calls);
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            var expression = try @import("compiler.zig").compileScalar(alloc, "initcap($1)", .{});
+            defer expression.deinit();
+            var bound = try bind(alloc, expression.expression, &.{}, &.{}, .{});
+            defer bound.deinit();
+            const value = try bound.evaluate(alloc, &.{}, &.{.{ .string = "héLLO😀wORLD" }}, .{});
+            defer alloc.free(value.value.string);
+            try std.testing.expectEqualStrings("HéLlo😀World", value.value.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
 }
 
 test "SQL UTF8 text transforms bound work allocation and parameter types" {
