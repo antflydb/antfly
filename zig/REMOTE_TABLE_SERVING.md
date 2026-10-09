@@ -1202,6 +1202,11 @@ legacy ordinals, stay raw. `ASPSSEG1`, `ASPSPG01` and raw block readers remain
 supported. Native sparse recipe v8 and catalog definition v9 fence older remote
 publications for rebuild. Physical mappings and visibility checks use bounded
 cursor leases; live-row rank/select caches use four reusable fixed buffers.
+Visibility lanes retain their lower-bound result and proven missing interval,
+including EOF. Requests within that interval reuse the lease; backward requests
+outside it seek again. Absent tombstone or epoch families therefore do not restart
+an LSM merge cursor for every candidate. Disk-proof capture uses independent
+epoch and deletion lanes to preserve forward locality across both families.
 
 Compaction pins inputs and reserves a durable intent under the apply gate. Modern
 proof capture, merging, directory spooling and staging run outside that gate.
