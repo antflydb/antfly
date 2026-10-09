@@ -13587,6 +13587,13 @@ pub const ApiHttpServer = struct {
         return source.commitBatchWithCancellation(alloc, signed, sync_level, request.cancellation);
     }
 
+    /// Only use at read-only preparation boundaries, never around commit.
+    /// Generic catalog unavailability after admission does not prove abort.
+    fn precommitIntegrityPreparationError(err: anyerror) anyerror {
+        const classified = @import("antfly_local_sources").api_relational_integrity_commit.preparationError(err);
+        return if (classified == error.IntegrityCatalogUnavailable) error.PreDecisionReadUnavailable else classified;
+    }
+
     fn commitPublicTableBatchWithIntegrity(
         self: *ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -13672,7 +13679,7 @@ pub const ApiHttpServer = struct {
             integrity.prepareRepair(alloc, reader, snapshot.tables, snapshot.ranges, tables[0], preparation_request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err
         else blk: {
             const optimistic = integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request) catch |err| {
-                if (err != error.PreparedGenerationChanged) return err;
+                if (err != error.PreparedGenerationChanged) return precommitIntegrityPreparationError(err);
                 // Preparation only reads and owns speculative commands; no
                 // transaction has begun. Rebind the entire plan once against
                 // a read-indexed catalog, under the original deadline.
@@ -13682,7 +13689,7 @@ pub const ApiHttpServer = struct {
                 if (!try integrity.metadataRequiresCoordination(alloc, snapshot.tables, tables)) {
                     return self.commitPublicBatchWithPolicy(alloc, source, tables, snapshot.tables, sync_level, request);
                 }
-                break :blk try integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request);
+                break :blk integrity.prepareWithCoverageControlled(alloc, reader, snapshot.tables, snapshot.ranges, tables, preparation_request) catch |read_err| return precommitIntegrityPreparationError(read_err);
             };
             break :blk optimistic;
         };
@@ -13693,7 +13700,7 @@ pub const ApiHttpServer = struct {
         ensureTableOperationActive(request) catch |err| return if (err == error.DeadlineExceeded) error.PreDecisionDeadlineExceeded else err;
         try self.authorizeIntegrityMutations(request, prepared.tables);
         if (request.relational_recovery == .none) {
-            integrity.rejectDefiniteConflicts(alloc, reader, snapshot.tables, snapshot.ranges, prepared.tables, preparation_request) catch |err| return integrity.preparationError(err);
+            integrity.rejectDefiniteConflicts(alloc, reader, snapshot.tables, snapshot.ranges, prepared.tables, preparation_request) catch |err| return precommitIntegrityPreparationError(err);
         }
         return self.commitPublicBatchWithPolicy(alloc, source, prepared.tables, snapshot.tables, sync_level, request);
     }
@@ -13822,6 +13829,7 @@ pub const ApiHttpServer = struct {
             // a durable abort. Unlike generic 503, the batch cannot later
             // commit, so callers may safely retry with a new attempt.
             error.TransactionPrepareAbortedUnavailable => return error.WriteDefinitelyAbortedUnavailable,
+            error.PreDecisionReadUnavailable => return error.WritePrecommitReadUnavailable,
             // Coverage is checked before coordinator admission. Preserve that
             // definite result instead of the generic unknown-write 503.
             error.ConstraintActivationPending => return error.ConstraintActivationUnavailable,
@@ -39886,6 +39894,9 @@ test "api http server coordinated batch outcomes retain prepared names and confl
     const Fake = struct {
         db: *db_mod.DB,
         committed: bool = false,
+        read_failure: ?anyerror = null,
+        commit_failure: ?anyerror = null,
+        commit_calls: usize = 0,
         expected_key: ?[]u8 = null,
         snapshots_released: usize = 0,
         tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 701, .name = "lifetime_rows", .placement_role = "data", .schema_json = public_schema }},
@@ -39904,6 +39915,7 @@ test "api http server coordinated batch outcomes retain prepared names and confl
         }
         fn lookup(ptr: *anyopaque, allocator: std.mem.Allocator, _: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, _: read_gate.ReadConsistency) !?table_reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.read_failure) |err| return err;
             const value = (try self.db.lookup(allocator, key, opts)) orelse return null;
             return .{ .json = value.json, .version = value.version orelse 0, .expected_content_digest = value.expected_content_digest };
         }
@@ -39921,6 +39933,8 @@ test "api http server coordinated batch outcomes retain prepared names and confl
         }
         fn commit(ptr: *anyopaque, _: std.mem.Allocator, tables: []const distributed_txn.TableCommitRequest, _: db_mod.types.SyncLevel) !?distributed_txn.CommitOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.commit_calls += 1;
+            if (self.commit_failure) |err| return err;
             try std.testing.expectEqual(@as(usize, 1), tables.len);
             try std.testing.expectEqual(@as(usize, 1), tables[0].integrity_commands.len);
             // Return the actual arena-owned slices, not copies that could
@@ -39962,6 +39976,17 @@ test "api http server coordinated batch outcomes retain prepared names and confl
         try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
     }
     try std.testing.expectEqual(@as(usize, 2), fake.snapshots_released);
+    const calls = fake.commit_calls;
+    var retained: ?integrity.Prepared = null;
+    defer if (retained) |*prepared| prepared.deinit();
+    fake.read_failure = error.StorageReadTemporarilyUnavailable;
+    try std.testing.expectError(error.PreDecisionReadUnavailable, server.commitPublicTableBatchWithIntegrity(alloc, writer, &requests, .write, .{}, &retained));
+    try std.testing.expect(retained == null);
+    try std.testing.expectEqual(calls, fake.commit_calls);
+    fake.read_failure = null;
+    fake.commit_failure = error.CommitDecisionUnknown;
+    try std.testing.expectError(error.CommitDecisionUnknown, server.commitPublicTableBatchWithIntegrity(alloc, writer, &requests, .write, .{}, &retained));
+    try std.testing.expectEqual(calls + 1, fake.commit_calls);
 }
 
 test "api http server stale no-FK catalog cannot take uncoordinated batch path" {

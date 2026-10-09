@@ -2274,7 +2274,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_diagnostic_tests).step);
     const hosted_cte_runtime_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
-        .filters = &.{ "mounted hosted prepared CTE mutations and recursive read retain owner fences", "hosted CTE MERGE retries only proven precommit read unavailability", "SQL pgwire MERGE completion reports committed affected rows" },
+        .filters = &.{ "mounted hosted prepared CTE mutations and recursive read retain owner fences", "hosted CTE MERGE retries only proven precommit read unavailability", "SQL pgwire MERGE completion reports committed affected rows", "SQL unknown mutation keeps native reconciliation receipt without allocation", "public table batch handler maps write unavailable errors" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-cte-runtime-test", "Run linked hosted prepared CTE and recursive owner-snapshot regression")

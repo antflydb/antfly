@@ -1179,6 +1179,19 @@ hosted test now runs the exact pgwire PREPARE/EXECUTE sequence against that owne
 asserts the `MERGE 1` completion and typed read-back, and retries only a proven
 precommit read-unavailable error. Distributed fault evidence remains missing;
 the case stays unresolved.
+Integrity preparation now preserves its no-admission evidence through the
+public batch response and SQL/pgwire classification. A transient catalog read
+from the read-only preparation or definite-conflict probe emits a specific
+`transaction_precommit_read_unavailable` receipt; SQL reports the shared
+retryable statement-read diagnostic rather than an ambiguous mutation outcome.
+The marker is not inferred from a generic 503 or emitted around commit. Tests
+inject a preparation read failure and assert zero commit calls, then inject
+`CommitDecisionUnknown` from commit and assert it remains unknown. Receipt
+classification rejects contradictory committed statuses or any transaction ID
+(including malformed IDs), and remains allocation-free after native admission.
+The native public-API gate owns the commit-boundary regression; the hosted CTE
+gate includes receipt and public-response regressions without importing a
+physical database. This repair does not complete the distributed fault cases.
 For `sql-0009` and `sql-0010`, the exact prepared recursive CTE read and UPDATE
 now run through authenticated hosted pgwire against a Raft-backed relational
 owner. A parent and child exercise a nontrivial `UNION ALL` delta: the read
