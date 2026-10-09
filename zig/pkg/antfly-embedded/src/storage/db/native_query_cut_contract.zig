@@ -4,6 +4,31 @@ const std = @import("std");
 const Namespace = @import("doc_identity_namespace.zig").Namespace;
 pub const ttl_ms: u64 = 300_000;
 pub const max_ttl_ms: u64 = std.time.ms_per_hour;
+/// Original committed key cover. Group IDs identify logical fanout slots;
+/// namespaces identify immutable physical generations, independently of owners.
+pub const Range = struct {
+    group_id: u64,
+    namespace: Namespace,
+    start_key: []const u8,
+    end_key: ?[]const u8 = null,
+};
+pub const Recipe = struct {
+    schema_json: []const u8,
+    read_schema_json: []const u8,
+    indexes_json: []const u8,
+};
+pub fn validateCover(table_id: u64, cover: []const Range) !void {
+    if (cover.len == 0 or cover.len > 4096 or cover[0].start_key.len != 0 or cover[cover.len - 1].end_key != null) return error.CatalogGenerationChanged;
+    for (cover, 0..) |range, i| {
+        if (range.group_id == 0 or range.namespace.table_id != table_id) return error.CatalogGenerationChanged;
+        for (cover[0..i]) |previous| if (previous.group_id == range.group_id or previous.namespace.eql(range.namespace)) return error.CatalogGenerationChanged;
+        if (range.end_key) |end| if (std.mem.order(u8, range.start_key, end) != .lt) return error.CatalogGenerationChanged;
+        if (i != 0) {
+            const end = cover[i - 1].end_key orelse return error.CatalogGenerationChanged;
+            if (!std.mem.eql(u8, end, range.start_key)) return error.CatalogGenerationChanged;
+        }
+    }
+}
 pub const Request = struct {
     id: []const u8,
     table_id: u64,
@@ -13,10 +38,16 @@ pub const Request = struct {
     /// replacement range, but physical document IDs remain in this namespace.
     origin: ?Namespace = null,
     timeout_ms: ?u64 = null,
+    cover: []const Range = &.{},
+    recipe: ?Recipe = null,
     pub fn namespace(self: Request, owner: Namespace) !Namespace {
         if (owner.table_id != self.table_id) return error.CatalogGenerationChanged;
         const original = self.origin orelse owner;
         if (original.table_id != self.table_id or (self.create and !original.eql(owner))) return error.CatalogGenerationChanged;
+        if (self.create and self.cover.len != 0) {
+            for (self.cover) |range| if (range.namespace.eql(owner)) return original;
+            return error.CatalogGenerationChanged;
+        }
         return original;
     }
     /// Each original generation gets its own virtual/local cache root when
@@ -43,6 +74,10 @@ pub const Request = struct {
     }
     pub fn validate(self: Request, now: u64) !void {
         if (self.id.len != 64 or self.table_id == 0) return error.InvalidQueryRequest;
+        if (self.cover.len != 0) {
+            try validateCover(self.table_id, self.cover);
+            if (self.recipe == null) return error.CatalogGenerationChanged;
+        }
         if (self.origin) |origin| if (origin.table_id != self.table_id) return error.CatalogGenerationChanged;
         for (self.id) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidQueryRequest;
         if (self.expires_ms <= now or self.expires_ms > now +| max_ttl_ms) return error.CatalogGenerationChanged;

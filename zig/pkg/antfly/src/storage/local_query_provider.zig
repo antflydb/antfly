@@ -62,7 +62,41 @@ pub fn execute(
         defer alloc.free(bytes);
         var descriptor = std.json.parseFromSlice(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child, alloc, bytes, .{}) catch |err| return fail(err, .validate_request, out_failure);
         defer descriptor.deinit();
-        retained = live_db.openQueryCut(descriptor.value, requestCancellationToken(request)) catch |err| return fail(err, .validate_request, out_failure);
+        if (!descriptor.value.create and descriptor.value.cover.len > 1) {
+            // The public coordinator sends the original cover to one current
+            // carrier. Physical storage owns all lazy remote generation leases.
+            if (request.kind != .search and request.kind != .preflight) return fail(error.UnsupportedQueryRequest, .validate_request, out_failure);
+            var cover = @import("native_retained_cover.zig").Owner.init(alloc, live_db, table_name, descriptor.value, requestCancellationToken(request)) catch |err| return fail(err, .validate_request, out_failure);
+            defer cover.deinit();
+            const query_json = std.json.Stringify.valueAlloc(alloc, body, .{}) catch |err| return fail(err, .validate_request, out_failure);
+            defer alloc.free(query_json);
+            var owned = query_api.parseQueryRequest(alloc, null, table_name, query_json) catch |err| return fail(err, .validate_request, out_failure);
+            defer owned.deinit(alloc);
+            @import("antfly_local_sources").storage_local_query_controls.applyExecutionOptions(&owned.req, request.execution_options);
+            owned.req.cancellation = requestCancellationToken(request);
+            if (request.has_execution_deadline != 0) owned.req.execution_deadline_ns = request.execution_deadline_ns;
+            if (request.kind == .preflight) {
+                const max_work: u32 = if (parsed.value.object.get("max_work")) |value| if (value == .integer) std.math.cast(u32, value.integer) orelse return fail(error.InvalidQueryRequest, .preflight, out_failure) else return fail(error.InvalidQueryRequest, .preflight, out_failure) else 0;
+                var summary = cover.preflight(alloc, owned.req, max_work) catch |err| return fail(err, .preflight, out_failure);
+                defer summary.deinit(alloc);
+                const summary_bytes = std.json.Stringify.valueAlloc(alloc, summary, .{}) catch |err| return fail(err, .preflight, out_failure);
+                out_response.buffer = .{ .ptr = summary_bytes.ptr, .len = @intCast(summary_bytes.len) };
+                return .ok;
+            }
+            const response = cover.execute(alloc, owned.req) catch |err| return fail(err, executeOperation(request.dialect), out_failure);
+            out_response.* = .{ .buffer = .{ .ptr = response.json.ptr, .len = @intCast(response.json.len) }, .identity_read_generation = response.identity_read_generation orelse 0, .has_identity_read_generation = @intFromBool(response.identity_read_generation != null) };
+            return .ok;
+        }
+        var direct = descriptor.value;
+        if (!direct.create and direct.cover.len == 1) {
+            // One original range needs one physical executor. Keep its origin
+            // namespace while avoiding a nested coordinator and duplicate work
+            // accounting. This also retains native readonly-backend handling.
+            direct.origin = direct.cover[0].namespace;
+            direct.cover = &.{};
+            direct.recipe = null;
+        }
+        retained = live_db.openQueryCut(direct, requestCancellationToken(request)) catch |err| return fail(err, .validate_request, out_failure);
     };
     const db: *db_mod.DB = if (retained) |*cut| cut else live_db;
 

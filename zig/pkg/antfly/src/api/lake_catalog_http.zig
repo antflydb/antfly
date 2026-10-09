@@ -120,10 +120,10 @@ fn encode(a: A, result: configured.CatalogResult, state: ?[]const u8, id: []cons
 }
 pub fn errorStatus(err: anyerror) u16 {
     return switch (err) {
-        error.Forbidden, error.LakeCatalogForbidden, error.ExternalLakeReadOnly, error.UnsupportedExternalLakeCredentialRef, error.LakeVacuumOwnershipRequired => 403,
+        error.Forbidden, error.LakeCatalogForbidden, error.ExternalLakeReadOnly, error.UnsupportedExternalLakeCredentialRef, error.LakeVacuumOwnershipRequired, error.LakeVacuumCatalogCoordinationRequired => 403,
         error.LakeTableNotFound, error.TableNotFound => 404,
-        error.TableGenerationChanged, error.LakeCommitConflict, error.LakeCommitIdReused, error.LakeRelocationRequired, error.WalIdempotencyConflict, error.LakeCheckpointConflict, error.LakeSourceConflict, error.LakeMaintenanceAlreadyStarted => 409,
-        error.InvalidLakeChangeBatch, error.InvalidLakeRow, error.UnsupportedLakeWriteType, error.LakeWriteTooLarge, error.InvalidLakeMaintenanceLimits => 400,
+        error.TableGenerationChanged, error.LakeCommitConflict, error.LakeCommitIdReused, error.LakeRelocationRequired, error.WalIdempotencyConflict, error.LakeCheckpointConflict, error.LakeSourceConflict, error.LakeMaintenanceAlreadyStarted, error.LakeObjectStillReferenced => 409,
+        error.InvalidLakeChangeBatch, error.InvalidLakeRow, error.UnsupportedLakeWriteType, error.LakeWriteTooLarge, error.InvalidLakeMaintenanceLimits, error.InvalidLakeMaintenanceProvider, error.InvalidLakeRetirement, error.LakeObjectRetired => 400,
         error.InvalidLakeCatalog, error.InvalidLakeMetadata, error.InvalidLakeCommit, error.UnsupportedLakeRequirement, error.UnsupportedLakeUpdate, error.UnsupportedLakeFormatVersion, error.LakeMetadataTooLarge, error.UnexpectedToken, error.UnknownField, error.MissingField => 400,
         error.DeadlineExceeded, error.Timeout => 504,
         else => 503,

@@ -119,6 +119,7 @@ pub const CatalogOperation = union(enum) {
     load,
     create: lake_catalog.types.Commit,
     commit: lake_catalog.types.Commit,
+    retire: lake_catalog.managed.Retirement,
     resolve: struct { id: []const u8, hash: []const u8 },
 };
 pub const CatalogResult = union(enum) {
@@ -133,7 +134,7 @@ pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, o
     try context.ensureActive();
     try binding.validateSupported();
     const config = binding.catalog orelse return error.InvalidLakeCatalog;
-    const mutation = operation == .create or operation == .commit;
+    const mutation = operation == .create or operation == .commit or operation == .retire;
     if (mutation and binding.write_policy != .iceberg_writer) return error.ExternalLakeReadOnly;
     var source_options = options;
     source_options.read_only = !mutation or config.type == .rest;
@@ -180,11 +181,52 @@ pub fn executeLakeCatalogAlloc(a: Allocator, binding: catalog_binding.Binding, o
     catalog = .{ .rest = .{ .config = config, .transport = transport.transport(), .context = context, .journal = journal, .now_ms = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms) } };
     return executeCatalog(a, &catalog, operation);
 }
+/// Invoke a separately authorized provider maintenance controller. Antfly never
+/// deletes external-catalog files through its ordinary source credentials.
+pub fn executeExternalMaintenanceAlloc(a: Allocator, binding: catalog_binding.Binding, options: BindingObjectStoreOpenOptions, context: lake_catalog.types.Context, uuid: []const u8, metadata_location: []const u8, protected: []const []const u8, policy: lake_catalog.maintenance.Policy) ![]u8 {
+    try context.ensureActive();
+    try binding.validateSupported();
+    if (binding.write_policy != .iceberg_writer) return error.ExternalLakeReadOnly;
+    const config = binding.catalog orelse return error.InvalidLakeCatalog;
+    if (config.type != .rest) return error.InvalidLakeMaintenanceProvider;
+    const integration = config.maintenance orelse return error.LakeVacuumCatalogCoordinationRequired;
+    try integration.validate();
+    const node = options.node_config orelse return error.LakeCatalogConnectionRequired;
+    const connection = node.connections.get(integration.connection) orelse return error.LakeCatalogConnectionRequired;
+    if (connection.kind != .external_io or !hasConnectionCapability(connection, "lake_maintenance")) return error.LakeCatalogForbidden;
+    const external = connection.external_io orelse return error.LakeCatalogForbidden;
+    if (external.protocol != .http) return error.LakeCatalogForbidden;
+    try ensureCatalogOriginAllowed(integration.uri, external.hosts);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var headers: std.ArrayList([2][]const u8) = .empty;
+    var header_it = external.headers.iterator();
+    while (header_it.next()) |entry| {
+        const value = try common_secrets.resolveReferenceOwned(scratch, options.secret_store, entry.value_ptr.*);
+        if (std.mem.indexOfAny(u8, value, "\r\n\x00") != null or std.mem.indexOfAny(u8, entry.key_ptr.*, "\r\n\x00") != null) return error.LakeCatalogForbidden;
+        if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Idempotency-Key") or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Host") or std.ascii.eqlIgnoreCase(entry.key_ptr.*, "Content-Length")) return error.LakeCatalogForbidden;
+        try headers.append(scratch, .{ entry.key_ptr.*, value });
+    }
+    var opened = try openNativeArtifactObjectStoreAlloc(a, node, options.secret_store, false);
+    defer opened.deinit();
+    const identity = try std.json.Stringify.valueAlloc(scratch, .{ .source = binding.source_uri, .catalog = config, .uuid = uuid }, .{});
+    const journal_prefix = try std.fmt.allocPrint(scratch, "{s}/lake-provider-maintenance/{d}/{d}/{s}", .{ opened.prefix, options.catalog_table_id, options.catalog_generation, lake_catalog.types.digestHex(identity) });
+    const reader_prefix = try @import("lake_snapshot_pins.zig").namespace(scratch, opened.prefix, binding, uuid);
+    var io_impl: ?std.Io.Threaded = if (context.io == null) std.Io.Threaded.init(a, .{}) else null;
+    defer if (io_impl) |*io| io.deinit();
+    var http = @import("httpx").Client.initWithConfig(a, context.io orelse io_impl.?.io(), .{ .keep_alive = false, .cookies_enabled = false, .max_response_size = 16384, .timeouts = .{ .connect_ms = 10_000, .read_ms = 30_000, .write_ms = 30_000 } });
+    defer http.deinit();
+    var transport: lake_catalog.rest.HttpTransport = .{ .client = &http, .headers = headers.items };
+    const controller: lake_catalog.maintenance.Controller = .{ .config = integration, .catalog = config, .transport = transport.transport(), .journal = .{ .client = opened.client, .bucket = opened.bucket, .prefix = journal_prefix }, .context = context };
+    return controller.run(a, binding.source_uri, uuid, metadata_location, protected, .{ .connection = node.storage.artifacts.connection.?, .bucket = opened.bucket, .prefix = reader_prefix }, policy);
+}
 fn executeCatalog(a: Allocator, catalog: *lake_catalog.Catalog, operation: CatalogOperation) !CatalogResult {
     return switch (operation) {
         .load => .{ .table = try catalog.load(a) },
         .create => |c| .{ .table = try catalog.create(a, c.id, c.body, c.timestamp_ms) },
         .commit => |c| .{ .table = try catalog.commit(a, c) },
+        .retire => |r| .{ .table = try catalog.retire(a, r) },
         .resolve => |c| .{ .outcome = try catalog.resolve(a, c.id, c.hash) },
     };
 }

@@ -271,20 +271,90 @@ class RestAuthority(BaseHTTPRequestHandler):
             )
 
 
+class MaintenanceAuthority(RestAuthority):
+    """Antfly controller-protocol fixture; does not qualify vendor GC tooling."""
+
+    def do_GET(self):
+        if self.path != "/v1/antfly/maintenance/capabilities":
+            return super().do_GET()
+        return self.respond(
+            200,
+            {
+                "protocol": 1,
+                "provider": self.server.provider,
+                "catalog_uri": self.server.origin,
+                "writer_fencing": not self.server.unsafe,
+                "external_reader_protection": True,
+                "native_reader_registry": True,
+                "immutable_retirement": True,
+                "idempotent_jobs": True,
+                "nessie_references": self.server.provider == "nessie",
+                "polaris_table_roots": self.server.provider == "polaris",
+            },
+        )
+
+    def do_POST(self):
+        if not self.path.startswith("/v1/antfly/maintenance/jobs/"):
+            return super().do_POST()
+        raw = self.rfile.read(int(self.headers["Content-Length"]))
+        digest = hashlib.sha256(raw).hexdigest()
+        assert self.path.endswith(digest)
+        assert self.headers["Idempotency-Key"] == digest
+        body = json.loads(raw)
+        assert body["provider"] == self.server.provider
+        assert body["reader_registry"]["connection"] == "objects"
+        assert body["reader_registry"]["protocol"] == "antfly-snapshot-pins-v1"
+        previous = self.server.jobs.setdefault(digest, raw)
+        assert previous == raw
+        self.server.submissions += 1
+        return self.respond(
+            200,
+            {
+                "protocol": 1,
+                "provider": self.server.provider,
+                "operation_id": body["operation_id"],
+                "request_hash": digest,
+                "table_uuid": body["table_uuid"],
+                "state": "complete",
+                "expired_snapshots": 0,
+                "eligible_objects": 0,
+                "deleted_objects": 0,
+                "retained_objects": 0,
+            },
+        )
+
+
+@pytest.mark.parametrize("provider", ["nessie", "polaris"])
+def test_external_maintenance_controller_protocol_and_restart(tmp_path, provider):
+    test_native_catalog_file_commit_read_and_restart(
+        tmp_path, "rest", False, maintenance_provider=provider
+    )
+
+
 @pytest.mark.parametrize("mode", ["managed", "rest"])
 @pytest.mark.parametrize("native_rows", [False, True, "delete_first", "overlay"])
-def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows):
+def test_native_catalog_file_commit_read_and_restart(
+    tmp_path, mode, native_rows, maintenance_provider=None
+):
     binary = os.environ.get("ANTFLY_NATIVE_BINARY")
     if not binary:
         pytest.skip("set ANTFLY_NATIVE_BINARY for native HTTP qualification")
     port = free_port()
     root = tmp_path / "warehouse"
     root.mkdir()
-    authority = ThreadingHTTPServer(("127.0.0.1", 0), RestAuthority)
+    authority = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        MaintenanceAuthority if maintenance_provider else RestAuthority,
+    )
     authority.metadata, authority.revision, authority.root = None, 0, root
     authority.location = ""
     threading.Thread(target=authority.serve_forever, daemon=True).start()
     origin = f"http://127.0.0.1:{authority.server_port}"
+    authority.origin = origin
+    authority.provider = maintenance_provider
+    authority.unsafe = False
+    authority.jobs = {}
+    authority.submissions = 0
     storage_connection = {
         "kind": "external_io",
         "capabilities": ["lake_read", "lake_write", "storage.primary"],
@@ -326,6 +396,17 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
             "uri": origin,
             "namespace": ["hackernews"],
             "name": "items",
+        }
+    if maintenance_provider:
+        config["connections"]["maintenance"] = {
+            "kind": "external_io",
+            "capabilities": ["lake_maintenance"],
+            "external_io": {"protocol": "http", "hosts": [origin]},
+        }
+        catalog_config["maintenance"] = {
+            "provider": maintenance_provider,
+            "connection": "maintenance",
+            "uri": origin,
         }
     warehouse = "s3://archive/hn"
 
@@ -1427,6 +1508,30 @@ def test_native_catalog_file_commit_read_and_restart(tmp_path, mode, native_rows
                     ]
                     == progress["last_result"]
                 )
+        if maintenance_provider:
+            request = {
+                "action": "vacuum",
+                "operation_id": "provider-wire-job",
+                "dry_run": False,
+            }
+            first = call("POST", "/tables/hn/lake/maintenance", request)
+            assert first["complete"] and first["delegated"], first
+            assert first["provider"] == maintenance_provider
+            assert first["provider_state"] == "complete"
+            original_body = next(iter(authority.jobs.values()))
+            catalog.load_table("hackernews.items").transaction().set_properties(
+                {"qualification.after-provider-job": "preserved"}
+            ).commit_transaction()
+            stop()
+            start()
+            assert call("POST", "/tables/hn/lake/maintenance", request) == first
+            assert next(iter(authority.jobs.values())) == original_body
+            assert authority.submissions == 2
+            authority.unsafe = True
+            with pytest.raises(HTTPError) as unsafe:
+                call("POST", "/tables/hn/lake/maintenance", request)
+            assert unsafe.value.code == 403
+            assert authority.submissions == 2
     finally:
         if process and process.poll() is None:
             stop()

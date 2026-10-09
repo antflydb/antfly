@@ -211,3 +211,92 @@ test "lake catalog REST preserves definitive rejection across restart without re
     defer accepted.deinit(a);
     try std.testing.expectEqual(@as(usize, 2), fake.post_calls);
 }
+
+test "lake catalog retirement is a durable HEAD fence and prevents resurrection after reopen" {
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var faults = storage.ScriptedFaultClient.init(a, memory.client());
+    defer faults.deinit();
+    var catalog: managed.Managed = .{ .client = faults.client(), .bucket = "archive", .prefix = "hn", .source_uri = "gs://archive/hn" };
+    var initial = try catalog.create(a, "create", create_request, 1);
+    defer initial.deinit(a);
+    var parent = try catalog.load(a);
+    defer parent.deinit(a);
+    const dead = "gs://archive/hn/metadata/list.avro";
+    const request: managed.Retirement = .{ .id = "retirement", .expected_metadata_location = parent.metadata_location, .expected_version = parent.version.?, .objects = &.{dead} };
+    faults.put_filter = .{ .ptr = &faults, .matches = struct {
+        fn matches(_: *anyopaque, _: []const u8, key: []const u8, _: []const u8) bool {
+            return std.mem.endsWith(u8, key, "/head.json");
+        }
+    }.matches };
+    faults.next_put = .{ .commit_then_fail = error.ConnectionResetByPeer };
+    var retired = try catalog.retire(a, request);
+    defer retired.deinit(a);
+    try std.testing.expect(retired.retirement_root != null);
+    var current = try catalog.load(a);
+    defer current.deinit(a);
+    try std.testing.expectEqualStrings(parent.metadata_location, current.metadata_location);
+    try std.testing.expect(!std.mem.eql(u8, parent.version.?, current.version.?));
+    var reopened = catalog;
+    var replay = try reopened.retire(a, request);
+    defer replay.deinit(a);
+    try std.testing.expectEqual(retired.retirement_root.?, replay.retirement_root.?);
+    const c: types.Commit = .{ .id = "resurrection", .expected_metadata_location = current.metadata_location, .body = updates, .timestamp_ms = 2 };
+    try std.testing.expectError(error.LakeObjectRetired, reopened.commit(a, c));
+    // Even a harmless metadata writer cannot erase the retirement set.
+    const harmless: types.Commit = .{ .id = "properties", .expected_metadata_location = current.metadata_location, .body = "{\"requirements\":[],\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"owner\":\"HN\"}}]}", .timestamp_ms = 3 };
+    var changed = try reopened.commit(a, harmless);
+    defer changed.deinit(a);
+    var after = try reopened.load(a);
+    defer after.deinit(a);
+    try std.testing.expectEqual(retired.retirement_root.?, after.retirement_root.?);
+    const stale: managed.Retirement = .{ .id = "stale-retirement", .expected_metadata_location = parent.metadata_location, .expected_version = parent.version.?, .objects = &.{"gs://archive/hn/data/other.parquet"} };
+    try std.testing.expectError(error.LakeCommitConflict, reopened.retire(a, stale));
+}
+
+test "lake catalog retirement rejects live files and fences staged writers that predate GC" {
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var faults = storage.ScriptedFaultClient.init(a, memory.client());
+    defer faults.deinit();
+    var catalog: managed.Managed = .{ .client = faults.client(), .bucket = "archive", .prefix = "hn", .source_uri = "gs://archive/hn" };
+    var initial = try catalog.create(a, "create", create_request, 1);
+    defer initial.deinit(a);
+    var parent = try catalog.load(a);
+    defer parent.deinit(a);
+    const writer: types.Commit = .{ .id = "pending-writer", .expected_metadata_location = parent.metadata_location, .body = "{\"requirements\":[],\"updates\":[{\"action\":\"set-properties\",\"updates\":{\"writer\":\"pending\"}}]}", .timestamp_ms = 2 };
+    faults.put_filter = .{ .ptr = &faults, .matches = struct {
+        fn matches(_: *anyopaque, _: []const u8, key: []const u8, _: []const u8) bool {
+            return std.mem.endsWith(u8, key, "/head.json");
+        }
+    }.matches };
+    faults.next_put = .{ .fail_before = error.ConnectionResetByPeer };
+    try std.testing.expectError(error.LakeCommitOutcomeUnknown, catalog.commit(a, writer));
+    var proof = try catalog.retire(a, .{ .id = "GC", .expected_metadata_location = parent.metadata_location, .expected_version = parent.version.?, .objects = &.{"gs://archive/hn/data/dead.parquet"} });
+    defer proof.deinit(a);
+    try std.testing.expectError(error.LakeCommitConflict, catalog.commit(a, writer));
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var current = try catalog.load(a);
+    defer current.deinit(a);
+    const row = try metadata.parse(scratch, "{\"title\":\"live\"}");
+    const files: @import("row_commit.zig").Files = .{ .client = memory.client(), .bucket = "archive", .prefix = "hn", .uri = "gs://archive/hn" };
+    const built = try @import("row_commit.zig").prepare(scratch, current, files, .{ .batch_id = "batch", .source = "source", .epoch = "epoch", .checkpoint = "one", .key_fields = &.{"title"}, .changes = &.{.{ .op = .upsert, .row = row }} }, 10, 3);
+    var published = try catalog.commit(a, .{ .id = "publish", .expected_metadata_location = current.metadata_location, .body = built.body, .timestamp_ms = 3 });
+    defer published.deinit(a);
+    var live = try catalog.load(a);
+    defer live.deinit(a);
+    const root = try metadata.parse(scratch, live.metadata_json);
+    const list_uri = try metadata.str(try metadata.get((try metadata.get(root, "snapshots")).array.items[0], "manifest-list"));
+    const list_bytes = try @import("row_commit.zig").read(scratch, files, list_uri);
+    const list = try @import("../iceberg_avro.zig").parseManifestListAlloc(scratch, list_bytes);
+    const manifest_bytes = try @import("row_commit.zig").read(scratch, files, list.entries[0].manifest_path);
+    const manifest = try @import("../iceberg_avro.zig").parseDataManifestAlloc(scratch, manifest_bytes);
+    const data_uri = manifest.entries[0].file_path;
+    try std.testing.expectError(error.LakeObjectStillReferenced, catalog.retire(a, .{ .id = "unsafe-GC", .expected_metadata_location = live.metadata_location, .expected_version = live.version.?, .objects = &.{data_uri} }));
+    const snapshot_id = try metadata.int(try metadata.get((try metadata.get(root, "snapshots")).array.items[0], "snapshot-id"));
+    const statistics_body = try std.json.Stringify.valueAlloc(scratch, .{ .requirements = .{}, .updates = .{.{ .action = "set-statistics", .statistics = .{ .@"snapshot-id" = snapshot_id, .@"statistics-path" = "gs://archive/hn/data/dead.parquet", .@"file-size-in-bytes" = @as(u64, 1), .@"file-footer-size-in-bytes" = @as(u64, 1), .@"blob-metadata" = .{} } }} }, .{});
+    try std.testing.expectError(error.LakeObjectRetired, catalog.commit(a, .{ .id = "statistics-resurrection", .expected_metadata_location = live.metadata_location, .body = statistics_body, .timestamp_ms = 4 }));
+}

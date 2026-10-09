@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub const maintenance = @import("maintenance.zig");
 pub const types = @import("types.zig");
 pub const metadata = @import("metadata.zig");
 pub const managed = @import("managed.zig");
@@ -42,6 +43,12 @@ pub const Catalog = union(enum) {
             .rest => |*v| v.commit(a, request),
         };
     }
+    pub fn retire(self: *const Catalog, a: std.mem.Allocator, request: managed.Retirement) !types.Table {
+        return switch (self.*) {
+            .managed => |*value| value.retire(a, request),
+            .rest => error.LakeVacuumCatalogCoordinationRequired,
+        };
+    }
     pub fn resolve(self: *const Catalog, a: std.mem.Allocator, id: []const u8, hash: []const u8) !types.Outcome {
         return switch (self.*) {
             .managed => |*v| v.resolve(a, id, hash),
@@ -52,6 +59,7 @@ pub const Catalog = union(enum) {
 test {
     _ = parquet_writer;
     _ = row_commit;
+    _ = @import("retirement_index.zig");
     _ = @import("tests.zig");
 }
 

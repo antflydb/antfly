@@ -550,7 +550,12 @@ archive-scale latency still need operational qualification.
 Native ordered queries publish their complete retained document/vector generation
 through the artifact provider before admitting a cursor. Replacement owners can
 restore missing local cuts from filesystem, S3 or GCS artifacts while preserving
-the original query view. Missing authoritative data returns 409. Local cut files
+the original query view. Version-2 capabilities retain the original ordered range
+cover; continuation uses one current carrier and separately reads each original
+range once after a split or merge. Version-1 capabilities without the cover require
+a new query. Routing and two-origin storage tests cover this contract; real
+multi-node topology-change qualification remains outstanding.
+Missing authoritative data returns 409. Local cut files
 are a read cache, and credentials can rotate without changing native cursor scope.
 Set `lake_indexes.query_cursors.retention_ms` (default 300000, maximum 3600000),
 `max_native_cuts` (default 64) and `max_native_retained_bytes` (default 64 GiB).

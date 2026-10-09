@@ -118,6 +118,24 @@ stale writers after restart. Uncertain outcomes fail closed. Garbage collection
 must retain proof for outstanding intents; this implementation does not delete
 catalog history automatically.
 
+Managed vacuum publishes a content-addressed retirement-index root through that
+same HEAD CAS before deleting files. Catalog authority rechecks every current
+snapshot and statistics/partition-statistics roots; referenced files cannot be
+retired. New commits check statistics files, new manifest lists, manifests and
+live data/delete entries against the
+retirement index. Immutable manifests already live in the fenced parent can be
+reused without scanning their data files again. Retired URIs cannot be resurrected
+by changing table properties or by staging before GC. Lost retirement responses
+recover through the existing intent/receipt/history protocol.
+
+Root-bearing catalog records use private format 2; old binaries must be upgraded
+before enabling destructive vacuum. Retirement nodes and catalog proof history
+are retained, including unpublished nodes from lost CAS attempts. Operations remain
+bounded (4,096 selected objects, 256 MiB metadata traversal, 32 MiB retirement-node JSON
+budget) and fail without deleting when authority cannot be established.
+Archive-scale marking beyond that traversal budget still needs resumable authority
+verification.
+
 REST commits first persist an immutable intent. They validate the caller's
 requirements against the loaded metadata and add guards for table identity,
 schema, partition/sort IDs and the main branch. The service remains the final
@@ -129,6 +147,21 @@ unknown unless a marker or receipt proves success. Absence of a marker never
 proves failure after another writer has advanced or expired metadata. An
 original HTTP 409 rejection is persisted as durable non-commit proof before
 exposing a conflict; restart cannot accidentally replay that rejected request.
+
+## External catalog maintenance
+
+Nessie and Polaris both catalog Iceberg tables. Nessie adds catalog-wide branches
+and tags; Polaris implements Iceberg REST catalog governance. Antfly-owned Iceberg
+catalogs do not require either service.
+
+For external catalogs, generic REST commits and an ownership assertion cannot
+establish deletion authority. The optional provider controller integration delegates
+physical deletion to a separately authorized maintenance service. Both Nessie and
+Polaris protocol adapters validate provider-specific root capabilities and journal
+an exact job before submitting it. A standard vendor REST endpoint alone does not
+implement this maintenance protocol. Controller implementations/deployment and real
+vendor qualification remain outstanding. See [configuration, required guarantees
+and provider-specific work](external-lake-maintenance.md).
 
 ## Boundaries and next layers
 

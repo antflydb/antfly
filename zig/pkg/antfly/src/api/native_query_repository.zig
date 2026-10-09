@@ -441,9 +441,11 @@ pub const Repository = struct {
         const a = arena.allocator();
         const manifest = try checkedManifest(a, try self.readManifest(a, request, namespace, cancellation), request, namespace);
         const expected_domain = try self.domain(a, namespace);
+        // Publication may reuse the adjacent warmer epoch (one additional
+        // hour) beyond its ordinary two-window chunk horizon.
         for (manifest.files) |file| for (file.chunks) |ref| {
             const scope = (try artifacts.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.CatalogGenerationChanged;
-            if (!std.mem.eql(u8, &scope.domain, &expected_domain) or scope.fencingToken() < request.expires_ms or scope.fencingToken() > request.expires_ms +| 2 * cache_window_ms) return error.CatalogGenerationChanged;
+            if (!std.mem.eql(u8, &scope.domain, &expected_domain) or scope.fencingToken() < request.expires_ms or scope.fencingToken() > request.expires_ms +| 3 * cache_window_ms) return error.CatalogGenerationChanged;
         };
         const expiry = @import("antfly_platform").time.monotonicNs() +| (request.expires_ms -| cut.nowMs()) * std.time.ns_per_ms;
         const control: cut.Control = .{ .parent = cancellation, .deadline_ns = if (request.timeout_ms) |value| @min(expiry, @import("antfly_platform").time.monotonicNs() +| value *| std.time.ns_per_ms) else expiry };
@@ -461,6 +463,8 @@ pub const Repository = struct {
         errdefer std.Io.Dir.cwd().deleteTree(io, staging) catch {};
         var store = self.store.artifactStore();
         const expected_domain = try self.domain(a, namespace);
+        // Publication may reuse the adjacent warmer epoch (one additional
+        // hour) beyond its ordinary two-window chunk horizon.
         for (manifest.files) |file| {
             try cancellation.check();
             const destination = try std.fmt.allocPrint(a, "{s}/{s}", .{ staging, file.path });
@@ -470,7 +474,7 @@ pub const Repository = struct {
             var offset: u64 = 0;
             for (file.chunks) |ref| {
                 const scope = (try artifacts.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.CatalogGenerationChanged;
-                if (!std.mem.eql(u8, &scope.domain, &expected_domain) or (scope.fencingToken() < request.expires_ms or scope.fencingToken() > request.expires_ms +| 2 * cache_window_ms)) return error.CatalogGenerationChanged;
+                if (!std.mem.eql(u8, &scope.domain, &expected_domain) or (scope.fencingToken() < request.expires_ms or scope.fencingToken() > request.expires_ms +| 3 * cache_window_ms)) return error.CatalogGenerationChanged;
                 const payload = store.getVerifiedAllocWithCancellation(ref.artifact_id, @intCast(ref.byte_len), ref.checksum, cancellation) catch |err| switch (err) {
                     error.NotFound, error.ObjectNotFound, error.FileNotFound, error.ArtifactIntegrityMismatch => return error.CatalogGenerationChanged,
                     else => return err,
@@ -629,6 +633,17 @@ test "external lake native repository warming resumes bounded uploads after rest
     try std.testing.expect(try repository.capability().warm(io, short_root, short_request, namespace, .none, chunk_bytes));
     const short_manifest = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, short_request, namespace, .none), short_request, namespace);
     try std.testing.expectEqualStrings(manifest.files[0].chunks[0].artifact_id, short_manifest.files[0].chunks[0].artifact_id);
+    // The neighboring warmer epoch can extend beyond the foreground cut's
+    // two-window horizon. Both virtual reads and fallback recovery must accept
+    // this authenticated reuse without weakening namespace or expiry checks.
+    const short_remote_path = try std.fmt.allocPrint(scratch, "{s}/short-remote", .{directory.path()});
+    var short_remote = (try repository.capability().openRead(io, short_remote_path, short_request, namespace, .none)).?;
+    defer short_remote.deinit();
+    const short_tail = try short_remote.view.readFileRangeAlloc(a, try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{short_remote_path}), 2 * chunk_bytes, 17);
+    defer a.free(short_tail);
+    try std.testing.expectEqualSlices(u8, bytes[2 * chunk_bytes ..][0..17], short_tail);
+    const short_recovered = try std.fmt.allocPrint(scratch, "{s}/short-recovered", .{directory.path()});
+    try repository.capability().recover(io, short_recovered, short_request, namespace, .none);
     try repository.capability().publish(io, root, request, namespace, .none);
     var remote = (try repository.capability().openRead(io, try std.fmt.allocPrint(scratch, "{s}/remote", .{directory.path()}), request, namespace, .none)).?;
     defer remote.deinit();

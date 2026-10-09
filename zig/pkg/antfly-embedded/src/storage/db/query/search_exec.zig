@@ -4691,6 +4691,30 @@ test "distributed field sort requires runtime mappings" {
     try std.testing.expectEqualStrings("missing_runtime_mapping", diagnostic.detail);
 }
 
+test "distributed cursor windows retain corpus totals with native exhaustion proof" {
+    const a = std.testing.allocator;
+    const order = [_]types.SortField{.{ .field = "rank" }};
+    const cursor = [_]std.json.Value{ .{ .integer = 2 }, .{ .string = "doc:b" } };
+    const req: types.SearchRequest = .{ .order_by = &order, .search_after = &cursor, .limit = 2 };
+    var hits = [_]types.SearchHit{try testSortedHitAlloc(a, "doc:z", 3)};
+    defer testDeinitFixedHits(a, &hits);
+    var shards = [_]types.SearchResult{
+        .{ .alloc = a, .hits = &.{}, .total_hits = 1 },
+        .{ .alloc = a, .hits = &hits, .total_hits = 1 },
+    };
+    const schema = testNumericRankRuntimeSchema();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(a, req, &shards, schema));
+    shards[0].ordered_window_complete = true;
+    shards[1].ordered_window_complete = true;
+    const merged = try mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(a, req, &shards, schema);
+    defer testFreeOwnedHits(a, merged.hits);
+    try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
+    try std.testing.expectEqualStrings("doc:z", merged.hits[0].id);
+    try std.testing.expectEqual(types.TotalHitsRelation.exact, merged.total_hits_relation);
+    shards[0].total_hits_relation = .gte;
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(a, req, &shards, schema));
+}
+
 test "distributed merge rejects provably incomplete exact shard windows" {
     const alloc = std.testing.allocator;
     const order_by = [_]types.SortField{.{ .field = "rank" }};
@@ -5434,6 +5458,7 @@ const DistributedSortedShard = struct {
     hits: []const types.SearchHit = &.{},
     total_hits: ?u32 = null,
     total_hits_relation: types.TotalHitsRelation = .exact,
+    window_complete: bool = false,
 };
 
 const DistributedMergeHeapEntry = struct {
@@ -5558,6 +5583,7 @@ fn validateDistributedShardWindowsCompleteForRequestedPage(
     const required_window = distributedRequestedShardWindow(req);
     if (required_window == 0) return;
     for (shards) |shard| {
+        if (shard.window_complete and shard.total_hits_relation == .exact) continue;
         const returned_window: u64 = @intCast(shard.hits.len);
         if (returned_window >= required_window) continue;
         const total_hits = shard.total_hits orelse {
@@ -6035,6 +6061,7 @@ pub fn mergeDistributedSortedSearchResultHitsWithRuntimeSchemaAlloc(
             .hits = result.hits,
             .total_hits = result.total_hits,
             .total_hits_relation = result.total_hits_relation,
+            .window_complete = result.ordered_window_complete,
         };
         available_hits += result.hits.len;
     }
@@ -6079,6 +6106,7 @@ pub fn mergeDistributedSortedSearchResultsWithRuntimeSchemaAlloc(
             .hits = result.hits,
             .total_hits = result.total_hits,
             .total_hits_relation = result.total_hits_relation,
+            .window_complete = result.ordered_window_complete,
         };
         available_hits += result.hits.len;
     }
@@ -12214,6 +12242,11 @@ pub fn searchTextQuery(
         } else if ((late_visibility_paginate or group_chunk_parents or executor.filter_candidate_presence) and !effective_req.count_only) {
             try paginateSearchResultInPlace(&out, effective_req.offset, effective_req.limit);
         }
+        // This is population-exhaustion evidence, independently of corpus
+        // totals (which include matches before a cursor). Preserve it through
+        // the in-process distributed merge; partial candidate streams cannot
+        // certify a short shard window.
+        out.ordered_window_complete = requestHasSortPageOptions(effective_req) and candidates_exhausted and out.total_hits_relation == .exact;
         if (!requires_field_sort and !effective_req.count_only and collect_score_profile) {
             out.sort_profile = sortResultProfile(effective_req, .{ .kind = .score_top_k }, false, .{
                 .candidate_source = "text_postings",
@@ -18047,12 +18080,17 @@ fn collectMatchAllCandidateStateWithOptions(
                 }
             }
 
+            // Early termination does not transfer either resume bound to the
+            // next scan. Keep them owned by the batch until it is destroyed.
+            if (state.stopped_early) {
+                batch.deinit();
+                break;
+            }
             const maybe_next_lower = batch.next_lower;
             batch.next_lower = null;
             const maybe_next_upper = batch.next_upper;
             batch.next_upper = null;
             batch.deinit();
-            if (state.stopped_early) break;
             if (options.primary_key_reverse) {
                 const next_upper = maybe_next_upper orelse break;
                 alloc.free(current_upper);

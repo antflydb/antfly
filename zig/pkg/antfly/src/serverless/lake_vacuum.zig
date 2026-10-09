@@ -25,7 +25,7 @@ const iceberg = local.serverless_external_source_mod.iceberg_avro;
 const A = std.mem.Allocator;
 const V = std.json.Value;
 pub const Options = struct { operation_id: []const u8, dry_run: bool = true, exclusive_ownership: bool = false, retain_ms: u64 = 7 * 24 * 60 * 60 * 1000, keep_latest: usize = 2, max_deleted: usize = 4096 };
-pub const Result = struct { expired_snapshots: usize = 0, eligible_objects: usize = 0, deleted_objects: usize = 0, retained_objects: usize = 0, complete: bool = false };
+pub const Result = struct { expired_snapshots: usize = 0, eligible_objects: usize = 0, deleted_objects: usize = 0, retained_objects: usize = 0, complete: bool = false, delegated: bool = false, provider: ?catalog.maintenance.Provider = null, provider_state: ?catalog.maintenance.State = null };
 const Retired = struct { snapshot: []const u8, objects: []const []const u8 };
 const Job = struct { id: []const u8, expected: []const u8, body: []const u8, timestamp_ms: i64, retired: []const Retired };
 const Marker = struct { uri: []const u8, sha256: []const u8, etag: ?[]const u8, owner: []const u8 };
@@ -77,6 +77,22 @@ fn retainedIds(a: A, root: V, extra: []const []const u8, keep_latest: usize, bef
 }
 pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Binding, options: configured.BindingObjectStoreOpenOptions, context: catalog.types.Context, request: Options, protected: []const []const u8) !Result {
     if (request.operation_id.len == 0 or request.operation_id.len > 256 or request.retain_ms < 10 * 60 * 1000 or request.keep_latest == 0 or request.keep_latest > 1024 or request.max_deleted == 0 or request.max_deleted > 4096) return error.InvalidLakeMaintenanceLimits;
+    // A local object-store retirement marker cannot fence commits or readers
+    // admitted by an external catalog. An ownership assertion is insufficient:
+    // late REST commits can resurrect a file after our final mark phase.
+    if (binding.catalog != null and binding.catalog.?.type == .rest and binding.catalog.?.maintenance != null) {
+        var current = try configured.executeLakeCatalogAlloc(a, binding, options, context, .load);
+        defer current.deinit(a);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const metadata = try catalog.metadata.parse(arena.allocator(), current.table.metadata_json);
+        const uuid = try catalog.metadata.str(try catalog.metadata.get(metadata, "table-uuid"));
+        const body = try configured.executeExternalMaintenanceAlloc(a, binding, options, context, uuid, current.table.metadata_location, protected, .{ .operation_id = request.operation_id, .dry_run = request.dry_run, .retain_ms = request.retain_ms, .keep_latest = request.keep_latest, .max_deleted = request.max_deleted });
+        defer a.free(body);
+        const receipt = try std.json.parseFromSliceLeaky(catalog.maintenance.Result, arena.allocator(), body, .{ .ignore_unknown_fields = true });
+        return .{ .expired_snapshots = receipt.expired_snapshots, .eligible_objects = receipt.eligible_objects, .deleted_objects = receipt.deleted_objects, .retained_objects = receipt.retained_objects, .complete = receipt.state == .complete, .delegated = true, .provider = receipt.provider, .provider_state = receipt.state };
+    }
+    if (!request.dry_run and binding.catalog != null and binding.catalog.?.type == .rest) return error.LakeVacuumCatalogCoordinationRequired;
     if (!request.dry_run and !request.exclusive_ownership) return error.LakeVacuumOwnershipRequired;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -148,6 +164,12 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
     defer latest.deinit(a);
     const live_root = try catalog.metadata.parse(scratch, latest.table.metadata_json);
     var marked: std.StringHashMapUnmanaged(void) = .empty;
+    inline for (.{ "statistics", "partition-statistics" }) |kind| {
+        if (live_root.object.get(kind)) |entries| {
+            if (entries != .array) return error.InvalidLakeMetadata;
+            for (entries.array.items) |entry| try marked.put(scratch, try catalog.metadata.str(try catalog.metadata.get(entry, "statistics-path")), {});
+        }
+    }
     for ((try catalog.metadata.get(live_root, "snapshots")).array.items) |snapshot| {
         const id = try std.fmt.allocPrint(scratch, "{d}", .{try catalog.metadata.int(try catalog.metadata.get(snapshot, "snapshot-id"))});
         const expired = for (job.retired) |old| {
@@ -167,6 +189,31 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
             for (retired.objects) |uri| try marked.put(scratch, uri, {});
         }
     }
+    // Publish the selected irreversible retirement set through catalog HEAD
+    // before deleting anything. The authority rechecks current roots and uses
+    // this exact version in its CAS; racing writers cause a conflict, while
+    // later writers must reject every retired URI.
+    var approved: std.StringHashMapUnmanaged(void) = .empty;
+    if (!request.dry_run) {
+        var selected: std.ArrayList([]const u8) = .empty;
+        for (job.retired) |old| {
+            if (blocked.contains(old.snapshot)) continue;
+            for (old.objects) |uri| {
+                if (selected.items.len == request.max_deleted) break;
+                if (marked.contains(uri) or approved.contains(uri)) continue;
+                if (try collectOwned(scratch, destination, uri, true) != .eligible) continue;
+                try selected.append(scratch, uri);
+                try approved.put(scratch, uri, {});
+            }
+        }
+        if (selected.items.len != 0) {
+            const version = latest.table.version orelse return error.LakeCatalogConditionalWritesRequired;
+            const intent = try std.json.Stringify.valueAlloc(scratch, .{ .version = version, .objects = selected.items }, .{});
+            var proof = try configured.executeLakeCatalogAlloc(a, binding, options, context, .{ .retire = .{ .id = try std.fmt.allocPrint(scratch, "vacuum-retire-{s}", .{catalog.types.digestHex(intent)}), .expected_metadata_location = latest.table.metadata_location, .expected_version = version, .objects = selected.items } });
+            defer proof.deinit(a);
+            if (proof.table.retirement_root == null) return error.InvalidLakeRetirementIndex;
+        }
+    }
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     result.expired_snapshots = job.retired.len;
     result.complete = true;
@@ -183,7 +230,7 @@ pub fn run(a: A, binding: local.serverless_external_source_catalog_binding.Bindi
                 continue;
             }
             const at_limit = result.deleted_objects == request.max_deleted;
-            switch (try collectOwned(scratch, destination, uri, request.dry_run or at_limit)) {
+            switch (try collectOwned(scratch, destination, uri, request.dry_run or at_limit or !approved.contains(uri))) {
                 .retained => result.retained_objects += 1,
                 .eligible => {
                     result.eligible_objects += 1;
@@ -267,4 +314,11 @@ test "external lake vacuum deletes only owned unchanged objects and replays abse
     var remaining = try client.getObject(files.bucket, "hn/data/replaced.parquet", .{});
     defer remaining.deinit(alloc);
     try std.testing.expectEqualStrings("new-content", remaining.body);
+}
+
+test "external lake REST vacuum cannot delete using an exclusive ownership assertion" {
+    const binding: local.serverless_external_source_catalog_binding.Binding = .{ .table_id = "events", .format = .iceberg, .source_uri = "s3://bucket/events", .schema_fingerprint = "schema", .write_policy = .iceberg_writer, .catalog = .{ .type = .rest, .connection = "catalog", .uri = "https://catalog.example.com", .namespace = &.{"analytics"}, .name = "events" } };
+    // No credentials or object I/O are needed: reject before any persisted
+    // intent, catalog mutation, retirement marker, or file deletion.
+    try std.testing.expectError(error.LakeVacuumCatalogCoordinationRequired, run(std.testing.allocator, binding, .{}, .{}, .{ .operation_id = "vacuum", .dry_run = false, .exclusive_ownership = true }, &.{}));
 }

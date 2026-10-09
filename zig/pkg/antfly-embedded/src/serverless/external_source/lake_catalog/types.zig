@@ -21,6 +21,7 @@ pub const max_commit_bytes = 4 * 1024 * 1024;
 
 pub const Config = struct {
     type: enum { managed, rest },
+    maintenance: ?@import("maintenance.zig").Config = null,
     /// Required for REST. A node-configured external_io/http connection with
     /// lake_catalog_read / lake_catalog_write capabilities; never raw secrets.
     connection: ?[]const u8 = null,
@@ -31,10 +32,11 @@ pub const Config = struct {
 
     pub fn validate(self: Config) !void {
         if (self.type == .managed) {
-            if (self.connection != null or self.uri != null or self.namespace.len != 0 or self.name != null or self.warehouse != null) return error.InvalidLakeCatalog;
+            if (self.maintenance != null or self.connection != null or self.uri != null or self.namespace.len != 0 or self.name != null or self.warehouse != null) return error.InvalidLakeCatalog;
             return;
         }
         if (self.connection == null or self.connection.?.len == 0 or self.uri == null or self.name == null or self.namespace.len == 0) return error.InvalidLakeCatalog;
+        if (self.maintenance) |maintenance| try maintenance.validate();
         const uri = try std.Uri.parse(self.uri.?);
         if ((!std.mem.eql(u8, uri.scheme, "https") and !std.mem.eql(u8, uri.scheme, "http")) or uri.host == null or uri.user != null or uri.password != null or uri.query != null or uri.fragment != null) return error.InvalidLakeCatalog;
         if (self.name.?.len == 0 or self.namespace.len > 32) return error.InvalidLakeCatalog;
@@ -44,6 +46,7 @@ pub const Config = struct {
 };
 
 pub const Table = struct {
+    retirement_root: ?[32]u8 = null,
     metadata_location: []u8,
     metadata_json: []u8,
     /// Opaque compare-and-swap evidence. Callers must not synthesize it.

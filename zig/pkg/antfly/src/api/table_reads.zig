@@ -7361,7 +7361,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route_snapshot.deinit(alloc);
         var lookup_groups: ?[]u64 = null;
         defer if (lookup_groups) |groups| alloc.free(groups);
-        if (isDocumentLookupBatch(req)) {
+        if (isDocumentLookupBatch(req) and (req.native_query_cut == null or req.native_query_cut.?.cover.len == 0)) {
             var keyed = try routing_session.documentKeyRoutes(alloc, table_name, req.filter_doc_ids, queryRoutingDeadline(self.catalog, req));
             defer keyed.span.deinit(alloc);
             lookup_groups = keyed.key_groups;
@@ -7467,7 +7467,7 @@ pub const HostedProvisionedTableReadSource = struct {
         var routed_source = hosted.*;
         routed_source.catalog = routing_session.catalog();
         const self = &routed_source;
-        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, "", "", queryRoutingDeadline(self.catalog, req));
+        var route_snapshot = try requestRoutedSpanSnapshot(alloc, self.catalog, table_name, "", "", .{ .search = req }, queryRoutingDeadline(self.catalog, req));
         defer route_snapshot.deinit(alloc);
         const group_ids = route_snapshot.group_ids;
         if (group_ids.len == 0) return null;
@@ -10538,6 +10538,30 @@ fn isDocumentLookupBatch(req: db_mod.types.SearchRequest) bool {
 }
 
 fn requestRoutedSpanSnapshot(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, table_name: []const u8, from: []const u8, to: []const u8, request: ProvisionedConsistencyRequest, deadline: ?u64) !table_catalog.RoutedSpanSnapshot {
+    if (request == .search) if (request.search.native_query_cut) |cut| if (cut.cover.len != 0) {
+        var current = try table_catalog.routedSpanSnapshotUntil(alloc, catalog, table_name, "", "", deadline);
+        errdefer current.deinit(alloc);
+        if (current.table_id != cut.table_id or current.group_ids.len == 0) return error.CatalogGenerationChanged;
+        if (cut.create) {
+            // A topology race during capture must not yield a partial original
+            // cover. Every physical owner additionally validates its namespace.
+            if (current.routes.len != cut.cover.len) return error.CatalogGenerationChanged;
+            for (current.routes, cut.cover) |route, original| {
+                if (route.group_id != original.group_id or route.identity_namespace.table_id != original.namespace.table_id or route.identity_namespace.shard_id != original.namespace.shard_id or route.identity_namespace.range_id != original.namespace.range_id) return error.CatalogGenerationChanged;
+            }
+        } else {
+            // One current fenced carrier serves the immutable original cover.
+            // Current child ranges must never each replay an entire old range.
+            const routes = try alloc.dupe(table_catalog.CatalogGroupRoute, current.routes[0..1]);
+            errdefer alloc.free(routes);
+            const groups = try alloc.dupe(u64, current.group_ids[0..1]);
+            alloc.free(current.routes);
+            alloc.free(current.group_ids);
+            current.routes = routes;
+            current.group_ids = groups;
+        }
+        return current;
+    };
     if (request == .search and from.len == 0 and to.len == 0 and isDocumentLookupBatch(request.search))
         return table_catalog.routedDocumentKeysSnapshotUntil(alloc, catalog, table_name, request.search.filter_doc_ids, deadline);
     return table_catalog.routedSpanSnapshotUntil(alloc, catalog, table_name, from, to, deadline);
@@ -34361,4 +34385,50 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "native retained routing chooses one carrier after split merge and rejects capture races" {
+    const a = std.testing.allocator;
+    const Cut = @typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child;
+    const Range = @typeInfo(@FieldType(Cut, "cover")).pointer.child;
+    const Fixture = struct {
+        tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 7, .name = "docs" }},
+        ranges: []metadata_table_manager.RangeRecord,
+        fn snapshot(raw: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .tables = &self.tables, .ranges = self.ranges };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminRead;
+        }
+        fn freeAdmin(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const origins: [1]Range = .{.{ .group_id = 10, .namespace = .{ .table_id = 7, .shard_id = 10, .range_id = 11 }, .start_key = "" }};
+    var split: [2]metadata_table_manager.RangeRecord = .{
+        .{ .table_id = 7, .group_id = 30, .range_id = 31, .start_key = "", .end_key = "m" },
+        .{ .table_id = 7, .group_id = 40, .range_id = 41, .start_key = "m" },
+    };
+    var fixture: Fixture = .{ .ranges = &split };
+    const source: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.freeAdmin, .routing_snapshot = Fixture.snapshot, .linearizable_routing_snapshot = Fixture.snapshot, .free_routing_snapshot = Fixture.free } };
+    const id: [64]u8 = @splat('a');
+    var req: db_mod.types.SearchRequest = .{ .native_query_cut = .{ .id = &id, .table_id = 7, .expires_ms = 1000, .cover = &origins, .recipe = .{ .schema_json = "", .read_schema_json = "", .indexes_json = "{}" } } };
+    {
+        var selected = try requestRoutedSpanSnapshot(a, source, "docs", "", "", .{ .search = req }, null);
+        defer selected.deinit(a);
+        try std.testing.expectEqualSlices(u64, &.{30}, selected.group_ids);
+    }
+    req.native_query_cut.?.create = true;
+    try std.testing.expectError(error.CatalogGenerationChanged, requestRoutedSpanSnapshot(a, source, "docs", "", "", .{ .search = req }, null));
+    req.native_query_cut.?.create = false;
+    var merged: [1]metadata_table_manager.RangeRecord = .{.{ .table_id = 7, .group_id = 50, .range_id = 51, .start_key = "" }};
+    fixture.ranges = &merged;
+    {
+        var selected = try requestRoutedSpanSnapshot(a, source, "docs", "", "", .{ .search = req }, null);
+        defer selected.deinit(a);
+        try std.testing.expectEqualSlices(u64, &.{50}, selected.group_ids);
+    }
+    fixture.tables[0].table_id = 8;
+    merged[0].table_id = 8;
+    try std.testing.expectError(error.CatalogGenerationChanged, requestRoutedSpanSnapshot(a, source, "docs", "", "", .{ .search = req }, null));
 }

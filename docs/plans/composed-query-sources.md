@@ -98,9 +98,15 @@ native projection codecs. A retained request can carry its authenticated origina
 namespace and open that generation on a replacement range in the same table
 incarnation. Each original namespace gets a separate cache root, preserving its
 physical document identities. Creation cannot capture a different owner's live
-namespace. Distributed cursor routing still needs a retained original range cover
-and exactly one execution per original range after split/merge; the storage reader
-capability alone does not provide that routing contract.
+namespace. Version-2 public capabilities retain the complete original ordered range
+cover. Capture rejects a changed cover; continuation selects one current,
+catalog-fenced carrier and opens each original immutable range exactly once.
+Original logical group IDs remain distinct for distributed result merging, even
+when a merged or replacement owner serves all origins. Search and work preflight
+use the retained cover; this does not grant cross-table virtual catalog access.
+Version-1 capabilities without that cover must restart their query. Storage-level
+two-origin pagination and routing split/merge/incarnation checks are qualified;
+public live-cluster topology-change qualification remains outstanding.
 Query capture briefly closes write admission while derivations converge and
 manifests are sealed; deadlines, cancellation and WAL/capacity admission bound
 this work. The retained files never hold an apply lock across cursor pages.
@@ -212,7 +218,18 @@ keeps each compaction turn within its row/byte limits while a durable file,
 row-group and row cursor resumes a larger selection across restarts. Output pages
 are immutable; final publication retains the original parent requirement. Confirmed
 parent conflicts terminate the job; unknown outcomes replay the exact intent.
-Automatic vacuum requires explicit exclusive ownership and remains disabled for REST catalogs with external metadata writers.
+Antfly-owned vacuum requires explicit exclusive ownership and publishes an
+irreversible file-retirement root through the same catalog HEAD CAS used by
+writers. Future commits reject retired references; earlier staged writers conflict.
+The authority independently verifies that selected files are absent from every
+current snapshot. A content-addressed persistent radix index avoids rewriting a
+flat archive-sized retirement list. Reader admission remains fenced by durable
+snapshot pins. Destructive REST vacuum cannot use an exclusive-ownership assertion
+to bypass catalog coordination. Optional Nessie/Polaris controller integrations
+journal and delegate provider-owned maintenance, with explicit capability checks
+for writer fencing, external readers and the shared Antfly pin registry. Those are
+integration protocols; actual provider controller implementation and deployment
+remain required. See [external maintenance](../design/external-lake-maintenance.md).
 
 Example policy (serialized as the Iceberg property value):
 

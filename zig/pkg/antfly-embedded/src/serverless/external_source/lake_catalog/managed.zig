@@ -8,8 +8,11 @@ const storage = @import("objectstore");
 const types = @import("types.zig");
 const metadata = @import("metadata.zig");
 const A = std.mem.Allocator;
+const retired = @import("retirement_index.zig");
+pub const Retirement = struct { id: []const u8, expected_metadata_location: []const u8, expected_version: []const u8, objects: []const []const u8 };
 
 pub const Record = struct {
+    retirement_root: ?retired.Digest = null,
     format: u8 = 1,
     commit_id: []const u8,
     request_hash: []const u8,
@@ -65,7 +68,7 @@ pub const Managed = struct {
         const result = try std.json.parseFromSlice(Record, a, bytes, .{ .allocate = .alloc_always });
         errdefer result.deinit();
         const r = result.value;
-        if (r.format != 1 or r.commit_id.len == 0 or r.request_hash.len != 64 or r.metadata_hash.len != 64 or r.metadata_key.len == 0 or r.metadata_location.len == 0) return error.InvalidLakeCatalog;
+        if ((r.format != 1 and r.format != 2) or (r.format == 1 and r.retirement_root != null) or (r.format == 2 and r.retirement_root == null) or r.commit_id.len == 0 or r.request_hash.len != 64 or r.metadata_hash.len != 64 or r.metadata_key.len == 0 or r.metadata_location.len == 0) return error.InvalidLakeCatalog;
         return result;
     }
     pub fn load(self: *const Managed, a: A) !types.Table {
@@ -87,7 +90,7 @@ pub const Managed = struct {
         errdefer a.free(body);
         const etag = try a.dupe(u8, version);
         errdefer a.free(etag);
-        return .{ .metadata_location = location, .metadata_json = body, .version = etag, .record_key = try self.recordKey(a, head.body) };
+        return .{ .metadata_location = location, .metadata_json = body, .version = etag, .record_key = try self.recordKey(a, head.body), .retirement_root = r.retirement_root };
     }
     fn checkMetadataKey(self: Managed, a: A, candidate: []const u8) !void {
         const allowed = try self.key(a, "metadata/antfly-");
@@ -157,6 +160,7 @@ pub const Managed = struct {
         if (!std.mem.eql(u8, table.metadata_location, c.expected_metadata_location)) return error.LakeCommitConflict;
         const bytes = try metadata.applyAlloc(a, table.metadata_json, table.metadata_location, c);
         defer a.free(bytes);
+        try self.validateNewReferences(a, table, bytes);
         const candidate = try self.stage(a, c, bytes, table);
         defer a.free(candidate);
         try self.publish(a, candidate);
@@ -164,13 +168,149 @@ pub const Managed = struct {
         defer p.deinit();
         return self.loadCommitted(a, p.value);
     }
+    /// Atomically publish irreversible retirements through the same HEAD CAS
+    /// as ordinary commits. A writer that read before this CAS must conflict;
+    /// a writer that reads afterward validates against the new immutable root.
+    pub fn retire(self: *const Managed, a: A, request: Retirement) !types.Table {
+        if (request.id.len == 0 or request.id.len > 256 or request.expected_version.len == 0 or request.objects.len == 0 or request.objects.len > 4096) return error.InvalidLakeRetirement;
+        const bytes = try std.json.Stringify.valueAlloc(a, request, .{});
+        defer a.free(bytes);
+        if (bytes.len > types.max_commit_bytes) return error.InvalidLakeRetirement;
+        const request_hash = types.digestHex(bytes);
+        const intent = try self.intentKey(a, request.id);
+        defer a.free(intent);
+        if (try self.get(a, intent, 64 * 1024)) |value| {
+            var existing = value;
+            defer existing.deinit(a);
+            const parsed = try record(a, existing.body);
+            defer parsed.deinit();
+            if (!std.mem.eql(u8, parsed.value.request_hash, &request_hash)) return error.LakeCommitIdReused;
+            try self.publish(a, existing.body);
+            return self.loadCommitted(a, parsed.value);
+        }
+        var table = try self.load(a);
+        defer table.deinit(a);
+        if (!std.mem.eql(u8, table.metadata_location, request.expected_metadata_location) or table.version == null or !std.mem.eql(u8, table.version.?, request.expected_version)) return error.LakeCommitConflict;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var selected: std.StringHashMapUnmanaged(void) = .empty;
+        const allowed = try std.fmt.allocPrint(scratch, "{s}/", .{std.mem.trimEnd(u8, self.source_uri, "/")});
+        for (request.objects) |uri| {
+            if (uri.len > 4096 or !std.mem.startsWith(u8, uri, allowed) or std.mem.indexOf(u8, uri[allowed.len..], "..") != null) return error.InvalidLakeRetirement;
+            try selected.put(scratch, uri, {});
+        }
+        var index = retired.Index.init(a, self.client, self.bucket, try self.catalogKey(scratch, "retirements"), self.context);
+        defer index.deinit();
+        // The authority independently checks every current root, including
+        // named branches. A coordinator's earlier mark set is not evidence.
+        try self.checkReferences(scratch, table.metadata_json, null, &index, null, &selected);
+        var root = table.retirement_root;
+        for (request.objects) |uri| root = try index.insert(root, uri);
+        // Keep the metadata bytes unchanged. The catalog version nevertheless
+        // advances and the immutable history retains receipt recovery proof.
+        const head_key = try self.catalogKey(scratch, "head.json");
+        var head = (try self.get(a, head_key, 64 * 1024)) orelse return error.LakeTableNotFound;
+        defer head.deinit(a);
+        const parsed = try record(a, head.body);
+        defer parsed.deinit();
+        var next = parsed.value;
+        next.format = 2;
+        next.retirement_root = root;
+        next.commit_id = request.id;
+        next.request_hash = &request_hash;
+        next.previous_version = table.version;
+        next.previous_record = table.record_key;
+        const candidate = try std.json.Stringify.valueAlloc(a, next, .{ .emit_null_optional_fields = false });
+        defer a.free(candidate);
+        try self.immutable(a, try self.recordKey(scratch, candidate), candidate);
+        try self.immutable(a, intent, candidate);
+        try self.publish(a, candidate);
+        const prepared = try record(a, candidate);
+        defer prepared.deinit();
+        return self.loadCommitted(a, prepared.value);
+    }
+    fn validateNewReferences(self: *const Managed, a: A, parent: types.Table, candidate: []const u8) !void {
+        if (parent.retirement_root == null) return;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var index = retired.Index.init(a, self.client, self.bucket, try self.catalogKey(scratch, "retirements"), self.context);
+        defer index.deinit();
+        try self.checkReferences(scratch, candidate, parent.metadata_json, &index, parent.retirement_root, null);
+    }
+    fn checkUri(uri: []const u8, index: *retired.Index, root: ?retired.Digest, selected: ?*std.StringHashMapUnmanaged(void)) !void {
+        try index.context.ensureActive();
+        if (selected) |set| if (set.contains(uri)) return error.LakeObjectStillReferenced;
+        if (try index.contains(root, uri)) return error.LakeObjectRetired;
+    }
+    fn checkReferences(self: *const Managed, a: A, candidate: []const u8, parent: ?[]const u8, index: *retired.Index, root: ?retired.Digest, selected: ?*std.StringHashMapUnmanaged(void)) !void {
+        const files: @import("row_commit.zig").Files = .{ .client = self.client, .bucket = self.bucket, .prefix = self.prefix, .uri = self.source_uri, .context = self.context };
+        const next = try metadata.parse(a, candidate);
+        const before = if (parent) |bytes_| try metadata.parse(a, bytes_) else null;
+        // Statistics files are metadata roots too. Unlike immutable snapshot
+        // IDs, statistics entries can be replaced by an ordinary update.
+        inline for (.{ "statistics", "partition-statistics" }) |kind| {
+            if (next.object.get(kind)) |entries| {
+                if (entries != .array) return error.InvalidLakeMetadata;
+                for (entries.array.items) |entry| try checkUri(try metadata.str(try metadata.get(entry, "statistics-path")), index, root, selected);
+            }
+        }
+        if (before) |previous| {
+            const has_new = for ((try metadata.get(next, "snapshots")).array.items) |snapshot| {
+                const id = try metadata.int(try metadata.get(snapshot, "snapshot-id"));
+                const existed = for ((try metadata.get(previous, "snapshots")).array.items) |original| {
+                    if (try metadata.int(try metadata.get(original, "snapshot-id")) == id) break true;
+                } else false;
+                if (!existed) break true;
+            } else false;
+            if (!has_new) return;
+        }
+        var budget: usize = 256 * 1024 * 1024;
+        var existing_manifests: std.StringHashMapUnmanaged(void) = .empty;
+        if (before) |previous| if (previous.object.get("current-snapshot-id")) |current_id| if (current_id != .null) {
+            for ((try metadata.get(previous, "snapshots")).array.items) |snapshot| {
+                if (try metadata.int(try metadata.get(snapshot, "snapshot-id")) != try metadata.int(current_id)) continue;
+                const uri = try metadata.str(try metadata.get(snapshot, "manifest-list"));
+                const bytes = try @import("row_commit.zig").readLimited(a, files, uri, @min(budget, 16 * 1024 * 1024));
+                budget -= bytes.len;
+                const list = try @import("../iceberg_avro.zig").parseManifestListAlloc(a, bytes);
+                for (list.entries) |entry| try existing_manifests.put(a, entry.manifest_path, {});
+                break;
+            }
+        };
+        for ((try metadata.get(next, "snapshots")).array.items) |snapshot| {
+            try self.context.ensureActive();
+            const id = try metadata.int(try metadata.get(snapshot, "snapshot-id"));
+            const old = if (before) |previous| for ((try metadata.get(previous, "snapshots")).array.items) |original| {
+                if (try metadata.int(try metadata.get(original, "snapshot-id")) == id) break true;
+            } else false else false;
+            if (old) continue;
+            const list_uri = try metadata.str(try metadata.get(snapshot, "manifest-list"));
+            try checkUri(list_uri, index, root, selected);
+            const list_bytes = try @import("row_commit.zig").readLimited(a, files, list_uri, @min(budget, 16 * 1024 * 1024));
+            budget -= list_bytes.len;
+            const list = try @import("../iceberg_avro.zig").parseManifestListAlloc(a, list_bytes);
+            for (list.entries) |entry| {
+                // Immutable manifests proved live in the fenced parent cannot
+                // contain retired files. Verify new manifests only; an append
+                // must not rescan the full archive after every vacuum turn.
+                if (existing_manifests.contains(entry.manifest_path)) continue;
+                try checkUri(entry.manifest_path, index, root, selected);
+                const manifest_bytes = try @import("row_commit.zig").readLimited(a, files, entry.manifest_path, @min(budget, 16 * 1024 * 1024));
+                budget -= manifest_bytes.len;
+                const manifest = try @import("../iceberg_avro.zig").parseDataManifestAlloc(a, manifest_bytes);
+                for (manifest.entries) |file| if (file.status != .deleted) try checkUri(file.file_path, index, root, selected);
+            }
+        }
+    }
     fn loadCommitted(self: *const Managed, a: A, r: Record) !types.Table {
         var data = (try self.get(a, r.metadata_key, types.max_metadata_bytes)) orelse return error.InvalidLakeCatalog;
         defer data.deinit(a);
         if (!std.mem.eql(u8, &types.digestHex(data.body), r.metadata_hash)) return error.InvalidLakeCatalog;
         const location = try a.dupe(u8, r.metadata_location);
         errdefer a.free(location);
-        return .{ .metadata_location = location, .metadata_json = try a.dupe(u8, data.body) };
+        return .{ .metadata_location = location, .metadata_json = try a.dupe(u8, data.body), .retirement_root = r.retirement_root };
     }
     fn intentKey(self: Managed, a: A, id: []const u8) ![]u8 {
         const name = try std.fmt.allocPrint(a, "intents/{s}.json", .{types.digestHex(id)});
@@ -185,8 +325,8 @@ pub const Managed = struct {
         const uri = try std.fmt.allocPrint(a, "{s}/{s}", .{ std.mem.trimEnd(u8, self.source_uri, "/"), relative });
         defer a.free(uri);
         try self.immutable(a, data_key, bytes);
-        const r: Record = .{ .commit_id = c.id, .request_hash = &types.commitHash(c), .metadata_location = uri, .metadata_key = data_key, .metadata_hash = &types.digestHex(bytes), .previous_record = if (previous) |p| p.record_key else null, .previous_version = if (previous) |p| p.version else null };
-        const record_bytes = try std.json.Stringify.valueAlloc(a, r, .{});
+        const r: Record = .{ .format = if (previous != null and previous.?.retirement_root != null) 2 else 1, .retirement_root = if (previous) |p| p.retirement_root else null, .commit_id = c.id, .request_hash = &types.commitHash(c), .metadata_location = uri, .metadata_key = data_key, .metadata_hash = &types.digestHex(bytes), .previous_record = if (previous) |p| p.record_key else null, .previous_version = if (previous) |p| p.version else null };
+        const record_bytes = try std.json.Stringify.valueAlloc(a, r, .{ .emit_null_optional_fields = false });
         errdefer a.free(record_bytes);
         const record_key = try self.recordKey(a, record_bytes);
         defer a.free(record_key);

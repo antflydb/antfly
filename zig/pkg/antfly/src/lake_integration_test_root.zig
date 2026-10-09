@@ -28,6 +28,7 @@ test {
     _ = @import("api/composed_query.zig");
     _ = @import("api/lake_retained_cut.zig");
     _ = @import("api/native_retained_cut_test.zig");
+    _ = @import("api/native_public_repartition_test.zig");
     _ = @import("api/lake_enrichment_units.zig");
     _ = @import("api/lake_recent_vectors.zig");
     _ = @import("api/lake_vector_enrichment.zig");

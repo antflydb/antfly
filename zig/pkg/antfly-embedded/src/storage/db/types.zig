@@ -2845,6 +2845,10 @@ pub const SearchResult = struct {
     hits: []SearchHit,
     total_hits: u32,
     total_hits_relation: TotalHitsRelation = .exact,
+    /// Trusted in-process proof that the native exact sorter exhausted this
+    /// cursor window or filled its requested limit. Corpus totals alone cannot
+    /// prove exhaustion after search_after/search_before. Not a public wire flag.
+    ordered_window_complete: bool = false,
     identity_read_generation: ?u64 = null,
     /// Snapshot vector for a distributed result. Shard generations are
     /// independent, so a multi-shard replay must use these tokens rather than
