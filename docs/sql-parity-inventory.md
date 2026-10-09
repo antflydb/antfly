@@ -1487,6 +1487,31 @@ forged and injected claims or orphan bindings, and preserves ordinary document
 groups alongside adopted relational groups. A 256-table regression completes
 within 16-KiB verifier scratch; no whole-catalog map or user-row scan is added.
 Valid multi-group/index checkpoints preserve exact ownership across restart.
+`system_catalog/relation_reconciliation.zig` adds an isolated, durable
+candidate-job protocol rather than backfilling the active registry in place.
+Its binary job state pins a source incarnation/revision and a globally unique
+candidate identity. Source preparation is bounded by 64 tables, 8192 claims
+and 4 MiB of logical page bytes; its owned collision plan is prepared outside
+apply. Apply point-checks the exact prior job state and current source epoch,
+then commits candidate claims and the continuation cursor in the caller's
+same metadata transaction. Replacement jobs fence stale pages and cannot reuse
+an existing candidate range. Physical lexical cursors, not numeric table-ID
+ordering, survive restart. A separate complete source pass compares ordered
+source fingerprints and verifies candidate owners. A candidate-range pass then
+checks cardinality and domain-separated multiset fingerprints, excluding extra
+or altered entries without a whole-catalog map. Ready is not a serving state.
+`zig build system-catalog-reconciliation-test system-catalog-relation-store-test`
+covers malformed state, source changes, missing/forged candidates, cross-page
+collisions, job replacement, allocation faults, transaction abort and actual
+native-store restart after each page. Preparation against a million-table
+generated source processes one 64-table page within 64 KiB scratch. Native
+coverage mixes document and relational/index definitions and rereads owners
+when a candidate changes after preparation. This is not installed as a
+background metadata service yet: authoritative epoch wiring, pending-generation
+reservation sources, Raft command/snapshot/replay integration, bounded abandoned
+candidate GC, capability barriers and atomic active-root publication still
+precede writer adoption and SQL point resolution. No original SQL case is
+credited for this protocol component.
 FK publication and restore command envelopes use the same admission boundary,
 but pending-generation name reservations, initial adoption/migration and full
 distributed publication fault coverage still require

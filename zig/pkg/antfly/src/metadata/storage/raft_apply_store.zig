@@ -27,6 +27,7 @@ const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const catalog_name_key_buffer_bytes = 2048;
 const system_catalog_storage = @import("../../system_catalog/storage.zig");
 const relation_names = @import("antfly_local_sources").system_catalog_relation_names;
+const relation_reconciliation = @import("antfly_local_sources").system_catalog_relation_reconciliation;
 const command_journal = @import("command_journal.zig");
 const sql_settings = @import("antfly_local_sources").system_catalog_settings;
 const sql_policies = @import("antfly_local_sources").system_catalog_policies;
@@ -708,6 +709,180 @@ test "system catalog relation namespace transaction checkpoint verification uses
     var bytes: [16 * 1024]u8 = undefined;
     var bounded = std.heap.FixedBufferAllocator.init(&bytes);
     try verifyRelationCheckpointTxn(bounded.allocator(), &txn);
+}
+
+test "system catalog relation namespace transaction reconciliation is isolated atomic and restartable" {
+    const r = relation_reconciliation;
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    const epoch: r.Epoch = .{ .incarnation = @splat(1), .revision = 17 };
+    const initial = try r.State.init(group, @splat(3), epoch);
+    const T = struct {
+        const Source = struct {
+            txn: *docstore.DocStore.Txn,
+            cursor: docstore.DocStore.Txn.CursorAdapter,
+            prefix: []const u8,
+            started: bool = false,
+            cut: ?RaftApplyStore.RelationSnapshot = null,
+            fn deinit(self: *@This()) void {
+                if (self.cut) |*cut| cut.deinit();
+                self.cursor.close();
+            }
+            pub fn nextAfter(self: *@This(), after: []const u8) !?r.SourceRow {
+                if (self.cut) |*cut| cut.deinit();
+                self.cut = null;
+                const row = (if (!self.started) blk: {
+                    self.started = true;
+                    const found = (try self.cursor.seekAtOrAfter(if (after.len == 0) self.prefix else after)) orelse return null;
+                    break :blk if (std.mem.eql(u8, found.key, after)) try self.cursor.next() else found;
+                } else try self.cursor.next()) orelse return null;
+                if (!std.mem.startsWith(u8, row.key, self.prefix)) return null;
+                const id = (try RaftApplyStore.capturedRelationTableId(row.key, group)) orelse return error.InvalidCatalogRecord;
+                self.cut = try RaftApplyStore.relationSnapshot(std.testing.allocator, self.txn, group, id, true);
+                return .{ .key = row.key, .table_id = id, .claims = self.cut.?.claims() };
+            }
+        };
+        const Candidates = struct {
+            cursor: docstore.DocStore.Txn.CursorAdapter,
+            prefix: []const u8,
+            started: bool = false,
+            pub fn nextAfter(self: *@This(), after: []const u8) !?r.CandidateRow {
+                const row = (if (!self.started) blk: {
+                    self.started = true;
+                    const found = (try self.cursor.seekAtOrAfter(if (after.len == 0) self.prefix else after)) orelse return null;
+                    break :blk if (std.mem.eql(u8, found.key, after)) try self.cursor.next() else found;
+                } else try self.cursor.next()) orelse return null;
+                if (!std.mem.startsWith(u8, row.key, self.prefix)) return null;
+                return .{ .key = row.key, .value = row.value };
+            }
+        };
+        const Fault = struct {
+            txn: *docstore.DocStore.Txn,
+            job_key: []const u8,
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                return self.txn.get(key);
+            }
+            pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
+                if (std.mem.eql(u8, key, self.job_key)) return error.InjectedJobWriteFailure;
+                try self.txn.put(key, value);
+            }
+            pub fn delete(self: *@This(), key: []const u8) !void {
+                try self.txn.delete(key);
+            }
+        };
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/reconciliation", .{tmp.sub_path});
+    defer a.free(root);
+    var job_buf: [128]u8 = undefined;
+    const job_key = try r.jobKey(&job_buf, group);
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        const tables = try a.alloc(metadata.TableRecord, r.max_tables_per_page + 1);
+        defer a.free(tables);
+        var count: usize = 0;
+        defer for (tables[0..count]) |table| a.free(table.name);
+        for (tables, 0..) |*table, i| {
+            table.* = .{ .table_id = i + 1, .name = try std.fmt.allocPrint(a, "table_{d}", .{i}), .schema_json = "{}" };
+            count += 1;
+        }
+        tables[0].schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_key","keys":[{"column":"email"}]}]}
+        ;
+        try store.replaceStandaloneCatalog(group, 0, tables, &.{}, "{}");
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try r.start(&txn, &initial, epoch, null);
+        try txn.commit();
+    }
+    var pages: usize = 0;
+    while (true) {
+        // Every page gets a newly opened durable store, not just a decoded
+        // state fixture. Physical table IDs exercise decimal lexical order.
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        const state = try r.State.decode(try read.get(job_key));
+        try std.testing.expect(!try RaftApplyStore.relationWriterEnabledTxn(&read, group));
+        var active: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &read, .alloc = a, .group_id = group };
+        try std.testing.expect((try active.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "table_0" })) == null);
+        if (state.phase == .ready) {
+            try std.testing.expectEqual(@as(u64, r.max_tables_per_page + 1), state.expected.rows);
+            try std.testing.expectEqual(@as(u64, r.max_tables_per_page + 2), state.expected.claims);
+            try std.testing.expectEqual(@as(usize, 6), pages);
+            break;
+        }
+        var prefix_buf: [r.max_cursor_bytes]u8 = undefined;
+        var page = if (state.phase == .verifying_candidate) blk: {
+            var source: T.Candidates = .{ .cursor = try read.openCursor(), .prefix = try r.candidatePrefix(&prefix_buf, &state) };
+            defer source.cursor.close();
+            break :blk try r.Page.prepareCandidate(a, state, epoch, &source);
+        } else blk: {
+            var source: T.Source = .{ .txn = &read, .cursor = try read.openCursor(), .prefix = try tablePrefixForGroup(&prefix_buf, group) };
+            defer source.deinit();
+            break :blk try r.Page.prepareSource(a, state, epoch, &source);
+        };
+        defer page.deinit();
+        if (pages == 0) {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var fault: T.Fault = .{ .txn = &txn, .job_key = job_key };
+            try std.testing.expectError(error.InjectedJobWriteFailure, page.apply(&fault, epoch));
+            var candidates: r.CandidateStore(docstore.DocStore.Txn) = .{ .txn = &txn, .state = &state };
+            // Candidate writes really occurred before the failed job put.
+            try std.testing.expect(try candidates.getClaim(page.claims[0].key) != null);
+        }
+        if (pages == 4) {
+            // Prepare from the old read snapshot, then corrupt a candidate
+            // without moving the source epoch. Apply must reread exact owners,
+            // not trust the preparer's prior candidate verification.
+            const claim = page.claims[0];
+            {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                var forged = claim.owner;
+                forged.schema_digest[0] ^= 1;
+                var key_buf: [r.max_cursor_bytes]u8 = undefined;
+                try txn.put(try r.candidateKey(&key_buf, &state, claim.key), &(try forged.encode()));
+                try txn.commit();
+            }
+            {
+                var txn = try store.store.beginWriteTxn();
+                defer txn.abort();
+                try std.testing.expectError(error.CatalogGenerationChanged, page.apply(&txn, epoch));
+                try std.testing.expectEqualSlices(u8, &(try state.encode()), try txn.get(job_key));
+            }
+            {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                var key_buf: [r.max_cursor_bytes]u8 = undefined;
+                try txn.put(try r.candidateKey(&key_buf, &state, claim.key), &(try claim.owner.encode()));
+                try txn.commit();
+            }
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            if (pages == 0) {
+                var candidates: r.CandidateStore(docstore.DocStore.Txn) = .{ .txn = &txn, .state = &state };
+                try std.testing.expect((try candidates.getClaim(page.claims[0].key)) == null);
+                try std.testing.expectEqualSlices(u8, &(try initial.encode()), try txn.get(job_key));
+            }
+            try std.testing.expectError(error.CatalogGenerationChanged, page.apply(&txn, .{ .incarnation = epoch.incarnation, .revision = epoch.revision + 1 }));
+            try page.apply(&txn, epoch);
+            try txn.commit();
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            try std.testing.expectError(error.CatalogGenerationChanged, page.apply(&txn, epoch));
+        }
+        pages += 1;
+        try std.testing.expect(pages <= 6);
+    }
 }
 
 test "system catalog relation namespace transaction rolls back with schema and persists across restart" {

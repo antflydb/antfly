@@ -359,6 +359,16 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     b.step("system-catalog-relation-test", "Test namespace ownership and atomic catalog publication plans")
         .dependOn(&run_relation_name_tests.step);
     run_sql_tests.step.dependOn(&run_relation_name_tests.step);
+    const relation_reconciliation_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/relation_reconciliation.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    relation_reconciliation_tests.root_module.addImport("antfly_platform", platform_mod);
+    const run_relation_reconciliation_tests = b.addRunArtifact(relation_reconciliation_tests);
+    b.step("system-catalog-reconciliation-test", "Test resumable, fenced relation ownership reconciliation")
+        .dependOn(&run_relation_reconciliation_tests.step);
+    run_sql_tests.step.dependOn(&run_relation_reconciliation_tests.step);
     const pgwire_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/pgwire_test_root.zig"),
         .target = target,
