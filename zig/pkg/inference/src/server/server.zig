@@ -31803,6 +31803,12 @@ fn validateEmbeddingGroupContract(contract: ResolvedInferenceExecutorContract, g
             const info = try image_pipeline.inspectEncodedForInference(bytes, null);
             pixels += try info.pixels();
         },
+        .raster => |raster| {
+            try raster.validate();
+            media_parts += 1;
+            has_image = true;
+            pixels += try raster.pixels();
+        },
         .audio => |bytes| {
             media_parts += 1;
             media_bytes += bytes.len;
@@ -35909,6 +35915,60 @@ test "embeddinggemma2 ordered media matches official F32 oracle" {
         try std.testing.expect(cos >= @as(f64, if (metal) 0.9999 else 0.99999));
         try std.testing.expect(max_abs <= @as(f64, if (metal) 1e-3 else 1e-4));
     }
+    // Qualify real batched raster execution against the encoded-image path.
+    // Use different aspect ratios and padded renderer strides, preserving the
+    // same pixels in the PNG reference. No full-page copy exists in serving.
+    var decoded = try image_pipeline.decode(a, image_bytes);
+    defer decoded.deinit(a);
+    var rasters: [5]readers_api.RasterImage = undefined;
+    var rgba: [5][]u8 = undefined;
+    var pngs: [5][]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (0..initialized) |index| {
+        a.free(rgba[index]);
+        a.free(pngs[index]);
+    };
+    for (&rasters, 0..) |*raster, index| {
+        const height = if (index % 2 == 0) decoded.height else @max(@as(u32, 1), decoded.height / 2);
+        const row_bytes = @as(usize, decoded.width) * 4;
+        const stride = row_bytes + 16;
+        const pixels = try a.alloc(u8, row_bytes * height);
+        defer a.free(pixels);
+        for (0..@as(usize, decoded.width) * height) |pixel| {
+            @memcpy(pixels[pixel * 4 ..][0..3], decoded.data[pixel * 3 ..][0..3]);
+            pixels[pixel * 4 + 3] = 255;
+        }
+        const padded = try a.alloc(u8, stride * height);
+        errdefer a.free(padded);
+        @memset(padded, 91);
+        for (0..height) |row| @memcpy(padded[row * stride ..][0..row_bytes], pixels[row * row_bytes ..][0..row_bytes]);
+        const png = try antfly_image.png.encodeRgba(a, decoded.width, height, pixels);
+        rgba[index] = padded;
+        pngs[index] = png;
+        raster.* = .{ .bytes = padded, .width = decoded.width, .height = height, .stride_bytes = stride, .format = .rgba8 };
+        initialized += 1;
+    }
+    var pipeline = loaded.embeddingPipeline(a);
+    pipeline.execution_control = node.extractionExecutionControl(null);
+    const batched = try pipeline.embedBorrowedRastersReported(&rasters);
+    defer freeDirectDenseVectors(a, batched.vectors);
+    // Aspect ratio bucketing can legitimately leave a singleton; execution
+    // reporting must reflect the actual cohort forwards rather than padding.
+    for (rasters, pngs, batched.vectors) |raster, png, vector| {
+        const encoded = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{.{ .image = png }} }, .{ .dimensions = 128 }, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+        defer a.free(encoded.vector);
+        const reduced = try @import("antfly_decisions").scoring.centroid(a, &.{vector}, 128);
+        defer a.free(reduced);
+        for (encoded.vector, reduced) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, @as(f32, if (metal) 1e-3 else 1e-4));
+        const single = try grouped.embedRasters(a, loaded.session, loaded.getTokenizer(), &.{raster}, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+        defer freeDirectDenseVectors(a, single.vectors);
+        for (vector, single.vectors[0]) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, @as(f32, if (metal) 1e-3 else 1e-4));
+    }
+    const equal_pages: [5]readers_api.RasterImage = @splat(rasters[0]);
+    const native_batch = try pipeline.embedBorrowedRastersReported(&equal_pages);
+    defer freeDirectDenseVectors(a, native_batch.vectors);
+    try std.testing.expectEqual(.native_batch, native_batch.execution);
+    for (native_batch.vectors) |vector| for (vector, batched.vectors[0]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, @as(f32, if (metal) 1e-3 else 1e-4));
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }
 

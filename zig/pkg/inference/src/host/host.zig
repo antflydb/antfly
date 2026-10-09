@@ -1467,6 +1467,8 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 .decoded_pixels = pixels,
                 .max_media_parts_per_item = 1,
             });
+            var identity_handle = if (decoded.metadata.value.model_identity) |expected| try state.node.pinEmbeddingModelIdentity(alloc, state.io, decoded.metadata.value.model, expected, execution_control) else null;
+            defer if (identity_handle) |*handle| handle.release();
             const vectors = try state.node.embedDenseRastersDirectWithExecutionControl(
                 alloc,
                 state.io,
@@ -1474,6 +1476,11 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 decoded.metadata.value.model,
                 decoded.images,
             );
+            state.node.applyDenseEmbeddingDimensions(alloc, state.io, decoded.metadata.value.model, vectors, decoded.metadata.value.dimensions) catch |err| {
+                for (vectors) |vector| alloc.free(vector);
+                alloc.free(vectors);
+                return err;
+            };
             if (context.out_numeric_result != null) {
                 errdefer {
                     for (vectors) |vector| alloc.free(vector);
@@ -3660,3 +3667,25 @@ const PullProgressReporter = struct {
         if (callback(self.context.progress_context, &view) == 0) self.cancelled.store(true, .release);
     }
 };
+
+test "standalone raster embedding control preserves dimensions pins and borrowed strides" {
+    const a = std.testing.allocator;
+    const identity: [64]u8 = @splat('a');
+    const bytes = [_]u8{ 255, 0, 0, 255, 0, 255, 0, 255, 91, 92, 93, 94 };
+    const metadata = try std.json.Stringify.valueAlloc(a, inference_bridge.ReadRasterImagesRequest{
+        .model = "embeddinggemma2",
+        .model_identity = &identity,
+        .dimensions = 128,
+        .raster_count = 1,
+        .rasters = &.{.{ .width = 2, .height = 1, .stride_bytes = 12, .format = .rgba8 }},
+    }, .{});
+    defer a.free(metadata);
+    const payloads = [_]inference_bridge.ProviderBinaryPayload{.{ .bytes = inference_bridge.String.init(&bytes), .content_type = inference_bridge.String.init("image/x-antfly-rgba8") }};
+    const refs = [_]inference_bridge.ProviderAttachmentRef{.{ .attachment_index = 0 }};
+    var decoded = try decodeReadRasterImagesProviderRequest(a, metadata, &payloads, 1, &refs, 1);
+    defer decoded.deinit(a);
+    try std.testing.expectEqual(@as(?u32, 128), decoded.metadata.value.dimensions);
+    try std.testing.expectEqualStrings(&identity, decoded.metadata.value.model_identity.?);
+    try std.testing.expectEqual(@as(usize, 12), decoded.images[0].stride_bytes);
+    try std.testing.expectEqual(@intFromPtr(bytes[0..].ptr), @intFromPtr(decoded.images[0].bytes.ptr));
+}

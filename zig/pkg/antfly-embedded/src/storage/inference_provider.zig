@@ -1804,6 +1804,8 @@ pub fn inferenceProviderEmbedDenseRasters(
         .embed_dense_rasters,
         inference_bridge.ReadRasterImagesRequest{
             .model = model,
+            .model_identity = context.model_identity,
+            .dimensions = context.dimensions,
             .raster_count = rasters.len,
             .rasters = borrowed.metadata,
         },

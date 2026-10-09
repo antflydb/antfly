@@ -18,6 +18,7 @@ const audio = @import("../pipelines/audio.zig");
 const inference_audio = @import("inference_audio");
 const platform = @import("antfly_platform");
 const image = @import("../pipelines/image.zig");
+const antfly_image = @import("antfly_image");
 const ops = @import("../ops/ops.zig");
 const gguf_metadata = @import("../gguf/metadata.zig");
 const gguf_format = @import("../gguf/format.zig");
@@ -336,7 +337,27 @@ const ProjectorF32 = struct {
 pub fn encodeEmbeddingGemma2Image(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8) !EncodedImage {
     var weights = ProjectorWeights.initHuggingFace(cb, allocator);
     defer weights.deinit();
-    return encodeSingleImage(cb, allocator, &weights, .{
+    return encodeSingleImage(cb, allocator, &weights, embeddingGemma2ImageConfig(), bytes);
+}
+
+/// Renderer-owned pixels share the encoded-image projector after decoding.
+pub fn encodeEmbeddingGemma2Raster(cb: *const ComputeBackend, allocator: std.mem.Allocator, raster: antfly_image.BorrowedRasterAttachment) !EncodedImage {
+    const view = try raster.imageView();
+    try image.DecodeLimits.inference_default.validate(view.width, view.height);
+    var weights = ProjectorWeights.initHuggingFace(cb, allocator);
+    defer weights.deinit();
+    return encodeSingleImageView(cb, allocator, &weights, embeddingGemma2ImageConfig(), view);
+}
+
+/// One image marker pair plus the tokenizer's BOS/EOS tokens.
+pub fn embeddingGemma2RasterSequenceLength(raster: antfly_image.BorrowedRasterAttachment) !usize {
+    try raster.validate();
+    try image.DecodeLimits.inference_default.validate(raster.width, raster.height);
+    return targetGeometry(embeddingGemma2ImageConfig(), raster.width, raster.height).tokenCount() + 4;
+}
+
+fn embeddingGemma2ImageConfig() Config {
+    return .{
         .text_hidden = 512,
         .vision_hidden = 768,
         .intermediate_size = 3072,
@@ -348,7 +369,7 @@ pub fn encodeEmbeddingGemma2Image(cb: *const ComputeBackend, allocator: std.mem.
         .image_mean = .{ 0, 0, 0 },
         .image_std = .{ 1, 1, 1 },
         .position_embeddings_per_axis = 10240,
-    }, bytes);
+    };
 }
 
 pub fn encodeEmbeddingGemma2Audio(cb: *const ComputeBackend, allocator: std.mem.Allocator, bytes: []const u8) !EncodedAudio {
@@ -1170,8 +1191,18 @@ fn encodeSingleImage(
     const decoded = try image.decode(allocator, image_bytes);
     defer decoded.deinit(allocator);
 
+    return encodeSingleImageView(cb, allocator, store, cfg, .{ .data = decoded.data, .width = decoded.width, .height = decoded.height, .format = .rgb8 });
+}
+
+fn encodeSingleImageView(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    store: *ProjectorWeights,
+    cfg: Config,
+    decoded: image.ImageU8,
+) !EncodedImage {
     const geometry = targetGeometry(cfg, decoded.width, decoded.height);
-    const pixel_values = try image.preprocessDecodedRectScaledWithResample(
+    const pixel_values = try image.preprocessImageViewRectScaledWithResample(
         allocator,
         decoded,
         @intCast(geometry.width),
@@ -1191,7 +1222,8 @@ fn encodeSingleImage(
 
     const hidden_shape = [_]i32{ @intCast(geometry.grid_x * geometry.grid_y), @intCast(cfg.vision_hidden) };
     var hidden = try cb.fromFloat32Shape(positioned, &hidden_shape);
-    errdefer cb.free(hidden);
+    var hidden_live = true;
+    errdefer if (hidden_live) cb.free(hidden);
 
     for (0..cfg.block_count) |layer| {
         try cb.checkExecutionControl();
@@ -1207,6 +1239,7 @@ fn encodeSingleImage(
 
     const hidden_data = try cb.toFloat32(hidden, allocator);
     cb.free(hidden);
+    hidden_live = false;
     defer allocator.free(hidden_data);
 
     const pooled = try averagePoolSpatial(allocator, hidden_data, cfg, geometry);

@@ -43,8 +43,15 @@ must remain consistent between indexing and retrieval.
 
 Existing flat inputs return one vector per text or media part. A group returns
 one vector for all its ordered content. Each request must use one form throughout.
-Managed batches execute rows/groups serially within the request workspace;
-the underlying encoder's masked batch path has separate numerical tests.
+Encoded rows/groups execute serially within the request workspace. Local PDF
+page embeddings borrow the renderer's RGBA pixels, including padded row strides,
+without PNG encoding or decoding. They share the encoded-image resize and
+projector, then execute the encoder in cohorts of up to four pages. Cohorts
+preserve page order, cap token padding at 25%, and occupy at most 2048 padded
+token slots. Masks isolate attention and mean pooling by page. Projections are
+released after each cohort, and observed execution reports native batching only
+when every cohort contains multiple pages. Model identity pins, reduced
+dimensions, deadlines and cancellation also apply to this raster path.
 For example, post this body to `/ai/v1/embed`:
 
 ```json

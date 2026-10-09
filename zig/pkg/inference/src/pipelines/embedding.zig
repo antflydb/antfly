@@ -1121,6 +1121,10 @@ pub const EmbeddingPipeline = struct {
 
     pub fn embedBorrowedRastersReported(self: *EmbeddingPipeline, rasters: []const antfly_image.BorrowedRasterAttachment) anyerror!ImageBatchResult {
         if (rasters.len == 0) return .{ .vectors = try self.allocator.alloc([]f32, 0), .execution = .serial };
+        if (session_factory.getEmbeddingGemma2Config(self.session) != null) {
+            const result = try @import("embedding_gemma2.zig").embedRasters(self.allocator, self.session, self.tok, rasters, .{}, self.execution_lock, self.execution_control);
+            return .{ .vectors = result.vectors, .execution = result.execution };
+        }
         const vectors = self.embedBorrowedRastersBatch(rasters) catch |err| {
             if (rasters.len > 1 and shouldFallbackBatchedImageError(err)) {
                 const embeddings = try self.allocator.alloc([]f32, rasters.len);
