@@ -3075,7 +3075,11 @@ test "SQL runtime executes spilled order group distinct and join under a small s
         defer compiled.deinit();
         var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 };
         defer std.debug.assert(quota.live == 0);
-        var result = try execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 256 * 1024, .page_rows = 16 });
+        var result = execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 256 * 1024, .page_rows = 16 }) catch |err| {
+            std.debug.print("SQL small-budget failure: sql={s} error={s} outer_peak={d}\n", .{ case.sql, @errorName(err), quota.peak });
+            if (@errorReturnTrace()) |trace| std.debug.dumpErrorReturnTrace(trace);
+            return err;
+        };
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
         try std.testing.expectEqualStrings(case.first, result.output.rows[0][0].string);
@@ -3432,4 +3436,22 @@ test "SQL filtered LIMIT hints require a complete bound predicate and remain adv
         try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
         try std.testing.expectEqual(case.goal, backend.row_goal);
     }
+}
+
+test "SQL constrained partition join preserves every row after shared allocation denial" {
+    const a = std.testing.allocator;
+    var fixture: TestBackend = .{ .row_count = 2000 };
+    var backend = fixture.coordinated();
+    backend.pinned_statement_snapshot = true;
+    backend.execution_io = std.testing.io;
+    var compiled = try compiler.compile(a, "SELECT COUNT(*) AS n, SUM(CAST(a._id AS BIGINT)) AS total FROM things a JOIN things b ON a._id = b._id", .{});
+    defer compiled.deinit();
+    var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 };
+    defer std.debug.assert(quota.live == 0);
+    var result = try execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 256 * 1024, .page_rows = 16 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("2000", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("1999000", result.output.rows[0][1].string);
+    try std.testing.expect(result.state.budget.peak <= 256 * 1024);
 }

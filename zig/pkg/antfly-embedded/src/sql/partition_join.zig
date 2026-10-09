@@ -582,7 +582,34 @@ pub const Join = struct {
                         offset += block.count();
                         continue;
                     }
-                    const consumed = try self.hash.?.addBatchUntilFull(self.a, values, keys[0..block.count()]);
+                    const consumed = self.hash.?.addBatchUntilFull(self.a, values, keys[0..block.count()]) catch |err| {
+                        if (err != error.OutOfMemory) return err;
+                        // The shared statement allocator can deny growth even
+                        // when the hash's local estimate fits. Typed appends
+                        // may already be partial, so retire the entire hash
+                        // before splitting and replaying the immutable build.
+                        // No prefix is published or transferred twice.
+                        self.hash.?.deinit();
+                        self.hash = null;
+                        _ = self.scratch.reset(.free_all);
+                        file.rewind();
+                        var replay: u64 = 0;
+                        var all_hash_union: u64 = 0;
+                        var all_hash_intersection: u64 = std.math.maxInt(u64);
+                        while (replay < file.size) {
+                            try self.manager.checkFor(self.execution);
+                            const scanned = try file.readBatchBorrowed(replay, 256);
+                            for (scanned.rows) |row| {
+                                const h = (try operators.HashJoin.keyHash(row.keys)) orelse 0;
+                                all_hash_union |= h;
+                                all_hash_intersection &= h;
+                            }
+                            replay = scanned.following;
+                        }
+                        if (!try self.split(all_hash_union ^ all_hash_intersection)) return err;
+                        repartitioned = true;
+                        break;
+                    };
                     const following = offset + block.count();
                     offset += consumed;
                     if (consumed == block.count()) continue;
