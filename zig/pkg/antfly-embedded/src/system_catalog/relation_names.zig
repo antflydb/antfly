@@ -278,6 +278,39 @@ pub const TableCut = struct {
         phase: Phase = .active,
         publication_id: [16]u8 = @splat(0),
     };
+    /// Project one authoritative publication without exposing its successor.
+    /// The caller must validate the durable plan and exact predecessor first;
+    /// these schema-derived names are not evidence of publication authority.
+    /// Old-only names remain active until cutover; shared names retain both
+    /// owners, and new-only names carry a reservation without an active owner.
+    pub fn initSuccessor(a: A, predecessor: ?Definition, successor: Definition) !TableCut {
+        if (successor.phase != .reserved) return error.InvalidCatalogRecord;
+        if (predecessor) |before| if (before.phase != .active) return error.InvalidCatalogRecord;
+        var pending = try init(a, successor);
+        defer pending.deinit();
+        var output: TableCut = if (predecessor) |before| try init(a, before) else .{ .arena = std.heap.ArenaAllocator.init(a), .claims = &.{} };
+        errdefer output.deinit();
+        const owned = output.arena.allocator();
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        var positions: std.HashMapUnmanaged(Key, usize, Context, 80) = .empty;
+        // Transfer the already-owned predecessor names and claims rather than
+        // constructing a third full schema cut. Only new names need copying.
+        var result = std.ArrayList(Claim).fromOwnedSlice(@constCast(output.claims));
+        try positions.ensureTotalCapacity(scratch.allocator(), @intCast(result.items.len));
+        for (result.items, 0..) |claim, index| positions.putAssumeCapacity(claim.key, index);
+        for (pending.claims) |claim| {
+            if (positions.get(claim.key)) |index| {
+                result.items[index].pending = claim.owner;
+            } else {
+                if (result.items.len == max_claims) return error.CatalogCommandTooLarge;
+                const key: Key = .{ .namespace_id = claim.key.namespace_id, .name = try owned.dupe(u8, claim.key.name) };
+                try result.append(owned, .{ .key = key, .owner = claim.owner });
+            }
+        }
+        output.claims = try result.toOwnedSlice(owned);
+        return output;
+    }
     // A names-only projection skips column definitions, expressions, display
     // metadata and other unrelated schema payloads without building their DOM.
     const SchemaNames = struct {
@@ -755,6 +788,95 @@ test "catalog table cuts preserve constraint and index provenance without duplic
     defer document.deinit();
     try std.testing.expectEqual(@as(usize, 1), document.claims.len);
     try std.testing.expectEqual(@as(u32, 0), document.claims[0].owner.schema_version);
+}
+
+test "catalog successor cuts preserve shared removed and new names across physical replacement" {
+    const a = std.testing.allocator;
+    const before: TableCut.Definition = .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = "{\"version\":3,\"relational_indexes\":[{\"name\":\"shared\"},{\"name\":\"removed\"}]}" };
+    const after: TableCut.Definition = .{ .namespace_id = 2, .table_id = 8, .name = "items", .schema_json = "{\"version\":4,\"unique_constraints\":[{\"name\":\"shared\"},{\"name\":\"added\"}]}", .phase = .reserved, .publication_id = @splat(9) };
+    var cut = try TableCut.initSuccessor(a, before, after);
+    defer cut.deinit();
+    try std.testing.expectEqual(@as(usize, 4), cut.claims.len);
+    const expected = [_][]const u8{ "items", "shared", "removed", "added" };
+    for (cut.claims, expected) |claim, name| try std.testing.expectEqualStrings(name, claim.key.name);
+    const shared = try cut.claims[1].entry();
+    try std.testing.expectEqual(@as(u64, 7), shared.active.?.table_id);
+    try std.testing.expectEqual(@as(u64, 8), shared.pending.?.table_id);
+    try std.testing.expectEqual(Kind.index, shared.active.?.kind);
+    try std.testing.expectEqual(Kind.constraint_index, shared.pending.?.kind);
+    try std.testing.expectEqual(@as(u32, 3), shared.active.?.schema_version);
+    try std.testing.expectEqual(@as(u32, 4), shared.pending.?.schema_version);
+    try std.testing.expectEqualSlices(u8, &after.publication_id, &shared.pending.?.publication_id);
+    const removed = try cut.claims[2].entry();
+    try std.testing.expect(removed.active != null and removed.pending == null);
+    const added = try cut.claims[3].entry();
+    try std.testing.expect(added.active == null and added.pending != null);
+    try std.testing.expect(!std.mem.eql(u8, &shared.active.?.schema_digest, &shared.pending.?.schema_digest));
+    var initial = try TableCut.initSuccessor(a, null, after);
+    defer initial.deinit();
+    for (initial.claims) |claim| try std.testing.expect((try claim.entry()).active == null);
+    var moved = after;
+    moved.namespace_id = 3;
+    var separate = try TableCut.initSuccessor(a, before, moved);
+    defer separate.deinit();
+    try std.testing.expectEqual(@as(usize, 6), separate.claims.len);
+    for (separate.claims[0..3]) |claim| try std.testing.expect((try claim.entry()).pending == null);
+    for (separate.claims[3..]) |claim| try std.testing.expect((try claim.entry()).active == null);
+    try std.testing.expectError(error.InvalidCatalogRecord, TableCut.initSuccessor(a, before, before));
+    try std.testing.expectError(error.InvalidCatalogRecord, TableCut.initSuccessor(a, after, after));
+    var unfenced = after;
+    unfenced.publication_id = @splat(0);
+    try std.testing.expectError(error.InvalidCatalogRecord, TableCut.initSuccessor(a, before, unfenced));
+}
+
+test "catalog successor cuts bound the union rather than the sum of both schemas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var schema: std.ArrayList(u8) = .empty;
+    try schema.appendSlice(a, "{\"version\":1,\"relational_indexes\":[");
+    for (0..max_claims - 1) |i| {
+        if (i != 0) try schema.append(a, ',');
+        try schema.appendSlice(a, try std.fmt.allocPrint(a, "{{\"name\":\"idx_{d}\"}}", .{i}));
+    }
+    try schema.appendSlice(a, "]}");
+    const before: TableCut.Definition = .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = schema.items };
+    var after = before;
+    after.table_id = 8;
+    after.phase = .reserved;
+    after.publication_id = @splat(9);
+    var full = try TableCut.initSuccessor(std.testing.allocator, before, after);
+    defer full.deinit();
+    try std.testing.expectEqual(max_claims, full.claims.len);
+    for (full.claims) |claim| {
+        const entry = try claim.entry();
+        try std.testing.expect(entry.active != null and entry.pending != null);
+    }
+    // Both inputs are individually admissible, but the renamed table adds
+    // one distinct name to a full predecessor cut.
+    after.name = "renamed";
+    try std.testing.expectError(error.CatalogCommandTooLarge, TableCut.initSuccessor(std.testing.allocator, before, after));
+}
+
+test "catalog successor cuts own retired source buffers and unwind every allocation failure" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            var cut = blk: {
+                const name = try a.dupe(u8, "items");
+                defer a.free(name);
+                const schema = try a.dupe(u8, "{\"version\":4,\"relational_indexes\":[{\"name\":\"new_idx\"}]}");
+                defer a.free(schema);
+                break :blk try TableCut.initSuccessor(a, .{ .namespace_id = 2, .table_id = 7, .name = name, .schema_json = "" }, .{ .namespace_id = 2, .table_id = 8, .name = name, .schema_json = schema, .phase = .reserved, .publication_id = @splat(9) });
+            };
+            defer cut.deinit();
+            try std.testing.expectEqualStrings("items", cut.claims[0].key.name);
+            try std.testing.expectEqualStrings("new_idx", cut.claims[1].key.name);
+            try std.testing.expectEqual(@as(u64, 8), (try cut.claims[0].entry()).pending.?.table_id);
+        }
+    };
+    try Probe.run(std.testing.allocator);
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Probe.run, .{});
 }
 
 test "catalog table cuts skip unrelated schema payloads under bounded allocator headroom" {

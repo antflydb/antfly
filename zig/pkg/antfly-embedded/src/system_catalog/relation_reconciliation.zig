@@ -1122,16 +1122,12 @@ test "relation reconciliation permanent failure is fenced terminal and retains v
 
 test "relation reconciliation compound candidates retain active visibility and verify reserved successor bytes" {
     const a = std.testing.allocator;
-    var successor = test_owner;
-    successor.table_id = 8;
-    successor.phase = .reserved;
-    successor.publication_id = @splat(9);
-    const claims = [_]names.Claim{
-        .{ .key = test_claims[0].key, .owner = test_owner, .pending = successor },
-        .{ .key = .{ .namespace_id = 5, .name = "new_idx" }, .owner = successor },
-    };
-    try std.testing.expectError(error.InvalidCatalogRecord, names.Plan.init(a, &.{}, &claims));
-    const rows = [_]SourceRow{.{ .key = "table:7", .table_id = 7, .pending_table_id = 8, .claims = &claims }};
+    var cut = try names.TableCut.initSuccessor(a, .{ .namespace_id = 5, .table_id = 7, .name = "orders", .schema_json = "{\"version\":3}" }, .{ .namespace_id = 5, .table_id = 8, .name = "orders", .schema_json = "{\"version\":4,\"relational_indexes\":[{\"name\":\"new_idx\"}]}", .phase = .reserved, .publication_id = @splat(9) });
+    defer cut.deinit();
+    const claims = cut.claims;
+    const successor = (try claims[0].entry()).pending.?;
+    try std.testing.expectError(error.InvalidCatalogRecord, names.Plan.init(a, &.{}, claims));
+    const rows = [_]SourceRow{.{ .key = "table:7", .table_id = 7, .pending_table_id = 8, .claims = claims }};
     var source: TestSource = .{ .rows = &rows };
     const initial = try State.init(41, try nextJobId(null), test_epoch);
     var txn = TestTxn.init();
@@ -1141,10 +1137,10 @@ test "relation reconciliation compound candidates retain active visibility and v
     defer build.deinit();
     try build.apply(&txn, test_epoch);
     var reader: CandidateStore(TestTxn) = .{ .txn = &txn, .state = &initial };
-    try std.testing.expect((try reader.getClaim(claims[0].key)).?.eql(test_owner));
+    try std.testing.expect((try reader.getClaim(claims[0].key)).?.eql(claims[0].owner));
     try std.testing.expect((try reader.getEntry(claims[0].key)).?.pending.?.eql(successor));
     try std.testing.expect(try reader.getClaim(claims[1].key) == null);
-    try std.testing.expect((try reader.getEntry(claims[1].key)).?.pending.?.eql(successor));
+    try std.testing.expect((try reader.getEntry(claims[1].key)).?.pending.?.eql(claims[1].owner));
     var verified = try Page.prepareSource(a, build.after, test_epoch, &source);
     defer verified.deinit();
     try verified.apply(&txn, test_epoch);

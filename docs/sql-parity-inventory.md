@@ -1738,6 +1738,17 @@ Native replay rejects even correctly fingerprinted pending claims until an
 authoritative pending-plan source exists; the new proof is not self-authenticating.
 Pending-plan source projections, writer admission and active-root serving remain
 unfinished. There is no fallback decoder or newly enabled public lookup.
+The owned table-cut projector can now combine an exact predecessor definition
+with a plan-fenced successor definition in expected linear time. It retains
+old-only active names, both owners for shared names and pending-only new names,
+including different physical IDs, namespace changes and index-kind changes.
+It reuses the predecessor's arena instead of copying its names into a third
+cut, and bounds the distinct-name union at 8192 rather than rejecting two
+full but overlapping schemas. Pure tests cover that boundary, input retirement
+and exhaustive allocation failures; reconciliation's compound-candidate test
+now uses actual schema-derived projected claims. This is projection machinery,
+not durable FK/restore plan source activation: pinned plan reads, lifecycle
+authority and semantic source-epoch integration remain required.
 Multi-peer coordinator failover/fault coverage remains to be extended alongside
 serving activation. Pending-generation reservation sources,
 capability barriers and atomic active-root publication still
