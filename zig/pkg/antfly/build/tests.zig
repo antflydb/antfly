@@ -2578,7 +2578,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-artifact-read-test", "Run artifact integrity and request-owned provider wait contracts").dependOn(&b.addRunArtifact(artifact_read_tests).step);
     const sql_worker_tests = b.addTest(.{
         .root_module = serverless_manifest_test_mod,
-        .filters = &.{"SQL imported worker"},
+        .filters = &.{ "SQL imported worker", "SQL worker capacity error" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const sql_worker_run = b.addRunArtifact(sql_worker_tests);
