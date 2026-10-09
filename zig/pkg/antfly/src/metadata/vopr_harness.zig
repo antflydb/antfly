@@ -6911,6 +6911,7 @@ pub const MetadataAdminVoprSource = struct {
             .lake_index_lifecycle_read,
             .lake_index_lifecycle_work,
             .lake_index_lifecycle_mutate,
+            .relation_replace,
             .policy_install_snapshot,
             .policy_publication_status,
             .policy_publication_work,

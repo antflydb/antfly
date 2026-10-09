@@ -311,6 +311,11 @@ test "system catalog relation namespace transaction guarded replacements fence o
         try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = bytes });
         if (version < topology_protocol.relation_mutation_version) try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.applyStandaloneCommand(group, command));
     }
+    // A delayed publication-floor proof cannot downgrade an activated writer.
+    const delayed_activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.relation_publication_version, .incarnation = identity, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
+    defer a.free(delayed_activation);
+    try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = delayed_activation });
+    try std.testing.expectEqual(topology_protocol.relation_mutation_version, (try store.topologyActivation(group)).?.version);
     const encoded = try encodeTransitionCommand(a, command);
     defer a.free(encoded);
     try std.testing.expectEqual(@backingInt(TransitionTag.compare_and_replace_relation_table), encoded[transition_magic.len]);
@@ -19901,6 +19906,11 @@ pub const RaftApplyStore = struct {
                 var key_buf: [160]u8 = undefined;
                 const incarnation_bytes = try txn.get(try metadataIncarnationKeyForGroup(&key_buf, group_id));
                 if (!std.meta.eql((try decodeMetadataIncarnationRecord(incarnation_bytes)).incarnation, activation.incarnation)) return;
+                if (try stagingGet(txn, try topologyActivationKeyForGroup(&key_buf, group_id))) |current_raw| {
+                    var current = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, current_raw, .{});
+                    defer current.deinit();
+                    if (std.meta.eql(current.value.incarnation, activation.incarnation) and current.value.version > activation.version) return;
+                }
                 if (try relation_reconciliation.readSourceRevision(txn, group_id) != 0 and activation.version < topology_protocol.relation_reconciliation_version) return;
                 if (try stagingGet(txn, try relation_reconciliation.liveKey(&key_buf, group_id)) != null and activation.version < topology_protocol.relation_publication_version) return;
                 try txn.put(try topologyActivationKeyForGroup(&key_buf, group_id), bytes);

@@ -607,6 +607,18 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             defer result.deinit(alloc);
             break :blk std.json.Stringify.valueAlloc(alloc, result, .{});
         },
+        .relation_replace => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, request.replacement.indexes_json);
+            try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, request.replacement.indexes_json);
+            const version = try tables_api.schemaVersion(request.replacement.schema_json);
+            const stamp = try svc.replaceRelationTableDefinitionStampedWithContext(context, request.expected, request.replacement, request.guard);
+            // A response allocation failure after the durable receipt cannot
+            // become a replayable pre-admission error on the forwarding hop.
+            break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
+        },
         .mutate => |request| mutate(svc, alloc, context, request),
     };
 }

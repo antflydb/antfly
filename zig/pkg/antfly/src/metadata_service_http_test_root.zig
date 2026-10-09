@@ -26,6 +26,7 @@ const http_server = @import("metadata/http_server.zig");
 
 test {
     _ = service;
+    _ = @import("system_catalog/server_call.zig");
     _ = @import("metadata/relation_reconciliation_worker.zig");
     _ = catalog_projection_reader;
     _ = admin_read_operations;

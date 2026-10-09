@@ -3519,6 +3519,10 @@ fn relationSourceDecoderFloor(service: anytype) !u16 {
         if (service.projectedStore()) |store| {
             if (comptime @hasDecl(@TypeOf(store.*), "relationSourceTrackingActive")) {
                 if (try store.relationSourceTrackingActive(service.metadata_group_id)) {
+                    if (comptime @hasDecl(@TypeOf(store.*), "topologyActivation")) {
+                        if (try store.topologyActivation(service.metadata_group_id)) |activation|
+                            if (activation.version >= metadata_topology_protocol.relation_mutation_version) return activation.version;
+                    }
                     if (comptime @hasDecl(@TypeOf(store.*), "relationReconciliationWork")) {
                         if ((try store.relationReconciliationWork(service.metadata_group_id)).root != null) return metadata_topology_protocol.relation_publication_version;
                     }
@@ -3530,10 +3534,43 @@ fn relationSourceDecoderFloor(service: anytype) !u16 {
     return 0;
 }
 
+/// Capability observation alone does not install the apply-side barrier. Own
+/// and observe its durable receipt before admitting the user's guarded write.
+fn ensureRelationMutationActivation(service: anytype, context: api_operation.RequestContext) !void {
+    const readiness = try service.ensureTableTopologyProtocolReadyWithContext(context, metadata_topology_protocol.relation_mutation_version);
+    const activation: metadata_topology_protocol.Activation = .{
+        .version = readiness.required_version,
+        .incarnation = readiness.metadata_incarnation orelse return error.TableTopologyProtocolUpgradeRequired,
+        .member_count = readiness.protected_member_count,
+        .membership_fingerprint = readiness.protected_membership_fingerprint,
+    };
+    const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    if (try store.topologyActivation(service.metadata_group_id)) |current| if (current.satisfies(activation)) return;
+    try service.validateTableTopologyProtocolReadinessWithContext(context, readiness);
+    const bytes = try std.json.Stringify.valueAlloc(service.alloc, activation, .{});
+    defer service.alloc.free(bytes);
+    const receipt = try service.proposeTopologyActivationWithReceipt(bytes, readiness);
+    try service.waitForTransitionAppliedWithContext(receipt, context);
+    const applied = (try store.topologyActivation(service.metadata_group_id)) orelse return error.TableTopologyProtocolUpgradeRequired;
+    if (!applied.satisfies(activation)) return error.TableTopologyProtocolUpgradeRequired;
+}
+
 const CoordinatedDecoderAdmission = struct {
     readiness: ?TableTopologyProtocolReadiness = null,
     source_mutation: bool,
 };
+
+fn topologyActivationAdmission(service: anytype, bytes: []const u8, readiness: TableTopologyProtocolReadiness) !CoordinatedDecoderAdmission {
+    if (bytes.len > 1024) return error.InvalidMetadataTransitionEncoding;
+    var parsed = try std.json.parseFromSlice(metadata_topology_protocol.Activation, service.alloc, bytes, .{});
+    defer parsed.deinit();
+    const activation = parsed.value;
+    if (readiness.metadata_incarnation == null or activation.version != readiness.required_version or
+        !std.meta.eql(activation.incarnation, readiness.metadata_incarnation.?) or
+        activation.member_count != readiness.protected_member_count or
+        !std.meta.eql(activation.membership_fingerprint, readiness.protected_membership_fingerprint)) return error.TableTopologyProtocolUpgradeRequired;
+    return .{ .readiness = readiness, .source_mutation = false };
+}
 fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metadata_storage.TransitionCommand) !CoordinatedDecoderAdmission {
     if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
         for (commands) |command| try preflightRowPolicyTopologyCommand(service, command);
@@ -4290,7 +4327,7 @@ fn runRelationReconciliationRound(service: anytype) !void {
             const readiness = try self.service.observeTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.relation_publication_version);
             if (readiness.term != leader_cut.term) return error.NotLeader;
             const activation: metadata_topology_protocol.Activation = .{
-                .version = metadata_topology_protocol.relation_publication_version,
+                .version = readiness.required_version,
                 .incarnation = readiness.metadata_incarnation orelse return error.TableTopologyProtocolUpgradeRequired,
                 .member_count = readiness.protected_member_count,
                 .membership_fingerprint = readiness.protected_membership_fingerprint,
@@ -4301,11 +4338,15 @@ fn runRelationReconciliationRound(service: anytype) !void {
                 const bytes = try std.json.Stringify.valueAlloc(self.service.alloc, activation, .{});
                 defer self.service.alloc.free(bytes);
                 try self.service.validateTableTopologyProtocolReadinessWithContext(request, readiness);
-                return .{ .activated = try self.append(.{ .activate_topology_protocol = bytes }, leader_cut.term) };
+                return .{ .activated = self.finishAppend(try self.service.proposeTopologyActivationWithReceipt(bytes, readiness)) };
             }
             const proof = (try self.store.stepRelationPublicationProof(state, now_ns)) orelse return .pending;
             self.service.relation_publication_preparation.proof = .{ .state = proof.state, .applied_index = proof.applied_index, .root = proof.root };
-            return .{ .publish = .{ .state = proof.state, .prior = proof.root, .activation = activation } };
+            // The publication command attests its own fixed decoder floor;
+            // durable activation may protect a newer writer capability.
+            var publication_activation = activation;
+            publication_activation.version = metadata_topology_protocol.relation_publication_version;
+            return .{ .publish = .{ .state = proof.state, .prior = proof.root, .activation = publication_activation } };
         }
         pub fn cancelPublication(self: *@This()) void {
             self.service.relation_publication_preparation.cancel();
@@ -4329,6 +4370,9 @@ fn runRelationReconciliationRound(service: anytype) !void {
         }
         fn append(self: *@This(), transition: metadata_storage.TransitionCommand, term: u64) !relation_worker.Receipt {
             const receipt = try self.service.proposeTransitionCommandWithReceiptInTerm(transition, term);
+            return self.finishAppend(receipt);
+        }
+        fn finishAppend(self: *@This(), receipt: MetadataProposalReceipt) relation_worker.Receipt {
             // We only suppress in-flight duplicates, never certify an exact
             // applied term. Release the shared waiter's compaction proof now;
             // otherwise every background page would retain a zero-waiter
@@ -6193,16 +6237,20 @@ pub const MetadataService = struct {
         self: *MetadataService,
         command: metadata_storage.TransitionCommand,
     ) !MetadataProposalReceipt {
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null);
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null);
     }
 
     pub fn proposeTransitionCommandWithReceiptInTerm(self: *MetadataService, command: metadata_storage.TransitionCommand, expected_term: u64) !MetadataProposalReceipt {
         if (expected_term == 0) return error.NotLeader;
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term);
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term, null);
     }
 
-    fn proposeTransitionCommandWithReceiptInExpectedTerm(self: *MetadataService, command: metadata_storage.TransitionCommand, expected_term: ?u64) !MetadataProposalReceipt {
-        const decoder = try prepareCoordinatedDecoderAdmission(self, &.{command});
+    pub fn proposeTopologyActivationWithReceipt(self: *MetadataService, bytes: []const u8, readiness: TableTopologyProtocolReadiness) !MetadataProposalReceipt {
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(.{ .activate_topology_protocol = bytes }, readiness.term, try topologyActivationAdmission(self, bytes, readiness));
+    }
+
+    fn proposeTransitionCommandWithReceiptInExpectedTerm(self: *MetadataService, command: metadata_storage.TransitionCommand, expected_term: ?u64, activation_admission: ?CoordinatedDecoderAdmission) !MetadataProposalReceipt {
+        const decoder = activation_admission orelse try prepareCoordinatedDecoderAdmission(self, &.{command});
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
         const safe_command = try runtimeStatusProtocolSafeCommand(self, command, &owned_legacy_store);
@@ -6751,7 +6799,7 @@ pub const MetadataService = struct {
 
     pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
         try requireRelationMutationOwnerWithContext(self, expected, guard, context);
-        try ensureCoordinatedDecoderWithContext(self, .{ .compare_and_replace_table = .{ .expected = expected, .replacement = replacement, .relation_guard = guard } }, context);
+        try ensureRelationMutationActivation(self, context);
         return replaceTableDefinitionGuardedWithContextReceipt(self, expected, replacement, guard, context);
     }
 
@@ -8816,7 +8864,7 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         command: metadata_storage.TransitionCommand,
     ) !MetadataProposalReceipt {
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null);
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null, null);
     }
 
     pub fn proposeTransitionCommandsWithReceipt(
@@ -8878,15 +8926,20 @@ pub const MetadataHttpService = struct {
         expected_term: u64,
     ) !MetadataProposalReceipt {
         if (expected_term == 0) return error.NotLeader;
-        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term);
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term, null);
+    }
+
+    pub fn proposeTopologyActivationWithReceipt(self: *MetadataHttpService, bytes: []const u8, readiness: TableTopologyProtocolReadiness) !MetadataProposalReceipt {
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(.{ .activate_topology_protocol = bytes }, readiness.term, try topologyActivationAdmission(self, bytes, readiness));
     }
 
     fn proposeTransitionCommandWithReceiptInExpectedTerm(
         self: *MetadataHttpService,
         command: metadata_storage.TransitionCommand,
         expected_term: ?u64,
+        activation_admission: ?CoordinatedDecoderAdmission,
     ) !MetadataProposalReceipt {
-        const decoder = try prepareCoordinatedDecoderAdmission(self, &.{command});
+        const decoder = activation_admission orelse try prepareCoordinatedDecoderAdmission(self, &.{command});
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
         const safe_command = try runtimeStatusProtocolSafeCommand(self, command, &owned_legacy_store);
@@ -9792,7 +9845,7 @@ pub const MetadataHttpService = struct {
 
     pub fn replaceRelationTableDefinitionStampedWithContext(self: *MetadataHttpService, context: api_operation.RequestContext, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, guard: relation_catalog.RelationMutationGuard) !metadata_api.CatalogMutationStamp {
         try requireRelationMutationOwnerWithContext(self, expected, guard, context);
-        try ensureCoordinatedDecoderWithContext(self, .{ .compare_and_replace_table = .{ .expected = expected, .replacement = replacement, .relation_guard = guard } }, context);
+        try ensureRelationMutationActivation(self, context);
         return replaceTableDefinitionGuardedWithContextReceipt(self, expected, replacement, guard, context);
     }
 
@@ -10423,7 +10476,9 @@ pub const MetadataHttpService = struct {
                     zig017_return_error = zig017_err;
                     return zig017_err;
                 });
-                break :blk (self.proposeTransitionCommandWithReceiptInTerm(.{ .activate_topology_protocol = bytes }, observation.term) catch |zig017_err| {
+                var activation_readiness = expected_readiness;
+                activation_readiness.required_version = activation.version;
+                break :blk (self.proposeTopologyActivationWithReceipt(bytes, activation_readiness) catch |zig017_err| {
                     zig017_return_error = zig017_err;
                     return zig017_err;
                 });
@@ -18923,6 +18978,48 @@ test "relation reconciliation worker activates and publishes verified roots in r
     const replacement = try T.settle(&svc, false);
     try std.testing.expect(!replacement.root.?.eql(rebuilt.root.?));
     try std.testing.expect(replacement.root.?.eql(r.Generation.of(&replacement.current.?)));
+    // Exercise private transport admission against a real published owner and
+    // durable Raft receipt, not just the point-read and proposal mocks.
+    const catalog_calls = @import("../system_catalog/server_call.zig");
+    const catalog_operations = @import("../system_catalog/operations.zig");
+    const owner_cut = try store.resolveSystemCatalogIdentities(a, group, .{ .relations = &.{.{ .name = "shared_key" }} });
+    defer owner_cut.deinit(a);
+    const owner = owner_cut.relations[0].?;
+    const before = (try store.getTable(a, group, owner.owner.table_id)).?;
+    defer metadata_table_manager.freeTable(a, before);
+    var after = before;
+    after.description = "guarded private replacement";
+    const replace_call: catalog_calls.Call = .{ .relation_replace = .{
+        .guard = .{ .target = .{ .name = "shared_key" }, .logical_table = owner.logical_table, .owner = owner.owner, .incarnation = owner_cut.relation_epoch.?.incarnation },
+        .expected = before,
+        .replacement = after,
+    } };
+    try std.testing.expectError(error.Forbidden, catalog_operations.call(&svc, a, .{}, replace_call));
+    try std.testing.expectError(error.DeadlineExceeded, catalog_operations.call(&svc, a, .{ .setting_admin = true, .deadline_ns = 0 }, replace_call));
+    var stale_membership = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relation_mutation_version);
+    stale_membership.protected_membership_fingerprint[0] ^= 1;
+    const stale_activation = try std.json.Stringify.valueAlloc(a, metadata_topology_protocol.Activation{
+        .version = stale_membership.required_version,
+        .incarnation = stale_membership.metadata_incarnation.?,
+        .member_count = stale_membership.protected_member_count,
+        .membership_fingerprint = stale_membership.protected_membership_fingerprint,
+    }, .{});
+    defer a.free(stale_activation);
+    try std.testing.expectError(error.NotLeader, svc.proposeTopologyActivationWithReceipt(stale_activation, stale_membership));
+    try std.testing.expectEqual(metadata_topology_protocol.relation_publication_version, (try store.topologyActivation(group)).?.version);
+    const reply = try catalog_operations.call(&svc, a, .{ .setting_admin = true }, replace_call);
+    defer a.free(reply);
+    var result = try std.json.parseFromSlice(catalog_calls.RelationReplacementResult, a, reply, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.value.schema_version);
+    try std.testing.expect(result.value.stamp != null);
+    const committed = (try store.getTable(a, group, before.table_id)).?;
+    defer metadata_table_manager.freeTable(a, committed);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(after, committed));
+    const next_source = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_table = .{ .table_id = 2, .name = "two-after-activation", .schema_json = "{}" } });
+    try svc.waitForTransitionApplied(next_source);
+    _ = try T.settle(&svc, false);
+    try std.testing.expectEqual(metadata_topology_protocol.relation_mutation_version, (try store.topologyActivation(group)).?.version);
     svc.lockRuntime();
     defer svc.unlockRuntime();
     try std.testing.expectEqual(@as(usize, 0), svc.raft.host.host.runtime_host.groups.getPtr(group).?.tracked_proposal_receipts.count());

@@ -23,6 +23,24 @@ const TableList = domain.TableList;
 const TableStatusTarget = domain.TableStatusTarget;
 const Target = domain.Target;
 
+/// Internal, body-bound admission; never deserialize this from public SQL.
+pub const RelationReplacement = struct {
+    guard: domain.RelationMutationGuard,
+    expected: @import("../metadata/table_manager.zig").TableRecord,
+    replacement: @import("../metadata/table_manager.zig").TableRecord,
+
+    pub fn validate(self: @This()) !void {
+        try self.guard.validate();
+        if (self.expected.table_id != self.guard.owner.table_id or self.replacement.table_id != self.expected.table_id or
+            !std.mem.eql(u8, self.expected.name, self.replacement.name)) return error.InvalidCatalogMutation;
+    }
+};
+
+pub const RelationReplacementResult = struct {
+    schema_version: u32,
+    stamp: ?@import("../metadata/api.zig").CatalogMutationStamp = null,
+};
+
 pub const Call = union(enum) {
     lake_index_lifecycle_read: u64,
     lake_index_lifecycle_work: ?u64,
@@ -70,6 +88,7 @@ pub const Call = union(enum) {
     snapshot: void,
     resolve: Target,
     resolve_many: ResolveMany,
+    relation_replace: RelationReplacement,
     query_definition: []const u8,
     mutate: Request,
     // A distinct operation makes older peers reject unsupported point reads.
@@ -79,6 +98,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
+            .relation_replace => true,
             .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -150,4 +170,40 @@ test "native lake lifecycle calls bind private read and mutation grants" {
     try std.testing.expect(write.requiresAdministrativeGrant());
     try std.testing.expect(write.isMutation());
     try std.testing.expect(!write.requiresSettingAuthorityReadGrant());
+}
+
+test "system catalog relation replacement requires a body-bound administrative mutation grant" {
+    const call: Call = .{ .relation_replace = undefined };
+    try std.testing.expect(call.requiresAdministrativeGrant());
+    try std.testing.expect(call.isMutation());
+    try std.testing.expect(!call.requiresSettingAuthorityReadGrant());
+}
+
+test "system catalog relation replacement wire retains exact owner and rejects identity changes" {
+    const a = std.testing.allocator;
+    const table: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = 7, .name = "physical" };
+    var request: RelationReplacement = .{
+        .guard = .{ .target = .{ .name = "idx" }, .logical_table = "logical", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .index }, .incarnation = @splat(1) },
+        .expected = table,
+        .replacement = table,
+    };
+    try request.validate();
+    const bytes = try std.json.Stringify.valueAlloc(a, Call{ .relation_replace = request }, .{});
+    defer a.free(bytes);
+    var parsed = try std.json.parseFromSlice(Call, a, bytes, .{});
+    defer parsed.deinit();
+    try parsed.value.relation_replace.validate();
+    try std.testing.expect(parsed.value.relation_replace.guard.owner.eql(request.guard.owner));
+    try std.testing.expectEqualStrings("logical", parsed.value.relation_replace.guard.logical_table);
+    // Old peers cannot silently discard the guard and execute an ordinary CAS.
+    const LegacyCall = union(enum) { resolve_many: ResolveMany, mutate: Request };
+    try std.testing.expectError(error.UnknownField, std.json.parseFromSlice(LegacyCall, a, bytes, .{}));
+    request.replacement.table_id = 8;
+    try std.testing.expectError(error.InvalidCatalogMutation, request.validate());
+    request.replacement = table;
+    request.replacement.name = "renamed";
+    try std.testing.expectError(error.InvalidCatalogMutation, request.validate());
+    request.replacement = table;
+    request.guard.incarnation = @splat(0);
+    try std.testing.expectError(error.InvalidCatalogMutation, request.validate());
 }

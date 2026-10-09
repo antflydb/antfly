@@ -2308,6 +2308,26 @@ catalog. Shared admission preserves semantic JSON equality and propagates OOM;
 the native gate passes all 38 tests and 50 steps, including extension acquisition
 after name admission, replicated deterministic rejection, standalone revision
 preservation and exhaustive allocation faults. This adds no corpus credit.
+The private catalog envelope now carries guarded replacements under a body-bound
+administrative grant. Hosted ingress returns an exact durable mutation stamp;
+standalone preallocates its reply and verifies the committed postimage before
+updating its projection. Extension ownership rejections remain definitive across
+the private HTTP hop, while ambiguous outcomes cannot be reclassified as safe
+rejections. Strict old-peer decoding and guard/identity wire tests are included.
+The real-service test exposed a missing durable activation step that mock
+readiness could not prove: guarded writes now install and observe capability 33
+before user admission. Activation proofs retain their exact membership and term
+through append under the runtime lock, and durable activation cannot decrease
+within an incarnation. Later publication work retains that higher writer floor
+while attesting its fixed publication decoder contract. All 23 coordinator tests
+and 50 build steps pass for this final cut, including a real replacement receipt,
+stale-membership rejection and a subsequent source rebuild. The native store's
+38 tests also pass, including delayed lower-version activation rejection. The
+standalone private-transport cut separately completes all 66 build steps, with
+178 tests passing and one skipped. That gate includes private admission and
+missing-capability rejection without durable state changes; it does not prove
+standalone publication bootstrap or public SQL index activation. Public SQL
+index lowering remains unfinished and no original-case dispositions change.
 The first standalone gate exposed missing storage-owner cleanup symbols in its
 unlinked test composition. Its catalog tests now use a dedicated module linked
 to the production ABI providers, without changing unrelated restore roots or

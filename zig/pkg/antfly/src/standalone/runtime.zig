@@ -2406,10 +2406,7 @@ const LocalStandaloneMetadata = struct {
         admitted.cancellation = .none;
         const result = try systemCatalogAdmitted(ptr, alloc, admitted, call);
         errdefer alloc.free(result);
-        if (call != .mutate and call != .setting_mutate and call != .policy_definition_mutate and
-            call != .policy_publication_begin and call != .policy_publication_mutate and
-            call != .fk_initial_create_begin and call != .fk_initial_create_mutate and
-            call != .fk_generation_publication_begin and call != .fk_generation_publication_mutate) try context.ensureActive();
+        if (!call.isMutation()) try context.ensureActive();
         return result;
     }
 
@@ -2842,6 +2839,31 @@ const LocalStandaloneMetadata = struct {
                     alloc.free(names);
                 }
                 return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = revision, .tables = tables, .logical_names = names }, .{});
+            },
+            .relation_replace => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, request.replacement.indexes_json);
+                try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, request.replacement.indexes_json);
+                const version = try antfly.public_api.tables.schemaVersion(request.replacement.schema_json);
+                // Own the bounded reply before commit; cancellation afterwards
+                // cannot claim that the durable mutation was rolled back.
+                const reply = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").RelationReplacementResult{ .schema_version = version }, .{});
+                errdefer alloc.free(reply);
+                try context.ensureActive();
+                const previous = self.durable_revision;
+                try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .compare_and_replace_table = .{ .expected = request.expected, .replacement = request.replacement, .relation_guard = request.guard } });
+                const actual = (store.getTable(alloc, group_ids.main_metadata_group_id, request.expected.table_id) catch return error.MetadataMutationOutcomeUnknown) orelse return error.MetadataMutationOutcomeUnknown;
+                defer antfly.metadata.table_manager.freeTable(alloc, actual);
+                if (!antfly.metadata.table_manager.tableDefinitionsEqual(actual, request.replacement)) return error.MetadataMutationOutcomeUnknown;
+                const revision = store.standaloneRevision() catch return error.MetadataMutationOutcomeUnknown;
+                if (previous != 0 and previous != std.math.maxInt(u64) and revision == previous + 1) {
+                    self.manager.upsertTable(actual) catch return error.MetadataMutationOutcomeUnknown;
+                    self.epoch = revision;
+                    self.durable_revision = revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                return reply;
             },
             .mutate => |request| {
                 if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
@@ -13848,6 +13870,38 @@ test "system catalog native authority writes bounded deltas and recovers logical
     defer reopened.deinit();
     try std.testing.expect(reopened.system_catalog_state.?.index.find(.database, 0, "renamed") != null);
     try std.testing.expect(reopened.system_catalog_state.?.index.find(.database, 0, "tenant_999") == null);
+}
+
+test "system catalog standalone relation replacement requires private admission and durable capability" {
+    if (comptime control_only_storage_sources) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    const store = metadata.lifecycle_store.?;
+    const table: antfly.metadata.table_manager.TableRecord = .{ .table_id = 7, .name = "physical", .schema_json = "{\"version\":1}" };
+    try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .upsert_table = table });
+    const revision = try store.standaloneRevision();
+    var replacement = table;
+    replacement.description = "must not commit without durable activation";
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .relation_replace = .{
+        .guard = .{ .target = .{ .name = "idx" }, .logical_table = "physical", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .index }, .incarnation = @splat(1) },
+        .expected = table,
+        .replacement = replacement,
+    } };
+    const source = metadata.statusSource();
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(alloc, .{}, call));
+    try std.testing.expectError(error.DeadlineExceeded, source.systemCatalog(alloc, .{ .setting_admin = true, .deadline_ns = 0 }, call));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, source.systemCatalog(alloc, .{ .setting_admin = true }, call));
+    try std.testing.expectEqual(revision, try store.standaloneRevision());
+    const unchanged = (try store.getTable(alloc, group_ids.main_metadata_group_id, table.table_id)).?;
+    defer antfly.metadata.table_manager.freeTable(alloc, unchanged);
+    try std.testing.expect(antfly.metadata.table_manager.tableDefinitionsEqual(table, unchanged));
 }
 
 test "system catalog cancellation callbacks run outside the authority mutex" {
