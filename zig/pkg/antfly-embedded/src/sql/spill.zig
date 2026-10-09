@@ -37,7 +37,7 @@ fn childWaitEnd(raw: *anyopaque) !void {
     const entry = execution.entry orelse return error.InvalidRunnableTransition;
     try execution.enter(entry.class);
 }
-fn childWait(execution: *Runnable.Execution) @import("execution_wait.zig").Boundary {
+pub fn childWait(execution: *Runnable.Execution) @import("execution_wait.zig").Boundary {
     return .{ .ptr = execution, .begin = childWaitBegin, .end = childWaitEnd };
 }
 
@@ -188,7 +188,7 @@ pub const Manager = struct {
     pub fn check(self: *Manager) !void {
         try self.checkpoint(self.context);
     }
-    fn checkFor(self: *Manager, execution: ?*Runnable.Execution) !void {
+    pub fn checkFor(self: *Manager, execution: ?*Runnable.Execution) !void {
         if (execution) |child| return child.checkpoint();
         return self.check();
     }
@@ -780,7 +780,7 @@ pub const Sequential = struct {
     pub fn init(manager: *Manager, bytes: usize) !Sequential {
         return initFor(manager, bytes, null);
     }
-    fn initFor(manager: *Manager, bytes: usize, execution: ?*Runnable.Execution) !Sequential {
+    pub fn initFor(manager: *Manager, bytes: usize, execution: ?*Runnable.Execution) !Sequential {
         return .{ .file = try manager.createFor(execution), .block_bytes = @max(128, @min(bytes, manager.max_record_bytes / 4)), .write_arena = .init(manager.allocator()), .read_arena = .init(manager.allocator()) };
     }
     pub fn close(self: *Sequential) void {
@@ -1759,7 +1759,7 @@ pub const Sort = struct {
         for (row.keys) |key| if (!key.sql_null) {
             _ = try scalar.compare(key.value, key.value);
         };
-        try self.manager.check();
+        try self.manager.checkFor(self.execution);
         var bytes: usize = @sizeOf(Row);
         for (row.values) |v| bytes +|= try operators.datumBytes(v);
         for (row.keys) |v| bytes +|= try operators.datumBytes(v);
@@ -1934,7 +1934,7 @@ pub const Sort = struct {
             self.a.destroy(job);
         }
         try self.sortRows();
-        var run = try Sequential.init(self.manager, self.blockBytes());
+        var run = try Sequential.initFor(self.manager, self.blockBytes(), self.execution);
         var transferred = false;
         errdefer if (!transferred) run.close();
         try self.writeRows(&run);

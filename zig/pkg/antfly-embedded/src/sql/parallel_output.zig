@@ -67,6 +67,8 @@ const Block = struct {
 };
 pub const Pipe = struct {
     manager: *spill.Manager,
+    // Only the producer touches this receiver; clear it before physical join.
+    producer_execution: ?*@import("../common/runnable_scheduler.zig").Execution = null,
     slots: [2]*Block = undefined,
     queue: std.Io.Queue(*Block),
     pending: ?*Block = null,
@@ -104,7 +106,7 @@ pub const Pipe = struct {
         return self.appendBatch(.{ .rows = &.{row.values} }, .{ .rows = &.{row.keys} }, &.{row.ordinal});
     }
     pub fn appendBatch(self: *Pipe, values: Batch, keys: Batch, ordinals: []const u64) !void {
-        try self.manager.check();
+        try self.manager.checkFor(self.producer_execution);
         if (self.pending == null) self.pending = try Block.create(self.manager.allocator());
         try self.pending.?.appendBatch(values, keys, ordinals);
         if (self.pending.?.bytes >= self.block_bytes or self.pending.?.ordinals.items.len >= 64) try self.flush();
@@ -133,9 +135,14 @@ pub const Pipe = struct {
             self.pending = null;
             return;
         }
-        // Single-element put has unambiguous ownership on cancellation.
-        _ = try self.queue.put(self.manager.io, &.{block}, 1);
-        self.pending = null;
+        const boundary = if (self.producer_execution) |execution| spill.childWait(execution) else null;
+        if (boundary) |wait| try wait.begin(wait.ptr);
+        const result = self.queue.put(self.manager.io, &.{block}, 1);
+        // Commit ownership before reacquisition. A denied resume must never
+        // leave both the producer and the queue owning the same block.
+        if (result) |_| self.pending = null else |_| {}
+        if (boundary) |wait| try wait.end(wait.ptr);
+        _ = try result;
     }
     pub fn finish(self: *Pipe, failure: ?anyerror) void {
         self.flush() catch |err| {
@@ -143,6 +150,17 @@ pub const Pipe = struct {
         };
         self.terminal_error = self.terminal_error orelse failure;
         self.queue.close(self.manager.io);
+    }
+    fn receive(self: *Pipe) !?*Block {
+        var block: [1]*Block = undefined;
+        _ = self.queue.get(self.manager.io, &block, 1) catch |err| switch (err) {
+            error.Closed => return null,
+            else => return err,
+        };
+        return block[0];
+    }
+    fn discardReceived(block: ?*Block) void {
+        if (block) |owned| owned.close();
     }
     /// A retained span survives producer and pipe teardown. Consumers release
     /// the span explicitly; successive pulls never invalidate another lease.
@@ -154,12 +172,11 @@ pub const Pipe = struct {
             self.current = null;
         };
         if (self.current == null) {
-            var block: [1]*Block = undefined;
-            _ = self.queue.get(self.manager.io, &block, 1) catch |err| switch (err) {
-                error.Closed => return null,
-                else => return err,
-            };
-            self.current = block[0];
+            const boundary = self.manager.wait orelse if (self.manager.cpu_scope) |scope| scope.wait else null;
+            const block = try @import("execution_wait.zig").runOwned(boundary, receive, .{self}, discardReceived, .{});
+            errdefer if (block) |owned| owned.close();
+            if (boundary != null) try self.manager.check();
+            self.current = block orelse return null;
             self.index = 0;
         }
         const block = self.current.?;
@@ -255,4 +272,89 @@ fn leaseScenario(a: A) !void {
 }
 test "SQL worker column leases survive pipe teardown and allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, leaseScenario, .{});
+}
+
+test "SQL scoped output backpressure releases CPU and held views survive physical producer retirement" {
+    const Runnable = @import("../common/runnable_scheduler.zig");
+    const Fixture = struct {
+        execution: *Runnable.Execution,
+        pipe: *Pipe = undefined,
+        producing: std.atomic.Value(usize) = .init(0),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(Runnable.State.running, self.execution.entry.?.state);
+            try self.execution.checkpoint();
+        }
+        fn begin(raw: *anyopaque) !void {
+            try check(raw);
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.execution.enter(.query);
+        }
+        fn work(self: *@This(), execution: *Runnable.Execution) anyerror!void {
+            self.pipe.producer_execution = execution;
+            defer self.pipe.producer_execution = null;
+            var failure: ?anyerror = null;
+            self.produce() catch |err| {
+                failure = err;
+            };
+            self.pipe.finish(failure);
+        }
+        fn produce(self: *@This()) !void {
+            for (0..8) |index| {
+                self.producing.store(index + 1, .release);
+                try self.pipe.append(.{ .values = &.{@import("scalar.zig").Datum.json(.{ .string = &@as([512]u8, @splat('x')) })}, .keys = &.{}, .ordinal = index });
+            }
+        }
+        fn discard(_: A, _: void) void {}
+    };
+    const a = std.testing.allocator;
+    var owner = try Runnable.Scheduler.init(.{ .slots = 2 });
+    var execution: Runnable.Execution = .{};
+    try execution.start(&owner, .{ .io = std.testing.io }, .query);
+    defer execution.finish();
+    var fixture = Fixture{ .execution = &execution };
+    const boundary = @import("execution_wait.zig").Boundary{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end };
+    var manager = spill.Manager{ .alloc = a, .io = std.testing.io, .context = &fixture, .checkpoint = Fixture.check, .wait = boundary, .parallel_work = false };
+    defer manager.deinit();
+    const pipe = try Pipe.create(&manager, 512);
+    var open = true;
+    defer if (open) pipe.close();
+    fixture.pipe = pipe;
+    const scope = @import("parallel_scheduler.zig").ExecutionScope{ .execution = &execution, .allocator = a, .io = std.testing.io, .wait = boundary };
+    var task = (try scope.submit(8192, a, Fixture.work, .{&fixture}, Fixture.discard)).?;
+    defer if (task.future != null) {
+        pipe.stop();
+        _ = task.cancel(std.testing.io) catch {};
+    };
+    try execution.park(.resource_blocked);
+    var blocked = false;
+    for (0..2000) |_| {
+        if (fixture.producing.load(.acquire) >= 3 and owner.stats().resource_blocked == 2) {
+            blocked = true;
+            break;
+        }
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(blocked);
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+    var health: Runnable.Execution = .{};
+    try health.start(&owner, .{ .io = std.testing.io, .allow_wait = false }, .control);
+    try health.checkpoint();
+    health.finish();
+    try execution.enter(.query);
+    const held = (try pipe.nextBatch(1)).?;
+    defer held.deinit();
+    try std.testing.expectEqual(@as(u64, 0), held.ordinal(0));
+    pipe.stop();
+    _ = task.cancel(std.testing.io) catch {};
+    try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+    try std.testing.expect(pipe.producer_execution == null);
+    pipe.close();
+    open = false;
+    try std.testing.expectEqualStrings(&@as([512]u8, @splat('x')), (try held.values().cell(a, 0, 0)).value.string);
 }
