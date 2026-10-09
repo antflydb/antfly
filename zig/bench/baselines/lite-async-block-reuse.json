@@ -465,5 +465,75 @@
       "zig/bench/baselines/lite-mapping-batches-followup.json"
     ],
     "scope": "PR #1013 measurements remain historical ReleaseSafe helper fixtures. Combined branch reruns reader, artifact, Roaring, LSM and WASM validation; no new end-to-end throughput or soak result is claimed."
+  },
+  "identity_rank_and_admission_followup": {
+    "comparison_commit": "174f0c7fc03492cf49245641809d63394bdbebea",
+    "merged_main_commit": "a202a18842315cd5ae1f59d76a93dbddac0e72e4",
+    "fixtures": {
+      "inactive_decoded_owner_admission": {
+        "host_budget_bytes": 131072,
+        "inactive_decoded_payload_bytes": 16384,
+        "before_retained_charge_bytes": 16448,
+        "after_retained_charge_bytes": 0,
+        "mandatory_decode_bytes": 131072,
+        "before": "OutOfMemory",
+        "after": "success",
+        "inactive_physical_and_index_owner_preserved": true
+      },
+      "active_decoded_owner_preservation": {
+        "host_budget_bytes": 131072,
+        "inactive_decoded_payload_bytes": 16384,
+        "active_decoded_payload_bytes": 16384,
+        "after_active_charge_bytes": 16448,
+        "mandatory_decode_bytes": 98304,
+        "after": "success",
+        "active_bytes_preserved": true
+      },
+      "sparse_file_mapping": {
+        "postings": 128,
+        "document_stride": 5,
+        "lookahead_iterations_before": 2872,
+        "lookahead_iterations_after": 127,
+        "logical_reads_before": 125,
+        "logical_reads_after": 125,
+        "mapping_window_refills": 1
+      },
+      "stored_identity_streaming": {
+        "documents": 384,
+        "identity_bytes": 2578,
+        "warm_cache_probes_before": 768,
+        "warm_cache_probes_after": 6,
+        "scope": "Production identity output helper, metadata validation included. Whole merge also performs other metadata/body passes."
+      },
+      "live_count": {
+        "source_documents": 500000,
+        "deleted_documents": 100000,
+        "live_documents": 400000,
+        "before": "500000 bitmap membership calls",
+        "after": "One frozen rank lookup; preparation shared by all merge passes",
+        "overflow": "error.Overflow"
+      }
+    },
+    "design": [
+      "Before mandatory admission, clear optional decoded/prefix buffers on completed zero-user block owners while preserving physical and index pins. Active owners keep their decoded storage.",
+      "Track the mapping lookahead right edge across rejected density windows; reset on chunk changes and backward/repeated positions.",
+      "Stream contiguous identity spans in append and sorted merges through a 64 KiB stack copy buffer with up to 128 validated metadata rows per batch.",
+      "Prepare and validate deletion rank navigation before any merge output pass, then reuse it for live counts and stored-block deletion interval checks."
+    ],
+    "bounds": {
+      "identity_copy_buffer_bytes": 65536,
+      "identity_metadata_buffer_bytes": 3072,
+      "sorted_identity_run_documents_max": 128,
+      "mapping_window_bytes_max": 512
+    },
+    "coverage": [
+      "Inactive optional storage yields admission to a 128 KiB mandatory decode under a 128 KiB budget.",
+      "An active decoded owner survives reclamation while a separate 96 KiB mandatory decode succeeds.",
+      "Sparse mapping matches point-read results with linear lookahead.",
+      "Batched ID output matches individual reads, including sparse deletions.",
+      "IDs of 192 KiB plus 17 bytes stream without allocating decoder scratch; fully deleted ranges skip missing stored metadata.",
+      "Live counts use rank and reject aggregate u32 overflow."
+    ],
+    "limitations": "Native Debug production-helper fixtures. Counts do not establish end-to-end throughput or 2 GiB soak behavior. ID batching adds fixed stack storage; arbitrary sorted permutations may retain single-row runs. Frozen deletion navigation has allocation cost and is shared across merge passes."
   }
 }

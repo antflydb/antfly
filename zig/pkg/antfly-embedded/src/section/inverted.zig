@@ -3625,8 +3625,18 @@ fn mapDocumentCached(iterator: *PostingsIterator, map: anytype, doc: u32) !u32 {
             if (iterator.mapping_window.items.len == 0 or doc < iterator.mapping_window_base or @as(u64, doc) - iterator.mapping_window_base >= iterator.mapping_window.items.len / 4) {
                 const base = doc;
                 const docs = iterator.doc_values.items;
-                var end = iterator.chunk_doc_pos + 1;
-                while (end < docs.len and docs[end] >= doc and @as(u64, docs[end]) - doc < 128 and docs[end] < map.len) : (end += 1) {}
+                // Keep the right edge monotone even when density rejects a
+                // window. Each document is inspected at most once per chunk.
+                if (iterator.mapping_scan_chunk != iterator.current_chunk_index or iterator.chunk_doc_pos <= iterator.mapping_scan_start) {
+                    iterator.mapping_scan_end = iterator.chunk_doc_pos + 1;
+                    iterator.mapping_scan_chunk = iterator.current_chunk_index;
+                }
+                iterator.mapping_scan_start = iterator.chunk_doc_pos;
+                var end = @min(docs.len, @max(iterator.chunk_doc_pos + 1, iterator.mapping_scan_end));
+                while (end < docs.len and docs[end] >= doc and @as(u64, docs[end]) - doc < 128 and docs[end] < map.len) : (end += 1) {
+                    if (@import("builtin").is_test) iterator.test_mapping_scan_steps += 1;
+                }
+                iterator.mapping_scan_end = end;
                 const postings = end - iterator.chunk_doc_pos;
                 const count = @as(u64, docs[end - 1]) - doc + 1;
                 // Sparse terms keep four-byte point reads: don't trade fewer
@@ -3837,6 +3847,10 @@ pub const PostingsIterator = struct {
     mapping_window_base: u32 = std.math.maxInt(u32),
     mapping_rank_hint: usize = 0,
     mapping_window_refills: u64 = 0,
+    mapping_scan_chunk: usize = std.math.maxInt(usize),
+    mapping_scan_start: usize = std.math.maxInt(usize),
+    mapping_scan_end: usize = 0,
+    test_mapping_scan_steps: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
     document_chunks_rejected: u64 = 0,
     max_payload_chunk_bytes: usize = 64 * 1024,
     norms_data: []const u8 = &.{},
@@ -11085,4 +11099,32 @@ test "deleted modern chunks avoid document scratch while retaining frequency fra
         std.debug.print("LITE_DELETED_CHUNKS reject={any} documents=4096 elapsed_ns={d} peak={d}\n", .{ reject_chunks, elapsed, budget.peak });
     }
     try std.testing.expect(peaks[1] < peaks[0]);
+}
+
+test "mapping windows use linear lookahead for moderately sparse chunks" {
+    const a = std.testing.allocator;
+    const State = struct {
+        reads: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            for (0..out.len / 4) |i| std.mem.writeInt(u32, out[i * 4 ..][0..4], @intCast(offset / 4 + i), .little);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = State{};
+    const view = try @import("../segment_source.zig").View.init(.{ .ranges = .{ .ptr = &state, .length = 1000 * 4, .read_into = State.read, .close = State.close } }, 0, 1000 * 4);
+    const map = AffineDocMap{ .len = 1000, .offset = 7, .ids = view };
+    var iterator = PostingsIterator{ .alloc = a };
+    defer iterator.deinit();
+    for (0..128) |i| try iterator.doc_values.append(a, @intCast(i * 5));
+    iterator.test_mapping_scan_steps = 0;
+    for (iterator.doc_values.items, 0..) |doc, i| {
+        iterator.chunk_doc_pos = i;
+        try std.testing.expectEqual(doc + 7, try mapDocumentCached(&iterator, map, doc));
+    }
+    std.debug.print("LINEAR_SPARSE_MAPPING postings=128 stride=5 reads={d} scan_steps={d} refills={d}\n", .{ state.reads, iterator.test_mapping_scan_steps, iterator.mapping_window_refills });
+    try std.testing.expectEqual(@as(usize, 125), state.reads);
+    try std.testing.expectEqual(@as(u64, 1), iterator.mapping_window_refills);
+    try std.testing.expect(iterator.test_mapping_scan_steps <= 128);
 }

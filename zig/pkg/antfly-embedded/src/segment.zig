@@ -2199,6 +2199,11 @@ const memory_segment_sink_vtable = SegmentSink.VTable{
 pub const MergeInput = struct {
     reader: *const SegmentReader,
     deleted: ?roaring.RoaringBitmap = null,
+    deletion_rank: ?*const roaring.FrozenRankIndex = null,
+
+    fn deletedBefore(self: MergeInput, doc: u32) usize {
+        return if (self.deletion_rank) |rank| rank.rank(doc) else if (self.deleted) |deleted| deleted.rank(doc) else 0;
+    }
 
     fn isDeleted(self: MergeInput, doc_id: u32) bool {
         return if (self.deleted) |deleted| deleted.contains(doc_id) else false;
@@ -2806,7 +2811,23 @@ pub fn writeMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []
     try writeMergedSegmentToSinkWithOptions(alloc, sink, inputs, .{});
 }
 
-pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSink, inputs: []const MergeInput, options: MergeOptions) !void {
+pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSink, inputs_arg: []const MergeInput, options: MergeOptions) !void {
+    if (inputs_arg.len == 0) return error.NoSegments;
+    // Freeze and validate deletion navigation before any output pass.
+    const doc_counts = try alloc.alloc(u32, inputs_arg.len);
+    defer alloc.free(doc_counts);
+    const deleted_docs = try alloc.alloc(?roaring.RoaringBitmap, inputs_arg.len);
+    defer alloc.free(deleted_docs);
+    for (inputs_arg, doc_counts, deleted_docs) |input, *count, *deleted| {
+        count.* = input.reader.doc_count;
+        deleted.* = input.deleted;
+    }
+    const rank_maps = try inverted.prepareRankDocMaps(alloc, doc_counts, deleted_docs);
+    defer inverted.deinitRankDocMaps(alloc, rank_maps);
+    const inputs = try alloc.dupe(MergeInput, inputs_arg);
+    defer alloc.free(inputs);
+    for (inputs, rank_maps) |*input, *map| input.deletion_rank = if (map.rank_index) |*rank| rank else null;
+
     var tracked = PageChecksumSink.init(alloc, output);
     defer tracked.deinit();
     var tracked_sink = tracked.sink();
@@ -2830,7 +2851,7 @@ pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSin
         }
         return;
     }
-    try writeAppendMergedSegmentToSink(alloc, sink, inputs);
+    try writeAppendMergedSegmentToSink(alloc, sink, inputs, doc_counts, rank_maps);
     if (options.source_map) |map| {
         var output_doc: u32 = 0;
         for (inputs, 0..) |input, input_idx| for (0..input.reader.doc_count) |source_doc| {
@@ -2904,11 +2925,11 @@ fn indexSortFieldsEqual(a: []const SegmentIndexSortField, b: []const SegmentInde
     return true;
 }
 
-fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput) !void {
+fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, doc_counts: []const u32, rank_maps: []const inverted.RankDocMap) !void {
     if (inputs.len == 0) return error.NoSegments;
 
     const stored_offset: u64 = @intCast(sink.len());
-    const doc_count = countLiveDocs(inputs);
+    const doc_count = try countLiveDocs(inputs);
     const stored_metadata_length = try writeMergedStoredFields(alloc, sink, inputs, doc_count);
     const stored_length: u64 = @intCast(sink.len() - @as(usize, @intCast(stored_offset)));
     const stored_metadata_crc = try sink.crc32Range(@intCast(stored_offset), @intCast(stored_metadata_length));
@@ -2931,18 +2952,6 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
         for (built_fields.items) |*field| field.deinit(alloc);
         built_fields.deinit(alloc);
     }
-
-    // Freeze deletion navigation once for all fields in this merge.
-    const doc_counts = try alloc.alloc(u32, inputs.len);
-    defer alloc.free(doc_counts);
-    const deleted_docs = try alloc.alloc(?roaring.RoaringBitmap, inputs.len);
-    defer alloc.free(deleted_docs);
-    for (inputs, doc_counts, deleted_docs) |input, *count, *deleted| {
-        count.* = input.reader.doc_count;
-        deleted.* = input.deleted;
-    }
-    const rank_maps = try inverted.prepareRankDocMaps(alloc, doc_counts, deleted_docs);
-    defer inverted.deinitRankDocMaps(alloc, rank_maps);
 
     // For each field, append merged sections directly into the sink and retain
     // only compact section-index metadata.
@@ -3160,12 +3169,11 @@ fn writeSortedMergedSegmentToSink(
     try writeSegmentVersionChecksumAndMagic(sink, @intCast(sections_index_offset));
 }
 
-fn countLiveDocs(inputs: []const MergeInput) u32 {
+fn countLiveDocs(inputs: []const MergeInput) !u32 {
     var total: u32 = 0;
     for (inputs) |input| {
-        for (0..input.reader.doc_count) |doc_id_usize| {
-            if (!input.isDeleted(@intCast(doc_id_usize))) total += 1;
-        }
+        const deleted = input.deletedBefore(input.reader.doc_count);
+        total = try std.math.add(u32, total, input.reader.doc_count - @as(u32, @intCast(deleted)));
     }
     return total;
 }
@@ -3224,6 +3232,63 @@ const StoredTableOutput = struct {
     }
 };
 
+// Task-private output permits bounded streaming: no source-sized ID allocation
+// or published slice is needed. Every metadata row remains validated.
+fn appendStoredIdentityRange(sink: *SegmentSink, input: MergeInput, start_doc: u32, count: u32, scratch: *SegmentReadScratch) !void {
+    const reader = input.reader;
+    if (start_doc > reader.doc_count or count > reader.doc_count - start_doc) return error.InvalidSegment;
+    if (count == 0 or input.deletedBefore(start_doc + count) - input.deletedBefore(start_doc) == count) return;
+    const native = reader.native orelse {
+        for (0..count) |i| {
+            const doc = start_doc + @as(u32, @intCast(i));
+            if (input.isDeleted(doc)) continue;
+            scratch.reset();
+            const id = (try reader.storedIdAlloc(scratch.allocator(), doc)) orelse return error.InvalidSegment;
+            try sink.appendSlice(id);
+        }
+        return;
+    };
+    const range = &native.range;
+    const source = native.metadata_cache.?.borrowedSource();
+    const ids_start = range.stored_offset + 21 + @as(u64, range.doc_count) * stored_fields_v4_doc_entry_size + @as(u64, range.num_blocks) * 12;
+    var entries: [128 * stored_fields_v4_doc_entry_size]u8 = undefined;
+    var bytes: [64 * 1024]u8 = undefined;
+    var processed: u32 = 0;
+    while (processed < count) {
+        const rows = @min(@as(u32, 128), count - processed);
+        try source.readInto(range.stored_offset + 21 + (@as(u64, start_doc) + processed) * stored_fields_v4_doc_entry_size, entries[0 .. rows * stored_fields_v4_doc_entry_size]);
+        var span_start: u64 = 0;
+        var span_len: u64 = 0;
+        for (0..rows) |i| {
+            const entry = entries[i * stored_fields_v4_doc_entry_size ..][0..stored_fields_v4_doc_entry_size];
+            const offset = std.mem.readInt(u64, entry[0..8], .little);
+            const length = std.mem.readInt(u32, entry[8..12], .little);
+            const block = std.mem.readInt(u32, entry[12..16], .little);
+            if (block >= range.num_blocks or offset > range.id_bytes_length or length > range.id_bytes_length - offset) return error.InvalidSegment;
+            const deleted = input.isDeleted(start_doc + processed + @as(u32, @intCast(i)));
+            if (deleted or (span_len != 0 and offset != span_start + span_len)) {
+                try appendStoredIdentitySpan(sink, source, ids_start + span_start, span_len, &bytes);
+                span_len = 0;
+            }
+            if (deleted) continue;
+            if (span_len == 0) span_start = offset;
+            span_len += length;
+        }
+        try appendStoredIdentitySpan(sink, source, ids_start + span_start, span_len, &bytes);
+        processed += rows;
+    }
+}
+
+fn appendStoredIdentitySpan(sink: *SegmentSink, source: @import("segment_source.zig").Source, offset: u64, length: u64, scratch: []u8) !void {
+    var copied: u64 = 0;
+    while (copied < length) {
+        const bytes = scratch[0..@intCast(@min(scratch.len, length - copied))];
+        try source.readInto(offset + copied, bytes);
+        try sink.appendSlice(bytes);
+        copied += bytes.len;
+    }
+}
+
 fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, doc_count: u32) !u64 {
     const stored_start = sink.len();
     if (try allStoredFieldsOmitted(inputs)) return writeOmittedStoredFields(sink, doc_count);
@@ -3248,15 +3313,7 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
     defer identity_scratch.deinit();
     const id_bytes_start = sink.len();
     var copy_locations: [stored_fields_block_doc_target]SegmentReader.V4StoredDocLocation = undefined;
-    for (inputs) |input| {
-        for (0..input.reader.doc_count) |doc_id_usize| {
-            const doc_id: u32 = @intCast(doc_id_usize);
-            if (input.isDeleted(doc_id)) continue;
-            identity_scratch.reset();
-            const id = (try input.reader.storedIdAlloc(identity_scratch.allocator(), doc_id)) orelse continue;
-            try sink.appendSlice(id);
-        }
-    }
+    for (inputs) |input| try appendStoredIdentityRange(sink, input, 0, input.reader.doc_count, &identity_scratch);
     const id_bytes_len: u64 = @intCast(sink.len() - id_bytes_start);
     try sink.writeAt(id_bytes_len_pos, &@as([8]u8, @bitCast(@as(u64, id_bytes_len))));
 
@@ -3377,10 +3434,17 @@ fn writeMergedStoredFieldsInOrderWithReuse(
     defer identity_scratch.deinit();
     const id_bytes_start = sink.len();
     var record_iterator_1 = records.iterator();
-    while (try record_iterator_1.next()) |record| {
-        identity_scratch.reset();
-        const id = (try inputs[record.ref.input_idx].reader.storedIdAlloc(identity_scratch.allocator(), record.ref.doc_id)) orelse return error.InvalidSegment;
-        try sink.appendSlice(id);
+    var pending = try record_iterator_1.next();
+    while (pending) |first| {
+        var count: u32 = 1;
+        pending = try record_iterator_1.next();
+        while (count < stored_fields_block_doc_target) {
+            const next = pending orelse break;
+            if (next.ref.input_idx != first.ref.input_idx or @as(u64, next.ref.doc_id) != @as(u64, first.ref.doc_id) + count) break;
+            count += 1;
+            pending = try record_iterator_1.next();
+        }
+        try appendStoredIdentityRange(sink, inputs[first.ref.input_idx], first.ref.doc_id, count, &identity_scratch);
     }
     const id_bytes_len: u64 = @intCast(sink.len() - id_bytes_start);
     try sink.writeAt(id_bytes_len_pos, &@as([8]u8, @bitCast(@as(u64, id_bytes_len))));
@@ -3612,9 +3676,8 @@ fn copyableStoredBlockDocsWithMetadata(input: MergeInput, start_doc_id: u32, loc
 
     var count: u32 = 0;
     var raw_bytes: usize = 0;
-    for (batch[0..length], 0..) |loc, index| {
+    for (batch[0..length]) |loc| {
         if (loc.block_idx != first.block_idx) break;
-        if (input.isDeleted(start_doc_id + @as(u32, @intCast(index)))) return null;
         if (loc.block_start != first.block_start or loc.block_end != first.block_end) return null;
         if (count >= stored_fields_block_doc_target) return null;
         if (locations) |out| out[count] = loc;
@@ -3622,6 +3685,7 @@ fn copyableStoredBlockDocsWithMetadata(input: MergeInput, start_doc_id: u32, loc
         raw_bytes +|= 4 +| @as(usize, loc.raw_len);
     }
     if (count == 0) return null;
+    if (input.deletedBefore(start_doc_id + count) != input.deletedBefore(start_doc_id)) return null;
     if (count > stored_fields_block_doc_target) return null;
     if (count > 1 and raw_bytes > stored_fields_block_raw_target) return null;
     return count;
@@ -9675,4 +9739,112 @@ test "stored metadata batches adapt to short blocks and changing document sizes"
     const probes = reader.native.?.metadata_cache.?.cache.clock - before;
     try std.testing.expect(probes <= 200);
     std.debug.print("LITE_SHORT_STORED_METADATA rounds=100 cache_probes={d} table_bytes_per_block=24 previous_table_bytes_per_block=3096\n", .{probes});
+}
+
+test "stored identity streaming batches metadata and preserves ID bytes" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    for (0..384) |doc| {
+        var id: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{doc}), "small stored document");
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = State{ .bytes = bytes };
+    var reader = try SegmentReader.initSource(a, .{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close } });
+    defer reader.deinit();
+    for (0..384) |doc| {
+        const id = (try reader.storedIdAlloc(a, @intCast(doc))).?;
+        a.free(id);
+    }
+    var scratch = SegmentReadScratch.init(a, 64 * 1024);
+    defer scratch.deinit();
+    var ids: std.ArrayListUnmanaged(u8) = .empty;
+    defer ids.deinit(a);
+    const cache = &reader.native.?.metadata_cache.?;
+    const before = cache.cache.clock;
+    for (0..384) |doc| {
+        scratch.reset();
+        const id = (try reader.storedIdAlloc(scratch.allocator(), @intCast(doc))).?;
+        try ids.appendSlice(a, id);
+    }
+    const per_doc_probes = cache.cache.clock - before;
+    var output = MemorySegmentSink.init(a);
+    defer output.deinit();
+    var sink = output.sink();
+    const before_batch = cache.cache.clock;
+    try appendStoredIdentityRange(&sink, .{ .reader = &reader }, 0, reader.doc_count, &scratch);
+    const batch_probes = cache.cache.clock - before_batch;
+    try std.testing.expectEqualSlices(u8, ids.items, output.out.items);
+    std.debug.print("STORED_ID_STREAM documents=384 identity_bytes={d} cache_probes={d}->{d}\n", .{ ids.items.len, per_doc_probes, batch_probes });
+    try std.testing.expectEqual(@as(u64, 768), per_doc_probes);
+    try std.testing.expect(batch_probes <= 6);
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    for (0..384) |i| if (i % 3 == 0) try deleted.add(@intCast(i));
+    output.out.clearRetainingCapacity();
+    ids.clearRetainingCapacity();
+    for (0..384) |i| {
+        if (deleted.contains(@intCast(i))) continue;
+        scratch.reset();
+        const id = (try reader.storedIdAlloc(scratch.allocator(), @intCast(i))).?;
+        try ids.appendSlice(a, id);
+    }
+    try appendStoredIdentityRange(&sink, .{ .reader = &reader, .deleted = deleted }, 0, reader.doc_count, &scratch);
+    try std.testing.expectEqualSlices(u8, ids.items, output.out.items);
+}
+
+test "merge live counts use rank and reject overflow" {
+    const a = std.testing.allocator;
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.addRange(0, 100000);
+    var reader: SegmentReader = undefined;
+    reader.doc_count = 500000;
+    var rank = try roaring.FrozenRankIndex.init(a, deleted);
+    defer rank.deinit();
+    try std.testing.expectEqual(@as(u32, 400000), try countLiveDocs(&.{.{ .reader = &reader, .deleted = deleted, .deletion_rank = &rank }}));
+    reader.doc_count = std.math.maxInt(u32);
+    try std.testing.expectError(error.Overflow, countLiveDocs(&.{ .{ .reader = &reader }, .{ .reader = &reader } }));
+}
+
+test "stored identity streaming bounds scratch for large IDs and skips deleted ranges" {
+    const a = std.testing.allocator;
+    const id = try a.alloc(u8, 192 * 1024 + 17);
+    defer a.free(id);
+    for (id, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    try writer.addStoredDoc(id, "document");
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try SegmentReader.initSource(a, .{ .contiguous = bytes });
+    defer reader.deinit();
+    var scratch = SegmentReadScratch.init(a, 64 * 1024);
+    defer scratch.deinit();
+    var output = MemorySegmentSink.init(a);
+    defer output.deinit();
+    var sink = output.sink();
+    try appendStoredIdentityRange(&sink, .{ .reader = &reader }, 0, 1, &scratch);
+    try std.testing.expectEqualSlices(u8, id, output.out.items);
+    try std.testing.expectEqual(@as(usize, 0), scratch.arena.queryCapacity());
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.add(0);
+    // A wholly deleted input need not have stored metadata at all.
+    var omitted: SegmentReader = undefined;
+    omitted.doc_count = 1;
+    output.out.clearRetainingCapacity();
+    try appendStoredIdentityRange(&sink, .{ .reader = &omitted, .deleted = deleted }, 0, 1, &scratch);
+    try std.testing.expectEqual(@as(usize, 0), output.out.items.len);
+    try std.testing.expectError(error.InvalidSegment, appendStoredIdentityRange(&sink, .{ .reader = &reader }, 1, 1, &scratch));
 }

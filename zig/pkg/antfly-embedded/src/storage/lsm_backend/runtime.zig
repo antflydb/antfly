@@ -6487,6 +6487,17 @@ const BatchAsyncBlocks = struct {
     }
 
     fn reclaimIdleScratch(self: *@This()) void {
+        // Completed owners retain optional decoded/key state for reuse. Drop
+        // that state before mandatory admission, preserving physical/index pins.
+        for (self.entries[0..self.limit]) |*entry| if (entry.occupied and entry.users == 0) {
+            self.clearPrefixReader(entry);
+            if (entry.decoded) |bytes| {
+                self.decoded_bytes -= bytes.len;
+                self.reusableAllocator().free(bytes);
+                entry.decoded = null;
+                entry.raw_reader = .{};
+            }
+        };
         if (self.workspace) |*workspace| workspace.reclaimIdle();
     }
 
@@ -12816,4 +12827,93 @@ test "lsm point followup oversized mandatory decode reclaims idle workspace cred
     const decoded = try snappy.decode(mandatory.allocator(), large_compressed);
     defer mandatory.allocator().free(decoded);
     try std.testing.expectEqualSlices(u8, &large, decoded);
+}
+
+test "lsm point followup inactive decoded scratch yields to mandatory admission" {
+    const a = std.testing.allocator;
+    const resources = @import("../resource_manager.zig");
+    const snappy = @import("../../encoding/snappy.zig");
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 * 1024 } });
+    defer manager.deinit(a);
+    var mandatory = resources.BudgetedAllocator.init(&manager, .lsm_read_working_set, a, 1);
+    defer mandatory.deinit();
+    var pool: LocalReader = .{};
+    defer pool.deinit();
+    var shared: BatchAsyncBlocks = .{ .allocator = a, .workspace_config = .{ .pool = &pool, .backing = a, .manager = &manager, .io = std.testing.io, .limit = 8 * 1024 * 1024 } };
+    defer shared.deinit();
+    const small: [16 * 1024]u8 = @splat('x');
+    const compressed = try snappy.encode(a, &small);
+    defer a.free(compressed);
+    var read: AsyncPointBlockRead = .{ .candidate = .{ .run_index = 0 }, .path = "/inactive-decoded", .run_id = 1, .generation = 1, .index_handle = null, .block_index = 0, .absolute_offset = 0, .physical_len = @intCast(compressed.len), .logical_len = small.len, .compression = .snappy, .checksum = @import("antfly_hash").Crc32.hash(compressed), .status = .ready_handle };
+    const old = shared.insert(read);
+    try std.testing.expect(try shared.decodedPayload(old, compressed) != null);
+    try std.testing.expectEqual(@as(usize, 0), old.users);
+    // Completed owners remain occupied and cached until the batch ends or
+    // the window fills. Reclamation must also release their optional buffers.
+    const large: [128 * 1024]u8 = @splat('y');
+    const large_compressed = try snappy.encode(a, &large);
+    defer a.free(large_compressed);
+    read.absolute_offset = 16384;
+    read.logical_len = large.len;
+    read.physical_len = @intCast(large_compressed.len);
+    read.checksum = @import("antfly_hash").Crc32.hash(large_compressed);
+    const block = shared.insert(read);
+    try std.testing.expect(try shared.decodedPayload(block, large_compressed) == null);
+    shared.reclaimIdleScratch();
+    const charged = manager.sliceStats(.lsm_read_working_set).used_bytes;
+    try std.testing.expectEqual(@as(usize, 0), charged);
+    try std.testing.expect(old.occupied);
+    try std.testing.expect(old.decoded == null);
+    const decoded = try snappy.decode(mandatory.allocator(), large_compressed);
+    defer mandatory.allocator().free(decoded);
+    try std.testing.expectEqualSlices(u8, &large, decoded);
+    std.debug.print("INACTIVE_SCRATCH_ADMISSION idle_owner_users=0 retained_charge={d} mandatory_bytes=131072 mandatory=success inactive_owner_preserved=true\n", .{charged});
+}
+
+test "lsm point followup mandatory reclamation preserves active decoded owners" {
+    const a = std.testing.allocator;
+    const resources = @import("../resource_manager.zig");
+    const snappy = @import("../../encoding/snappy.zig");
+    var manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 128 * 1024 } });
+    defer manager.deinit(a);
+    var mandatory = resources.BudgetedAllocator.init(&manager, .lsm_read_working_set, a, 1);
+    defer mandatory.deinit();
+    var pool: LocalReader = .{};
+    defer pool.deinit();
+    var shared: BatchAsyncBlocks = .{ .allocator = a, .workspace_config = .{ .pool = &pool, .backing = a, .manager = &manager, .io = std.testing.io, .limit = 8 * 1024 * 1024 } };
+    defer shared.deinit();
+    const small: [16 * 1024]u8 = @splat('x');
+    const compressed = try snappy.encode(a, &small);
+    defer a.free(compressed);
+    var read: AsyncPointBlockRead = .{ .candidate = .{ .run_index = 0 }, .path = "/inactive-decoded", .run_id = 1, .generation = 1, .index_handle = null, .block_index = 0, .absolute_offset = 0, .physical_len = @intCast(compressed.len), .logical_len = small.len, .compression = .snappy, .checksum = @import("antfly_hash").Crc32.hash(compressed), .status = .ready_handle };
+    const old = shared.insert(read);
+    try std.testing.expect(try shared.decodedPayload(old, compressed) != null);
+    try std.testing.expectEqual(@as(usize, 0), old.users);
+    // Completed owners remain occupied and cached until the batch ends or
+    // the window fills. Reclamation must also release their optional buffers.
+    read.absolute_offset = 32768;
+    const active = shared.insert(read);
+    active.users = 1;
+    defer active.users = 0;
+    const active_decoded = (try shared.decodedPayload(active, compressed)).?;
+    const large: [96 * 1024]u8 = @splat('y');
+    const large_compressed = try snappy.encode(a, &large);
+    defer a.free(large_compressed);
+    read.absolute_offset = 16384;
+    read.logical_len = large.len;
+    read.physical_len = @intCast(large_compressed.len);
+    read.checksum = @import("antfly_hash").Crc32.hash(large_compressed);
+    const block = shared.insert(read);
+    try std.testing.expect(try shared.decodedPayload(block, large_compressed) == null);
+    shared.reclaimIdleScratch();
+    const charged = manager.sliceStats(.lsm_read_working_set).used_bytes;
+    try std.testing.expect(charged > 0 and charged < 20 * 1024);
+    try std.testing.expectEqualSlices(u8, &small, active_decoded);
+    try std.testing.expect(active.decoded != null);
+    try std.testing.expect(old.occupied);
+    try std.testing.expect(old.decoded == null);
+    const decoded = try snappy.decode(mandatory.allocator(), large_compressed);
+    defer mandatory.allocator().free(decoded);
+    try std.testing.expectEqualSlices(u8, &large, decoded);
+    std.debug.print("INACTIVE_SCRATCH_ADMISSION idle_owner_users=0 retained_charge={d} mandatory_bytes=98304 mandatory=success inactive_owner_preserved=true\n", .{charged});
 }
