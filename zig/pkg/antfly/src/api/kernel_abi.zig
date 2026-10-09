@@ -29,9 +29,28 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 25;
+pub const abi_version: u32 = 26;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
+
+/// The producer owns the executor implementation and its worker accounting.
+/// Each successful acquisition is an independent lane, released only after
+/// every task and imported receiver has physically retired.
+pub const SqlWorkerBorrow = extern struct {
+    version: u32 = abi_version,
+    struct_size: u32 = @sizeOf(@This()),
+    context: *anyopaque,
+    capacity: usize,
+    io: native_abi.IoBorrow,
+    release: *const fn (*anyopaque) callconv(.c) void,
+};
+pub const SqlWorkerFactory = extern struct {
+    version: u32 = abi_version,
+    struct_size: u32 = @sizeOf(@This()),
+    context: *anyopaque,
+    capacity: usize,
+    acquire: *const fn (*anyopaque, usize, *SqlWorkerBorrow) callconv(.c) Status,
+};
 
 pub const RuntimeIoBorrows = extern struct {
     version: u32 = abi_version,
@@ -40,6 +59,9 @@ pub const RuntimeIoBorrows = extern struct {
     api_network: ?*const native_abi.IoBorrow = null,
     api_filesystem: ?*const native_abi.IoBorrow = null,
     durable: ?*const native_abi.IoBorrow = null,
+    sql_execution: ?*const native_abi.IoBorrow = null,
+    sql_control: ?*const native_abi.IoBorrow = null,
+    sql_workers: ?*const SqlWorkerFactory = null,
 };
 
 pub const CreateContext = extern struct {

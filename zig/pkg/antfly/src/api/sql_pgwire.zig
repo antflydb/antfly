@@ -1121,7 +1121,9 @@ test "SQL pgwire dispatch preserves imported executor authority including unavai
         .cancel_requested = &canceled,
     };
     for ([_]?std.Io{ null, imported_io }, 0..) |executor, i| {
-        api.cfg.imported_runtime_io.?.durable = executor;
+        api.cfg.imported_runtime_io.?.durable = raw_io;
+        api.cfg.imported_runtime_io.?.sql_execution = executor;
+        api.cfg.imported_runtime_io.?.sql_control = executor;
         var job: Job = .{ .adapter = &adapter, .alloc = std.testing.allocator, .credential = &credential, .request = request, .kind = .execute };
         try std.testing.expectError(error.SqlWriteCapacityUnavailable, adapter.dispatch(&job));
         var stream: StreamJob = .{ .adapter = &adapter, .alloc = std.testing.allocator, .credential = &credential, .request = request };

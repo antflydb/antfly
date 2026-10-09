@@ -296,19 +296,27 @@ fn createOpaqueServer(
 ) !OpaqueApiHttpServer {
     const functions = try validateFunctionTable();
     var cfg_copy = cfg;
-    const api_io = if (cfg.backend_runtime) |runtime| runtime.apiIo() else null;
-    const api_network_io = if (cfg.backend_runtime) |runtime| runtime.apiNetworkIo() else null;
-    const api_filesystem_io = if (cfg.backend_runtime) |runtime| runtime.apiFilesystemIo() else null;
-    const durable_io = if (cfg.backend_runtime) |runtime| runtime.io() else null;
+    const api_io = if (cfg.imported_runtime_io) |views| views.api else if (cfg.backend_runtime) |runtime| runtime.apiIo() else null;
+    const api_network_io = if (cfg.imported_runtime_io) |views| views.api_network else if (cfg.backend_runtime) |runtime| runtime.apiNetworkIo() else null;
+    const api_filesystem_io = if (cfg.imported_runtime_io) |views| views.api_filesystem else if (cfg.backend_runtime) |runtime| runtime.apiFilesystemIo() else null;
+    const durable_io = if (cfg.imported_runtime_io) |views| views.durable else if (cfg.backend_runtime) |runtime| runtime.io() else null;
     const api_borrow: ?abi.native_abi.IoBorrow = if (api_io) |io| .init(&io) else null;
     const api_network_borrow: ?abi.native_abi.IoBorrow = if (api_network_io) |io| .init(&io) else null;
     const api_filesystem_borrow: ?abi.native_abi.IoBorrow = if (api_filesystem_io) |io| .init(&io) else null;
     const durable_borrow: ?abi.native_abi.IoBorrow = if (durable_io) |io| .init(&io) else null;
+    const sql_execution_io = if (cfg.imported_runtime_io) |views| views.sql_execution else if (cfg.backend_runtime) |runtime| runtime.io() else null;
+    const sql_control_io = if (cfg.imported_runtime_io) |views| views.sql_control else if (cfg.backend_runtime) |runtime| runtime.controlIo() else null;
+    const sql_execution_borrow: ?abi.native_abi.IoBorrow = if (sql_execution_io) |io| .init(&io) else null;
+    const sql_control_borrow: ?abi.native_abi.IoBorrow = if (sql_control_io) |io| .init(&io) else null;
+    const sql_worker_factory = if (cfg.imported_runtime_io) |views| views.sql_workers else if (cfg.backend_runtime) |runtime| @import("sql_worker_lease.zig").factory(runtime) else null;
     const runtime_io: abi.RuntimeIoBorrows = .{
         .api = if (api_borrow) |*borrow| borrow else null,
         .api_network = if (api_network_borrow) |*borrow| borrow else null,
         .api_filesystem = if (api_filesystem_borrow) |*borrow| borrow else null,
         .durable = if (durable_borrow) |*borrow| borrow else null,
+        .sql_execution = if (sql_execution_borrow) |*borrow| borrow else null,
+        .sql_control = if (sql_control_borrow) |*borrow| borrow else null,
+        .sql_workers = if (sql_worker_factory) |*producer| producer else null,
     };
     var source_copy = source;
     var reads_copy = read_source;
@@ -324,7 +332,7 @@ fn createOpaqueServer(
         .owner_alloc = &boundary_allocator.abi_allocator,
         .cfg = &cfg_copy,
         .cfg_contract = .of(server_mod.ApiHttpServerConfig),
-        .runtime_io = if (cfg.backend_runtime != null) &runtime_io else null,
+        .runtime_io = if (cfg.backend_runtime != null or cfg.imported_runtime_io != null) &runtime_io else null,
         .source = &source_copy,
         .source_contract = .of(server_mod.StatusSource),
         .table_reads = &reads_copy,

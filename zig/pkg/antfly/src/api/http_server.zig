@@ -1517,6 +1517,9 @@ pub const RuntimeIoViews = struct {
     api_network: ?std.Io = null,
     api_filesystem: ?std.Io = null,
     durable: ?std.Io = null,
+    sql_execution: ?std.Io = null,
+    sql_control: ?std.Io = null,
+    sql_workers: ?@import("kernel_abi.zig").SqlWorkerFactory = null,
 };
 
 test "imported runtime I/O views override raw runtime including unavailable views" {
@@ -3928,13 +3931,13 @@ pub const ApiHttpServer = struct {
     sql_preparation_admission: RequestAdmission,
     sql_control_preparation: RequestAdmission = RequestAdmission.init(4),
     sql_control_admission: RequestAdmission = RequestAdmission.init(4),
-    sql_control_workers: ?db_mod.background_runtime.BackendRuntime.WorkerLease = null,
-    sql_cleanup_workers: ?db_mod.background_runtime.BackendRuntime.WorkerLease = null,
-    sql_cleanup_reaper_workers: ?db_mod.background_runtime.BackendRuntime.WorkerLease = null,
+    sql_control_workers: ?@import("sql_worker_lease.zig").Lease = null,
+    sql_cleanup_workers: ?@import("sql_worker_lease.zig").Lease = null,
+    sql_cleanup_reaper_workers: ?@import("sql_worker_lease.zig").Lease = null,
     sql_cleanup_runtime: ?*@import("runnable_cleanup_owner.zig").Runtime = null,
     sql_cleanup_closing: bool = false,
     sql_workers_mutex: std.atomic.Mutex = .unlocked,
-    sql_workers: ?db_mod.background_runtime.BackendRuntime.WorkerLease = null,
+    sql_workers: ?@import("sql_worker_lease.zig").Lease = null,
     sql_workers_closing: bool = false,
 
     write_admission: RequestAdmission,
@@ -4464,23 +4467,31 @@ pub const ApiHttpServer = struct {
         return @import("antfly_local_sources").common_request_admission.runnable_metrics.snapshot(mutable.runnableScheduler());
     }
 
+    fn acquireSqlWorkers(self: *ApiHttpServer, capacity: usize) !@import("sql_worker_lease.zig").Lease {
+        if (self.cfg.imported_runtime_io) |views| {
+            const producer = views.sql_workers orelse return error.SqlWriteCapacityUnavailable;
+            return @import("sql_worker_lease.zig").Lease.acquireImported(self.alloc, producer, capacity);
+        }
+        return @import("sql_worker_lease.zig").Lease.acquireNative(self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable, capacity);
+    }
     pub fn sqlControlIo(self: *ApiHttpServer) !std.Io {
-        // An explicit foreign view is authoritative, including absence. Its
-        // owner supplies the executor vtable and wakeup/TLS identity.
-        if (self.cfg.imported_runtime_io) |views|
-            return views.durable orelse error.SqlWriteCapacityUnavailable;
-        const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
-        if (runtime.borrowed_io != null or runtime.lane_limits.worker_capacity < 10)
-            return runtime.controlIo() orelse error.SqlWriteCapacityUnavailable;
+        const imported = self.cfg.imported_runtime_io;
+        if (imported) |views| {
+            if (views.sql_workers == null) return views.sql_control orelse error.SqlWriteCapacityUnavailable;
+        } else {
+            const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
+            if (runtime.borrowed_io != null or runtime.lane_limits.worker_capacity < 10)
+                return runtime.controlIo() orelse error.SqlWriteCapacityUnavailable;
+        }
         platform_sync.lockYielding(&self.sql_workers_mutex);
         defer self.sql_workers_mutex.unlock();
         if (self.sql_workers_closing) return error.SqlWriteCapacityUnavailable;
         if (self.sql_control_workers == null) {
-            // Four execution slots plus one cleanup slot. Reserve before the
-            // foreground owner can spend the dedicated worker envelope.
-            self.sql_control_workers = runtime.acquireWorkers(.{ .capacity = 5 }) catch {
-                if (self.cfg.query_waiting.max_wait_ms == 0)
-                    return runtime.controlIo() orelse error.SqlWriteCapacityUnavailable;
+            self.sql_control_workers = self.acquireSqlWorkers(5) catch {
+                if (self.cfg.query_waiting.max_wait_ms == 0) {
+                    if (imported) |views| return views.sql_control orelse error.SqlWriteCapacityUnavailable;
+                    return self.cfg.backend_runtime.?.controlIo() orelse error.SqlWriteCapacityUnavailable;
+                }
                 return error.SqlWriteCapacityUnavailable;
             };
         }
@@ -4490,14 +4501,20 @@ pub const ApiHttpServer = struct {
     /// Own a bounded foreground SQL executor independent of durable/general
     /// completion and control lanes. Reserve it before publishing SQL work.
     pub fn sqlExecutionIo(self: *ApiHttpServer) !std.Io {
-        // An explicit foreign view is authoritative, including absence. Its
-        // owner supplies the executor vtable and wakeup/TLS identity.
-        if (self.cfg.imported_runtime_io) |views|
-            return views.durable orelse error.SqlWriteCapacityUnavailable;
-        const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
-        if ((self.cfg.query_waiting.max_wait_ms == 0 and self.runnableScheduler() == null) or runtime.borrowed_io != null or
-            self.cfg.query_max_concurrent_requests == 0 or self.cfg.write_max_concurrent_requests == 0)
-            return runtime.io() orelse error.SqlWriteCapacityUnavailable;
+        const imported = self.cfg.imported_runtime_io;
+        if (imported) |views| {
+            if (views.sql_workers == null) return views.sql_execution orelse error.SqlWriteCapacityUnavailable;
+        }
+        const legacy = (self.cfg.query_waiting.max_wait_ms == 0 and self.runnableScheduler() == null) or
+            self.cfg.query_max_concurrent_requests == 0 or self.cfg.write_max_concurrent_requests == 0;
+        const worker_capacity: u64 = if (imported) |views| blk: {
+            if (legacy or views.sql_workers == null) return views.sql_execution orelse error.SqlWriteCapacityUnavailable;
+            break :blk views.sql_workers.?.capacity;
+        } else blk: {
+            const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
+            if (legacy or runtime.borrowed_io != null) return runtime.io() orelse error.SqlWriteCapacityUnavailable;
+            break :blk runtime.lane_limits.worker_capacity;
+        };
         _ = try self.sqlControlIo();
         platform_sync.lockYielding(&self.sql_workers_mutex);
         defer self.sql_workers_mutex.unlock();
@@ -4506,13 +4523,12 @@ pub const ApiHttpServer = struct {
             const required = @as(u64, self.cfg.query_max_concurrent_requests) +
                 self.cfg.query_waiting.max_queued_requests + self.cfg.write_max_concurrent_requests +
                 @max(1, self.cfg.sql_max_concurrent_preparations) + 4;
-            // Leave at least half the dedicated-worker envelope for existing
-            // service owners. Dispatch itself stays bounded when operation
-            // ceilings exceed this foreground executor.
-            const capacity = @min(required, (@as(u64, runtime.lane_limits.worker_capacity) / 2) -| 5);
-            if (capacity < @as(u64, self.cfg.query_waiting.max_queued_requests) + 4)
-                return runtime.io() orelse error.SqlWriteCapacityUnavailable;
-            self.sql_workers = runtime.acquireWorkers(.{ .capacity = std.math.cast(usize, capacity) orelse return error.SqlWriteCapacityUnavailable }) catch
+            const capacity = @min(required, (worker_capacity / 2) -| 5);
+            if (capacity < @as(u64, self.cfg.query_waiting.max_queued_requests) + 4) {
+                if (imported) |views| return views.sql_execution orelse error.SqlWriteCapacityUnavailable;
+                return self.cfg.backend_runtime.?.io() orelse error.SqlWriteCapacityUnavailable;
+            }
+            self.sql_workers = self.acquireSqlWorkers(std.math.cast(usize, capacity) orelse return error.SqlWriteCapacityUnavailable) catch
                 return error.SqlWriteCapacityUnavailable;
         }
         return self.sql_workers.?.io();
@@ -4522,11 +4538,14 @@ pub const ApiHttpServer = struct {
     /// Gated cleanup tasks may occupy every worker until their stream closes;
     /// they must never consume foreground or protected control concurrency.
     pub fn sqlCleanupIo(self: *ApiHttpServer) !std.Io {
-        const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
-        // A borrowed WorkerLease aliases general I/O. Its accounting alone
-        // cannot prove independent cleanup or preserve control progress.
-        if (runtime.borrowed_io != null or runtime.lane_limits.worker_capacity < 10)
-            return error.SqlWriteCapacityUnavailable;
+        const worker_capacity: usize = if (self.cfg.imported_runtime_io) |views|
+            (views.sql_workers orelse return error.SqlWriteCapacityUnavailable).capacity
+        else blk: {
+            const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
+            if (runtime.borrowed_io != null or runtime.lane_limits.worker_capacity < 10)
+                return error.SqlWriteCapacityUnavailable;
+            break :blk runtime.lane_limits.worker_capacity;
+        };
         _ = try self.sqlControlIo();
         platform_sync.lockYielding(&self.sql_workers_mutex);
         defer self.sql_workers_mutex.unlock();
@@ -4538,9 +4557,9 @@ pub const ApiHttpServer = struct {
                 self.cfg.query_max_concurrent_requests
             else
                 return error.SqlWriteCapacityUnavailable;
-            const capacity = @min(retained_ceiling, runtime.lane_limits.worker_capacity / 4);
+            const capacity = @min(retained_ceiling, worker_capacity / 4);
             if (capacity == 0) return error.SqlWriteCapacityUnavailable;
-            self.sql_cleanup_workers = runtime.acquireWorkers(.{ .capacity = capacity }) catch
+            self.sql_cleanup_workers = self.acquireSqlWorkers(capacity) catch
                 return error.SqlWriteCapacityUnavailable;
         }
         return self.sql_cleanup_workers.?.io();
@@ -4550,13 +4569,12 @@ pub const ApiHttpServer = struct {
     /// reaper executors have actual reserved capacity. No control-lane alias.
     pub fn sqlCleanupOwner(self: *ApiHttpServer) !*@import("runnable_cleanup_owner.zig").Runtime {
         _ = try self.sqlCleanupIo();
-        const backend = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
         platform_sync.lockYielding(&self.sql_workers_mutex);
         defer self.sql_workers_mutex.unlock();
         if (self.sql_workers_closing or self.sql_cleanup_closing) return error.SqlWriteCapacityUnavailable;
         if (self.sql_cleanup_runtime) |active| return active;
         if (self.sql_cleanup_reaper_workers == null) {
-            self.sql_cleanup_reaper_workers = backend.acquireWorkers(.{ .capacity = 1 }) catch return error.SqlWriteCapacityUnavailable;
+            self.sql_cleanup_reaper_workers = self.acquireSqlWorkers(1) catch return error.SqlWriteCapacityUnavailable;
         }
         const active = @import("runnable_cleanup_owner.zig").Runtime.create(self.alloc, self.sql_cleanup_reaper_workers.?.io(), self.sql_cleanup_workers.?.capacity) catch {
             // Runtime.create physically retires its partial state before
@@ -4580,6 +4598,13 @@ pub const ApiHttpServer = struct {
 
     pub fn sqlQueryWaitingEnabled(self: *const ApiHttpServer) bool {
         if (self.cfg.query_waiting.max_wait_ms == 0) return false;
+        if (self.cfg.imported_runtime_io) |views| {
+            if (views.sql_workers == null) return false;
+            const mutable = @constCast(self);
+            platform_sync.lockYielding(&mutable.sql_workers_mutex);
+            defer mutable.sql_workers_mutex.unlock();
+            return views.sql_workers != null and !self.sql_workers_closing and self.sql_workers != null;
+        }
         if (self.cfg.backend_runtime) |runtime| {
             if (runtime.borrowed_io != null) return false;
             const mutable = @constCast(self);

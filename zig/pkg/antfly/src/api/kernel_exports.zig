@@ -53,20 +53,29 @@ const RuntimeIoReceivers = struct {
     api_network: ?runtime_io_abi.Receiver = null,
     api_filesystem: ?runtime_io_abi.Receiver = null,
     durable: ?runtime_io_abi.Receiver = null,
+    sql_execution: ?runtime_io_abi.Receiver = null,
+    sql_control: ?runtime_io_abi.Receiver = null,
+    sql_workers: ?abi.SqlWorkerFactory = null,
 
     fn init(self: *@This(), borrows: *const abi.RuntimeIoBorrows) !void {
         if (!abi.validContext(abi.RuntimeIoBorrows, borrows.version, borrows.struct_size))
             return error.UnsupportedVersion;
-        inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+        inline for (.{ "api", "api_network", "api_filesystem", "durable", "sql_execution", "sql_control" }) |field| {
             @field(self, field) = if (@field(borrows, field)) |borrow| try borrow.receive() else null;
         }
+        self.sql_workers = if (borrows.sql_workers) |producer| blk: {
+            if (!abi.validContext(abi.SqlWorkerFactory, producer.version, producer.struct_size) or producer.capacity < 10)
+                return error.UnsupportedVersion;
+            break :blk producer.*;
+        } else null;
     }
 
     fn views(self: *@This()) server_mod.RuntimeIoViews {
         var result: server_mod.RuntimeIoViews = .{};
-        inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+        inline for (.{ "api", "api_network", "api_filesystem", "durable", "sql_execution", "sql_control" }) |field| {
             @field(result, field) = if (@field(self, field)) |*receiver| receiver.io() else null;
         }
+        result.sql_workers = self.sql_workers;
         return result;
     }
 };
@@ -1215,10 +1224,12 @@ test "API kernel runtime I/O receivers validate capability layout and domains" {
         .api_network = &borrow,
         .api_filesystem = &borrow,
         .durable = &borrow,
+        .sql_execution = &borrow,
+        .sql_control = &borrow,
     };
     try receivers.init(&borrows);
     const views = receivers.views();
-    inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+    inline for (.{ "api", "api_network", "api_filesystem", "durable", "sql_execution", "sql_control" }) |field| {
         const io = @field(views, field).?;
         try std.testing.expect(io.userdata == std.testing.io.userdata);
         try std.testing.expect(io.vtable == std.testing.io.vtable);
@@ -1237,7 +1248,7 @@ test "API kernel runtime I/O receiver keeps imported unavailable views null" {
     var receivers: RuntimeIoReceivers = .{};
     try receivers.init(&.{});
     const views = receivers.views();
-    inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+    inline for (.{ "api", "api_network", "api_filesystem", "durable", "sql_execution", "sql_control" }) |field| {
         try std.testing.expect(@field(views, field) == null);
     }
 }
@@ -1289,6 +1300,8 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
         .api_network = &borrow,
         .api_filesystem = &borrow,
         .durable = &borrow,
+        .sql_execution = &borrow,
+        .sql_control = &borrow,
     };
     context.runtime_io = &borrows;
     borrow.contract.version +%= 1;
@@ -1326,7 +1339,7 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
         const state: *ServerState = @ptrCast(@alignCast(handle.?));
         try std.testing.expect(state.server.cfg.imported_runtime_io != null);
         const views = state.server.cfg.imported_runtime_io.?;
-        inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
+        inline for (.{ "api", "api_network", "api_filesystem", "durable", "sql_execution", "sql_control" }) |field| {
             const view = @field(views, field).?;
             try std.testing.expect(view.userdata == @as(?*anyopaque, &@field(state.runtime_io, field).?));
             try std.testing.expect(view.vtable != std.testing.io.vtable);

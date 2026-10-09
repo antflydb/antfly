@@ -2576,6 +2576,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-artifact-read-test", "Run artifact integrity and request-owned provider wait contracts").dependOn(&b.addRunArtifact(artifact_read_tests).step);
+    const sql_worker_tests = b.addTest(.{
+        .root_module = serverless_manifest_test_mod,
+        .filters = &.{"SQL imported worker"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_worker_run = b.addRunArtifact(sql_worker_tests);
+    sql_worker_run.addArg("--require-no-skips");
+    b.step("antfly-sql-worker-capability-test", "Run actual imported SQL lane ownership, saturation and failure retirement").dependOn(&sql_worker_run.step);
     const serverless_manifest_tests = b.addTest(.{
         .root_module = serverless_manifest_test_mod,
         .filters = &.{
