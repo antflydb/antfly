@@ -5,8 +5,10 @@ benchmarks and the qualified pure Zig H.264 subset are implemented. Latest main
 (PR #1014) is merged as of 2026-10-09. EmbeddingGemma 2 ordered video groups now
 use native decode/CPU preparation or VideoToolbox/Metal preparation and the merged
 native/Metal vision and text encoders. Completed Metal patch buffers enter inference
-directly; existing projector/token composition host boundaries remain. Full pretrained
-video embedding parity and resident vision/backbone optimization need qualification.
+directly; existing projector/token composition host boundaries remain. Six pretrained
+F32 video cases qualify native CPU and Metal numerical parity under the declared
+RGB decoder policy; resident vision/backbone optimization remains open. See the
+[pretrained validation receipt](testdata/video-pretrained-validation.md).
 
 Related documents:
 
@@ -811,9 +813,12 @@ fMP4 ingestion; complete snapshots can be submitted through the same byte API.
 
 Contract, processor identity, presentation sampling, mixed placeholder placement,
 HTTP family scoping and Metal buffer destruction/linear-consumer tests qualify this
-integration. Pretrained end-to-end video comparison requires the official checkpoint;
-this workspace has neither the weights nor a video embedding oracle. Retain this
-qualification gap in receipts until those comparisons run.
+integration. The pinned official checkpoint and independent F32 video oracle now
+qualify six video/mixed cases, including presentation reordering, repeated frames,
+multiple clips and HTTP 128-dimensional output. JPEG reference RGB uses independent
+Pillow/libjpeg decoding; FFmpeg default MJPEG IDCT differs on the colorful fixture.
+See the [pretrained validation receipt](testdata/video-pretrained-validation.md) for
+exact scope, errors and remaining application-level qualification.
 
 See the [dated integration validation](testdata/video-model-integration-validation.md)
 for executed checks, cross-platform compilation and retained qualification limits.

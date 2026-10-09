@@ -5,8 +5,9 @@ are delivered. Latest `origin/main` at `755cb12a68`, including PR #1014 at
 `d409767dc7`, is integrated, 2026-10-09.
 Ordered EmbeddingGemma 2 video groups, native/Metal projector execution, canonical
 media/attachment API inputs and direct completed Metal patch-buffer handoff are
-implemented. Full pretrained video parity, fully resident vision/token/backbone
-optimization and remaining CUDA/NVDEC routes remain open; see the dated integration
+implemented. Six pretrained F32 video cases qualify CPU/Metal numerical parity.
+Fully resident vision/token/backbone optimization and remaining CUDA/NVDEC routes
+remain open; see the dated integration
 contract in VIDEO.md. The original design started at `cdf572a7467d581f6f1b39bcf514878488555f11`.
 
 Library contracts live in [MEDIA.md](../../zig/lib/media/MEDIA.md) and
@@ -218,7 +219,7 @@ packet/timeline/selection parity, bounded metadata/source buffers, and
 cancellation/lease/allocation failures. See the library docs for the precise
 implemented API and unsupported shapes.
 
-### 2. Apple decode and EmbeddingGemma video — integration implemented, pretrained qualification pending
+### 2. Apple decode and EmbeddingGemma video — integration and pretrained numerical qualification delivered
 
 Delivered independently of PR #1014: native VideoToolbox H.264 sessions with
 owned selected NV12 surfaces, explicit hardware enforcement/route receipts,
@@ -242,7 +243,9 @@ groups, family-scoped HTTP handling and processor identity validation. Eligible
 static H.264 uses VideoToolbox→Metal; portable codecs use host→CPU/Metal preparation.
 A completed retained MTLBuffer enters inference patch projection without prepared
 pixel readback. Existing model projector/token host boundaries remain. Unit/lifecycle
-qualification is automated; the official checkpoint/video oracle is unavailable here.
+qualification is automated; six official-checkpoint F32 cases and HTTP/group
+comparisons now qualify both backends under the declared RGB decoder policy.
+See the [pretrained receipt](../../zig/lib/video/testdata/video-pretrained-validation.md).
 
 Exit: CPU-reference/Metal prepared patch and embedding comparisons, end-to-end
 HTTP/group parity, qualified source-format capabilities, and drain/retry tests.
@@ -267,8 +270,8 @@ reader teardown, allocation failures and cancellation/retry are tested. Linux
 compiles the portable APIs; WASI executes portable planner/host tests. These
 counts establish reduced work, not end-to-end latency or retrieval parity.
 
-Still pending: qualify full pretrained video embeddings against the final processor
-and implement batched resident vision/projector execution,
+Still pending: expand pretrained video/application retrieval qualification beyond
+the six reference cases, and implement batched resident vision/projector execution,
 direct device-token backbone inputs, and device pooling/normalization. Qualify
 resident model execution on the delivered software-decode → Metal and
 VideoToolbox → Metal preparation routes. Extend the delivered decode/preparation
@@ -353,7 +356,7 @@ Store dated benchmark receipts separately from these living contracts.
 ## Open decisions
 
 - Logical-picture indexing for model sampling of field/partition transport,
-  plus pretrained video parity through the merged grouped-input contract.
+  plus broader application-level pretrained video qualification beyond six cases.
 - Broader production-stream qualification beyond the implemented static H.264
   tool subset documented in `lib/video/VIDEO.md`. Multi-slice, CAVLC/CABAC I/P/B,
   scaling matrices, native depth/chroma, MBAFF, fragmented standalone PAFF fields

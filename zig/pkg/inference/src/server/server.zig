@@ -36065,6 +36065,120 @@ test "embeddinggemma2 linked reduced dimensions match HTTP and preserve ownershi
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "embeddinggemma2 pretrained video matches official F32 oracle" {
+    const model = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
+    const oracle = platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_VIDEO_ORACLE") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const metal = platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_METAL");
+    var node = try Node.init(a, .{ .models_dir = std.fs.path.dirname(model).?, .allow_unknown_models = true, .process_termination_available = true, .generation_budget_overrides = .{ .host_limit_bytes = 6 * 1024 * 1024 * 1024, .backend_limit_bytes = 12 * 1024 * 1024 * 1024, .combined_limit_bytes = 18 * 1024 * 1024 * 1024, .scratch_limit_bytes = 8 * 1024 * 1024 * 1024 } });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    node.session_manager.required_backend = if (metal) .metal else .native;
+    node.model_manager.session_manager.required_backend = if (metal) .metal else .native;
+    var handle = try node.model_manager.acquireFromDirWithControl(model, node.extractionExecutionControl(null));
+    defer handle.release();
+    const loaded = handle.get();
+    const file = @import("../util/c_file.zig");
+    const json = try file.readFile(a, oracle);
+    defer a.free(json);
+    const reference = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer reference.deinit();
+    try std.testing.expectEqualStrings("914f7f89142e33e77833254d9c9b90c3cef7303b", reference.value.object.get("revision").?.string);
+    try std.testing.expectEqualStrings("float32", reference.value.object.get("precision").?.string);
+    const grouped = @import("../pipelines/embedding_gemma2.zig");
+    const media = @import("antfly_media");
+    const video = @import("../pipelines/embedding_gemma2_video.zig");
+    const Row = struct { name: []const u8, tokens: usize, cosine: f64, max_abs: f64, norm: f64 };
+    var rows: std.ArrayList(Row) = .empty;
+    defer rows.deinit(a);
+    var failures: usize = 0;
+    for (reference.value.object.get("cases").?.array.items) |case| {
+        const name = case.object.get("name").?.string;
+        if (platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_CASE")) |selected| if (!std.mem.eql(u8, selected, name)) continue;
+        var bytes: std.ArrayList([]u8) = .empty;
+        defer {
+            for (bytes.items) |value| a.free(value);
+            bytes.deinit(a);
+        }
+        var parts: std.ArrayList(grouped.Part) = .empty;
+        defer parts.deinit(a);
+        if (std.mem.eql(u8, name, "text_video")) try parts.append(a, .{ .text = "Describe the action." });
+        for (case.object.get("videos").?.array.items, case.object.get("selected_frames").?.array.items, 0..) |filename, selections, i| {
+            const path = try std.fs.path.join(a, &.{ std.fs.path.dirname(oracle).?, filename.string });
+            defer a.free(path);
+            const clip = try file.readFile(a, path);
+            try bytes.append(a, clip);
+            try parts.append(a, .{ .video = clip });
+            var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = clip }, .identity = path };
+            var reader = try media.mp4.Reader.init(a, &source, .{});
+            defer reader.deinit();
+            const indexes = try video.select(a, &reader);
+            defer a.free(indexes);
+            try std.testing.expectEqual(selections.array.items.len, indexes.len);
+            // Compare logical presentation ordinal, including duplicate selections
+            // and B-picture decode/presentation reordering.
+            for (indexes, selections.array.items) |index, ordinal| {
+                var rank: usize = 0;
+                for (reader.packets, 0..) |packet, j| if (packet.pts < reader.packets[index].pts or (packet.pts == reader.packets[index].pts and j < index)) {
+                    rank += 1;
+                };
+                try std.testing.expectEqual(@as(usize, @intCast(ordinal.integer)), rank);
+            }
+            if (std.mem.eql(u8, name, "two_videos") and i == 0) try parts.append(a, .{ .text = "Compare these clips." });
+        }
+        if (std.mem.eql(u8, name, "video_text")) try parts.append(a, .{ .text = "Describe the action." });
+        const result = try grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = parts.items }, .{}, loaded.embeddingExecutionLock(), node.extractionExecutionControl(null));
+        defer a.free(result.vector);
+        try std.testing.expectEqual(case.object.get("token_ids").?.array.items.len, result.input_tokens);
+        var expected: [768]f32 = undefined;
+        var max_abs: f64 = 0;
+        var norm: f64 = 0;
+        for (&expected, case.object.get("embedding").?.array.items, result.vector) |*dest, value, actual| {
+            dest.* = @floatCast(value.float);
+            max_abs = @max(max_abs, @abs(value.float - actual));
+            norm += @as(f64, actual) * actual;
+        }
+        const cosine = try @import("antfly_decisions").scoring.cosine(result.vector, &expected, 768);
+        std.debug.print("embeddinggemma2 video={s} metal={} tokens={d} cosine={d:.9} max_abs={d:.9}\n", .{ name, metal, result.input_tokens, cosine, max_abs });
+        try rows.append(a, .{ .name = name, .tokens = result.input_tokens, .cosine = cosine, .max_abs = max_abs, .norm = @sqrt(norm) });
+        failures += @intFromBool(cosine < @as(f64, if (metal) 0.9999 else 0.99999) or max_abs > @as(f64, if (metal) 1e-3 else 1e-4));
+        try std.testing.expectApproxEqAbs(@as(f64, 1), @sqrt(norm), 1e-5);
+
+        if (std.mem.eql(u8, name, "text_video")) {
+            const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.items[0].len));
+            defer a.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, bytes.items[0]);
+            const body = try std.fmt.allocPrint(a, "{{\"model\":\"{s}\",\"dimensions\":128,\"input\":[{{\"content\":[{{\"type\":\"text\",\"text\":\"Describe the action.\"}},{{\"type\":\"media\",\"data\":\"{s}\",\"mime_type\":\"video/mp4\"}}]}}]}}", .{ std.fs.path.basename(model), encoded });
+            defer a.free(body);
+            var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+            defer request.deinit();
+            request.body = body;
+            var ctx = httpx.Context.init(a, std.testing.io, &request);
+            defer ctx.deinit();
+            var response = try node.createEmbedding(&ctx);
+            defer response.deinit();
+            errdefer std.debug.print("pretrained video HTTP status={d} body={s}\n", .{ response.status.code, response.body orelse "" });
+            try std.testing.expectEqual(@as(u16, 200), response.status.code);
+            const value = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+            defer value.deinit();
+            const vector = value.value.object.get("data").?.array.items[0].object.get("embedding").?.array.items;
+            try std.testing.expectEqual(@as(usize, 128), vector.len);
+            var denominator: f64 = 0;
+            for (result.vector[0..128]) |v| denominator += @as(f64, v) * v;
+            for (vector, result.vector[0..128]) |v, expected_value| try std.testing.expectApproxEqAbs(@as(f64, expected_value) / @sqrt(denominator), v.float, 1e-5);
+            try std.testing.expectEqual(@as(usize, 64), value.value.object.get("model_identity").?.string.len);
+            try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+        }
+    }
+    try std.testing.expect(rows.items.len != 0);
+    if (platform.env.getenv("ANTFLY_EMBEDDINGGEMMA2_VIDEO_REPORT")) |path| {
+        const report = try std.json.Stringify.valueAlloc(a, .{ .backend = if (metal) "metal" else "native", .model_identity = loaded.embedding_identity, .cases = rows.items, .failures = failures }, .{ .whitespace = .indent_2 });
+        defer a.free(report);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = report });
+    }
+    try std.testing.expectEqual(@as(usize, 0), failures);
+}
+
 test "embeddinggemma2 video MIME is accepted only inside family ordered groups" {
     const a = std.testing.allocator;
     var input_names = [_][]const u8{ "text", "image", "audio" };

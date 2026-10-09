@@ -364,3 +364,13 @@ must release retained Segments to keep shared budgets available.
 MP4 `avc3` descriptions expose `Track.inband_parameter_sets`; packet offsets and
 clock indexing are unchanged. Dynamic portable codec decoding uses the video
 parameter registry rather than altering media parsing or Apple hardware policy.
+
+## Pretrained video qualification (2026-10-09)
+
+The EmbeddingGemma 2 adapter now compares six MP4/MOV video and ordered mixed
+groups against independently generated pinned-checkpoint F32 embeddings. Native
+CPU and Metal checks include presentation sampling, repeated frames, token counts,
+normalization and HTTP dimensions. This qualifies the tested RGB decoder policies
+and model integration; it does not extend container or codec scope. See the
+[pretrained receipt](../video/testdata/video-pretrained-validation.md) and
+[reproducible fixtures](../../../tools/embeddinggemma2/testdata/video/README.md).

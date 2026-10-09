@@ -1,0 +1,198 @@
+{
+  "version": 1,
+  "date": "2026-10-09",
+  "host": "macOS ARM64",
+  "checkpoint_revision": "914f7f89142e33e77833254d9c9b90c3cef7303b",
+  "oracle_sha256": "fd721cfb54d60b378afcabc8487d29f69526f119ef96b70a25e373ffd05cd2bd",
+  "runs": {
+    "cpu_debug": {
+      "backend": "native",
+      "model_identity": "2e3ab9d26dcdc60ebb4d0d6b2c744e0285545358eb6945b8fbbe9c0b1a6c2081",
+      "cases": [
+        {
+          "name": "mjpeg_video",
+          "tokens": 266,
+          "cosine": 0.9999999999984845,
+          "max_abs": 1.862645149230957e-07,
+          "norm": 1.0000000061528385
+        },
+        {
+          "name": "h264_video",
+          "tokens": 266,
+          "cosine": 0.999999999998646,
+          "max_abs": 1.862645149230957e-07,
+          "norm": 1.000000005184323
+        },
+        {
+          "name": "text_video",
+          "tokens": 277,
+          "cosine": 0.9999999999988014,
+          "max_abs": 2.0346487872302532e-07,
+          "norm": 0.9999999969416015
+        },
+        {
+          "name": "video_text",
+          "tokens": 278,
+          "cosine": 0.9999999999985811,
+          "max_abs": 2.086162567138672e-07,
+          "norm": 0.9999999970795858
+        },
+        {
+          "name": "repeated_video",
+          "tokens": 530,
+          "cosine": 0.9999999999993403,
+          "max_abs": 1.4156103134155273e-07,
+          "norm": 0.9999999985239592
+        },
+        {
+          "name": "two_videos",
+          "tokens": 543,
+          "cosine": 0.9999999999980027,
+          "max_abs": 2.835877239704132e-07,
+          "norm": 1.0000000029747291
+        }
+      ],
+      "failures": 0,
+      "exit_code": 0,
+      "http_128_dimensions": true,
+      "binary_sha256": "1c20fed7f77589dcffcf14db2191539eb5ed73e6ed16cfe38412a1cb9e1ab090",
+      "test_log": "1/5085 server.server.test.embeddinggemma2 pretrained video matches official F32 oracle...embeddinggemma2 video=mjpeg_video metal=false tokens=266 cosine=1.000000000 max_abs=0.000000186\nembeddinggemma2 video=h264_video metal=false tokens=266 cosine=1.000000000 max_abs=0.000000186\nembeddinggemma2 video=text_video metal=false tokens=277 cosine=1.000000000 max_abs=0.000000203\nembeddinggemma2 video=video_text metal=false tokens=278 cosine=1.000000000 max_abs=0.000000209\nembeddinggemma2 video=repeated_video metal=false tokens=530 cosine=1.000000000 max_abs=0.000000142\nembeddinggemma2 video=two_videos metal=false tokens=543 cosine=1.000000000 max_abs=0.000000284\nOK\n1 selected; 1 passed; 0 skipped.\n",
+      "includes_teardown_scope_fix": false
+    },
+    "cpu_release_safe": {
+      "backend": "native",
+      "model_identity": "2e3ab9d26dcdc60ebb4d0d6b2c744e0285545358eb6945b8fbbe9c0b1a6c2081",
+      "cases": [
+        {
+          "name": "mjpeg_video",
+          "tokens": 266,
+          "cosine": 0.9999999999988651,
+          "max_abs": 1.4156103134155273e-07,
+          "norm": 0.999999994326573
+        },
+        {
+          "name": "h264_video",
+          "tokens": 266,
+          "cosine": 0.9999999999982857,
+          "max_abs": 2.384185791015625e-07,
+          "norm": 0.9999999949656379
+        },
+        {
+          "name": "text_video",
+          "tokens": 277,
+          "cosine": 0.9999999999989074,
+          "max_abs": 2.253800630569458e-07,
+          "norm": 1.0000000039381658
+        },
+        {
+          "name": "video_text",
+          "tokens": 278,
+          "cosine": 0.999999999998785,
+          "max_abs": 2.086162567138672e-07,
+          "norm": 0.9999999962722929
+        },
+        {
+          "name": "repeated_video",
+          "tokens": 530,
+          "cosine": 0.9999999999992318,
+          "max_abs": 1.601874828338623e-07,
+          "norm": 0.9999999932877773
+        },
+        {
+          "name": "two_videos",
+          "tokens": 543,
+          "cosine": 0.9999999999978606,
+          "max_abs": 4.76837158203125e-07,
+          "norm": 0.9999999973337383
+        }
+      ],
+      "failures": 0,
+      "exit_code": 0,
+      "http_128_dimensions": true,
+      "binary_sha256": "7cf02bf856ee8797a26d93e548c17c34b644026b991e62d8a3d6b4e9579e1312",
+      "test_log": "1/5085 server.server.test.embeddinggemma2 pretrained video matches official F32 oracle...embeddinggemma2 video=mjpeg_video metal=false tokens=266 cosine=1.000000000 max_abs=0.000000142\nembeddinggemma2 video=h264_video metal=false tokens=266 cosine=1.000000000 max_abs=0.000000238\nembeddinggemma2 video=text_video metal=false tokens=277 cosine=1.000000000 max_abs=0.000000225\nembeddinggemma2 video=video_text metal=false tokens=278 cosine=1.000000000 max_abs=0.000000209\nembeddinggemma2 video=repeated_video metal=false tokens=530 cosine=1.000000000 max_abs=0.000000160\nembeddinggemma2 video=two_videos metal=false tokens=543 cosine=1.000000000 max_abs=0.000000477\nOK\n1 selected; 1 passed; 0 skipped.\n",
+      "includes_teardown_scope_fix": false
+    },
+    "metal_debug": {
+      "backend": "metal",
+      "model_identity": "2e3ab9d26dcdc60ebb4d0d6b2c744e0285545358eb6945b8fbbe9c0b1a6c2081",
+      "cases": [
+        {
+          "name": "mjpeg_video",
+          "tokens": 266,
+          "cosine": 0.9999999999986845,
+          "max_abs": 1.825392246246338e-07,
+          "norm": 0.9999999996720961
+        },
+        {
+          "name": "h264_video",
+          "tokens": 266,
+          "cosine": 0.999999999998566,
+          "max_abs": 2.6934139896184206e-07,
+          "norm": 0.9999999941398305
+        },
+        {
+          "name": "text_video",
+          "tokens": 277,
+          "cosine": 0.9999999999988947,
+          "max_abs": 2.076849341392517e-07,
+          "norm": 1.0000000000009892
+        },
+        {
+          "name": "video_text",
+          "tokens": 278,
+          "cosine": 0.9999999999979006,
+          "max_abs": 2.514570951461792e-07,
+          "norm": 1.000000003421815
+        },
+        {
+          "name": "repeated_video",
+          "tokens": 530,
+          "cosine": 0.9999999999985789,
+          "max_abs": 1.909211277961731e-07,
+          "norm": 0.9999999974196777
+        },
+        {
+          "name": "two_videos",
+          "tokens": 543,
+          "cosine": 0.9999999999984173,
+          "max_abs": 2.5704503059387207e-07,
+          "norm": 0.9999999966166487
+        }
+      ],
+      "failures": 0,
+      "exit_code": 0,
+      "http_128_dimensions": true,
+      "binary_sha256": "c6241edc110d32f0a43182f659accf782533fd729d0112a01614f7cf2edb55b7",
+      "test_log": "1/5100 server.server.test.embeddinggemma2 pretrained video matches official F32 oracle...embeddinggemma2 video=mjpeg_video metal=true tokens=266 cosine=1.000000000 max_abs=0.000000183\nembeddinggemma2 video=h264_video metal=true tokens=266 cosine=1.000000000 max_abs=0.000000269\nembeddinggemma2 video=text_video metal=true tokens=277 cosine=1.000000000 max_abs=0.000000208\nembeddinggemma2 video=video_text metal=true tokens=278 cosine=1.000000000 max_abs=0.000000251\nembeddinggemma2 video=repeated_video metal=true tokens=530 cosine=1.000000000 max_abs=0.000000191\nembeddinggemma2 video=two_videos metal=true tokens=543 cosine=1.000000000 max_abs=0.000000257\nOK\n2/5100 server.model_manager.test.model manager teardown starts both tickets before cached executor destruction...OK\n3/5100 server.model_manager.test.model manager teardown composite keeps both peer tickets through ordered session cleanup...OK\n4/5100 server.model_manager.test.model manager teardown dormant ticket covers nested close without allocation or borrowed request...OK\n5/5100 server.model_manager.test.model manager teardown disarms driver protection before host tokenizer destruction...OK\n6/5100 server.model_manager.test.model manager teardown raw session retains monitor and offline driver IO after manager...OK\n7/5100 server.model_manager.test.model manager teardown rejects missing isolation and failed ticket before backend entry...OK\n8/5100 server.model_manager.test.model manager teardown supervised child fixture...SKIP\n8 selected; 7 passed; 1 skipped.\n",
+      "includes_teardown_scope_fix": true
+    }
+  },
+  "stuck_driver_children": [
+    {
+      "mode": "rollback",
+      "expected_exit": 86,
+      "actual_exit": 86,
+      "log": "1/5100 server.model_manager.test.model manager teardown supervised child fixture...teardown-fixture operation-start:rollback\nteardown-fixture close-entered lease-held64\n"
+    },
+    {
+      "mode": "cache",
+      "expected_exit": 86,
+      "actual_exit": 86,
+      "log": "1/5100 server.model_manager.test.model manager teardown supervised child fixture...teardown-fixture operation-start:cache\nteardown-fixture cache-entered primary-and-optional-active lease-held64\n"
+    },
+    {
+      "mode": "stderr-return",
+      "expected_exit": 86,
+      "actual_exit": 86,
+      "log": "teardown-fixture close-entered lease-held64\n1/5100 server.model_manager.test.model manager teardown supervised child fixture...teardown-fixture operation-start:stderr-return\nteardown-fixture final-check-isolated\nteardown-fixture stderr-lock-held\n"
+    }
+  ],
+  "final_metal_source_sha256": {
+    "zig/pkg/inference/src/server/server.zig": "8f402648487ada5575dfedb7b657b7d6c4437575b035ec2249e14937f034d194",
+    "zig/pkg/inference/src/server/model_manager.zig": "adc6be6a72453e39bfcc49ab866e8fb3a993f84c8c341d7782d360f167726e59",
+    "zig/pkg/inference/src/pipelines/embedding_gemma2.zig": "f3807e8b13a1c2cd67c93462b561c81a2bbbabced7cc4043c3ef44fb9a871580",
+    "zig/pkg/inference/src/pipelines/embedding_gemma2_video.zig": "d3652024d382d41a869af082edf9b13056a1f004f433d5b1989ec89d9e3129c6",
+    "tools/embeddinggemma2/reference.py": "1b795e7ed63448ea129bf1bddd0b1efd616a60139508d1178c5cc34899e61755"
+  }
+}

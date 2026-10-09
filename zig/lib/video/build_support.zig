@@ -57,7 +57,7 @@ pub fn addTests(b: *std.Build, root: std.Build.LazyPath, target: std.Build.Resol
     const qualification = b.addExecutable(.{ .name = "video-qualification", .root_module = qualification_module });
     b.getInstallStep().dependOn(&b.addInstallArtifact(qualification, .{}).step);
     const run = b.addRunArtifact(qualification);
-    run.addArg(b.option([]const u8, "qualify-mode", "hash or mutate") orelse "hash");
+    run.addArg(b.option([]const u8, "qualify-mode", "hash, dump, dump-rgb (MJPEG), or mutate") orelse "hash");
     run.addArg(b.option([]const u8, "qualify-input", "MP4 corpus file") orelse "testdata/h264-sintel-original.mp4");
     run.addArg(b.option([]const u8, "qualify-count", "Number of deterministic mutations") orelse "1000");
     b.step("qualify-video", "Hash native decoded samples or run bounded corpus mutations").dependOn(&run.step);

@@ -34,6 +34,7 @@ TRANSFORMERS_REVISION = "92cd495f2720c064bc78eb2d93e28704c5bce51f"
 SOURCE_HASHES = {
     "models/embedding_gemma2/modeling_embedding_gemma2.py": "132d8714852fa8f0c376af797229e7b48fe94e0cf6cae6f6640681e934062923",
     "models/embedding_gemma2/processing_embedding_gemma2.py": "6bc770072c6c1df02c3cde4f79c65720c84e1d7f76ca4092baa0dbd217151b52",
+    "models/embedding_gemma2/video_processing_embedding_gemma2.py": "77e0866c0fbcc61476a4601ad6cddceb90f70cb4cb6aae3b7aed7f0ea56ac864",
     "models/gemma4/modeling_gemma4.py": "edc123ab83fbb25548ec65536eaecee998c088653adf683be3ef69d62e2bfea9",
     "models/gemma4/image_processing_gemma4.py": "5d280d5448b1c219183a27e95b6aa7178b350275772d07881c91c65f13fa815e",
     "models/gemma4/feature_extraction_gemma4.py": "40545340a144aad4d74c6cedb4eae5daa4efd54ae432649583e19b5d756c02c7",
@@ -288,6 +289,300 @@ def media_oracle(directory, output):
     )
 
 
+def video_oracle(directory, output):
+    """Independent decoded RGB, upstream sampling/processor and pretrained F32 vectors."""
+    verify_reference(directory)
+    import shutil
+    import subprocess
+    import tempfile
+
+    import numpy as np
+    import torch
+    import transformers
+    from PIL import Image
+    from transformers import AutoModel, AutoProcessor
+    from transformers.video_utils import VideoMetadata
+
+    torch.set_num_threads(4)
+    torch.manual_seed(17)
+    assets = output.parent
+    assets.mkdir(parents=True, exist_ok=True)
+    width, height, frames, fps = 640, 480, 8, 4
+    y, x = np.indices((height, width))
+    pixels = np.stack(
+        [
+            np.repeat((((x // 32 + y // 32 + i) % 5) < 2)[..., None], 3, axis=2).astype(
+                np.uint8
+            )
+            * 255
+            for i in range(frames)
+        ]
+    )
+    with tempfile.TemporaryDirectory(prefix="embeddinggemma2-video-") as temporary:
+        raw = Path(temporary) / "source.rgb"
+        raw.write_bytes(pixels.tobytes())
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                "rgb24",
+                "-video_size",
+                f"{width}x{height}",
+                "-framerate",
+                str(fps),
+                "-i",
+                str(raw),
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-qp",
+                "1",
+                "-pix_fmt",
+                "yuv420p",
+                "-x264-params",
+                "keyint=8:min-keyint=8:scenecut=0:bframes=2:no-deblock=1",
+                "-colorspace",
+                "smpte170m",
+                "-color_trc",
+                "bt709",
+                "-color_primaries",
+                "bt709",
+                "-color_range",
+                "tv",
+                str(assets / "video-h264.mp4"),
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                "rgb24",
+                "-video_size",
+                f"{width}x{height}",
+                "-framerate",
+                "0.25",
+                "-i",
+                str(raw),
+                "-frames:v",
+                "1",
+                "-c:v",
+                "mjpeg",
+                "-q:v",
+                "1",
+                "-pix_fmt",
+                "yuvj444p",
+                str(assets / "video-repeat.mov"),
+            ],
+            check=True,
+        )
+    original = Path(__file__).resolve().parents[2] / "zig/lib/video/testdata/mjpeg.mov"
+    shutil.copyfile(original, assets / "video-mjpeg.mov")
+    clips = {}
+    provenance = []
+    for filename in ("video-h264.mp4", "video-repeat.mov", "video-mjpeg.mov"):
+        path = assets / filename
+        probe = json.loads(
+            subprocess.check_output(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_streams",
+                    "-of",
+                    "json",
+                    str(path),
+                ]
+            )
+        )["streams"][0]
+        decoded = subprocess.check_output(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-i",
+                str(path),
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "-",
+            ]
+        )
+        w, h = probe["width"], probe["height"]
+        video = np.frombuffer(decoded, dtype=np.uint8).reshape(-1, h, w, 3).copy()
+        ffmpeg_decoded = decoded
+        rgb_decoder = "FFmpeg H.264 RGB"
+        if probe["codec_name"] == "mjpeg":
+            # lib/video uses the image library's libjpeg-compatible JPEG RGB
+            # policy. FFmpeg's default MJPEG IDCT can differ by three byte
+            # levels; isolate that declared decoder policy from F32 model parity.
+            # Pillow independently decodes the original packet bytes; native
+            # pixels never enter the expected-vector generator.
+            with tempfile.TemporaryDirectory(
+                prefix="embeddinggemma2-jpeg-"
+            ) as temporary:
+                pattern = str(Path(temporary) / "frame-%d.jpg")
+                subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-v",
+                        "error",
+                        "-i",
+                        str(path),
+                        "-map",
+                        "0:v:0",
+                        "-c:v",
+                        "copy",
+                        pattern,
+                    ],
+                    check=True,
+                )
+                video = np.stack(
+                    [
+                        np.array(
+                            Image.open(Path(temporary) / f"frame-{i + 1}.jpg").convert(
+                                "RGB"
+                            )
+                        )
+                        for i in range(len(video))
+                    ]
+                )
+            decoded = video.tobytes()
+            rgb_decoder = "FFmpeg packet demux + Pillow/libjpeg JPEG RGB"
+        ffmpeg_delta = video.astype(np.int16) - np.frombuffer(
+            ffmpeg_decoded, dtype=np.uint8
+        ).reshape(video.shape).astype(np.int16)
+        duration = float(probe["duration"])
+        rate = len(video) / duration
+        clips[filename] = (
+            video,
+            VideoMetadata(
+                total_num_frames=len(video),
+                fps=rate,
+                duration=duration,
+                width=w,
+                height=h,
+            ),
+        )
+        provenance.append(
+            {
+                "path": filename,
+                "sha256": sha256(path),
+                "rgb_sha256": hashlib.sha256(decoded).hexdigest(),
+                "rgb_decoder": rgb_decoder,
+                "ffmpeg_default_rgb_sha256": hashlib.sha256(ffmpeg_decoded).hexdigest(),
+                "ffmpeg_default_max_abs": int(np.abs(ffmpeg_delta).max()),
+                "ffmpeg_default_changed_channels": int(np.count_nonzero(ffmpeg_delta)),
+                "frames": len(video),
+                "fps": rate,
+                "duration": duration,
+                "width": w,
+                "height": h,
+            }
+        )
+
+    model = AutoModel.from_pretrained(
+        directory, dtype=torch.float32, local_files_only=True
+    ).eval()
+    processor = AutoProcessor.from_pretrained(directory, local_files_only=True)
+    cases = [
+        ("mjpeg_video", ["video-mjpeg.mov"], "<|video|>"),
+        ("h264_video", ["video-h264.mp4"], "<|video|>"),
+        (
+            "text_video",
+            ["video-h264.mp4"],
+            "title: none | text: Describe the action.\n<|video|>",
+        ),
+        (
+            "video_text",
+            ["video-h264.mp4"],
+            "title: none | text: <|video|>\nDescribe the action.",
+        ),
+        ("repeated_video", ["video-repeat.mov"], "<|video|>"),
+        (
+            "two_videos",
+            ["video-h264.mp4", "video-mjpeg.mov"],
+            "title: none | text: <|video|>\nCompare these clips.\n<|video|>",
+        ),
+    ]
+    results = []
+    with torch.inference_mode():
+        for name, filenames, text in cases:
+            metadata = [VideoMetadata(**dict(clips[f][1])) for f in filenames]
+            selected = [
+                processor.video_processor.sample_frames(
+                    m,
+                    fps=processor.video_processor.fps,
+                    max_frames=processor.video_processor.max_frames,
+                    overflow_strategy=processor.video_processor.overflow_strategy,
+                ).tolist()
+                for m in metadata
+            ]
+            inputs = processor(
+                videos=[clips[f][0] for f in filenames],
+                video_metadata=metadata,
+                text=[text],
+                return_tensors="pt",
+            )
+            print(
+                name,
+                "selected",
+                selected,
+                "tokens",
+                inputs["input_ids"].shape[-1],
+                flush=True,
+            )
+            hidden = model(**inputs).last_hidden_state
+            mask = inputs["attention_mask"].unsqueeze(-1)
+            pooled = torch.nn.functional.normalize(
+                (hidden * mask).sum(1) / mask.sum(1), p=2, dim=-1
+            )
+            results.append(
+                {
+                    "name": name,
+                    "videos": filenames,
+                    "selected_frames": selected,
+                    "token_ids": inputs["input_ids"][0].tolist(),
+                    "embedding": pooled[0].tolist(),
+                }
+            )
+    output.write_text(
+        json.dumps(
+            {
+                "model": MODEL,
+                "revision": REVISION,
+                "transformers_revision": TRANSFORMERS_REVISION,
+                "source_hashes": SOURCE_HASHES,
+                "torch": torch.__version__,
+                "torchvision": __import__("torchvision").__version__,
+                "transformers": transformers.__version__,
+                "ffmpeg": subprocess.check_output(
+                    ["ffmpeg", "-version"], text=True
+                ).splitlines()[0],
+                "precision": "float32",
+                "assets": provenance,
+                "cases": results,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
 def media_stages(directory, output):
     verify_reference(directory)
     """Matched producer boundaries for diagnosing native media parity."""
@@ -431,7 +726,14 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument(
         "operation",
-        choices=("acquire", "oracle", "media-oracle", "media-stages", "long-oracle"),
+        choices=(
+            "acquire",
+            "oracle",
+            "media-oracle",
+            "media-stages",
+            "long-oracle",
+            "video-oracle",
+        ),
     )
     p.add_argument("directory", type=Path)
     p.add_argument("--output", type=Path, default=Path("embeddinggemma2_oracle.json"))
@@ -442,6 +744,8 @@ def main():
         oracle(args.directory, args.output)
     elif args.operation == "long-oracle":
         long_oracle(args.directory, args.output)
+    elif args.operation == "video-oracle":
+        video_oracle(args.directory, args.output)
     elif args.operation == "media-stages":
         media_stages(args.directory, args.output)
     else:

@@ -739,8 +739,12 @@ unsupported. Native CPU uses pure Zig H.264/MJPEG; Metal prefers VideoToolbox fo
 eligible static H.264 and consumes completed Metal prepared patch buffers directly.
 Existing vision/projector host boundaries remain. The current model display policy
 requires square pixels, no rotation and supported SDR color metadata (BT.601 default
-when absent); declared VUI/container matrix or range conflicts fail explicitly. This input path is contract/lifecycle qualified; full official pretrained
-video embedding parity has not yet run in this workspace. See [VIDEO.md](../../zig/lib/video/VIDEO.md#embeddinggemma-2-model-adapter-2026-10-09).
+when absent); declared VUI/container matrix or range conflicts fail explicitly.
+Six pinned pretrained F32 video cases qualify native CPU and Metal numerical
+parity, including ordered mixed groups, repeated frames and HTTP dimensions.
+JPEG RGB uses the independent Pillow/libjpeg reference policy; default FFmpeg
+MJPEG IDCT can differ. See the [pretrained receipt](../../zig/lib/video/testdata/video-pretrained-validation.md)
+and [VIDEO.md](../../zig/lib/video/VIDEO.md#embeddinggemma-2-model-adapter-2026-10-09).
 
 Model FPS sampling currently requires progressive one-picture-per-sample AVC
 (Baseline/Main/High-family) or MJPEG. PAFF/MBAFF and Extended-profile partition

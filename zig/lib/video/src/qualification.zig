@@ -32,11 +32,22 @@ pub fn main(init: std.process.Init) !void {
     try input.interface.readSliceAll(original);
     var out_buffer: [8192]u8 = undefined;
     var out = std.Io.File.stdout().writer(init.io, &out_buffer);
-    if (std.mem.eql(u8, mode, "hash") or std.mem.eql(u8, mode, "dump")) {
+    if (std.mem.eql(u8, mode, "hash") or std.mem.eql(u8, mode, "dump") or std.mem.eql(u8, mode, "dump-rgb")) {
         var src = media.source.Source{ .allocator = a, .identity = path, .storage = .{ .borrowed = original }, .limits = .{ .max_total_bytes = 4 * 1024 * 1024 * 1024 } };
         var reader = try media.mp4.Reader.init(a, &src, .{});
         defer reader.deinit();
         if (reader.packets.len > 20_000) return error.ResourceLimitExceeded;
+        if (std.mem.eql(u8, mode, "dump-rgb")) {
+            if (reader.track.codec != .mjpeg) return error.UnsupportedVideoCodec;
+            for (0..reader.packets.len) |index| {
+                var frame = try video.mjpeg.decodeFrame(a, &reader, index, .{});
+                defer frame.deinit();
+                var offset: usize = 0;
+                while (offset < frame.rgba.len) : (offset += 4) try out.interface.writeAll(frame.rgba[offset..][0..3]);
+            }
+            try out.interface.flush();
+            return;
+        }
         const indexes = try a.alloc(usize, reader.packets.len);
         defer a.free(indexes);
         for (indexes, 0..) |*index, i| index.* = i;

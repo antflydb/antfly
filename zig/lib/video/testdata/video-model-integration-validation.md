@@ -90,8 +90,10 @@ zig build test-embeddinggemma2 -Dmetal=true --summary all -- --test-filter embed
 
 ## Qualification limits
 
-No official pretrained weights or video embedding oracle are available in this
-workspace. This turn qualifies the processor, token composition, HTTP routing and
+At the time of this integration run, no official pretrained weights or video
+embedding oracle were available in this workspace. The follow-up
+[pretrained validation](video-pretrained-validation.md) closes that numerical gap.
+This historical receipt qualifies the processor, token composition, HTTP routing and
 device lifecycle; it does not establish end-to-end pretrained video numerical or
 retrieval parity. Existing checkpoint-dependent family tests skip explicitly.
 
