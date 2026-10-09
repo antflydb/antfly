@@ -267,11 +267,17 @@ func corpusPrepareCmd(args []string) error {
 		totalPages := 0
 		if entry.MIME == "application/pdf" {
 			totalPages, e = store.pages(entry.Locator)
-			if e != nil {
-				return fmt.Errorf("count pages %s: %w", entry.ID, e)
+			if e == nil && totalPages < 1 {
+				e = fmt.Errorf("PDF has no pages")
 			}
-			if totalPages < 1 {
-				return fmt.Errorf("PDF %s has no pages", entry.ID)
+			if e != nil {
+				// An unreadable source (e.g. a corrupt archive entry) must not
+				// abort a full-corpus preparation; record it and move on.
+				if e = recordSkippedSource(filepath.Join(*state, "skipped.ndjson"), entry.ID, e); e != nil {
+					return e
+				}
+				progress.InputOffset += n
+				continue
 			}
 		} else if entry.Locator.Size > corpusMaxBytes {
 			return fmt.Errorf("audio %s exceeds 128 MiB; split it before preparation", entry.ID)
@@ -464,6 +470,7 @@ func corpusLoadCmd(args []string) error {
 	model := flags.String("embedding-model", DefaultEmbeddingModel, "Embedding model, with 512 dimensions")
 	extractorModel := flags.String("artifact-extractor-model", DefaultAutographModel, "Registered inference model for relation extraction")
 	language := flags.String("language", "en-US", "Apple OCR and transcription locale")
+	numShards := flags.Int("num-shards", 1, "Number of shards when creating the table")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -497,7 +504,7 @@ func corpusLoadCmd(args []string) error {
 	}
 	description := corpusDescription(indexes, sourceConfig.PagesPerRecord)
 	if *create {
-		if _, err = corpusRequest(client, http.MethodPost, tableURL, map[string]any{"num_shards": 1, "indexes": indexes, "schema": corpusTableSchema(), "description": description}); err != nil {
+		if _, err = corpusRequest(client, http.MethodPost, tableURL, map[string]any{"num_shards": *numShards, "indexes": indexes, "schema": corpusTableSchema(), "description": description}); err != nil {
 			return err
 		}
 	}
@@ -726,4 +733,19 @@ func corpusDescription(indexes map[string]any, pagesPerRecord int) string {
 	encoded, _ := json.Marshal([]any{indexes, pagesPerRecord})
 	sum := sha256.Sum256(encoded)
 	return "epstein-corpus-v1:" + hex.EncodeToString(sum[:])
+}
+
+func recordSkippedSource(path, id string, cause error) error {
+	fmt.Printf("Skipping unreadable source %s: %v\n", id, cause)
+	line, err := json.Marshal(map[string]string{"id": id, "error": cause.Error()})
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.Write(append(line, '\n'))
+	return err
 }
