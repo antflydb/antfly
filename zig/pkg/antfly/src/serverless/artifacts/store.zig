@@ -943,7 +943,8 @@ test "artifact reads suspend only provider waits and retire payloads on lost aut
             .provider_error => try std.testing.expectError(error.InputOutput, result),
             .corrupt => try std.testing.expectError(error.ArtifactIntegrityMismatch, result),
         }
-        try std.testing.expectEqual(if (case == .source_canceled) @as(usize, 0) else if (bounded) 1 else 2, fixture.calls);
+        const expected_calls: usize = if (case == .source_canceled) 0 else if (bounded) 1 else 2;
+        try std.testing.expectEqual(expected_calls, fixture.calls);
         if (case != .unscheduled) try std.testing.expectEqual(fixture.calls, fixture.controls);
         execution.finish();
         try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
