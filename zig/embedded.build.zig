@@ -63,12 +63,12 @@ pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
     const install_lite = b.addInstallArtifact(lite, .{});
     const lite_step = b.step("lite", "Build the independent file-oriented Lite CLI and public C ABI");
     lite_step.dependOn(&install_lite.step);
-    lite_step.dependOn(&embedded.install_libantfly.step);
+    lite_step.dependOn(embedded.install_libantfly);
     lite_step.dependOn(&embedded.install_capi_header.step);
     lite_step.dependOn(&b.top_level_steps.get("licenses-antfly-lite").?.step);
 
     b.getInstallStep().dependOn(&install_lite.step);
-    b.getInstallStep().dependOn(&embedded.install_libantfly.step);
+    b.getInstallStep().dependOn(embedded.install_libantfly);
     b.getInstallStep().dependOn(&embedded.install_capi_header.step);
     b.default_step = lite_step;
 

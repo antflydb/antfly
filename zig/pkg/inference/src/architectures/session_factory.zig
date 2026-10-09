@@ -4002,6 +4002,8 @@ fn normalizeWeightKey(store_kind: tensor_store_mod.StoreKind, arch_config: ArchC
         if (std.mem.startsWith(u8, key, "encoder."))
             return std.fmt.bufPrint(buf, "model.{s}", .{key["encoder.".len..]}) catch return error.NameTooLong;
         if (std.mem.startsWith(u8, key, "model.")) return key;
+        // Laya's encoder and question heads share the runtime model namespace.
+        // GLiNER's composite heads instead retain their top-level names.
         if (arch_config.modern_bert.laya != null or
             std.mem.startsWith(u8, key, "embeddings.") or
             std.mem.startsWith(u8, key, "layers.") or
@@ -6706,6 +6708,20 @@ test "detectArchitecture and weight normalization recognize HuggingFace ModernBE
         "classifier.0.weight",
         try normalizeWeightKey(.safetensors, arch, "classifier.0.weight", &key_buf),
     );
+}
+
+test "ModernBERT Laya head weights share the encoder runtime namespace" {
+    const arch: ArchConfig = .{ .modern_bert = .{ .laya = .{} } };
+    var key_buf: [256]u8 = undefined;
+    const keys = [_]struct { source: []const u8, runtime: []const u8 }{
+        .{ .source = "encoder.layers.0.attn.Wqkv.weight", .runtime = "model.layers.0.attn.Wqkv.weight" },
+        .{ .source = "type_emb.weight", .runtime = "model.type_emb.weight" },
+        .{ .source = "head.layers.0.attn.Wqkv.weight", .runtime = "model.head.layers.0.attn.Wqkv.weight" },
+        .{ .source = "model.type_emb.weight", .runtime = "model.type_emb.weight" },
+    };
+    for (keys) |key| {
+        try std.testing.expectEqualStrings(key.runtime, try normalizeWeightKey(.safetensors, arch, key.source, &key_buf));
+    }
 }
 
 test "detectArchitecture recognizes Nomic Embed Text NomicBERT config" {

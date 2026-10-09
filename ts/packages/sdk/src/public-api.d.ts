@@ -6728,6 +6728,12 @@ export interface components {
         /** @description Immutable source embedding ownership. Omit storage when creating a table to select vector_store for a local single-shard standalone table without HA or replication, and primary_lsm for other deployments. Existing tables retain their recorded ownership; changing the creation default does not migrate data. Snapshot/backup and split operations currently reject vector_store tables; explicitly select primary_lsm when these operations are required. */
         TableStorageSettings: {
             /**
+             * @description Durable table engine, independent of deployment. local uses the hosting process's local or Lite backend and normal shard placement. object uses external lake data with durable sidecars, or an Antfly-owned object WAL and published generations. Object tables do not allocate data Raft groups; omit num_shards and replication_sources. Metadata remains authoritative for table lifetime. Configure the shared destination through storage.artifacts. Writable object document tables initially require immutable schema and index definitions; changes require a new table and explicit migration.
+             * @default local
+             * @enum {string}
+             */
+            engine?: "local" | "object";
+            /**
              * @description Explicit ownership choice. vector_store requires a fresh local single-shard standalone table without HA or replication. An explicit empty storage object keeps primary_lsm; omit the storage object to use the deployment default.
              * @default primary_lsm
              * @enum {string}
@@ -24070,6 +24076,7 @@ export interface operations {
                  * @description Read consistency for the lookup. The default `read_index` routes to
                  *     the primary for linearizable reads. `stale` allows a hot standby to
                  *     serve the lookup at its safe-read LSN.
+                 *     Owned object document tables support only explicit `stale` reads of published generations. The default `read_index` and `leader_lease` are rejected with HTTP 400. Use `sync_level=full_index` on writes to wait for publication before a stale lookup.
                  */
                 consistency?: "read_index" | "leader_lease" | "stale";
             };

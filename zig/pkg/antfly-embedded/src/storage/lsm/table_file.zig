@@ -2015,18 +2015,19 @@ fn encodePrefixCompressedBlockAlloc(allocator: std.mem.Allocator, block_bytes: [
 
 fn decodePrefixCompressedBlockAlloc(
     allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
     payload: []const u8,
     expected_len: usize,
 ) ![]u8 {
     const view = try parsePrefixBlockPayload(payload);
 
     var previous_key = std.ArrayListUnmanaged(u8).empty;
-    defer previous_key.deinit(allocator);
+    defer previous_key.deinit(scratch);
     var current_key = std.ArrayListUnmanaged(u8).empty;
-    defer current_key.deinit(allocator);
+    defer current_key.deinit(scratch);
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(allocator);
-    try out.ensureTotalCapacity(allocator, expected_len);
+    try out.ensureTotalCapacityPrecise(allocator, expected_len);
 
     var entries_cursor: usize = 0;
     for (0..view.entry_count) |entry_index| {
@@ -2034,7 +2035,8 @@ fn decodePrefixCompressedBlockAlloc(
             const expected_restart = try view.restartOffset(entry_index / view.restart_interval);
             if (expected_restart != entries_cursor) return error.InvalidTableFile;
         }
-        const entry = try readPrefixBlockEntry(allocator, view.encoded_entries, &entries_cursor, previous_key.items, &current_key);
+        const entry = try readPrefixBlockEntry(scratch, view.encoded_entries, &entries_cursor, previous_key.items, &current_key);
+        if (try tableEntryEncodedLen(entry) > expected_len -| out.items.len) return error.InvalidTableFile;
         try appendEntryBytesToList(allocator, &out, .{
             .namespace_name = entry.namespace_name,
             .key = entry.key,
@@ -2043,12 +2045,12 @@ fn decodePrefixCompressedBlockAlloc(
         });
 
         previous_key.clearRetainingCapacity();
-        try previous_key.ensureTotalCapacity(allocator, entry.key.len);
+        try previous_key.ensureTotalCapacity(scratch, entry.key.len);
         previous_key.appendSliceAssumeCapacity(entry.key);
     }
     if (entries_cursor != view.encoded_entries.len) return error.InvalidTableFile;
     if (out.items.len != expected_len) return error.InvalidTableFile;
-    return try out.toOwnedSlice(allocator);
+    return out.toOwnedSliceAssert();
 }
 
 const PrefixBlockView = struct {
@@ -2134,6 +2136,8 @@ fn prefixRestartEntry(
 
 fn findExactEntryInPrefixPayloadAlloc(
     allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    max_result_bytes: usize,
     payload: []const u8,
     first_entry_index: usize,
     namespace_name: ?[]const u8,
@@ -2143,12 +2147,12 @@ fn findExactEntryInPrefixPayloadAlloc(
     if (view.entry_count == 0) return null;
 
     var restart_key = std.ArrayListUnmanaged(u8).empty;
-    defer restart_key.deinit(allocator);
+    defer restart_key.deinit(scratch);
     var lo: usize = 0;
     var hi: usize = view.restart_count;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        const entry = try prefixRestartEntry(allocator, view, mid, &restart_key);
+        const entry = try prefixRestartEntry(scratch, view, mid, &restart_key);
         if (compareEntryTo(entry, namespace_name, key) != .gt) {
             lo = mid + 1;
         } else {
@@ -2164,18 +2168,21 @@ fn findExactEntryInPrefixPayloadAlloc(
         view.encoded_entries.len;
 
     var previous_key = std.ArrayListUnmanaged(u8).empty;
-    defer previous_key.deinit(allocator);
+    defer previous_key.deinit(scratch);
     var current_key = std.ArrayListUnmanaged(u8).empty;
-    defer current_key.deinit(allocator);
+    defer current_key.deinit(scratch);
     var entry_index = first_entry_index + restart_index * view.restart_interval;
     while (entries_cursor < end_cursor and entry_index < first_entry_index + view.entry_count) : (entry_index += 1) {
-        const entry = try readPrefixBlockEntry(allocator, view.encoded_entries, &entries_cursor, previous_key.items, &current_key);
+        const entry = try readPrefixBlockEntry(scratch, view.encoded_entries, &entries_cursor, previous_key.items, &current_key);
         const order = compareEntryTo(entry, namespace_name, key);
         if (order == .eq) {
+            const size = try tableEntryEncodedLen(entry);
+            if (size > max_result_bytes) return error.InvalidTableFile;
             var out = std.ArrayListUnmanaged(u8).empty;
             errdefer out.deinit(allocator);
+            try out.ensureTotalCapacityPrecise(allocator, size);
             try appendEntryBytesToList(allocator, &out, entry);
-            const bytes = try out.toOwnedSlice(allocator);
+            const bytes = out.toOwnedSliceAssert();
             errdefer allocator.free(bytes);
             return .{
                 .index = entry_index,
@@ -2186,7 +2193,7 @@ fn findExactEntryInPrefixPayloadAlloc(
         if (order == .gt) return null;
 
         previous_key.clearRetainingCapacity();
-        try previous_key.ensureTotalCapacity(allocator, entry.key.len);
+        try previous_key.ensureTotalCapacity(scratch, entry.key.len);
         previous_key.appendSliceAssumeCapacity(entry.key);
     }
     if (entries_cursor != end_cursor) return error.InvalidTableFile;
@@ -2202,16 +2209,36 @@ pub fn findExactEntryInCompressedBlockPayloadAlloc(
     namespace_name: ?[]const u8,
     key: []const u8,
 ) !?OwnedPositionedEntry {
+    return findExactEntryInCompressedBlockPayloadWithScratchAlloc(allocator, allocator, compression, payload, expected_checksum, first_entry_index, namespace_name, key, std.math.maxInt(usize));
+}
+
+pub fn findExactEntryInCompressedBlockPayloadWithScratchAlloc(
+    allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    compression: BlockCompression,
+    payload: []const u8,
+    expected_checksum: u32,
+    first_entry_index: usize,
+    namespace_name: ?[]const u8,
+    key: []const u8,
+    max_result_bytes: usize,
+) !?OwnedPositionedEntry {
     try validateBlockPayload(payload, expected_checksum);
     return switch (compression) {
-        .prefix => try findExactEntryInPrefixPayloadAlloc(allocator, payload, first_entry_index, namespace_name, key),
+        .prefix => try findExactEntryInPrefixPayloadAlloc(allocator, scratch, max_result_bytes, payload, first_entry_index, namespace_name, key),
         .prefix_snappy => blk: {
-            const prefix_payload = try snappy.decode(allocator, payload);
-            defer allocator.free(prefix_payload);
-            break :blk try findExactEntryInPrefixPayloadAlloc(allocator, prefix_payload, first_entry_index, namespace_name, key);
+            if (max_result_bytes != std.math.maxInt(usize)) try validatePrefixDecodedSize(payload, max_result_bytes);
+            const prefix_payload = try snappy.decode(scratch, payload);
+            defer scratch.free(prefix_payload);
+            break :blk try findExactEntryInPrefixPayloadAlloc(allocator, scratch, max_result_bytes, prefix_payload, first_entry_index, namespace_name, key);
         },
         .none, .snappy => null,
     };
+}
+
+pub fn validatePrefixDecodedSize(payload: []const u8, logical_len: usize) !void {
+    const ceiling = std.math.add(usize, std.math.mul(usize, logical_len, 4) catch return error.InvalidTableFile, 256) catch return error.InvalidTableFile;
+    if (try snappy.decodedLen(payload) > ceiling) return error.InvalidTableFile;
 }
 
 fn commonPrefixLen(lhs: []const u8, rhs: []const u8) usize {
@@ -2228,6 +2255,17 @@ pub fn decodeBlockPayloadAlloc(
     expected_len: usize,
     expected_checksum: u32,
 ) ![]u8 {
+    return decodeBlockPayloadWithScratchAlloc(allocator, allocator, compression, payload, expected_len, expected_checksum);
+}
+
+pub fn decodeBlockPayloadWithScratchAlloc(
+    allocator: std.mem.Allocator,
+    scratch: std.mem.Allocator,
+    compression: BlockCompression,
+    payload: []const u8,
+    expected_len: usize,
+    expected_checksum: u32,
+) ![]u8 {
     try validateBlockPayload(payload, expected_checksum);
     return switch (compression) {
         .none => blk: {
@@ -2235,16 +2273,18 @@ pub fn decodeBlockPayloadAlloc(
             break :blk try allocator.dupe(u8, payload);
         },
         .snappy => blk: {
+            if (try snappy.decodedLen(payload) != expected_len) return error.InvalidTableFile;
             const decoded = try snappy.decode(allocator, payload);
             errdefer allocator.free(decoded);
             if (decoded.len != expected_len) return error.InvalidTableFile;
             break :blk decoded;
         },
-        .prefix => try decodePrefixCompressedBlockAlloc(allocator, payload, expected_len),
+        .prefix => try decodePrefixCompressedBlockAlloc(allocator, scratch, payload, expected_len),
         .prefix_snappy => blk: {
-            const prefix_payload = try snappy.decode(allocator, payload);
-            defer allocator.free(prefix_payload);
-            break :blk try decodePrefixCompressedBlockAlloc(allocator, prefix_payload, expected_len);
+            try validatePrefixDecodedSize(payload, expected_len);
+            const prefix_payload = try snappy.decode(scratch, payload);
+            defer scratch.free(prefix_payload);
+            break :blk try decodePrefixCompressedBlockAlloc(allocator, scratch, prefix_payload, expected_len);
         },
     };
 }

@@ -34,9 +34,10 @@ pub const ParsedTableSchema = schema_mod.ParsedTableSchema;
 pub const CreateTableRequest = table_create_contract.CreateTableRequest;
 
 pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metadata_table_manager.TableRecord {
-    const min_ranges = req.num_shards orelse 1;
+    const storage: @import("../common/table_storage.zig").Settings = req.storage orelse .{};
+    const min_ranges = if (storage.engine == .object) 0 else req.num_shards orelse 1;
     return .{
-        .storage = req.storage orelse .{},
+        .storage = storage,
         .table_id = deriveId(table_name, 0x54424c45),
         .name = table_name,
         .description = req.description orelse "",
@@ -44,7 +45,7 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
         .indexes_json = req.indexes_json orelse default_indexes_json,
         .replication_sources_json = req.replication_sources_json orelse "[]",
         .placement_role = "data",
-        .desired_replica_count = 3,
+        .desired_replica_count = if (storage.engine == .object) 0 else 3,
         .min_ranges = min_ranges,
     };
 }

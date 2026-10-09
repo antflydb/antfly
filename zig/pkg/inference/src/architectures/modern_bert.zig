@@ -363,7 +363,10 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
         // consecutive (interleaved) pairs.
         config.rope_interleaved = false;
         try requireOptionalString(obj, "hidden_activation", "gelu");
-        try requirePositionEmbeddingType(obj, config.laya != null);
+        // `position_embedding_type` is not checked: Transformers' ModernBERT
+        // neither defines nor reads it and always applies RoPE. Checkpoints
+        // carry leftover values ("absolute" in answerdotai/ModernBERT-base
+        // and Laya, "sans_pos" in Ettin) that do not change the model.
         try requireOptionalBool(obj, "attention_bias", false);
         try requireOptionalBool(obj, "mlp_bias", false);
         try requireOptionalBool(obj, "norm_bias", false);
@@ -420,18 +423,6 @@ fn ropeTheta(params: std.json.ObjectMap, layer_type: []const u8) !f32 {
 fn requireOptionalString(obj: std.json.ObjectMap, key: []const u8, expected: []const u8) !void {
     const value = obj.get(key) orelse return;
     if (value != .string or !std.mem.eql(u8, value.string, expected)) return error.UnsupportedModernBertConfig;
-}
-
-fn requirePositionEmbeddingType(obj: std.json.ObjectMap, has_laya_head: bool) !void {
-    const value = obj.get("position_embedding_type") orelse return;
-    if (value != .string) return error.UnsupportedModernBertConfig;
-    if (std.mem.eql(u8, value.string, "sans_pos")) return;
-    // prepare_laya.py preserves the upstream encoder's legacy "absolute"
-    // metadata. Transformers ModernBERT still uses RoPE for these Laya
-    // checkpoints; this field does not declare a learned position table.
-    // Keep the exception limited to validated Laya decision checkpoints.
-    if (has_laya_head and std.mem.eql(u8, value.string, "absolute")) return;
-    return error.UnsupportedModernBertConfig;
 }
 
 fn requireOptionalBool(obj: std.json.ObjectMap, key: []const u8, expected: bool) !void {
@@ -548,7 +539,9 @@ pub fn forwardPackedCT(
 ) !CT {
     try validateConfig(config);
     const seq_len = input_ids.len;
-    if (seq_len == 0 or seq_len > config.max_position_embeddings or packed_row.positions.len != seq_len) return error.InvalidInputShape;
+    // Independent packed branches restart their logical positions, so their
+    // combined physical rows can exceed the model's positional window.
+    if (seq_len == 0 or seq_len > @import("../models/laya.zig").max_packed_len_limit or packed_row.positions.len != seq_len) return error.InvalidInputShape;
     for (packed_row.positions) |p| if (p < 0 or p >= config.max_position_embeddings) return error.InvalidInputShape;
     const mask = try allocator.alloc(i64, seq_len);
     defer allocator.free(mask);
@@ -596,7 +589,7 @@ pub fn forwardBranchesCT(
     if (rows == 0 or packed_row.positions.len != rows or branches.keys.len != config.num_hidden_layers or branches.values.len != config.num_hidden_layers) return error.InvalidInputShape;
     for (packed_row.positions) |p| if (p < 0 or p >= config.max_position_embeddings) return error.InvalidInputShape;
     const seq_len = std.math.add(usize, branches.prefix_rows, rows) catch return error.InvalidInputShape;
-    if (seq_len > config.max_position_embeddings) return error.InvalidInputShape;
+    if (seq_len > @import("../models/laya.zig").max_packed_len_limit) return error.InvalidInputShape;
     const mask = try allocator.alloc(i64, seq_len);
     defer allocator.free(mask);
     @memset(mask, 1);
@@ -2100,8 +2093,6 @@ test "ModernBERT rejects declared semantics its fused kernels do not implement" 
     for ([_][]const u8{
         "\"hidden_activation\":\"relu\"}",
         "\"hidden_activation\":false}",
-        "\"position_embedding_type\":\"absolute\"}",
-        "\"position_embedding_type\":null}",
         "\"attention_bias\":true}",
         "\"attention_bias\":\"false\"}",
         "\"mlp_bias\":true}",
@@ -2122,6 +2113,17 @@ test "ModernBERT rejects declared semantics its fused kernels do not implement" 
         \\"rope_parameters":{"full_attention":{"rope_theta":160000,"rope_type":"default"},"sliding_attention":{"rope_theta":160000}}}
     );
     try std.testing.expectEqual(CheckpointLayout.huggingface_fused_qkv_no_bias, supported.checkpoint_layout);
+
+    // Transformers ignores `position_embedding_type` for ModernBERT; the
+    // reference answerdotai/ModernBERT and Laya checkpoints declare
+    // "absolute" and still use RoPE.
+    for ([_][]const u8{ "\"absolute\"", "\"sans_pos\"", "null" }) |value| {
+        const json = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, "\"position_embedding_type\":", value, "}" });
+        defer std.testing.allocator.free(json);
+        const parsed = try parseConfig(std.testing.allocator, json);
+        try std.testing.expectEqual(CheckpointLayout.huggingface_fused_qkv_no_bias, parsed.checkpoint_layout);
+        try std.testing.expect(!parsed.rope_interleaved);
+    }
 }
 
 test "ModernBERT accepts prepared Laya legacy position metadata without changing RoPE" {
@@ -2132,8 +2134,8 @@ test "ModernBERT accepts prepared Laya legacy position metadata without changing
         \\"laya":{"head_layers":2,"max_len":128,"head_max_len":64},
     ;
     const baseline = try parseConfig(std.testing.allocator, prefix ++ "\"attention_bias\":false}");
-    for ([_][]const u8{ "sans_pos", "absolute" }) |position_type| {
-        const json = try std.fmt.allocPrint(std.testing.allocator, "{s}\"position_embedding_type\":\"{s}\"}}", .{ prefix, position_type });
+    for ([_][]const u8{ "\"sans_pos\"", "\"absolute\"", "null", "false", "\"relative\"" }) |position_type| {
+        const json = try std.fmt.allocPrint(std.testing.allocator, "{s}\"position_embedding_type\":{s}}}", .{ prefix, position_type });
         defer std.testing.allocator.free(json);
         const config = try parseConfig(std.testing.allocator, json);
         try std.testing.expectEqualDeep(baseline, config);
@@ -2142,9 +2144,6 @@ test "ModernBERT accepts prepared Laya legacy position metadata without changing
         try std.testing.expectEqual(CheckpointLayout.huggingface_fused_qkv_no_bias, config.checkpoint_layout);
     }
     for ([_][]const u8{
-        "\"position_embedding_type\":null}",
-        "\"position_embedding_type\":false}",
-        "\"position_embedding_type\":\"relative\"}",
         "\"position_embedding_type\":\"absolute\",\"hidden_activation\":\"relu\"}",
         "\"position_embedding_type\":\"absolute\",\"attention_bias\":true}",
         "\"position_embedding_type\":\"absolute\",\"mlp_bias\":true}",

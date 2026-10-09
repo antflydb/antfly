@@ -29,6 +29,7 @@ pub const Kind = enum { database, namespace, tablespace, table };
 /// Request-owned query preparation data, excluding topology and unrelated
 /// tables. Read schema and index generations are captured together.
 pub const QueryDefinition = struct {
+    storage_engine: @import("../common/table_storage.zig").Engine = .local,
     table_id: u64 = 0,
     schema_json: []const u8,
     read_schema_json: []const u8,
@@ -36,7 +37,9 @@ pub const QueryDefinition = struct {
     lake_index_catalog_json: []const u8 = "",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        if (self.lake_index_catalog_json.len != 0) {
+        if (self.storage_engine == .object) {
+            try jw.write(.{ .table_id = self.table_id, .storage_engine = self.storage_engine, .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json, .lake_index_catalog_json = self.lake_index_catalog_json });
+        } else if (self.lake_index_catalog_json.len != 0) {
             try jw.write(.{ .table_id = self.table_id, .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json, .lake_index_catalog_json = self.lake_index_catalog_json });
         } else {
             try jw.write(.{ .table_id = self.table_id, .schema_json = self.schema_json, .read_schema_json = self.read_schema_json, .indexes_json = self.indexes_json });
@@ -44,7 +47,7 @@ pub const QueryDefinition = struct {
     }
 
     pub fn fromTable(table: anytype) @This() {
-        return .{ .table_id = table.table_id, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json, .lake_index_catalog_json = table.lake_index_catalog_json };
+        return .{ .storage_engine = table.storage.engine, .table_id = table.table_id, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json, .lake_index_catalog_json = table.lake_index_catalog_json };
     }
     pub fn clone(self: @This(), alloc: std.mem.Allocator) !@This() {
         const schema = try alloc.dupe(u8, self.schema_json);
@@ -53,7 +56,7 @@ pub const QueryDefinition = struct {
         errdefer alloc.free(read_schema);
         const indexes = try alloc.dupe(u8, self.indexes_json);
         errdefer alloc.free(indexes);
-        return .{ .table_id = self.table_id, .schema_json = schema, .read_schema_json = read_schema, .indexes_json = indexes, .lake_index_catalog_json = try alloc.dupe(u8, self.lake_index_catalog_json) };
+        return .{ .storage_engine = self.storage_engine, .table_id = self.table_id, .schema_json = schema, .read_schema_json = read_schema, .indexes_json = indexes, .lake_index_catalog_json = try alloc.dupe(u8, self.lake_index_catalog_json) };
     }
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         alloc.free(self.schema_json);
