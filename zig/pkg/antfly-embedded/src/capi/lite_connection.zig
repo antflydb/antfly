@@ -176,6 +176,12 @@ pub const Connection = struct {
         self.wake.set(h.handleLockIo());
     }
 
+    fn hasPendingGeneratedEnrichment(database: *h.db_mod.DB) bool {
+        const runtime = database.enrichment_runtime orelse return false;
+        return database.core.hasGeneratedEnrichmentTargets() and
+            runtime.stats().applied_sequence < database.core.nextEnrichmentSequence();
+    }
+
     fn maintenanceLoop(self: *Connection) void {
         const io = h.handleLockIo();
         while (!self.stopping.load(.acquire)) {
@@ -193,6 +199,18 @@ pub const Connection = struct {
             defer lease.close();
             const root = self.refresh() catch continue;
             const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
+            // A reopened generation can have durable producer debt without
+            // this connection ever receiving a mutation notification. Inspect
+            // every table under the lease, including namespaces not yet used
+            // by a foreground call. Keep writer_no_replay's explicit policy.
+            if (self.options.open_mode == .writer) {
+                @import("tables.zig").load(root) catch continue;
+                if (hasPendingGeneratedEnrichment(&root.db)) self.maintenance_pending = true;
+                var tables = root.embedded_tables.valueIterator();
+                while (tables.next()) |table| {
+                    if (hasPendingGeneratedEnrichment(&table.*.db)) self.maintenance_pending = true;
+                }
+            }
             if (self.maintenance_pending) {
                 self.maintenance_pending = false;
                 root.db.runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation(cancellation) catch {

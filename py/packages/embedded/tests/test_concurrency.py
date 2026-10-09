@@ -218,6 +218,13 @@ def test_readonly_snapshot_without_sidecar_in_readonly_directory(tmp_path: Path)
                 with antfly_embedded.open(snapshot, no_sync=True) as writer:
                     with pytest.raises(antfly_embedded.BusyError):
                         writer.sql("UPDATE items SET name = 'after' WHERE id = 1")
+                    # A second reader must not switch lock authorities while
+                    # the first reader still owns the fallback inode fence.
+                    with antfly_embedded.open(snapshot, mode=antfly_embedded.OpenMode.READONLY) as second:
+                        assert second.sql("SELECT name FROM items")["rows"] == [["before"]]
+                        assert list(directory.iterdir()) == [snapshot]
+                        with pytest.raises(antfly_embedded.BusyError):
+                            writer.sql("UPDATE items SET name = 'after' WHERE id = 1")
                     assert cursor.fetch(10)["result"]["rows"] == [["before"]]
                     cursor.close()
                     reader.close()
@@ -333,6 +340,56 @@ def test_cross_process_connections_refresh_documents_and_search(tmp_path: Path) 
         assert parent.lookup("child")["body"] == "child publication"
         result = parent.search({"full_text_search": {"match": {"field": "body", "text": "publication"}}, "limit": 10})
         assert "child" in str(result)
+
+
+@pytest.mark.parametrize("table_name", ["default", "named"])
+@pytest.mark.parametrize("refresh", [False, True])
+def test_background_enrichment_resumes_durable_work(tmp_path: Path, table_name: str, refresh: bool) -> None:
+    path = tmp_path / "enrichment-recovery.aflite"
+    options = antfly_embedded.OpenOptions(no_sync=True, local_runtime_configured=True, busy_timeout=5.0)
+    with antfly_embedded.create_with_options(path, options) as db:
+        if table_name != "default":
+            db.create_table(table_name, {})
+    # Keep an existing generation for the refresh case. Otherwise reopen only
+    # after the producer exits, exercising recovery on a cold connection.
+    parent = antfly_embedded.open_with_options(path, options) if refresh else None
+    script = """
+import antfly_embedded as af, json, os, sys
+db = af.open_with_options(sys.argv[1], af.OpenOptions(no_sync=True, local_runtime_configured=True, busy_timeout=5.0))
+table = db if sys.argv[2] == 'default' else db.open_table(sys.argv[2])
+table.add_index({'name': 'semantic', 'kind': 'dense_vector', 'config_json': json.dumps({
+    'field': 'embedding', 'dims': 3, 'metric': 'l2_squared',
+    'generator': {'kind': 'dense_embedding', 'source_field': 'body', 'embedding_name': 'dense_v1'},
+})})
+table.batch_json({'inserts': {'doc': {'body': 'durable generated work'}}, 'sync_level': 'write'})
+# Preserve the durable journal without relying on graceful drain/close.
+os._exit(0)
+"""
+    try:
+        subprocess.run(
+            [sys.executable, "-c", script, str(path), table_name], env=_child_environment(), check=True, timeout=60
+        )
+        if parent is None:
+            parent = antfly_embedded.open_with_options(path, options)
+        # Leave the connection idle so only its lease-scoped worker discovers
+        # the pending namespace. Neither a new write nor run_until_idle occurs.
+        time.sleep(2)
+        table = parent if table_name == "default" else parent.open_table(table_name)
+        try:
+            deadline = time.monotonic() + 10
+            while True:
+                enrichment = table.stats()["enrichment"]
+                if enrichment["applied_sequence"] >= 1:
+                    break
+                assert time.monotonic() < deadline, enrichment
+                time.sleep(0.05)
+            assert enrichment["applied_sequence"] >= enrichment["target_sequence"]
+        finally:
+            if table is not parent:
+                table.close()
+    finally:
+        if parent is not None:
+            parent.close()
 
 
 def test_cross_process_dense_checkpoints_refresh_search(tmp_path: Path) -> None:

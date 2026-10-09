@@ -255,7 +255,9 @@ lease. Calls on writable connections currently use an exclusive lease even
 for reads, a conservative policy that serializes those calls across processes.
 Read-only snapshots without a lock sidecar also open from read-only directories
 or media. Their calls use a shared inode fence when sidecar creation is denied;
-writers take the exclusive inode fence before installing a missing sidecar.
+every sidecar creator takes the exclusive inode fence before installing it.
+Reopened native writers discover pending generated enrichment in the durable
+journals of all tables and resume it under their connection lease.
 
 After an external commit or atomic file replacement, a connection reopens its
 cached runtime before the next operation. Streaming SQL cursors retain the

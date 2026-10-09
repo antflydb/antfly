@@ -8215,13 +8215,24 @@ pub fn lockReaderPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
     }) catch |err| switch (err) {
         error.FileNotFound => blk: {
             // A distributed snapshot may have no sidecar and live on read-only
-            // media. Fence its inode while checking/creating the sidecar; a
-            // writer must take the exclusive inode fence before creating one.
-            const data = try std.Io.Dir.cwd().openFile(io, path, .{
+            // media. Every sidecar creator must exclude fallback inode readers,
+            // including a reader installing the sidecar after media changes.
+            var exclusive_inode = true;
+            const data = std.Io.Dir.cwd().openFile(io, path, .{
                 .mode = .read_only,
-                .lock = .shared,
+                .lock = .exclusive,
                 .lock_nonblocking = true,
-            });
+            }) catch |inode_err| switch (inode_err) {
+                error.WouldBlock, error.FileBusy => blk_data: {
+                    exclusive_inode = false;
+                    break :blk_data try std.Io.Dir.cwd().openFile(io, path, .{
+                        .mode = .read_only,
+                        .lock = .shared,
+                        .lock_nonblocking = true,
+                    });
+                },
+                else => return inode_err,
+            };
             var keep_data = false;
             defer if (!keep_data) data.close(io);
             // A writer may have installed the sidecar before our inode fence.
@@ -8232,6 +8243,10 @@ pub fn lockReaderPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
             })) |existing| break :blk existing else |open_err| {
                 if (open_err != error.FileNotFound) return open_err;
             }
+            if (!exclusive_inode) {
+                keep_data = true;
+                break :blk data;
+            }
             break :blk std.Io.Dir.cwd().createFile(io, lock_path, .{
                 .read = true,
                 .truncate = false,
@@ -8239,6 +8254,7 @@ pub fn lockReaderPathWithIo(allocator: Allocator, io: std.Io, path: []const u8) 
                 .lock_nonblocking = true,
             }) catch |create_err| switch (create_err) {
                 error.AccessDenied, error.ReadOnlyFileSystem => {
+                    try data.lock(io, .shared);
                     keep_data = true;
                     break :blk data;
                 },
