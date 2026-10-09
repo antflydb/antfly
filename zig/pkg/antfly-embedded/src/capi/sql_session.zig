@@ -59,13 +59,13 @@ pub const Session = struct {
             saved_table.columns = &.{};
             try self.entries.append(a, .{ .table = saved_table, .mutation = copy });
         }
-        try self.validateStaged(table);
+        try self.validateStaged(table, before);
         return .committed;
     }
 
     // Enforce immediate integrity against the transaction's complete postimage
     // and retain cascades as session writes, so subsequent SELECTs see them.
-    fn validateStaged(self: *Session, target: catalog.Table) !void {
+    fn validateStaged(self: *Session, target: catalog.Table, statement_start: usize) !void {
         var arena = std.heap.ArenaAllocator.init(self.handle.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -78,7 +78,9 @@ pub const Session = struct {
         };
         if (!coordinated) return;
         const requests = try self.commitRequests(a);
-        var prepared = try d.api_relational_integrity_commit.prepareSessionStatement(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, &.{}, requests, .{});
+        const previous = try requestsForEntries(a, self.entries.items[0..statement_start]);
+        const statement = try requestsForEntries(a, self.entries.items[statement_start..]);
+        var prepared = try d.api_relational_integrity_commit.prepareSessionStatement(self.handle.alloc, adapter.localSource(), metadata.table, metadata.range, previous, statement, .{});
         defer prepared.deinit();
         const owned = self.arena.allocator();
         for (prepared.tables) |request| {
@@ -127,8 +129,12 @@ pub const Session = struct {
     }
 
     pub fn merged(self: *Session, alloc: std.mem.Allocator) ![]Entry {
+        return mergeEntries(alloc, self.entries.items);
+    }
+
+    fn mergeEntries(alloc: std.mem.Allocator, entries: []const Entry) ![]Entry {
         var result: std.ArrayList(Entry) = .empty;
-        for (self.entries.items) |entry| {
+        for (entries) |entry| {
             var found = false;
             for (result.items) |*prior| {
                 if (std.mem.eql(u8, prior.table.physical_name, entry.table.physical_name) and std.mem.eql(u8, prior.mutation.key, entry.mutation.key)) {
@@ -148,7 +154,11 @@ pub const Session = struct {
     }
 
     pub fn commitRequests(self: *Session, a: std.mem.Allocator) ![]d.api_distributed_txn_contract.TableCommitRequest {
-        const entries = try self.merged(a);
+        return requestsForEntries(a, self.entries.items);
+    }
+
+    fn requestsForEntries(a: std.mem.Allocator, input: []const Entry) ![]d.api_distributed_txn_contract.TableCommitRequest {
+        const entries = try mergeEntries(a, input);
         var names: std.StringHashMapUnmanaged(catalog.Table) = .empty;
         for (entries) |entry| try names.put(a, entry.table.physical_name, entry.table);
         const requests = try a.alloc(d.api_distributed_txn_contract.TableCommitRequest, names.count());

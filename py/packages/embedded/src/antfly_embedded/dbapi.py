@@ -286,9 +286,7 @@ class Cursor:
                 keyword = _keyword(operation)
                 if keyword in {"BEGIN", "START"}:
                     self.connection._active = True
-                elif keyword in {"COMMIT", "END"} or (
-                    keyword == "ROLLBACK" and not re.search(r"\bTO\b", operation, re.I)
-                ):
+                elif keyword in {"COMMIT", "END"} or (keyword == "ROLLBACK" and "TO" not in _control_tokens(operation)):
                     self.connection._active = False
                 return self
             page = self._native.fetch()
@@ -408,9 +406,13 @@ ROWID = _TypeCategory("uuid", "string")
 
 
 def _keyword(statement: str) -> str:
+    words = _control_tokens(statement)
+    return words[0] if words else ""
+
+
+def _control_tokens(statement: str) -> list[str]:
     clean = re.sub(r"/\*.*?\*/|--[^\n]*", " ", statement, flags=re.S)
-    words = clean.split(None, 1)
-    return words[0].upper() if words else ""
+    return re.findall(r"[A-Za-z_][A-Za-z_0-9]*|[^\s]", clean.upper())
 
 
 _PARAM_TOKENS = re.compile(

@@ -466,3 +466,54 @@ def test_materialized_syntax_errors_abort_transactions(require_native, aflite_pa
             session.execute("INSERT INTO numbers (_id,n) VALUES ('kept',2)")
             session.execute("COMMIT")
         assert database.sql("SELECT n FROM numbers")["rows"] == [["2"]]
+
+
+@pytest.mark.parametrize("storage", [af.Storage.LITE, af.Storage.DIRECTORY])
+@pytest.mark.parametrize("staged_insert", [False, True])
+def test_repeated_cascading_updates_in_transaction(require_native, tmp_path, storage, staged_insert):
+    path = tmp_path / ("cascade.aflite" if storage == af.Storage.LITE else "cascade")
+    options = af.OpenOptions(storage=storage, no_sync=True)
+    opener = af.create_with_options if storage == af.Storage.LITE else af.open_with_options
+    with opener(path, options) as database:
+        database.sql("CREATE TABLE parents (id BIGINT PRIMARY KEY)")
+        database.sql(
+            "CREATE TABLE children (id BIGINT PRIMARY KEY, parent_id BIGINT REFERENCES parents(id) ON UPDATE CASCADE)"
+        )
+        with closing(database.sql_session()) as session:
+            if staged_insert:
+                session.execute("BEGIN")
+            session.execute("INSERT INTO parents (_id,id) VALUES ('parent',1)")
+            session.execute("INSERT INTO children (_id,id,parent_id) VALUES ('child',1,1)")
+            if not staged_insert:
+                session.execute("BEGIN")
+            session.execute("UPDATE parents SET id=2 WHERE id=1")
+            assert session.execute("SELECT parent_id FROM children")["rows"] == [["2"]]
+            session.execute("SAVEPOINT second")
+            session.execute("UPDATE parents SET id=3 WHERE id=2")
+            assert session.execute("SELECT parent_id FROM children")["rows"] == [["3"]]
+            session.execute("ROLLBACK TO SAVEPOINT second")
+            assert session.execute("SELECT parent_id FROM children")["rows"] == [["2"]]
+            session.execute("UPDATE parents SET id=3 WHERE id=2")
+            session.execute("COMMIT")
+    with af.open_with_options(path, options) as database:
+        assert database.sql("SELECT id FROM parents")["rows"] == [["3"]]
+        assert database.sql("SELECT parent_id FROM children")["rows"] == [["3"]]
+
+
+@pytest.mark.parametrize("rollback", ["ROLLBACK /* back to start */", "ROLLBACK -- back to start\n"])
+def test_commented_rollback_preserves_manual_transactions(require_native, aflite_path, rollback):
+    with closing(dbapi.connect(aflite_path, no_sync=True)) as connection:
+        cursor = connection.cursor()
+        cursor.execute("CREATE TABLE numbers (n BIGINT)")
+        cursor.execute("INSERT INTO numbers (n) VALUES (1)")
+        cursor.execute(rollback)
+        cursor.execute("INSERT INTO numbers (n) VALUES (2)")
+        connection.rollback()
+        assert cursor.execute("SELECT n FROM numbers").fetchall() == []
+        cursor.execute("INSERT INTO numbers (n) VALUES (3)")
+        cursor.execute("SAVEPOINT point")
+        cursor.execute("INSERT INTO numbers (n) VALUES (4)")
+        cursor.execute("ROLLBACK /* to is a comment */ TO /* start */ SAVEPOINT point")
+        assert cursor.execute("SELECT n FROM numbers").fetchall() == [(3,)]
+        connection.rollback()
+        assert cursor.execute("SELECT n FROM numbers").fetchall() == []
