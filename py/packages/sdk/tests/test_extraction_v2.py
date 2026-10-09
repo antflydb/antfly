@@ -12,6 +12,7 @@ from antfly.client_generated.models import (
     ExtractionOptions,
     ExtractionOptionsWordSplitter,
     ExtractionRequest,
+    TrainedPredicateAnswer,
 )
 from antfly.client_generated.types import Unset
 
@@ -308,6 +309,11 @@ def test_decisions_preserve_zero_predicate_and_action_probability():
         "questions": [{"name": "needed", "type": "predicate", "instructions": "Need search?"}],
     }
     response = client_with_transport(lambda _: httpx.Response(200, json=payload)).decide(request)
-    assert response.answers[0].probability == 0
-    assert response.answers[0].act_probability == 0
+    answers = response.answers
+    assert isinstance(answers, list)
+    assert len(answers) == 1
+    predicate = answers[0]
+    assert isinstance(predicate, TrainedPredicateAnswer)
+    assert predicate.probability == 0
+    assert predicate.act_probability == 0
     assert response.to_dict() == payload
