@@ -2119,6 +2119,29 @@ reopen. The earlier self-install fixture now restores into a separate receiver
 before replaying its referenced heartbeat, matching actual snapshot transfer.
 This completes native snapshot-prefix retry amortization, not root publication
 or public SQL activation; the original parity dispositions remain unchanged.
+The embedded database-catalog merge retains named/composite conflict targets,
+constraint metadata, multi-table routing and staged-transaction conflict reads.
+Its SQL C-ABI gate passes 51/51 build steps and 12 tests after array fixtures
+were migrated to the actual default-table catalog identity. The snapshot retry
+gate before this merge passed 94/94 steps, including 173 native catalog tests,
+15 coordinator tests, 22 linked tests and 10 opaque metadata-owner tests.
+Embedded-session mutation folding now uses an indexed physical-table/primary-key
+tuple rather than a quadratic scan. It preserves first-seen order and original
+write predicates while retaining the latest non-predicate postimage. Table ID,
+schema version and storage mode are fenced across distinct keys too, closing
+the earlier per-key-only generation check. Commit request construction groups
+rows in one pass and emits deterministic first-seen table order, without a
+full input rescan per table. Transferred buffers have explicit failure cleanup.
+Standalone fold tests cover tuple identity, predicates, deletes/resurrection,
+generation fences and caller-allocation faults. A reproducible ReleaseFast
+microbenchmark (`mutation_fold_bench.zig`, 4,096 inputs, 20 iterations) measured
+legacy/indexed fold time of 32.46/0.478 ms for one-table distinct rows,
+19.36/0.486 ms across 64 tables, 10.14/0.317 ms for half-repeated rows and
+0.171/0.139 ms for 32 hot rows. The distinct one-table indexed path allocated
+1.21 MB versus 0.54 MB cumulatively per fold; temporary hash storage is released
+before return. These are CPU/allocation microbenchmarks, not end-to-end SQL or
+storage throughput. Native session-integration validation remains in progress.
+No original parity disposition is changed by this infrastructure improvement.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,
