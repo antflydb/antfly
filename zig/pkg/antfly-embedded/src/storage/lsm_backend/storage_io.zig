@@ -608,6 +608,9 @@ pub const Storage = struct {
         list_file_names_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![][]u8 = null,
         now_ns: *const fn (*anyopaque) u64,
         root_identity_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![]u8 = null,
+        /// Writes require a caller-owned publication lease, including staging
+        /// immutable files whose namespace shares the primary database.
+        requires_foreground_publication: ?*const fn (*anyopaque) bool = null,
         /// The host guarantees that rename_absolute is an atomic replacement
         /// when source and destination are siblings on the same storage.
         rename_is_atomic: bool = false,
@@ -861,6 +864,11 @@ pub const Storage = struct {
 
     pub fn nowNs(self: Storage) u64 {
         return self.vtable.now_ns(self.ptr);
+    }
+
+    pub fn requiresForegroundPublication(self: Storage) bool {
+        const requires = self.vtable.requires_foreground_publication orelse return false;
+        return requires(self.ptr);
     }
 
     pub fn rootIdentityAlloc(self: Storage, allocator: Allocator, root_dir: []const u8) ![]u8 {

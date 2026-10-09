@@ -2474,6 +2474,24 @@ pub const Store = struct {
         // Seal the cut before selecting segments; later preparations remain
         // in the WAL suffix preserved by publication.
         if (self.selective_gc) try self.checkpointLocked();
+        if (!self.selective_gc and self.opened.store.wal_committed_bytes > try self.opened.store.manifest.?.sealed_wals.bytes()) {
+            // Finish any checkpoint that can release SourceLock BEFORE
+            // selecting the primary snapshot. Otherwise a writer can commit
+            // in that gap and its payload lands inside the source cut but
+            // outside both the primary mark and the protected WAL suffix.
+            var successor = try self.opened.clone(self.alloc);
+            var successor_owned = true;
+            defer if (successor_owned) successor.deinit();
+            const sealed = successor.store.sealWal() catch |err| {
+                self.setPoisoned(successor.store.poisoned);
+                return err;
+            };
+            if (sealed) {
+                self.opened.deinit();
+                self.opened = successor;
+                successor_owned = false;
+            } else try self.checkpointLocked();
+        }
         if (@import("builtin").is_test) if (self.mark_snapshot_test_hook) |hook| try hook.call(hook.ctx);
         // This is a one-pass ownership scan, not foreground working-set data.
         // Keep the same read snapshot while bypassing ordinary cache admission.
@@ -2540,22 +2558,6 @@ pub const Store = struct {
         else
             null;
         defer if (mark_scratch) |reservation| reservation.release();
-        if (!self.selective_gc and self.opened.store.wal_committed_bytes != 0) {
-            // Retain the cut as a sealed extent so full GC can share its
-            // post-cut WAL view too, without rereading or copying that WAL.
-            var successor = try self.opened.clone(self.alloc);
-            var successor_owned = true;
-            defer if (successor_owned) successor.deinit();
-            const sealed = successor.store.sealWal() catch |err| {
-                self.setPoisoned(successor.store.poisoned);
-                return err;
-            };
-            if (sealed) {
-                self.opened.deinit();
-                self.opened = successor;
-                successor_owned = false;
-            } else try self.checkpointLocked();
-        }
         var source_snapshot = try self.opened.clone(self.alloc);
         errdefer source_snapshot.deinit();
         const scopes = if (self.ann_scopes) |scopes| try self.alloc.dupe(u64, scopes) else null;
@@ -4062,6 +4064,69 @@ test "source vector payloads incremental collection retains updates retries dele
         defer alloc.free(restored);
         try std.testing.expectEqualSlices(u8, second, restored);
     }
+}
+
+test "source vector payloads GC checkpoints before selecting the primary cut" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const docs = @import("docstore.zig");
+    const mem = @import("mem_backend.zig");
+    const keys = @import("internal_keys.zig");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/gc-checkpoint-cut", false);
+    defer source.deinit();
+    source.selective_gc = false;
+    source.positional_batch_reads = true;
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "model");
+    defer alloc.free(key);
+    // Exhaust the sealed-extent slots so mark setup must fall back to the
+    // checkpoint path that releases SourceLock during file construction.
+    const max_extents = @import("antfly_vectorindex").vector_block_manifest.wal_extents.max_extents;
+    for (0..max_extents + 1) |sequence| {
+        const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, sequence, &.{ 1, 2, 3 });
+        defer alloc.free(artifact);
+        try store.put(key, artifact);
+        if (sequence < max_extents) try std.testing.expect(try source.opened.store.sealWal());
+    }
+    const latest = try codec.encodeDenseEmbeddingAlloc(alloc, 99, &.{ 4, 5, 6 });
+    defer alloc.free(latest);
+    const Hook = struct {
+        var primary: *docs.DocStore = undefined;
+        var artifact_key: []const u8 = undefined;
+        var artifact: []const u8 = undefined;
+        var called: bool = false;
+        fn run(_: *Store, phase: Store.CheckpointPhase) !void {
+            if (phase != .stage or called) return;
+            called = true;
+            try primary.put(artifact_key, artifact);
+        }
+    };
+    Hook.primary = &store;
+    Hook.artifact_key = key;
+    Hook.artifact = latest;
+    Hook.called = false;
+    source.checkpoint_test_hook = Hook.run;
+    defer source.checkpoint_test_hook = null;
+    try std.testing.expect(!try source.collect(&raw));
+    try std.testing.expect(Hook.called);
+    try std.testing.expect(!source.collectionPending());
+    source.checkpoint_test_hook = null;
+    while (!try source.collect(&raw)) {}
+    const ref = try payload.Reference.forArtifact(key, latest);
+    var reopened = try Store.open(alloc, memory.storage(), "/gc-checkpoint-cut", false);
+    defer reopened.deinit();
+    const resolved = try Store.resolve(&reopened, alloc, key, ref);
+    defer alloc.free(resolved);
+    try std.testing.expectEqualSlices(u8, latest, resolved);
 }
 
 test "source vector payloads lock-free session admission invalidates a racing GC cut" {

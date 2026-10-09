@@ -5171,6 +5171,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("vector-payload-bench", "Build real-file source payload and hash benchmarks").dependOn(&install_vector_payload_bench.step);
 
     const vector_payload_test_mod = makeLmdbModule(b, "pkg/antfly/src/vector_payload_store_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
+    vector_payload_test_mod.addImport("antfly_test_error_logs", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/test_error_logs.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     antfly_imports.configureRuntimeContracts(vector_payload_test_mod);
     vector_payload_test_mod.addImport("bloom", bloom_mod);
     vector_payload_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
@@ -5901,7 +5906,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lite_merge_publication_runtime_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission" },
+        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission", "db text merge backpressure drains sustained segment debt to low watermark", "db text merge producer admission isolates quarantined dimensions" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lite-merge-publication-runtime-test", "Verify incremental merge publication handoff and shutdown")

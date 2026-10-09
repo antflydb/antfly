@@ -9658,6 +9658,10 @@ pub const HBCIndex = struct {
             // The browser has one execution thread; captured immutable inputs
             // keep the same publication protocol with synchronous preparation.
             ExperimentalPostingCheckpointBuild.run(build);
+        } else if (posting_store.storage.requiresForegroundPublication()) {
+            // Native embedded staging writes into the same .aflite namespace.
+            // Finish it while the caller still owns the connection path lease.
+            ExperimentalPostingCheckpointBuild.run(build);
         } else {
             build.future = build.io.concurrent(ExperimentalPostingCheckpointBuild.run, .{build}) catch fallback: {
                 // Embedded/single-threaded callers may provide an I/O runtime
@@ -9722,12 +9726,16 @@ pub const HBCIndex = struct {
             build.rebase_sequence = posting_store.covered_source_sequence;
             build.rebase_wal_bytes = posting_store.wal_committed_bytes;
             build.completed.store(false, .release);
-            build.future = build.io.concurrent(ExperimentalPostingCheckpointBuild.runRebase, .{build}) catch |err| {
-                build.build_error = err;
-                build.completed.store(true, .release);
-                if (build.resource_manager) |manager| manager.dense_checkpoint_ready.notify();
-                return err;
-            };
+            if (posting_store.storage.requiresForegroundPublication()) {
+                ExperimentalPostingCheckpointBuild.runRebase(build);
+            } else {
+                build.future = build.io.concurrent(ExperimentalPostingCheckpointBuild.runRebase, .{build}) catch |err| {
+                    build.build_error = err;
+                    build.completed.store(true, .release);
+                    if (build.resource_manager) |manager| manager.dense_checkpoint_ready.notify();
+                    return err;
+                };
+            }
             return false;
         }
         self.experimental_posting_checkpoint_build = null;
