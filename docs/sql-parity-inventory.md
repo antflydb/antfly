@@ -2261,6 +2261,15 @@ The first standalone gate exposed missing storage-owner cleanup symbols in its
 unlinked test composition. Its catalog tests now use a dedicated module linked
 to the production ABI providers, without changing unrelated restore roots or
 introducing test cleanup stubs; the linked rerun must complete independently.
+Relation results now retain the owning table's logical name from the same
+transaction as its physical identity and active claim. A published namespace
+move or rename cannot silently turn a physical routing name into an authorization
+name. Native tests cover qualified index lookup after moving a logical binding
+without renaming storage, old-namespace misses, owned wire round trips and the
+existing 16 KiB allocation bound. The native gate again passes all 35 tests.
+This read contract is not a write-admission fence: SQL index activation still
+needs owner/binding preconditions rechecked in the mutation transaction, not
+only a preflight schema-version comparison.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,

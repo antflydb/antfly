@@ -159,9 +159,14 @@ fn verifyRelationRecoveryForTest(store: *RaftApplyStore, a: std.mem.Allocator, g
 /// obtains the actual native source/candidate proof before installing a root.
 fn adoptLiveRelationWriterForTest(store: *RaftApplyStore, a: std.mem.Allocator, group: u64) !relation_reconciliation.State {
     try adoptRelationWriterForTest(store, a, group);
+    return publishLiveRelationRootForTest(store, a, group);
+}
+
+fn publishLiveRelationRootForTest(store: *RaftApplyStore, a: std.mem.Allocator, group: u64) !relation_reconciliation.State {
     {
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
+        if (!try RaftApplyStore.relationWriterEnabledTxn(&txn, group)) return error.InvalidCatalogRecord;
         if (try relation_reconciliation.readSourceRevision(&txn, group) == 0) try relation_reconciliation.advanceSource(&txn, group);
         try txn.commit();
     }
@@ -208,6 +213,7 @@ test "system catalog relation namespace transaction bulk resolution requires a l
         try std.testing.expectEqual(relation_names.Kind.table, resolved.relations[0].?.owner.kind);
         try std.testing.expectEqual(relation_names.Kind.index, resolved.relations[1].?.owner.kind);
         try std.testing.expectEqualStrings(table.name, resolved.relations[1].?.table.name);
+        try std.testing.expectEqualStrings(table.name, resolved.relations[1].?.logical_table);
         try std.testing.expectEqualStrings(table.schema_json, resolved.relations[1].?.table.query_definition.?.schema_json);
         try std.testing.expect(resolved.relations[2] == null);
         try std.testing.expect(resolved.relations[3] == null);
@@ -684,7 +690,7 @@ test "system catalog relation namespace transaction follows logical bindings wit
         try txn.put(try RaftApplyStore.relationWriterKeyForGroup(&buf, group), "AFRW01");
         try txn.commit();
     }
-    const table: metadata.TableRecord = .{ .table_id = 7, .name = "physical", .schema_json = "{}" };
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "physical", .schema_json = "{\"version\":1,\"relational_indexes\":[{\"name\":\"scoped_idx\"}]}" };
     try store.replaceStandaloneCatalog(group, 0, &.{table}, &.{}, "{}");
     try applySystemCatalogTestCommand(&store, 1, .{ .expected_revision = 0, .mutation = .{ .action = .rename, .kind = .table, .name = "physical", .new_name = "logical" } });
     const binding: system_catalog.Resource = .{ .kind = .table, .id = 7, .parent_id = system_catalog.default_namespace_id, .name = "logical", .storage_name = "physical" };
@@ -702,6 +708,18 @@ test "system catalog relation namespace transaction follows logical bindings wit
         .logical = .{ .previous_revision = 2, .delta = .{ .upserts = &.{}, .removes = &removes, .next_id = 9 } },
     }));
     try std.testing.expectEqual(revision, try store.standaloneRevision());
+    try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
+    _ = try publishLiveRelationRootForTest(&store, a, group);
+    {
+        const targets = [_]system_catalog.RelationTarget{ .{ .namespace = "other", .name = "scoped_idx" }, .{ .name = "scoped_idx" }, .{ .namespace = "other", .name = "logical" } };
+        const resolved = try store.resolveSystemCatalogIdentities(a, group, .{ .relations = &targets });
+        defer resolved.deinit(a);
+        try resolved.validateRelations(.{ .relations = &targets });
+        try std.testing.expectEqualStrings("logical", resolved.relations[0].?.logical_table);
+        try std.testing.expectEqualStrings("physical", resolved.relations[0].?.table.name);
+        try std.testing.expect(resolved.relations[1] == null);
+        try std.testing.expectEqual(relation_names.Kind.table, resolved.relations[2].?.owner.kind);
+    }
     var txn = try store.store.beginReadTxn();
     defer txn.abort();
     var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = group };
@@ -13936,6 +13954,15 @@ pub const RaftApplyStore = struct {
             var table = try decodeTableIdentity(alloc, bytes);
             errdefer table.deinit(alloc);
             if (table.table_id != owner.table_id) return error.InvalidCatalogRecord;
+            var binding = try system_catalog_storage.getById(alloc, &txn, group_id, .table, owner.table_id);
+            defer if (binding) |*value| value.deinit();
+            const logical_name = if (binding) |value| blk: {
+                if (value.value.parent_id != namespace_id or !std.mem.eql(u8, value.value.storage_name, table.name)) return error.InvalidCatalogRecord;
+                break :blk value.value.name;
+            } else blk: {
+                if (namespace_id != system_catalog.default_namespace_id) return error.InvalidCatalogRecord;
+                break :blk table.name;
+            };
             if (request.include_query_definitions) {
                 table.query_definition = try self.queryTableDefinitionTxn(alloc, &txn, group_id, table.name);
                 const definition = table.query_definition orelse return error.InvalidCatalogRecord;
@@ -13943,7 +13970,7 @@ pub const RaftApplyStore = struct {
                 std.crypto.hash.Blake3.hash(definition.schema_json, &digest, .{});
                 if (!std.mem.eql(u8, &digest, &owner.schema_digest)) return error.InvalidCatalogRecord;
             }
-            slot.* = .{ .owner = owner, .table = table };
+            slot.* = .{ .owner = owner, .table = table, .logical_table = try alloc.dupe(u8, logical_name) };
         }
         return .{ .revision = meta.revision, .tables = tables, .logical_names = try system_catalog.logicalNamesAlloc(alloc, view, request.storage_names), .relation_epoch = if (live) |value| value.root.epoch else null, .relations = relations };
     }

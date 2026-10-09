@@ -877,9 +877,13 @@ pub const RelationTarget = struct {
 pub const ResolvedRelation = struct {
     owner: @import("relation_names.zig").Owner,
     table: ResolvedTable,
+    /// Logical table name in the requested namespace, captured with ownership.
+    /// The physical routing name is never substituted for authorization.
+    logical_table: []const u8,
 
     pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
         self.table.deinit(alloc);
+        alloc.free(self.logical_table);
     }
 };
 
@@ -930,9 +934,10 @@ pub const ResolvedMany = struct {
         const epoch = self.relation_epoch orelse return error.TableTopologyUpgradeRequired;
         if (epoch.revision == 0 or std.mem.allEqual(u8, &epoch.incarnation, 0) or self.relations.len != request.relations.len) return error.InvalidCatalogRecord;
         if (request.expected_relation_epoch) |expected| if (!epoch.eql(expected)) return error.CatalogGenerationChanged;
-        for (self.relations) |relation| if (relation) |value| {
+        for (self.relations, request.relations) |relation, target| if (relation) |value| {
             try value.owner.validate();
             if (value.owner.phase != .active or value.table.table_id != value.owner.table_id or value.table.name.len == 0) return error.InvalidCatalogRecord;
+            (Target{ .database = target.database, .namespace = target.namespace, .table = value.logical_table }).validate() catch return error.InvalidCatalogRecord;
             if (request.include_query_definitions) {
                 const definition = value.table.query_definition orelse return error.InvalidCatalogRecord;
                 if (definition.table_id != value.owner.table_id) return error.InvalidCatalogRecord;
