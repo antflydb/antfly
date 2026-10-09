@@ -1295,7 +1295,13 @@ pub const Operations = struct {
     pub fn textStats(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, body: []const u8) Error!query_api.QueryResponse {
         try request.ensureActive();
         const reads = try self.routedReads(alloc, request, group_id);
-        return (reads.textStatsGroupLocal(alloc, group_id, table_name, body) catch |err| {
+        const native_request = request.platformDeadline() catch |err| return mapCommonReadError(err) orelse error.Internal;
+        const controls: db_mod.types.SearchRequest = .{
+            .execution_deadline_ns = native_request.deadline_ns,
+            .cancellation = if (std.meta.eql(request.cancellation, operation.CancellationToken.none)) null else request.cancellation,
+            .execution_runnable = if (request.execution_team) |team| team.borrow else null,
+        };
+        return (reads.textStatsGroupLocalWithControls(alloc, group_id, table_name, body, controls) catch |err| {
             if (mapCommonReadError(err)) |mapped| return mapped;
             return switch (err) {
                 error.InvalidQueryRequest, error.UnsupportedQueryRequest => error.InvalidArgument,

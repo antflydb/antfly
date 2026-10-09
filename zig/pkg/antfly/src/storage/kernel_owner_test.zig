@@ -2545,6 +2545,8 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
     );
     try std.testing.expectEqual(@as(u64, 0), response.len);
     const invalid_controlled = abi.ControlledJsonOperationRequest{ .version = abi.abi_version + 1 };
+    try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_text_stats_controlled_json(null, &invalid_controlled, &response, &query_failure));
+    try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_expand_json(null, &invalid_controlled, &response, &query_failure));
     try std.testing.expectEqual(@as(u64, 0), response.len);
     try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_owner_graph_hydrate_json(null, &invalid_controlled, &response, &query_failure));

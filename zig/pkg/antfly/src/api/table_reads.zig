@@ -2484,6 +2484,7 @@ pub const BoundTableReadSource = struct {
                 .query_group_local = queryGroupLocal,
                 .search_result_group_local = searchResultGroupLocal,
                 .text_stats_group_local = textStatsGroupLocal,
+                .text_stats_group_local_controlled = textStatsGroupLocalControlled,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
                 .join_partition_group_local = null,
                 .join_rows_group_local = null,
@@ -3087,6 +3088,19 @@ pub const BoundTableReadSource = struct {
         return try collectBoundLocalTextStats(self, alloc, table_name, body);
     }
 
+    fn textStatsGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        _: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_mod.types.SearchRequest,
+    ) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        return try collectBoundLocalTextStatsControlled(self, alloc, table_name, body, controls);
+    }
+
     fn algebraicPartialsGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -3654,6 +3668,7 @@ pub const ProvisionedTableReadSource = struct {
                 .query_group_local = queryGroupLocalPhysical,
                 .search_result_group_local = searchResultGroupLocalPhysical,
                 .text_stats_group_local = textStatsGroupLocalPhysical,
+                .text_stats_group_local_controlled = textStatsGroupLocalPhysicalControlled,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocalPhysical,
                 .graph_expand_group_local = graphExpandGroupLocalPhysical,
                 .graph_hydrate_group_local = graphHydrateGroupLocalPhysical,
@@ -4130,7 +4145,9 @@ pub const ProvisionedTableReadSource = struct {
                 .search_result_group_local = searchResultGroupCoordinator,
                 .search_result_group_local_routed = searchResultGroupLocalRouted,
                 .text_stats_group_local = textStatsGroupLocal,
+                .text_stats_group_local_controlled = textStatsGroupLocalControlled,
                 .text_stats_group_local_routed = textStatsGroupLocalRouted,
+                .text_stats_group_local_controlled_routed = textStatsGroupLocalRoutedControlled,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
                 // Route only the remote half of exact-group join work. Local
                 // routes return a typed sentinel so distributed_join executes
@@ -5223,6 +5240,16 @@ pub const ProvisionedTableReadSource = struct {
         return try textStatsGroupLocal(&routed, alloc, group_id, table_name, body);
     }
 
+    fn textStatsGroupLocalRoutedControlled(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, controls: db_mod.types.SearchRequest) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: ProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(table_name, fence, &route_storage, &pinned, &routed);
+        return try textStatsGroupLocalControlled(&routed, alloc, group_id, table_name, body, controls);
+    }
+
     fn algebraicPartialsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
@@ -5820,6 +5847,35 @@ pub const ProvisionedTableReadSource = struct {
         unreachable;
     }
 
+    fn textStatsGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_mod.types.SearchRequest,
+    ) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var attempt: usize = 0;
+        while (attempt < topology_read_attempt_limit) : (attempt += 1) {
+            try checkQueryDeadline(controls);
+            var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .search = controls }, .stale, .general, 0);
+            defer if (read_activity) |*activity| activity.deinit();
+            return self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, controls) catch |err| switch (err) {
+                error.ResidentDbRetryRequired => {
+                    if (read_activity) |*activity| activity.deinit();
+                    read_activity = null;
+                    try self.prepareResidentGroupsForReadRetry(alloc, table_name, &.{group_id});
+                    if (attempt + 1 < topology_read_attempt_limit) continue;
+                    return error.StorageReadTemporarilyUnavailable;
+                },
+                else => return err,
+            };
+        }
+        unreachable;
+    }
+
     fn textStatsGroupLocalPhysical(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -5829,6 +5885,19 @@ pub const ProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try collectProvisionedHostedLocalTextStats(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, self.callerReadActivityHeld());
+    }
+
+    fn textStatsGroupLocalPhysicalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_mod.types.SearchRequest,
+    ) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try collectProvisionedHostedLocalTextStatsControlled(self.resident_db, self.cache, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, self.callerReadActivityHeld(), controls);
     }
 
     fn algebraicPartialsGroupLocal(
@@ -6618,6 +6687,7 @@ pub const HostedProvisionedTableReadSource = struct {
                 .query_group_local = queryGroupLocalPhysical,
                 .search_result_group_local = searchResultGroupLocalPhysical,
                 .text_stats_group_local = textStatsGroupLocalPhysical,
+                .text_stats_group_local_controlled = textStatsGroupLocalPhysicalControlled,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocalPhysical,
                 .graph_expand_group_local = graphExpandGroupLocalPhysical,
                 .graph_hydrate_group_local = graphHydrateGroupLocalPhysical,
@@ -6792,6 +6862,16 @@ pub const HostedProvisionedTableReadSource = struct {
         return try textStatsGroupLocal(&routed, alloc, group_id, table_name, body);
     }
 
+    fn textStatsGroupLocalRoutedControlled(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8, controls: db_mod.types.SearchRequest) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
+        var pinned: RoutePinnedCatalog = undefined;
+        var routed: HostedProvisionedTableReadSource = undefined;
+        try self.bindRouteFence(alloc, table_name, fence, &route_storage, &pinned, &routed);
+        return try textStatsGroupLocalControlled(&routed, alloc, group_id, table_name, body, controls);
+    }
+
     fn algebraicPartialsGroupLocalRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, body: []const u8) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
@@ -6895,7 +6975,9 @@ pub const HostedProvisionedTableReadSource = struct {
                 .search_result_group_local = searchResultGroupLocal,
                 .search_result_group_local_routed = searchResultGroupLocalRouted,
                 .text_stats_group_local = textStatsGroupLocal,
+                .text_stats_group_local_controlled = textStatsGroupLocalControlled,
                 .text_stats_group_local_routed = textStatsGroupLocalRouted,
+                .text_stats_group_local_controlled_routed = textStatsGroupLocalRoutedControlled,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
                 .algebraic_partials_group_local_routed = algebraicPartialsGroupLocalRouted,
                 .join_partition_group_local_with_timeout = joinPartitionGroupLocal,
@@ -7789,6 +7871,19 @@ pub const HostedProvisionedTableReadSource = struct {
         return try (try self.groupLocalSourceForGroup(alloc, group_id, table_name, .{}, null)).textStatsGroupLocal(alloc, group_id, table_name, body);
     }
 
+    fn textStatsGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_mod.types.SearchRequest,
+    ) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try (try self.groupLocalSourceForGroup(alloc, group_id, table_name, controls, null)).textStatsGroupLocalWithControls(alloc, group_id, table_name, body, controls);
+    }
+
     fn textStatsGroupLocalPhysical(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -7798,6 +7893,19 @@ pub const HostedProvisionedTableReadSource = struct {
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         return try collectProvisionedHostedLocalTextStats(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false);
+    }
+
+    fn textStatsGroupLocalPhysicalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_mod.types.SearchRequest,
+    ) !?query_api.QueryResponse {
+        try checkQueryDeadline(controls);
+        const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        return try collectProvisionedHostedLocalTextStatsControlled(null, null, self.replica_root_dir, self.catalog, alloc, group_id, self.visibleRootGeneration(group_id), self.backend_runtime, table_name, body, false, controls);
     }
 
     fn algebraicPartialsGroupLocal(
@@ -8280,18 +8388,21 @@ fn collectProvisionedSearchRequestTextStatsParallel(
             group_id: u64,
             table_name_inner: []const u8,
             body_inner: []const u8,
+            req_inner: db_mod.types.SearchRequest,
         ) void {
-            _ = slot.owner.activate() catch |err| {
+            var worker_req = req_inner;
+            worker_req.execution_runnable = slot.owner.activate() catch |err| {
                 slot.err = err;
                 return;
             };
             defer slot.owner.park();
             const arena = slot.arena.allocator();
-            var response = source.groupLocalSource().textStatsGroupLocal(
+            var response = source.groupLocalSource().textStatsGroupLocalWithControls(
                 arena,
                 group_id,
                 table_name_inner,
                 body_inner,
+                worker_req,
             ) catch |err| {
                 slot.err = err;
                 return;
@@ -8315,7 +8426,7 @@ fn collectProvisionedSearchRequestTextStatsParallel(
         const original_class = try @import("runnable_fanout_owner.zig").parkCoordinator(req.execution_runnable);
         var group: std.Io.Group = .init;
         for (group_ids[start..end], start..end) |group_id, i| {
-            group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, body });
+            group.async(io, Fiber.run, .{ self, &slots[i], group_id, table_name, body, req });
         }
         try group.await(io);
         try @import("runnable_fanout_owner.zig").resumeCoordinator(req.execution_runnable, original_class);
@@ -8387,11 +8498,12 @@ fn collectHostedSearchRequestTextStatsParallel(
             defer slot.owner.park();
             const arena = slot.arena.allocator();
             var response = switch (route) {
-                .local => source.groupLocalSource().textStatsGroupLocal(
+                .local => source.groupLocalSource().textStatsGroupLocalWithControls(
                     arena,
                     group_id,
                     table_name_inner,
                     body_inner,
+                    worker_req,
                 ),
                 .remote => |remote| textStatsRemote(source.internalExecutor(), arena, remote.base_uri, group_id, table_name_inner, body_inner, worker_req),
             } catch |err| {
@@ -14993,6 +15105,17 @@ fn collectBoundLocalTextStats(
     return .{ .json = try executeStorageKernelTextStats(alloc, self.db, table_name, body) };
 }
 
+fn collectBoundLocalTextStatsControlled(
+    self: *BoundTableReadSource,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    body: []const u8,
+    controls: db_mod.types.SearchRequest,
+) !?query_api.QueryResponse {
+    if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+    return .{ .json = try physical_local_query.executeStorageKernelTextStatsWithControls(alloc, self.db, table_name, body, controls) };
+}
+
 pub const executeStorageKernelTextStats = physical_local_query.executeStorageKernelTextStats;
 
 fn collectBoundLocalAlgebraicPartials(
@@ -15032,6 +15155,40 @@ fn collectProvisionedHostedLocalTextStats(
         },
         else => blk: {
             const stats = try collectTextStatsFromDbForRequest(alloc, owner.db(), parsed);
+            defer distributed_stats_mod.deinitTextFieldStats(alloc, stats);
+            break :blk .{ .json = try encodeTextStatsResponse(alloc, stats) };
+        },
+    };
+}
+
+fn collectProvisionedHostedLocalTextStatsControlled(
+    resident_db: ?ResidentDbSource,
+    cache: ?*ProvisionedTableReadCache,
+    replica_root_dir: []const u8,
+    catalog: table_catalog.CatalogSource,
+    alloc: std.mem.Allocator,
+    group_id: u64,
+    lsm_root_generation: u64,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+    table_name: []const u8,
+    body: []const u8,
+    read_activity_held: bool,
+    controls: db_mod.types.SearchRequest,
+) !?query_api.QueryResponse {
+    try checkQueryDeadline(controls);
+    var parsed = try parseTextStatsRequest(alloc, table_name, body);
+    defer parsed.deinit(alloc);
+    var owner = try provisionedLocalQueryDbOwner(resident_db, cache, replica_root_dir, catalog, alloc, group_id, lsm_root_generation, backend_runtime, table_name, read_activity_held);
+    defer owner.deinit();
+    try checkQueryDeadline(controls);
+    return switch (parsed) {
+        .background_fields => blk: {
+            const stats = try physical_local_query.collectBackgroundTextStatsFromDbForRequestWithControls(alloc, owner.db(), parsed, controls);
+            defer db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, stats);
+            break :blk .{ .json = try encodeBackgroundTextStatsResponse(alloc, stats) };
+        },
+        else => blk: {
+            const stats = try physical_local_query.collectTextStatsFromDbForRequestWithControls(alloc, owner.db(), parsed, controls);
             defer distributed_stats_mod.deinitTextFieldStats(alloc, stats);
             break :blk .{ .json = try encodeTextStatsResponse(alloc, stats) };
         },
@@ -15083,11 +15240,12 @@ fn collectProvisionedSearchRequestTextStats(
             group_req.identity_read_generation = generation.?;
             const body = try encodeQueryTextStatsRequest(alloc, group_req);
             defer alloc.free(body);
-            var response = (try self.groupLocalSource().textStatsGroupLocal(
+            var response = (try self.groupLocalSource().textStatsGroupLocalWithControls(
                 alloc,
                 group_id,
                 table_name,
                 body,
+                req,
             )) orelse return error.TableNotFound;
             defer response.deinit(alloc);
             shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
@@ -15113,7 +15271,7 @@ fn collectProvisionedSearchRequestTextStats(
     }
 
     for (group_ids, 0..) |group_id, i| {
-        var response = (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound;
+        var response = (try self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, req)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -15150,11 +15308,12 @@ fn collectHostedSearchRequestTextStats(
             defer alloc.free(body);
             const route = routes[i];
             var response = switch (route) {
-                .local => (try self.groupLocalSource().textStatsGroupLocal(
+                .local => (try self.groupLocalSource().textStatsGroupLocalWithControls(
                     alloc,
                     group_id,
                     table_name,
                     body,
+                    req,
                 )) orelse return error.TableNotFound,
                 .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
             };
@@ -15186,7 +15345,7 @@ fn collectHostedSearchRequestTextStats(
     for (group_ids, 0..) |group_id, i| {
         const route = routes[i];
         var response = switch (route) {
-            .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
+            .local => (try self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, req)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -15229,7 +15388,7 @@ fn collectProvisionedAggregationTextStats(
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         const body = try encodeExplicitTextStatsRequestForSearchRequest(alloc, field_requests, group_req);
         defer alloc.free(body);
-        var response = (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound;
+        var response = (try self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, req)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -15269,7 +15428,7 @@ fn collectProvisionedAggregationBackgroundTextStats(
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[i].?;
         const body = try encodeBackgroundTextStatsRequestForSearchRequest(alloc, field_requests, group_req);
         defer alloc.free(body);
-        var response = (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound;
+        var response = (try self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, req)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         shard_stats[i] = try parseBackgroundTextStatsResponse(alloc, response.json);
         initialized += 1;
@@ -15314,7 +15473,7 @@ fn collectHostedAggregationTextStats(
         defer alloc.free(body);
         const route = routes[i];
         var response = switch (route) {
-            .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
+            .local => (try self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, req)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);
@@ -15361,7 +15520,7 @@ fn collectHostedAggregationBackgroundTextStats(
         defer alloc.free(body);
         const route = routes[i];
         var response = switch (route) {
-            .local => (try self.groupLocalSource().textStatsGroupLocal(alloc, group_id, table_name, body)) orelse return error.TableNotFound,
+            .local => (try self.groupLocalSource().textStatsGroupLocalWithControls(alloc, group_id, table_name, body, req)) orelse return error.TableNotFound,
             .remote => |remote| (try textStatsRemote(self.internalExecutor(), alloc, remote.base_uri, group_id, table_name, body, group_req)) orelse return error.TableNotFound,
         };
         defer response.deinit(alloc);

@@ -863,6 +863,8 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .search_result_group_local_routed = searchResultGroupLocalRouted,
                 .text_stats_group_local = textStatsGroupLocal,
                 .text_stats_group_local_routed = textStatsGroupLocalRouted,
+                .text_stats_group_local_controlled = textStatsGroupLocalControlled,
+                .text_stats_group_local_controlled_routed = textStatsGroupLocalControlledRouted,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
                 .algebraic_partials_group_local_routed = algebraicPartialsGroupLocalRouted,
                 .graph_expand_group_local = graphExpandGroupLocal,
@@ -4683,6 +4685,21 @@ pub const ProvisionedKernelOwnerSource = struct {
         return try textStatsGroupLocal(ptr, alloc, group_id, table_name, body);
     }
 
+    fn textStatsGroupLocalControlledRouted(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        fence: metadata_api.CatalogRouteFence,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_types.SearchRequest,
+    ) !?query_response.QueryResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try table_reads.checkQueryDeadline(controls);
+        try self.validateRoutedRead(alloc, fence, group_id, table_name);
+        return try textStatsGroupLocalControlled(ptr, alloc, group_id, table_name, body, controls);
+    }
+
     fn algebraicPartialsGroupLocalRouted(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -6096,6 +6113,32 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         var response = try lease.owner().textStatsJson(table_name, body);
         defer response.deinit();
+        return .{ .json = try alloc.dupe(u8, response.bytes()) };
+    }
+
+    fn textStatsGroupLocalControlled(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        controls: db_types.SearchRequest,
+    ) !?query_response.QueryResponse {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        try table_reads.checkQueryDeadline(controls);
+        var lease = try self.acquireWithControls(group_id, table_name, .from(controls));
+        defer lease.deinit();
+        try table_reads.checkQueryDeadline(controls);
+        var cancellation = controls.cancellation;
+        var borrow = controls.execution_runnable;
+        var response = try lease.owner().textStatsJsonWithOptions(table_name, body, .{
+            .execution_deadline_ns = controls.execution_deadline_ns,
+            .cancellation_ctx = if (cancellation) |*token| token else null,
+            .cancellation_fn = if (cancellation != null) cancellationTokenRequested else null,
+            .execution_runnable = if (borrow) |*value| value else null,
+        });
+        defer response.deinit();
+        try table_reads.checkQueryDeadline(controls);
         return .{ .json = try alloc.dupe(u8, response.bytes()) };
     }
 

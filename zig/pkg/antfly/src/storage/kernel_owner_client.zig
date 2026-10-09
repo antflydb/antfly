@@ -829,6 +829,16 @@ pub const Owner = struct {
         return response;
     }
 
+    pub fn textStatsJsonWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, options: QueryOptions) !Response {
+        var response: Response = .{};
+        var failure: abi.FailureIdentity = .{};
+        var request = controlledRequest(table_name, request_json, options.execution_deadline_ns, options.cancellation_ctx, options.cancellation_fn);
+        request.execution_runnable = options.execution_runnable;
+        const status = abi.antfly_storage_owner_text_stats_controlled_json(self.handle, &request, &response.buffer, &failure);
+        try acceptStorageOwnerFailure(status, failure, "storage-owner controlled text stats");
+        return response;
+    }
+
     pub fn algebraicPartialsJson(self: *Owner, table_name: []const u8, request_json: []const u8) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};

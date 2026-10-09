@@ -2156,6 +2156,14 @@ pub extern fn antfly_storage_owner_text_stats_json(
     out_failure: *FailureIdentity,
 ) callconv(.c) Status;
 
+/// Trusted synchronous statistics controls; borrowed authority is never JSON.
+pub extern fn antfly_storage_owner_text_stats_controlled_json(
+    owner: ?*anyopaque,
+    request: *const ControlledJsonOperationRequest,
+    out_response: *OwnedBytes,
+    out_failure: *FailureIdentity,
+) callconv(.c) Status;
+
 pub extern fn antfly_storage_owner_algebraic_partials_json(
     owner: ?*anyopaque,
     request: *const JsonOperationRequest,

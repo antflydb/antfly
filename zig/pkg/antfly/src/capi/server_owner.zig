@@ -5264,6 +5264,23 @@ pub fn storageOwnerTextStatsJson(
     );
 }
 
+pub fn storageOwnerTextStatsControlledJson(
+    owner: ?*anyopaque,
+    request: *const kernel_owner_abi.ControlledJsonOperationRequest,
+    out_response: *kernel_owner_abi.OwnedBytes,
+    out_failure: *kernel_owner_abi.FailureIdentity,
+) callconv(.c) kernel_owner_abi.Status {
+    out_response.* = .{};
+    out_failure.* = .{};
+    if (request.version != kernel_owner_abi.abi_version)
+        return storageOwnerQueryFailure(error.InvalidAbiVersion, .validate_request, out_failure);
+    const handle = asHandle(owner) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    const table_name = storageOwnerTableName(handle, request.table_name) orelse
+        return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
+    return executeStorageOwnerCompiledControlledOperation(handle, table_name, request, .text_stats, .text_stats, out_response, out_failure);
+}
+
 pub fn storageOwnerAlgebraicPartialsJson(
     owner: ?*anyopaque,
     request: *const kernel_owner_abi.JsonOperationRequest,
@@ -5398,7 +5415,7 @@ pub fn storageOwnerGraphExpandJson(
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
     const table_name = storageOwnerTableName(handle, request.table_name) orelse
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
-    return executeStorageOwnerCompiledGraph(
+    return executeStorageOwnerCompiledControlledOperation(
         handle,
         table_name,
         request,
@@ -5423,7 +5440,7 @@ pub fn storageOwnerGraphHydrateJson(
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
     const table_name = storageOwnerTableName(handle, request.table_name) orelse
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
-    return executeStorageOwnerCompiledGraph(
+    return executeStorageOwnerCompiledControlledOperation(
         handle,
         table_name,
         request,
@@ -5448,7 +5465,7 @@ pub fn storageOwnerGraphEdgesJson(
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
     const table_name = storageOwnerTableName(handle, request.table_name) orelse
         return storageOwnerQueryFailure(error.InvalidArgument, .validate_request, out_failure);
-    return executeStorageOwnerCompiledGraph(
+    return executeStorageOwnerCompiledControlledOperation(
         handle,
         table_name,
         request,
@@ -5459,7 +5476,7 @@ pub fn storageOwnerGraphEdgesJson(
     );
 }
 
-pub fn executeStorageOwnerCompiledGraph(
+pub fn executeStorageOwnerCompiledControlledOperation(
     handle: *Handle,
     table_name: []const u8,
     request: *const kernel_owner_abi.ControlledJsonOperationRequest,

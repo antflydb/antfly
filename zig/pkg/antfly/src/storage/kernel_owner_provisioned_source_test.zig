@@ -1302,6 +1302,34 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         text_stats_body,
     )).?;
     defer text_stats_response.deinit(alloc);
+    // Exercise the checked caller, storage-owner export and compiled local
+    // provider with one original native owner, including inference phase.
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const native_clock = @import("antfly_platform").time;
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var canceled = std.atomic.Value(bool).init(false);
+        var execution: native.Execution = .{};
+        defer execution.finish();
+        const deadline = native_clock.monotonicNs() + 30 * std.time.ns_per_s;
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = native_clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = struct {
+            fn requested(raw: *const anyopaque) bool {
+                return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+            }
+        }.requested } }, phase);
+        var read: @import("../api/runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = alloc };
+        const team = try read.team();
+        const trusted: db_mod.types.SearchRequest = .{ .execution_runnable = team.borrow, .execution_deadline_ns = deadline, .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled) };
+        var controlled_response = (try read_source.source().textStatsGroupLocalWithControls(alloc, 7001, "articles", text_stats_body, trusted)).?;
+        defer controlled_response.deinit(alloc);
+        try std.testing.expectEqualStrings(text_stats_response.json, controlled_response.json);
+        try std.testing.expectEqual(phase, try execution.retainedClass());
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        canceled.store(true, .release);
+        try std.testing.expectError(error.Canceled, read_source.source().textStatsGroupLocalWithControls(alloc, 7001, "articles", text_stats_body, trusted));
+    }
     var text_stats = try table_reads.parseTextStatsHttpResponse(alloc, text_stats_body, text_stats_response.json);
     defer text_stats.deinit(alloc);
     switch (text_stats) {
