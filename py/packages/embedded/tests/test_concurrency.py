@@ -367,8 +367,8 @@ def test_cross_process_connections_refresh_documents_and_search(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("table_name", ["default", "named"])
-@pytest.mark.parametrize("refresh", [False, True])
-def test_background_enrichment_resumes_durable_work(tmp_path: Path, table_name: str, refresh: bool) -> None:
+@pytest.mark.parametrize("open_kind", ["cold", "refresh", "deferred"])
+def test_background_enrichment_resumes_durable_work(tmp_path: Path, table_name: str, open_kind: str) -> None:
     path = tmp_path / "enrichment-recovery.aflite"
     options = antfly_embedded.OpenOptions(no_sync=True, local_runtime_configured=True, busy_timeout=5.0)
     with antfly_embedded.create_with_options(path, options) as db:
@@ -376,7 +376,8 @@ def test_background_enrichment_resumes_durable_work(tmp_path: Path, table_name: 
             db.create_table(table_name, {})
     # Keep an existing generation for the refresh case. Otherwise reopen only
     # after the producer exits, exercising recovery on a cold connection.
-    parent = antfly_embedded.open_with_options(path, options) if refresh else None
+    parent = antfly_embedded.open_with_options(path, options) if open_kind == "refresh" else None
+    locker = None
     script = """
 import antfly_embedded as af, json, os, sys
 db = af.open_with_options(sys.argv[1], af.OpenOptions(no_sync=True, local_runtime_configured=True, busy_timeout=5.0))
@@ -393,25 +394,50 @@ os._exit(0)
         subprocess.run(
             [sys.executable, "-c", script, str(path), table_name], env=_child_environment(), check=True, timeout=60
         )
-        if parent is None:
+        if open_kind == "deferred":
+            locker = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    "import fcntl,sys; f=open(sys.argv[1], 'r+'); "
+                    "fcntl.flock(f, fcntl.LOCK_EX); print('locked', flush=True); sys.stdin.readline()",
+                    str(path) + ".lock",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            assert locker.stdout.readline().strip() == "locked"
             parent = antfly_embedded.open_with_options(path, options)
-        # Leave the connection idle so only its lease-scoped worker discovers
-        # the pending namespace. Neither a new write nor run_until_idle occurs.
-        time.sleep(2)
-        table = parent if table_name == "default" else parent.open_table(table_name)
-        try:
+            locker.stdin.close()
+            locker.wait(timeout=5)
+        elif parent is None:
+            parent = antfly_embedded.open_with_options(path, options)
+        # Observe through a read-only connection: calling the parent would
+        # initialize a deferred generation and hide an idle worker regression.
+        observer_options = antfly_embedded.OpenOptions(
+            no_sync=True, local_runtime_configured=True, mode=antfly_embedded.OpenMode.READONLY, busy_timeout=5.0
+        )
+        with antfly_embedded.open_with_options(path, observer_options) as observer:
             deadline = time.monotonic() + 10
             while True:
-                enrichment = table.stats()["enrichment"]
+                table = observer if table_name == "default" else observer.open_table(table_name)
+                try:
+                    enrichment = table.stats()["enrichment"]
+                finally:
+                    if table is not observer:
+                        table.close()
                 if enrichment["applied_sequence"] >= 1:
                     break
                 assert time.monotonic() < deadline, enrichment
                 time.sleep(0.05)
             assert enrichment["applied_sequence"] >= enrichment["target_sequence"]
-        finally:
-            if table is not parent:
-                table.close()
     finally:
+        if locker is not None:
+            if locker.poll() is None:
+                locker.stdin.close()
+            locker.wait(timeout=5)
         if parent is not None:
             parent.close()
 

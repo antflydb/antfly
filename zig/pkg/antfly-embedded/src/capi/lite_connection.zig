@@ -191,12 +191,13 @@ pub const Connection = struct {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             if (self.stopping.load(.acquire)) break;
-            if (self.current == null) continue;
             self.gate.mutex.lockUncancelable(io);
             defer self.gate.mutex.unlock(io);
             if (self.stopping.load(.acquire)) break;
             var lease = native.lockWriterPathWithIo(alloc, io, self.path) catch continue;
             defer lease.close();
+            // A contended open can defer its first generation. Initialize it
+            // under the lease so idle maintenance can resume without an API call.
             const root = self.refresh() catch continue;
             const cancellation = h.db_mod.types.CancellationToken.fromAtomic(&self.stopping);
             // A reopened generation can have durable producer debt without
