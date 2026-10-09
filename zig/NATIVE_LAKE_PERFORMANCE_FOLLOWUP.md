@@ -341,11 +341,12 @@ multi-segment regression admits only the overlapping stream and reads one block.
 
 ## Bounded native generation publication and metadata maintenance
 
-Native sparse checkpoint recipe v7 and index-definition fence v8 add independently
+Native sparse checkpoint recipe v8 and index-definition fence v9 retain independently
 addressable score summaries and ordinal bucket routes. A term's routes carry
 conservative segment ordinal bounds. Positive selections occupying at most eight
 16-bit ordinal buckets seek their interval-tree ancestors, deduplicate segment identities,
-and reject disjoint extents without loading term-directory roots. Broad selections
+and reject disjoint extents before loading posting payloads. Guarded routes check a
+constant-size active root in the same snapshot. Broad selections
 use the primary term route. Legacy routes retain root-based discovery until rebuilt.
 Each segment/term has one dyadic covering route, preventing wide compactions
 from multiplying routes across every covered bucket. Navigation admission includes
@@ -362,17 +363,20 @@ publish together. Speculative payload warming remains bounded by the shared sche
 Compaction allocates a durable, never-reused generation ID and an intent record.
 Posting pages, score summaries, incarnation proofs, and paged forward-vector
 metadata stage in transactions bounded by 4 MiB of payload (plus the largest
-individual metadata record). No query discovers a generation until the transaction
-that publishes its roots and routes. The root switch also retires old roots and
-records cleanup intents. Reclamation then deletes at most 128 keys per transaction;
-readers retain their original backend snapshots. Writable startup processes the
+individual metadata record). Guarded routes stage with their directory pages and
+become usable only when a final transaction activates their generation roots.
+The root switch also retires old roots and records cleanup intents. Posting and
+metadata reclamation deletes at most 128 keys per transaction; a directory-ledger
+batch deletes at most 129 route/directory keys. Readers retain their original
+backend snapshots. Writable startup processes the
 small intent directory to reclaim abandoned staging and interrupted retirement,
 without scanning all archive pages. Reclamation checks posting and document-map
 roots independently because both families can share a numeric generation ID.
 
-Term-route cleanup copies each term directory once before mutation. It no longer
-calls transaction get once per term, avoiding retained quadratic copies in LSM
-write transactions.
+Modern term-route cleanup copies one directory page before each mutation batch.
+The page is a durable ledger for both route families, including generations that
+never activated. Legacy route cleanup retains its single-directory-copy path.
+Neither path retains one root copy per term in an LSM write transaction.
 
 For modern input generations, incarnation sidecars stream in ordinal order into
 private fixed-width disk proofs. Term merging resolves these proofs without
@@ -382,9 +386,9 @@ instead of repeating a full binary search for every posting. A bounded merge of
 the source proofs emits output epochs. Forward-vector metadata uses the shared
 external sorter, deduplicates native ordinals, and stages independently addressable
 records under a small document-map root. Legacy blobs remain readable. Locator
-refresh follows publication in bounded transactions, resumes from durable intents
-after a crash, and checks current incarnation
-and tombstones under the write gate; until refresh finishes, the ordinary fallback
+refresh follows publication in batches of at most 256 records, resumes from
+durable intents after a crash, and rechecks the active generation, current
+incarnation and tombstones under each short write gate; until refresh finishes, the ordinary fallback
 resolves the published document-map root by ordinal through the small in-flight
 intent directory, including read-only snapshots. The complete-locator fast-miss
 fence therefore remains valid during refresh. Physical-to-native mappings retain the

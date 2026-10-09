@@ -1194,10 +1194,24 @@ Inventory v18 carries optional Bloom offsets and lengths, retaining older codec
 readability. Unknown algorithms, physical interpretations and malformed headers
 fall back to scans; exact residual evaluation remains authoritative.
 
-Paged sparse roots (`ASPSPG01`) reference independently seekable KV blocks by
-segment/term/final ordinal. Existing `ASPSSEG1` segments remain readable; native
-sparse recipe v5 fences publications for rebuild. Compaction reserves before
-materializing source payloads and transactionally replaces roots and block keys.
+Paged sparse roots (`ASPSPG02`) occupy 32 bytes and reference 64-term directory
+pages plus independently seekable posting KV blocks by segment/term/final ordinal.
+Optional lossless `ASP2` transport packs positive ordinal gaps, preserving V1 weight
+bytes and canonical f32 scoring; blocks that cannot shrink, including repeated
+legacy ordinals, stay raw. `ASPSSEG1`, `ASPSPG01` and raw block readers remain
+supported. Native sparse recipe v8 and catalog definition v9 fence older remote
+publications for rebuild. Physical mappings and visibility checks use bounded
+cursor leases; live-row rank/select caches use four reusable fixed buffers.
+
+Compaction pins inputs and reserves a durable intent under the apply gate. Modern
+proof capture, merging, directory spooling and staging run outside that gate.
+Directory pages and guarded term/interval routes stage together; queries require
+the generation root in the same snapshot. A short activation validates and
+replaces roots. Locator refresh reacquires the gate for at most 256 records and
+rechecks generation/incarnation validity. Bounded retirement runs outside the
+apply gate, using directory pages as route ledgers. Durable intents recover
+abandoned staging and interrupted locator refresh while backend snapshots retain
+old readers.
 Direct ordered-index builds exceeding eight definitions share one union-projection
 replay across bounded cohorts; its changed-file union preserves incremental seed
 reuse and avoids decoding unchanged files. Publication continues sharing its
