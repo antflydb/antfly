@@ -359,3 +359,58 @@ test "live MP4 automatic framing handles every byte arrival and final EOF" {
     try Harness.run(std.testing.allocator, bytes[0..split], bytes[split..], expected, bytes.len);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{ bytes[0..split], bytes[split..], expected, bytes.len });
 }
+
+test "live MP4 automatic framing validates partial extended headers and EOF sized payloads" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/fragmented.mp4");
+    var split: usize = 0;
+    var end: usize = bytes.len;
+    var cursor: usize = 0;
+    while (cursor < bytes.len) {
+        const box = try iso.readBox(bytes, cursor);
+        if (box.typ == iso.fourcc("moof")) {
+            if (split == 0) split = cursor else {
+                end = cursor;
+                break;
+            }
+        }
+        cursor = box.end;
+    }
+    {
+        var ingest = try Ingest.init(a, "partial-header", bytes[0..split], .{});
+        defer ingest.deinit();
+        const extended = [_]u8{ 0, 0, 0, 1, 'f', 'r', 'e', 'e', 0, 0, 0, 0, 0, 0, 0, 16 };
+        try ingest.push(extended[0..9]);
+        try std.testing.expect((try ingest.nextSegment(false)) == null);
+        try std.testing.expectError(error.IncompleteMediaSegment, ingest.nextSegment(true));
+        try std.testing.expectEqual(@as(usize, 9), ingest.pending.items.len);
+    }
+    {
+        var ingest = try Ingest.init(a, "malformed-size", bytes[0..split], .{});
+        defer ingest.deinit();
+        try ingest.push(&.{ 0, 0, 0, 7, 'f', 'r', 'e', 'e' });
+        try std.testing.expectError(error.MalformedMedia, ingest.nextSegment(false));
+        try std.testing.expectEqual(@as(usize, 8), ingest.pending.items.len);
+    }
+    {
+        const segment = try a.dupe(u8, bytes[split..end]);
+        defer a.free(segment);
+        cursor = 0;
+        var payload: ?usize = null;
+        while (cursor < segment.len) {
+            const box = try iso.readBox(segment, cursor);
+            if (box.typ == iso.fourcc("mdat") and box.end == segment.len) payload = cursor;
+            cursor = box.end;
+        }
+        const offset = payload orelse return error.MissingMediaPayload;
+        @memset(segment[offset..][0..4], 0);
+        var ingest = try Ingest.init(a, "eof-payload", bytes[0..split], .{});
+        defer ingest.deinit();
+        try ingest.push(segment);
+        try std.testing.expect((try ingest.nextSegment(false)) == null);
+        var framed = (try ingest.nextSegment(true)) orelse return error.MissingMediaPayload;
+        defer framed.deinit();
+        try std.testing.expect(framed.reader.packets.len > 0);
+        try std.testing.expect((try ingest.nextSegment(true)) == null);
+    }
+}

@@ -22,7 +22,9 @@ pub const Options = struct {
     max_parameter_bytes: usize = 4 * 1024 * 1024,
     max_configurations: usize = 256,
 };
+pub const Color = struct { matrix: ?u8 = null, transfer: ?u8 = null };
 pub const Config = struct {
+    color: Color = .{},
     profile: u32,
     bit_depth: u8,
     bypass_allowed: bool,
@@ -93,6 +95,7 @@ pub const Frame = struct {
     duration: u32,
     timescale: u32,
     full_range: bool,
+    color: Color = .{},
     decode_high_water: usize,
     decoded_packets: usize = 1,
     field_macroblocks: usize = 0,
@@ -196,8 +199,9 @@ pub fn configParse(allocator: std.mem.Allocator, config: []const u8) !Config {
     const sub_y: usize = (if (chroma_format == 1) @as(usize, 2) else 1) * (if (frame_only) @as(usize, 1) else 2);
     const sub_x: usize = if (chroma_format == 0 or chroma_format == 3) 1 else 2;
     if (left + right >= coded_width / sub_x or (top + bottom) * sub_y >= coded_height) return error.MalformedVideoConfig;
+    var color = Color{};
     var full_range = false;
-    if (try bits.read(1) != 0) full_range = try vui(&bits);
+    if (try bits.read(1) != 0) full_range = try vui(&bits, &color);
     try bits.finish();
     if (cursor >= config.len or config[cursor] != 1) return error.UnsupportedVideoProfile;
     cursor += 1;
@@ -238,7 +242,7 @@ pub fn configParse(allocator: std.mem.Allocator, config: []const u8) !Config {
         if (chroma_offset1 < -12 or chroma_offset1 > 12) return error.MalformedVideoConfig;
     }
     try p.finish();
-    return .{ .bypass_allowed = bypass_allowed, .frame_only = frame_only, .mbaff = mbaff, .chroma_format = chroma_format, .separate_planes = separate_planes, .bit_depth = bit_depth, .groups = groups, .redundant = redundant, .constrained = constrained, .scaling = scaling, .chroma_offset1 = chroma_offset1, .profile = profile, .max_refs = max_refs, .gaps_allowed = gaps_allowed, .active0 = active0, .active1 = active1, .weighted_p = weighted_p, .weighted_b = weighted_b, .direct8 = direct8, .transform8 = transform8, .cabac = cabac, .id = id, .pps = pps_id, .frame_bits = frame_bits, .poc_type = poc, .poc_zero = poc_zero, .poc_nonref = poc_nonref, .poc_bottom = poc_bottom, .poc_cycle = poc_cycle, .poc_offsets = poc_offsets, .poc_bits = poc_bits, .coded_width = coded_width, .coded_height = coded_height, .width = coded_width - sub_x * (left + right), .height = coded_height - sub_y * (top + bottom), .left = sub_x * left, .top = sub_y * top, .full_range = full_range, .bottom_poc = bottom_poc, .qp = qp, .qs = qs, .chroma_offset = chroma_offset, .deblock_present = deblock_present };
+    return .{ .color = color, .bypass_allowed = bypass_allowed, .frame_only = frame_only, .mbaff = mbaff, .chroma_format = chroma_format, .separate_planes = separate_planes, .bit_depth = bit_depth, .groups = groups, .redundant = redundant, .constrained = constrained, .scaling = scaling, .chroma_offset1 = chroma_offset1, .profile = profile, .max_refs = max_refs, .gaps_allowed = gaps_allowed, .active0 = active0, .active1 = active1, .weighted_p = weighted_p, .weighted_b = weighted_b, .direct8 = direct8, .transform8 = transform8, .cabac = cabac, .id = id, .pps = pps_id, .frame_bits = frame_bits, .poc_type = poc, .poc_zero = poc_zero, .poc_nonref = poc_nonref, .poc_bottom = poc_bottom, .poc_cycle = poc_cycle, .poc_offsets = poc_offsets, .poc_bits = poc_bits, .coded_width = coded_width, .coded_height = coded_height, .width = coded_width - sub_x * (left + right), .height = coded_height - sub_y * (top + bottom), .left = sub_x * left, .top = sub_y * top, .full_range = full_range, .bottom_poc = bottom_poc, .qp = qp, .qs = qs, .chroma_offset = chroma_offset, .deblock_present = deblock_present };
 }
 fn hrd(bits: *Bits) !void {
     const count = try bits.ue() + 1;
@@ -251,7 +255,7 @@ fn hrd(bits: *Bits) !void {
     }
     _ = try bits.read(20);
 }
-fn vui(bits: *Bits) !bool {
+fn vui(bits: *Bits, color: *Color) !bool {
     if (try bits.read(1) != 0) {
         if (try bits.read(8) == 255) _ = try bits.read(32);
     }
@@ -260,7 +264,13 @@ fn vui(bits: *Bits) !bool {
     if (try bits.read(1) != 0) {
         _ = try bits.read(3);
         full = try bits.read(1) != 0;
-        if (try bits.read(1) != 0) _ = try bits.read(24);
+        if (try bits.read(1) != 0) {
+            _ = try bits.read(8); // color primaries; no gamut conversion is applied.
+            const transfer: u8 = @intCast(try bits.read(8));
+            const matrix: u8 = @intCast(try bits.read(8));
+            if (transfer != 2) color.transfer = transfer;
+            if (matrix != 2) color.matrix = matrix;
+        }
     }
     if (try bits.read(1) != 0) {
         _ = try bits.ue();
@@ -1314,6 +1324,7 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
     var field_macroblocks: usize = 0;
     var payload_bytes: u64 = 0;
     var next_picture_id: u32 = 0;
+    var active_sps_hash: ?[32]u8 = null;
     var packet_index = start;
     var end = index + 1;
     while (packet_index < end) : (packet_index += 1) {
@@ -1325,6 +1336,7 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
         var partition_span = try @import("h264_partition_span.zig").Span.init(allocator, reader, packet_index, start, input_packet.bytes, options);
         defer partition_span.deinit();
         const packet_bytes = partition_span.bytes;
+        for (indexes) |wanted| if (wanted > packet_index and wanted <= partition_span.last and std.mem.indexOfScalar(usize, partition_span.members.items, wanted) == null) return error.UnsupportedVideoProfile;
         if (partition_span.last >= end) end = partition_span.last + 1;
         var partitions = try @import("h264_partitions.zig").Registry.init(allocator, packet_bytes, reader.track.nal_length_bytes, cfg.redundant, options.max_slices, reader.input.control);
         defer partitions.deinit();
@@ -1346,8 +1358,10 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
                         if (next_cfg.separate_planes) next_cfg = next_cfg.independent(plane);
                         if (!@import("h264_dynamic.zig").layoutCompatible(cfg, next_cfg)) return error.UnsupportedDynamicGeometry;
                         for (workspaces) |slot| if (slot) |workspace| {
-                            if (workspace.active and cfg.id != next_cfg.id) return error.MixedVideoPictures;
+                            const next_hash = registry.session.entries.items[registry.session.packet_configs[registry.base + packet_index]].sps_hash;
+                            if (workspace.active and active_sps_hash != null and !std.mem.eql(u8, &active_sps_hash.?, &next_hash)) return error.MixedVideoPictures;
                         };
+                        active_sps_hash = registry.session.entries.items[registry.session.packet_configs[registry.base + packet_index]].sps_hash;
                         cfg = next_cfg;
                     }
                     const prefix = try slicePrefix(allocator, cfg, nal, reader.input.control);
@@ -1466,7 +1480,7 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
             if (!workspace.complete) {
                 const h = workspace.headers[0] orelse workspace.headers[1].?;
                 if (!h.field_pic and !partition_span.partitioned) return error.IncompleteVideoPicture;
-                if (workspace.wanted()) try extendAssembly(reader, start, packet_index, &end, &max_packet, &peak, &transient, output_size, config_reservation.resources.host_bytes, options);
+                if (workspace.wanted()) try extendAssembly(reader, start, partition_span.last, &end, &max_packet, &peak, &transient, output_size, config_reservation.resources.host_bytes, options);
                 continue;
             }
             for (workspace.metadata) |m| field_macroblocks += @intFromBool(m.field);
@@ -1492,7 +1506,7 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
                 }
                 if (callback) |publish| {
                     const picture_bytes = (cfg.width * cfg.height + (if (cfg.chroma_format == 0) @as(usize, 0) else 2 * (cfg.width / sub_x) * (cfg.height / sub_y))) * @sizeOf(Sample);
-                    const metadata_frame = Frame{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .allocator = budget.backing, .nv12 = output[0..picture_bytes], .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
+                    const metadata_frame = Frame{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .allocator = budget.backing, .nv12 = output[0..picture_bytes], .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .color = cfg.color, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
                     for (workspace.selected, 0..) |wanted, request_slot| if (wanted) {
                         try publish(callback_context.?, request_slot, &metadata_frame);
                     };
@@ -1505,7 +1519,7 @@ fn decodeConfigured(comptime Sample: type, initial_cfg: Config, config_reservati
     const picture_bytes = (cfg.width * cfg.height + (if (cfg.chroma_format == 0) @as(usize, 0) else 2 * (cfg.width / sub_x) * (cfg.height / sub_y))) * @sizeOf(Sample);
     try reservation.resize(.{ .host_bytes = picture_bytes });
     const final_output = if (output.len == picture_bytes) output else try allocator.realloc(output, picture_bytes);
-    return .{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .reservation = reservation, .allocator = budget.backing, .nv12 = final_output, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
+    return .{ .interlaced = !cfg.frame_only, .field_macroblocks = field_macroblocks, .chroma_format = cfg.chroma_format, .bit_depth = cfg.bit_depth, .reservation = reservation, .allocator = budget.backing, .nv12 = final_output, .width = @intCast(cfg.width), .height = @intCast(cfg.height), .pts = output_packet.pts, .duration = output_packet.duration, .timescale = reader.track.timescale, .full_range = cfg.full_range, .color = cfg.color, .decode_high_water = budget.peak, .decoded_packets = decoded_packets, .payload_bytes = payload_bytes };
 }
 
 /// Three independent monochrome prediction lanes. Each lane decodes the shared

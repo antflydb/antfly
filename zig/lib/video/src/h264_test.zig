@@ -1479,3 +1479,179 @@ test "video H264 JM advanced reconstruction allocation failures and admission un
     try std.testing.checkAllAllocationFailures(a, Harness.run, .{@as([]const u8, @embedFile("../testdata/h264-jm-partitions.mp4"))});
     try std.testing.checkAllAllocationFailures(a, Harness.run, .{@as([]const u8, @embedFile("../testdata/h264-jm-separate-14.mp4"))});
 }
+
+test "video non-IDR SPS changes preserve predicted references and reset intra geometry" {
+    const Receipt = struct { cases: []const struct { mp4_sha256: []const u8, frames: []const struct { width: u32, height: u32, sha256: []const u8 } } };
+    const receipt = try std.json.parseFromSlice(Receipt, a, @embedFile("../testdata/h264-transitions-oracle.json"), .{ .ignore_unknown_fields = true });
+    defer receipt.deinit();
+    inline for (.{ "predicted", "intra-geometry" }, 0..) |name, case| {
+        const bytes = @embedFile("../testdata/h264-sps-" ++ name ++ ".mp4");
+        var src = media.source.Source{ .allocator = a, .identity = name, .storage = .{ .borrowed = bytes } };
+        var reader = try media.mp4.Reader.init(a, &src, .{});
+        defer reader.deinit();
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        try std.testing.expectEqualStrings(receipt.value.cases[case].mp4_sha256, &std.fmt.bytesToHex(digest, .lower));
+        for (receipt.value.cases[case].frames, 0..) |expected, index| {
+            var frame = try video.h264.decodeFrame(a, &reader, index, .{});
+            defer frame.deinit();
+            try std.testing.expectEqual(expected.width, frame.width);
+            try std.testing.expectEqual(expected.height, frame.height);
+            std.crypto.hash.sha2.Sha256.hash(frame.nv12, &digest, .{});
+            try std.testing.expectEqualStrings(expected.sha256, &std.fmt.bytesToHex(digest, .lower));
+        }
+        const Capture = struct {
+            expected: []const @TypeOf(receipt.value.cases[0].frames[0]),
+            count: usize = 0,
+            fn publish(ctx: *anyopaque, slot: usize, frame: *const video.h264.Frame) !void {
+                const self: *@This() = @ptrCast(@alignCast(ctx));
+                const indexes = [_]usize{ 2, 0, 1, 2 };
+                var hash: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(frame.nv12, &hash, .{});
+                try std.testing.expectEqualStrings(self.expected[indexes[slot]].sha256, &std.fmt.bytesToHex(hash, .lower));
+                self.count += 1;
+            }
+        };
+        var capture = Capture{ .expected = receipt.value.cases[case].frames };
+        _ = try video.h264.decodeSelected(a, &reader, &.{ 2, 0, 1, 2 }, .{}, &capture, Capture.publish);
+        try std.testing.expectEqual(@as(usize, 4), capture.count);
+    }
+}
+
+fn splitPartitionPackets(allocator: std.mem.Allocator, reader: *media.mp4.Reader) ![]media.mp4.Packet {
+    var packets: std.ArrayList(media.mp4.Packet) = .empty;
+    errdefer packets.deinit(allocator);
+    for (reader.packets) |packet| {
+        var lease = try reader.input.read(packet.offset, packet.size);
+        defer lease.deinit();
+        var cursor: usize = 0;
+        var partitioned = false;
+        while (cursor < lease.bytes.len) {
+            const length = std.mem.readInt(u32, lease.bytes[cursor..][0..4], .big);
+            if (lease.bytes[cursor + 4] & 31 == 2) partitioned = true;
+            cursor += 4 + length;
+        }
+        if (!partitioned) {
+            try packets.append(allocator, packet);
+            continue;
+        }
+        cursor = 0;
+        while (cursor < lease.bytes.len) {
+            const length = std.mem.readInt(u32, lease.bytes[cursor..][0..4], .big);
+            var part = packet;
+            part.offset += cursor;
+            part.size = 4 + length;
+            part.duration = if (cursor + 4 + length == lease.bytes.len) packet.duration else 0;
+            try packets.append(allocator, part);
+            cursor += 4 + length;
+        }
+    }
+    return packets.toOwnedSlice(allocator);
+}
+
+test "video data partitions across transport packets route every member and release allocations" {
+    const bytes = @embedFile("../testdata/h264-jm-partitions.mp4");
+    const Receipt = struct { frames: []const []const u8 };
+    const receipt = try std.json.parseFromSlice(Receipt, a, @embedFile("../testdata/h264-jm-partitions-oracle.json"), .{ .ignore_unknown_fields = true });
+    defer receipt.deinit();
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator, payload: []const u8, hashes: []const []const u8) !void {
+            var no_resize = std.testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
+            const alloc = no_resize.allocator();
+            var src = media.source.Source{ .allocator = alloc, .identity = "split-partitions", .storage = .{ .borrowed = payload } };
+            var reader = try media.mp4.Reader.init(alloc, &src, .{});
+            defer reader.deinit();
+            const parts = try splitPartitionPackets(alloc, &reader);
+            defer alloc.free(parts);
+            const original = reader.packets;
+            reader.packets = parts;
+            defer reader.packets = original;
+            try std.testing.expect(parts.len > original.len);
+            // Selecting any A/B/C member must reconstruct the same complete frame.
+            var frame = try video.h264.decodeFrame(alloc, &reader, parts.len - 2, .{});
+            defer frame.deinit();
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(frame.nv12, &digest, .{});
+            try std.testing.expectEqualStrings(hashes[hashes.len - 1], &std.fmt.bytesToHex(digest, .lower));
+            const Capture = struct {
+                packets: []const media.mp4.Packet,
+                hashes: []const []const u8,
+                count: usize = 0,
+                fn publish(ctx: *anyopaque, slot: usize, picture: *const video.h264.Frame) !void {
+                    const self: *@This() = @ptrCast(@alignCast(ctx));
+                    const group: usize = @intCast(self.packets[slot].media_pts);
+                    var hash: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(picture.nv12, &hash, .{});
+                    try std.testing.expectEqualStrings(self.hashes[group], &std.fmt.bytesToHex(hash, .lower));
+                    self.count += 1;
+                }
+            };
+            const indexes = try alloc.alloc(usize, parts.len);
+            defer alloc.free(indexes);
+            for (indexes, 0..) |*index, i| index.* = i;
+            var capture = Capture{ .packets = parts, .hashes = hashes };
+            _ = try video.h264.decodeSelected(alloc, &reader, indexes, .{}, &capture, Capture.publish);
+            try std.testing.expectEqual(parts.len, capture.count);
+        }
+    };
+    try Harness.run(a, bytes, receipt.value.frames);
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{ bytes, receipt.value.frames });
+}
+
+test "video SPS transition allocation failures retain source and admission ownership" {
+    const Harness = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var no_resize = std.testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
+            var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+            defer std.debug.assert(pool.snapshot().host_bytes == 0);
+            var src = media.source.Source{ .allocator = a, .identity = "sps-allocation", .storage = .{ .borrowed = @embedFile("../testdata/h264-sps-predicted.mp4") }, .admission_pool = &pool };
+            var reader = try media.mp4.Reader.init(a, &src, .{});
+            defer reader.deinit();
+            const retained = src.retained_bytes;
+            defer std.debug.assert(src.retained_bytes == retained);
+            const session = try video.h264_dynamic.Session.init(no_resize.allocator(), &reader, .{});
+            defer session.deinit();
+            var frame = try session.decodeFrame(2);
+            defer frame.deinit();
+            try std.testing.expectEqual(@as(u32, 64), frame.width);
+        }
+    };
+    try Harness.run(a);
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{});
+}
+
+test "video split partitions enforce aggregate packet and shared gathering budgets" {
+    var src = media.source.Source{ .allocator = a, .identity = "partition-limits", .storage = .{ .borrowed = @embedFile("../testdata/h264-jm-partitions.mp4") } };
+    var reader = try media.mp4.Reader.init(a, &src, .{});
+    defer reader.deinit();
+    const parts = try splitPartitionPackets(a, &reader);
+    defer a.free(parts);
+    var split = reader;
+    split.packets = parts;
+    var category_a: ?usize = null;
+    for (parts, 0..) |packet, i| {
+        var lease = try src.read(packet.offset, packet.size);
+        defer lease.deinit();
+        if (lease.bytes[4] & 31 == 2) {
+            category_a = i;
+            break;
+        }
+    }
+    const index = category_a orelse return error.MissingVideoPartition;
+    var lease = try split.readPacket(index);
+    defer lease.deinit();
+    const Span = @import("h264_partition_span.zig").Span;
+    try std.testing.expectError(error.ResourceLimitExceeded, Span.init(a, &split, index, 0, lease.bytes, .{ .max_packet_bytes = lease.bytes.len }));
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 1 } };
+    src.admission_pool = &pool;
+    try std.testing.expectError(error.SharedAdmissionExceeded, Span.init(a, &split, index, 0, lease.bytes, .{}));
+    try std.testing.expectEqual(@as(u64, 0), pool.snapshot().host_bytes);
+    src.admission_pool = null;
+    const Stop = struct {
+        fn check(_: ?*const anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    src.control = .{ .check_fn = Stop.check };
+    try std.testing.expectError(error.Cancelled, Span.init(a, &split, index, 0, lease.bytes, .{}));
+}

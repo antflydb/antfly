@@ -21,8 +21,9 @@ pub const Span = struct {
         const flags = try kinds(initial, reader.track.nal_length_bytes);
         if (!flags.a) return self;
         self.partitioned = true;
-        self.reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = try std.math.add(usize, options.max_packet_bytes, options.max_dependency_packets * @sizeOf(usize)) }) else media.admission.Token{};
-        try self.members.append(allocator, first);
+        self.reservation = if (reader.input.admission_pool) |pool| try pool.acquire(.{ .host_bytes = @sizeOf(usize) }) else media.admission.Token{};
+        try self.members.ensureTotalCapacityPrecise(allocator, 1);
+        self.members.appendAssumeCapacity(first);
         var next = first + 1;
         while (next < reader.packets.len and next - dependency_start < options.max_dependency_packets) : (next += 1) {
             try reader.input.control.check();
@@ -32,13 +33,21 @@ pub const Span = struct {
             self.extra_read_bytes += lease.bytes.len;
             const part = try kinds(lease.bytes, reader.track.nal_length_bytes);
             if (part.a or part.other_picture or part.config) break;
-            if (self.storage.items.len == 0) try self.storage.appendSlice(allocator, initial);
-            const length = try std.math.add(usize, self.storage.items.len, lease.bytes.len);
+            const previous = if (self.storage.items.len == 0) initial.len else self.storage.items.len;
+            const length = try std.math.add(usize, previous, lease.bytes.len);
             if (length > options.max_packet_bytes) return error.ResourceLimitExceeded;
+            // Charge coalesced bytes, simultaneous growth and escaped/RBSP copies.
+            // Source leases and the core workspace have separate reservations.
+            const member_count = self.members.items.len + @intFromBool(part.residual);
+            try self.reservation.resize(.{ .host_bytes = try std.math.add(usize, try std.math.mul(usize, length, 3), try std.math.mul(usize, member_count, @sizeOf(usize))) });
             // Precise capacity growth avoids uncharged allocator over-allocation.
             try self.storage.ensureTotalCapacityPrecise(allocator, length);
+            if (self.storage.items.len == 0) self.storage.appendSliceAssumeCapacity(initial);
             self.storage.appendSliceAssumeCapacity(lease.bytes);
-            if (part.residual) try self.members.append(allocator, next);
+            if (part.residual) {
+                try self.members.ensureTotalCapacityPrecise(allocator, member_count);
+                self.members.appendAssumeCapacity(next);
+            }
             self.last = next;
         }
         if (self.storage.items.len != 0) self.bytes = self.storage.items;

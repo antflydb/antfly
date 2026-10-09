@@ -349,6 +349,41 @@ pub fn encodeEmbeddingGemma2Raster(cb: *const ComputeBackend, allocator: std.mem
     return encodeSingleImageView(cb, allocator, &weights, embeddingGemma2ImageConfig(), view);
 }
 
+/// Video uses the pinned 140-token policy rather than the image 280-token policy.
+pub fn embeddingGemma2VideoGeometry(width: u32, height: u32) struct { width: u32, height: u32, tokens: usize } {
+    var cfg = embeddingGemma2ImageConfig();
+    cfg.max_image_tokens = 140;
+    const g = targetGeometry(cfg, width, height);
+    return .{ .width = @intCast(g.width), .height = @intCast(g.height), .tokens = g.tokenCount() };
+}
+
+/// Input is the lib/video centered NHWC patch contract, one borrowed frame.
+/// Native and Metal use the same vision transformer and projection weights.
+pub fn encodeEmbeddingGemma2VideoPatches(cb: *const ComputeBackend, allocator: std.mem.Allocator, patches: []const f32, width: u32, height: u32) !EncodedImage {
+    if (patches.len != @as(usize, width) * height * 3) return error.InvalidTensorShape;
+    const input = try cb.fromFloat32Shape(patches, &.{ @intCast(patches.len / 768), 768 });
+    defer cb.free(input);
+    return encodeEmbeddingGemma2VideoTensor(cb, allocator, input, width, height);
+}
+
+/// Device tensors can enter the patch projection without a prepared-pixel readback.
+pub fn encodeEmbeddingGemma2VideoTensor(cb: *const ComputeBackend, allocator: std.mem.Allocator, input: @import("../ops/ops.zig").CT, width: u32, height: u32) !EncodedImage {
+    var cfg = embeddingGemma2ImageConfig();
+    cfg.max_image_tokens = 140;
+    if (width == 0 or height == 0 or width % 48 != 0 or height % 48 != 0) return error.InvalidTensorShape;
+    const g = Geometry{ .width = width, .height = height, .grid_x = width / 16, .grid_y = height / 16, .pooled_x = width / 48, .pooled_y = height / 48 };
+    if (g.tokenCount() > 140) return error.InvalidTensorShape;
+    var store = ProjectorWeights.initHuggingFace(cb, allocator);
+    defer store.deinit();
+    const weight = try store.linearCt("v.patch_embd.weight", 768, cfg.vision_hidden);
+    defer cb.free(weight);
+    const projected = try cb.linearNoBias(input, weight, g.grid_x * g.grid_y, 768, cfg.vision_hidden);
+    defer cb.free(projected);
+    const data = try cb.toFloat32(projected, allocator);
+    defer allocator.free(data);
+    return encodePositionedPatches(cb, allocator, &store, cfg, data, g);
+}
+
 /// One image marker pair plus the tokenizer's BOS/EOS tokens.
 pub fn embeddingGemma2RasterSequenceLength(raster: antfly_image.BorrowedRasterAttachment) !usize {
     try raster.validate();
@@ -1217,6 +1252,10 @@ fn encodeSingleImageView(
     const patches = try patchEmbed(cb, allocator, store, cfg, pixel_values, geometry);
     defer allocator.free(patches);
 
+    return encodePositionedPatches(cb, allocator, store, cfg, patches, geometry);
+}
+
+fn encodePositionedPatches(cb: *const ComputeBackend, allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, patches: []const f32, geometry: Geometry) !EncodedImage {
     const positioned = try addPositionEmbeddings(allocator, store, cfg, patches, geometry);
     defer allocator.free(positioned);
 

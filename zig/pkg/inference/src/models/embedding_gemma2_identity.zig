@@ -54,7 +54,7 @@ pub fn validateProcessor(a: std.mem.Allocator, bytes: []const u8) !void {
     const reference = try std.json.parseFromSlice(std.json.Value, a, @embedFile("embedding_gemma2_processor.json"), .{});
     defer reference.deinit();
     if (parsed.value != .object) return error.InvalidEmbeddingGemma2Processor;
-    for ([_][]const u8{ "processor_class", "audio_ms_per_token", "audio_seq_length", "image_seq_length", "feature_extractor", "image_processor" }) |key| {
+    for ([_][]const u8{ "processor_class", "audio_ms_per_token", "audio_seq_length", "image_seq_length", "feature_extractor", "image_processor", "video_processor" }) |key| {
         if (!same(parsed.value.object.get(key) orelse return error.InvalidEmbeddingGemma2Processor, reference.value.object.get(key).?)) return error.InvalidEmbeddingGemma2Processor;
     }
 }

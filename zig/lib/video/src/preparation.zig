@@ -32,6 +32,8 @@ pub const Options = struct {
     rotation: Rotation = .none,
     /// Rescale to [0,1], then center for HF vision patch linear inputs if requested.
     centered: bool = true,
+    /// Torchvision rounds intermediate RGB8 stages; Pillow truncates them.
+    torchvision: bool = false,
     max_soft_tokens: usize = 140,
     max_source_pixels: usize = 16 * 1024 * 1024,
     max_scratch_bytes: usize = 128 * 1024 * 1024,
@@ -183,7 +185,7 @@ fn prepareRgb(allocator: std.mem.Allocator, bytes: []const u8, width: usize, hei
     // Shared image control follows the same deadline through both resize passes.
     var scope = image.work_control.Scope.enter(.{ .context = control.context, .check_fn = control.check_fn });
     defer scope.deinit();
-    const chw = try image.preprocessDecodedRectScaledWithResample(allocator, .{ .data = bytes, .width = @intCast(width), .height = @intCast(height), .format = .rgb8 }, g.width, g.height, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1.0 / 255.0, .pillow_bicubic);
+    const chw = try image.preprocessDecodedRectScaledWithResample(allocator, .{ .data = bytes, .width = @intCast(width), .height = @intCast(height), .format = .rgb8 }, g.width, g.height, .{ 0, 0, 0 }, .{ 1, 1, 1 }, 1.0 / 255.0, if (options.torchvision) .torchvision_bicubic else .pillow_bicubic);
     defer allocator.free(chw);
     const result = try allocator.alloc(f32, g.values());
     errdefer allocator.free(result);
@@ -209,10 +211,13 @@ const Axis = struct {
         const taps = try std.math.add(usize, try std.math.mul(usize, 4, std.math.divCeil(usize, source, target) catch return error.ResourceLimitExceeded), 2);
         return std.math.mul(usize, target, try std.math.add(usize, try std.math.mul(usize, taps, 32), 64));
     }
-    fn init(allocator: std.mem.Allocator, source: usize, target: usize, max_bytes: usize) !Axis {
+    fn init(allocator: std.mem.Allocator, source: usize, target: usize, max_bytes: usize, torchvision: bool) !Axis {
         if (try bound(source, target) > max_bytes) return error.ResourceLimitExceeded;
-        var axis = try image.buildPillowBicubicAxis(allocator, source, target);
+        var axis = try image.buildPillowBicubicAxis(allocator, source, target, torchvision);
         defer axis.deinit();
+        // Lift Torchvision int16 coefficients into the shader's fixed 22-bit
+        // scale without changing the two-pass integer rounding.
+        for (axis.weights) |*weight| weight.* *= @as(i32, 1) << @intCast(22 - axis.precision_bits);
         const table = try allocator.alloc(u32, target * 3);
         errdefer allocator.free(table);
         for (0..target) |i| {
@@ -236,7 +241,7 @@ pub const Metal = struct {
     /// One bounded resident geometry. Commands retain replaced buffers through
     /// completion; this owner is single-consumer even across concurrent jobs.
     coefficients: ?*anyopaque = null,
-    coefficient_key: [4]u32 = .{ 0, 0, 0, 0 },
+    coefficient_key: [5]u32 = .{ 0, 0, 0, 0, 0 },
     coefficient_bytes: usize = 0,
     coefficient_build_bound: usize = 0,
     coefficient_limit: usize = 16 * 1024 * 1024,
@@ -277,14 +282,14 @@ pub const Metal = struct {
     }
     fn ensureCoefficients(self: *Metal, allocator: std.mem.Allocator, width: u32, height: u32, g: Geometry, options: Options, control: media.source.Control) !usize {
         const rotated = options.rotation == .clockwise90 or options.rotation == .clockwise270;
-        const key: [4]u32 = .{ if (rotated) height else width, if (rotated) width else height, g.width, g.height };
+        const key: [5]u32 = .{ if (rotated) height else width, if (rotated) width else height, g.width, g.height, @intFromBool(options.torchvision) };
         if (self.coefficients != null and std.mem.eql(u32, &key, &self.coefficient_key)) {
             if (self.coefficient_build_bound > options.max_scratch_bytes / 4) return error.ResourceLimitExceeded;
             return 0;
         }
-        var xaxis = try Axis.init(allocator, key[0], key[2], options.max_scratch_bytes / 4);
+        var xaxis = try Axis.init(allocator, key[0], key[2], options.max_scratch_bytes / 4, options.torchvision);
         defer xaxis.deinit();
-        var yaxis = try Axis.init(allocator, key[1], key[3], options.max_scratch_bytes / 4);
+        var yaxis = try Axis.init(allocator, key[1], key[3], options.max_scratch_bytes / 4, options.torchvision);
         defer yaxis.deinit();
         try control.check();
         const byte_count = (xaxis.table.len + xaxis.weights.len + yaxis.table.len + yaxis.weights.len) * 4;

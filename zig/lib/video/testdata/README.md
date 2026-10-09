@@ -244,3 +244,9 @@ results for Baseline/Main/High10/High444. External corpus artifacts are not fetc
 or generated during normal tests. See [expansion validation](h264-expansion-validation.md).
 
 JM monochrome cases additionally qualify compressed CABAC 8-bit and CAVLC 10-bit I/P pictures. JM writes neutral 4:2:0 chroma for monochrome output; these receipts hash only each native Y plane without converting range/depth.
+
+`generate_h264_transitions.py` adds original non-IDR compatible SPS/crop/reference
+changes with predicted P-skip samples, plus non-IDR intra geometry epochs. Hashes
+are checked against known samples and independent canonical IDR FFmpeg decodes;
+the combined non-IDR transition streams are explicitly qualified extensions,
+not claimed to be conforming SPS activation within one coded video sequence.

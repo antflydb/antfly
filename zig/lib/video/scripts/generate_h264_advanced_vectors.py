@@ -122,7 +122,9 @@ class Cabac:
             self.normalize()
 
 
-def configuration(cabac=False, poc=2, width=64, height=48, gaps=False):
+def configuration(
+    cabac=False, poc=2, width=64, height=48, gaps=False, crop_right=0, references=1
+):
     sps = Bits()
     for value in (77 if cabac else 66, 0, 10):
         sps.fixed(value, 8)
@@ -136,12 +138,17 @@ def configuration(cabac=False, poc=2, width=64, height=48, gaps=False):
         sps.ue(2)
         sps.se(2)
         sps.se(2)
-    sps.ue(1)
+    sps.ue(references)
     sps.fixed(gaps, 1)
     sps.ue(width // 16 - 1)
     sps.ue(height // 16 - 1)
-    for value in (1, 1, 0, 0):
-        sps.fixed(value, 1)
+    sps.fixed(1, 1)
+    sps.fixed(1, 1)
+    sps.fixed(bool(crop_right), 1)
+    if crop_right:
+        for crop in (0, crop_right, 0, 0):
+            sps.ue(crop)
+    sps.fixed(0, 1)
     pps = Bits()
     pps.ue(0)
     pps.ue(0)
@@ -158,7 +165,14 @@ def configuration(cabac=False, poc=2, width=64, height=48, gaps=False):
 
 
 def pcm_vector(
-    cabac, poc, width=64, height=48, frames=4, frame_numbers=None, gaps=False
+    cabac,
+    poc,
+    width=64,
+    height=48,
+    frames=4,
+    frame_numbers=None,
+    gaps=False,
+    idr_first=True,
 ):
     sps, pps = configuration(cabac, poc, width, height, gaps)
     output = sps.nal(0x67) + pps.nal(0x68)
@@ -168,12 +182,12 @@ def pcm_vector(
         for value in (0, 2, 0):
             bits.ue(value)
         bits.fixed(frame if frame_numbers is None else frame_numbers[frame], 4)
-        if frame == 0:
+        if frame == 0 and idr_first:
             bits.ue(0)
         if poc == 1:
             bits.se(0)
             bits.se(-1)
-        if frame == 0:
+        if frame == 0 and idr_first:
             bits.fixed(0, 2)
         else:
             bits.fixed(0, 1)
@@ -193,7 +207,7 @@ def pcm_vector(
             if coder:
                 coder.restart()
                 coder.terminate(mb + 1 == width * height // 256)
-        output += bits.nal(0x65 if frame == 0 else 0x61, stop=not cabac)
+        output += bits.nal(0x65 if frame == 0 and idr_first else 0x61, stop=not cabac)
     return output
 
 

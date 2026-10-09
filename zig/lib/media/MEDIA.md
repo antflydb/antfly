@@ -92,7 +92,7 @@ Growth denial preserves the prior reservation. Slice, pixel, packet, dependency
 and allocator high-water limits remain independent of shared admission limits.
 
 WebM video indexing and version-pinned object-store transport adapters are now
-implemented below, together with bounded sequential spooling, caller-framed live
+implemented below, together with bounded sequential spooling, automatically framed live
 fragment ingestion and Cues seeking. General encrypted/dynamic-description support
 remains planned.
 
@@ -345,14 +345,19 @@ live seek abstraction. Snapshot addresses stay stable; release Readers and packe
 leases before snapshot destruction. Provider context and initial identity are borrowed.
 
 `live_mp4.Ingest` owns an initialization snapshot and accepts arbitrary partial
-arrival chunks. The caller invokes `finishSegment` at an explicit segment envelope
-boundary; only complete supported moof/mdat segments are published. Emitted `Segment`
+arrival chunks. `nextSegment(false)` discovers complete moof + one-or-more mdat
+segments at following moof/styp headers; drain it after each push. At final EOF,
+`nextSegment(true)` closes the last segment and resolves size-zero boxes. Partial
+headers/payloads wait until more input, then fail explicitly if EOF is premature.
+Extended-size headers are supported and bounded. `finishSegment` remains an optional
+caller-framed compatibility API. Only validated supported fragments are published. Emitted `Segment`
 values own immutable backing, a Reader, and distinct ordinal source identities.
 Earlier packet leases survive subsequent arrivals. Segment count, aggregate ingested
 bytes, pending bytes, identity bytes and index limits bound retention. Pending-buffer
 growth charges both old and new allocations during copying. DTS replay/regression
 and changed track/configuration/geometry fail; failed validation retains pending
-input for retry or `discardSegment`. This does not implement network/HLS/DASH framing,
+input for retry or `discardSegment`. The caller still supplies complete initialization bytes; automatic media box
+framing does not implement HTTP/HLS/DASH transport,
 indefinite sessions, encrypted samples or initialization reconfiguration. Consumers
 must release retained Segments to keep shared budgets available.
 

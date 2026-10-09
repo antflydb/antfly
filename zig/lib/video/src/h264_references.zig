@@ -484,7 +484,7 @@ pub fn StateFor(comptime Sample: type) type {
                     };
                     used += @intFromBool(short) + @as(usize, @intFromBool(long));
                 }
-                if (used >= max_refs) {
+                while (used >= max_refs) {
                     var oldest: ?usize = null;
                     var oldest_num: i32 = std.math.maxInt(i32);
                     const maximum: i32 = @as(i32, 1) << @as(u5, @intCast(self.frame_bits));
@@ -496,6 +496,15 @@ pub fn StateFor(comptime Sample: type) type {
                         }
                     };
                     self.remove(allocator, oldest orelse return error.MissingVideoReference);
+                    used = 0;
+                    for (self.pictures[0..self.count]) |pic| {
+                        var short = false;
+                        var long = false;
+                        for (0..2) |parity| if (pic.fields[parity]) {
+                            if (pic.field_long[parity] == null) short = true else long = true;
+                        };
+                        used += @intFromBool(short) + @as(usize, @intFromBool(long));
+                    }
                 }
             }
             var complementary: ?usize = null;

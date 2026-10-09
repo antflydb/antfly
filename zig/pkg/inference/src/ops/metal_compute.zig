@@ -1784,6 +1784,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return owned_ct;
     }
 
+    pub fn videoDevice(cb: *const ops.ComputeBackend) !*anyopaque {
+        if (cb.kind() != .metal) return error.UnsupportedVideoBackend;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return metal_runtime.termite_metal_decode_runtime_device(self.provider_impl.raw_decode_runtime) orelse error.MetalRuntimeUnavailable;
+    }
+
+    /// Caller waits for producer completion and releases its Prepared owner
+    /// before consuming this tensor. The CT retains the Metal allocation.
+    pub fn importVideoBuffer(cb: *const ops.ComputeBackend, buffer: *anyopaque, values: usize) !CT {
+        if (cb.kind() != .metal or values == 0 or values % 768 != 0) return error.InvalidTensorShape;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
+        const bytes = try std.math.mul(usize, values, @sizeOf(f32));
+        const handle = metal_runtime.termite_metal_buffer_retain_external(runtime, buffer, bytes) orelse return error.ForeignResidentVideoBuffer;
+        var tensor = MetalTensor.deviceOwned(@ptrCast(runtime), handle, 0, bytes, &.{ @intCast(values / 768), 768 });
+        errdefer tensor.deinit();
+        return self.ctFromOwnedMetalTensor(tensor);
+    }
+
     pub fn makeDeviceResident(cb: *const ops.ComputeBackend, tensor: CT) !?CT {
         if (cb.kind() != .metal) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
@@ -40970,5 +40989,54 @@ test "metal GLiNER centered residual norm preserves sum and low variance" {
         const actual_sum = try cb.toFloat32(fused.sum, a);
         defer a.free(actual_sum);
         for (actual_sum, values, residual) |got, left, right| try std.testing.expectEqual(left + right, got);
+    }
+}
+
+test "embeddinggemma2 Metal video buffer survives producer destruction and enters resident linear" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.MetalUnavailable;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    var compute = try MetalCompute.initWithIo(a, &store, null, std.testing.io);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const preparation = @import("antfly_video").preparation;
+    var preparer = try preparation.Metal.init(try MetalCompute.videoDevice(&cb));
+    defer preparer.deinit();
+    var rgba: [13 * 7 * 4]u8 = undefined;
+    for (&rgba, 0..) |*byte, i| byte.* = @truncate(i * 31 + i / 7);
+    const options = preparation.Options{ .width = 48, .height = 48, .matrix = .bt601, .torchvision = true };
+    const expected = try preparation.referenceRgba(a, &rgba, 13, 7, options, .{});
+    defer a.free(expected);
+    var prepared = try preparer.submitRgba(a, &rgba, 13, 7, options, .{});
+    var live = true;
+    defer if (live) prepared.deinit();
+    try prepared.wait(std.testing.io, .{});
+    const input = try MetalCompute.importVideoBuffer(&cb, try prepared.buffer(), prepared.geometry.values());
+    defer cb.free(input);
+    prepared.deinit();
+    live = false;
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&cb, input));
+    const copied = try cb.toFloat32(input, a);
+    defer a.free(copied);
+    try std.testing.expectEqual(expected.len, copied.len);
+    for (expected, copied) |want, got| try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&cb, input));
+    var weights: [768 * 2]f32 = @splat(0);
+    weights[0] = 1;
+    weights[768 + 1] = 1;
+    const weight = try cb.fromFloat32Shape(&weights, &.{ 2, 768 });
+    defer cb.free(weight);
+    const projected = try cb.linearNoBias(input, weight, 9, 768, 2);
+    defer cb.free(projected);
+    const actual = try cb.toFloat32(projected, a);
+    defer a.free(actual);
+    for (0..9) |patch| {
+        try std.testing.expectApproxEqAbs(expected[patch * 768], actual[patch * 2], 1e-6);
+        try std.testing.expectApproxEqAbs(expected[patch * 768 + 1], actual[patch * 2 + 1], 1e-6);
     }
 }

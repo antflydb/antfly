@@ -79,6 +79,8 @@ pub fn create(ctx: Context) Suite {
     tests.root_module.addImport("antfly_readers", readers_mod);
     tests.root_module.addImport("antfly_transcribing", ctx.graph.transcribing_mod);
     tests.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
+    tests.root_module.addImport("antfly_media", ctx.graph.inference_mod.import_table.get("antfly_media").?);
+    tests.root_module.addImport("antfly_video", ctx.graph.inference_mod.import_table.get("antfly_video").?);
     tests.root_module.addImport("inference_chunker", ctx.graph.inference_chunker_mod);
     tests.root_module.addImport("jinja", ctx.graph.jinja_mod);
     tests.root_module.addImport("inference_tokenizer", ctx.graph.inference_tokenizer_mod);

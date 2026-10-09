@@ -1515,6 +1515,17 @@ pub fn build(b: *std.Build) void {
     // Tests
     const suite = workflows_tests.create(workflow_ctx);
     const tests = suite.tests;
+    b.step("test-embeddinggemma2", "Run the filtered inference suite for EmbeddingGemma 2 qualification").dependOn(&suite.run_tests.step);
+    const video_model_root = b.createModule(.{ .root_source_file = b.path("src/inference_internal.zig"), .target = target, .optimize = optimize });
+    var video_imports = inference_internal_mod.import_table.iterator();
+    while (video_imports.next()) |entry| video_model_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    video_model_root.addImport("inference_internal", video_model_root);
+    runtime_build.configureRuntimeLinks(b, video_model_root, target, runtime_config.backend, runtime_config.paths);
+    runtime_build.applyCBindings(video_model_root, runtime_graph.c_bindings);
+    video_model_root.link_libc = runtime_config.backend.link_libc;
+    const video_model_tests = b.addTest(.{ .root_module = video_model_root, .filters = &.{ "embeddinggemma2 video", "embeddinggemma2 Metal video" } });
+    b.step("check-video-model", "Compile video model qualification for cross-platform checks").dependOn(&video_model_tests.step);
+    b.step("test-video-model", "Qualify video processor, token layout and native/Metal buffer lifetime without checkpoint weights").dependOn(&b.addRunArtifact(video_model_tests).step);
     const run_cli_tests = suite.run_cli_tests;
 
     const bge_m3_e2e_bench_tests = bge_benchmark.tests;

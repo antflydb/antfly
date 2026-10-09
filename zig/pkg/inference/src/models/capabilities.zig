@@ -62,6 +62,7 @@ pub fn modelSupportsCapability(
 }
 
 pub fn modelAcceptsInput(manifest: *const manifest_mod.ModelManifest, input: []const u8) bool {
+    if (std.mem.eql(u8, input, "video")) return manifest.embedding_style == .embedding_gemma2 and modelAcceptsInput(manifest, "image");
     return modelKindAcceptsInput(
         @tagName(manifest.model_type),
         manifest.gliner_model_type,

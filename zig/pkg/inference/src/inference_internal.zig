@@ -46,6 +46,7 @@ pub const server = struct {
 };
 pub const pipelines = struct {
     pub const embedding_gemma2 = @import("pipelines/embedding_gemma2.zig");
+    pub const embedding_gemma2_video = @import("pipelines/embedding_gemma2_video.zig");
     pub const embedding = @import("pipelines/embedding.zig");
     pub const gliner = @import("pipelines/gliner.zig");
     pub const extraction_schema = @import("pipelines/extraction_schema.zig");
@@ -142,3 +143,11 @@ pub const gguf = struct {
     pub const quant_codec = @import("gguf/quant_codec.zig");
     pub const tensor_types = @import("gguf/tensor_types.zig");
 };
+
+// This root also owns the focused test-video-model gate; external module tests
+// are not collected merely by importing a namespace from a separate test root.
+test "embeddinggemma2 video module declarations" {
+    _ = pipelines.embedding_gemma2;
+    _ = pipelines.embedding_gemma2_video;
+    if (build_options.enable_metal) _ = native_compute.metal;
+}

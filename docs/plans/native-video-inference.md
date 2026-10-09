@@ -1,14 +1,13 @@
 # Native video inference and EmbeddingGemma 2
 
-Status: phase 1, the independent phase 2 decoder/preparation library, the phase 3
-scheduling subset, stage 4 portable MJPEG/Metal preparation, independent
-efficiency/admission/source work and a pure Zig H.264 subset delivered,
-2026-10-08. Phase 2 model/API integration, phase 3 resident model execution, and
-the remaining stage 4 routes remain pending; full video embedding is not yet
-available. Tim's PR #1014 remains a separate dependency
-at the user's request. The initial design was written
-against `origin/main` commit `cdf572a7467d581f6f1b39bcf514878488555f11`;
-fetching a newer remote head was unavailable because GitHub DNS resolution failed.
+Status: native video/media foundations, portable codec expansion and scheduling
+are delivered. Latest `origin/main` at `755cb12a68`, including PR #1014 at
+`d409767dc7`, is integrated, 2026-10-09.
+Ordered EmbeddingGemma 2 video groups, native/Metal projector execution, canonical
+media/attachment API inputs and direct completed Metal patch-buffer handoff are
+implemented. Full pretrained video parity, fully resident vision/token/backbone
+optimization and remaining CUDA/NVDEC routes remain open; see the dated integration
+contract in VIDEO.md. The original design started at `cdf572a7467d581f6f1b39bcf514878488555f11`.
 
 Library contracts live in [MEDIA.md](../../zig/lib/media/MEDIA.md) and
 [VIDEO.md](../../zig/lib/video/VIDEO.md). Existing foundations are
@@ -24,11 +23,10 @@ materialization, or repeated decoding for overlapping indexing windows.
 The first model integration is EmbeddingGemma 2, while the media libraries stay
 independent of that model and available to later video-capable models.
 
-Tim's [PR #1014](https://github.com/antflydb/antfly/pull/1014) proposes native
-CPU/Metal EmbeddingGemma 2 text, image, audio, and ordered-group embeddings, and
-explicitly excludes video. This plan builds on its proposed model identity,
-resident weights, admission, ordered-content, and pooling contracts without
-assuming the PR has merged. Recheck its final interfaces before implementation.
+Tim's [PR #1014](https://github.com/antflydb/antfly/pull/1014) merged native
+CPU/Metal EmbeddingGemma 2 text, image, audio, and ordered-group embeddings.
+This branch adds video through its final model identity, resident weights,
+admission, ordered-content, and pooling interfaces.
 
 A video input should return one joint embedding of the selected ordered frames,
 optionally interleaved with text and explicitly requested audio. Independent
@@ -220,7 +218,7 @@ packet/timeline/selection parity, bounded metadata/source buffers, and
 cancellation/lease/allocation failures. See the library docs for the precise
 implemented API and unsupported shapes.
 
-### 2. Apple decode and correct EmbeddingGemma video — library delivered, integration pending
+### 2. Apple decode and EmbeddingGemma video — integration implemented, pretrained qualification pending
 
 Delivered independently of PR #1014: native VideoToolbox H.264 sessions with
 owned selected NV12 surfaces, explicit hardware enforcement/route receipts,
@@ -234,13 +232,17 @@ portable selection/host-preparation suites execute on WASI. See
 The decoder defaults to packet zero; optional verified-IDR dependency planning
 is delivered in the independent stage 3 subset below. Full native-workspace
 accounting, generalized color/display policies and model preparation geometry
-parity require later qualification. Model/backend code from
-Tim's current head `7a7b63f63da5e772309597ba2409a9ef50860a59` is not merged here.
+parity require later qualification. The final model/backend code from PR #1014
+is merged from origin/main.
 
-Remaining after that dependency is available: integrate video-specific ordered
-tokens with the final PR #1014 interfaces. Add internal borrowed surfaces and
-canonical API/SDK video contracts. A host preparation path can establish the
-oracle before device fusion is enabled.
+Delivered model integration: explicit video token 258884, pinned 140-token geometry,
+1 FPS / uniform 32-frame sampling in presentation order, one ordered joint sequence,
+native CPU and Metal vision/text execution, canonical MP4/MOV media and attachment
+groups, family-scoped HTTP handling and processor identity validation. Eligible
+static H.264 uses VideoToolbox→Metal; portable codecs use host→CPU/Metal preparation.
+A completed retained MTLBuffer enters inference patch projection without prepared
+pixel readback. Existing model projector/token host boundaries remain. Unit/lifecycle
+qualification is automated; the official checkpoint/video oracle is unavailable here.
 
 Exit: CPU-reference/Metal prepared patch and embedding comparisons, end-to-end
 HTTP/group parity, qualified source-format capabilities, and drain/retry tests.
@@ -265,8 +267,8 @@ reader teardown, allocation failures and cancellation/retry are tested. Linux
 compiles the portable APIs; WASI executes portable planner/host tests. These
 counts establish reduced work, not end-to-end latency or retrieval parity.
 
-Still pending after the model dependency: qualify preparation geometry against
-the final processor, implement batched resident vision/projector execution,
+Still pending: qualify full pretrained video embeddings against the final processor
+and implement batched resident vision/projector execution,
 direct device-token backbone inputs, and device pooling/normalization. Qualify
 resident model execution on the delivered software-decode → Metal and
 VideoToolbox → Metal preparation routes. Extend the delivered decode/preparation
@@ -350,14 +352,15 @@ Store dated benchmark receipts separately from these living contracts.
 
 ## Open decisions
 
-- Final content-part fields and capability advertisement after PR #1014 settles.
+- Logical-picture indexing for model sampling of field/partition transport,
+  plus pretrained video parity through the merged grouped-input contract.
 - Broader production-stream qualification beyond the implemented static H.264
   tool subset documented in `lib/video/VIDEO.md`. Multi-slice, CAVLC/CABAC I/P/B,
   scaling matrices, native depth/chroma, MBAFF, fragmented standalone PAFF fields
   and field MMCO 1–6 are implemented. Bounded buffering across unrelated coded
   pictures is a separately qualified assembly extension with frozen prediction
-  snapshots. Non-complementary field pairs and dynamic parameter sets remain
-  outside the declared subset. CAVLC
+  snapshots. Non-complementary field pairs and incompatible predicted-picture
+  geometry transitions remain outside the declared subset. CAVLC
   table provenance and BSD license are pinned.
 - Reference decoder RGB conversion policy, VFR sampling compatibility, and
   accepted cross-backend numerical/retrieval tolerances.
@@ -374,7 +377,7 @@ dated evidence under history, and remove this plan per the documentation rules.
 
 ### Independent codec/container expansion — delivered 2026-10-08
 
-The portable H.264 route now adds bounded IDR-delimited SPS/geometry epochs,
+The portable H.264 route now adds bounded SPS/geometry epochs with qualified compatible non-IDR transitions,
 non-IDR PPS changes, frame-number gap inference, monochrome, independent colour
 planes, Extended-profile data partitions and 8-bit 4:2:0 SP/SI. FFmpeg qualifies
 native samples and media clocks on original Sintel content and profile variants;
@@ -390,8 +393,9 @@ LLVM row packing; scalar transforms remain after a slower vector experiment.
 Full-trailer completed CPU/GPU measurements accompany kernel receipts.
 
 Shared media now supports validated WebM Cues, unknown-size Cluster boundaries,
-bounded sequential spooling and immutable caller-framed live fMP4 segments. This
+bounded sequential spooling and immutable automatically framed live fMP4 segments. This
 adds neither VP8/VP9/AV1 decoding nor an automatic network streaming protocol.
-Remaining work includes non-IDR SPS transitions, cross-packet data partition assembly,
-broader mixed-tool corpus qualification, hardware P010 import, VP-family decoding,
-CUDA/NVDEC, and model/API integration after the independent model dependency merges.
+Non-IDR compatible SPS transitions, fresh intra geometry epochs, cross-packet A/B/C
+partition gathering and automatic moof/mdat media framing are delivered. Remaining
+work includes broader mixed-tool corpus qualification, hardware P010 import,
+VP-family decoding, CUDA/NVDEC and fully resident model execution/parity.

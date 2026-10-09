@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Ordered text/image/audio groups, one embedding per group.
+//! Ordered text/image/audio/video groups, one embedding per group.
 const std = @import("std");
 const factory = @import("../architectures/session_factory.zig");
 const encoder = @import("../architectures/embedding_gemma2.zig");
@@ -22,7 +22,7 @@ const Session = @import("../backends/session.zig").Session;
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const scoring = @import("antfly_decisions").scoring;
-pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8, raster: @import("antfly_image").BorrowedRasterAttachment };
+pub const Part = union(enum) { text: []const u8, image: []const u8, audio: []const u8, video: []const u8, raster: @import("antfly_image").BorrowedRasterAttachment };
 
 fn partBytes(part: Part) []const u8 {
     return switch (part) {
@@ -62,7 +62,7 @@ fn embedScoped(a: std.mem.Allocator, session: Session, tokenizer: Tokenizer, gro
         input_bytes = std.math.add(usize, input_bytes, partBytes(part).len) catch return error.ResourceLimitExceeded;
         switch (part) {
             .text => {},
-            .image, .raster => if (!cfg.vision) return error.NoVisionSession,
+            .image, .raster, .video => if (!cfg.vision) return error.NoVisionSession,
             .audio => if (!cfg.audio) return error.NoAudioSession,
         }
     }
@@ -141,6 +141,25 @@ fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").Compu
         if (index > 0) try rendered.append(a, '\n');
         switch (part) {
             .text => |text| try rendered.appendSlice(a, text),
+            .video => |bytes| {
+                const encoded = try @import("embedding_gemma2_video.zig").encode(a, cb, bytes, effective);
+                defer a.free(encoded.frame_tokens);
+                var owned = true;
+                errdefer if (owned) a.free(encoded.embeddings);
+                const count_video = encoded.embeddings.len / 512;
+                media_tokens = std.math.add(usize, media_tokens, count_video) catch return error.EmbeddingInputTooLong;
+                if (media_tokens > 8192) return error.EmbeddingInputTooLong;
+                // Tokenize with the validated image placeholder, then rewrite its
+                // video rows to 258884. Upstream adds the video special token at
+                // processor construction; original tokenizer sidecars lack it.
+                for (encoded.frame_tokens) |count_frame| {
+                    try rendered.appendSlice(a, "<|image>");
+                    for (0..count_frame) |_| try rendered.appendSlice(a, "<|image|>");
+                    try rendered.appendSlice(a, "<image|>");
+                }
+                try media.append(a, .{ .id = 258884, .embeddings = encoded.embeddings, .tokens = count_video });
+                owned = false;
+            },
             .image, .audio, .raster => {
                 const bytes = partBytes(part);
                 const is_image = part != .audio;
@@ -186,13 +205,20 @@ fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").Compu
     const embeddings = try cb.toFloat32(raw, a);
     errdefer a.free(embeddings);
     for (embeddings) |*value| value.* *= @sqrt(@as(f32, 512));
+    try overlayMedia(ids, embeddings, media.items);
+    return .{ .ids = ids, .mask = mask, .embeddings = embeddings };
+}
+
+fn overlayMedia(ids: []i64, embeddings: []f32, media: []const SoftTokens) !void {
+    if (embeddings.len != ids.len * 512) return error.InvalidTensorShape;
     var media_index: usize = 0;
     var soft_index: usize = 0;
     for (ids, 0..) |id, row| {
         if (id != 258880 and id != 258881) continue;
-        if (media_index >= media.items.len) return error.InvalidEmbeddingGroup;
-        const item = media.items[media_index];
-        if (id != item.id) return error.InvalidEmbeddingGroup;
+        if (media_index >= media.len) return error.InvalidEmbeddingGroup;
+        const item = media[media_index];
+        if (id != (if (item.id == 258884) @as(i64, 258880) else item.id)) return error.InvalidEmbeddingGroup;
+        if (item.id == 258884) ids[row] = 258884;
         @memcpy(embeddings[row * 512 ..][0..512], item.embeddings[soft_index * 512 ..][0..512]);
         soft_index += 1;
         if (soft_index == item.tokens) {
@@ -200,8 +226,7 @@ fn prepareGroup(a: std.mem.Allocator, cb: *const @import("../ops/ops.zig").Compu
             media_index += 1;
         }
     }
-    if (media_index != media.items.len or soft_index != 0) return error.InvalidEmbeddingGroup;
-    return .{ .ids = ids, .mask = mask, .embeddings = embeddings };
+    if (media_index != media.len or soft_index != 0) return error.InvalidEmbeddingGroup;
 }
 
 const Raster = @import("antfly_image").BorrowedRasterAttachment;
@@ -497,4 +522,27 @@ test "embeddinggemma2 raster batch packing and pooling isolate rows padding and 
 
 test "embeddinggemma2 raster batch cancellation precedes model access" {
     try std.testing.expectError(error.Timeout, embedRasters(std.testing.allocator, undefined, undefined, &.{}, .{}, null, .{ .deadline_ns = 0 }));
+}
+
+test "embeddinggemma2 video rows preserve image audio and frame ordering" {
+    const a = std.testing.allocator;
+    var ids = [_]i64{ 2, 255999, 258880, 258882, 255999, 258880, 258880, 258882, 255999, 258880, 258882, 256000, 258881, 258883, 1 };
+    const data = try a.alloc(f32, ids.len * 512);
+    defer a.free(data);
+    @memset(data, -1);
+    var image: [512]f32 = @splat(10);
+    var frames: [3 * 512]f32 = undefined;
+    for (&frames, 0..) |*v, i| v.* = @floatFromInt(20 + i / 512);
+    var audio: [512]f32 = @splat(30);
+    try overlayMedia(&ids, data, &.{ .{ .id = 258880, .tokens = 1, .embeddings = &image }, .{ .id = 258884, .tokens = 3, .embeddings = &frames }, .{ .id = 258881, .tokens = 1, .embeddings = &audio } });
+    try std.testing.expectEqualSlices(i64, &.{ 2, 255999, 258880, 258882, 255999, 258884, 258884, 258882, 255999, 258884, 258882, 256000, 258881, 258883, 1 }, &ids);
+    for ([_]usize{ 2, 5, 6, 9, 12 }, [_]f32{ 10, 20, 21, 22, 30 }) |row, value| for (data[row * 512 ..][0..512]) |got| try std.testing.expectEqual(value, got);
+    try std.testing.expectEqual(@as(f32, -1), data[0]);
+    var orphan = [_]i64{258880};
+    try std.testing.expectError(error.InvalidEmbeddingGroup, overlayMedia(&orphan, data[0..512], &.{}));
+    try validateGroup(.{ .content = &.{ .{ .video = "mp4" }, .{ .text = "caption" } } }, .{});
+}
+
+test {
+    _ = @import("embedding_gemma2_video.zig");
 }

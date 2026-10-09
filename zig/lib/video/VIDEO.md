@@ -1,13 +1,12 @@
 # Native video decoding and sampled surfaces
 
-Status: phase 1, the independent phase 2 decoder/preparation library, the
-independent phase 3 scheduling subset, phase 4 portable MJPEG lane, and
-software-decode-to-Metal preparation, resident resize coefficients, shared
-admission, synchronized benchmarks and a pure Zig H.264 subset are implemented,
-2026-10-08. EmbeddingGemma
-2 model-token integration, HTTP/SDK video inputs, and resident vision/backbone
-execution remain pending. Tim's PR #1014 is kept separate as requested; its model
-code is not incorporated into this branch.
+Status: native container/decode/preparation/scheduling libraries, shared admission,
+benchmarks and the qualified pure Zig H.264 subset are implemented. Latest main
+(PR #1014) is merged as of 2026-10-09. EmbeddingGemma 2 ordered video groups now
+use native decode/CPU preparation or VideoToolbox/Metal preparation and the merged
+native/Metal vision and text encoders. Completed Metal patch buffers enter inference
+directly; existing projector/token composition host boundaries remain. Full pretrained
+video embedding parity and resident vision/backbone optimization need qualification.
 
 Related documents:
 
@@ -263,11 +262,10 @@ malformed/interlaced/progressive inputs, memory/work limits, deterministic
 allocation failure, cancellation during decode/preparation, and retry. The full
 portable decode/preparation suite executes on WASI and compiles for Linux.
 
-This CPU route supplies host patches for a later model consumer. The Metal route
-below stages software-decoded pictures on the caller's device. Neither runs an
-embedding model. Additional H.264 tools, NVDEC/CUDA and resident model execution
-remain pending independently or behind
-PR #1014 as described in the implementation plan.
+This CPU route supplies host patches to model consumers. The Metal route below
+stages software-decoded pictures on the caller's device. The EmbeddingGemma 2
+adapter described below consumes both routes; NVDEC/CUDA and further resident
+model optimization remain follow-ups in the implementation plan.
 
 ## Implemented software decode to Metal
 
@@ -327,8 +325,8 @@ For the original two-second fixture, preparing overlapping windows together give
 
 Depth two retains at most 24,576 staged RGBA bytes; completed unique patch outputs
 occupy 221,184 bytes. These are asserted logical work/resource counts, not latency
-or embedding benchmarks. Resident vision/projector/backbone/pooling still await
-PR #1014; NVIDIA NVDEC/CUDA and expanded native-depth Metal imports remain independent follow-ups.
+or embedding benchmarks. The merged EmbeddingGemma 2 adapter is described below;
+further resident model optimization and NVIDIA NVDEC/CUDA remain follow-ups.
 
 ## Implemented independent efficiency and portable H.264 work
 
@@ -456,12 +454,17 @@ frame-number gaps, Extended-profile CAVLC data partitions and 8-bit 4:2:0 SP/SI.
 Unequal component depths outside monochrome, additional profiles and unsupported
 parameter transitions fail explicitly. Interlaced output preserves woven samples;
 no deinterlacing policy is applied. Capability `portable_h264_subset` is
-`qualified-avc1-avc3-8to14bit-mono-420-422-444-dynamic-idr-separate-planes-sp-si-partitions-mbaff-paff`.
+`qualified-avc1-avc3-8to14bit-mono-420-422-444-dynamic-epochs-separate-planes-sp-si-partitions-mbaff-paff`.
 No OpenH264, x264, JM or FFmpeg runtime is linked.
 
 `h264_dynamic.Session` scans a bounded parameter-set registry and records decode
-epochs. SPS/geometry/depth/chroma changes require an IDR; PPS changes with unchanged
-SPS may occur between predicted pictures. Limits bound probe packets, retained
+epochs. Layout/POC-compatible non-IDR SPS changes preserve prediction references
+while allowing crop, scaling, range and reference-capacity changes. Storage-incompatible
+geometry/depth/chroma changes can start at a complete non-IDR intra picture with an
+empty DPB. Missing references and parameter changes during pending picture assembly
+fail explicitly. These are qualified extensions: H.264 keeps an SPS active for its
+coded video sequence; this does not claim arbitrary non-IDR SPS conformance. PPS
+changes can occur between complete pictures. Limits bound probe packets, retained
 parameter bytes and configurations. Probe counters are separate from dependency
 decode counters. A selected request may span epochs and retain duplicate/unordered
 callback slots. Dynamic indexing supports avc3 sample entries; it does not silently
@@ -472,8 +475,10 @@ Separate colour planes reconstruct through three independent monochrome DPB
 passes, then combine owned native samples; receipts count all three passes and
 payload reads. Frame gaps infer bounded non-existing references with POC and sliding
 marking; attempting to predict from unavailable samples fails. B/C data partitions
-must accompany their A partitions in the same container access-unit packet; association
-uses slice identity, not NAL ordering. Missing, duplicate and orphan partitions fail.
+may arrive in subsequent partition-only transport packets after category A; bounded
+gathering stops at the next coded picture or configuration boundary. Auxiliary packets
+may intervene. Association uses slice identity, not NAL ordering. Category A must arrive
+first across packets; residuals preceding A and ambiguous picture boundaries fail. Missing, duplicate and orphan partitions fail.
 SP/SI reconstruction and deblocking are checked against the official JM 19.0 decoder,
 including switching SP. These qualifications do not promise every possible combination
 of these tools. See [expansion validation](testdata/h264-expansion-validation.md).
@@ -767,3 +772,53 @@ Use `-Dvideo-use-llvm=true`, `-Dbenchmark-backend=cpu`, `-Dbenchmark-iterations=
 and `-Dbenchmark-size=384` to compare completed real-clip routes at realistic
 preparation geometry. Output reports completed wall/GPU times and process/allocator
 peaks; aggregate device allocation is not a per-request GPU peak.
+
+
+## EmbeddingGemma 2 model adapter (2026-10-09)
+
+Inference imports video alongside the exact audio/media/image module identities.
+`pipelines/embedding_gemma2_video.zig` samples logical presentation order with the
+pinned processor's 1 FPS / uniform 32-frame policy, maps selections back to decode
+indexes, and projects one frame at a time. The video geometry budget is 140 pooled
+16×16 / 3×3 soft tokens per frame, distinct from the image 280-token budget. RGB8
+Torchvision antialiased bicubic preparation is centered for patch projection; the
+coefficient cache key includes the resize policy. Video placeholders use ID 258884,
+inside each frame's image opener/closer, without timestamps or separators between
+frames. Original tokenizer sidecars need not contain the dynamically added video
+token: validated image placeholder rows are rewritten before encoder execution.
+Mixed text/image/audio/video order, task-prefix and joint mean-pooling semantics
+follow the merged model pipeline, including the 8192-token total bound.
+
+Native CPU uses portable MJPEG/H.264. Metal uses verified-IDR VideoToolbox for
+eligible static H.264, direct CoreVideo preparation and a retained external MTLBuffer
+handoff on the runtime's device. Portable H.264 and MJPEG may instead stage native
+planes or RGBA into Metal; monochrome uses CPU preparation. A producer fence completes
+before the imported CT enters inference. Producer ownership is released after CT
+retention and before inference pooling/reuse; cancellation and failure release both.
+The model admission covers request preprocessing and workspace before decode. Existing
+vision position addition, spatial pooling, projected token composition and text pooling
+still include host boundaries; this adapter does not claim an entirely resident model.
+
+The HTTP grouped form accepts `media` or binary `attachment` with `video/mp4` or
+`video/quicktime`; existing Go/Python/TypeScript media contracts carry these MIME bytes.
+Flat video parts and WebM codecs are rejected. Encoded input is bounded to 64 MiB,
+frames to 32, source pixels and decoder/preparation workspace retain library limits.
+The current model display policy accepts square-pixel unrotated SDR, declared SPS VUI or nclx/nclc
+BT.601/BT.709 matrices, and a documented BT.601 default when color metadata is absent.
+HDR/unsupported display policies fail instead of being silently interpreted. Video
+audio tracks are not implicitly embedded. Container init data is explicit for live
+fMP4 ingestion; complete snapshots can be submitted through the same byte API.
+
+Contract, processor identity, presentation sampling, mixed placeholder placement,
+HTTP family scoping and Metal buffer destruction/linear-consumer tests qualify this
+integration. Pretrained end-to-end video comparison requires the official checkpoint;
+this workspace has neither the weights nor a video embedding oracle. Retain this
+qualification gap in receipts until those comparisons run.
+
+See the [dated integration validation](testdata/video-model-integration-validation.md)
+for executed checks, cross-platform compilation and retained qualification limits.
+
+Model FPS sampling currently requires progressive one-picture-per-sample AVC
+(Baseline/Main/High-family) or MJPEG. PAFF/MBAFF and Extended-profile partition
+transport remain library capabilities; the model adapter rejects them until a
+logical-picture index qualifies their frame-count/FPS semantics.

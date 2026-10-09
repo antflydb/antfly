@@ -8,6 +8,6 @@ pub const metal_rgba_preparation_compiled = metal_preparation_compiled;
 pub const portable_host_preparation = true;
 pub const portable_mjpeg_decode = true;
 pub const portable_h264_decode = true;
-pub const portable_h264_subset = "qualified-avc1-avc3-8to14bit-mono-420-422-444-dynamic-idr-separate-planes-sp-si-partitions-mbaff-paff";
+pub const portable_h264_subset = "qualified-avc1-avc3-8to14bit-mono-420-422-444-dynamic-epochs-separate-planes-sp-si-partitions-mbaff-paff";
 pub const nvdec_decode = false;
 pub const cuda_preparation = false;
