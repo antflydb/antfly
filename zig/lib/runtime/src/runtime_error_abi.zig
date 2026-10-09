@@ -33,7 +33,12 @@ test "runnable demand error remains append-only and rejects forged behavior" {
 }
 
 test "execution wait scheduling details are append-only and preserve behavior classes" {
-    try std.testing.expectEqual(@backingInt(Detail.invalid_sql_spill) + 1, @backingInt(Detail.runnable_wait_timeout));
+    // Keep the newer main-branch detail identities before the appended
+    // scheduling extension. No merge may renumber those published IDs.
+    try std.testing.expectEqual(@backingInt(Detail.invalid_sql_spill) + 1, @backingInt(Detail.metric_not_ready));
+    try std.testing.expectEqual(@backingInt(Detail.metric_not_ready) + 1, @backingInt(Detail.metric_stale));
+    try std.testing.expectEqual(@backingInt(Detail.metric_stale) + 1, @backingInt(Detail.invalid_generated_tool_arguments));
+    try std.testing.expectEqual(@backingInt(Detail.invalid_generated_tool_arguments) + 1, @backingInt(Detail.runnable_wait_timeout));
     const cases = [_]struct { err: anyerror, code: Code }{
         .{ .err = error.RunnableWaitTimeout, .code = .timeout },
         .{ .err = error.SchedulerClosed, .code = .unavailable },

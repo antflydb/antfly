@@ -944,9 +944,9 @@ test "runnable execution port checks parked lifetime without CPU grants or owner
     for ([_]?anyerror{ null, error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |failure| {
         TestClock.now_ns = 0;
         var flag = std.atomic.Value(bool).init(false);
-        var state: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 2, .max_operations = 4 }), .native_now_ns = TestClock.now };
-        defer state.owner.deinit();
-        const port = state.port();
+        var owner_state: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 2, .max_operations = 4 }), .native_now_ns = TestClock.now };
+        defer owner_state.owner.deinit();
+        const port = owner_state.port();
         const io = std.testing.io;
         const io_borrow = runtime.native_abi.IoBorrow.init(&io);
         var handle: ?*anyopaque = null;
@@ -955,10 +955,10 @@ test "runnable execution port checks parked lifetime without CPU grants or owner
         defer port.finish(handle.?);
         const borrowed = try abi.Borrowed.fromOwner(port, handle.?, 1, .query);
         try std.testing.expect(port.park(handle.?, @backingInt(abi.Wait.resource)).isOk());
-        const before = state.owner.scheduler.stats();
+        const before = owner_state.owner.scheduler.stats();
         if (failure == error.Canceled) flag.store(true, .release);
         if (failure == error.DeadlineExceeded) TestClock.now_ns = 10;
-        if (failure == error.SchedulerClosed) state.owner.close();
+        if (failure == error.SchedulerClosed) owner_state.owner.close();
         if (failure) |expected| {
             try std.testing.expectError(expected, port.checkLifetime(handle.?));
             try std.testing.expectError(expected, borrowed.checkLifetime());
@@ -970,7 +970,7 @@ test "runnable execution port checks parked lifetime without CPU grants or owner
             try port.checkLifetime(handle.?);
             port.finish(health.?);
         }
-        const after = state.owner.scheduler.stats();
+        const after = owner_state.owner.scheduler.stats();
         try std.testing.expectEqual(@as(usize, 0), after.runnable_slots);
         try std.testing.expectEqual(before.operations, after.operations);
         try std.testing.expectEqual(before.retained_bytes, after.retained_bytes);
