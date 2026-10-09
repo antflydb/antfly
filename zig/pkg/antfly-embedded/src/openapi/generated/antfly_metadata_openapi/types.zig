@@ -13501,6 +13501,10 @@ pub const SortProfile = struct {
             try jw.objectField("candidate_count");
             try jw.write(value);
         }
+        if (self.ordered_scanned_count) |value| {
+            try jw.objectField("ordered_scanned_count");
+            try jw.write(value);
+        }
         if (self.cursor_rejected_count) |value| {
             try jw.objectField("cursor_rejected_count");
             try jw.write(value);

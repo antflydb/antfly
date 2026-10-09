@@ -26029,6 +26029,14 @@ components:
         - - sources
           - artifact_name
       properties:
+        store_source:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: true
+          description: Opt in to retaining the indexed source projection in serverless full-text sidecars
+            for cold highlighting. With field set, only that field is retained; otherwise the index source
+            projection is retained. Increases index storage and build work. Omit or set false to hydrate
+            highlights from the source table. Provisioned indexes already retain source independently.
         sources:
           type: array
           minItems: 1
@@ -28392,6 +28400,8 @@ components:
           type: boolean
         field:
           type: string
+        store_source:
+          type: boolean
         analysis_config:
           $ref: '#/components/schemas/TextAnalysisConfig'
     CreatedFullTextIndex:

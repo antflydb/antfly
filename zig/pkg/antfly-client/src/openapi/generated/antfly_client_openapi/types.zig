@@ -5589,6 +5589,8 @@ pub const CreateFullTextIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Opt in to retaining the indexed source projection in serverless full-text sidecars for cold highlighting. With field set, only that field is retained; otherwise the index source projection is retained. Increases index storage and build work. Omit or set false to hydrate highlights from the source table. Provisioned indexes already retain source independently.
+    store_source: ?bool = null,
     /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const FullTextArtifactIndexSource = null,
     /// Whether to use memory-only storage
@@ -5605,6 +5607,7 @@ pub const CreateFullTextIndexRequest = struct {
         .{ "description", "description", true },
         .{ "version", "version", true },
         .{ "enrichments", "enrichments", true },
+        .{ "store_source", "store_source", true },
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
@@ -5633,6 +5636,10 @@ pub const CreateFullTextIndexRequest = struct {
         }
         if (self.enrichments) |value| {
             try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.store_source) |value| {
+            try jw.objectField("store_source");
             try jw.write(value);
         }
         if (self.sources) |value| {
@@ -6617,6 +6624,7 @@ pub const CreatedFullTextIndex = struct {
     sources: ?[]const FullTextArtifactIndexSource = null,
     mem_only: ?bool = null,
     field: ?[]const u8 = null,
+    store_source: ?bool = null,
     analysis_config: ?TextAnalysisConfig = null,
     type: []const u8,
 
@@ -6629,6 +6637,7 @@ pub const CreatedFullTextIndex = struct {
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
+        .{ "store_source", "store_source", true },
         .{ "analysis_config", "analysis_config", true },
         .{ "type", "type", false },
     };
@@ -6669,6 +6678,10 @@ pub const CreatedFullTextIndex = struct {
             try jw.objectField("field");
             try jw.write(value);
         }
+        if (self.store_source) |value| {
+            try jw.objectField("store_source");
+            try jw.write(value);
+        }
         if (self.analysis_config) |value| {
             try jw.objectField("analysis_config");
             try jw.write(value);
@@ -6684,6 +6697,7 @@ pub const CreatedFullTextIndexConfig = struct {
     sources: ?[]const FullTextArtifactIndexSource = null,
     mem_only: ?bool = null,
     field: ?[]const u8 = null,
+    store_source: ?bool = null,
     analysis_config: ?TextAnalysisConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -6691,6 +6705,7 @@ pub const CreatedFullTextIndexConfig = struct {
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
+        .{ "store_source", "store_source", true },
         .{ "analysis_config", "analysis_config", true },
     };
 
@@ -6714,6 +6729,10 @@ pub const CreatedFullTextIndexConfig = struct {
         }
         if (self.field) |value| {
             try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.store_source) |value| {
+            try jw.objectField("store_source");
             try jw.write(value);
         }
         if (self.analysis_config) |value| {
@@ -14402,6 +14421,8 @@ pub const FullTextArtifactIndexSource = struct {
 };
 
 pub const FullTextIndexConfig = struct {
+    /// Opt in to retaining the indexed source projection in serverless full-text sidecars for cold highlighting. With field set, only that field is retained; otherwise the index source projection is retained. Increases index storage and build work. Omit or set false to hydrate highlights from the source table. Provisioned indexes already retain source independently.
+    store_source: ?bool = null,
     /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const FullTextArtifactIndexSource = null,
     /// Whether to use memory-only storage
@@ -14414,6 +14435,7 @@ pub const FullTextIndexConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "store_source", "store_source", true },
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
@@ -14431,6 +14453,10 @@ pub const FullTextIndexConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.store_source) |value| {
+            try jw.objectField("store_source");
+            try jw.write(value);
+        }
         if (self.sources) |value| {
             try jw.objectField("sources");
             try jw.write(value);
@@ -20880,6 +20906,8 @@ pub const IndexConfig = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
     enrichments: ?[]const EnrichmentConfig = null,
+    /// Opt in to retaining the indexed source projection in serverless full-text sidecars for cold highlighting. With field set, only that field is retained; otherwise the index source projection is retained. Increases index storage and build work. Omit or set false to hydrate highlights from the source table. Provisioned indexes already retain source independently.
+    store_source: ?bool = null,
     /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const FullTextArtifactIndexSource = null,
     /// Whether to use memory-only storage
@@ -20952,6 +20980,7 @@ pub const IndexConfig = struct {
         .{ "type", "type", false },
         .{ "version", "version", true },
         .{ "enrichments", "enrichments", true },
+        .{ "store_source", "store_source", true },
         .{ "sources", "sources", true },
         .{ "mem_only", "mem_only", true },
         .{ "field", "field", true },
@@ -21013,6 +21042,10 @@ pub const IndexConfig = struct {
         }
         if (self.enrichments) |value| {
             try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.store_source) |value| {
+            try jw.objectField("store_source");
             try jw.write(value);
         }
         if (self.sources) |value| {
@@ -38247,6 +38280,10 @@ pub const SortProfile = struct {
         }
         if (self.candidate_count) |value| {
             try jw.objectField("candidate_count");
+            try jw.write(value);
+        }
+        if (self.ordered_scanned_count) |value| {
+            try jw.objectField("ordered_scanned_count");
             try jw.write(value);
         }
         if (self.cursor_rejected_count) |value| {

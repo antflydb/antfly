@@ -70,6 +70,7 @@ class SortProfile:
                 `missing_segment_index_sort`, `covered_without_bounds`, and
                 `covered_with_bounds`.
             candidate_count (int | Unset): Candidate documents considered by sort execution.
+            ordered_scanned_count (int | Unset): Ordered lake entries traversed before native membership filtering.
             cursor_rejected_count (int | Unset): Candidates rejected by cursor comparison.
             selected_count (int | Unset): Hits selected for the returned page.
             total_us (int | Unset): Total sort execution time in microseconds.
@@ -146,6 +147,7 @@ class SortProfile:
     sort_lifecycle_state: SortProfileSortLifecycleState | Unset = UNSET
     index_sort_coverage: str | Unset = UNSET
     candidate_count: int | Unset = UNSET
+    ordered_scanned_count: int | Unset = UNSET
     cursor_rejected_count: int | Unset = UNSET
     selected_count: int | Unset = UNSET
     total_us: int | Unset = UNSET
@@ -192,6 +194,8 @@ class SortProfile:
         index_sort_coverage = self.index_sort_coverage
 
         candidate_count = self.candidate_count
+
+        ordered_scanned_count = self.ordered_scanned_count
 
         cursor_rejected_count = self.cursor_rejected_count
 
@@ -240,6 +244,8 @@ class SortProfile:
             field_dict["index_sort_coverage"] = index_sort_coverage
         if candidate_count is not UNSET:
             field_dict["candidate_count"] = candidate_count
+        if ordered_scanned_count is not UNSET:
+            field_dict["ordered_scanned_count"] = ordered_scanned_count
         if cursor_rejected_count is not UNSET:
             field_dict["cursor_rejected_count"] = cursor_rejected_count
         if selected_count is not UNSET:
@@ -309,6 +315,8 @@ class SortProfile:
 
         candidate_count = d.pop("candidate_count", UNSET)
 
+        ordered_scanned_count = d.pop("ordered_scanned_count", UNSET)
+
         cursor_rejected_count = d.pop("cursor_rejected_count", UNSET)
 
         selected_count = d.pop("selected_count", UNSET)
@@ -340,6 +348,7 @@ class SortProfile:
             sort_lifecycle_state=sort_lifecycle_state,
             index_sort_coverage=index_sort_coverage,
             candidate_count=candidate_count,
+            ordered_scanned_count=ordered_scanned_count,
             cursor_rejected_count=cursor_rejected_count,
             selected_count=selected_count,
             total_us=total_us,

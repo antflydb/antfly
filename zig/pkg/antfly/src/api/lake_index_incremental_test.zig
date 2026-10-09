@@ -61,7 +61,7 @@ test "external lake incremental native publication appends replaces removes and 
         }
     };
     var clock: u8 = 0;
-    var table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "lake", .schema_json = schema_json, .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"all_text\":{\"type\":\"full_text\"},\"dense\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2},\"sparse\":{\"type\":\"embeddings\",\"external\":true,\"sparse\":true}}" };
+    var table: local.common_topology_records.TableRecord = .{ .table_id = 7, .name = "lake", .schema_json = schema_json, .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\",\"store_source\":true},\"all_text\":{\"type\":\"full_text\"},\"dense\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2},\"sparse\":{\"type\":\"embeddings\",\"external\":true,\"sparse\":true}}" };
     var retained: std.StringHashMapUnmanaged(void) = .empty;
     defer retained.deinit(a);
     var read_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
@@ -104,6 +104,15 @@ test "external lake incremental native publication appends replaces removes and 
                 const snapshot = writer.acquireSnapshot();
                 defer snapshot.release();
                 try std.testing.expectEqual(expected, snapshot.liveDocCount());
+                const doc = (try snapshot.storedDocDecompressed(a, 0)).?;
+                defer a.free(doc.data);
+                var stored = try std.json.parseFromSlice(std.json.Value, a, doc.data, .{});
+                defer stored.deinit();
+                if (std.mem.eql(u8, declaration.name, "body_text")) {
+                    try std.testing.expect(stored.value.object.contains("body"));
+                    try std.testing.expect(!stored.value.object.contains("dense"));
+                    try std.testing.expect(!stored.value.object.contains("sparse"));
+                } else try std.testing.expectEqual(@as(usize, 0), stored.value.object.count());
                 var pooled = try corpora.acquire(std.testing.io, store, declaration.artifact, root, schema_json, .{ .cache = &read_cache, .scope = @splat(1), .context = .{} }, .{}, .none);
                 defer pooled.deinit();
                 try std.testing.expectEqual(expected, pooled.snapshot.liveDocCount());

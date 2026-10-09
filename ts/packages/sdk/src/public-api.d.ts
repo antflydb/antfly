@@ -10991,6 +10991,11 @@ export interface components {
             candidate_count?: number;
             /**
              * Format: int64
+             * @description Ordered lake entries traversed before native membership filtering.
+             */
+            ordered_scanned_count?: number;
+            /**
+             * Format: int64
              * @description Candidates rejected by cursor comparison.
              */
             cursor_rejected_count?: number;
@@ -13051,6 +13056,11 @@ export interface components {
             };
         };
         FullTextIndexConfig: {
+            /**
+             * @description Opt in to retaining the indexed source projection in serverless full-text sidecars for cold highlighting. With field set, only that field is retained; otherwise the index source projection is retained. Increases index storage and build work. Omit or set false to hydrate highlights from the source table. Provisioned indexes already retain source independently.
+             * @default false
+             */
+            store_source?: boolean;
             /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             sources?: components["schemas"]["FullTextArtifactIndexSource"][];
             /** @description Whether to use memory-only storage */
@@ -14326,6 +14336,7 @@ export interface components {
             sources?: components["schemas"]["FullTextArtifactIndexSource"][];
             mem_only?: boolean;
             field?: string;
+            store_source?: boolean;
             analysis_config?: components["schemas"]["TextAnalysisConfig"];
         };
         /** @description Normalized effective full-text index configuration returned after creation. */
