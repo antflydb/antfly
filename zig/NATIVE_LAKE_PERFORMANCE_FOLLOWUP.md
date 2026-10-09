@@ -662,3 +662,133 @@ Debug E2E run passed 25 cases but exceeded the archive fixture's 300-second
 index-publication deadline before its query assertions. No fixture deadline or
 production limit was relaxed. Representative archive throughput remains
 unmeasured.
+
+## Follow-up to #1046: adaptive vector membership and bounded scoring state
+
+Status: planned; the work below is not implemented by this draft. PR #1046
+added bounded filtered text top-k, sparse include/exclude planning, and reusable
+public tie ordering. This follow-up covers the four remaining opportunities
+identified during its complete branch review. Preserve existing public query
+semantics and native storage ownership throughout; benchmark improvements rather
+than assuming a speedup from an algorithm change.
+
+### Adaptive metadata membership for vector queries
+
+Today `lake_index_text_query.zig` resolves complete physical include/exclude sets
+before dense or sparse ranking starts. Deferring broad physical-to-ordinal
+translation saves work, but it still pays for the full physical predicate result.
+Reuse the text predicate planner's exact candidate membership capability for
+vector candidates, with a query-owned adaptive membership provider:
+
+- Pin the source snapshot, publication, authorization scope, and native generation
+  for the provider's lifetime. Keep physical row coordinates separate from native
+  ordinals; never reuse ordinals across generations.
+- Materialize cheap selective index predicates up front. Probe expensive exact
+  predicates only for reached candidates, using bounded batches and a bounded
+  decision cache. Include and exclusion providers remain independent.
+- Bound accumulated point work by the cheaper exact index-walk or scan estimate.
+  Once that budget is reached, publish one immutable compressed physical set and
+  reuse it for the remainder of the query, including hybrid consumers.
+- Filter before sparse heap admission and use the dense engine's existing exact
+  predicate contract. Do not add a final-page-only filter that can underfill a
+  result or incorrectly claim top-k completeness. Dense ANN retains its existing
+  approximation contract; graph traversal and result eligibility stay distinct.
+- Retain authoritative scans for unsupported/residual predicates. Only a proven
+  exact whole predicate may use direct membership. Cancellation, deadline checks,
+  lease renewal, and query memory admission apply even on fully cached reads.
+
+Acceptance: differential dense, sparse, and hybrid results for selective includes,
+exclusion-only queries, broad predicates, empty sets, deletes, nulls, and snapshot
+changes. A rare sparse query with a broad indexed predicate must avoid walking the
+whole metadata range. A broad query must switch to one materialization rather
+than continue point probing indefinitely. Measure point probes, predicate/index
+pages, decoded Parquet rows/bytes, peak scratch, and cold/warm latency. Include
+real Parquet and Iceberg coverage in `e2e-full`, plus cancellation and allocation
+failure tests at the transition.
+
+### Per-document predicate decisions in sparse DAAT
+
+`SparseIndex.search` currently memoizes allowed and denied ordinals in two
+compressed bitmaps. Those grow with the documents reached by a broad scan.
+DAAT consumes all contributing streams for one document before advancing to the
+next document, so its predicate decision needs only the current ordinal and a
+tri-state decision (unknown, allowed, denied).
+
+- Keep deletion/incarnation checks per stream. Cache only the shared key predicate
+  decision after those checks; do not memoize stream-specific visibility.
+- Evaluate the key predicate at most once per reached document, after at least one
+  stream proves current visibility. Reuse the dedicated reverse-identity cursor
+  and its bounded scratch.
+- Separate this monotone DAAT state from the term-at-a-time/spill fallback. That
+  fallback revisits ordinals and needs its own bounded cache or uncached exact
+  probes; it must never assume the same traversal order.
+- Preserve signed contribution order, exact score ties, inclusion/exclusion masks,
+  cancellation, and page-admission fallback behavior.
+
+Acceptance: multiple terms/segments for one document call the predicate once in
+DAAT; a stale stream cannot suppress a later valid stream. Randomized differential
+results must match the reference for signed/zero weights, deletes, and mixed
+incarnations. Record predicate-state bytes across increasing archive sizes and
+exercise the spill fallback without relying on monotone order.
+
+### Shared heap-based native text top-k
+
+Both `FastTopK` and `scorer.TopKCollector` retain a window and scan all retained
+hits after each accepted replacement. Introduce one shared bounded heap with the
+existing score-descending, document-ID-ascending ranking contract. The worst hit
+is the heap root; accepted replacement becomes O(log k) and cutoff lookup O(1).
+
+- Use the same heap primitive in filtered and unfiltered text collectors. Keep
+  total-count/relation tracking, deletion checks, pending predicate batches, and
+  final result ownership in their existing layers.
+- Preserve deterministic equal-score selection and the scorer's zero threshold
+  until the heap is full. `k = 0`, an underfilled window, and offsets retain their
+  current semantics. Propagate allocation failure without losing owned storage.
+- Benchmark small default windows as well as large limits/offsets. A small-window
+  specialization is justified only by measurement and must use the same ranking
+  contract.
+
+Acceptance: compare heap output and competitive cutoffs with a full stable sort
+for randomized arrival orders, equal scores, empty/underfilled windows, k=0,
+and large k. Rerun WAND pruning/tie differential tests and filtered producer
+regressions. Report replacement counts and latency for k=10, 100, 1,000, and
+10,000 with both mostly rejected and frequently replaced candidates.
+
+### Streaming execution for more Boolean shapes
+
+Unsupported nested and mixed-field Boolean queries still reach
+`executeBoolAllHit`, which materializes all-hit arrays and score maps. Extend the
+native document-at-a-time scorer tree beyond the existing same-field fast paths.
+Preserve the existing public query syntax.
+
+- Compile supported leaves and Boolean nodes into monotone seekable iterators.
+  Implement conjunction, disjunction/minimum-should-match, and prohibition with
+  bounded live iterator state, preserving nested boosts and optional-clause rules.
+- Keep per-field full-corpus BM25 statistics and established f32 contribution
+  order. Do not reuse single-field bounds across mixed fields. Add competitive
+  pruning only when the complete subtree supplies a conservative bound.
+- Apply exact document constraints before heap admission. Phrase/position leaves
+  must verify positions before admission; unsupported leaves retain the existing
+  authoritative fallback.
+- Keep exact counts separate from early-stopping top-k work. Aggregations,
+  distributed statistics, sort, and cursor handling may use the new execution
+  only when their complete contracts are preserved. Do not silently downgrade a
+  supported request to approximate counting or filtering.
+
+Acceptance: randomized differential tests against the all-hit reference for
+nested must/should/must-not, mixed fields, duplicate clauses, minimum-should-match,
+boosts (including zero/negative where supported), deletes, filters, counts, and
+pagination. Include phrase leaves and unsupported fallback cases. Profile peak
+scratch and scored/visited candidates on broad nested queries; the supported
+streaming path must retain O(live iterators + k) ranking state rather than a
+corpus-sized score map.
+
+### Delivery and qualification
+
+Implement and qualify the shared heap and monotone DAAT decision state first,
+then adaptive vector membership, then broader Boolean lowering. Every stage must
+leave the existing fallback operational. Record the exact tested commit and
+optimization mode; rerun relevant tests after merging main. Extend the existing
+real Parquet/Iceberg E2E fixtures instead of adding a synthetic-only qualification.
+The draft becomes ready only after the implementations, differential tests,
+work-count/memory benchmarks, and applicable `e2e-full` cases are complete.
