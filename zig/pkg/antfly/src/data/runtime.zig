@@ -4831,6 +4831,13 @@ fn isSupersededHotStandbyStandbyReplicationRound(err: anyerror) bool {
         err == error.HAStandbyStateChanged;
 }
 
+fn isCooperativeHotStandbyStandbyReplicationRound(err: anyerror) bool {
+    // A bounded local publication proof yields with the durable received tail
+    // intact. It is neither transport degradation nor an acknowledged apply.
+    return err == error.CatalogPublicationProofPending or
+        isSupersededHotStandbyStandbyReplicationRound(err);
+}
+
 fn isRetryableMetadataBootstrapError(err: anyerror) bool {
     if (isRetryableControlPlaneTransportError(err)) return true;
     // Preserve the metadata layer's shared linearizable-authority contract.
@@ -7497,7 +7504,7 @@ pub const DataServer = struct {
             received_count += result.received_count;
             applied_count += result.applied_count;
 
-            if (result.end_of_wal) {
+            if (try antfly.hot_standby.http_replication_client.catchUpComplete(result)) {
                 return .{
                     .iterations = iterations,
                     .received_count = received_count,
@@ -7507,9 +7514,6 @@ pub const DataServer = struct {
                     .last_sent_lsn = result.last_sent_lsn,
                     .next_lsn = result.next_lsn,
                 };
-            }
-            if (result.received_count == 0 and result.applied_count == 0) {
-                return error.InternalReplicationDidNotAdvance;
             }
         }
     }
@@ -9224,7 +9228,7 @@ pub const DataServer = struct {
                 self.clearHotStandbyStandbyReplicationRetry();
                 self.clearHotStandbyStandbyReplicationError();
             } else |err| {
-                if (isSupersededHotStandbyStandbyReplicationRound(err)) {
+                if (isCooperativeHotStandbyStandbyReplicationRound(err)) {
                     self.clearHotStandbyStandbyReplicationRetry();
                     self.clearHotStandbyStandbyReplicationError();
                 } else {
@@ -43961,6 +43965,15 @@ fn consumerTests() type {
             try std.testing.expect(DataServer.hot_standby_replication_default_max_records_per_apply <= 8);
             try std.testing.expect(DataServer.hot_standby_replication_default_apply_window_ns > 0);
             try std.testing.expect(DataServer.hot_standby_replication_default_apply_window_ns <= std.time.ns_per_s);
+        }
+
+        test "data runtime publication proof yields without transport failure backoff" {
+            try std.testing.expect(isCooperativeHotStandbyStandbyReplicationRound(error.CatalogPublicationProofPending));
+            try std.testing.expect(isCooperativeHotStandbyStandbyReplicationRound(error.HAStandbyStateChanged));
+            try std.testing.expect(isCooperativeHotStandbyStandbyReplicationRound(error.HAStandbyNotConfigured));
+            try std.testing.expect(!isCooperativeHotStandbyStandbyReplicationRound(error.InvalidCatalogRecord));
+            try std.testing.expect(!isCooperativeHotStandbyStandbyReplicationRound(error.ConnectionResetByPeer));
+            try std.testing.expect(!isCooperativeHotStandbyStandbyReplicationRound(error.InternalReplicationDidNotAdvance));
         }
 
         test "data runtime HA apply window does not report caught up with pending or deferred WAL" {

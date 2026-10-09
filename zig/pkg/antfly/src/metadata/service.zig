@@ -3410,7 +3410,22 @@ fn prepareCoordinatedDecoderAdmission(service: anytype, commands: []const metada
     if (required_version == 0) return .{ .source_mutation = has_source };
     if (comptime !@hasDecl(@TypeOf(service.*), "cachedCoordinatedDecoderReadiness"))
         return error.TableTopologyProtocolUpgradeRequired;
-    return .{ .readiness = try service.cachedCoordinatedDecoderReadiness(required_version), .source_mutation = has_source };
+    const readiness = try service.cachedCoordinatedDecoderReadiness(required_version);
+    for (commands) |command| if (command == .apply_relation_reconciliation) {
+        const intent = try @import("relation_reconciliation_command.zig").Command.decode(command.apply_relation_reconciliation);
+        if (intent == .publish) {
+            const activation = intent.publish.activation;
+            // Bind the wire proof to the exact admission token that is
+            // revalidated under the runtime lock through append. This also
+            // closes the shrink-to-one-member cached-readiness shortcut.
+            if (readiness.metadata_incarnation == null or activation.version > readiness.required_version or
+                !std.meta.eql(activation.incarnation, readiness.metadata_incarnation.?) or
+                activation.member_count != readiness.protected_member_count or
+                !std.meta.eql(activation.membership_fingerprint, readiness.protected_membership_fingerprint))
+                return error.TableTopologyProtocolUpgradeRequired;
+        }
+    };
+    return .{ .readiness = readiness, .source_mutation = has_source };
 }
 
 fn validateRelationSourceDecoderFloor(service: anytype, expected: CoordinatedDecoderAdmission) !void {
@@ -4116,20 +4131,41 @@ fn runRelationReconciliationRound(service: anytype) !void {
         pub fn observe(self: *@This()) !@import("antfly_local_sources").system_catalog_relation_reconciliation.Work {
             return self.store.relationReconciliationWork(self.service.metadata_group_id);
         }
-        pub fn preparePublication(self: *@This(), work: @import("antfly_local_sources").system_catalog_relation_reconciliation.Work, _: relation_worker.Leader, now_ns: u64) !bool {
+        pub fn preparePublication(self: *@This(), work: @import("antfly_local_sources").system_catalog_relation_reconciliation.Work, leader_cut: relation_worker.Leader, now_ns: u64) !relation_worker.Preparation {
             self.service.relation_publication_preparation.cancel();
             const state = work.current orelse {
                 try self.store.cancelRelationPublicationProof(self.service.metadata_group_id);
-                return false;
+                return .idle;
             };
             if (work.epoch == null or !state.epoch.eql(work.epoch.?) or state.phase != .ready or state.failure != .none) {
                 try self.store.cancelRelationPublicationProof(self.service.metadata_group_id);
-                return false;
+                return .idle;
             }
-            if (try self.store.stepRelationPublicationProof(state, now_ns)) |proof| {
-                self.service.relation_publication_preparation.proof = .{ .state = proof.state, .applied_index = proof.applied_index, .root = proof.root };
+            const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
+            if (work.root) |root| if (root.eql(r.Generation.of(&state))) {
+                try self.store.cancelRelationPublicationProof(self.service.metadata_group_id);
+                return .idle;
+            };
+            const request: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| relation_worker.round_interval_ns };
+            const readiness = try self.service.observeTableTopologyProtocolReadyWithContext(request, metadata_topology_protocol.relation_publication_version);
+            if (readiness.term != leader_cut.term) return error.NotLeader;
+            const activation: metadata_topology_protocol.Activation = .{
+                .version = metadata_topology_protocol.relation_publication_version,
+                .incarnation = readiness.metadata_incarnation orelse return error.TableTopologyProtocolUpgradeRequired,
+                .member_count = readiness.protected_member_count,
+                .membership_fingerprint = readiness.protected_membership_fingerprint,
+            };
+            const durable_activation = try self.store.topologyActivation(self.service.metadata_group_id);
+            if (durable_activation == null or !durable_activation.?.satisfies(activation)) {
+                try self.store.cancelRelationPublicationProof(self.service.metadata_group_id);
+                const bytes = try std.json.Stringify.valueAlloc(self.service.alloc, activation, .{});
+                defer self.service.alloc.free(bytes);
+                try self.service.validateTableTopologyProtocolReadinessWithContext(request, readiness);
+                return .{ .activated = try self.append(.{ .activate_topology_protocol = bytes }, leader_cut.term) };
             }
-            return self.service.relation_publication_preparation.proof == null;
+            const proof = (try self.store.stepRelationPublicationProof(state, now_ns)) orelse return .pending;
+            self.service.relation_publication_preparation.proof = .{ .state = proof.state, .applied_index = proof.applied_index, .root = proof.root };
+            return .{ .publish = .{ .state = proof.state, .prior = proof.root, .activation = activation } };
         }
         pub fn cancelPublication(self: *@This()) void {
             self.service.relation_publication_preparation.cancel();
@@ -4142,8 +4178,16 @@ fn runRelationReconciliationRound(service: anytype) !void {
             defer self.service.alloc.free(bytes);
             const request: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| relation_worker.round_interval_ns };
             const transition: metadata_storage.TransitionCommand = .{ .apply_relation_reconciliation = bytes };
-            try ensureCoordinatedDecoderWithContext(self.service, transition, request);
+            // Background intents consume only local cached/durable capability
+            // evidence. A membership change yields to a later preparation
+            // round rather than entering a network/activation/apply wait here.
+            const readiness = try self.service.cachedCoordinatedDecoderReadiness(command.requiredDecoderVersion());
+            if (readiness.term != term) return error.NotLeader;
+            try self.service.validateTableTopologyProtocolReadinessWithContext(request, readiness);
             try request.ensureActive();
+            return self.append(transition, term);
+        }
+        fn append(self: *@This(), transition: metadata_storage.TransitionCommand, term: u64) !relation_worker.Receipt {
             const receipt = try self.service.proposeTransitionCommandWithReceiptInTerm(transition, term);
             // We only suppress in-flight duplicates, never certify an exact
             // applied term. Release the shared waiter's compaction proof now;
@@ -5981,6 +6025,10 @@ pub const MetadataService = struct {
     pub fn cachedCoordinatedDecoderReadiness(self: *MetadataService, required_version: u16) !TableTopologyProtocolReadiness {
         // In-process replicas all use this binary; this check is local only.
         return self.ensureTableTopologyProtocolReadyWithContext(.{}, required_version);
+    }
+
+    pub fn observeTableTopologyProtocolReadyWithContext(self: *MetadataService, request: api_operation.RequestContext, required_version: u16) !TableTopologyProtocolReadiness {
+        return self.ensureTableTopologyProtocolReadyWithContext(request, required_version);
     }
 
     pub fn proposeTransitionCommand(self: *MetadataService, command: metadata_storage.TransitionCommand) !void {
@@ -8590,7 +8638,7 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn cachedCoordinatedDecoderReadiness(self: *MetadataHttpService, required_version: u16) !TableTopologyProtocolReadiness {
-        return self.ensureTableTopologyProtocolReadyMode(.{}, required_version, true);
+        return self.ensureTableTopologyProtocolReadyMode(.{}, required_version, true, true);
     }
 
     pub fn proposeTransitionCommand(self: *MetadataHttpService, command: metadata_storage.TransitionCommand) !void {
@@ -9531,12 +9579,12 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn upsertSplitTransition(self: *MetadataHttpService, record: transition_state.SplitTransitionRecord) !void {
-        if (record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0) _ = try self.ensureTableTopologyProtocolReadyMode(.{}, metadata_topology_protocol.relational_integrity_topology_version, true);
+        if (record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0) _ = try self.ensureTableTopologyProtocolReadyMode(.{}, metadata_topology_protocol.relational_integrity_topology_version, true, true);
         try self.proposeTransitionCommand(.{ .upsert_split_transition = record });
     }
 
     pub fn admitSplitTransition(self: *MetadataHttpService, admission: metadata_reconciler.SplitAdmission) !void {
-        if (admission.record.table_contract.integrity_protocol != .none or admission.record.table_contract.read_schema_json.len != 0) _ = try self.ensureTableTopologyProtocolReadyMode(.{}, metadata_topology_protocol.relational_integrity_topology_version, true);
+        if (admission.record.table_contract.integrity_protocol != .none or admission.record.table_contract.read_schema_json.len != 0) _ = try self.ensureTableTopologyProtocolReadyMode(.{}, metadata_topology_protocol.relational_integrity_topology_version, true, true);
         var contract = admission.record.table_contract;
         const stores = try self.listProjectedStores(self.alloc);
         defer self.freeProjectedStores(self.alloc, stores);
@@ -9831,7 +9879,7 @@ pub const MetadataHttpService = struct {
 
     pub fn upsertMergeTransition(self: *MetadataHttpService, record: transition_state.MergeTransitionRecord) !void {
         if (record.online != null) return error.OnlineMergeUnavailable;
-        if (record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0) _ = try self.ensureTableTopologyProtocolReadyMode(.{}, metadata_topology_protocol.relational_integrity_topology_version, true);
+        if (record.table_contract.integrity_protocol != .none or record.table_contract.read_schema_json.len != 0) _ = try self.ensureTableTopologyProtocolReadyMode(.{}, metadata_topology_protocol.relational_integrity_topology_version, true, true);
         if (record.phase == .prepare) {
             var contract = record.table_contract;
             const stores = try self.listProjectedStores(self.alloc);
@@ -9922,12 +9970,18 @@ pub const MetadataHttpService = struct {
         request: api_operation.RequestContext,
         required_version: u16,
     ) !TableTopologyProtocolReadiness {
-        return self.ensureTableTopologyProtocolReadyMode(request, required_version, false);
+        return self.ensureTableTopologyProtocolReadyMode(request, required_version, false, true);
+    }
+
+    /// Background publication probes capability but appends activation as its
+    /// own term-fenced intent. It must never wait for apply inside its lane.
+    pub fn observeTableTopologyProtocolReadyWithContext(self: *MetadataHttpService, request: api_operation.RequestContext, required_version: u16) !TableTopologyProtocolReadiness {
+        return self.ensureTableTopologyProtocolReadyMode(request, required_version, false, false);
     }
 
     // Proposal-time admission must not instantiate the network/activation path:
     // activation itself proposes a command, and callers may hold mutation locks.
-    fn ensureTableTopologyProtocolReadyMode(self: *MetadataHttpService, request: api_operation.RequestContext, minimum_version: u16, comptime cached_only: bool) !TableTopologyProtocolReadiness {
+    fn ensureTableTopologyProtocolReadyMode(self: *MetadataHttpService, request: api_operation.RequestContext, minimum_version: u16, comptime cached_only: bool, comptime commit_activation: bool) !TableTopologyProtocolReadiness {
         var zig017_return_error: ?anyerror = null;
         (request.ensureActive() catch |zig017_err| {
             zig017_return_error = zig017_err;
@@ -10187,6 +10241,10 @@ pub const MetadataHttpService = struct {
                 };
             }
         }
+        // A probe-only result is deliberately not installed in the reusable
+        // ready cache: ordinary proposals must not confuse it with committed
+        // durable activation. The background worker owns that next intent.
+        if (!commit_activation) return expected_readiness;
         // Record only after every protected member has demonstrated support.
         // Hold membership admission through proposal, then wait without its lock.
         var activation = required_activation;
@@ -13237,6 +13295,17 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     publication_peers.member_versions = &.{ 32, 32, 32 };
     try ensureCoordinatedDecoderWithContext(&publication_peers, publication, .{});
     try publication_peers.propose(&.{publication});
+    try std.testing.expectEqual(@as(usize, 1), publication_peers.appended);
+    var stale_publication = try @import("relation_reconciliation_command.zig").Command.decode(publish_bytes);
+    stale_publication.publish.activation.member_count = 1;
+    const stale_count = try stale_publication.encodeAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(stale_count);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, publication_peers.propose(&.{.{ .apply_relation_reconciliation = stale_count }}));
+    stale_publication.publish.activation.member_count = readiness.protected_member_count;
+    stale_publication.publish.activation.membership_fingerprint[0] ^= 1;
+    const stale_membership = try stale_publication.encodeAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(stale_membership);
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, publication_peers.propose(&.{.{ .apply_relation_reconciliation = stale_membership }}));
     try std.testing.expectEqual(@as(usize, 1), publication_peers.appended);
 }
 
@@ -18515,7 +18584,63 @@ test "metadata control loop preserves prepared state while renewing its lease" {
     try std.testing.expectEqual(@as(u64, 9201), split_records[0].transition_id);
 }
 
-test "relation reconciliation worker drives real metadata control rounds without serving activation" {
+test "relation reconciliation worker HTTP capability observation does not append wait or publish ready cache" {
+    const a = std.testing.allocator;
+    const group: u64 = 1932;
+    const Factory = struct {
+        store: *raft_engine.core.MemoryStorage,
+        fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
+            return .{ .ptr = self, .vtable = &.{ .build_descriptor = build, .free_descriptor = free } };
+        }
+        fn build(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .group = .{
+                .group_id = record.group_id,
+                .local_node_id = record.local_node_id,
+                .raft_config = .{ .id = record.local_node_id, .group_id = record.group_id, .peers = try a.dupe(raft_engine.core.types.NodeId, &.{record.local_node_id}), .election_tick = 5, .heartbeat_tick = 1, .pre_vote = false, .check_quorum = true },
+                .storage = self.store.storage(),
+            }, .bootstrap = if (record.bootstrap_mode == .empty) .empty else .persisted };
+        }
+        fn free(_: *anyopaque, _: std.mem.Allocator, descriptor: *raft_engine.runtime.ReplicaDescriptor) void {
+            a.free(descriptor.group.raft_config.peers);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/relation-http-worker", .{tmp.sub_path});
+    defer a.free(root);
+    const catalog = try std.fmt.allocPrint(a, "{s}/replicas.txt", .{root});
+    defer a.free(catalog);
+    const snapshots = try std.fmt.allocPrint(a, "{s}/snapshots", .{root});
+    defer a.free(snapshots);
+    var raft_store = raft_engine.core.MemoryStorage.init(a);
+    defer raft_store.deinit();
+    var factory: Factory = .{ .store = &raft_store };
+    var svc = try MetadataHttpService.init(a, .{ .http = .{
+        .host = .{ .local_node_id = 1, .metadata_group_id = group, .replica_root_dir = root, .replica_catalog_path = catalog },
+        .transport = .{ .snapshot = .{ .root_dir = snapshots } },
+    } }, .{ .http = .{ .http = .{ .host = .{ .descriptor_factory = factory.iface() } } } }, .{ .observe_local_replica_root = false });
+    defer svc.deinit();
+    _ = try svc.ensureMetadataReplica(.{ .group_id = group, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty });
+    try svc.campaignMetadataGroup();
+    for (0..8) |_| try svc.runRound();
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    try std.testing.expect(try store.topologyActivation(group) == null);
+    const before = svc.raft.host.http_host.host.raftStatus(group).?.applied_index;
+    const observed = try svc.observeTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relation_publication_version);
+    try std.testing.expectEqual(metadata_topology_protocol.relation_publication_version, observed.required_version);
+    try std.testing.expectEqual(before, svc.raft.host.http_host.host.raftStatus(group).?.applied_index);
+    try std.testing.expect(try store.topologyActivation(group) == null);
+    try std.testing.expect(svc.table_topology_protocol_probe.cached == null);
+    // Ordinary admission must still perform its durable activation step; the
+    // preceding probe-only cohort cannot certify that this commit happened.
+    _ = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relation_publication_version);
+    const activated = (try store.topologyActivation(group)).?;
+    try std.testing.expectEqual(metadata_topology_protocol.relation_publication_version, activated.version);
+    try std.testing.expect(svc.raft.host.http_host.host.raftStatus(group).?.applied_index > before);
+}
+
+test "relation reconciliation worker activates and publishes verified roots in real metadata control rounds" {
     const a = std.testing.allocator;
     const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
     const control = @import("relation_reconciliation_command.zig");
@@ -18558,7 +18683,7 @@ test "relation reconciliation worker drives real metadata control rounds without
                 try svc.runRound();
                 const work = try store.relationReconciliationWork(group);
                 if (work.current) |state| if (state.epoch.eql(work.epoch.?) and work.garbage == null and
-                    (if (failed) state.failure != .none else state.phase == .ready and svc.relation_publication_preparation.proof != null and std.meta.eql(state, svc.relation_publication_preparation.proof.?.state))) return work;
+                    (if (failed) state.failure != .none else state.phase == .ready and work.root != null and work.root.?.eql(r.Generation.of(&state)))) return work;
             }
             return error.ReconciliationDidNotConverge;
         }
@@ -18587,10 +18712,6 @@ test "relation reconciliation worker drives real metadata control rounds without
     const activated = try svc.proposeTransitionCommandWithReceipt(.{ .activate_topology_protocol = activation });
     try svc.waitForTransitionApplied(activated);
     try std.testing.expectError(error.NotLeader, svc.proposeTransitionCommandWithReceiptInTerm(.{ .upsert_node = .{ .node_id = 99 } }, readiness.term + 1));
-    try T.command(&svc, .{ .adopt = proof });
-    const ready = try T.settle(&svc, false);
-    try std.testing.expectEqual(@as(u64, 0), ready.current.?.expected.rows);
-    try std.testing.expect(ready.root == null);
     const schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"relational_indexes":[{"name":"shared_key","keys":[{"column":"email"}]}]}
     ;
@@ -18598,10 +18719,12 @@ test "relation reconciliation worker drives real metadata control rounds without
         const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_table = .{ .table_id = id, .name = if (id == 1) "one" else "two", .schema_json = schema } });
         try svc.waitForTransitionApplied(receipt);
     }
+    // Historical conflicting definitions are reconciled before serving
+    // activation; published writers subsequently reject new collisions.
+    try T.command(&svc, .{ .adopt = proof });
     const failed = try T.settle(&svc, true);
     try std.testing.expectEqual(r.FailureReason.name_conflict, failed.current.?.failure);
     try std.testing.expect(failed.root == null);
-    try std.testing.expect(!std.meta.eql(ready.current.?.job_id, failed.current.?.job_id));
     const stopped = try failed.current.?.encode();
     for (0..4) |_| {
         svc.relation_reconciliation_worker.next_round_at_ns = 0;
@@ -18614,7 +18737,18 @@ test "relation reconciliation worker drives real metadata control rounds without
     const rebuilt = try T.settle(&svc, false);
     try std.testing.expectEqual(@as(u64, 2), rebuilt.current.?.expected.rows);
     try std.testing.expectEqual(r.FailureReason.none, rebuilt.current.?.failure);
-    try std.testing.expect(rebuilt.root == null and rebuilt.garbage == null);
+    try std.testing.expect(rebuilt.root != null and rebuilt.garbage == null);
+    try std.testing.expect(!std.meta.eql(failed.current.?.job_id, rebuilt.current.?.job_id));
+    const publication_activation = (try store.topologyActivation(group)).?;
+    try std.testing.expectEqual(metadata_topology_protocol.relation_publication_version, publication_activation.version);
+    try std.testing.expectEqualSlices(u8, &proof.membership_fingerprint, &publication_activation.membership_fingerprint);
+    // A live producer mutation invalidates the old candidate cut, then the
+    // worker builds, verifies, swaps and collects its replacement.
+    const changed = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_table = .{ .table_id = 2, .name = "two-renamed", .schema_json = "{}" } });
+    try svc.waitForTransitionApplied(changed);
+    const replacement = try T.settle(&svc, false);
+    try std.testing.expect(!replacement.root.?.eql(rebuilt.root.?));
+    try std.testing.expect(replacement.root.?.eql(r.Generation.of(&replacement.current.?)));
     svc.lockRuntime();
     defer svc.unlockRuntime();
     try std.testing.expectEqual(@as(usize, 0), svc.raft.host.host.runtime_host.groups.getPtr(group).?.tracked_proposal_receipts.count());

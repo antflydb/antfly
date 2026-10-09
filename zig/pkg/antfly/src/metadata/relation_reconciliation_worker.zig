@@ -3,13 +3,22 @@
 
 //! One bounded coordinator intent per control round. Durable job/retirement
 //! cuts are the authority; local state only throttles and suppresses duplicate
-//! in-flight proposals. This worker never adopts tracking or publishes roots.
+//! in-flight proposals. Source tracking is adopted explicitly; verified ready
+//! generations are published only after durable membership capability admission.
 const std = @import("std");
 const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
 const control = @import("relation_reconciliation_command.zig");
 
 pub const Receipt = struct { term: u64, index: u64 };
 pub const Leader = struct { term: u64, applied_index: u64 };
+pub const Preparation = union(enum) {
+    idle,
+    pending,
+    /// One capability activation was appended, not waited for.
+    activated: Receipt,
+    /// Local proof preparation completed for this exact observed cut.
+    publish: control.Publication,
+};
 pub const round_interval_ns = 250 * std.time.ns_per_ms;
 pub const publication_snapshot_lifetime_ns = 60 * std.time.ns_per_s;
 
@@ -104,8 +113,8 @@ pub fn PublicationPreparation(comptime Scan: type, comptime Proof: type) type {
 pub fn PublicationProofPool(comptime Scan: type, comptime Proof: type, comptime max_slots: usize, comptime max_scans: usize) type {
     if (max_slots == 0 or max_scans == 0 or max_scans > max_slots) @compileError("invalid publication preparation limits");
     return struct {
-        const Preparation = PublicationPreparation(Scan, Proof);
-        const Slot = struct { group: u64, used_at_ns: u64, preparation: Preparation = .{} };
+        const ScanPreparation = PublicationPreparation(Scan, Proof);
+        const Slot = struct { group: u64, used_at_ns: u64, preparation: ScanPreparation = .{} };
         lane: std.Io.Mutex = .init,
         slots: [max_slots]?Slot = @splat(null),
         closed: bool = false,
@@ -259,8 +268,30 @@ pub const Worker = struct {
             host.cancelPublication();
             return err;
         };
-        if (try host.preparePublication(work, leader, now_ns)) return false;
-        const command = (try nextIntent(work, group, self.prefer_gc)) orelse return false;
+        if (work.current) |state| if (state.group_id != group) return error.InvalidCatalogRecord;
+        const preparation: Preparation = if (self.prefer_gc and work.garbage != null)
+            .idle
+        else
+            try host.preparePublication(work, leader, now_ns);
+        switch (preparation) {
+            .pending => return false,
+            .activated => |receipt| {
+                if (receipt.term != leader.term or receipt.index == 0) return error.InvalidCatalogRecord;
+                self.pending = receipt;
+                return true;
+            },
+            else => {},
+        }
+        if (preparation == .publish) {
+            const state = work.current orelse return error.InvalidCatalogRecord;
+            const source = work.epoch orelse return error.InvalidCatalogRecord;
+            if (!std.meta.eql(preparation.publish.state, state) or !state.epoch.eql(source) or
+                !std.meta.eql(preparation.publish.prior, work.root)) return error.CatalogGenerationChanged;
+        }
+        const command: control.Command = if (preparation == .publish and !(self.prefer_gc and work.garbage != null))
+            .{ .publish = preparation.publish }
+        else
+            (try nextIntent(work, group, self.prefer_gc)) orelse return false;
         const receipt: Receipt = try host.propose(command, leader.term);
         if (receipt.term != leader.term or receipt.index == 0) return error.InvalidCatalogRecord;
         self.pending = receipt;
@@ -280,14 +311,15 @@ const Fake = struct {
     leader_error: ?anyerror = null,
     cancellations: usize = 0,
     expirations: usize = 0,
+    preparation: Preparation = .idle,
     pub fn cancelPublication(self: *@This()) void {
         self.cancellations += 1;
     }
     pub fn expirePublication(self: *@This(), _: u64) !void {
         self.expirations += 1;
     }
-    pub fn preparePublication(_: *@This(), _: r.Work, _: Leader, _: u64) !bool {
-        return false;
+    pub fn preparePublication(self: *@This(), _: r.Work, _: Leader, _: u64) !Preparation {
+        return self.preparation;
     }
     pub fn leader(self: *@This()) !?Leader {
         if (self.leader_error) |err| return err;
@@ -630,4 +662,51 @@ test "relation reconciliation worker discards term-local receipts without assumi
     try std.testing.expect(worker.pending == null);
     try std.testing.expectEqual(@as(usize, 1), host.reads);
     try std.testing.expectEqual(@as(usize, 0), host.appends);
+}
+
+test "relation reconciliation worker separates activation proof and publication without apply waits" {
+    var host: Fake = .{ .work = try publicationWorkForTest(), .preparation = .{ .activated = .{ .term = 7, .index = 9 } } };
+    var worker: Worker = .{};
+    try std.testing.expect(try worker.step(&host, 41, 0));
+    try std.testing.expectEqual(@as(usize, 0), host.appends);
+    try std.testing.expectEqual(@as(u64, 9), worker.pending.?.index);
+    try std.testing.expect(!try worker.step(&host, 41, round_interval_ns));
+    try std.testing.expectEqual(@as(usize, 1), host.reads);
+    host.cut.?.applied_index = 9;
+    host.preparation = .pending;
+    try std.testing.expect(!try worker.step(&host, 41, 2 * round_interval_ns));
+    try std.testing.expect(worker.pending == null);
+    host.preparation = .{ .publish = .{
+        .state = host.work.current.?,
+        .activation = .{ .version = @import("topology_protocol.zig").relation_publication_version, .incarnation = "01010101010101010101010101010101".*, .member_count = 1, .membership_fingerprint = @splat(3) },
+    } };
+    try std.testing.expect(try worker.step(&host, 41, 3 * round_interval_ns));
+    try std.testing.expect(host.last.? == .publish);
+    try std.testing.expectEqual(@as(usize, 1), host.appends);
+    const encoded = try host.last.?.encodeAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.meta.eql(host.last.?, try control.Command.decode(encoded)));
+}
+
+test "relation reconciliation worker rejects changed publication cuts and preserves GC fairness" {
+    const prior = try r.State.init(41, try r.nextJobId(null), epoch);
+    var ready = try r.State.init(41, try r.nextJobId(&prior), epoch);
+    ready.phase = .ready;
+    var host: Fake = .{ .work = .{ .epoch = epoch, .current = ready, .root = null, .garbage = r.Retirement.init(r.Generation.of(&prior)) }, .preparation = .pending };
+    var worker: Worker = .{ .prefer_gc = true };
+    try std.testing.expect(try worker.step(&host, 41, 0));
+    try std.testing.expect(host.last.? == .garbage);
+    host.cut.?.applied_index = 1;
+    try std.testing.expect(!try worker.step(&host, 41, round_interval_ns));
+    host.preparation = .{ .activated = .{ .term = 8, .index = 2 } };
+    try std.testing.expectError(error.InvalidCatalogRecord, worker.step(&host, 41, 2 * round_interval_ns));
+    host.preparation = .{ .publish = .{
+        .state = prior,
+        .activation = .{ .version = @import("topology_protocol.zig").relation_publication_version, .incarnation = "01010101010101010101010101010101".*, .member_count = 1, .membership_fingerprint = @splat(3) },
+    } };
+    try std.testing.expectError(error.CatalogGenerationChanged, worker.step(&host, 41, 3 * round_interval_ns));
+    host.preparation.publish.state = ready;
+    host.preparation.publish.prior = r.Generation.of(&prior);
+    try std.testing.expectError(error.CatalogGenerationChanged, worker.step(&host, 41, 4 * round_interval_ns));
+    try std.testing.expectEqual(@as(usize, 1), host.appends);
 }

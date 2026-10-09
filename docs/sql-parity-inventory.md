@@ -2161,8 +2161,7 @@ root replacement, membership mismatch and reopen. Native publication passes
 47/47 build steps, 175 catalog tests and 22 linked tests. The expanded mixed-v31/
 v32 proposal and stale-admission checks pass with all 15 coordinator tests
 (50/50 build steps); inventory, formatting and whitespace checks also pass.
-Automatic coordinator publication and public SQL namespace resolution, including
-their original parity cases, remain unfinished.
+Public SQL namespace resolution and its original parity cases remain unfinished.
 Standby apply now treats only `CatalogPublicationProofPending` as a cooperative
 yield, retaining the unapplied record and its successors behind the durable
 applied/safe-read frontier. Unexpected corruption and ordinary apply failures
@@ -2205,7 +2204,37 @@ three-record windows, complete ordered drain and cleanup; real OOM remains a
 hard failure before callback or progress advancement. That regression passes
 with all 448 hot-standby tests. These are bounded-work/allocation proofs, not
 production throughput claims. No original corpus disposition changes from
-these infrastructure tests; automatic coordinator publication remains guarded.
+these infrastructure tests.
+Automatic coordinator publication now advances explicitly tracked groups through
+separate capability-activation, proof-preparation and publication rounds. HTTP
+capability observation neither appends nor waits for activation, and does not
+populate the reusable durable-ready cache. The worker retains only a term/index
+receipt while activation is in flight, then prepares one bounded local proof
+page per eligible round. Publication carries its exact predecessor and durable
+membership activation; final proposal admission binds that wire activation to
+the readiness token rechecked under the runtime lock through append. Ordinary
+background intents consume cached/durable capability only, never entering an
+activation/apply wait. Collection gets its alternating round even when a ready
+replacement is waiting for proof or capability. Already-published generations
+cancel their preparation instead of repeatedly proposing the same root.
+New regressions cover activation receipt suppression, deferred proof work,
+publication codec round trips, stale cuts, member-count/fingerprint changes,
+GC fairness, real HTTP probe-only versus durable admission, and real control
+rounds that reject a conflicting historical baseline before publication, repair
+it, publish, mutate a live source and swap/collect the replacement.
+Replication completion now requires applied EOF, not merely transport EOF.
+The shared client/runtime completion check yields an unacknowledged durable tail
+to the next scheduled round instead of claiming catch-up or spinning. The data
+maintenance boundary treats the exact proof-pending outcome as cooperative work,
+not transport degradation/backoff. New HTTP primary/standby coverage defers the
+middle record three times, verifies that successors and upstream applied
+acknowledgements stay behind it, then drains the retained tail in order.
+These changes do not enable unqualified SQL index resolution by themselves or
+change any original parity dispositions. Verification passed 50/50 coordinator
+build steps (18 tests), 14 current worker component tests, all 450 hot-standby
+tests, and 93/93 runtime build steps (three selected runtime regressions).
+The runtime gate required loopback networking for its existing HTTP listener;
+the sandbox-only listener rejection was not counted as a code failure.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,
