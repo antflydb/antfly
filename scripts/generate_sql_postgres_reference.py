@@ -566,6 +566,32 @@ def cursor_result(cursor, case, read):
     }
 
 
+def mutation_profile(constraint_profile="base"):
+    """Explicit owner preconditions, never inferred from a successful query."""
+    profile = json.loads((FIXTURES / "sql_mutation_campaign_profile.json").read_text())
+    if constraint_profile == "base":
+        return profile
+    if constraint_profile != "unique-email":
+        raise ValueError("unknown mutation constraint profile")
+    profile["description"] = (
+        "Native-activated logical primary keys plus UNIQUE(email). "
+        "Unchanged original SQL, parameters and seed rows; complete RETURNING "
+        "and postimages of every table. Admission probes must independently "
+        "reject non-arbiter uniqueness collisions before any case is credited."
+    )
+    profile["unique"] = [["email"]]
+    # This source cohort inserts the proposed status into a distinct nullable
+    # column; do not rewrite those statements to fit the smaller base schema.
+    properties(profile["schema"])["next_status"] = {"type": "keyword"}
+    profile["admission_probes"] = [
+        {
+            "sql": "INSERT INTO usage_records (id,email) VALUES ('unique_probe','a@example.test')",
+            "sqlstate": "23505",
+        }
+    ]
+    return profile
+
+
 def mutation_reference(
     db, cases, profile, row_limit=ROW_LIMIT, byte_limit=16 * 1024 * 1024
 ):
@@ -694,6 +720,35 @@ def mutation_reference(
                         sql.SQL(",").join(map(sql.Identifier, columns)),
                     )
                 )
+        probes = profile.get("admission_probes", [])
+        if len(probes) > 128:
+            raise ValueError("mutation admission probes exceed the profile budget")
+        for probe in probes:
+            if (
+                not isinstance(probe.get("sql"), str)
+                or not 0 < len(probe["sql"]) <= byte_limit
+            ):
+                raise ValueError("invalid mutation admission probe")
+            expected = probe.get("sqlstate")
+            if not isinstance(expected, str) or not re.fullmatch(
+                r"[0-9A-Z]{5}", expected
+            ):
+                raise ValueError("invalid admission SQLSTATE")
+            try:
+                with db.transaction(force_rollback=True):
+                    # An incorrectly accepted probe must not bypass the same
+                    # streaming row/byte bounds as the mutation campaign.
+                    with StreamingMutationCursor(db) as cursor:
+                        collect(
+                            cursor, probe["sql"], None, [byte_limit], "admission probe"
+                        )
+            except psycopg.Error as error:
+                if error.sqlstate != expected:
+                    raise ValueError(
+                        "mutation admission probe SQLSTATE drift"
+                    ) from error
+            else:
+                raise ValueError("mutation admission probe unexpectedly succeeded")
         for case in cases:
             try:
                 if re.search(
@@ -1148,7 +1203,15 @@ def main():
         default=[],
         help="extend a checked golden with an exact manifest ID; existing contracts must still match",
     )
+    parser.add_argument(
+        "--constraint-profile",
+        choices=["base", "unique-email"],
+        default="base",
+        help="explicit mutation constraint-owner profile (does not rewrite source SQL)",
+    )
     args = parser.parse_args()
+    if args.constraint_profile != "base" and args.campaign != "mutation":
+        parser.error("constraint profiles require the mutation campaign")
     if args.include and not args.check:
         parser.error("--include requires a checked baseline golden")
     manifest = json.loads((FIXTURES / f"sql_{args.campaign}_campaign.json").read_text())
@@ -1187,6 +1250,8 @@ def main():
                 if args.campaign == "typed_array_read"
                 else aggregate_read_profile()
                 if args.campaign == "aggregate_read"
+                else mutation_profile(args.constraint_profile)
+                if args.campaign == "mutation"
                 else json.loads(
                     (
                         FIXTURES / f"sql_{args.campaign}_campaign_profile.json"

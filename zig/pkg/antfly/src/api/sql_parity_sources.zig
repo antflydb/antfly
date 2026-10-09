@@ -33,6 +33,8 @@ pub fn Tables(comptime count: usize) type {
         records: [count]local.common_topology_records.TableRecord,
         reads: [count]table_reads.BoundTableReadSource,
         captures: usize = 0,
+        lookup_calls: std.atomic.Value(usize) = .init(0),
+        unbounded_reads: std.atomic.Value(usize) = .init(0),
         ranges: []local.common_topology_records.RangeRecord = &.{},
 
         pub fn status(_: *anyopaque) !metadata.MetadataStatus {
@@ -117,10 +119,12 @@ pub fn Tables(comptime count: usize) type {
         }
         fn lookup(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, key: []const u8, opts: db.types.LookupOptions, consistency: raft.ReadConsistency) !?native.LookupResponse {
             const self: *Self = @ptrCast(@alignCast(ptr));
+            _ = self.lookup_calls.fetchAdd(1, .monotonic);
             return (try self.read(table)).lookup(a, table, key, opts, consistency);
         }
         fn openRead(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db.types.ScanOptions, consistency: raft.ReadConsistency) !?native.RelationalReadView {
             const self: *Self = @ptrCast(@alignCast(ptr));
+            if (from.len == 0 and to.len == 0) _ = self.unbounded_reads.fetchAdd(1, .monotonic);
             return (try self.read(table)).openRelationalRead(a, table, from, to, opts, consistency);
         }
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db.types.ScanOptions, _: raft.ReadConsistency) !?native.ScanResponse {

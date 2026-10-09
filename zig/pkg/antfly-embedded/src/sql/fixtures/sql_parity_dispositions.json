@@ -57,6 +57,16 @@
       "cwd": ".",
       "timeout_seconds": 120
     },
+    "sql-postgres-unique-mutation-reference": {
+      "command": ["uv", "run", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_postgres_reference.py", "mutation", "--constraint-profile", "unique-email", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_unique_mutation_postgres_reference.json"],
+      "cwd": ".",
+      "timeout_seconds": 120
+    },
+    "sql-mounted-unique-mutations": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "sql-postgres-correlated-reference": {
       "command": ["uv", "run", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_postgres_reference.py", "correlated_mutation", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_correlated_mutation_postgres_reference.json"],
       "cwd": ".",
@@ -13613,13 +13623,23 @@
     },
     {
       "id": "sql-1394",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL and parameters execute through mounted native HTTP against activated logical primary keys and UNIQUE(email). PostgreSQL independently verifies exact output labels/types/NULL provenance and complete postimages of all three tables. A separate duplicate-email probe proves uniqueness is enforced, and native counters rule out unbounded reads or full statement capture for this cohort. This does not claim partial/expression arbiters or distributed fault coverage.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-1395",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL and parameters execute through mounted native HTTP against activated logical primary keys and UNIQUE(email). PostgreSQL independently verifies exact output labels/types/NULL provenance and complete postimages of all three tables. A separate duplicate-email probe proves uniqueness is enforced, and native counters rule out unbounded reads or full statement capture for this cohort. This does not claim partial/expression arbiters or distributed fault coverage.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-1396",
@@ -13633,18 +13653,33 @@
     },
     {
       "id": "sql-1398",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL and parameters execute through mounted native HTTP against activated logical primary keys and UNIQUE(email). PostgreSQL independently verifies exact output labels/types/NULL provenance and complete postimages of all three tables. A separate duplicate-email probe proves uniqueness is enforced, and native counters rule out unbounded reads or full statement capture for this cohort. This does not claim partial/expression arbiters or distributed fault coverage.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-1399",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL and parameters execute through mounted native HTTP against activated logical primary keys and UNIQUE(email). PostgreSQL independently verifies exact output labels/types/NULL provenance and complete postimages of all three tables. A separate duplicate-email probe proves uniqueness is enforced, and native counters rule out unbounded reads or full statement capture for this cohort. This does not claim partial/expression arbiters or distributed fault coverage.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-1400",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL and parameters execute through mounted native HTTP against activated logical primary keys and UNIQUE(email). PostgreSQL independently verifies exact output labels/types/NULL provenance and complete postimages of all three tables. A separate duplicate-email probe proves uniqueness is enforced, and native counters rule out unbounded reads or full statement capture for this cohort. This does not claim partial/expression arbiters or distributed fault coverage.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-1401",
@@ -13653,8 +13688,13 @@
     },
     {
       "id": "sql-1402",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL and parameters execute through mounted native HTTP against activated logical primary keys and UNIQUE(email). PostgreSQL independently verifies exact output labels/types/NULL provenance and complete postimages of all three tables. A separate duplicate-email probe proves uniqueness is enforced, and native counters rule out unbounded reads or full statement capture for this cohort. This does not claim partial/expression arbiters or distributed fault coverage.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-1403",
@@ -13673,13 +13713,23 @@
     },
     {
       "id": "sql-1406",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL and parameters execute through mounted native HTTP against activated logical primary keys and UNIQUE(email). PostgreSQL independently verifies exact output labels/types/NULL provenance and complete postimages of all three tables. A separate duplicate-email probe proves uniqueness is enforced, and native counters rule out unbounded reads or full statement capture for this cohort. This does not claim partial/expression arbiters or distributed fault coverage.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-1407",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL and parameters execute through mounted native HTTP against activated logical primary keys and UNIQUE(email). PostgreSQL independently verifies exact output labels/types/NULL provenance and complete postimages of all three tables. A separate duplicate-email probe proves uniqueness is enforced, and native counters rule out unbounded reads or full statement capture for this cohort. This does not claim partial/expression arbiters or distributed fault coverage.",
+      "evidence": [
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-1408",

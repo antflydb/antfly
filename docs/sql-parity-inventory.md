@@ -1,7 +1,11 @@
 # Original SQL extraction parity inventory
 
-Current audited dispositions: **454 implemented / 136 rejected / 73 superseded /
-923 unresolved**. Six original JSON/regex/string reads now have exact
+Current audited dispositions: **462 implemented / 136 rejected / 73 superseded /
+915 unresolved**. Eight original non-primary-key upserts now have exact native
+and PostgreSQL evidence under activated UNIQUE(email), including independent
+duplicate-email rejection, complete three-table postimages and point-oriented
+ownership resolution without unbounded source reads or statement capture.
+Six original JSON/regex/string reads now have exact
 PostgreSQL and mounted native endpoint evidence, backed by shared bounded
 scalar kernels. Eleven original aggregate cases now have mounted native
 public-HTTP and independent PostgreSQL evidence for escaped patterns, nullable
@@ -1385,8 +1389,25 @@ preserving object-key order, separators and decimal scale. PostgreSQL goldens
 and native tests cover these distinctions, and repeated point extraction
 borrows the original string under a zero-capacity allocator and shared work
 budget. These are component contracts, not original-case completion credit:
-generated document/index owner profiles and explicit UNIQUE-arbiter mutation
-profiles are still required before their historical cases can be activated.
+generated document/index and partial/expression-arbiter owner profiles are still
+required before their historical cases can be activated. Ordinary UNIQUE(email)
+upserts now have the explicit owner profile described below.
+
+Eight original UNIQUE(email) mutations (sql-1394, sql-1395, sql-1398, sql-1399,
+sql-1400, sql-1402, sql-1406 and sql-1407) execute unchanged against native
+logical PK and UNIQUE owners. The profile retains the base seed rows and
+supplies the nullable `next_status` column required by that source cohort;
+it does not rewrite source statements or change the baseline mutation oracle.
+Schema declarations, fixture reset writes and mutations share native integrity
+machinery. An independent duplicate-email probe must fail with `23505` and
+leave storage unchanged, preventing an unconstrained fixture from receiving
+credit. PostgreSQL checks exact RETURNING metadata/NULLs and complete postimages
+of every table. Probes use the same streaming row/byte bounds as other oracle
+mutations, and wrong codes or unexpectedly accepted probes fail closed. Native
+read counters enforce no unbounded source reads or full statement capture for
+this cohort. Ambiguous unqualified conflict expressions, temporal profiles,
+partial/expression arbiters and distributed fault activation remain separate
+work; their historical entries have not been reclassified.
 
 Quantified scalar children now retain correlated ORDER/LIMIT/OFFSET,
 group/aggregate, window and nested-derived boundaries in a typed Apply

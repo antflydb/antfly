@@ -1831,6 +1831,63 @@ class PostgresReferenceTest(unittest.TestCase):
                 self.db.execute("SELECT _id,n FROM named_items").fetchall(),
             )
 
+    def test_unique_mutation_profile_keeps_base_seeds_and_original_case_contracts(self):
+        import json
+        from generate_sql_postgres_reference import mutation_profile, properties
+
+        base = mutation_profile()
+        profile = mutation_profile("unique-email")
+        self.assertNotIn("unique", base)
+        self.assertNotIn("next_status", properties(base["schema"]))
+        self.assertEqual([["email"]], profile["unique"])
+        self.assertEqual(base["rows"], profile["rows"])
+        self.assertEqual(base["additional_tables"], profile["additional_tables"])
+        self.assertEqual(base, mutation_profile())
+        golden = json.loads(
+            (FIXTURES / "sql_unique_mutation_postgres_reference.json").read_text()
+        )
+        inventory = json.loads((FIXTURES / "sql_parity_inventory.json").read_text())[
+            "entries"
+        ]
+        ids = {case["id"] for case in golden["entries"]}
+        self.assertEqual(8, len(ids))
+        cases = [case for case in inventory if case["id"] in ids]
+        result = mutation_reference(self.db, cases, profile)
+        self.assertEqual([], result["excluded"])
+        self.assertEqual(profile, golden["profile"])
+        self.assertEqual(golden["entries"], result["entries"])
+        self.assertEqual(
+            {"usage_records", "archived_records", "source_records"},
+            set(result["entries"][0]["final_tables"]),
+        )
+
+    def test_unique_mutation_admission_probes_fail_closed(self):
+        from generate_sql_postgres_reference import mutation_profile
+
+        for probe in (
+            {
+                "sql": "INSERT INTO usage_records (id,email) VALUES ('unique_probe','a@example.test')",
+                "sqlstate": "23502",
+            },
+            {
+                "sql": "UPDATE usage_records SET status='changed' WHERE id='u1'",
+                "sqlstate": "23505",
+            },
+            {"sql": 42, "sqlstate": "23505"},
+            {"sql": "SELECT 1", "sqlstate": "invalid"},
+        ):
+            with self.subTest(probe=probe):
+                profile = mutation_profile("unique-email")
+                profile["admission_probes"] = [probe]
+                with self.assertRaises(ValueError):
+                    mutation_reference(self.db, [], profile)
+        profile = mutation_profile("unique-email")
+        profile["admission_probes"] *= 129
+        with self.assertRaises(ValueError):
+            mutation_reference(self.db, [], profile)
+        with self.assertRaises(ValueError):
+            mutation_profile("unknown")
+
     def test_original_mutation_profiles_enforce_logical_primary_keys(self):
         import json
 

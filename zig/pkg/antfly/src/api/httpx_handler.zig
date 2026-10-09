@@ -13752,10 +13752,21 @@ test "httpx SQL PostgreSQL conflict assignments and defaults preserve complete n
 }
 
 fn postgresNativeMutationCampaigns(comptime selected: []const []const u8) !void {
+    try postgresNativeMutationCampaignsWithConstraints(selected, false);
+}
+
+test "httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages" {
+    try postgresNativeMutationCampaignsWithConstraints(&.{
+        "sql-1394", "sql-1395", "sql-1398", "sql-1399",
+        "sql-1400", "sql-1402", "sql-1406", "sql-1407",
+    }, true);
+}
+
+fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []const u8, comptime unique: bool) !void {
     const alloc = std.testing.allocator;
     const parity = @import("sql_parity_reference.zig");
     const Source = @import("sql_parity_sources.zig").Tables(3);
-    for ([_]struct { bytes: []const u8, ids: []const []const u8, expected_captures: ?usize = null }{
+    for ([_]struct { bytes: []const u8, ids: []const []const u8, expected_captures: ?usize = null, unique: bool = false }{
         .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.mutation_postgres_reference, .ids = &.{
             "sql-0012", "sql-0013", "sql-0571", "sql-0572", "sql-0598", "sql-0599",
             "sql-0606", "sql-0607", "sql-0608", "sql-0609", "sql-0619", "sql-0620",
@@ -13763,7 +13774,9 @@ fn postgresNativeMutationCampaigns(comptime selected: []const []const u8) !void 
             "sql-1533", "sql-1564",
         } },
         .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.correlated_mutation_postgres_reference, .ids = &.{ "sql-0600", "sql-0601", "sql-0602", "sql-0610", "sql-0611", "sql-0612" }, .expected_captures = 6 },
+        .{ .bytes = @import("antfly_local_sources").sql_parity_fixtures.unique_mutation_postgres_reference, .ids = &.{}, .unique = true },
     }) |campaign| {
+        if (campaign.unique != unique) continue;
         if (selected.len != 0 and campaign.expected_captures != null) continue;
         const parsed = try std.json.parseFromSlice(parity.PostgresMutationReference, alloc, campaign.bytes, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
@@ -13779,8 +13792,9 @@ fn postgresNativeMutationCampaigns(comptime selected: []const []const u8) !void 
         const names = [_][]const u8{ "usage_records", "archived_records", "source_records" };
         const declarations = [_]std.json.Value{ profile.schema, profile.additional_tables[0].schema, profile.additional_tables[1].schema };
         const primary_keys = [_][]const []const u8{ profile.primary_key, profile.additional_tables[0].primary_key, profile.additional_tables[1].primary_key };
+        const unique_keys = [_][]const []const []const u8{ profile.unique, profile.additional_tables[0].unique, profile.additional_tables[1].unique };
         var schemas: [3][]const u8 = undefined;
-        for (declarations, primary_keys, names, &schemas) |declaration, columns, name, *schema| {
+        for (declarations, primary_keys, unique_keys, names, &schemas) |declaration, columns, keys, name, *schema| {
             var owned = declaration;
             try std.testing.expect(columns.len != 0);
             try std.testing.expect(try @import("antfly_local_sources").sql_schema_ddl.apply(a, &owned, .{
@@ -13789,6 +13803,15 @@ fn postgresNativeMutationCampaigns(comptime selected: []const []const u8) !void 
                 .name = .{ .table = name },
                 .schema_change = .{ .add_unique = .{ .name = try std.fmt.allocPrint(a, "{s}_pkey", .{name}), .columns = columns, .primary = true } },
             }));
+            for (keys, 0..) |key, ordinal| {
+                try std.testing.expect(key.len != 0);
+                try std.testing.expect(try @import("antfly_local_sources").sql_schema_ddl.apply(a, &owned, .{
+                    .kind = .table,
+                    .action = .alter_schema,
+                    .name = .{ .table = name },
+                    .schema_change = .{ .add_unique = .{ .name = try std.fmt.allocPrint(a, "{s}_unique_{d}", .{ name, ordinal }), .columns = key } },
+                }));
+            }
             schema.* = try std.json.Stringify.valueAlloc(a, owned, .{});
         }
         var databases: [3]db_mod.DB = undefined;
@@ -13815,6 +13838,13 @@ fn postgresNativeMutationCampaigns(comptime selected: []const []const u8) !void 
         defer server.deinit();
         var handler = AntflyApiHandler{ .api_server = &server };
         try parity.runPostgresMutations(alloc, &handler, &tables, &source.records, parsed.value, if (selected.len != 0) selected else campaign.ids);
+        if (unique) {
+            // Logical UNIQUE ownership must resolve through native point
+            // reads, not table-size-dependent statement capture or scans.
+            try std.testing.expect(source.lookup_calls.load(.monotonic) > 0);
+            try std.testing.expectEqual(@as(usize, 0), source.unbounded_reads.load(.monotonic));
+            try std.testing.expectEqual(@as(usize, 0), source.captures);
+        }
         if (selected.len == 0) try std.testing.expect(source.captures != 0);
         if (campaign.expected_captures) |count| try std.testing.expectEqual(count, source.captures);
     }

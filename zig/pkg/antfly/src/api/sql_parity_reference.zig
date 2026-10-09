@@ -401,14 +401,15 @@ pub const MutationReference = struct {
 
 pub const PostgresMutationReference = struct {
     pub const Seed = struct { key: []const u8, value: Json };
-    pub const Table = struct { name: []const u8, schema: Json, primary_key: []const []const u8 = &.{}, rows: []const Seed };
+    pub const Table = struct { name: []const u8, schema: Json, primary_key: []const []const u8 = &.{}, unique: []const []const []const u8 = &.{}, rows: []const Seed };
+    pub const AdmissionProbe = struct { sql: []const u8, sqlstate: []const u8 };
     pub const Rows = struct {
         columns: []const []const u8,
         column_oids: []const u32,
         rows: []const []const Json,
         sql_nulls: []const []const bool,
     };
-    profile: struct { schema: Json, primary_key: []const []const u8 = &.{}, rows: []const Seed, additional_tables: []const Table },
+    profile: struct { schema: Json, primary_key: []const []const u8 = &.{}, unique: []const []const []const u8 = &.{}, admission_probes: []const AdmissionProbe = &.{}, rows: []const Seed, additional_tables: []const Table },
     entries: []const struct {
         id: []const u8,
         command_tag: []const u8,
@@ -487,6 +488,10 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
             // complete post-state comparison below detects accidental writes.
             try expectMutationRejected(a, handler, "INSERT INTO usage_records (id) VALUES ('u1')", "23505");
             try expectMutationRejected(a, handler, "INSERT INTO usage_records (id) VALUES (NULL)", "23502");
+            try std.testing.expect(reference.profile.admission_probes.len <= 128);
+            for (reference.profile.admission_probes) |probe| {
+                try expectMutationRejected(a, handler, probe.sql, probe.sqlstate);
+            }
             var after = try tables[0].db.scan(a, "", "", .{ .include_documents = true, .limit = 4097 });
             defer after.deinit(a);
             try std.testing.expectEqual(before.documents.len, after.documents.len);
