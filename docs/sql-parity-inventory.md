@@ -1683,7 +1683,8 @@ failures. Failed generations cannot advance or have their reason/progress
 rewritten; authenticated replay and newer snapshot installation retain that
 terminal fence. New generations may reconcile corrected source epochs and
 retire failed partial candidates normally. The unpublished job format is now
-`AFRC02`; no compatibility decoder is added for this PR's unpublished format.
+`AFRC03`, binding compound candidate fingerprints; no compatibility decoder is
+added for this PR's unpublished format.
 Pure tests verify stale/failing writes, immutable failure replay, strict reason
 decoding and partial-candidate fingerprints. Native two-replica tests cover
 same-page/cross-page conflicts, duplicate commands with surviving neighbors,
@@ -1724,9 +1725,19 @@ canonical bytes, input ownership and allocation failures. A native regression
 checks rollback, committed publication, pinned-reader isolation, stale cancel
 and reopen. These are compound-entry mechanics, not publication authority:
 producers still must validate the immutable plan and capability/lifecycle cut.
-Reconciliation candidates, pending-plan source projections, writer admission
-and active-root serving have not yet switched to this compound representation;
-there is no fallback decoder or newly enabled public lookup.
+Reconciliation candidates now use canonical compound entries throughout
+building, source/candidate verification, snapshot/checkpoint verification,
+authenticated delta replay and bounded GC. Fingerprints include the complete
+active/reserved bytes and the source's explicit successor table identity.
+Candidate active-owner reads never return a pending-only name. Preparation
+transfers one arena into its immutable entry plan and omits explicit empty
+before-images, retaining the existing 64-KiB scratch regression. A compound
+candidate test verifies distinct replacement IDs, pending-only invisibility,
+forged successor detection, snapshot fingerprints, allocation faults and GC.
+Native replay rejects even correctly fingerprinted pending claims until an
+authoritative pending-plan source exists; the new proof is not self-authenticating.
+Pending-plan source projections, writer admission and active-root serving remain
+unfinished. There is no fallback decoder or newly enabled public lookup.
 Multi-peer coordinator failover/fault coverage remains to be extended alongside
 serving activation. Pending-generation reservation sources,
 capability barriers and atomic active-root publication still

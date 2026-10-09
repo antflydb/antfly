@@ -469,7 +469,7 @@ test "system catalog relation namespace transaction reconciliation binary replay
     const epoch: r.Epoch = .{ .incarnation = @splat(1), .revision = 17 };
     const initial = try r.State.init(group, try r.nextJobId(null), epoch);
     const T = struct {
-        const Variant = enum { valid, missing_claim, missing_job, missing_source, stale_epoch, forged, wrong_name, cross_group };
+        const Variant = enum { valid, missing_claim, missing_job, missing_source, stale_epoch, forged, forged_pending, wrong_name, cross_group };
         const Source = struct {
             row: r.SourceRow,
             pub fn nextAfter(self: *@This(), after: []const u8) !?r.SourceRow {
@@ -499,6 +499,12 @@ test "system catalog relation namespace transaction reconciliation binary replay
             // replay must also prove membership in the authoritative schema.
             var claim = cut.claims[0];
             if (variant == .forged) claim.owner.schema_digest[0] ^= 1;
+            if (variant == .forged_pending) {
+                var pending = claim.owner;
+                pending.phase = .reserved;
+                pending.publication_id = @splat(9);
+                claim.pending = pending;
+            }
             if (variant == .wrong_name) claim.key.name = "injected";
             var physical_buf: [160]u8 = undefined;
             var rows: Source = .{ .row = .{ .key = try tableKeyForGroup(&physical_buf, group, 7), .table_id = 7, .claims = &.{claim} } };
@@ -514,7 +520,7 @@ test "system catalog relation namespace transaction reconciliation binary replay
                 .cross_group => {
                     var other = state;
                     other.group_id += 1;
-                    try txn.put(try r.candidateKey(&buf, &other, claim.key), &(try claim.owner.encode()));
+                    try txn.put(try r.candidateKey(&buf, &other, claim.key), &(try (try claim.entry()).encode()));
                 },
                 else => {},
             }
@@ -536,7 +542,7 @@ test "system catalog relation namespace transaction reconciliation binary replay
     defer source.deinit();
     const valid = try T.effect(&source, initial, .valid);
     defer a.free(valid);
-    for ([_]T.Variant{ .missing_claim, .missing_job, .missing_source, .stale_epoch, .forged, .wrong_name, .cross_group }) |variant| {
+    for ([_]T.Variant{ .missing_claim, .missing_job, .missing_source, .stale_epoch, .forged, .forged_pending, .wrong_name, .cross_group }) |variant| {
         const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/rec-binary-{s}", .{ tmp.sub_path, @tagName(variant) });
         defer a.free(root);
         const invalid = try T.effect(&source, initial, variant);
@@ -1785,7 +1791,7 @@ test "system catalog relation namespace transaction reconciliation is isolated a
                 var forged = claim.owner;
                 forged.schema_digest[0] ^= 1;
                 var key_buf: [r.max_cursor_bytes]u8 = undefined;
-                try txn.put(try r.candidateKey(&key_buf, &state, claim.key), &(try forged.encode()));
+                try txn.put(try r.candidateKey(&key_buf, &state, claim.key), &(try (relation_names.Entry{ .active = forged }).encode()));
                 try txn.commit();
             }
             {
@@ -1798,7 +1804,7 @@ test "system catalog relation namespace transaction reconciliation is isolated a
                 var txn = try store.store.beginWriteTxn();
                 errdefer txn.abort();
                 var key_buf: [r.max_cursor_bytes]u8 = undefined;
-                try txn.put(try r.candidateKey(&key_buf, &state, claim.key), &(try claim.owner.encode()));
+                try txn.put(try r.candidateKey(&key_buf, &state, claim.key), &(try (try claim.entry()).encode()));
                 try txn.commit();
             }
         }
@@ -1934,7 +1940,7 @@ test "system catalog relation namespace transaction snapshots and checkpoints re
         defer page.deinit();
         var verified = try r.Page.prepareSource(a, page.after, epoch, &rows);
         defer verified.deinit();
-        const owner = try cut.claims[0].owner.encode();
+        const owner = try (try cut.claims[0].entry()).encode();
         var candidates: T.Candidates = .{ .row = .{ .key = candidate_key, .value = &owner } };
         var ready = try r.Page.prepareCandidate(a, verified.after, epoch, &candidates);
         defer ready.deinit();
@@ -1983,7 +1989,7 @@ test "system catalog relation namespace transaction snapshots and checkpoints re
         try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&target, a, group, 20, missing_root));
         var forged = cut.claims[0].owner;
         forged.schema_digest[0] ^= 1;
-        const forged_claim = try T.alter(snapshot, candidate_key, &(try forged.encode()));
+        const forged_claim = try T.alter(snapshot, candidate_key, &(try (relation_names.Entry{ .active = forged }).encode()));
         defer a.free(forged_claim);
         try std.testing.expectError(error.InvalidMetadataSnapshot, RaftApplyStore.installSnapshotFromRaft(&target, a, group, 20, forged_claim));
         {
@@ -16466,7 +16472,8 @@ pub const RaftApplyStore = struct {
             const record = (try relation_reconciliation.classify(entry.key_ptr.*)) orelse continue;
             if (record.kind != .candidate or entry.value_ptr.* != null) continue;
             const bytes = (try stagingGet(txn, entry.key_ptr.*)) orelse continue;
-            const owner = try relation_names.Owner.decode(bytes);
+            const candidate = try relation_names.Entry.decode(bytes);
+            const owner = candidate.active orelse return error.InvalidCatalogRecord;
             if (!tables.contains(owner.table_id)) {
                 if (tables.count() == relation_reconciliation.max_tables_per_page) return error.CatalogCommandTooLarge;
                 var table = try relationSnapshot(self.alloc, txn, group_id, owner.table_id, true);
@@ -16479,7 +16486,7 @@ pub const RaftApplyStore = struct {
             }
             const logical = try relation_reconciliation.logicalCandidateKey(entry.key_ptr.*, record.generation.?);
             const expected = tables.getPtr(owner.table_id).?.after_by_name.get(logical) orelse return error.InvalidCatalogRecord;
-            if (!expected.eql(owner)) return error.InvalidCatalogRecord;
+            if (!(relation_names.Entry{ .active = expected }).eql(candidate)) return error.InvalidCatalogRecord;
         }
     }
     fn applyRelationCommandTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: TransitionCommand, journal: *command_journal.Journal) !void {

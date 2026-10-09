@@ -244,7 +244,24 @@ pub const Key = struct {
         return key;
     }
 };
-pub const Claim = struct { key: Key, owner: Owner };
+pub const Claim = struct {
+    key: Key,
+    owner: Owner,
+    pending: ?Owner = null,
+    pub fn entry(self: @This()) !Entry {
+        const value: Entry = if (self.owner.phase == .reserved) blk: {
+            if (self.pending != null) return error.InvalidCatalogRecord;
+            break :blk .{ .pending = self.owner };
+        } else .{ .active = self.owner, .pending = self.pending };
+        try value.validate();
+        return value;
+    }
+    pub fn fromEntry(key: Key, value: Entry) !@This() {
+        try value.validate();
+        if (value.active) |owner| return .{ .key = key, .owner = owner, .pending = value.pending };
+        return .{ .key = key, .owner = value.pending orelse return error.InvalidCatalogRecord };
+    }
+};
 /// Name claims derived from one authoritative table definition and namespace
 /// binding. Own only the resulting names, not a second copy of the schema DOM.
 /// The digest fences the exact public schema bytes, independently of its
@@ -355,6 +372,7 @@ pub const EntryPlan = struct {
     pub const Change = struct { key: Key, before: Entry, after: Entry };
     arena: std.heap.ArenaAllocator,
     changes: []const Change,
+    claims: []const Claim = &.{},
     pub fn init(a: A, changes: []const Change) !EntryPlan {
         if (changes.len > max_claims) return error.CatalogCommandTooLarge;
         var arena = std.heap.ArenaAllocator.init(a);
@@ -373,6 +391,25 @@ pub const EntryPlan = struct {
         }
         return .{ .arena = arena, .changes = copy };
     }
+    /// Consume an arena whose claim names/array are already owned. Preparation
+    /// transfers this arena exactly once, including on error, avoiding a
+    /// second full-page copy of compound owners and namespace names.
+    pub fn takeClaims(input_arena: std.heap.ArenaAllocator, claims: []const Claim) !EntryPlan {
+        var arena = input_arena;
+        errdefer arena.deinit();
+        if (claims.len > max_claims) return error.CatalogCommandTooLarge;
+        const a = arena.allocator();
+        var seen: std.HashMapUnmanaged(Key, void, Context, 80) = .empty;
+        try seen.ensureTotalCapacity(a, @intCast(claims.len));
+        for (claims) |claim| {
+            try claim.key.validate();
+            if (seen.getOrPutAssumeCapacity(claim.key).found_existing) return error.CatalogAlreadyExists;
+            _ = try claim.entry();
+        }
+        // Creation has an implicit empty before-cut; do not materialize two
+        // optional compound owners per claim just to represent that absence.
+        return .{ .arena = arena, .changes = &.{}, .claims = claims };
+    }
     pub fn deinit(self: *EntryPlan) void {
         self.arena.deinit();
         self.* = undefined;
@@ -384,10 +421,15 @@ pub const EntryPlan = struct {
         return current;
     }
     pub fn validate(self: *const EntryPlan, reader: anytype) !void {
-        for (self.changes) |change| if (!(try observed(reader, change.key)).eql(change.before)) return error.CatalogGenerationChanged;
+        for (self.claims) |claim| if (!(try observed(reader, claim.key)).empty()) return error.CatalogAlreadyExists;
+        for (self.changes) |change| {
+            const current = try observed(reader, change.key);
+            if (!current.eql(change.before)) return error.CatalogGenerationChanged;
+        }
     }
     pub fn apply(self: *const EntryPlan, txn: anytype) !void {
         try self.validate(txn);
+        for (self.claims) |claim| try txn.putEntry(claim.key, try claim.entry());
         for (self.changes) |change| {
             if (change.before.eql(change.after)) continue;
             if (change.after.empty()) try txn.deleteEntry(change.key) else try txn.putEntry(change.key, change.after);
@@ -396,6 +438,7 @@ pub const EntryPlan = struct {
     /// Authenticated replay verifies sender effects, never fills missing rows
     /// or repairs a mismatched generation under a new producer identity.
     pub fn verifyPublished(self: *const EntryPlan, reader: anytype) !void {
+        for (self.claims) |claim| if (!(try observed(reader, claim.key)).eql(try claim.entry())) return error.CatalogGenerationChanged;
         for (self.changes) |change| if (!(try observed(reader, change.key)).eql(change.after)) return error.CatalogGenerationChanged;
     }
 };
@@ -494,6 +537,7 @@ pub const Plan = struct {
         const result = try a.alloc(Claim, claims.len);
         try map.ensureTotalCapacity(a, @intCast(claims.len));
         for (claims, result) |claim, *copy| {
+            if (claim.pending != null) return error.InvalidCatalogRecord;
             try claim.key.validate();
             try claim.owner.validate();
             const key: Key = .{ .namespace_id = claim.key.namespace_id, .name = try a.dupe(u8, claim.key.name) };
@@ -885,7 +929,8 @@ test "catalog relation publication owns repeated cuts and unwinds allocation fai
         }
     };
     try Probe.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Probe.run, .{});
 }
 
 test "catalog relation ownership is namespace scoped and generation fenced" {

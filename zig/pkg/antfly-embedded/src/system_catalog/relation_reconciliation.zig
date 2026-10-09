@@ -174,7 +174,7 @@ pub const State = struct {
         if (self.phase != .building and self.pass.claims > self.expected.claims) return error.InvalidCatalogRecord;
         if (self.phase == .ready and (self.cursor_len != 0 or !totalsEqual(self.pass, .{}))) return error.InvalidCatalogRecord;
     }
-    const magic = "AFRC02";
+    const magic = "AFRC03";
     pub const encoded_len = magic.len + 8 + 16 + 16 + 8 + 2 + 2 + max_cursor_bytes + 2 * (8 + 8 + 32 + 32);
     pub fn encode(self: *const State) ![encoded_len]u8 {
         try self.validate();
@@ -469,13 +469,13 @@ pub fn Verifier(comptime Reader: type) type {
                 },
                 .candidate => {
                     const generation = record.generation.?;
-                    const owner = try names.Owner.decode(value);
+                    const owner = try names.Entry.decode(value);
                     const logical = try decodeCandidateGenerationKey(key, generation);
                     if (try self.retirementFor(generation)) |retired| {
                         if (std.mem.order(u8, retired.cursor(), key) != .lt) return error.InvalidCatalogRecord;
                     } else {
                         self.claims = std.math.add(u64, self.claims, 1) catch return error.InvalidCatalogRecord;
-                        addClaimHash(&self.claim_hash, try claimHash(.{ .key = logical, .owner = owner }));
+                        addClaimHash(&self.claim_hash, try claimHash(try names.Claim.fromEntry(logical, owner)));
                     }
                 },
             }
@@ -599,15 +599,15 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
                 .candidate => {
                     const current = self.current orelse return error.InvalidCatalogRecord;
                     const generation = record.generation.?;
-                    const prior = if (old) |bytes| try names.Owner.decode(bytes) else null;
-                    const owner = if (next) |bytes| try names.Owner.decode(bytes) else null;
+                    const prior = if (old) |bytes| try names.Entry.decode(bytes) else null;
+                    const owner = if (next) |bytes| try names.Entry.decode(bytes) else null;
                     if (prior) |value| if (owner) |final| if (value.eql(final)) return;
                     if (std.mem.eql(u8, &generation.job_id, &current.job_id)) {
                         if (prior != null or owner == null) return error.InvalidCatalogRecord;
                         if (self.old) |before| if (std.mem.eql(u8, &before.job_id, &current.job_id) and before.phase != .building) return error.InvalidCatalogRecord;
                         self.count = std.math.add(u64, self.count, 1) catch return error.InvalidCatalogRecord;
                         const logical = try decodeCandidateGenerationKey(key, generation);
-                        addClaimHash(&self.hash, try claimHash(.{ .key = logical, .owner = owner.? }));
+                        addClaimHash(&self.hash, try claimHash(try names.Claim.fromEntry(logical, owner.?)));
                     } else {
                         if (prior == null or owner != null) return error.InvalidCatalogRecord;
                         try self.checkRetirement(generation);
@@ -668,7 +668,7 @@ pub fn start(txn: anytype, state: *const State, current_epoch: Epoch, prior: ?[]
     try txn.put(key, &bytes);
 }
 
-pub const SourceRow = struct { key: []const u8, table_id: u64, claims: []const names.Claim };
+pub const SourceRow = struct { key: []const u8, table_id: u64, pending_table_id: ?u64 = null, claims: []const names.Claim };
 /// Derived locally from a permanent source error, never accepted as a leader
 /// assertion. Recording it changes only the job record in the caller's txn.
 /// Stale epochs/CAS and all write errors require the caller to abort.
@@ -707,7 +707,7 @@ pub const GarbagePage = struct {
             const row: CandidateRow = (try source.nextAfter(after)) orelse break;
             if (row.key.len > max_cursor_bytes or std.mem.order(u8, after, row.key) != .lt) return error.InvalidCatalogRecord;
             _ = try decodeCandidateGenerationKey(row.key, before.generation);
-            _ = try names.Owner.decode(row.value);
+            _ = try names.Entry.decode(row.value);
             const key = try owned.dupe(u8, row.key);
             try rows.append(owned, .{ .key = key, .value = try owned.dupe(u8, row.value) });
             after = key;
@@ -776,7 +776,7 @@ pub const GarbagePage = struct {
     }
 };
 pub const Page = struct {
-    plan: names.Plan,
+    plan: names.EntryPlan,
     before: State,
     after: State,
     claims: []const names.Claim,
@@ -791,7 +791,8 @@ pub const Page = struct {
         try checkEpoch(&state, epoch);
         if (state.phase != .building and state.phase != .verifying_source) return error.InvalidCatalogRecord;
         var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
+        var transferred = false;
+        defer if (!transferred) arena.deinit();
         const owned = arena.allocator();
         var after = state;
         var claims: std.ArrayList(names.Claim) = .empty;
@@ -803,26 +804,27 @@ pub const Page = struct {
                 break;
             };
             if (row.table_id == 0 or row.key.len == 0 or row.key.len > max_cursor_bytes or
-                std.mem.order(u8, after.cursor(), row.key) != .lt or row.claims.len == 0) return error.InvalidCatalogRecord;
+                std.mem.order(u8, after.cursor(), row.key) != .lt or row.claims.len == 0 or row.pending_table_id == 0) return error.InvalidCatalogRecord;
             if (row.claims.len > names.max_claims) return error.CatalogCommandTooLarge;
             var row_bytes: usize = row.key.len;
             for (row.claims) |claim| {
                 try claim.key.validate();
-                try claim.owner.validate();
-                if (claim.owner.table_id != row.table_id) return error.InvalidCatalogRecord;
-                row_bytes += claim.key.name.len + names.Owner.encoded_len + 10;
+                const entry = try claim.entry();
+                if (entry.active) |owner| if (owner.table_id != row.table_id) return error.InvalidCatalogRecord;
+                if (entry.pending) |owner| if (owner.table_id != (row.pending_table_id orelse row.table_id)) return error.InvalidCatalogRecord;
+                row_bytes += claim.key.name.len + names.Entry.encoded_len + 10;
             }
             if (row_bytes > max_page_bytes) return error.CatalogCommandTooLarge;
             if (rows != 0 and (claims.items.len + row.claims.len > names.max_claims or bytes + row_bytes > max_page_bytes)) break;
             bytes += row_bytes;
             rows += 1;
             try appendSource(&after.pass, row);
-            for (row.claims) |claim| try claims.append(owned, .{ .key = .{ .namespace_id = claim.key.namespace_id, .name = try owned.dupe(u8, claim.key.name) }, .owner = claim.owner });
+            for (row.claims) |claim| try claims.append(owned, .{ .key = .{ .namespace_id = claim.key.namespace_id, .name = try owned.dupe(u8, claim.key.name) }, .owner = claim.owner, .pending = claim.pending });
             try after.setCursor(row.key);
         }
         // Reject duplicate names within this page before entering apply.
-        const plan = try names.Plan.init(a, &.{}, claims.items);
-        return .{ .plan = plan, .before = state, .after = after, .claims = plan.after };
+        transferred = true;
+        return own(arena, state, after, claims.items);
     }
 
     /// Independently stream the isolated candidate range after source
@@ -832,7 +834,8 @@ pub const Page = struct {
         try checkEpoch(&state, epoch);
         if (state.phase != .verifying_candidate) return error.InvalidCatalogRecord;
         var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
+        var transferred = false;
+        defer if (!transferred) arena.deinit();
         const owned = arena.allocator();
         var after = state;
         var claims: std.ArrayList(names.Claim) = .empty;
@@ -847,15 +850,19 @@ pub const Page = struct {
             };
             if (std.mem.order(u8, after.cursor(), row.key) != .lt or row.key.len > max_cursor_bytes) return error.InvalidCatalogRecord;
             const key = try decodeCandidateKey(row.key, &state);
-            const owner = try names.Owner.decode(row.value);
+            const owner = try names.Entry.decode(row.value);
             after.pass.claims = std.math.add(u64, after.pass.claims, 1) catch return error.CatalogCommandTooLarge;
             if (after.pass.claims > after.expected.claims) return error.InvalidCatalogRecord;
-            addClaimHash(&after.pass.claim_hash, try claimHash(.{ .key = key, .owner = owner }));
-            try claims.append(owned, .{ .key = .{ .namespace_id = key.namespace_id, .name = try owned.dupe(u8, key.name) }, .owner = owner });
+            const claim = try names.Claim.fromEntry(key, owner);
+            addClaimHash(&after.pass.claim_hash, try claimHash(claim));
+            try claims.append(owned, .{ .key = .{ .namespace_id = key.namespace_id, .name = try owned.dupe(u8, key.name) }, .owner = claim.owner, .pending = claim.pending });
             try after.setCursor(row.key);
         }
-        const plan = try names.Plan.init(a, &.{}, claims.items);
-        return .{ .plan = plan, .before = state, .after = after, .claims = plan.after };
+        transferred = true;
+        return own(arena, state, after, claims.items);
+    }
+    fn own(arena: std.heap.ArenaAllocator, before: State, after: State, claims: []const names.Claim) !Page {
+        return .{ .plan = try names.EntryPlan.takeClaims(arena, claims), .before = before, .after = after, .claims = claims };
     }
 
     pub fn deinit(self: *Page) void {
@@ -921,27 +928,30 @@ pub fn CandidateStore(comptime Txn: type) type {
         txn: *Txn,
         state: *const State,
         pub fn getClaim(self: *@This(), key: names.Key) !?names.Owner {
+            return if (try self.getEntry(key)) |entry| entry.active else null;
+        }
+        pub fn getEntry(self: *@This(), key: names.Key) !?names.Entry {
             var buf: [max_cursor_bytes]u8 = undefined;
             const value = self.txn.get(try candidateKey(&buf, self.state, key)) catch |err| {
                 if (err == error.NotFound) return null;
                 return err;
             };
-            return try names.Owner.decode(value);
+            return try names.Entry.decode(value);
         }
     };
 }
 fn CandidateWriter(comptime Txn: type) type {
     return struct {
         base: CandidateStore(Txn),
-        pub fn getClaim(self: *@This(), key: names.Key) !?names.Owner {
-            return self.base.getClaim(key);
+        pub fn getEntry(self: *@This(), key: names.Key) !?names.Entry {
+            return self.base.getEntry(key);
         }
-        pub fn putClaim(self: *@This(), key: names.Key, owner: names.Owner) !void {
+        pub fn putEntry(self: *@This(), key: names.Key, entry: names.Entry) !void {
             var buf: [max_cursor_bytes]u8 = undefined;
-            const value = try owner.encode();
+            const value = try entry.encode();
             try self.base.txn.put(try candidateKey(&buf, self.base.state, key), &value);
         }
-        pub fn deleteClaim(self: *@This(), key: names.Key) !void {
+        pub fn deleteEntry(self: *@This(), key: names.Key) !void {
             var buf: [max_cursor_bytes]u8 = undefined;
             try self.base.txn.delete(try candidateKey(&buf, self.base.state, key));
         }
@@ -967,13 +977,13 @@ fn finishSource(state: *State) !void {
 }
 fn claimHash(claim: names.Claim) ![32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update("antfly.relation-candidate.claim.v1");
+    hash.update("antfly.relation-candidate.claim.v2");
     var key: [10]u8 = undefined;
     std.mem.writeInt(u64, key[0..8], claim.key.namespace_id, .big);
     std.mem.writeInt(u16, key[8..10], @intCast(claim.key.name.len), .big);
     hash.update(&key);
     hash.update(claim.key.name);
-    const owner = try claim.owner.encode();
+    const owner = try (try claim.entry()).encode();
     hash.update(&owner);
     var digest: [32]u8 = undefined;
     hash.final(&digest);
@@ -991,12 +1001,13 @@ fn appendSource(totals: *Totals, row: SourceRow) !void {
     totals.rows = std.math.add(u64, totals.rows, 1) catch return error.CatalogCommandTooLarge;
     totals.claims = std.math.add(u64, totals.claims, row.claims.len) catch return error.CatalogCommandTooLarge;
     var hash = std.crypto.hash.Blake3.init(.{});
-    hash.update("antfly.relation-candidate.source.v1");
+    hash.update("antfly.relation-candidate.source.v2");
     hash.update(&totals.source_hash);
-    var numbers: [18]u8 = undefined;
+    var numbers: [26]u8 = undefined;
     std.mem.writeInt(u16, numbers[0..2], @intCast(row.key.len), .big);
     std.mem.writeInt(u64, numbers[2..10], row.table_id, .big);
     std.mem.writeInt(u64, numbers[10..18], row.claims.len, .big);
+    std.mem.writeInt(u64, numbers[18..26], row.pending_table_id orelse 0, .big);
     hash.update(&numbers);
     hash.update(row.key);
     for (row.claims) |claim| {
@@ -1109,6 +1120,77 @@ test "relation reconciliation permanent failure is fenced terminal and retains v
     try std.testing.expectEqual(FailureReason.source_limit, FailureReason.fromError(error.CatalogCommandTooLarge).?);
 }
 
+test "relation reconciliation compound candidates retain active visibility and verify reserved successor bytes" {
+    const a = std.testing.allocator;
+    var successor = test_owner;
+    successor.table_id = 8;
+    successor.phase = .reserved;
+    successor.publication_id = @splat(9);
+    const claims = [_]names.Claim{
+        .{ .key = test_claims[0].key, .owner = test_owner, .pending = successor },
+        .{ .key = .{ .namespace_id = 5, .name = "new_idx" }, .owner = successor },
+    };
+    try std.testing.expectError(error.InvalidCatalogRecord, names.Plan.init(a, &.{}, &claims));
+    const rows = [_]SourceRow{.{ .key = "table:7", .table_id = 7, .pending_table_id = 8, .claims = &claims }};
+    var source: TestSource = .{ .rows = &rows };
+    const initial = try State.init(41, try nextJobId(null), test_epoch);
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    try start(&txn, &initial, test_epoch, null);
+    var build = try Page.prepareSource(a, initial, test_epoch, &source);
+    defer build.deinit();
+    try build.apply(&txn, test_epoch);
+    var reader: CandidateStore(TestTxn) = .{ .txn = &txn, .state = &initial };
+    try std.testing.expect((try reader.getClaim(claims[0].key)).?.eql(test_owner));
+    try std.testing.expect((try reader.getEntry(claims[0].key)).?.pending.?.eql(successor));
+    try std.testing.expect(try reader.getClaim(claims[1].key) == null);
+    try std.testing.expect((try reader.getEntry(claims[1].key)).?.pending.?.eql(successor));
+    var verified = try Page.prepareSource(a, build.after, test_epoch, &source);
+    defer verified.deinit();
+    try verified.apply(&txn, test_epoch);
+    var key_buffers: [2][max_cursor_bytes]u8 = undefined;
+    var candidate_rows: [2]CandidateRow = undefined;
+    for (claims, &key_buffers, &candidate_rows) |claim, *buffer, *row| {
+        const key = try candidateKey(buffer, &initial, claim.key);
+        row.* = .{ .key = key, .value = try txn.get(key) };
+    }
+    var candidates: TestCandidates = .{ .rows = &candidate_rows };
+    var ready = try Page.prepareCandidate(a, verified.after, test_epoch, &candidates);
+    defer ready.deinit();
+    try ready.apply(&txn, test_epoch);
+    try std.testing.expectEqual(Phase.ready, ready.after.phase);
+    var verifier = try Verifier(TestTxn).init(&txn, 41);
+    var entries = txn.values.iterator();
+    while (entries.next()) |entry| try verifier.feed(entry.key_ptr.*, entry.value_ptr.*);
+    try verifier.finish();
+    var forged = try claims[0].entry();
+    forged.pending.?.schema_digest[0] ^= 1;
+    const forged_bytes = try forged.encode();
+    candidate_rows[0].value = &forged_bytes;
+    try std.testing.expectError(error.InvalidCatalogRecord, Page.prepareCandidate(a, verified.after, test_epoch, &candidates));
+    candidate_rows[0].value = try txn.get(candidate_rows[0].key);
+    var invalid_rows = rows;
+    invalid_rows[0].pending_table_id = null;
+    var invalid_source: TestSource = .{ .rows = &invalid_rows };
+    try std.testing.expectError(error.InvalidCatalogRecord, Page.prepareSource(a, initial, test_epoch, &invalid_source));
+    const Probe = struct {
+        fn prepare(alloc: A, state: State, input: []const SourceRow) !void {
+            var stream: TestSource = .{ .rows = input };
+            var page = try Page.prepareSource(alloc, state, test_epoch, &stream);
+            defer page.deinit();
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Probe.prepare, .{ initial, &rows });
+    const replacement = try State.init(41, try nextJobId(&ready.after), test_epoch);
+    try start(&txn, &replacement, test_epoch, &(try ready.after.encode()));
+    var garbage = try GarbagePage.prepare(a, Retirement.init(Generation.of(&initial)), &candidates);
+    defer garbage.deinit();
+    try std.testing.expect(try garbage.apply(&txn));
+    try std.testing.expect(try reader.getEntry(claims[0].key) == null);
+    try std.testing.expect(try reader.getEntry(claims[1].key) == null);
+}
+
 test "relation reconciliation requires source and independent candidate verification" {
     const a = std.testing.allocator;
     const state = try State.init(41, @splat(3), test_epoch);
@@ -1122,7 +1204,7 @@ test "relation reconciliation requires source and independent candidate verifica
     try std.testing.expectEqual(Phase.verifying_candidate, verified.after.phase);
     var key_buf: [max_cursor_bytes]u8 = undefined;
     const key = try candidateKey(&key_buf, &state, test_claims[0].key);
-    const owner = try test_owner.encode();
+    const owner = try (names.Entry{ .active = test_owner }).encode();
     const candidates = [_]CandidateRow{.{ .key = key, .value = &owner }};
     var candidate_source: TestCandidates = .{ .rows = &candidates };
     var ready = try Page.prepareCandidate(a, verified.after, test_epoch, &candidate_source);
@@ -1136,7 +1218,7 @@ test "relation reconciliation requires source and independent candidate verifica
     try std.testing.expectError(error.InvalidCatalogRecord, Page.prepareCandidate(a, verified.after, test_epoch, &missing_candidates));
     var forged_owner = test_owner;
     forged_owner.schema_digest[0] ^= 1;
-    const forged = try forged_owner.encode();
+    const forged = try (names.Entry{ .active = forged_owner }).encode();
     const bad_rows = [_]CandidateRow{.{ .key = key, .value = &forged }};
     var bad_source: TestCandidates = .{ .rows = &bad_rows };
     try std.testing.expectError(error.InvalidCatalogRecord, Page.prepareCandidate(a, verified.after, test_epoch, &bad_source));
@@ -1191,7 +1273,7 @@ test "relation reconciliation preparation unwinds allocation faults" {
             defer verify.deinit();
             var buf: [max_cursor_bytes]u8 = undefined;
             const key = try candidateKey(&buf, &state, test_claims[0].key);
-            const owner = try test_owner.encode();
+            const owner = try (names.Entry{ .active = test_owner }).encode();
             const rows = [_]CandidateRow{.{ .key = key, .value = &owner }};
             var candidates: TestCandidates = .{ .rows = &rows };
             var ready = try Page.prepareCandidate(a, verify.after, test_epoch, &candidates);
@@ -1367,7 +1449,7 @@ test "relation reconciliation seals only a transactionally verified candidate ta
         try std.testing.expectEqual(Phase.ready, page.after.phase);
         var key_buf: [max_cursor_bytes]u8 = undefined;
         const extra = try candidateKey(&key_buf, &initial, .{ .namespace_id = 5, .name = "late_extra" });
-        try txn.put(extra, &(try test_owner.encode()));
+        try txn.put(extra, &(try (names.Entry{ .active = test_owner }).encode()));
         txn.cursor_seeks = 0;
         txn.cursor_nexts = 0;
         try std.testing.expectError(error.InvalidCatalogRecord, page.apply(&txn, test_epoch));
@@ -1379,7 +1461,7 @@ test "relation reconciliation seals only a transactionally verified candidate ta
         // Another generation must not be mistaken for a late candidate.
         const future = try State.init(41, try nextJobId(&initial), test_epoch);
         var future_buf: [max_cursor_bytes]u8 = undefined;
-        try txn.put(try candidateKey(&future_buf, &future, test_claims[0].key), &(try test_owner.encode()));
+        try txn.put(try candidateKey(&future_buf, &future, test_claims[0].key), &(try (names.Entry{ .active = test_owner }).encode()));
         txn.cursor_seeks = 0;
         txn.cursor_nexts = 0;
         try page.apply(&txn, test_epoch);
@@ -1418,7 +1500,7 @@ test "relation reconciliation fences replacement jobs and rejects reused candida
     // A higher ID must also have an empty prefix: one native prefix seek,
     // rather than scanning all existing or abandoned candidate generations.
     var dirty_buf: [max_cursor_bytes]u8 = undefined;
-    try txn.put(try candidateKey(&dirty_buf, &future, test_claims[0].key), &(try test_owner.encode()));
+    try txn.put(try candidateKey(&dirty_buf, &future, test_claims[0].key), &(try (names.Entry{ .active = test_owner }).encode()));
     try std.testing.expectError(error.CatalogGenerationChanged, start(&txn, &future, test_epoch, &next_encoded));
 }
 
@@ -1525,7 +1607,7 @@ test "relation reconciliation garbage collection fences roots exact values and g
     try start(&txn, &next, test_epoch, &(try build.after.encode()));
     var candidate_buf: [max_cursor_bytes]u8 = undefined;
     const candidate_key = try candidateKey(&candidate_buf, &initial, test_claims[0].key);
-    const value = try test_owner.encode();
+    const value = try (names.Entry{ .active = test_owner }).encode();
     const rows = [_]CandidateRow{.{ .key = candidate_key, .value = &value }};
     var candidates: TestCandidates = .{ .rows = &rows };
     var garbage = try GarbagePage.prepare(a, Retirement.init(Generation.of(&initial)), &candidates);
@@ -1573,7 +1655,7 @@ test "relation reconciliation garbage preparation unwinds allocation faults" {
             const state = try State.init(41, try nextJobId(null), test_epoch);
             var buf: [max_cursor_bytes]u8 = undefined;
             const key = try candidateKey(&buf, &state, test_claims[0].key);
-            const value = try test_owner.encode();
+            const value = try (names.Entry{ .active = test_owner }).encode();
             const rows = [_]CandidateRow{.{ .key = key, .value = &value }};
             var source: TestCandidates = .{ .rows = &rows };
             var page = try GarbagePage.prepare(a, Retirement.init(Generation.of(&state)), &source);
@@ -1630,7 +1712,7 @@ test "relation reconciliation stored cut verification rejects missing forged and
     try T.verify(&txn, 41);
     var buf: [max_cursor_bytes]u8 = undefined;
     const key = try candidateKey(&buf, &initial, test_claims[0].key);
-    const owner = try test_owner.encode();
+    const owner = try (names.Entry{ .active = test_owner }).encode();
     try txn.delete(key);
     try std.testing.expectError(error.InvalidCatalogRecord, T.verify(&txn, 41));
     var forged = test_owner;
