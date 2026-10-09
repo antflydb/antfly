@@ -7414,7 +7414,46 @@ fn findExactEntryInCachedCompressedPrefixBlock(
     defer handle.release();
     var scratch = PointReadScratch.init(backend);
     defer scratch.deinit();
-    return findExactEntryInCachedPrefixWithScratch(handle.runTablePhysicalBlock(), block, window, held_values, value_allocator, scratch.allocator(), namespace, key) catch |err| return scratch.failure(err);
+    const found = (findExactEntryInCachedPrefixWithScratch(handle.runTablePhysicalBlock(), block, window, held_values, value_allocator, scratch.allocator(), namespace, key) catch |err| return scratch.failure(err)) orelse return null;
+    if (namespace.retainDataBlocks() and handle.claimPointBlockPromotion(window.len)) {
+        defer handle.finishPointBlockPromotion();
+        try promoteCachedPrefixBlock(backend, run, window, absolute_offset, handle.runTablePhysicalBlock());
+    }
+    return found;
+}
+
+/// Promotion is optional: admit construction independently of caller results,
+/// then let the shared cache charge retention. The physical owner elects one
+/// attempt; the normal decoded-load gate also coalesces with scan/batch loads.
+fn promoteCachedPrefixBlock(backend: anytype, run: *Run, window: lsm_table_file.EntryDataWindow, offset: u64, payload: []const u8) !void {
+    const cache = backend.options.cache orelse return;
+    const path = run.path orelse return error.RunStateUnavailable;
+    const generation = backend.root_generation;
+    cache.beginLoadWithBlock(path, run.id, generation, .run_table_block, offset, window.physicalLen()) catch return;
+    defer cache.finishLoadWithBlock(path, run.id, generation, .run_table_block, offset, window.physicalLen());
+    if (cache.retainRunTableBlock(path, run.id, generation, offset, window.physicalLen())) |retained| {
+        var winner = retained;
+        winner.release();
+        return;
+    }
+    const resources = @import("../resource_manager.zig");
+    var output_credit: ?resources.Reservation = if (backend.options.resource_manager) |manager|
+        manager.reserveWithoutReclaim(.lsm_read_working_set, window.len) catch |err| switch (err) {
+            error.ResourceBudgetExceeded => return,
+            else => return err,
+        }
+    else
+        null;
+    defer if (output_credit) |*credit| credit.release();
+    var scratch = PointReadScratch.init(backend);
+    defer scratch.deinit();
+    const decoded = lsm_table_file.decodeBlockPayloadWithScratchAlloc(cache.valueAllocator(), scratch.allocator(), window.compression, payload, window.len, window.checksum) catch |err| switch (err) {
+        error.OutOfMemory => return,
+        else => return err,
+    };
+    // put consumes decoded on every exit, including allocation failure.
+    var promoted = cache.putRunTableBlock(path, run.id, generation, offset, window.physicalLen(), decoded) catch return;
+    promoted.release();
 }
 
 fn findExactEntryInCachedPrefixWithScratch(
@@ -10770,6 +10809,8 @@ test "lsm shared sync prefix admission warm reuse and miss cleanup" {
     var admitted = resources.ResourceManager.init(.{});
     defer admitted.deinit(a);
     backend.options.resource_manager = &admitted;
+    // Exercise the mandatory direct path independently of optional promotion.
+    cache.max_bytes = 16 * 1024;
     for (0..64) |_| {
         const found = (try findExactEntryInCachedBlocks(&backend, &run, &index, &held, va, .{}, entries[0].key)).?;
         try std.testing.expectEqualStrings("v", found.entry.value);
@@ -10794,6 +10835,7 @@ test "lsm shared sync prefix admission warm reuse and miss cleanup" {
     };
     try std.testing.checkAllAllocationFailures(a, Fixture.check, .{ &backend, &run, &index, entries[0].key });
     try std.testing.expectEqual(@as(u64, 0), admitted.sliceStats(.lsm_read_working_set).used_bytes);
+    cache.max_bytes = 1024 * 1024;
     var warm_decoded = try loadRunTableBlockHandle(&backend, &run, &index, index.blockWindow(0), true);
     defer warm_decoded.release();
     backend.options.resource_manager = &denied;
@@ -10836,4 +10878,79 @@ test "lsm shared sync prefix admission warm reuse and miss cleanup" {
     bad_run.path = @constCast("/sync-corrupt");
     try std.testing.expectError(error.TableBlockChecksumMismatch, findExactEntryInCachedBlocks(&backend, &bad_run, &index, &held, va, .{}, entries[0].key));
     try std.testing.expectEqual(@as(u64, 0), admitted.sliceStats(.lsm_read_working_set).used_bytes);
+}
+
+test "lsm shared hot prefix promotion is bounded optional and reuses pins" {
+    for (0..6) |mode| {
+        const a = std.testing.allocator;
+        const B = @import("../lsm_backend.zig").Backend;
+        var storage = storage_io.MemoryStorage.init(a);
+        defer storage.deinit();
+        const resources = @import("../resource_manager.zig");
+        var budgets = resources.Options.defaultBudgets();
+        if (mode == 1) budgets[@backingInt(resources.Slice.lsm_read_working_set)] = .{ .hard_limit_bytes = 8192 };
+        if (mode == 2) budgets[@backingInt(resources.Slice.lsm_block_table_cache)] = .{ .hard_limit_bytes = 2048 };
+        var manager = resources.ResourceManager.init(.{ .budgets = budgets });
+        defer manager.deinit(a);
+        const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+        var cache_budget = Budget{ .backing = a };
+        var cache = cache_mod.Cache.init(cache_budget.allocator(), if (mode == 3) 16 * 1024 else 1024 * 1024);
+        cache.attachResourceManager(&manager);
+        defer cache.deinit();
+        var backend = try B.open(a, "/review-sync", .{ .storage = storage.storage(), .cache = &cache, .max_concurrent_point_block_reads = 1, .resource_manager = &manager });
+        defer backend.close();
+        var entries: [192]lsm_table_file.Entry = undefined;
+        var buffers: [192][80]u8 = undefined;
+        for (&entries, 0..) |*entry, i| entry.* = .{ .key = try std.fmt.bufPrint(&buffers[i], "long-shared-document-key-prefix-for-compression:{d:0>4}", .{i}), .value = "v" };
+        var filter = try lsm_table_file.buildFilterAlloc(a, &entries, lsm_table_file.default_filter_config);
+        defer filter.deinit(a);
+        const encoded = try lsm_table_file.encodeWithFilterAllocOptions(a, &entries, filter, .{ .block_compression = .snappy_adaptive });
+        defer a.free(encoded);
+        var index = try lsm_table_file.decodeIndexAlloc(a, encoded);
+        defer index.deinit(a);
+        try std.testing.expectEqual(lsm_table_file.BlockCompression.prefix_snappy, index.blockWindow(0).compression);
+        try storage.storage().writeFileAbsolute("/sync-block", encoded);
+        var run: Run = .{ .id = 1, .level = 0, .size_bytes = encoded.len, .path = @constCast("/sync-block"), .smallest_namespace_name = null, .largest_namespace_name = null, .smallest_key = @constCast(entries[0].key), .largest_key = @constCast(entries[entries.len - 1].key), .entry_count = entries.len, .bloom_filter = null, .state = null };
+        var result_budget = Budget{ .backing = std.heap.c_allocator };
+        const va = result_budget.allocator();
+        var held: std.ArrayListUnmanaged([]u8) = .empty;
+        defer releaseHeldValues(&held, va);
+        try held.ensureTotalCapacity(va, 1);
+        const namespace: backend_types.Namespace = .{ .block_cache_admission = if (mode == 4) .transient else .retain };
+        const offset = @as(u64, @intCast(index.entry_data_start)) + index.blockWindow(0).physicalRelativeOffset();
+        const count: usize = if (mode == 0) 10000 else 64;
+        const before = result_budget.alloc_calls;
+        const started = platform_time.monotonicNs();
+        for (0..count) |i| {
+            // Freeze cache allocation after seven direct hits. Required prefix
+            // scratch/results use independent allocators and must still succeed.
+            if (mode == 5 and i == 7) cache_budget.limit = cache_budget.live;
+            var found = (try findExactEntryInCachedBlocks(&backend, &run, &index, &held, va, namespace, entries[i % entries.len].key)).?;
+            defer if (found.handle) |*handle| handle.release();
+            try std.testing.expectEqualStrings("v", found.entry.value);
+            try std.testing.expectEqual(mode == 0 and i >= 8, found.handle != null);
+            for (held.items) |bytes| va.free(bytes);
+            held.clearRetainingCapacity();
+            if (i == 6) {
+                var premature = cache.retainRunTableBlock(run.path.?, run.id, backend.root_generation, offset, index.blockWindow(0).physicalLen());
+                defer if (premature) |*handle| handle.release();
+                try std.testing.expect(premature == null);
+            }
+            try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+        }
+        cache_budget.limit = std.math.maxInt(usize);
+        const elapsed = platform_time.monotonicNs() - started;
+        try std.testing.expectEqual(@as(usize, if (mode == 0) 8 else count), result_budget.alloc_calls - before);
+        try std.testing.expectEqual(@as(u64, if (mode == 4) count else 1), backend.snapshotReadStats().table_block_loads);
+        var promoted = cache.retainRunTableBlock(run.path.?, run.id, backend.root_generation, offset, index.blockWindow(0).physicalLen());
+        defer if (promoted) |*handle| handle.release();
+        try std.testing.expectEqual(mode == 0, promoted != null);
+        if (mode == 0) {
+            cache.invalidatePath(run.path.?);
+            const found = (try lsm_table_file.findExactEntryInBlock(&index, promoted.?.runTableBlock(), 0, null, entries[0].key)).?;
+            try std.testing.expectEqualStrings("v", found.entry.value);
+            try std.testing.expect(cache.retainRunTableBlock(run.path.?, run.id, backend.root_generation, offset, index.blockWindow(0).physicalLen()) == null);
+            std.debug.print("\nLSM hot prefix promoted {d} lookups ns={d} result_allocations={d}\n", .{ count, elapsed, result_budget.alloc_calls - before });
+        }
+    }
 }

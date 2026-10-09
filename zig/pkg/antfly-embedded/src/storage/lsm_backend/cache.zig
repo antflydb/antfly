@@ -106,6 +106,9 @@ pub const Cache = struct {
         ref_count: usize,
         transient_ref_count: std.atomic.Value(usize) = .init(0),
         last_access: u64,
+        // First attempt after eight hits, then one probe per 256 hits. The
+        // sentinel elects one in-flight promoter even across the retry window.
+        point_promotion_hits: std.atomic.Value(u16) = .init(7),
         invalidated: bool = false,
         lru_prev: ?*Entry = null,
         lru_next: ?*Entry = null,
@@ -1137,6 +1140,28 @@ pub const Handle = struct {
         return self.entry.value.run_table_block;
     }
 
+    /// Elect one promoter without allocating a separate hot-block directory.
+    /// Transient/policy-bypassed blocks and oversized expansions stay direct.
+    pub fn claimPointBlockPromotion(self: *const Handle, decoded_bytes: usize) bool {
+        const cache = self.cache orelse return false;
+        if (self.kind != .run_table_physical_block or decoded_bytes > 64 * 1024 or
+            decoded_bytes +| self.entry.path.len > cache.effectiveMaxBytes() / 16) return false;
+        const promoting = std.math.maxInt(u16);
+        var remaining = self.entry.point_promotion_hits.load(.monotonic);
+        while (remaining != promoting) {
+            const next = if (remaining == 0) promoting else remaining - 1;
+            if (self.entry.point_promotion_hits.cmpxchgWeak(remaining, next, .monotonic, .monotonic)) |observed| {
+                remaining = observed;
+            } else return remaining == 0;
+        }
+        return false;
+    }
+
+    pub fn finishPointBlockPromotion(self: *const Handle) void {
+        std.debug.assert(self.entry.point_promotion_hits.load(.monotonic) == std.math.maxInt(u16));
+        self.entry.point_promotion_hits.store(255, .monotonic);
+    }
+
     pub fn runTablePhysicalBlock(self: *const Handle) []const u8 {
         std.debug.assert(self.kind == .run_table_physical_block);
         return self.entry.value.run_table_physical_block;
@@ -1686,4 +1711,45 @@ test "cache pending load allocation failure leaves no published entry" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "lsm cache hot prefix promotion elects one concurrent owner and bounds expansion" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var cache = Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var handle = try cache.putRunTablePhysicalBlock("promotion", 1, 1, 0, 1, try a.dupe(u8, "x"));
+    defer handle.release();
+    try std.testing.expect(!handle.claimPointBlockPromotion(64 * 1024 + 1));
+    cache.max_bytes = 1024;
+    try std.testing.expect(!handle.claimPointBlockPromotion(4096));
+    cache.max_bytes = 1024 * 1024;
+    const Worker = struct {
+        handle: *const Handle,
+        winners: *std.atomic.Value(usize),
+        fn run(self: @This()) void {
+            for (0..64) |_| if (self.handle.claimPointBlockPromotion(4096)) {
+                _ = self.winners.fetchAdd(1, .monotonic);
+            };
+        }
+    };
+    var winners = std.atomic.Value(usize).init(0);
+    var threads: [4]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |thread| thread.join();
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{Worker{ .handle = &handle, .winners = &winners }});
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |thread| thread.join();
+    spawned = 0;
+    try std.testing.expectEqual(@as(usize, 1), winners.load(.monotonic));
+    try std.testing.expect(!handle.claimPointBlockPromotion(4096));
+    handle.finishPointBlockPromotion();
+    for (0..255) |_| try std.testing.expect(!handle.claimPointBlockPromotion(4096));
+    try std.testing.expect(handle.claimPointBlockPromotion(4096));
+    handle.finishPointBlockPromotion();
+    var transient = try cache.putTransientRunTablePhysicalBlock("transient", 2, 1, 0, 1, try a.dupe(u8, "x"));
+    defer transient.release();
+    for (0..16) |_| try std.testing.expect(!transient.claimPointBlockPromotion(4096));
 }

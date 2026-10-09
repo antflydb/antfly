@@ -261,6 +261,40 @@
       "exceptional_keys": "temporary admitted key allocation; reader is discarded before reuse",
       "decode_cache_caps_separate": true,
       "allocation_failure_retry": "restart from the index; preserve bounded capacity"
+    },
+    "shared_sync_hot_prefix_promotion": {
+      "comparison_commit": "f33b4becc9a1ad987afb8c4c55f5034891f81fbe",
+      "entries": 192,
+      "lookups": 10000,
+      "logical_block_bytes": 12672,
+      "physical_block_bytes": 509,
+      "before": {
+        "lookup_ns_samples": [
+          220376000,
+          218799000,
+          219617000
+        ],
+        "result_allocations": 10000
+      },
+      "after": {
+        "lookup_ns_samples": [
+          48891000,
+          51910000,
+          55550000
+        ],
+        "result_allocations": 8,
+        "physical_block_reads": 1,
+        "warm_result_allocations": 0
+      },
+      "policy": {
+        "initial_successful_hits": 8,
+        "retry_successful_hits": 256,
+        "maximum_decoded_bytes": 65536,
+        "maximum_cache_fraction": "1/16",
+        "construction_slice": "lsm_read_working_set",
+        "retention_slice": "lsm_block_table_cache"
+      },
+      "scope": "Native Debug helper fixture, MemoryStorage, C result allocator; before uses repeated physical-cache reads on the comparison head, after enables automatic promotion and attaches a resource manager. Timing samples are indicative, not end-to-end throughput or a controlled production benchmark. Targeted cases cover construction/retention denial, optional cache allocation failure, small-cache and transient bypass, invalidation with pinned values, concurrent promoter election and retry cooldown."
     }
   },
   "scope": "Deterministic allocation, directory traversal, admission, and isolated Debug timing fixtures, not query throughput or a 2 GiB soak. Caller-owned mutable values, captured read-layout pointer arrays, payload IO/cache ownership, and first-use overlay promotion still have costs. Directory planning and index metadata reuse bounded resource-charged arenas; async candidate metadata has fixed stack storage.",
