@@ -261,7 +261,7 @@ pub const Repository = struct {
         try cancellation.check();
         return if (page.next_continuation_token != null) try a.dupe(u8, key_bytes) else null;
     }
-    fn cachedFile(a: A, io: std.Io, path: []const u8, expected_domain: [32]u8, expires: u64, source: local.storage_db_native_backup_seal.File, complete: bool) !?[]const Ref {
+    fn cachedFile(a: A, io: std.Io, path: []const u8, expected_domain: [32]u8, expires: u64, source: local.storage_db_native_backup_seal.File, complete: bool, needed_until: u64) !?[]const Ref {
         const bytes = local.storage_db_native_backup.readFileAlloc(a, io, path, max_manifest_bytes) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
@@ -273,11 +273,21 @@ pub const Repository = struct {
             if (ref.byte_len == 0 or ref.byte_len > chunk_bytes) return null;
             artifacts.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum) catch return null;
             const scope = (artifacts.uploadScopeFromArtifactId(ref.artifact_id) catch return null) orelse return null;
-            if (!std.mem.eql(u8, &scope.domain, &expected_domain) or scope.fencingToken() != expires) return null;
+            if (!std.mem.eql(u8, &scope.domain, &expected_domain) or scope.fencingToken() <= needed_until) return null;
             size = std.math.add(u64, size, ref.byte_len) catch return null;
         }
         if (size > source.size or (complete and size != source.size)) return null;
         return cached.chunks;
+    }
+    fn cachedExtent(a: A, io: std.Io, parent: []const u8, digest: [32]u8, expected_domain: [32]u8, expires: u64, source: local.storage_db_native_backup_seal.File, complete: bool, needed_until: u64) !?[]const Ref {
+        // Warming uses a longer private cut than an ordinary public cursor.
+        // Reuse neighboring physical retention epochs only after validating
+        // every immutable chunk's actual horizon against this logical reader.
+        for ([_]u64{ expires, expires +| cache_window_ms, expires -| cache_window_ms }) |epoch| {
+            const path = try std.fmt.allocPrint(a, "{s}/.chunk-cache/{d}/{s}.json", .{ parent, epoch, std.fmt.bytesToHex(&digest, .lower) });
+            if (try cachedFile(a, io, path, expected_domain, epoch, source, complete, needed_until)) |refs| return refs;
+        }
+        return null;
     }
     fn safePath(path: []const u8) bool {
         return path.len != 0 and !std.fs.path.isAbsolute(path) and std.mem.indexOf(u8, path, "..") == null and std.mem.indexOfAny(u8, path, "\\\x00") == null;
@@ -353,7 +363,7 @@ pub const Repository = struct {
             const refs_estimate = std.math.cast(usize, (file.size / chunk_bytes + 1) * 512 + file.path.len) orelse return error.QueryCandidateBudgetExceeded;
             reference_bytes = std.math.add(usize, reference_bytes, refs_estimate) catch return error.QueryCandidateBudgetExceeded;
             if (reference_bytes > max_manifest_bytes) return error.QueryCandidateBudgetExceeded;
-            if (try cachedFile(a, io, cache_path, generation_domain, chunk_expiry, file, true)) |cached| {
+            if (try cachedExtent(a, io, parent, digest, generation_domain, chunk_expiry, file, true, request.expires_ms)) |cached| {
                 try files.append(a, .{ .path = file.path, .size = file.size, .chunks = cached });
                 continue;
             }
@@ -366,7 +376,7 @@ pub const Repository = struct {
             defer source.close(io);
             var chunks: std.ArrayListUnmanaged(Ref) = .empty;
             var offset: u64 = 0;
-            if (try cachedFile(a, io, cache_path, generation_domain, chunk_expiry, file, false)) |prefix_refs| {
+            if (try cachedExtent(a, io, parent, digest, generation_domain, chunk_expiry, file, false, request.expires_ms)) |prefix_refs| {
                 try chunks.appendSlice(a, prefix_refs);
                 for (prefix_refs) |ref| offset += ref.byte_len;
             }
@@ -589,7 +599,7 @@ test "external lake native repository warming resumes bounded uploads after rest
     const scratch = arena.allocator();
     const id: [64]u8 = @splat('d');
     const namespace: Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
-    const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000, .create = true };
+    const request: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + cache_window_ms, .create = true };
     const root = try std.fmt.allocPrint(scratch, "{s}/{s}", .{ directory.path(), id });
     try fs.createDirPathPortable(io, root);
     const bytes = try scratch.alloc(u8, 2 * chunk_bytes + 17);
@@ -606,7 +616,19 @@ test "external lake native repository warming resumes bounded uploads after rest
     try std.testing.expect(try repository.capability().warm(io, root, request, namespace, .none, chunk_bytes));
     const manifest = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, request, namespace, .none), request, namespace);
     try std.testing.expectEqual(@as(usize, 3), manifest.files[0].chunks.len);
-    // A foreground capture after warming uses the already committed generation.
+    // A shorter foreground cut reuses the warmer's different retention epoch.
+    const short_id: [64]u8 = @splat('e');
+    var short_request = request;
+    short_request.id = &short_id;
+    short_request.expires_ms = request.expires_ms - cache_window_ms + 300_000;
+    const short_root = try std.fmt.allocPrint(scratch, "{s}/{s}", .{ directory.path(), short_id });
+    try fs.createDirPathPortable(io, short_root);
+    try std.Io.Dir.hardLink(.cwd(), try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{root}), .cwd(), try std.fmt.allocPrint(scratch, "{s}/immutable.sst", .{short_root}), io, .{});
+    try cut.finish(a, io, short_root, short_request, namespace, 1, .none);
+    // One turn cannot upload this file: completing proves cross-epoch reuse.
+    try std.testing.expect(try repository.capability().warm(io, short_root, short_request, namespace, .none, chunk_bytes));
+    const short_manifest = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, short_request, namespace, .none), short_request, namespace);
+    try std.testing.expectEqualStrings(manifest.files[0].chunks[0].artifact_id, short_manifest.files[0].chunks[0].artifact_id);
     try repository.capability().publish(io, root, request, namespace, .none);
     var remote = (try repository.capability().openRead(io, try std.fmt.allocPrint(scratch, "{s}/remote", .{directory.path()}), request, namespace, .none)).?;
     defer remote.deinit();
