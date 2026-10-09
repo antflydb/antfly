@@ -420,6 +420,10 @@ between locator batches. Live-row cache tests cycle more artifacts than fit in t
 cache while allowing exactly four backing buffers; rank/select tests compare each
 selected ordinal with scalar iteration across dense holes and u32 boundaries.
 Existing score differential tests cover negative terms, ties, filtering and spill.
+Visibility lookup regressions exercise 100,003 missing keys with one seek per
+independent metadata lane, cached EOF, backward lookups and seek-error recovery.
+The same proven-interval reuse serves streamed disk-proof capture without
+alternating one cursor between epoch and deletion key families.
 Real Parquet and PyIceberg end-to-end tests remain the integration gate.
 
 Representative archive benchmarks are still required to quantify throughput,

@@ -1745,6 +1745,10 @@ fn immutableVersion(data: []const u8) !u32 {
 /// the parent query transaction, including when its allocator is an arena.
 const VisibilityReader = struct {
     cursors: [3]backend_erased.Cursor,
+    entries: [3]?backend_erased.Entry = @splat(null),
+    lower_keys: [3][17]u8 = undefined,
+    lower_lengths: [3]u8 = @splat(0),
+    positioned: [3]bool = @splat(false),
     fn init(txn: *backend_erased.ReadTxn) !@This() {
         var cursors: [3]backend_erased.Cursor = undefined;
         var count: usize = 0;
@@ -1760,7 +1764,26 @@ const VisibilityReader = struct {
     }
     pub fn get(self: *@This(), key: []const u8) ![]const u8 {
         const lane: usize = if (key[0] == key_doc_tombstone) 0 else if (key[0] == key_doc_incarnation) 1 else 2;
-        const entry = (try self.cursors[lane].seekAtOrAfter(key)) orelse return error.NotFound;
+        if (key.len > self.lower_keys[lane].len) return error.InvalidSparseSegment;
+        // A lower-bound seek proves the entire gap before its returned key
+        // absent. Reuse that borrowed result (including EOF) while requests
+        // stay in the proven interval. Missing metadata families must not
+        // restart a merged LSM cursor for every ascending posting ordinal.
+        if (self.positioned[lane] and std.mem.order(u8, key, self.lower_keys[lane][0..self.lower_lengths[lane]]) != .lt) {
+            if (self.entries[lane]) |entry| {
+                switch (std.mem.order(u8, key, entry.key)) {
+                    .eq => return entry.value,
+                    .lt => return error.NotFound,
+                    .gt => {},
+                }
+            } else return error.NotFound;
+        }
+        self.positioned[lane] = false;
+        self.entries[lane] = try self.cursors[lane].seekAtOrAfter(key);
+        @memcpy(self.lower_keys[lane][0..key.len], key);
+        self.lower_lengths[lane] = @intCast(key.len);
+        self.positioned[lane] = true;
+        const entry = self.entries[lane] orelse return error.NotFound;
         if (!std.mem.eql(u8, entry.key, key)) return error.NotFound;
         return entry.value;
     }
@@ -1804,8 +1827,8 @@ fn captureDiskProofs(a: Allocator, txn: anytype, id: u64, docmap: bool, options:
     errdefer result.deinit();
     var cursor = try txn.openCursor();
     defer cursor.close();
-    var current = try txn.openCursor();
-    defer current.close();
+    var current = try VisibilityReader.init(txn);
+    defer current.deinit();
     var key: [17]u8 = undefined;
     const prefix = segmentIncarnationKey(&key, id, 0, docmap)[0..9];
     var next = try cursor.seekAtOrAfter(prefix);
@@ -1816,16 +1839,13 @@ fn captureDiskProofs(a: Allocator, txn: anytype, id: u64, docmap: bool, options:
         const doc = std.math.cast(u32, std.mem.readInt(u64, entry.key[9..17], .big)) orelse return error.DocNumOverflow;
         const epoch = std.mem.readInt(u64, entry.value[0..8], .little);
         var current_key: [9]u8 = undefined;
-        const wanted = docIncarnationKey(&current_key, doc);
-        const found = try current.seekAtOrAfter(wanted);
-        const now = if (found) |value| blk: {
-            if (!std.mem.eql(u8, value.key, wanted)) break :blk @as(u64, 0);
-            if (value.value.len != 8) return error.InvalidSparseSegment;
-            break :blk std.mem.readInt(u64, value.value[0..8], .little);
-        } else 0;
+        const now = try currentIncarnation(&current, doc);
         if (epoch > now) return error.InvalidSparseSegment;
         const deleted_key = docTombstoneKey(&current_key, doc);
-        const deleted = if (try current.seekAtOrAfter(deleted_key)) |value| std.mem.eql(u8, value.key, deleted_key) else false;
+        const deleted = if (current.get(deleted_key)) |_| true else |err| switch (err) {
+            error.NotFound => false,
+            else => return err,
+        };
         try result.append(.{ .doc_num = doc, .epoch = epoch, .live = epoch == now and !deleted });
         next = try cursor.next();
     }
@@ -7452,4 +7472,74 @@ test "sparse background compaction retires fully deleted inputs without publishi
     try std.testing.expect(try index.publishSegmentCompactionTask(&task, &result));
     try SparseIndex.completeSegmentCompactionTask(a, &task, &result, null);
     try std.testing.expectEqual(@as(usize, 0), try index.segmentCount());
+}
+
+test "sparse visibility reuses proven missing intervals and EOF without losing backward lookups" {
+    const Fake = struct {
+        entry: backend_erased.Entry,
+        seeks: *usize,
+        fail_next: *bool,
+        pub fn close(_: *@This()) void {}
+        pub fn first(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn last(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn next(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn prev(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn seekAtOrBefore(_: *@This(), _: []const u8) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_erased.Entry {
+            self.seeks.* += 1;
+            if (self.fail_next.*) {
+                self.fail_next.* = false;
+                return error.InjectedSeekFailure;
+            }
+            return if (std.mem.order(u8, self.entry.key, key) != .lt) self.entry else null;
+        }
+    };
+    var source_key: [17]u8 = undefined;
+    _ = segmentIncarnationKey(&source_key, 42, 9000, false);
+    var seeks: [3]usize = @splat(0);
+    var failures: [3]bool = @splat(false);
+    var cursors: [3]backend_erased.Cursor = undefined;
+    var opened: usize = 0;
+    errdefer for (cursors[0..opened]) |*cursor| cursor.close();
+    for (&cursors, 0..) |*cursor, lane| {
+        cursor.* = try backend_erased.cursorFrom(std.testing.allocator, Fake{
+            .entry = .{ .key = &source_key, .value = "epoch" },
+            .seeks = &seeks[lane],
+            .fail_next = &failures[lane],
+        });
+        opened += 1;
+    }
+    var reader: VisibilityReader = .{ .cursors = cursors };
+    opened = 0;
+    defer reader.deinit();
+    var key: [9]u8 = undefined;
+    for (0..100_003) |doc| {
+        try std.testing.expectError(error.NotFound, reader.get(docTombstoneKey(&key, doc)));
+        try std.testing.expectError(error.NotFound, reader.get(docIncarnationKey(&key, doc)));
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1, 0 }, &seeks);
+    var requested: [17]u8 = undefined;
+    try std.testing.expectError(error.NotFound, reader.get(segmentIncarnationKey(&requested, 42, 8999, false)));
+    try std.testing.expectEqualStrings("epoch", try reader.get(&source_key));
+    try std.testing.expectEqual(@as(usize, 1), seeks[2]);
+    try std.testing.expectError(error.NotFound, reader.get(segmentIncarnationKey(&requested, 42, 9001, false)));
+    try std.testing.expectError(error.NotFound, reader.get(segmentIncarnationKey(&requested, 42, 100_003, false)));
+    try std.testing.expectEqual(@as(usize, 2), seeks[2]);
+    try std.testing.expectEqualStrings("epoch", try reader.get(&source_key));
+    try std.testing.expectError(error.NotFound, reader.get(segmentIncarnationKey(&requested, 42, 8999, false)));
+    try std.testing.expectEqual(@as(usize, 4), seeks[2]);
+    failures[2] = true;
+    try std.testing.expectError(error.InjectedSeekFailure, reader.get(segmentIncarnationKey(&requested, 42, 9001, false)));
+    try std.testing.expectEqualStrings("epoch", try reader.get(&source_key));
+    try std.testing.expectEqual(@as(usize, 6), seeks[2]);
 }
