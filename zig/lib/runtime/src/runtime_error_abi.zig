@@ -765,6 +765,7 @@ pub const Detail = enum(c_int) {
     read_safety_barrier_unavailable,
     backend_runtime_unavailable,
     invalid_runnable_demand,
+    sql_write_capacity_unavailable,
 };
 
 pub const Status = extern struct {
@@ -787,6 +788,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.SchedulerFull => status(.retryable, .scheduler_full),
         error.InvalidRunnableTransition => status(.internal, .invalid_runnable_transition),
         error.InvalidRunnableDemand => status(.invalid_argument, .invalid_runnable_demand),
+        error.SqlWriteCapacityUnavailable => status(.unavailable, .sql_write_capacity_unavailable),
         error.InvalidReadFenceTransition => status(.internal, .invalid_read_fence_transition),
         error.ExecutionWaitUnsupported => status(.unsupported, .execution_wait_unsupported),
         error.ReadSafetyBarrierUnavailable => status(.unavailable, .read_safety_barrier_unavailable),
@@ -1492,6 +1494,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .scheduler_full => "SchedulerFull",
         .invalid_runnable_transition => "InvalidRunnableTransition",
         .invalid_runnable_demand => "InvalidRunnableDemand",
+        .sql_write_capacity_unavailable => "SqlWriteCapacityUnavailable",
         .invalid_read_fence_transition => "InvalidReadFenceTransition",
         .execution_wait_unsupported => "ExecutionWaitUnsupported",
         .read_safety_barrier_unavailable => "ReadSafetyBarrierUnavailable",
@@ -2415,4 +2418,12 @@ test "external lake and spill errors retain exact identity across runtime archiv
         try std.testing.expect(errorHasStableDetail(err));
         try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
     }
+}
+
+test "SQL worker capacity error preserves append-only identity and unavailable behavior" {
+    try std.testing.expectEqual(@backingInt(Detail.invalid_runnable_demand) + 1, @backingInt(Detail.sql_write_capacity_unavailable));
+    const value = statusFromError(error.SqlWriteCapacityUnavailable);
+    try std.testing.expectEqual(@backingInt(Code.unavailable), value.code);
+    try std.testing.expectEqual(error.SqlWriteCapacityUnavailable, errorFromStatus(value));
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(Code.internal), .detail = value.detail }));
 }
