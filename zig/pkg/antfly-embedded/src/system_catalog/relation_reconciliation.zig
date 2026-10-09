@@ -239,6 +239,9 @@ fn decodeCandidateGenerationKey(bytes: []const u8, generation: Generation) !name
     try key.validate();
     return key;
 }
+pub fn logicalCandidateKey(bytes: []const u8, generation: Generation) !names.Key {
+    return decodeCandidateGenerationKey(bytes, generation);
+}
 
 pub fn rootKey(buf: []u8, group: u64) ![]const u8 {
     if (group == 0) return error.InvalidCatalogRecord;
@@ -386,6 +389,142 @@ pub fn Verifier(comptime Reader: type) type {
                 const expected = if (state.phase == .building) state.pass else state.expected;
                 if (self.claims != expected.claims or !std.mem.eql(u8, &self.claim_hash, &expected.claim_hash)) return error.InvalidCatalogRecord;
             } else if (self.claims != 0) return error.InvalidCatalogRecord;
+        }
+    };
+}
+
+/// Verify authenticated replay against a previously verified receiver cut.
+/// Only changed records are fed; before/after readers pin the same metadata
+/// transaction. This is not a seed verifier or serving capability proof.
+pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
+    return struct {
+        arena: std.heap.ArenaAllocator,
+        before: *Before,
+        after: *After,
+        group_id: u64,
+        old: ?State,
+        current: ?State,
+        root: ?Generation,
+        count: u64 = 0,
+        hash: [32]u8 = @splat(0),
+        records: usize = 0,
+        retirements: std.AutoHashMapUnmanaged([16]u8, void) = .empty,
+        pub fn init(a: A, before: *Before, after: *After, group: u64) !@This() {
+            var buf: [128]u8 = undefined;
+            const key = try jobKey(&buf, group);
+            const old = if (try optionalGet(before, key)) |bytes| try State.decode(bytes) else null;
+            const current = if (try optionalGet(after, key)) |bytes| try State.decode(bytes) else null;
+            if (old) |prior| {
+                const next = current orelse return error.InvalidCatalogRecord;
+                if (prior.group_id != group or std.mem.order(u8, &prior.job_id, &next.job_id) == .gt) return error.InvalidCatalogRecord;
+                if (std.mem.eql(u8, &prior.job_id, &next.job_id)) {
+                    if (!prior.epoch.eql(next.epoch) or @backingInt(next.phase) < @backingInt(prior.phase)) return error.InvalidCatalogRecord;
+                    if (prior.phase != .building and !totalsEqual(prior.expected, next.expected)) return error.InvalidCatalogRecord;
+                    if (prior.phase == next.phase and (next.pass.rows < prior.pass.rows or next.pass.claims < prior.pass.claims or
+                        std.mem.order(u8, next.cursor(), prior.cursor()) == .lt)) return error.InvalidCatalogRecord;
+                }
+            }
+            if (current) |next| if (next.group_id != group) return error.InvalidCatalogRecord;
+            const root_key = try rootKey(&buf, group);
+            const old_root = if (try optionalGet(before, root_key)) |bytes| try Generation.decode(bytes) else null;
+            const root = if (try optionalGet(after, root_key)) |bytes| try Generation.decode(bytes) else null;
+            if (old_root) |prior| {
+                const next = root orelse return error.InvalidCatalogRecord;
+                if (prior.group_id != group or std.mem.order(u8, &prior.job_id, &next.job_id) == .gt) return error.InvalidCatalogRecord;
+            }
+            // Checks root ancestry/readiness with point reads only. Full
+            // candidate cardinality is checked by the delta below, not finish.
+            _ = try Verifier(After).init(after, group);
+            var result: @This() = .{ .arena = .init(a), .before = before, .after = after, .group_id = group, .old = old, .current = current, .root = root };
+            if (old) |prior| if (current) |next| if (std.mem.eql(u8, &prior.job_id, &next.job_id)) {
+                const totals = if (prior.phase == .building) prior.pass else prior.expected;
+                result.count = totals.claims;
+                result.hash = totals.claim_hash;
+            };
+            return result;
+        }
+        pub fn deinit(self: *@This()) void {
+            self.arena.deinit();
+            self.* = undefined;
+        }
+        fn checkRetirement(self: *@This(), generation: Generation) !void {
+            if (self.retirements.contains(generation.job_id)) return;
+            if (self.retirements.count() == names.max_claims) return error.CatalogCommandTooLarge;
+            const current = self.current orelse return error.InvalidCatalogRecord;
+            if (generation.group_id != self.group_id or std.mem.order(u8, &generation.job_id, &current.job_id) != .lt) return error.InvalidCatalogRecord;
+            var buf: [128]u8 = undefined;
+            const key = try retirementKey(&buf, generation);
+            const old = if (try optionalGet(self.before, key)) |bytes| try Retirement.decode(bytes) else null;
+            const next = if (try optionalGet(self.after, key)) |bytes| try Retirement.decode(bytes) else null;
+            if (old) |prior| {
+                if (!prior.generation.eql(generation)) return error.InvalidCatalogRecord;
+            } else {
+                const prior = self.old orelse return error.InvalidCatalogRecord;
+                if (!Generation.of(&prior).eql(generation) or std.mem.order(u8, &prior.job_id, &current.job_id) != .lt) return error.InvalidCatalogRecord;
+            }
+            const resume_key = if (old) |*prior| prior.cursor() else "";
+            if (next) |*retired| {
+                if (!retired.generation.eql(generation) or std.mem.order(u8, retired.cursor(), resume_key) == .lt) return error.InvalidCatalogRecord;
+                if (self.root) |published| if (published.eql(generation) and retired.cursor_len != 0) return error.InvalidCatalogRecord;
+            } else if (self.root) |published| if (published.eql(generation)) return error.InvalidCatalogRecord;
+            // A bounded successor probe catches skipped GC entries and intent
+            // removal with remaining data. Resume past the original cursor,
+            // not the generation's already tombstoned prefix.
+            var prefix_buf: [max_cursor_bytes]u8 = undefined;
+            const prefix = try candidateGenerationPrefix(&prefix_buf, generation);
+            var cursor = try self.after.openCursor();
+            defer cursor.close();
+            var entry = try cursor.seekAtOrAfter(if (resume_key.len == 0) prefix else resume_key);
+            if (entry) |row| if (std.mem.eql(u8, row.key, resume_key)) {
+                entry = try cursor.next();
+            };
+            if (entry) |row| if (std.mem.startsWith(u8, row.key, prefix)) {
+                const retired = next orelse return error.InvalidCatalogRecord;
+                if (std.mem.order(u8, row.key, retired.cursor()) != .gt) return error.InvalidCatalogRecord;
+            };
+            try self.retirements.put(self.arena.allocator(), generation.job_id, {});
+        }
+        pub fn feed(self: *@This(), key: []const u8) !void {
+            const record = (try classify(key)) orelse return;
+            if (record.group_id != self.group_id) return error.InvalidCatalogRecord;
+            self.records += 1;
+            if (self.records > names.max_claims + max_tables_per_page) return error.CatalogCommandTooLarge;
+            const old = try optionalGet(self.before, key);
+            const next = try optionalGet(self.after, key);
+            switch (record.kind) {
+                .job, .root => {}, // Whole-record fences were checked by init.
+                .retirement => try self.checkRetirement(record.generation.?),
+                .candidate => {
+                    const current = self.current orelse return error.InvalidCatalogRecord;
+                    const generation = record.generation.?;
+                    const prior = if (old) |bytes| try names.Owner.decode(bytes) else null;
+                    const owner = if (next) |bytes| try names.Owner.decode(bytes) else null;
+                    if (prior) |value| if (owner) |final| if (value.eql(final)) return;
+                    if (std.mem.eql(u8, &generation.job_id, &current.job_id)) {
+                        if (prior != null or owner == null) return error.InvalidCatalogRecord;
+                        if (self.old) |before| if (std.mem.eql(u8, &before.job_id, &current.job_id) and before.phase != .building) return error.InvalidCatalogRecord;
+                        self.count = std.math.add(u64, self.count, 1) catch return error.InvalidCatalogRecord;
+                        const logical = try decodeCandidateGenerationKey(key, generation);
+                        addClaimHash(&self.hash, try claimHash(.{ .key = logical, .owner = owner.? }));
+                    } else {
+                        if (prior == null or owner != null) return error.InvalidCatalogRecord;
+                        try self.checkRetirement(generation);
+                        var buf: [128]u8 = undefined;
+                        if (try optionalGet(self.after, try retirementKey(&buf, generation))) |bytes| {
+                            const retired = try Retirement.decode(bytes);
+                            if (std.mem.order(u8, key, retired.cursor()) == .gt) return error.InvalidCatalogRecord;
+                        }
+                        if (self.root) |published| if (published.eql(generation)) return error.InvalidCatalogRecord;
+                    }
+                },
+            }
+        }
+        pub fn finish(self: *@This()) !void {
+            if (self.current) |current| {
+                const expected = if (current.phase == .building) current.pass else current.expected;
+                if (self.count != expected.claims or !std.mem.eql(u8, &self.hash, &expected.claim_hash)) return error.InvalidCatalogRecord;
+                if (self.old) |old| if (!std.mem.eql(u8, &old.job_id, &current.job_id)) try self.checkRetirement(Generation.of(&old));
+            } else if (self.count != 0) return error.InvalidCatalogRecord;
         }
     };
 }
@@ -1190,4 +1329,88 @@ test "relation reconciliation stored cut verification rejects missing forged and
     foreign.group_id = 42;
     const foreign_key = try candidateKey(&buf, &foreign, test_claims[0].key);
     try std.testing.expectError(error.InvalidCatalogRecord, verifier.feed(foreign_key, &owner));
+}
+
+test "relation reconciliation replay verifies deltas immutable seals and bounded GC cuts" {
+    const T = struct {
+        fn copy(original: *TestTxn) !TestTxn {
+            var result = TestTxn.init();
+            errdefer result.deinit();
+            var entries = original.values.iterator();
+            while (entries.next()) |entry| try result.put(entry.key_ptr.*, entry.value_ptr.*);
+            return result;
+        }
+        fn check(a: A, before: *TestTxn, after: *TestTxn, keys: []const []const u8) !void {
+            var verifier = try ReplayVerifier(TestTxn, TestTxn).init(a, before, after, 41);
+            defer verifier.deinit();
+            for (keys) |key| try verifier.feed(key);
+            try verifier.finish();
+        }
+    };
+    const a = std.testing.allocator;
+    var empty = TestTxn.init();
+    defer empty.deinit();
+    var built = TestTxn.init();
+    defer built.deinit();
+    const initial = try State.init(41, try nextJobId(null), test_epoch);
+    try start(&built, &initial, test_epoch, null);
+    var source: TestSource = .{ .rows = &test_rows };
+    var page = try Page.prepareSource(a, initial, test_epoch, &source);
+    defer page.deinit();
+    try page.apply(&built, test_epoch);
+    var job_buf: [128]u8 = undefined;
+    const job_key = try jobKey(&job_buf, 41);
+    var key_buf: [max_cursor_bytes]u8 = undefined;
+    const key = try candidateKey(&key_buf, &initial, test_claims[0].key);
+    try T.check(a, &empty, &built, &.{ job_key, key });
+    try std.testing.expectError(error.InvalidCatalogRecord, T.check(a, &empty, &built, &.{job_key}));
+    {
+        var bad = try T.copy(&built);
+        defer bad.deinit();
+        var forged = test_owner;
+        forged.schema_digest[0] ^= 1;
+        try bad.put(key, &(try forged.encode()));
+        try std.testing.expectError(error.InvalidCatalogRecord, T.check(a, &empty, &bad, &.{ job_key, key }));
+        // Once sealed, even a matching altered fingerprint cannot authorize
+        // changing the generation's previously verified owner bytes.
+        var state = page.after;
+        state.expected.claim_hash = try claimHash(.{ .key = test_claims[0].key, .owner = forged });
+        try bad.put(job_key, &(try state.encode()));
+        try std.testing.expectError(error.InvalidCatalogRecord, T.check(a, &built, &bad, &.{ job_key, key }));
+        try bad.delete(job_key);
+        try std.testing.expectError(error.InvalidCatalogRecord, T.check(a, &built, &bad, &.{job_key}));
+    }
+    var retired = try T.copy(&built);
+    defer retired.deinit();
+    const successor = try State.init(41, try nextJobId(&initial), test_epoch);
+    try start(&retired, &successor, test_epoch, &(try page.after.encode()));
+    var retirement_buf: [128]u8 = undefined;
+    const retirement_key = try retirementKey(&retirement_buf, Generation.of(&initial));
+    try T.check(a, &built, &retired, &.{ job_key, retirement_key });
+    {
+        var bad = try T.copy(&retired);
+        defer bad.deinit();
+        try bad.delete(retirement_key);
+        try std.testing.expectError(error.InvalidCatalogRecord, T.check(a, &retired, &bad, &.{retirement_key}));
+        var skipped = Retirement.init(Generation.of(&initial));
+        skipped.cursor_len = @intCast(key.len);
+        @memcpy(skipped.cursor_bytes[0..key.len], key);
+        try bad.put(retirement_key, &(try skipped.encode()));
+        try std.testing.expectError(error.InvalidCatalogRecord, T.check(a, &retired, &bad, &.{retirement_key}));
+        const original = Retirement.init(Generation.of(&initial));
+        try bad.put(retirement_key, &(try original.encode()));
+        try bad.delete(key);
+        try std.testing.expectError(error.InvalidCatalogRecord, T.check(a, &retired, &bad, &.{key}));
+    }
+    var collected = try T.copy(&retired);
+    defer collected.deinit();
+    try collected.delete(key);
+    try collected.delete(retirement_key);
+    try T.check(a, &retired, &collected, &.{ key, retirement_key });
+    const Fault = struct {
+        fn run(alloc: A, before: *TestTxn, after: *TestTxn, keys: []const []const u8) !void {
+            try T.check(alloc, before, after, keys);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fault.run, .{ &retired, &collected, @as([]const []const u8, &.{ key, retirement_key }) });
 }

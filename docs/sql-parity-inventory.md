@@ -1537,8 +1537,23 @@ or forged claims and missing job/retirement records, and reject a correctly
 framed incompatible checkpoint on import. A failed installing root remains
 unusable as a fresh target. This is recovery consistency for unpublished
 reconciliation state, not SQL serving or mutable active-root activation.
+Binary-effect replay now verifies bounded changed-key deltas against the
+receiver's previously verified cut rather than rescanning every candidate.
+It fences job/epoch/root regression and sealed fingerprints, accounts for
+candidate insertions, and checks retirement progress with bounded successor
+probes. New candidate owners are independently point-derived from authoritative
+table schemas and bindings, preventing a forged claim and matching forged job
+hash from authenticating each other. Per-effect work is bounded by the source
+page's table/claim limits; unrelated document effects do not install a
+before-image observer. Native tests reject missing job/claim effects, forged
+owners, wrong names and cross-group keys without publishing a receipt or
+signals, then retry the valid effect at the same log position and reopen the
+store to verify durable idempotence. Pure tests cover immutable seals, GC
+cursor skips, incomplete intent removal and allocator failures. This is delta
+consistency and active-source membership, not a complete-source adoption or
+serving capability proof; pending-generation sources remain unwired.
 Authoritative epoch wiring, pending-generation reservation sources,
-Raft job commands, bounded binary-effect replay verification, GC scheduling,
+Raft job commands, GC scheduling,
 capability barriers and atomic active-root publication still
 precede writer adoption and SQL point resolution. No original SQL case is
 credited for this protocol component.
