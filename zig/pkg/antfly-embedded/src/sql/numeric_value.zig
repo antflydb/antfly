@@ -684,7 +684,7 @@ pub fn fromFloat(ctx: *Context, input: f64, real: bool) !Owned {
     const parts = try @import("../common/json_float_decimal.zig").Parts.init(number);
     try ctx.charge(parts.work());
     var coefficient_buffer: [768]u8 = undefined;
-    const coefficient = try std.fmt.bufPrint(&coefficient_buffer, "{d}", .{parts.coefficient()});
+    const coefficient = try parts.coefficientText(&coefficient_buffer);
     var text_buffer: [800]u8 = undefined;
     const text = try std.fmt.bufPrint(&text_buffer, "{s}{s}e{d}", .{ if (parts.negative) "-" else "", coefficient, parts.decimalExponent() });
     var exact = try parse(ctx, text);

@@ -2152,6 +2152,18 @@ before return. These are CPU/allocation microbenchmarks, not end-to-end SQL or
 storage throughput. Native session integration passes 51/51 build steps,
 including its new request-buffer allocation-fault test and 12 C-ABI SQL tests.
 No original parity disposition is changed by this infrastructure improvement.
+Exact binary64-to-decimal expansion now formats bounded base-10^9 limbs rather
+than repeatedly dividing a 4,096-bit integer. SQL JSON numeric comparisons,
+decimal-token hash equivalence, PostgreSQL NUMERIC float coercion and canonical
+JSON persistence share the allocation-free kernel; their logical decimal and
+budget contracts are unchanged. The independent fixed-integer oracle checks
+every finite exponent, four boundary/pattern mantissas and both signs, including
+subnormals, signed zero, output-buffer limits and nonfinite rejection. A local
+ReleaseFast microbenchmark compares identical output checksums for 64 values
+spanning the finite exponent range in alternating execution order: the old wide
+formatter takes 1,366–1,419 ms versus 0.183–0.217 ms for decimal limbs across
+three samples. These are kernel measurements, not end-to-end query throughput.
+The change adds no original-case credit.
 Native relation publication now has a separate v32 command carrying the ready
 cut, exact predecessor generation and membership-bound activation, never a
 sender-authored publication proof. Replica preparation authenticates source and

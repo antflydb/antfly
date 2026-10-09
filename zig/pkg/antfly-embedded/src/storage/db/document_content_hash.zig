@@ -359,8 +359,10 @@ fn writeCanonicalJsonValue(alloc: std.mem.Allocator, writer: *std.Io.Writer, val
             // an exact parsed number token. Normalize both with the identical
             // decimal codec so encoding always passes strict restore checks.
             const parts = try @import("../../common/json_float_decimal.zig").Parts.init(number);
+            var coefficient_buffer: [768]u8 = undefined;
+            const coefficient = try parts.coefficientText(&coefficient_buffer);
             var buffer: [800]u8 = undefined;
-            const raw = std.fmt.bufPrint(&buffer, "{s}{d}e{d}", .{ if (parts.negative) "-" else "", parts.coefficient(), parts.decimalExponent() }) catch unreachable;
+            const raw = std.fmt.bufPrint(&buffer, "{s}{s}e{d}", .{ if (parts.negative) "-" else "", coefficient, parts.decimalExponent() }) catch unreachable;
             try writeCanonicalJsonNumber(alloc, writer, raw);
         },
         else => try std.json.Stringify.value(value, .{}, writer),

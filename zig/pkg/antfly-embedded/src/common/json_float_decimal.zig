@@ -58,4 +58,107 @@ pub const Parts = struct {
         }
         return exact;
     }
+
+    /// Exact decimal expansion using bounded base-10^9 limbs. Formatting a
+    /// u4096 through the generic integer writer repeatedly divides a wide
+    /// integer; that dominates cold numeric comparison even for binary64.
+    /// Here every multiply and carry fits u64, with no heap or wide division.
+    pub fn coefficientText(self: Parts, buffer: []u8) ![]const u8 {
+        const radix: u64 = 1_000_000_000;
+        var limbs: [86]u32 = undefined; // ceil(767 / 9)
+        var len: usize = 0;
+        var initial = self.mantissa;
+        while (true) {
+            limbs[len] = @intCast(initial % radix);
+            len += 1;
+            initial /= radix;
+            if (initial == 0) break;
+        }
+        var remaining: usize = @intCast(@abs(self.binary_exponent));
+        while (remaining != 0) {
+            // 5^13 and 2^29 both preserve limb*factor+carry within u64.
+            const chunk = @min(remaining, if (self.binary_exponent < 0) @as(usize, 13) else 29);
+            const factor: u64 = if (self.binary_exponent < 0) std.math.pow(u64, 5, chunk) else @as(u64, 1) << @intCast(chunk);
+            var carry: u64 = 0;
+            for (limbs[0..len]) |*limb| {
+                const product = @as(u64, limb.*) * factor + carry;
+                limb.* = @intCast(product % radix);
+                carry = product / radix;
+            }
+            while (carry != 0) {
+                std.debug.assert(len < limbs.len);
+                limbs[len] = @intCast(carry % radix);
+                len += 1;
+                carry /= radix;
+            }
+            remaining -= chunk;
+        }
+        const leading = try std.fmt.bufPrint(buffer, "{d}", .{limbs[len - 1]});
+        const size = leading.len + (len - 1) * 9;
+        if (buffer.len < size) return error.NoSpaceLeft;
+        var used = leading.len;
+        var index = len - 1;
+        while (index != 0) {
+            index -= 1;
+            _ = try std.fmt.bufPrint(buffer[used..][0..9], "{d:0>9}", .{limbs[index]});
+            used += 9;
+        }
+        return buffer[0..used];
+    }
 };
+
+test "exact float decimal limbs match the fixed integer coefficient across binary64 exponents" {
+    var buffer: [768]u8 = undefined;
+    // Every finite exponent, both signs, and mantissa boundaries. The oracle
+    // is independent wide multiplication; it never formats the wide integer.
+    for (0..2047) |exponent| {
+        for ([_]u64{ 0, 1, 0x5555555555555, 0xfffffffffffff }) |mantissa| {
+            for ([_]u64{ 0, @as(u64, 1) << 63 }) |sign| {
+                const bits = sign | (@as(u64, @intCast(exponent)) << 52) | mantissa;
+                const parts = try Parts.init(@bitCast(bits));
+                const text = try parts.coefficientText(&buffer);
+                try std.testing.expect(text.len <= 767);
+                try std.testing.expect(text.len == 1 or text[0] != '0');
+                try std.testing.expectEqual(parts.coefficient(), try std.fmt.parseInt(u4096, text, 10));
+                try std.testing.expectEqual(sign != 0 and bits & 0x7fffffffffffffff != 0, parts.negative);
+            }
+        }
+    }
+    const half = try Parts.init(0.5);
+    try std.testing.expectEqualStrings("5", try half.coefficientText(&buffer));
+    const zero = try Parts.init(-0.0);
+    try std.testing.expectEqualStrings("0", try zero.coefficientText(&buffer));
+    var short: [1]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, (try Parts.init(std.math.floatMax(f64))).coefficientText(&short));
+    try std.testing.expectError(error.InvalidJsonNumber, Parts.init(std.math.inf(f64)));
+    try std.testing.expectError(error.InvalidJsonNumber, Parts.init(std.math.nan(f64)));
+}
+
+test "exact float decimal benchmark bounded limbs against wide integer formatting" {
+    if (@import("builtin").mode == .debug) return error.SkipZigTest;
+    const count = 64;
+    var values: [count]Parts = undefined;
+    for (&values, 0..) |*parts, i| {
+        const exponent: u64 = @intCast(i * 2046 / (count - 1));
+        parts.* = try Parts.init(@bitCast((exponent << 52) | 0xaaaaaaaaaaaaa));
+    }
+    for (0..3) |sample| {
+        var elapsed: [2]i96 = undefined;
+        var checksums: [2]u64 = undefined;
+        for (0..2) |pass| {
+            const optimized = (sample + pass) % 2 != 0;
+            const slot = @intFromBool(optimized);
+            var buffer: [768]u8 = undefined;
+            var checksum = std.hash.Wyhash.init(0);
+            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            for (values) |parts| {
+                const text = if (optimized) try parts.coefficientText(&buffer) else try std.fmt.bufPrint(&buffer, "{d}", .{parts.coefficient()});
+                checksum.update(text);
+            }
+            elapsed[slot] = std.Io.Clock.awake.now(std.testing.io).nanoseconds - start;
+            checksums[slot] = checksum.final();
+        }
+        try std.testing.expectEqual(checksums[0], checksums[1]);
+        std.debug.print("exact_float_decimal {{\"values\":{d},\"sample\":{d},\"wide_ns\":{d},\"limb_ns\":{d}}}\n", .{ count, sample, elapsed[0], elapsed[1] });
+    }
+}

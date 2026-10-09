@@ -361,7 +361,7 @@ fn decimal(value: Json, buffer: []u8, budget: *Budget) !Decimal {
         .float => |v| {
             const parts = @import("../common/json_float_decimal.zig").Parts.init(v) catch return error.SqlNumericOutOfRange;
             try budget.consume(parts.work());
-            var result = try Decimal.parse(try std.fmt.bufPrint(buffer, "{d}", .{parts.coefficient()}), budget);
+            var result = try Decimal.parse(try parts.coefficientText(buffer), budget);
             result.negative = parts.negative;
             result.magnitude += parts.decimalExponent();
             return result;
