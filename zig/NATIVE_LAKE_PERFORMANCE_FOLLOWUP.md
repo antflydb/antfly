@@ -313,3 +313,66 @@ Positive selections reject disjoint segments before opening posting streams,
 avoiding a first-block read from every later segment for a point query. Older
 paged roots without the optional bounds retain the ordinary read path. The
 multi-segment regression admits only the overlapping stream and reads one block.
+
+## Bounded native generation publication and metadata maintenance
+
+Native sparse checkpoint recipe v7 and index-definition fence v8 add independently
+addressable score summaries and ordinal bucket routes. A term's routes carry
+conservative segment ordinal bounds. Positive selections occupying at most eight
+16-bit ordinal buckets seek their interval-tree ancestors, deduplicate segment identities,
+and reject disjoint extents without loading term-directory roots. Broad selections
+use the primary term route. Legacy routes retain root-based discovery until rebuilt.
+Each segment/term has one dyadic covering route, preventing wide compactions
+from multiplying routes across every covered bucket. Navigation admission includes
+the deduplication table.
+
+Posting score summaries contain the first ordinal and the canonical quantizer's
+minimum/maximum decoded weights. Native DAAT streams initially load these small
+summaries; conservative block and prefix bounds can reject a block before its
+payload is read. Scoring or advancing within an admitted block materializes its
+payload. Signed weights, exact ties, canonical f32 accumulation, and legacy blocks
+keep their existing semantics. Summary and payload keys share a generation and
+publish together. Speculative payload warming remains bounded by the shared scheduler.
+
+Compaction allocates a durable, never-reused generation ID and an intent record.
+Posting pages, score summaries, incarnation proofs, and paged forward-vector
+metadata stage in transactions bounded by 4 MiB of payload (plus the largest
+individual metadata record). No query discovers a generation until the transaction
+that publishes its roots and routes. The root switch also retires old roots and
+records cleanup intents. Reclamation then deletes at most 128 keys per transaction;
+readers retain their original backend snapshots. Writable startup processes the
+small intent directory to reclaim abandoned staging and interrupted retirement,
+without scanning all archive pages. Reclamation checks posting and document-map
+roots independently because both families can share a numeric generation ID.
+
+Term-route cleanup copies each term directory once before mutation. It no longer
+calls transaction get once per term, avoiding retained quadratic copies in LSM
+write transactions.
+
+For modern input generations, incarnation sidecars stream in ordinal order into
+private fixed-width disk proofs. Term merging resolves these proofs without
+retaining public IDs or a corpus-sized incarnation hash table. Per-stream ordinal
+hints use galloping seeks, so sequential terms reuse the bounded proof page cache
+instead of repeating a full binary search for every posting. A bounded merge of
+the source proofs emits output epochs. Forward-vector metadata uses the shared
+external sorter, deduplicates native ordinals, and stages independently addressable
+records under a small document-map root. Legacy blobs remain readable. Locator
+refresh follows publication in bounded transactions, resumes from durable intents
+after a crash, and checks current incarnation
+and tombstones under the write gate; until refresh finishes, the ordinary fallback
+resolves the published document-map root. Physical-to-native mappings retain the
+same identities throughout compaction.
+
+Bloom lookahead uses up to four independent row-group jobs on the shared scheduler.
+Credential-scoped, immutable cache keys coalesce speculative and required range
+reads. Every worker joins before inventory/descriptors are released and inherits
+request cancellation/deadlines. A negative Bloom result prevents speculative data
+page decoding, and constant statistics matching an equality predicate avoid a
+Bloom probe that cannot help prune. No new query options or source authority are
+introduced.
+
+Validation includes exact signed scoring against an exhaustive reference,
+metadata-only block rejection, single-get directory cleanup, bounded disk-proof
+lookup, hidden partial output, recovery of abandoned staging, old-reader leases,
+replacement/deletion fencing, forward lookup, and restart. Archive-scale cold/warm
+throughput remains a measurement requirement, not a claimed benchmark result.

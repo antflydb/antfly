@@ -28,7 +28,9 @@ pub fn addScore(left: f32, right: f32) !f32 {
     return result;
 }
 pub const Stats = struct { scored: usize = 0, skipped_blocks: usize = 0, skipped_prefixes: usize = 0 };
+pub const BlockProbe = union(enum) { legacy, end, block: struct { first: u32, last: u32, min: f32, max: f32 } };
 pub const BlockReader = struct {
+    probe: ?*const fn (*anyopaque, u64, u32, u64) anyerror!BlockProbe = null,
     ptr: *anyopaque,
     resident: *usize,
     read: *const fn (*anyopaque, A, u64, u32, u64) anyerror!?[]u8,
@@ -76,6 +78,7 @@ pub const Stream = struct {
         }
     }
     pub fn advance(self: *Stream) !void {
+        if (self.doc != null and self.chunk.len == 0) try self.materialize();
         if (self.doc != null and self.index + 1 < self.count) {
             self.index += 1;
             self.doc = std.math.add(u32, self.doc.?, std.mem.readInt(u32, self.chunk[13 + @as(usize, self.index) * 4 ..][0..4], .little)) catch return error.InvalidChunk;
@@ -84,7 +87,39 @@ pub const Stream = struct {
         if (self.reader != null and self.doc != null) self.seek_target = @as(u64, self.last) + 1;
         try self.load();
     }
+    fn materialize(self: *Stream) !void {
+        if (self.chunk.len != 0) return;
+        const first = self.doc orelse return;
+        self.doc = null;
+        self.seek_target = first;
+        try self.loadEncoded();
+        if (self.doc == null or self.doc.? != first) return error.InvalidChunk;
+    }
     fn load(self: *Stream) !void {
+        if (self.reader) |reader| if (reader.probe) |probe| {
+            switch (try probe(reader.ptr, self.segment.?, self.term, self.seek_target)) {
+                .end => {
+                    self.deinit();
+                    self.doc = null;
+                    self.chunk = &.{};
+                    return;
+                },
+                .legacy => {},
+                .block => |block| {
+                    if (block.first > block.last or block.last < self.seek_target) return error.InvalidChunk;
+                    if (self.doc) |prior| if (block.first <= prior) return error.InvalidChunk;
+                    self.deinit();
+                    self.chunk = &.{};
+                    self.doc = block.first;
+                    self.last = block.last;
+                    self.upper = if (std.math.isFinite(self.weight) and std.math.isFinite(block.min) and std.math.isFinite(block.max)) @max(0, @max(self.weight * block.min, self.weight * block.max)) else std.math.inf(f32);
+                    return;
+                },
+            }
+        };
+        try self.loadEncoded();
+    }
+    fn loadEncoded(self: *Stream) !void {
         const prior = self.doc;
         self.doc = null;
         var ordinal_bounds: ?[2]u32 = null;
@@ -143,7 +178,8 @@ pub const Stream = struct {
         // Nonfinite input keeps the conservative path: never prune by it.
         self.upper = if (std.math.isFinite(self.weight) and std.math.isFinite(self.min_weight) and std.math.isFinite(end)) @max(0, @max(self.weight * self.min_weight, self.weight * end)) else std.math.inf(f32);
     }
-    pub fn contribution(self: Stream) f32 {
+    pub fn contribution(self: *Stream) !f32 {
+        try self.materialize();
         const quantized: f32 = @floatFromInt(self.chunk[13 + @as(usize, self.count) * 4 + self.index]);
         return self.weight * (self.min_weight + quantized * self.step);
     }
@@ -258,7 +294,7 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
             if (streams[i].doc.? != doc) break;
             _ = queue.pop();
             if (try context.allows(streams[i], doc)) {
-                score = try addScore(score, streams[i].contribution());
+                score = try addScore(score, try streams[i].contribution());
                 matched = true;
             }
             try streams[i].advance();
@@ -473,4 +509,50 @@ test "sparse block prefix pivots match exhaustive signed f32 scores across rando
             try std.testing.expectEqual(expected.score, actual.score);
         }
     }
+}
+
+test "sparse metadata bounds skip posting payloads before decoding" {
+    const Reader = struct {
+        reads: usize = 0,
+        resident: usize = 0,
+        fn probe(_: *anyopaque, _: u64, _: u32, lower: u64) !BlockProbe {
+            if (lower >= 64) return .end;
+            const first: u32 = @intCast(lower / 16 * 16);
+            const weight: f32 = if (first == 0) 100 else 1;
+            return .{ .block = .{ .first = first, .last = first + 15, .min = weight, .max = weight } };
+        }
+        fn read(raw: *anyopaque, a: A, _: u64, _: u32, lower: u64) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = try a.alloc(u8, 16 + 13 + 16 * 5);
+            @memset(bytes, 0);
+            std.mem.writeInt(u32, bytes[0..4], 13 + 16 * 5, .little);
+            std.mem.writeInt(u32, bytes[4..8], 8, .little);
+            const chunk = bytes[8..];
+            chunk[0] = 1;
+            std.mem.writeInt(u32, chunk[1..5], 16, .little);
+            const weight: f32 = if (lower == 0) 100 else 1;
+            std.mem.writeInt(u32, chunk[5..9], @bitCast(weight), .little);
+            std.mem.writeInt(u32, chunk[9..13], @bitCast(weight), .little);
+            for (0..16) |i| std.mem.writeInt(u32, chunk[13 + i * 4 ..][0..4], if (i == 0) @intCast(lower) else 1, .little);
+            self.reads += 1;
+            self.resident += bytes.len;
+            return bytes;
+        }
+    };
+    const Context = struct {
+        pub fn check(_: *@This()) !void {}
+        pub fn allows(_: *@This(), _: Stream, _: u32) !bool {
+            return true;
+        }
+    };
+    var reader: Reader = .{};
+    var streams = [_]Stream{.{ .weight = 1, .segment = 1, .term = 1, .allocator = std.testing.allocator, .reader = .{ .ptr = &reader, .resident = &reader.resident, .read = Reader.read, .probe = Reader.probe } }};
+    defer streams[0].deinit();
+    var context: Context = .{};
+    var stats: Stats = .{};
+    const top = try collect(std.testing.allocator, &streams, 1, &context, &stats);
+    defer std.testing.allocator.free(top);
+    try std.testing.expectEqual(@as(u32, 0), top[0].doc_num);
+    try std.testing.expectEqual(@as(usize, 1), reader.reads);
+    try std.testing.expect(stats.skipped_blocks >= 3);
 }

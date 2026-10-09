@@ -12,6 +12,8 @@ const legacy_magic = "ASPSSEG1";
 const tag: u8 = 0x0d;
 pub const route_tag: u8 = 0x0e;
 const route_ready = [_]u8{0x0f};
+pub const bucket_tag: u8 = 0x14;
+const summary_tag: u8 = 0x11;
 pub fn routeKey(term: u32, id: u64) [13]u8 {
     var bytes: [13]u8 = undefined;
     bytes[0] = route_tag;
@@ -24,17 +26,56 @@ pub fn routed(txn: anytype) !bool {
         error.NotFound => return false,
         else => return err,
     };
-    return std.mem.eql(u8, bytes, &.{1});
+    return bytes.len == 1 and (bytes[0] == 1 or bytes[0] == 2);
+}
+/// One dyadic node covers a segment's interval of 16-bit ordinal buckets.
+/// Point selections seek ancestors instead of duplicating wide intervals into
+/// thousands of leaf routes. Exact bounds reject false-positive cover nodes.
+pub fn intervalNode(first: u32, last: u32) u32 {
+    const low = first >> 16;
+    const high = last >> 16;
+    const depth: u32 = @clz(@as(u16, @intCast(low ^ high)));
+    return (depth << 16) | (low >> @as(u5, @intCast(16 - depth)));
+}
+pub fn bucketKey(term: u32, node: u32, id: u64) [16]u8 {
+    var bytes: [16]u8 = undefined;
+    bytes[0] = bucket_tag;
+    std.mem.writeInt(u32, bytes[1..5], term, .big);
+    bytes[5] = @intCast(node >> 16);
+    std.mem.writeInt(u16, bytes[6..8], @truncate(node), .big);
+    std.mem.writeInt(u64, bytes[8..16], id, .big);
+    return bytes;
+}
+pub fn bucketed(txn: anytype) !bool {
+    const bytes = txn.get(&route_ready) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    return std.mem.eql(u8, bytes, &.{2});
 }
 fn route(txn: anytype, id: u64, root: []const u8) !void {
     const dir = try directory(root);
+    const bounds = if (std.mem.readInt(u32, root[8..12], .little) == 2) try ordinalBounds(root) else null;
+    var value: [8]u8 = undefined;
+    if (bounds) |range| {
+        std.mem.writeInt(u32, value[0..4], range[0], .little);
+        std.mem.writeInt(u32, value[4..8], range[1], .little);
+    }
     var at: usize = 0;
-    while (at < dir.len) : (at += 20) try txn.put(&routeKey(std.mem.readInt(u32, dir[at..][0..4], .little), id), &.{});
+    while (at < dir.len) : (at += 20) {
+        const term = std.mem.readInt(u32, dir[at..][0..4], .little);
+        try txn.put(&routeKey(term, id), if (bounds != null) &value else &.{});
+        const node = if (bounds) |range| intervalNode(range[0], range[1]) else 0;
+        try txn.put(&bucketKey(term, node, id), if (bounds != null) &value else &.{});
+    }
+}
+pub fn publishRoutes(txn: anytype, id: u64, root: []const u8) !void {
+    try route(txn, id, root);
 }
 /// Older snapshots keep the discovery fallback until the first publication
 /// builds a complete directory. Routes and the coverage fence commit together.
 pub fn ensureRoutes(a: A, txn: anytype) !void {
-    if (try routed(txn)) return;
+    if (try bucketed(txn)) return;
     var lower: [9]u8 = @splat(0);
     lower[0] = 0x03;
     while (true) {
@@ -53,7 +94,7 @@ pub fn ensureRoutes(a: A, txn: anytype) !void {
         if (id == std.math.maxInt(u64)) break;
         std.mem.writeInt(u64, lower[1..9], id + 1, .big);
     }
-    try txn.put(&route_ready, &.{1});
+    try txn.put(&route_ready, &.{2});
 }
 pub const max_block_bytes = 1024 * 1024;
 pub fn paged(root: []const u8) bool {
@@ -96,6 +137,23 @@ pub fn key(id: u64, term: u32, last: u32) [17]u8 {
     std.mem.writeInt(u32, result[13..17], last, .big);
     return result;
 }
+pub fn putBlock(txn: anytype, id: u64, term: u32, last: u32, block: []const u8) !void {
+    if (block.len < 26) return error.InvalidChunk;
+    const chunk = block[8..];
+    if (chunk[0] != 1) return error.InvalidChunk;
+    const first = std.mem.readInt(u32, chunk[13..17], .little);
+    const max: f32 = @bitCast(std.mem.readInt(u32, chunk[5..9], .little));
+    const min: f32 = @bitCast(std.mem.readInt(u32, chunk[9..13], .little));
+    const step = (if (max > min) max - min else @as(f32, 1)) / 255.0;
+    var summary: [12]u8 = undefined;
+    std.mem.writeInt(u32, summary[0..4], first, .little);
+    std.mem.writeInt(u32, summary[4..8], @bitCast(min), .little);
+    std.mem.writeInt(u32, summary[8..12], @bitCast(min + @as(f32, 255) * step), .little);
+    var summary_key = key(id, term, last);
+    summary_key[0] = summary_tag;
+    try txn.put(&summary_key, &summary);
+    try txn.put(&key(id, term, last), block);
+}
 pub fn publish(a: A, txn: anytype, id: u64, legacy: []const u8) ![]u8 {
     try ensureRoutes(a, txn);
     const dir = try directory(legacy);
@@ -128,7 +186,7 @@ pub fn publish(a: A, txn: anytype, id: u64, legacy: []const u8) ![]u8 {
             const first = std.mem.readInt(u32, chunk[13..17], .little);
             first_ordinal = if (first_ordinal) |before| @min(before, first) else first;
             last_ordinal = @max(last_ordinal, last);
-            try txn.put(&key(id, term, last), block);
+            try putBlock(txn, id, term, last, block);
             previous = last;
             at += @intCast(size);
         }
@@ -176,16 +234,22 @@ pub fn materialize(a: A, txn: anytype, id: u64, root: []const u8) ![]u8 {
     if (at != result.len) return error.InvalidSparseSegment;
     return result;
 }
-pub fn remove(txn: anytype, id: u64) !void {
+pub fn removeRoutes(txn: anytype, id: u64) !void {
     var root_key: [9]u8 = undefined;
     root_key[0] = 0x03;
     std.mem.writeInt(u64, root_key[1..9], id, .big);
     if (txn.get(&root_key)) |root| {
-        const length = (try directory(root)).len;
+        const dir = try txn.allocator.dupe(u8, try directory(root));
+        defer txn.allocator.free(dir);
+        const bounds = if (std.mem.readInt(u32, root[8..12], .little) == 2) try ordinalBounds(root) else null;
         var at: usize = 0;
-        while (at < length) : (at += 20) {
-            const dir = try directory(try txn.get(&root_key));
+        while (at < dir.len) : (at += 20) {
             const term = std.mem.readInt(u32, dir[at..][0..4], .little);
+            const node = if (bounds) |range| intervalNode(range[0], range[1]) else 0;
+            txn.delete(&bucketKey(term, node, id)) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
             txn.delete(&routeKey(term, id)) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
@@ -195,6 +259,9 @@ pub fn remove(txn: anytype, id: u64) !void {
         error.NotFound => {},
         else => return err,
     }
+}
+pub fn remove(txn: anytype, id: u64) !void {
+    try removeRoutes(txn, id);
     const prefix = key(id, 0, 0);
     while (true) {
         var keys: [128][17]u8 = undefined;
@@ -214,7 +281,15 @@ pub fn remove(txn: anytype, id: u64) !void {
         if (count == 0) return;
         // Never mutate through a live cursor: backends differ in how deleting
         // its current entry affects subsequent navigation.
-        for (keys[0..count]) |*entry| try txn.delete(entry);
+        for (keys[0..count]) |*entry| {
+            try txn.delete(entry);
+            var summary = entry.*;
+            summary[0] = summary_tag;
+            txn.delete(&summary) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        }
     }
 }
 pub fn Reader(comptime Txn: type) type {
@@ -244,6 +319,7 @@ pub fn Reader(comptime Txn: type) type {
             }
         };
         cursor: ?Cursor = null,
+        summaries: ?Cursor = null,
         io: ?std.Io = null,
         warming: [8]Warm = @splat(.{}),
         txn: *Txn,
@@ -255,6 +331,8 @@ pub fn Reader(comptime Txn: type) type {
             if (self.io) |io| for (&self.warming) |*warm| warm.retire(io);
             if (self.cursor) |*cursor| cursor.close();
             self.cursor = null;
+            if (self.summaries) |*cursor| cursor.close();
+            self.summaries = null;
         }
         fn prefetch(self: *@This(), id: u64, term: u32, last: u32) void {
             if (comptime !@hasDecl(Txn, "forkRead")) return;
@@ -275,7 +353,23 @@ pub fn Reader(comptime Txn: type) type {
             }
         }
         pub fn interface(self: *@This()) daat.BlockReader {
-            return .{ .ptr = self, .read = read, .resident = &self.resident };
+            return .{ .ptr = self, .read = read, .probe = probe, .resident = &self.resident };
+        }
+        fn probe(raw: *anyopaque, id: u64, term: u32, lower: u64) !daat.BlockProbe {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (lower > std.math.maxInt(u32)) return .end;
+            if (self.summaries == null) self.summaries = try self.txn.openCursor();
+            var seek = key(id, term, @intCast(lower));
+            seek[0] = summary_tag;
+            const entry = (try self.summaries.?.seekAtOrAfter(&seek)) orelse return .legacy;
+            if (entry.key.len != 17 or !std.mem.eql(u8, entry.key[0..13], seek[0..13])) return .legacy;
+            if (entry.value.len != 12) return error.InvalidSparseSegment;
+            return .{ .block = .{
+                .first = std.mem.readInt(u32, entry.value[0..4], .little),
+                .last = std.mem.readInt(u32, entry.key[13..17], .big),
+                .min = @bitCast(std.mem.readInt(u32, entry.value[4..8], .little)),
+                .max = @bitCast(std.mem.readInt(u32, entry.value[8..12], .little)),
+            } };
         }
         fn read(raw: *anyopaque, a: A, id: u64, term: u32, lower: u64) !?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -312,6 +406,8 @@ pub fn forEachBlock(txn: anytype, id: u64, term: ?u32, context: anytype, comptim
 test "paged posting codec seeks one block bounds memory and reclaims every page under OOM" {
     const FakeTxn = struct {
         a: A,
+        allocator: A,
+        get_calls: usize = 0,
         entries: std.ArrayList(Entry) = .empty,
         const Entry = struct { key: []const u8, value: []const u8 };
         fn deinit(self: *@This()) void {
@@ -322,6 +418,7 @@ test "paged posting codec seeks one block bounds memory and reclaims every page 
             self.entries.deinit(self.a);
         }
         fn get(self: *@This(), k: []const u8) anyerror![]const u8 {
+            self.get_calls += 1;
             for (self.entries.items) |entry| if (std.mem.eql(u8, entry.key, k)) return entry.value;
             return error.NotFound;
         }
@@ -367,7 +464,7 @@ test "paged posting codec seeks one block bounds memory and reclaims every page 
     };
     const Probe = struct {
         fn run(a: A) !void {
-            var txn: FakeTxn = .{ .a = a };
+            var txn: FakeTxn = .{ .a = a, .allocator = a };
             defer txn.deinit();
             var legacy: [36 + 3 * 39]u8 = @splat(0);
             @memcpy(legacy[0..8], legacy_magic);
@@ -406,7 +503,7 @@ test "paged posting codec seeks one block bounds memory and reclaims every page 
             defer stream.deinit();
             try stream.seek(4);
             try std.testing.expectEqual(@as(?u32, 4), stream.doc);
-            try std.testing.expectEqual(@as(f32, 3), stream.contribution());
+            try std.testing.expectEqual(@as(f32, 3), try stream.contribution());
             try std.testing.expectEqual(@as(usize, 1), reader.blocks);
             try stream.advance();
             try std.testing.expectEqual(@as(?u32, 5), stream.doc);
@@ -414,7 +511,8 @@ test "paged posting codec seeks one block bounds memory and reclaims every page 
             try std.testing.expectEqual(null, stream.doc);
             try std.testing.expectEqual(@as(usize, 0), reader.resident);
             reader.budget = 1;
-            try std.testing.expectError(error.ResourceBudgetExceeded, stream.seek(0));
+            try stream.seek(0);
+            try std.testing.expectError(error.ResourceBudgetExceeded, stream.contribution());
             try std.testing.expectEqual(@as(usize, 0), reader.resident);
             var root_key: [9]u8 = @splat(0);
             root_key[0] = 0x03;
@@ -422,7 +520,9 @@ test "paged posting codec seeks one block bounds memory and reclaims every page 
             try txn.put(&root_key, root);
             try std.testing.expect(try routed(&txn));
             _ = try txn.get(&routeKey(7, 42));
+            const gets_before_cleanup = txn.get_calls;
             try remove(&txn, 42);
+            try std.testing.expectEqual(gets_before_cleanup + 1, txn.get_calls);
             try std.testing.expectError(error.NotFound, txn.get(&routeKey(7, 42)));
             try txn.delete(&root_key);
             try std.testing.expectEqual(@as(usize, 1), txn.entries.items.len);
@@ -526,8 +626,27 @@ pub fn publishRun(a: A, txn: anytype, id: u64, root: []const u8, run: *Builder.R
         const bytes = try a.alloc(u8, length);
         defer a.free(bytes);
         try view.readInto(offset, bytes);
-        try txn.put(&key(id, term, last), bytes);
+        try putBlock(txn, id, term, last, bytes);
         offset += length;
     }
     try route(txn, id, root);
+}
+
+test "sparse interval routes cover boundary buckets without route duplication" {
+    const intervals = [_][2]u32{
+        .{ 0, 0 },          .{ 65535, 65536 },           .{ 0xffff0000, 0xffffffff },
+        .{ 0, 0xffffffff }, .{ 0x12340001, 0x1235ffff }, .{ 0x7fffffff, 0x80000000 },
+    };
+    for (intervals) |range| {
+        const node = intervalNode(range[0], range[1]);
+        const depth = node >> 16;
+        const prefix = node & 0xffff;
+        try std.testing.expect(depth <= 16);
+        for ((range[0] >> 16)..@as(usize, range[1] >> 16) + 1) |bucket| {
+            try std.testing.expectEqual(prefix, @as(u32, @intCast(bucket)) >> @as(u5, @intCast(16 - depth)));
+        }
+        const route_key = bucketKey(7, node, 42);
+        try std.testing.expectEqual(@as(u8, @intCast(depth)), route_key[5]);
+        try std.testing.expectEqual(@as(u16, @intCast(prefix)), std.mem.readInt(u16, route_key[6..8], .big));
+    }
 }

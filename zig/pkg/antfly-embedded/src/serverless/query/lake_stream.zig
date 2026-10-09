@@ -114,6 +114,7 @@ pub const Stream = struct {
     filter_columns: []const []const u8 = &.{},
     mapped_columns: std.ArrayList(types.ColumnVector) = .empty,
     lookahead: ?@import("../../sql/parallel_scheduler.zig").Task(anyerror!void) = null,
+    bloom_lookahead: [4]?@import("../../sql/parallel_scheduler.zig").Task(anyerror!void) = @splat(null),
     lookahead_cancelled: std.atomic.Value(bool) = .init(false),
     lookahead_started: usize = 0,
     lookahead_names: []const []const u8 = &.{},
@@ -132,6 +133,21 @@ pub const Stream = struct {
             if (cancel) task.cancel(io) catch {} else task.await(io) catch {};
             self.lookahead = null;
         }
+        if (self.source.scanner.shared_reader) |reader| if (reader.context.io) |io| for (&self.bloom_lookahead) |*task| {
+            if (task.*) |*work| {
+                if (cancel) work.cancel(io) catch {} else if (work.isComplete()) work.await(io) catch {} else continue;
+                task.* = null;
+            }
+        };
+    }
+    fn warmBloom(self: *Stream, inventory: external.Inventory, ordinal: u32) anyerror!void {
+        const reader = self.source.scanner.shared_reader.?;
+        var worker: @import("lake_serving_cache.zig").Reader = .{ .cache = reader.cache, .base = reader.base, .scope = reader.scope, .context = reader.context };
+        const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = lookaheadCanceled };
+        worker.context.cancellation = token;
+        worker.base.cancellation = token;
+        var stats: Stats = .{};
+        _ = try bloomGroupMayMatch(std.heap.page_allocator, worker.reader(), inventory.files[0], inventory.files[0].row_groups[ordinal], self.groupPredicates(), worker.context, &stats);
     }
     fn warmGroup(self: *Stream, inventory: external.Inventory, ordinal: u32, names: []const []const u8, required: []const bool) anyerror!void {
         const reader = self.source.scanner.shared_reader.?;
@@ -142,6 +158,8 @@ pub const Stream = struct {
         // Worker allocations never mutate a statement arena. Decoded buffers
         // belong to the bounded shared cache, and temporary work is admitted
         // by the same scheduler used by kernels, spill writes and prefetch.
+        var bloom_stats: Stats = .{};
+        if (!try bloomGroupMayMatch(std.heap.page_allocator, worker_reader.reader(), inventory.files[0], inventory.files[0].row_groups[ordinal], self.groupPredicates(), worker_reader.context, &bloom_stats)) return;
         var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(std.heap.page_allocator, worker_reader.reader(), inventory, inventory.files[0].file_id, ordinal, names, .{
             .max_rows = self.limits.max_row_group_rows,
             .max_input_bytes = @min(self.limits.max_input_bytes, 2 * 1024 * 1024),
@@ -182,6 +200,26 @@ pub const Stream = struct {
         self.lookahead_names = stable_names;
         self.lookahead_required = stable_required;
         self.lookahead_cancelled.store(false, .release);
+        var slot: usize = 0;
+        for (plan.row_group_plan.row_groups[self.group_index..]) |input| {
+            while (slot < self.bloom_lookahead.len and self.bloom_lookahead[slot] != null) slot += 1;
+            if (slot == self.bloom_lookahead.len) break;
+            const group = plan.inventory.files[0].row_groups[input.row_group_ordinal];
+            if (!groupMayMatch(group, self.groupPredicates())) continue;
+            const eligible = eligible: {
+                for (self.groupPredicates()) |predicate| {
+                    if (predicate.op != .eq) continue;
+                    for (group.column_chunks) |chunk| if (chunk.bloom_filter_offset != null and std.mem.eql(u8, chunk.column_id, predicate.column)) break :eligible true;
+                }
+                break :eligible false;
+            };
+            if (!eligible) continue;
+            if (self.selection) |selection| if (!selection.rangeMayMatch(self.active_file, group.ordinal, 0, group.row_count)) continue;
+            // Independent row-group probes overlap network latency. Required
+            // reads coalesce with these versioned, credential-scoped cache keys.
+            self.bloom_lookahead[slot] = @import("../../sql/parallel_scheduler.zig").global().submitTransient(io, 64 * 1024, warmBloom, .{ self, plan.inventory, input.row_group_ordinal });
+            slot += 1;
+        }
         self.lookahead = @import("../../sql/parallel_scheduler.zig").global().submitTransient(io, @min(self.limits.max_input_bytes, 2 * 1024 * 1024) +| @min(self.limits.max_decoded_bytes, 2 * 1024 * 1024), warmGroup, .{ self, plan.inventory, ordinal, stable_names, stable_required });
         if (self.lookahead != null) self.lookahead_started += 1 else self.freeLookaheadDescriptors();
     }
@@ -1127,6 +1165,15 @@ fn bloomGroupMayMatch(alloc: Allocator, reader: parquet.ObjectRangeReader, file:
         if (predicate.op != .eq) continue;
         for (group.column_chunks) |chunk| {
             if (!std.mem.eql(u8, predicate.column, chunk.column_id)) continue;
+            switch (predicate.value) {
+                .integer => |value| if (chunk.stats_min_i64 != null and chunk.stats_max_i64 != null and chunk.stats_min_i64.? == value and chunk.stats_max_i64.? == value) {
+                    continue;
+                },
+                .bytes => |value| if (chunk.stats_min_bytes != null and chunk.stats_max_bytes != null and std.mem.eql(u8, chunk.stats_min_bytes.?, value) and std.mem.eql(u8, chunk.stats_max_bytes.?, value)) {
+                    continue;
+                },
+                .boolean => {},
+            }
             const offset = chunk.bloom_filter_offset orelse continue;
             var value_bytes: [8]u8 = undefined;
             const bytes: []const u8 = switch (predicate.value) {
@@ -1229,6 +1276,13 @@ test "external lake Bloom pruning reads only metadata and one block with legacy 
     try std.testing.expect(try bloomGroupMayMatch(a, reader, file, group, &present, .{}, &stats));
     try std.testing.expectEqual(@as(usize, 6), fake.reads);
 
+    chunk.stats_min_i64 = 42;
+    chunk.stats_max_i64 = 42;
+    const constant_reads = fake.reads;
+    try std.testing.expect(try bloomGroupMayMatch(a, reader, file, group, &present, .{}, &stats));
+    try std.testing.expectEqual(constant_reads, fake.reads);
+    chunk.stats_min_i64 = null;
+    chunk.stats_max_i64 = null;
     const reads = fake.reads;
     chunk.logical_type = @constCast("timestamp_nanos");
     try std.testing.expect(try bloomGroupMayMatch(a, reader, file, group, &absent, .{}, &stats));
