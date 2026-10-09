@@ -6559,3 +6559,46 @@ Durable dynamic array constructors, element-changing durable casts, non-NULL
 SQL array defaults and broader array operations remain unfinished. Original
 inventory dispositions are unchanged; cache correctness is not evidence of
 activating those cases.
+
+### Durable array identity and streaming NUMERIC modifier casts
+
+The native expression VM, SQL schema lowering and public structural precheck
+now admit precisely typed array identity casts and NUMERIC-array modifier
+casts. An identity cast borrows canonical pinned input. Modifier casts reuse
+the streaming assignment kernel: one coefficient scratch region, preserved
+dimensions/lower bounds/NULL slots, sticky shared work and allocation admission,
+and no reconstructed flat cell vector or JSON round trip. Already constrained
+inputs remain allocation-free. Typed NULL retains its array domain, and nested
+casts retain distinct modifiers rather than overwriting an operand's cast.
+
+CASE and COALESCE still execute only selected branches. Overflow is a runtime
+error, not a schema-publication failure. Typed compilation continues to reject
+element-changing casts and scalar/array reinterpretation. The generated public
+specification, Go embedded specification, Python/TypeScript descriptions, Rust
+bundled specification and Zig contracts document the same boundary. The large
+Go diff is its compressed embedded OpenAPI payload, not a runtime refactor.
+
+Evidence extends all 11 independent binary-array fixtures with identity casts
+across pinned values, JSON input and cold ordinal rows. NUMERIC casts use the
+existing 20 modifier fixtures, independently reverified within all 893 exact
+PostgreSQL NUMERIC contracts. A SQL lowering regression checks query/VM byte
+agreement across typed NULL, nested modifiers, unselected overflow, JSON input
+and cold rows. Exhaustive allocation faults now exercise compiled cast plans
+and their streaming conversion; constrained reuse is checked with a failing
+allocator. This is not complete array-constructor/cast activation: dynamic
+constructors, element-changing casts and non-NULL SQL array defaults remain
+unfinished, and no original inventory case is reclassified by these tests.
+
+The combined SQL/schema/OpenAPI validation passes 626 local SQL tests (three
+existing skips), 226 server SQL tests, 74 local schema tests and seven public
+server expression tests, without failures or leaks; all 144 build steps pass.
+Python generation checks, TypeScript type-checking, Go SDK OpenAPI tests and
+Rust specification synchronization also pass. Formatting, whitespace, storage
+control-catalog and original inventory integrity checks pass; 929 original
+cases remain unresolved.
+
+A final cache audit additionally stops preparation after its allocation cohort
+is exhausted. Retrying a smaller candidate with a sticky quota flag could hide
+a later genuine backing allocation failure. The separate final-source constant
+gate passes all seven tests, including the new exhaustive mixed-size candidate
+fault sweep. This follow-up does not change expression demand or parity counts.

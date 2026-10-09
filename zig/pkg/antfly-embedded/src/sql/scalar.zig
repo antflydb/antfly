@@ -319,7 +319,7 @@ pub const Program = struct {
                     if ((!is_numeric and instruction.type.kind != .array) or !pure[index]) continue;
                     if (self.constant_numerics.contains(@intCast(index))) continue;
                 }
-                if (pool.remaining == 0 or pool.memory.footprint() >= pool.memory.limit) {
+                if (pool.memory.isExhausted() or pool.remaining == 0 or pool.memory.footprint() >= pool.memory.limit) {
                     if (input_validation) return error.SqlProgramLimitExceeded;
                     break;
                 }
@@ -371,7 +371,7 @@ pub const Program = struct {
             const source = if (call.function == .@"$overlaps" and self.constant_arrays.contains(call.args[1])) call.args[1] else call.args[0];
             if (self.constant_memberships.contains(source)) continue;
             const array = self.constant_arrays.get(source) orelse continue;
-            if (pool.remaining == 0 or pool.memory.footprint() >= pool.memory.limit) break;
+            if (pool.memory.isExhausted() or pool.remaining == 0 or pool.memory.footprint() >= pool.memory.limit) break;
             const index = try a.create(arrays.Membership);
             var work: arrays.Budget = .{ .remaining = pool.remaining };
             index.* = arrays.Membership.initWithBudget(pool.memory.allocator(), array.*, .{
@@ -1218,6 +1218,23 @@ test "SQL constant preparation owns adopted regions and unwinds every allocation
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "SQL constant cache exhaustion stops speculative allocation without hiding backing faults" {
+    const Run = struct {
+        fn run(a: Allocator) !void {
+            var parsed = try @import("compiler.zig").compileScalar(a, "ARRAY[ARRAY[1,2,3,4,5,6,7,8],ARRAY[1]]", .{});
+            defer parsed.deinit();
+            // The first candidate cannot fit, while a later smaller candidate
+            // could. Do not retry with a sticky exhaustion flag that could
+            // misclassify a subsequent genuine backing OOM as another quota.
+            var program = try bind(a, parsed.expression, &.{}, &.{}, .{ .constant_bytes = 1024 });
+            defer program.deinit();
+            try std.testing.expect(program.constant_pool.?.memory.isExhausted());
+            try std.testing.expectEqual(@as(usize, 0), program.constant_arrays.count());
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
 }
 
 test "SQL constant cache admission is bounded and does not change execution demand" {

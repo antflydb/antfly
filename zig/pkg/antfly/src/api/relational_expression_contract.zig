@@ -120,9 +120,9 @@ fn visit(value: std.json.Value, depth: usize, nodes: *usize) bool {
             if (op == .cast) {
                 const kind = value.object.get("type") orelse return false;
                 if (!validType(kind) or value.object.get("sql_type") == null) return false;
-                if (!std.mem.eql(u8, kind.string, "integer") and !std.mem.eql(u8, kind.string, "number") and !std.mem.eql(u8, kind.string, "numeric")) return false;
+                if (!std.mem.eql(u8, kind.string, "integer") and !std.mem.eql(u8, kind.string, "number") and !std.mem.eql(u8, kind.string, "numeric") and !std.mem.eql(u8, kind.string, "sql_array")) return false;
                 if (value.object.get("numeric_modifier")) |modifier| {
-                    if (modifier != .object or !std.mem.eql(u8, kind.string, "numeric") or !std.mem.eql(u8, value.object.get("sql_type").?.string, "numeric")) return false;
+                    if (modifier != .object or (!std.mem.eql(u8, kind.string, "numeric") and !std.mem.eql(u8, kind.string, "sql_array")) or !std.mem.eql(u8, value.object.get("sql_type").?.string, "numeric")) return false;
                 }
             }
             if (value.object.get("collation")) |collation| if (collation != .string or collation.string.len == 0) return false;
@@ -130,6 +130,12 @@ fn visit(value: std.json.Value, depth: usize, nodes: *usize) bool {
             if (args != .array) return false;
             const count = args.array.items.len;
             if (!expressions.acceptsArity(compiled_op, count)) return false;
+            if (op == .cast and std.mem.eql(u8, value.object.get("type").?.string, "sql_array")) {
+                const child = args.array.items[0];
+                if (child == .object) if (child.object.get("type")) |kind| {
+                    if (kind != .string or !std.mem.eql(u8, kind.string, "sql_array")) return false;
+                };
+            }
             for (args.array.items) |arg| if (!visit(arg, depth + 1, nodes)) return false;
         },
     }
@@ -264,6 +270,22 @@ pub fn cloneCanonicalExpression(alloc: std.mem.Allocator, source: wire.Relationa
     try canonicalizeOwnedExpression(alloc, &result);
     result.args = children;
     return result;
+}
+
+test "relational declarations public array casts preserve typed NULL and NUMERIC modifier contracts" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        \\{"op":"cast","type":"sql_array","sql_type":"int64","args":[{"op":"literal","type":"sql_array","sql_type":"int64","value":null}]}
+        ,
+        \\{"op":"cast","type":"sql_array","sql_type":"numeric","numeric_modifier":{"precision":4,"scale":2},"args":[{"op":"literal","type":"sql_array","sql_type":"numeric","value":null}]}
+    }) |text| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+        defer parsed.deinit();
+        try std.testing.expect(valid(parsed.value));
+        var plan = try expressions.Plan.init(a, .{}, parsed.value, .sql_array);
+        defer plan.deinit();
+        try std.testing.expect((try plan.evaluate(std.testing.failing_allocator, &.{})) == .null);
+    }
 }
 
 test "relational declarations public expression grammar shares typed array numeric CASE and IN shapes" {

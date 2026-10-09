@@ -224,16 +224,17 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                     }
                     if (source.kind != part.type) return error.UnsupportedSqlShape;
                     if (source.element_type != part.element_type) return error.UnsupportedSqlShape;
+                    if (part.type == .array) break :converted try json(alloc, .{ .op = "cast", .type = "sql_array", .sql_type = @tagName(part.element_type.?), .args = &[_]Json{values[part.operand]} });
                     break :converted values[part.operand];
                 };
                 if (part.numeric_modifier) |modifier| {
-                    if (part.element_type != .numeric or part.type != .number) return error.UnsupportedSqlShape;
+                    if (part.element_type != .numeric or (part.type != .number and part.type != .array)) return error.UnsupportedSqlShape;
                     // This branch's numeric cast is newly allocated. Attach
                     // its modifier, never overwrite an operand's inner cast.
                     if (std.mem.eql(u8, lowered.object.get("op").?.string, "cast")) {
                         try lowered.object.put(alloc, "numeric_modifier", try json(alloc, modifier));
                     } else {
-                        lowered = try json(alloc, .{ .op = "cast", .type = "numeric", .sql_type = "numeric", .numeric_modifier = modifier, .args = &[_]Json{lowered} });
+                        lowered = try json(alloc, .{ .op = "cast", .type = nativeType(part.type, part.element_type), .sql_type = "numeric", .numeric_modifier = modifier, .args = &[_]Json{lowered} });
                     }
                 }
                 break :blk lowered;
@@ -483,6 +484,58 @@ test "SQL schema array column comparisons branches and nulls share query and dur
         var parsed = try @import("compiler.zig").compileScalar(a, sql, .{});
         defer parsed.deinit();
         try std.testing.expectError(error.UnsupportedSqlShape, lowerColumns(a, &columns, parsed.expression, .boolean));
+    }
+}
+
+test "SQL schema NUMERIC array casts share query and durable execution" {
+    var region = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer region.deinit();
+    const a = region.allocator();
+    const native = @import("../schema/relational_expression.zig");
+    const storage = @import("array_storage.zig");
+    const codec = @import("../storage/db/algebraic/relational_row_codec.zig");
+    const columns = [_]scalar.Column{.{ .name = "a", .type = .array, .element_type = .numeric }};
+    const table: @import("../storage/schema.zig").TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .numeric },
+    } };
+    var original = try @import("array_text.zig").decode(a, .numeric, "[-3:-1]={12.345,NULL,-12.345}", .{});
+    defer original.deinit();
+    const canonical = try storage.encodeAlloc(a, original.value, .{});
+    const input: native.Value = .{ .sql_array = .{ .element_type = .numeric, .bytes = canonical } };
+    var layout = try codec.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    const row_bytes = try codec.serializeOrdinal(a, table.version, table.relational_columns, &.{
+        .{ .ordinal = 0, .path = "a", .value_type = .bytes_val, .sql_array_element_type = .numeric, .value = .{ .bytes_val = canonical } },
+    }, @splat(0));
+    const row = try codec.ordinalRowView(row_bytes, table, &layout);
+    for ([_][]const u8{
+        "CAST(a AS numeric[])",
+        "CAST(a AS numeric(4,2)[])",
+        "CAST(NULL AS numeric(4,2)[])",
+        "COALESCE(CAST(NULL AS numeric(4,2)[]), a)",
+        "CAST(CAST(a AS numeric(4,2)[]) AS numeric(4,1)[])",
+        "CASE WHEN false THEN CAST(a AS numeric(1,0)[]) ELSE a END",
+        "COALESCE(a, CAST(a AS numeric(1,0)[]))",
+    }) |sql| {
+        var parsed = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer parsed.deinit();
+        const lowered = try lowerColumns(a, &columns, parsed.expression, .array);
+        var durable = try native.Plan.init(a, table, lowered.expression, .sql_array);
+        defer durable.deinit();
+        var query = try scalar.bind(a, parsed.expression, &columns, &.{}, .{});
+        defer query.deinit();
+        const result = try query.evaluate(a, &.{scalar.Datum.typedArray(&original.value)}, &.{}, .{});
+        if (result.sql_null) {
+            try std.testing.expect((try durable.evaluate(std.testing.failing_allocator, &.{input})) == .null);
+            continue;
+        }
+        const expected = try storage.encodeAlloc(a, result.array.?.*, .{});
+        const converted = try durable.evaluate(a, &.{input});
+        try std.testing.expectEqualSlices(u8, expected, converted.sql_array.bytes);
+        try std.testing.expectEqualSlices(u8, expected, (try durable.evaluateRow(a, row)).sql_array.bytes);
+        var document: Json = .{ .object = .empty };
+        try document.object.put(a, "a", try @import("array_wire.zig").toJsonLeaky(a, original.value, .{}));
+        try std.testing.expectEqualSlices(u8, expected, (try durable.evaluateJson(a, document)).sql_array.bytes);
     }
 }
 

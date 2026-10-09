@@ -676,6 +676,16 @@ pub const Plan = struct {
             const order = try compareValues(execution, left, right, node.fold_ascii);
             return comparisonValue(node.op, false, false, order);
         }
+        if (node.op == .cast and node.kind == .sql_array) {
+            const input = try self.evaluateNode(execution, source, node.children[0]);
+            if (input == .null) return input;
+            if (input != .sql_array or input.sql_array.element_type != node.sql_type) return error.InvalidRelationalExpressionInput;
+            // Identity casts borrow the pinned canonical row. NUMERIC typmods
+            // share assignment's streaming coefficient conversion and sticky
+            // admission; neither path reconstructs a flat cell vector or JSON.
+            if (node.numeric_modifier) |modifier| return normalizeNumericArrayBinding(execution, input, modifier, false);
+            return input;
+        }
         var operands: [32]Value = undefined;
         for (node.children, 0..) |child, i| {
             operands[i] = try self.evaluateNode(execution, source, child);
@@ -1025,6 +1035,17 @@ test "relational declarations typed array programs share PostgreSQL values acros
         }, @splat(0));
         const row = try codec.ordinalRowView(bytes, table, &layout);
         try std.testing.expect((try plan.evaluateRow(r, row)).boolean);
+        const cast_json = try std.json.parseFromSliceLeaky(std.json.Value, r, try std.json.Stringify.valueAlloc(r, .{
+            .op = "cast",
+            .type = "sql_array",
+            .sql_type = @tagName(entry.element_type),
+            .args = .{.{ .op = "column", .column = "a" }},
+        }, .{}), .{});
+        var identity_cast = try Plan.init(a, table, cast_json, .sql_array);
+        defer identity_cast.deinit();
+        try std.testing.expectEqual(canonical.ptr, (try identity_cast.evaluate(std.testing.failing_allocator, &.{pinned})).sql_array.bytes.ptr);
+        try std.testing.expectEqualSlices(u8, canonical, (try identity_cast.evaluateJson(r, document.value)).sql_array.bytes);
+        try std.testing.expectEqualSlices(u8, canonical, (try identity_cast.evaluateRow(std.testing.failing_allocator, row)).sql_array.bytes);
         var allowance: usize = max_allocated_bytes;
         try std.testing.expect((try plan.evaluateBoundRowWithBudget(r, row, &allowance)).boolean);
         var wrong_columns = [_]schema.RelationalColumn{table.relational_columns[0]};
@@ -1032,6 +1053,7 @@ test "relational declarations typed array programs share PostgreSQL values acros
         var wrong_row = row;
         wrong_row.table_schema.relational_columns = &wrong_columns;
         try std.testing.expectError(error.RelationalIndexColumnTypeMismatch, plan.evaluateRow(r, wrong_row));
+        try std.testing.expectError(error.RelationalIndexColumnTypeMismatch, identity_cast.evaluateRow(r, wrong_row));
     }
     try std.testing.expectEqual(@as(usize, 11), fixture.value.entries.len);
 }
@@ -1712,10 +1734,11 @@ const Compiler = struct {
                 }
                 switch (op) {
                     .cast => {
-                        if (node.kind != .integer and node.kind != .number and node.kind != .numeric) return error.InvalidRelationalExpressionType;
+                        if (node.kind != .integer and node.kind != .number and node.kind != .numeric and node.kind != .sql_array) return error.InvalidRelationalExpressionType;
                         const kind = input.object.get("type") orelse return error.InvalidRelationalExpression;
                         if (kind != .string) return error.InvalidRelationalExpression;
                         node.kind = std.meta.stringToEnum(Kind, kind.string) orelse return error.InvalidRelationalExpressionType;
+                        if ((operand.kind == .sql_array) != (node.kind == .sql_array)) return error.InvalidRelationalExpressionType;
                         if (input.object.get("sql_type") == null) return error.InvalidRelationalExpression;
                     },
                     .add, .subtract, .multiply, .divide, .negate => if (node.kind != .integer and node.kind != .number and node.kind != .numeric) return error.InvalidRelationalExpressionType,
@@ -1745,6 +1768,7 @@ const Compiler = struct {
             if (identity != .string) return error.InvalidRelationalExpressionType;
             const typed = std.meta.stringToEnum(Numeric, identity.string) orelse return error.InvalidRelationalExpressionType;
             if (node.kind != .sql_array and (node.kind != .integer or !casts.integral(typed)) and (node.kind != .number or !casts.floating(typed)) and (node.kind != .numeric or typed != .numeric)) return error.InvalidRelationalExpressionType;
+            if (node.kind == .sql_array and op == .cast and self.nodes.items[node.children[0]].sql_type != typed) return error.InvalidRelationalExpressionType;
             node.sql_type = typed;
             if (op == .literal and node.kind != .numeric and node.kind != .sql_array) node.literal = numericCast(node.literal, typed) catch return error.InvalidRelationalExpressionType;
             // Do not change fingerprints of historical unannotated programs.
@@ -1756,7 +1780,7 @@ const Compiler = struct {
             }
         }
         if (input.object.get("numeric_modifier")) |constraint| {
-            if (node.op != .cast or node.kind != .numeric or node.sql_type != .numeric) return error.InvalidRelationalExpressionType;
+            if (node.op != .cast or (node.kind != .numeric and node.kind != .sql_array) or node.sql_type != .numeric) return error.InvalidRelationalExpressionType;
             const modifier = @import("../sql/numeric_storage.zig").modifierFromJson(constraint) catch return error.InvalidRelationalExpressionType;
             node.numeric_modifier = modifier;
             self.frame("SQL NUMERIC cast modifier v1");
@@ -2427,18 +2451,39 @@ test "relational declarations NUMERIC JSON assignments share PostgreSQL scalar a
         var execution = Execution.init(alloc, &budget);
         const modifier: exact.TypeModifier = .{ .precision = entry.precision, .scale = entry.scale };
         const raw_array = try arrayJson(&execution, .numeric, document.value, null);
+        const cast_text = try std.json.Stringify.valueAlloc(alloc, .{
+            .op = "cast",
+            .type = "sql_array",
+            .sql_type = "numeric",
+            .numeric_modifier = modifier,
+            .args = .{.{ .op = "column", .column = "a" }},
+        }, .{});
+        const cast_json = try std.json.parseFromSliceLeaky(std.json.Value, alloc, cast_text, .{});
+        const cast_table: schema.TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{
+            .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .numeric },
+        } };
+        var cast: ?Plan = null;
+        if (modifier.validate()) |_| {
+            cast = try Plan.init(alloc, cast_table, cast_json, .sql_array);
+        } else |_| try std.testing.expectError(error.InvalidRelationalExpressionType, Plan.init(alloc, cast_table, cast_json, .sql_array));
+        defer if (cast) |*plan| plan.deinit();
         if (entry.@"error") |code| {
             const expected = if (std.mem.eql(u8, code, "22023")) error.SqlInvalidParameterValue else error.RelationalExpressionOverflow;
             try std.testing.expectError(expected, normalizeNumericJson(&execution, .{ .string = entry.left }, modifier, false));
             try std.testing.expectError(expected, normalizeNumericArrayJson(&execution, &document.value, modifier, false));
             try std.testing.expectError(expected, arrayJson(&execution, .numeric, document.value, modifier));
             try std.testing.expectError(expected, normalizeNumericArrayBinding(&execution, raw_array, modifier, false));
+            if (cast) |*plan| try std.testing.expectError(expected, plan.evaluate(alloc, &.{raw_array}));
             try std.testing.expectEqual(original.ptr, document.value.object.get("values").?.array.items.ptr);
             continue;
         }
         const adapted = try arrayJson(&execution, .numeric, document.value, modifier);
         const assigned = try normalizeNumericArrayBinding(&execution, raw_array, modifier, false);
         try std.testing.expectEqualSlices(u8, adapted.sql_array.bytes, assigned.sql_array.bytes);
+        const converted = try cast.?.evaluate(alloc, &.{raw_array});
+        try std.testing.expectEqualSlices(u8, adapted.sql_array.bytes, converted.sql_array.bytes);
+        const cast_reused = try cast.?.evaluate(std.testing.failing_allocator, &.{converted});
+        try std.testing.expectEqual(converted.sql_array.bytes.ptr, cast_reused.sql_array.bytes.ptr);
         const before_reuse = budget;
         const reused = try normalizeNumericArrayBinding(&execution, assigned, modifier, false);
         try std.testing.expectEqual(assigned.sql_array.bytes.ptr, reused.sql_array.bytes.ptr);
@@ -2485,9 +2530,23 @@ test "relational declarations canonical NUMERIC array assignment streams with fa
     const target: exact.TypeModifier = .{ .precision = 4, .scale = 2 };
     const Run = struct {
         fn run(alloc: Allocator, source: Value, modifier: exact.TypeModifier) !void {
+            const declaration = try std.json.Stringify.valueAlloc(alloc, .{
+                .op = "cast",
+                .type = "sql_array",
+                .sql_type = "numeric",
+                .numeric_modifier = modifier,
+                .args = .{.{ .op = "column", .column = "a" }},
+            }, .{});
+            defer alloc.free(declaration);
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, declaration, .{});
+            defer parsed.deinit();
+            var plan = try Plan.init(alloc, .{ .storage_mode = .relational, .relational_columns = &.{
+                .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .numeric },
+            } }, parsed.value, .sql_array);
+            defer plan.deinit();
             var allowance: usize = max_allocated_bytes;
             var execution = Execution.init(alloc, &allowance);
-            const result = normalizeNumericArrayBinding(&execution, source, modifier, false) catch |err| {
+            const result = plan.evaluateWithExecution(&execution, &.{source}) catch |err| {
                 if (err == error.OutOfMemory) try std.testing.expect(execution.numeric.failure == null);
                 try std.testing.expectEqual(alloc.ptr, execution.alloc.ptr);
                 try std.testing.expectEqual(alloc.vtable, execution.numeric.alloc.vtable);
@@ -2504,7 +2563,7 @@ test "relational declarations canonical NUMERIC array assignment streams with fa
             }
             var no_bytes: usize = 0;
             var no_heap = Execution.init(std.testing.failing_allocator, &no_bytes);
-            const reused = try normalizeNumericArrayBinding(&no_heap, result, modifier, false);
+            const reused = try plan.evaluateWithExecution(&no_heap, &.{result});
             try std.testing.expectEqual(result.sql_array.bytes.ptr, reused.sql_array.bytes.ptr);
             try std.testing.expectEqual(@as(usize, 0), no_bytes);
             try std.testing.expectEqual(alloc.ptr, execution.alloc.ptr);
