@@ -1044,15 +1044,23 @@ disjunctions require every branch to be exact. An indexed conjunct may narrow
 a residual predicate, but an exclusion never discards rows using a superset.
 Unsupported expressions retain the shared exact residual evaluator.
 
-The consumer builds a Roaring bitmap in the pinned text snapshot's document
-number space. Both selective and broad predicates seek the tuple bounds in an immutable
+The consumer produces exact membership in the pinned text snapshot's document
+number space. A selective metadata predicate materializes a Roaring bitmap from
+its immutable compressed row-set tree. A broad exact whole-index conjunction
+can defer membership until the text filter has supplied segment-local candidates.
+Those candidates invert through the shared native-to-physical directory and
+point-probe the authenticated reverse tree against the same tuple bounds. Point
+work is capped across all segments/count passes by the estimated full-membership
+cost; exceeding it materializes one compressed bitmap for every later pass.
+Complex Boolean predicates and residual expressions retain the existing planner.
+Both selective and broad materializations seek the tuple bounds in the immutable
 compressed row-set tree. Contiguous per-tuple/file/group physical blocks encode
 as extents; scattered selections encode as Roaring sets. Broad categorical
 predicates consume blocks rather than one forward record per matching row.
 Initial publication aggregates the sorted tuple stream; incremental publication
 replaces only changed-file blocks through bounded spill and copy-on-write pages.
 The forward/reverse trees remain available for SQL seeks and file replacement;
-predicate evaluation does not scan the unrelated physical reverse tree. Native text metadata version 8
+full predicate materialization does not scan the unrelated physical reverse tree. Native text metadata version 8
 publishes a delete-aware physical-row ordinal directory per file. Contiguous
 2^20-row blocks need only an ordinal base and extent; blocks with holes use an
 authenticated Roaring bitmap and rank. Group identifiers and the high bits of
@@ -1207,7 +1215,14 @@ cursor leases; live-row rank/select caches use four reusable fixed buffers.
 Visibility lanes retain their lower-bound result and proven missing interval,
 including EOF. Requests within that interval reuse the lease; backward requests
 outside it seek again. Absent tombstone or epoch families therefore do not restart
-an LSM merge cursor for every candidate. Disk-proof capture uses independent
+an LSM merge cursor for every candidate. Positive epoch families additionally
+admit 64-ordinal pages after two probes demonstrate locality in a block. Up to
+32 prefixes keep independent cursors/pages, so interleaved segments reuse their
+pages without evicting one another. Other prefixes and scattered first probes
+retain point reads. Page fills copy epoch bytes, propagate read failures, and
+remain bound to the original read transaction. Fresh bitmap lower-bound probes
+binary-search container keys rather than walking preceding containers.
+Disk-proof capture uses independent
 epoch and deletion lanes to preserve forward locality across both families.
 
 Compaction pins inputs and reserves a durable intent under the apply gate. Modern
@@ -1237,7 +1252,11 @@ multi-segment regression admits only the overlapping stream and reads one block.
 The bounded native text corpus cache owns the physical/native ordinal directory,
 including its typed block and delete-bitmap references. Every query phase borrows
 the same immutable directory under its corpus pin. Decoded ordered-row roots
-likewise cache the snapshot-bound public file digests.
+likewise cache snapshot-bound public file digests and a sorted file-slot directory.
+An explicit verified-root handle retains structural validation under the decoded
+metadata lease; each reader still checks the requested fingerprint and uses the
+request's cancellation, publication lease, and credential-scoped store capability.
+Warm reader initialization therefore avoids repeating an O(files) validation.
 
 Ordered-row recipe v6 includes a tuple/file count tree. It supports complete
 public-ID tie ordering without duplicating every row into another sort tree or

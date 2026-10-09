@@ -2626,6 +2626,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lake_refinement_bench_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lake_refinement_bench = b.addTest(.{ .root_module = lake_refinement_bench_mod, .filters = &.{"native dictionary refinement benchmark"} });
     b.step("lake-native-refinement-bench", "Compare repeated and reused native Parquet dictionary decoding").dependOn(&b.addRunArtifact(lake_refinement_bench).step);
+    const bitmap_seek_bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bitmap_seek_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bitmap_seek_bench_mod.addImport("roaring", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/encoding/roaring.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const bitmap_seek_bench = b.addTest(.{ .root_module = bitmap_seek_bench_mod, .filters = &.{"native bitmap lower-bound seek benchmark"} });
+    b.step("lake-bitmap-seek-bench", "Measure fresh bitmap lower-bound probes across 50 million ordinals").dependOn(&b.addRunArtifact(bitmap_seek_bench).step);
+
     const lake_test_step = b.step("lake-test", "Run Antfly lake-native tests");
     lake_test_step.dependOn(&run_lake_scaffold_tests.step);
     unit_test_step.dependOn(&run_lake_scaffold_tests.step);

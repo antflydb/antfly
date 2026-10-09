@@ -137,6 +137,13 @@ pub const PinnedTextSource = struct {
 pub const IndexedTextPredicate = struct {
     bitmap: roaring.RoaringBitmap,
     exact: bool = true,
+    producer: ?@import("../../../search/query.zig").DocNumProducer = null,
+    owner: ?*anyopaque = null,
+    close: ?*const fn (*anyopaque) void = null,
+    pub fn deinit(self: *@This()) void {
+        if (self.close) |close| close(self.owner.?);
+        self.bitmap.deinit();
+    }
 };
 
 /// Providers may prove the complete order, including the public-ID tie. Older
@@ -11666,16 +11673,16 @@ pub fn searchTextQuery(
     const can_apply_live_all_docs = !chunk_backed or (try snapshot.hasDocOrdinalCoverage());
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var indexed_include: ?IndexedTextPredicate = null;
-    defer if (indexed_include) |*predicate| predicate.bitmap.deinit();
+    defer if (indexed_include) |*predicate| predicate.deinit();
     var indexed_exclude: ?IndexedTextPredicate = null;
-    defer if (indexed_exclude) |*predicate| predicate.bitmap.deinit();
+    defer if (indexed_exclude) |*predicate| predicate.deinit();
     if (!suppress_native_resolved_doc_filter) {
         if (executor.resolve_indexed_filter) |resolve| {
             if (effective_req.filter_query_json.len != 0) indexed_include = try resolve(executor.ctx, alloc, snapshot, effective_req.filter_query_json);
             if (effective_req.exclusion_query_json.len != 0) indexed_exclude = try resolve(executor.ctx, alloc, snapshot, effective_req.exclusion_query_json);
             // An exclusion superset would discard valid rows. Keep it residual.
             if (indexed_exclude) |*predicate| if (!predicate.exact) {
-                predicate.bitmap.deinit();
+                predicate.deinit();
                 indexed_exclude = null;
             };
         }
@@ -11684,8 +11691,8 @@ pub fn searchTextQuery(
         const must = try arena_alloc.alloc(search_mod.SearchQuery, if (indexed_include != null) 2 else 1);
         must[0] = base_search_query;
         const exclusions = try arena_alloc.alloc(search_mod.SearchQuery, if (indexed_exclude != null) 1 else 0);
-        if (indexed_include) |*bitmap| must[1] = .{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap.bitmap, .boost = 0 } };
-        if (indexed_exclude) |*bitmap| exclusions[0] = .{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap.bitmap } };
+        if (indexed_include) |*bitmap| must[1] = .{ .doc_num = .{ .ids = &.{}, .bitmap = if (bitmap.producer == null) &bitmap.bitmap else null, .producer = bitmap.producer, .boost = 0 } };
+        if (indexed_exclude) |*bitmap| exclusions[0] = .{ .doc_num = .{ .ids = &.{}, .bitmap = if (bitmap.producer == null) &bitmap.bitmap else null, .producer = bitmap.producer } };
         base_search_query = .{ .bool_query = .{ .must = must, .must_not = exclusions } };
     }
     var constraint_req = effective_req;
@@ -11766,7 +11773,7 @@ pub fn searchTextQuery(
         native_constraints.exclusion_query_json_resolved,
     );
 
-    if ((indexed_include != null and indexed_include.?.bitmap.cardinality() == 0) or
+    if ((indexed_include != null and indexed_include.?.producer == null and indexed_include.?.bitmap.cardinality() == 0) or
         (native_constraints.positive_filter and native_constraints.filter_doc_ids.len == 0 and native_constraints.filter_doc_nums.len == 0))
     {
         const score_profile = if (collect_score_profile) sortResultProfile(effective_req, .{
@@ -11796,7 +11803,9 @@ pub fn searchTextQuery(
         effective_req.identity_read_generation,
     );
     var full_candidate_limit = effectiveTextCandidateLimit(snapshot.liveDocCount(), native_constraints);
-    if (indexed_include) |predicate| full_candidate_limit = @min(full_candidate_limit, boundedU32(predicate.bitmap.cardinality()));
+    if (indexed_include) |predicate| if (predicate.producer == null) {
+        full_candidate_limit = @min(full_candidate_limit, boundedU32(predicate.bitmap.cardinality()));
+    };
     const requires_field_sort = effective_req.order_by.len > 0;
     const search_query = try textSearchQueryWithNativeDocIdsAlloc(arena_alloc, base_search_query, native_constraints, effective_req.count_only);
     if (executor.native_count_visibility_exact and effective_req.count_only and !unresolved_stored_filters and

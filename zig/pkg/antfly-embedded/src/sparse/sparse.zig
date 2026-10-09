@@ -1810,6 +1810,51 @@ fn immutableVersion(data: []const u8) !u32 {
 /// Epochs are copied into the bounded cache; no point-get payload survives in
 /// the parent query transaction, including when its allocator is an arena.
 const VisibilityReader = struct {
+    // Pin a bounded set of metadata prefixes. A prefix keeps its own cursor
+    // and a 64-ordinal page, so interleaved segments never restart one another.
+    // Once admitted lanes fill, other prefixes retain the point/gap fallback;
+    // they cannot evict hot lanes or trigger page-cache thrashing.
+    const Prefix = struct { tag: u8, segment: u64 };
+    const Page = struct {
+        cursor: ?backend_erased.Cursor = null,
+        prefix: [9]u8 = @splat(0),
+        prefix_len: u8 = 0,
+        block: ?u64 = null,
+        last_probe: ?u64 = null,
+        present: u64 = 0,
+        values: [64][8]u8 = undefined,
+        fn get(self: *Page, key: []const u8) ![]const u8 {
+            const doc = std.mem.readInt(u64, key[key.len - 8 ..][0..8], .big);
+            const block = doc >> 6;
+            if (self.block == null or self.block.? != block) {
+                self.block = null; // Failed reads never leave a valid page.
+                self.present = 0;
+                var lower: [17]u8 = undefined;
+                @memcpy(lower[0..self.prefix_len], self.prefix[0..self.prefix_len]);
+                std.mem.writeInt(u64, lower[self.prefix_len..][0..8], block << 6, .big);
+                var next = try self.cursor.?.seekAtOrAfter(lower[0 .. self.prefix_len + 8]);
+                while (next) |entry| {
+                    if (entry.key.len != self.prefix_len + 8 or !std.mem.eql(u8, entry.key[0..self.prefix_len], self.prefix[0..self.prefix_len])) break;
+                    const ordinal = std.mem.readInt(u64, entry.key[self.prefix_len..][0..8], .big);
+                    if (ordinal >> 6 != block) break;
+                    if (entry.value.len != 8) return error.InvalidSparseSegment;
+                    const position: u6 = @truncate(ordinal);
+                    self.values[position] = entry.value[0..8].*;
+                    self.present |= @as(u64, 1) << position;
+                    next = try self.cursor.?.next();
+                }
+                self.block = block;
+            }
+            const position: u6 = @truncate(doc);
+            if (self.present & (@as(u64, 1) << position) == 0) return error.NotFound;
+            return &self.values[position];
+        }
+    };
+    txn: ?*backend_erased.ReadTxn = null,
+    pages: [32]Page = @splat(.{}),
+    page_count: usize = 0,
+    page_slots: std.AutoHashMapUnmanaged(Prefix, usize) = .empty,
+    page_loads: usize = 0,
     cursors: [3]backend_erased.Cursor,
     entries: [3]?backend_erased.Entry = @splat(null),
     lower_keys: [3][17]u8 = undefined,
@@ -1823,12 +1868,47 @@ const VisibilityReader = struct {
             cursor.* = try txn.openCursor();
             count += 1;
         }
-        return .{ .cursors = cursors };
+        return .{ .txn = txn, .cursors = cursors };
     }
     fn deinit(self: *@This()) void {
         for (&self.cursors) |*cursor| cursor.close();
+        for (self.pages[0..self.page_count]) |*page| if (page.cursor) |*cursor| cursor.close();
+        if (self.txn) |txn| self.page_slots.deinit(txn.allocator);
     }
     pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+        const txn = self.txn orelse return self.getPoint(key);
+        if (!((key.len == 9 and key[0] == key_doc_incarnation) or
+            (key.len == 17 and (key[0] == key_segment_incarnation or key[0] == key_docmap_incarnation)))) return self.getPoint(key);
+        const prefix: Prefix = .{ .tag = key[0], .segment = if (key.len == 17) std.mem.readInt(u64, key[1..9], .big) else 0 };
+        const slot = if (self.page_slots.get(prefix)) |index| index else {
+            // Keep proven-absent intervals cheap; allocate a page only after
+            // reaching positive metadata in this pinned transaction.
+            const value = try self.getPoint(key);
+            if (self.page_count == self.pages.len) return value;
+            const index = self.page_count;
+            try self.page_slots.put(txn.allocator, prefix, index);
+            self.pages[index].last_probe = std.mem.readInt(u64, key[key.len - 8 ..][0..8], .big) >> 6;
+            self.pages[index].prefix_len = @intCast(key.len - 8);
+            @memcpy(self.pages[index].prefix[0 .. key.len - 8], key[0 .. key.len - 8]);
+            self.page_count += 1;
+            return value;
+        };
+        const page = &self.pages[slot];
+        const block = std.mem.readInt(u64, key[key.len - 8 ..][0..8], .big) >> 6;
+        if (page.cursor == null) {
+            // Selective or widely scattered probes retain point reads. Admit
+            // the scan page only after observing locality within one block.
+            const value = try self.getPoint(key);
+            if (page.last_probe == null or page.last_probe.? != block) {
+                page.last_probe = block;
+                return value;
+            }
+            page.cursor = try txn.openCursor();
+        }
+        if (page.block == null or page.block.? != block) self.page_loads += 1;
+        return page.get(key);
+    }
+    fn getPoint(self: *@This(), key: []const u8) ![]const u8 {
         const lane: usize = if (key[0] == key_doc_tombstone) 0 else if (key[0] == key_doc_incarnation) 1 else 2;
         if (key.len > self.lower_keys[lane].len) return error.InvalidSparseSegment;
         // A lower-bound seek proves the entire gap before its returned key
@@ -7697,4 +7777,105 @@ test "sparse legacy repeated postings survive paged scoring compaction and resta
             }
         }
     }
+}
+
+test "sparse visibility pages bound interleaved epochs and retain pinned snapshots" {
+    const a = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "visibility-pages");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{ .backend = .lsm });
+    defer index.close();
+    {
+        var write = try index.beginWriteTxn();
+        errdefer write.abort();
+        var key: [9]u8 = undefined;
+        const epoch = [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 };
+        for (0..256) |doc| {
+            if (doc == 17) continue;
+            try write.put(docIncarnationKey(&key, doc), &epoch);
+            for (0..40) |segment| try putSegmentIncarnation(&write, segment, doc, 7, false);
+        }
+        try write.commit();
+    }
+    var old = try index.beginReadTxn();
+    defer old.abort();
+    var reader = try VisibilityReader.init(&old);
+    defer reader.deinit();
+    var current: [9]u8 = undefined;
+    var source: [17]u8 = undefined;
+    for ([_]u64{ 0, 64, 128, 192 }) |doc| try std.testing.expectEqual(@as(u64, 7), try currentIncarnation(&reader, doc));
+    try std.testing.expectEqual(@as(usize, 0), reader.page_loads);
+    for (0..256) |doc| {
+        if (doc == 17) {
+            try std.testing.expectError(error.NotFound, reader.get(docIncarnationKey(&current, doc)));
+            continue;
+        }
+        try std.testing.expectEqual(@as(u64, 7), try currentIncarnation(&reader, doc));
+        for (0..40) |segment| try std.testing.expectEqual(@as(u64, 7), try segmentIncarnation(&reader, segment, SEGMENT_FORMAT_VERSION, doc, false));
+    }
+    try std.testing.expectEqual(@as(usize, 32), reader.page_count);
+    try std.testing.expectEqual(@as(usize, 32 * 4), reader.page_loads);
+    // A backward hole and a point outside the last page cannot reuse a false
+    // presence bit from another block or an interleaved segment.
+    try std.testing.expectError(error.NotFound, reader.get(docIncarnationKey(&current, 17)));
+    try std.testing.expectError(error.NotFound, reader.get(segmentIncarnationKey(&source, 2, 256, false)));
+    try std.testing.expectEqual(@as(u64, 7), try currentIncarnation(&reader, 0));
+    {
+        var write = try index.beginWriteTxn();
+        errdefer write.abort();
+        const epoch = [_]u8{ 9, 0, 0, 0, 0, 0, 0, 0 };
+        try write.put(docIncarnationKey(&current, 200), &epoch);
+        try write.commit();
+    }
+    try std.testing.expectEqual(@as(u64, 7), try currentIncarnation(&reader, 200));
+    var newer = try index.beginReadTxn();
+    defer newer.abort();
+    var newer_reader = try VisibilityReader.init(&newer);
+    defer newer_reader.deinit();
+    try std.testing.expectEqual(@as(u64, 9), try currentIncarnation(&newer_reader, 200));
+}
+
+test "sparse visibility partial page failures never become cached absence" {
+    const Fake = struct {
+        key: []const u8,
+        value: []const u8,
+        fail: *bool,
+        pub fn close(_: *@This()) void {}
+        pub fn first(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn last(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn prev(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn seekAtOrBefore(_: *@This(), _: []const u8) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn next(self: *@This()) !?backend_erased.Entry {
+            if (self.fail.*) {
+                self.fail.* = false;
+                return error.InjectedPageReadFailure;
+            }
+            return null;
+        }
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_erased.Entry {
+            return if (std.mem.order(u8, self.key, key) != .lt) .{ .key = self.key, .value = self.value } else null;
+        }
+    };
+    var key: [9]u8 = undefined;
+    var failure = true;
+    const epoch = [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 };
+    var cursor = try backend_erased.cursorFrom(std.testing.allocator, Fake{ .key = docIncarnationKey(&key, 7), .value = &epoch, .fail = &failure });
+    defer cursor.close();
+    var page: VisibilityReader.Page = .{ .cursor = cursor, .prefix_len = 1 };
+    page.prefix[0] = key_doc_incarnation;
+    try std.testing.expectError(error.InjectedPageReadFailure, page.get(&key));
+    try std.testing.expect(page.block == null);
+    try std.testing.expectEqualSlices(u8, &epoch, try page.get(&key));
+    try std.testing.expectEqual(@as(?u64, 0), page.block);
+    var missing: [9]u8 = undefined;
+    try std.testing.expectError(error.NotFound, page.get(docIncarnationKey(&missing, 8)));
 }

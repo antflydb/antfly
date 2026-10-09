@@ -285,6 +285,7 @@ pub const DocIdQuery = struct {
 pub const DocNumQuery = struct {
     ids: []const u32,
     bitmap: ?*const roaring.RoaringBitmap = null,
+    producer: ?query_mod.DocNumProducer = null,
     boost: f32 = 1.0,
 };
 
@@ -1226,7 +1227,7 @@ fn executeDocNum(
     dq: DocNumQuery,
     request: SearchRequest,
 ) !SearchResult {
-    return executeFilterQuery(alloc, snap, .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } }, request, dq.boost);
+    return executeFilterQuery(alloc, snap, .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap, .producer = dq.producer } }, request, dq.boost);
 }
 
 fn executeBoolField(
@@ -2439,6 +2440,23 @@ fn executeBool(
     if (bq.boost == 1 and bq.should.len == 0 and bq.must.len >= 1 and bq.must.len <= 2 and bq.must_not.len <= 1 and
         request.filter_doc_bitmap == null and request.exclude_doc_bitmap == null)
     {
+        const producer_include = bq.must.len == 2 and bq.must[1] == .doc_num and bq.must[1].doc_num.producer != null and bq.must[1].doc_num.boost == 0;
+        const producer_exclude = bq.must_not.len == 1 and bq.must_not[0] == .doc_num and bq.must_not[0].doc_num.producer != null;
+        const native_include = bq.must.len == 1 or (bq.must[1] == .doc_num and bq.must[1].doc_num.ids.len == 0 and bq.must[1].doc_num.boost == 0 and (bq.must[1].doc_num.bitmap != null or producer_include));
+        const native_exclude = bq.must_not.len == 0 or (bq.must_not[0] == .doc_num and bq.must_not[0].doc_num.ids.len == 0 and (bq.must_not[0].doc_num.bitmap != null or producer_exclude));
+        if ((producer_include or producer_exclude) and native_include and native_exclude) {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const filter = try searchQueryToFilterArena(arena.allocator(), .{ .bool_query = bq });
+            var membership = try snap.executeFilterBitmap(alloc, filter);
+            defer membership.deinit();
+            var constrained = request;
+            constrained.query = bq.must[0];
+            constrained.filter_doc_bitmap = &membership;
+            constrained.graph_queries = &.{};
+            return execute(alloc, snap, constrained);
+        }
+
         var constrained = request;
         var recognized = bq.must.len == 2 or bq.must_not.len == 1;
         if (bq.must.len == 2) {
@@ -2625,7 +2643,7 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
             .inclusive_end = rq.inclusive_end,
         } },
         .doc_id => |dq| .{ .doc_id = .{ .doc_ids = dq.ids } },
-        .doc_num => |dq| .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } },
+        .doc_num => |dq| .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap, .producer = dq.producer } },
         .bool_field => |bq| .{ .bool_field = .{ .field = bq.field, .value = bq.value } },
         .geo_distance => |gq| .{ .geo_distance = .{
             .field = gq.field,
@@ -2789,7 +2807,7 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             .filter_slice = &.{},
         },
         .doc_num => |dq| .{
-            .filter = .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } },
+            .filter = .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap, .producer = dq.producer } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },
@@ -5862,4 +5880,81 @@ test "search signed date histogram retains negative wide and nested buckets" {
     try std.testing.expectEqual(@as(usize, 3), nested.len);
     try std.testing.expectEqual(dh.keys[0], nested[0].bucket_key.timestamp);
     try std.testing.expectEqual(@as(i128, -std.time.ns_per_day), nested[0].aggs[0].result.date_histogram.keys[0]);
+}
+
+test "external lake deferred membership refines text candidates with exact scores counts and exclusions" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "zero", .data = "{}", .terms = &.{.{ .term = "rare", .freq = 4, .norm = 10 }} },
+        .{ .id = "one", .data = "{}", .terms = &.{.{ .term = "common", .freq = 2, .norm = 10 }} },
+        .{ .id = "two", .data = "{}", .terms = &.{.{ .term = "rare", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    const Producer = struct {
+        calls: usize = 0,
+        probed: usize = 0,
+        fail: bool = false,
+        fn produce(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.InjectedMembershipFailure;
+            self.calls += 1;
+            var result = roaring.RoaringBitmap.init(alloc);
+            errdefer result.deinit();
+            const selected = candidates orelse return error.ExpectedTextCandidates;
+            self.probed += selected.cardinality();
+            var iterator = selected.iterator();
+            while (iterator.next()) |doc| {
+                if (doc >= count) return error.InvalidArgument;
+                if ((offset + doc) % 2 == 0) try result.add(doc);
+            }
+            return result;
+        }
+    };
+    var producer: Producer = .{};
+    const deferred: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = &producer, .produce = Producer.produce }, .boost = 0 } };
+    const base: SearchQuery = .{ .match = .{ .field = "title", .text = "rare" } };
+    const included: SearchQuery = .{ .bool_query = .{ .must = &.{ base, deferred } } };
+    const excluded: SearchQuery = .{ .bool_query = .{ .must = &.{base}, .must_not = &.{deferred} } };
+    var original = try execute(a, writer.snapshot(), .{ .query = base, .k = 6, .include_stored = false });
+    defer original.deinit();
+    var bitmap = roaring.RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    for ([_]u32{ 0, 2, 4 }) |doc| try bitmap.add(doc);
+    const bitmap_clause: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap, .boost = 0 } };
+    for ([_]SearchQuery{ included, excluded }) |query| {
+        const reference_query: SearchQuery = if (query.bool_query.must.len == 2)
+            .{ .bool_query = .{ .must = &.{ base, bitmap_clause } } }
+        else
+            .{ .bool_query = .{ .must = &.{base}, .must_not = &.{bitmap_clause} } };
+        var reference = try execute(a, writer.snapshot(), .{ .query = reference_query, .k = 6, .include_stored = false });
+        defer reference.deinit();
+        var result = try execute(a, writer.snapshot(), .{ .query = query, .k = 6, .include_stored = false });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+        try std.testing.expectEqual(@as(u32, 2), try countMatches(a, writer.snapshot(), query));
+        var count = try executeCountCandidates(a, writer.snapshot(), query);
+        defer count.deinit();
+        try std.testing.expectEqual(@as(u32, 2), count.total_hits);
+        for (result.hits) |hit| {
+            try std.testing.expectEqual(query.bool_query.must.len == 2, hit.doc_id % 2 == 0);
+            const expected = for (original.hits) |before| {
+                if (before.doc_id == hit.doc_id) break before.score;
+            } else return error.TestUnexpectedResult;
+            // Existing filtered/unfiltered scorer kernels can differ by an
+            // f32 ULP; deferred membership must exactly match bitmap scoring.
+            try std.testing.expectApproxEqAbs(expected, hit.score, 0.000001);
+            const bitmap_score = for (reference.hits) |before| {
+                if (before.doc_id == hit.doc_id) break before.score;
+            } else return error.TestUnexpectedResult;
+            try std.testing.expectEqual(bitmap_score, hit.score);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 12), producer.calls);
+    try std.testing.expectEqual(@as(usize, 24), producer.probed);
+    producer.fail = true;
+    try std.testing.expectError(error.InjectedMembershipFailure, execute(a, writer.snapshot(), .{ .query = included, .k = 2 }));
 }

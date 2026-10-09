@@ -202,7 +202,7 @@ pub const BoolFilter = struct {
 
         // Process must clauses (AND)
         for (self.must) |clause| {
-            var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
+            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, if (result) |*r| r else null) else try clause.executeWithOffset(alloc, seg, doc_offset);
             if (result) |*r| {
                 r.andWith(&clause_bm);
                 clause_bm.deinit();
@@ -233,7 +233,7 @@ pub const BoolFilter = struct {
 
         // Process must_not clauses (ANDNOT)
         for (self.must_not) |clause| {
-            var clause_bm = try clause.executeWithOffset(alloc, seg, doc_offset);
+            var clause_bm = if (clause == .doc_num) try clause.doc_num.refine(alloc, seg, doc_offset, &result.?) else try clause.executeWithOffset(alloc, seg, doc_offset);
             defer clause_bm.deinit();
             result.?.andNotWith(&clause_bm);
         }
@@ -1725,12 +1725,29 @@ pub const DocIdFilter = struct {
     }
 };
 
+/// Request-owned exact membership producer. A required Boolean clause may
+/// supply its already-matched local candidates; the producer returns only
+/// matching local ordinals in an owned bitmap. Its owner outlives every
+/// synchronous filter pass.
+pub const DocNumProducer = struct {
+    ptr: *anyopaque,
+    produce: *const fn (*anyopaque, Allocator, u32, u32, ?*const roaring.RoaringBitmap) anyerror!roaring.RoaringBitmap,
+};
+
 /// Global numeric document filter: matches documents by snapshot-global doc ID.
 pub const DocNumFilter = struct {
     doc_nums: []const u32,
     bitmap: ?*const roaring.RoaringBitmap = null,
+    producer: ?DocNumProducer = null,
 
     pub fn executeWithOffset(self: DocNumFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32) FilterError!roaring.RoaringBitmap {
+        return self.refine(alloc, seg, doc_offset, null);
+    }
+    pub fn refine(self: DocNumFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32, candidates: ?*const roaring.RoaringBitmap) FilterError!roaring.RoaringBitmap {
+        if (self.producer) |producer| {
+            if (self.bitmap != null or self.doc_nums.len != 0) return error.InvalidArgument;
+            return producer.produce(producer.ptr, alloc, doc_offset, seg.reader.doc_count, candidates);
+        }
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
@@ -1900,7 +1917,7 @@ pub fn countFilter(
     var doc_offset: u32 = 0;
     for (snap.segments) |*seg| {
         const next_offset = std.math.add(u32, doc_offset, seg.reader.doc_count) catch return error.CountOverflow;
-        if (filter == .doc_num and filter.doc_num.bitmap != null and filter.doc_num.doc_nums.len == 0) {
+        if (filter == .doc_num and filter.doc_num.bitmap != null and filter.doc_num.producer == null and filter.doc_num.doc_nums.len == 0) {
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
             if (seg.shared.deleted == null) {

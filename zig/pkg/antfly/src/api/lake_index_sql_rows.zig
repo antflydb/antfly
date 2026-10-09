@@ -39,7 +39,7 @@ const Owner = struct {
     predicate_lower: []const u8 = "",
     predicate_upper: ?[]const u8 = null,
     predicate_count: u64 = 0,
-    metadata: ?@import("lake_index_decoded_metadata.zig").Owned(ordered.Root) = null,
+    metadata: ?@import("lake_index_decoded_metadata.zig").Owned(ordered.VerifiedRoot) = null,
     table: catalog.Table,
     request: catalog.Scan,
     context: operation.RequestContext,
@@ -430,6 +430,21 @@ pub const Predicate = struct {
         if (self.scan) return std.math.maxInt(u64);
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         return owner.predicate_count;
+    }
+    pub fn hasMembership(self: Predicate) bool {
+        if (self.scan) return false;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        return owner.reader.root.reverse != null;
+    }
+    pub fn canProbeMembership(self: Predicate) bool {
+        if (self.scan) return false;
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        return owner.reader.canProbeMembership();
+    }
+    pub fn contains(self: *Predicate, ref: local.storage_rowsource_types.RowRef) !bool {
+        const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
+        try owner.read_context.ensureActive();
+        return owner.reader.containsPhysical(ref, owner.predicate_lower, owner.predicate_upper);
     }
     pub fn hasBlocks(self: Predicate) bool {
         if (self.scan) return false;
@@ -945,9 +960,9 @@ fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table
         if (decl.artifact.kind == .ordered_row_index and std.mem.eql(u8, decl.name, name)) break decl;
     } else return if (policy == .automatic) null else error.ExternalLakeRowIndexNotPublished;
     const cancel: operation.CancellationToken = .{ .ptr = owner, .is_cancelled_fn = Owner.canceled };
-    const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.Root, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, declaration.artifact) else false;
-    owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.Root, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, owner.artifacts, declaration.artifact, cancel, ordered.loadRoot);
-    const root = owner.metadata.?.value.*;
+    const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, declaration.artifact) else false;
+    owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.VerifiedRoot, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, owner.artifacts, declaration.artifact, cancel, ordered.VerifiedRoot.load);
+    const root = owner.metadata.?.value.value;
     if (identities_only and (!std.mem.eql(u8, root.source, source.inventory.source_id) or !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id))) return error.ExternalLakeSnapshotMismatch;
     const domain = if (pinned) |shared| shared.domain else @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, owner.store_identity, selected.?.publication().namespace);
     if (!std.mem.eql(u8, &root.domain, &domain)) return error.InvalidNativeLakeRowIndex;
@@ -973,7 +988,7 @@ fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table
     if (upper) |end| {
         if (std.mem.order(u8, lower, end) != .lt) empty_range = true;
     }
-    try owner.reader.initCached(a, &owner.artifacts, root, expected, lower, upper, cancel, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context });
+    try owner.reader.initVerified(a, &owner.artifacts, owner.metadata.?.value.*, expected, lower, upper, cancel, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context });
     if (empty_range) owner.reader.exhausted = true;
     owner.reader_open = true;
     owner.covered = root.cover.len != 0;

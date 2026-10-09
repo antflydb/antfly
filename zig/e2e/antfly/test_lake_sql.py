@@ -2523,7 +2523,7 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
     count = 100003
     input_file = tmp_path / "predicates.parquet"
     data_table = pa.table({
-        "body": ["common early"] * (count - 1000) + ["common late"] * 1000,
+        "body": ["common early rarefirst"] + ["common early"] * (count - 1001) + ["common late"] * 999 + ["common late rarelast"],
         "sparse_native": ['{"1":1}'] * count,
         "amount": range(count),
         "sort_rank": [0, 1] + list(range(2, count - 1)) + [0],
@@ -2627,6 +2627,24 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
         assert counted["hits"]["total"] == {"value": count - 2, "relation": "exact"}, (
             counted
         )
+        # Broad indexed metadata must refine selective text candidates without
+        # changing BM25 statistics, exact counts, exclusions, or segment offsets.
+        # These terms live in different files/native segments.
+        for term, amount, matches in (("rarefirst", 0, False), ("rarelast", count - 1, True)):
+            search = {"term": term, "field": "body"}
+            unfiltered = query({"match_all": {}}, full_text_search=search)
+            assert [h["_source"]["amount"] for h in unfiltered["hits"]["hits"]] == [amount]
+            selected = query(broad, full_text_search=search)
+            assert [h["_source"]["amount"] for h in selected["hits"]["hits"]] == ([amount] if matches else [])
+            if matches:
+                assert selected["hits"]["hits"][0]["_score"] == pytest.approx(unfiltered["hits"]["hits"][0]["_score"], abs=1e-6)
+            exact = query(broad, full_text_search=search, count=True, fields=[], limit=0)
+            assert exact["hits"]["total"] == {"value": int(matches), "relation": "exact"}
+            excluded = call("POST", "/tables/indexed_predicates/query", {
+                "full_text_search": search, "exclusion_query": broad,
+                "count": True, "fields": [], "limit": 0,
+            })
+            assert excluded["hits"]["total"] == {"value": int(not matches), "relation": "exact"}
         # A selective amount index can supply candidates while category remains
         # residual; exact count must not confuse that superset with final matches.
         selective_and = {

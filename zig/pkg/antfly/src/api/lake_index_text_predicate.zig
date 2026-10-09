@@ -82,7 +82,9 @@ pub const LiveRowsCache = struct {
 /// Directory storage scales with files/groups/blocks and compressed delete holes.
 pub const Identities = struct {
     const Span = struct { lower: u32, upper: u32, rows: []const corpus.physical.Block };
+    const FileSpan = struct { file: []const u8, span: Span };
     files: std.StringHashMapUnmanaged(Span) = .empty,
+    spans: []const FileSpan = &.{},
     offsets: []const u32,
     pub fn init(a: A, root: corpus.Root, snapshot: *const local.index.IndexSnapshot) !Identities {
         if (root.version != corpus.metadata_version or (root.file_groups.len == 0 and snapshot.segments.len != 0)) return error.InvalidNativeLakeTextCorpus;
@@ -90,8 +92,9 @@ pub const Identities = struct {
         offsets[0] = 0;
         for (snapshot.segments, 0..) |segment, i| offsets[i + 1] = try std.math.add(u32, offsets[i], segment.reader.doc_count);
         var result: Identities = .{ .offsets = offsets };
+        const spans = try a.alloc(FileSpan, root.file_groups.len);
         var segment: usize = 0;
-        for (root.file_groups) |group| {
+        for (root.file_groups, 0..) |group, group_index| {
             const start = segment;
             segment += group.segments.len;
             if (segment > snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
@@ -104,8 +107,10 @@ pub const Identities = struct {
                 ref.checksum = try a.dupe(u8, ref.checksum);
             };
             entry.value_ptr.* = .{ .lower = offsets[start], .upper = offsets[segment], .rows = physical_rows };
+            spans[group_index] = .{ .file = entry.key_ptr.*, .span = entry.value_ptr.* };
         }
         if (segment != snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;
+        result.spans = spans;
         return result;
     }
     fn liveRows(a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, block: corpus.physical.Block) !*const Bitmap {
@@ -166,6 +171,36 @@ pub const Identities = struct {
             break :blk low - block.lower;
         };
         return try std.math.add(u32, span.lower, try std.math.add(u32, block.base, rank));
+    }
+    /// Binary searches keep native-to-physical lookup logarithmic in files and
+    /// physical blocks. Delete holes use the same authenticated rank directory.
+    pub fn physicalRow(self: Identities, a: A, cache: *LiveRowsCache, store: @import("../serverless/artifacts/store.zig").ArtifactStore, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, ordinal_value: u32, source: []const u8, snapshot: []const u8) !local.storage_rowsource_types.RowRef {
+        var lo: usize = 0;
+        var hi = self.spans.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.spans[mid].span.upper <= ordinal_value) lo = mid + 1 else hi = mid;
+        }
+        if (lo == self.spans.len) return error.InvalidNativeLakeTextCorpus;
+        const file = self.spans[lo];
+        if (ordinal_value < file.span.lower) return error.InvalidNativeLakeTextCorpus;
+        const relative = ordinal_value - file.span.lower;
+        lo = 0;
+        hi = file.span.rows.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const block = file.span.rows[mid];
+            if (@as(u64, block.base) + block.count <= relative) lo = mid + 1 else hi = mid;
+        }
+        if (lo == file.span.rows.len) return error.InvalidNativeLakeTextCorpus;
+        const block = file.span.rows[lo];
+        if (relative < block.base) return error.InvalidNativeLakeTextCorpus;
+        const rank = relative - block.base;
+        const low = if (block.bitmap != null) blk: {
+            const live = try liveRows(a, cache, store, cached, block);
+            break :blk live.read_rank.?.select(rank) orelse return error.InvalidNativeLakeTextCorpus;
+        } else try std.math.add(u32, block.lower, rank);
+        return .{ .external = .{ .source_id = source, .snapshot_id = snapshot, .file_id = file.file, .row_group_ordinal = block.group, .row_ordinal = (block.high << corpus.physical.shift) | low } };
     }
     /// Invert only selected ordinal blocks. Contiguous extents stay compressed;
     /// delete holes are resolved within their authenticated physical block.
@@ -234,6 +269,7 @@ fn PredicateResolver(comptime Set: type) type {
             defer arena.deinit();
             const parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), json, .{});
             const compiled = try Graph.compilePatternFilter(arena.allocator(), parsed.value);
+            if (Set == Bitmap) if (try self.openProducer(a, arena.allocator(), compiled)) |producer| return producer;
             var result = try self.value(a, arena.allocator(), compiled, 0, true);
             if (result) |resolved| {
                 const usable = if (Set == Bitmap)
@@ -255,6 +291,80 @@ fn PredicateResolver(comptime Set: type) type {
             }
             if (Set == Bitmap) return if (result) |resolved| .{ .bitmap = resolved.bitmap, .exact = resolved.exact } else null;
             return result;
+        }
+        const ProducerOwner = struct {
+            a: A,
+            resolver: Self,
+            predicate: rows.Predicate,
+            cache: LiveRowsCache = .{},
+            materialized: ?Bitmap = null,
+            spent_work: u64 = 0,
+            const point_work: u64 = 64;
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.materialized) |*bitmap| bitmap.deinit();
+                self.cache.deinit(self.a);
+                self.predicate.deinit();
+                self.a.destroy(self);
+            }
+            fn produce(raw: *anyopaque, a: A, offset: u32, count: u32, candidates: ?*const Bitmap) anyerror!Bitmap {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.resolver.context.ensureActive();
+                if (self.materialized == null) {
+                    const work = if (candidates) |selected| std.math.mul(u64, selected.cardinality(), point_work) catch std.math.maxInt(u64) else std.math.maxInt(u64);
+                    if (candidates != null and work <= self.predicate.work -| self.spent_work) {
+                        self.spent_work +|= work;
+                        var result = Bitmap.init(a);
+                        errdefer result.deinit();
+                        const cached: @import("lake_index_aggregate_artifact.zig").CachedRead = .{ .cache = &self.resolver.server.lake_read_cache, .scope = self.resolver.store_identity, .context = self.resolver.read_context };
+                        var iterator = candidates.?.iterator();
+                        var checked: usize = 0;
+                        while (iterator.next()) |local_ordinal| : (checked += 1) {
+                            if (checked % 64 == 0) try self.resolver.context.ensureActive();
+                            if (local_ordinal >= count) return error.InvalidNativeLakeTextCorpus;
+                            if (!self.predicate.canProbeMembership()) {
+                                self.materialized = try self.resolver.consume(self.a, &self.predicate);
+                                const slice = try self.materialized.?.sliceRebased(a, offset, @as(u64, offset) + count);
+                                result.deinit();
+                                return slice;
+                            }
+                            const ordinal_value = try std.math.add(u32, offset, local_ordinal);
+                            const row = try self.resolver.identities.physicalRow(self.a, &self.cache, self.resolver.store, cached, ordinal_value, self.resolver.source.inventory.source_id, self.resolver.source.inventory.snapshot_id);
+                            if (try self.predicate.contains(row)) try result.add(local_ordinal);
+                        }
+                        return result;
+                    }
+                    // One full compressed membership is shared by every later
+                    // segment/count pass. Point work is bounded by this plan's
+                    // estimated cost, including when selective segments precede
+                    // a broad segment.
+                    self.materialized = try self.resolver.consume(self.a, &self.predicate);
+                }
+                return self.materialized.?.sliceRebased(a, offset, @as(u64, offset) + count);
+            }
+        };
+        fn openProducer(self: Self, a: A, pa: A, compiled: Compiled) !?Result {
+            // Only a proven exact whole-index conjunction can be deferred.
+            // Boolean combinations and residual predicates retain the planner.
+            if (self.identities.spans.len == 0) return null;
+            var conditions: std.ArrayList(Condition) = .empty;
+            if (!try collectConditions(pa, compiled, &conditions, 0)) return null;
+            var predicate = (try rows.tryOpenPredicateWithContext(a, self.server, self.table, conditions.items, self.context, self.source, self.pinned)) orelse return null;
+            errdefer predicate.deinit();
+            if (!predicate.hasMembership()) {
+                predicate.deinit();
+                return null;
+            }
+            // A point-sized metadata predicate is cheaper to materialize than
+            // even one reverse-tree probe. Preserve native scorer pushdown.
+            if (predicate.estimatedRows() == 0 or predicate.work <= ProducerOwner.point_work) {
+                const bitmap = try self.consume(a, &predicate);
+                predicate.deinit();
+                return .{ .bitmap = bitmap };
+            }
+            const owner = try a.create(ProducerOwner);
+            owner.* = .{ .a = a, .resolver = self, .predicate = predicate };
+            return .{ .bitmap = Bitmap.init(a), .producer = .{ .ptr = owner, .produce = ProducerOwner.produce }, .owner = owner, .close = ProducerOwner.close };
         }
         fn value(self: Self, a: A, pa: A, input: Compiled, depth: usize, allow_scan: bool) anyerror!?PredicateResult {
             if (depth > 64) return null;
@@ -945,6 +1055,14 @@ test "external lake large ordinal selections invert compressed extents and delet
     defer identities.files.deinit(a);
     try identities.files.put(a, "selected", .{ .lower = 10, .upper = 200014, .rows = &blocks });
     try identities.files.put(a, "unselected", .{ .lower = 300000, .upper = 500004, .rows = &blocks });
+    identities.spans = &.{ .{ .file = "selected", .span = identities.files.get("selected").? }, .{ .file = "unselected", .span = identities.files.get("unselected").? } };
+    var live_cache: LiveRowsCache = .{};
+    defer live_cache.deinit(a);
+    for ([_]u32{ 10, 200010, 200011, 200012, 200013, 300000, 500003 }) |ordinal_value| {
+        const row = try identities.physicalRow(a, &live_cache, store, cached, ordinal_value, "source", "snapshot");
+        try std.testing.expectEqual(@as(?u32, ordinal_value), try identities.ordinal(a, &live_cache, store, cached, row));
+    }
+    for ([_]u32{ 9, 200014, 299999, 500004 }) |ordinal_value| try std.testing.expectError(error.InvalidNativeLakeTextCorpus, identities.physicalRow(a, &live_cache, store, cached, ordinal_value, "source", "snapshot"));
     var selected = Bitmap.init(a);
     defer selected.deinit();
     try selected.addRange(10, 200011);

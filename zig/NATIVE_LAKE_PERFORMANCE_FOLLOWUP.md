@@ -491,3 +491,45 @@ four scanned candidates per page. The public `_id` tie-breaker remains ascending
 the fixture declares matching ascending and descending timestamp indexes.
 Regenerated Go SDK tests, license checks, both source-boundary audits, formatting
 and diff checks also pass. Archive-scale cold/warm throughput remains unmeasured.
+
+
+### Adaptive predicate membership and warm metadata
+
+Exact whole-index metadata conjunctions can defer membership until text filtering
+produces local candidates. Binary searches map native ordinals into the shared
+file/block directory, including rank/select over authenticated delete holes.
+A reverse-tree point probe checks the stored tuple against exact predicate bounds
+without Parquet hydration. One request owner holds the predicate metadata lease,
+bounded reusable path scratch, and live-row cache until every scoring/count pass
+finishes. Errors and cancellation propagate through the native filter contract.
+
+The admission model charges 64 work units per point probe and never spends more
+point work than the existing full-membership estimate across segments and passes.
+An independent 8 MiB authenticated page-read allowance switches plans before
+another worst-case reverse-tree path could exceed it, preserving the existing
+full-materialization read budget. If candidates are broad or either probe budget
+expires, one lazily materialized compressed bitmap serves all subsequent passes. Cheap metadata predicates still materialize
+up front, preserving direct bitmap pushdown into native bounded scorers. Exact
+counts and exclusions use the same producer; a candidate-local answer is never
+cached as complete membership. General Boolean/residual plans retain their
+existing exact evaluator. This does not make arbitrary broad queries LIMIT-bounded.
+
+Decoded ordered roots carry structural-validation proof and a sorted file-slot
+directory. Warm readers retain that cache lease and repeat the request fingerprint
+check, without rebuilding an O(files) validation hash table. Publication, credential,
+snapshot and cancellation checks retain their request-owned authority.
+
+Sparse positive epoch reads use bounded 64-ordinal pages for 32 independently
+pinned key prefixes after observing two nearby probes. Extra prefixes keep the
+existing point/gap fallback rather than evicting hot pages. Missing families retain
+EOF/interval proof reuse, and scattered/selective probes avoid speculative scans.
+A read failure cannot leave a valid partial page, and old transactions continue
+seeing their original epoch values after a newer publication.
+
+Fresh bitmap seeks now binary-search container keys. A local ReleaseFast CPU
+measurement of one million probes into 50 million dense ordinals improved from
+383,519,375 ns to 10,352,833 ns (about 37x). This is one kernel measurement with
+concurrent compilation active, not remote query latency or archive throughput.
+Run `zig build lake-bitmap-seek-bench -Doptimize=ReleaseFast` to reproduce the
+current kernel and compare its checksum against prepared rank/select.
+The captured sample is in `bench/baselines/native-lake-bitmap-seeks.json`.

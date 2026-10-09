@@ -1397,12 +1397,14 @@ pub const Iterator = struct {
         const containers = self.bitmap.containers.items;
         const keys = self.bitmap.keys.items;
 
-        // 1) Skip containers whose key < target_high entirely.
-        while (self.chunk_idx < containers.len and keys[self.chunk_idx] < target_high) {
-            self.chunk_idx += 1;
-            self.initChunk();
-        }
+        // Jump directly to the target container. Fresh lower-bound probes
+        // must not walk every preceding container in a broad selection.
         if (self.chunk_idx >= containers.len) return null;
+        if (keys[self.chunk_idx] < target_high) {
+            self.chunk_idx = self.bitmap.lowerChunk(target_high);
+            self.initChunk();
+            if (self.chunk_idx >= containers.len) return null;
+        }
 
         // 2) If we landed on a strictly-greater container, return its first
         // remaining value via the regular sequential path.
@@ -2144,4 +2146,22 @@ test "frozen rank select skips dense words holes and empty containers" {
         try std.testing.expectEqual(ordinal, bitmap.rank(value));
     }
     try std.testing.expect(bitmap.read_rank.?.select(ordinal) == null);
+}
+
+test "fresh bitmap seeks jump dense containers and never rewind exhausted iterators" {
+    var bitmap = RoaringBitmap.init(std.testing.allocator);
+    defer bitmap.deinit();
+    try bitmap.addRange(0, 50_000_000);
+    try bitmap.remove(49_123_456);
+    try bitmap.add(std.math.maxInt(u32));
+    for ([_]u32{ 0, 65_535, 65_536, 49_123_456, 49_999_999, 50_000_000, std.math.maxInt(u32) }) |lower| {
+        var fresh = bitmap.iterator();
+        const expected: u32 = if (lower >= 50_000_000) std.math.maxInt(u32) else if (lower == 49_123_456) lower + 1 else lower;
+        try std.testing.expectEqual(@as(?u32, expected), fresh.seekTo(lower));
+    }
+    var forward = bitmap.iterator();
+    try std.testing.expectEqual(@as(?u32, 49_999_999), forward.seekTo(49_999_999));
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), forward.seekTo(0));
+    try std.testing.expectEqual(@as(?u32, null), forward.seekTo(0));
+    try std.testing.expectEqual(@as(?u32, null), forward.seekTo(std.math.maxInt(u32)));
 }

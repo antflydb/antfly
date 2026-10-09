@@ -31,6 +31,7 @@ pub const metadata_version: u16 = 5;
 pub const predicate_blocks = @import("lake_index_predicate_blocks.zig");
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const Root = struct {
+    pub const FileSlot = struct { file: []const u8, slot: u32 };
     version: u16 = metadata_version,
     tuple_encoding: u32 = tuples.encoding_version,
     fingerprint: [32]u8,
@@ -41,6 +42,7 @@ pub const Root = struct {
     tie_version: u8 = 0,
     /// Derived once by loadRoot in the bounded decoded-metadata cache.
     public_digests: []const [32]u8 = &.{},
+    file_slots: []const FileSlot = &.{},
     predicates: ?tree.Ref = null,
     source: []const u8,
     snapshot: []const u8,
@@ -50,7 +52,7 @@ pub const Root = struct {
     pub fn jsonStringify(self: Root, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
         inline for (@typeInfo(Root).@"struct".field_names) |field| {
-            if (comptime !std.mem.eql(u8, field, "public_digests")) {
+            if (comptime !std.mem.eql(u8, field, "public_digests") and !std.mem.eql(u8, field, "file_slots")) {
                 try stream.objectField(field);
                 try stream.write(@field(self, field));
             }
@@ -356,6 +358,14 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cance
     const digests = try a.alloc([32]u8, root.files.len);
     for (root.files, digests) |file, *digest| digest.* = local.storage_rowsource_identity.fileDigest(root.source, root.snapshot, file);
     root.public_digests = digests;
+    const slots = try a.alloc(Root.FileSlot, root.files.len);
+    for (root.files, slots, 0..) |file, *entry, slot| entry.* = .{ .file = file, .slot = @intCast(slot) };
+    std.mem.sort(Root.FileSlot, slots, {}, struct {
+        fn less(_: void, left: Root.FileSlot, right: Root.FileSlot) bool {
+            return std.mem.order(u8, left.file, right.file) == .lt;
+        }
+    }.less);
+    root.file_slots = slots;
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeRowIndex;
     if (!std.mem.eql(u8, &scope.domain, &root.domain)) return error.InvalidNativeLakeRowIndex;
     return root;
@@ -363,8 +373,19 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cance
 
 /// Caller retains the leased root and store capability through cursor close.
 /// A batch is owned by its caller, including all physical identity strings.
+/// Authenticated immutable metadata owned by a decoded-cache lease. Readers
+/// reuse structural validation, then check the request-specific fingerprint.
+pub const VerifiedRoot = struct {
+    value: Root,
+    pub fn load(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cancellation, cache: ?artifacts.CachedRead) !VerifiedRoot {
+        return .{ .value = try loadRoot(a, store, ref, cancellation, cache) };
+    }
+};
+
 pub const Reader = struct {
     physical_cursor: ?tree.Cursor = null,
+    membership_arena: ?std.heap.ArenaAllocator = null,
+    membership_reads: u64 = 8 * 1024 * 1024,
     predicate_cursor: ?tree.Cursor = null,
     root: Root,
     pages: page_store.PageStore,
@@ -378,6 +399,10 @@ pub const Reader = struct {
     }
     pub fn initCached(self: *Reader, a: A, store: *stores.ArtifactStore, root: Root, fingerprint: [32]u8, lower: []const u8, upper: ?[]const u8, cancellation: Cancellation, cached: ?artifacts.CachedRead) !void {
         try root.validate();
+        return self.initVerified(a, store, .{ .value = root }, fingerprint, lower, upper, cancellation, cached);
+    }
+    pub fn initVerified(self: *Reader, a: A, store: *stores.ArtifactStore, verified: VerifiedRoot, fingerprint: [32]u8, lower: []const u8, upper: ?[]const u8, cancellation: Cancellation, cached: ?artifacts.CachedRead) !void {
+        const root = verified.value;
         if (!std.mem.eql(u8, &root.fingerprint, &fingerprint)) return error.ExternalLakeIndexUnavailable;
         self.* = .{ .root = root, .pages = undefined, .cached = cached };
         self.pages = .{ .domain = root.domain, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.remaining_reads, .remaining_write_bytes = &self.remaining_writes };
@@ -395,6 +420,8 @@ pub const Reader = struct {
         return artifacts.readArtifact(a, store.*, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, self.cached);
     }
     pub fn deinit(self: *Reader) void {
+        if (self.membership_arena) |*arena| arena.deinit();
+        self.membership_arena = null;
         if (self.cursor) |*cursor| cursor.deinit();
         self.cursor = null;
         if (self.physical_cursor) |*cursor| cursor.deinit();
@@ -416,6 +443,43 @@ pub const Reader = struct {
             try blocks.append(a, .{ .file = self.root.files[file], .group = std.mem.readInt(u32, physical[4..8], .big), .base = base, .selection = try predicate_blocks.decode(a, record.value) });
         }
         return blocks.toOwnedSlice(a);
+    }
+    pub fn canProbeMembership(self: *const Reader) bool {
+        const reverse = self.root.reverse orelse return false;
+        // A lower bound beyond a leaf can visit its next sibling path.
+        return self.membership_reads >= 2 * (@as(u64, reverse.height) + 1) * tree.max_page_bytes;
+    }
+    /// Probe one physical coordinate in the authenticated reverse tree. Scratch
+    /// retains only its maximum root-to-leaf path across repeated probes.
+    pub fn containsPhysical(self: *Reader, ref: rows.RowRef, lower: []const u8, upper: ?[]const u8) !bool {
+        if (ref != .external) return error.InvalidNativeLakeRowIndex;
+        const row = ref.external;
+        if (!std.mem.eql(u8, row.source_id, self.root.source) or !std.mem.eql(u8, row.snapshot_id, self.root.snapshot)) return error.ExternalLakeSnapshotMismatch;
+        const slot = blk: {
+            var lo: usize = 0;
+            var hi = self.root.file_slots.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (std.mem.order(u8, self.root.file_slots[mid].file, row.file_id) == .lt) lo = mid + 1 else hi = mid;
+            }
+            if (lo < self.root.file_slots.len and std.mem.eql(u8, self.root.file_slots[lo].file, row.file_id)) break :blk self.root.file_slots[lo].slot;
+            if (self.root.file_slots.len != 0) return error.ExternalLakeSnapshotMismatch;
+            // Direct in-memory roots may lack the load-time derived directory.
+            for (self.root.files, 0..) |file, index| if (std.mem.eql(u8, file, row.file_id)) break :blk @as(u32, @intCast(index));
+            return error.ExternalLakeSnapshotMismatch;
+        };
+        const physical = coordinate(slot, row);
+        if (self.membership_arena == null) self.membership_arena = .init(self.cursor.?.alloc);
+        _ = self.membership_arena.?.reset(.retain_capacity);
+        var pages = self.pages;
+        pages.remaining_read_bytes = &self.membership_reads;
+        var cursor = try tree.Cursor.init(self.membership_arena.?.allocator(), pages.store(), self.root.reverse orelse return error.InvalidNativeLakeRowIndex, &physical, null);
+        defer cursor.deinit();
+        const record = try cursor.next() orelse return false;
+        if (!std.mem.startsWith(u8, record.key, &physical)) return false;
+        if (record.key.len < 32 or !std.mem.eql(u8, record.key[record.key.len - 16 ..], &physical)) return error.InvalidNativeLakeRowIndex;
+        const key = record.key[16..];
+        return std.mem.order(u8, key, lower) != .lt and (upper == null or std.mem.order(u8, key, upper.?) == .lt);
     }
     /// Reverse-tree order is physical file/group/row order. Test the stored
     /// tuple against the exact seek bounds without opening Parquet columns.
@@ -538,6 +602,22 @@ test "external lake ordered deltas retain untouched pages and delete only one fi
     std.mem.writeInt(u32, &upper_key, 103, .big);
     try predicate_reader.init(a, &store, root, @splat(3), &lower_key, &upper_key, .none);
     defer predicate_reader.deinit();
+    const Probe = struct {
+        fn row(n: u64) rows.RowRef {
+            return .{ .external = .{ .source_id = "lake", .snapshot_id = "snapshot", .file_id = "a", .row_group_ordinal = 0, .row_ordinal = n } };
+        }
+    };
+    for ([_]u64{ 102, 99, 100, 103, 101, 2048 }) |n| try std.testing.expectEqual(n >= 100 and n < 103, try predicate_reader.containsPhysical(Probe.row(n), &lower_key, &upper_key));
+    var wrong = Probe.row(100);
+    wrong.external.snapshot_id = "changed";
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, predicate_reader.containsPhysical(wrong, &lower_key, &upper_key));
+    var rejected: Reader = undefined;
+    try std.testing.expectError(error.ExternalLakeIndexUnavailable, rejected.initVerified(a, &store, .{ .value = root }, @splat(9), &lower_key, &upper_key, .none, null));
+    const materialization_reads = predicate_reader.remaining_reads;
+    try std.testing.expect(try predicate_reader.containsPhysical(Probe.row(101), &lower_key, &upper_key));
+    try std.testing.expectEqual(materialization_reads, predicate_reader.remaining_reads);
+    predicate_reader.membership_reads = 0;
+    try std.testing.expect(!predicate_reader.canProbeMembership());
     const physical_matches = try predicate_reader.nextPhysical(ca, 1024, &lower_key, &upper_key);
     try std.testing.expectEqual(@as(usize, 3), physical_matches.len);
     for (physical_matches, 100..) |row, expected_row| try std.testing.expectEqual(@as(u64, @intCast(expected_row)), row.external.row_ordinal);
