@@ -660,7 +660,11 @@ test "external lake ordered pulls borrow each execution and retain publication a
                 self.controls += 1;
                 self.calls += 1;
             }
-            const bytes = try self.base.vtable.get_bounded_alloc_with_cancellation.?(self.base.ptr, alloc, id, max, token);
+            const bytes = try self.base.getAllocWithCancellationUsingAllocator(alloc, id, token);
+            if (bytes.len > max) {
+                alloc.free(bytes);
+                return error.ArtifactTooLarge;
+            }
             if (self.enabled) switch (self.case) {
                 .success => {},
                 .canceled => self.signal.store(true, .release),
