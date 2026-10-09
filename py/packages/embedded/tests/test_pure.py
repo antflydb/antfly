@@ -24,8 +24,28 @@ from pathlib import Path
 
 import pytest
 
-from antfly_embedded import errors
+from antfly_embedded import _ffi, errors
+from antfly_embedded._database import Database
 from antfly_embedded._library import find_library, library_file_names
+
+
+def test_open_table_rejects_success_without_a_handle(monkeypatch: pytest.MonkeyPatch) -> None:
+    closed = []
+
+    class NullTableLibrary:
+        def antfly_db_open_table(self, handle, name, out):
+            return errors.OK
+
+        def antfly_db_close(self, handle):
+            closed.append(handle.value)
+
+    library = NullTableLibrary()
+    monkeypatch.setattr(_ffi, "get_lib", lambda: library)
+    with Database(7) as database:
+        with pytest.raises(errors.InternalError, match="antfly_db_open_table.*null handle"):
+            database.open_table("items")
+        assert database._active == 0
+    assert closed == [7]
 
 
 def test_error_code_name_and_description_are_stable() -> None:
