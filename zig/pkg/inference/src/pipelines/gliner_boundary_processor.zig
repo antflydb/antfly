@@ -818,7 +818,7 @@ test "boundary processor allocation failures release the complete batch" {
             try std.testing.expectEqual(@as(usize, 4), batch.samples[0].groups.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&schema});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&schema});
 }
 
 test "gliner boundary original word ranges and synthetic terminal capacity share the processor grammar" {
@@ -848,6 +848,6 @@ test "gliner boundary original word ranges and synthetic terminal capacity share
             return error.Cancelled;
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Check.run, .{});
     try std.testing.expectError(error.Cancelled, sourceWordRanges(a, text, .{ .control = .{ .check_fn = Check.cancel } }));
 }

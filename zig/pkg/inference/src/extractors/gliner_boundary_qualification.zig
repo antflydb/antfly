@@ -24,6 +24,7 @@ const wire = @import("extraction_v2.zig");
 const pipeline = @import("../pipelines/gliner_boundary_pipeline.zig");
 const processor = @import("../pipelines/gliner_boundary_processor.zig");
 const document = @import("../pipelines/gliner_boundary_long_document.zig");
+const OffsetUnit = @import("../pipelines/gliner_boundary_decode.zig").OffsetUnit;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Allocator = std.mem.Allocator;
 
@@ -355,7 +356,7 @@ test "boundary qualification source words preserve Unicode and release every fai
             try std.testing.expectError(error.InvalidUtf8, sourceWords(a, "\xff", .{}));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
     try std.testing.expectError(error.BoundaryTextLimitExceeded, sourceWords(std.testing.allocator, "a b c", .{ .max_text_words = 2 }));
     const Bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
     var bounded = Bounded{ .backing = std.testing.allocator, .limit = 1 };
@@ -742,6 +743,404 @@ test "boundary qualification canonical feature matrix covers every task and opti
     inline for (@typeInfo(policy.Feature).@"enum".field_names, @typeInfo(policy.Feature).@"enum".field_values) |_, field_value| {
         try std.testing.expect(covered.contains(@fromBackingInt(field_value)));
     }
+}
+
+const FamilyGeometryRow = struct {
+    id: []const u8,
+    text: []const u8,
+    native_schema_json: []const u8,
+    encoded: struct { input_ids: []const i64 },
+};
+
+fn expectFamilyFeatures(id: []const u8, actual: policy.Features, decide: bool) !void {
+    var expected = policy.Features.initMany(&.{ .classification_single, .word_whitespace, .overlap_flat, .decoder_auto, .single_window, .confidence });
+    if (decide) {
+        expected.insert(.classification_context);
+        expected.insert(.schema_descriptions);
+        expected.insert(.offset_utf8);
+    } else {
+        expected.remove(.classification_single);
+        expected.insert(.offset_codepoints);
+        expected.insert(.spans);
+        if (std.mem.eql(u8, id, "english_full_task")) {
+            expected.insert(.entities);
+            expected.insert(.schema_descriptions);
+            expected.insert(.classification_single);
+            expected.insert(.legacy_structures);
+            expected.insert(.relations);
+        } else if (std.mem.endsWith(u8, id, "_entities")) {
+            expected.insert(.entities);
+            expected.insert(.schema_descriptions);
+        } else {
+            expected.insert(.classification_single);
+            expected.insert(.classification_structured);
+            if (std.mem.eql(u8, id, "described_labels")) expected.insert(.schema_descriptions);
+            if (std.mem.eql(u8, id, "instruction_prompt")) expected.insert(.classification_context);
+        }
+    }
+    inline for (@typeInfo(policy.Feature).@"enum".field_values) |field_value| {
+        const feature: policy.Feature = @fromBackingInt(field_value);
+        errdefer std.debug.print("family geometry feature {s}: {s}\n", .{ id, @tagName(feature) });
+        try std.testing.expectEqual(expected.contains(feature), actual.contains(feature));
+    }
+}
+
+fn measureFamilyRow(a: Allocator, tok: anytype, identity: artifact.Identity, row: FamilyGeometryRow, decide: bool) !policy.LengthContract {
+    var schema = try std.json.parseFromSlice(std.json.Value, a, row.native_schema_json, .{ .duplicate_field_behavior = .@"error" });
+    defer schema.deinit();
+    const body = if (decide)
+        try std.json.Stringify.valueAlloc(a, .{
+            .schema_version = @as(u32, 2),
+            .model = "boundary",
+            .schema = schema.value,
+            .options = .{ .include_confidence = true },
+            .inputs = &.{.{ .content = row.text }},
+        }, .{})
+    else
+        try std.json.Stringify.valueAlloc(a, .{
+            .schema_version = @as(u32, 2),
+            .model = "boundary",
+            .schema = schema.value,
+            .options = .{ .include_confidence = true, .include_spans = true, .offset_unit = "unicode_codepoints" },
+            .inputs = &.{.{ .content = row.text }},
+        }, .{});
+    defer a.free(body);
+    var request = try wire.parseJson(a, body, .{});
+    defer request.deinit();
+    const features = try requiredFeatures(&request, null);
+    try expectFamilyFeatures(row.id, features, decide);
+    const item = &request.items[0];
+    var prepared = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = item.text, .schema = &item.compiled }}, item.options.preprocessing(.{}));
+    defer prepared.deinit();
+    try std.testing.expectEqualSlices(i64, row.encoded.input_ids, prepared.samples[0].input_ids);
+    const words = try sourceWords(a, item.text, item.options.preprocessing(.{}));
+    const observed = try lengths(1, item.text.len, words, 1, &prepared);
+    try policy.require(identity, .native, features, observed);
+    try policy.require(identity, .metal, features, observed);
+    if (!decide) {
+        const utf8_body = try std.json.Stringify.valueAlloc(a, .{
+            .schema_version = @as(u32, 2),
+            .model = "boundary",
+            .schema = schema.value,
+            .options = .{ .include_confidence = true, .include_spans = true, .offset_unit = "utf8_bytes" },
+            .inputs = &.{.{ .content = row.text }},
+        }, .{});
+        defer a.free(utf8_body);
+        var utf8_request = try wire.parseJson(a, utf8_body, .{});
+        defer utf8_request.deinit();
+        const utf8_features = try requiredFeatures(&utf8_request, null);
+        inline for (@typeInfo(policy.Feature).@"enum".field_values) |field_value| {
+            const feature: policy.Feature = @fromBackingInt(field_value);
+            const expected = if (feature == .offset_codepoints)
+                false
+            else if (feature == .offset_utf8)
+                true
+            else
+                features.contains(feature);
+            try std.testing.expectEqual(expected, utf8_features.contains(feature));
+        }
+        try policy.require(identity, .native, utf8_features, observed);
+        try policy.require(identity, .metal, utf8_features, observed);
+    }
+    std.debug.print("GLiNER2.5 family geometry {s}: bytes={d} document_words={d} window_words={d} padded_sequence_tokens={d}\n", .{
+        row.id,
+        observed.document_bytes.min,
+        observed.document_words.min,
+        observed.window_words.min,
+        observed.padded_sequence_tokens.min,
+    });
+    return observed;
+}
+
+const FamilyClassificationGroup = enum { bare, described, context, context_described, mixed };
+const FamilyEntityGroup = enum { bare, described };
+
+fn expectExactFamilyLengths(actual: policy.LengthContract, expected: policy.LengthContract) !void {
+    try std.testing.expectEqual(expected.request_items, actual.request_items);
+    try std.testing.expectEqual(expected.document_bytes, actual.document_bytes);
+    try std.testing.expectEqual(expected.document_words, actual.document_words);
+    try std.testing.expectEqual(expected.window_count, actual.window_count);
+    try std.testing.expectEqual(expected.window_words, actual.window_words);
+    try std.testing.expectEqual(expected.padded_sequence_tokens, actual.padded_sequence_tokens);
+}
+
+fn measureFamilyEntityRow(
+    a: Allocator,
+    tok: anytype,
+    identity: artifact.Identity,
+    row: FamilyGeometryRow,
+    group: FamilyEntityGroup,
+    offset: OffsetUnit,
+) !policy.LengthContract {
+    var schema = try std.json.parseFromSlice(std.json.Value, a, row.native_schema_json, .{ .duplicate_field_behavior = .@"error" });
+    defer schema.deinit();
+    const body = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = "boundary",
+        .schema = schema.value,
+        .options = .{
+            .include_confidence = true,
+            .include_spans = true,
+            .offset_unit = if (offset == .unicode_codepoints) "unicode_codepoints" else "utf8_bytes",
+        },
+        .inputs = &.{.{ .content = row.text }},
+    }, .{});
+    defer a.free(body);
+    var request = try wire.parseJson(a, body, .{});
+    defer request.deinit();
+    const features = try requiredFeatures(&request, null);
+    var expected = policy.Features.initMany(&.{
+        .entities,
+        .word_whitespace,
+        .overlap_flat,
+        .decoder_auto,
+        .single_window,
+        .confidence,
+        .spans,
+    });
+    expected.insert(if (offset == .unicode_codepoints) .offset_codepoints else .offset_utf8);
+    if (group == .described) expected.insert(.schema_descriptions);
+    inline for (@typeInfo(policy.Feature).@"enum".field_values) |field_value| {
+        const feature: policy.Feature = @fromBackingInt(field_value);
+        errdefer std.debug.print("family entity geometry feature {s}: {s}\n", .{ row.id, @tagName(feature) });
+        try std.testing.expectEqual(expected.contains(feature), features.contains(feature));
+    }
+    const item = &request.items[0];
+    var prepared = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = item.text, .schema = &item.compiled }}, item.options.preprocessing(.{}));
+    defer prepared.deinit();
+    try std.testing.expectEqualSlices(i64, row.encoded.input_ids, prepared.samples[0].input_ids);
+    const words = try sourceWords(a, item.text, item.options.preprocessing(.{}));
+    const observed = try lengths(1, item.text.len, words, 1, &prepared);
+    const source_word_floor = std.mem.endsWith(u8, row.id, "source_word_floor");
+    const expected_lengths: policy.LengthContract = if (std.mem.endsWith(u8, row.id, "long"))
+        .{
+            .request_items = policy.Range.exact(1),
+            .document_bytes = policy.Range.exact(663),
+            .document_words = policy.Range.exact(114),
+            .window_count = policy.Range.exact(1),
+            .window_words = policy.Range.exact(114),
+            .padded_sequence_tokens = policy.Range.exact(if (group == .bare) 181 else 202),
+        }
+    else
+        .{
+            .request_items = policy.Range.exact(1),
+            .document_bytes = policy.Range.exact(if (source_word_floor) 5 else if (std.mem.indexOf(u8, row.id, "clean") != null) 2 else 1),
+            .document_words = policy.Range.exact(if (source_word_floor) 1 else if (std.mem.indexOf(u8, row.id, "clean") != null) 2 else 1),
+            .window_count = policy.Range.exact(1),
+            .window_words = policy.Range.exact(2),
+            .padded_sequence_tokens = policy.Range.exact(if (source_word_floor)
+                if (group == .bare) 17 else 22
+            else if (group == .bare) 18 else 24),
+        };
+    try expectExactFamilyLengths(observed, expected_lengths);
+    if (observed.document_bytes.min == 1) {
+        // Several broader learned-feature rows cover individual dimensions
+        // of this shape, but no single reviewed entity row covers their
+        // combination. The policy deliberately reports its conservative
+        // cross-row fallback dimension rather than pretending the byte axis
+        // alone explains the refusal.
+        try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, policy.require(identity, .native, features, observed));
+        try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, policy.require(identity, .metal, features, observed));
+    } else {
+        try policy.require(identity, .native, features, observed);
+        try policy.require(identity, .metal, features, observed);
+    }
+    std.debug.print("GLiNER2.5 family entity geometry {s}/{s}/{s}: bytes={d} document_words={d} window_words={d} padded_sequence_tokens={d}\n", .{
+        row.id,
+        @tagName(group),
+        @tagName(offset),
+        observed.document_bytes.min,
+        observed.document_words.min,
+        observed.window_words.min,
+        observed.padded_sequence_tokens.min,
+    });
+    return observed;
+}
+
+fn entityGroup(id: []const u8) !FamilyEntityGroup {
+    if (std.mem.startsWith(u8, id, "bare_")) return .bare;
+    if (std.mem.startsWith(u8, id, "described_")) return .described;
+    return error.InvalidFamilyReference;
+}
+
+fn measureFamilyClassificationRow(
+    a: Allocator,
+    tok: anytype,
+    identity: artifact.Identity,
+    row: FamilyGeometryRow,
+    group: FamilyClassificationGroup,
+    offset: OffsetUnit,
+) !policy.LengthContract {
+    var schema = try std.json.parseFromSlice(std.json.Value, a, row.native_schema_json, .{ .duplicate_field_behavior = .@"error" });
+    defer schema.deinit();
+    const body = try std.json.Stringify.valueAlloc(a, .{
+        .schema_version = @as(u32, 2),
+        .model = "boundary",
+        .schema = schema.value,
+        .options = .{
+            .include_confidence = true,
+            .include_spans = true,
+            .offset_unit = if (offset == .unicode_codepoints) "unicode_codepoints" else "utf8_bytes",
+        },
+        .inputs = &.{.{ .content = row.text }},
+    }, .{});
+    defer a.free(body);
+    var request = try wire.parseJson(a, body, .{});
+    defer request.deinit();
+    const features = try requiredFeatures(&request, null);
+    var expected = policy.Features.initMany(&.{
+        .classification_single,
+        .classification_structured,
+        .word_whitespace,
+        .overlap_flat,
+        .decoder_auto,
+        .single_window,
+        .confidence,
+        .spans,
+    });
+    expected.insert(if (offset == .unicode_codepoints) .offset_codepoints else .offset_utf8);
+    switch (group) {
+        .bare => {},
+        .described => expected.insert(.schema_descriptions),
+        .context => expected.insert(.classification_context),
+        .context_described => {
+            expected.insert(.classification_context);
+            expected.insert(.schema_descriptions);
+        },
+        .mixed => {
+            for ([_]policy.Feature{ .entities, .relations, .legacy_structures, .classification_context, .schema_descriptions }) |feature| expected.insert(feature);
+        },
+    }
+    inline for (@typeInfo(policy.Feature).@"enum".field_values) |field_value| {
+        const feature: policy.Feature = @fromBackingInt(field_value);
+        errdefer std.debug.print("family classification geometry feature {s}: {s}\n", .{ row.id, @tagName(feature) });
+        try std.testing.expectEqual(expected.contains(feature), features.contains(feature));
+    }
+    const item = &request.items[0];
+    var prepared = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = item.text, .schema = &item.compiled }}, item.options.preprocessing(.{}));
+    defer prepared.deinit();
+    try std.testing.expectEqualSlices(i64, row.encoded.input_ids, prepared.samples[0].input_ids);
+    const words = try sourceWords(a, item.text, item.options.preprocessing(.{}));
+    const observed = try lengths(1, item.text.len, words, 1, &prepared);
+    try policy.require(identity, .native, features, observed);
+    try policy.require(identity, .metal, features, observed);
+    std.debug.print("GLiNER2.5 family classification geometry {s}/{s}/{s}: bytes={d} document_words={d} window_words={d} padded_sequence_tokens={d}\n", .{
+        row.id,
+        @tagName(group),
+        @tagName(offset),
+        observed.document_bytes.min,
+        observed.document_words.min,
+        observed.window_words.min,
+        observed.padded_sequence_tokens.min,
+    });
+    return observed;
+}
+
+fn classificationGroup(id: []const u8) !FamilyClassificationGroup {
+    if (std.mem.eql(u8, id, "one_character_two_label") or std.mem.eql(u8, id, "bare_long")) return .bare;
+    if (std.mem.startsWith(u8, id, "described_")) return .described;
+    if (std.mem.startsWith(u8, id, "prompt_described_")) return .context_described;
+    if (std.mem.startsWith(u8, id, "prompt_")) return .context;
+    return error.InvalidFamilyReference;
+}
+
+fn familyIdentity(checkpoint: pipeline.FamilyCheckpoint) !artifact.Identity {
+    var identity = artifact.Identity{
+        .backbone = .multi,
+        .precision = .fp32,
+        .weight = .{ .size_bytes = checkpoint.model.size_bytes, .sha256 = undefined },
+        .sidecars = undefined,
+    };
+    if (checkpoint.model.sha256.len != identity.weight.sha256.len) return error.InvalidFamilyReference;
+    @memcpy(&identity.weight.sha256, checkpoint.model.sha256);
+    inline for (.{ "config.json", "encoder_config/config.json", "tokenizer.json", "tokenizer_config.json" }, 0..) |name, index| {
+        const pin = @field(checkpoint.sidecars, name);
+        if (pin.sha256.len != identity.sidecars[index].sha256.len) return error.InvalidFamilyReference;
+        identity.sidecars[index].size_bytes = pin.size_bytes;
+        @memcpy(&identity.sidecars[index].sha256, pin.sha256);
+    }
+    return identity;
+}
+
+// Reproducible policy measurement over the exact committed Python captures.
+// Loads tokenizer/config sidecars only; model weights are never opened.
+test "GLiNER2.5 multilingual family qualification measures exact captured wire geometry" {
+    const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
+    const c_file = @import("../util/c_file.zig");
+    const platform = @import("antfly_platform");
+    const a = std.testing.allocator;
+    inline for (pipeline.multilingual_family_checkpoints, 0..) |checkpoint, checkpoint_index| {
+        const environment = checkpoint.environment_prefix ++ "_MODEL_DIR";
+        const directory = platform.env.getenv(environment) orelse return error.SkipZigTest;
+        const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+        defer a.free(tokenizer_path);
+        const tokenizer_bytes = try c_file.readFileMax(a, tokenizer_path, checkpoint.sidecars.@"tokenizer.json".size_bytes);
+        defer a.free(tokenizer_bytes);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(tokenizer_bytes, &digest, .{});
+        const tokenizer_hash = std.fmt.bytesToHex(digest, .lower);
+        try std.testing.expectEqualStrings(checkpoint.sidecars.@"tokenizer.json".sha256, &tokenizer_hash);
+        const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+        defer tokenizer.tokenizer().deinitTokenizer();
+        const capture_bytes = try fixtures.fixtureBytes(a, checkpoint.capture_fixture);
+        defer a.free(capture_bytes);
+        const Capture = struct { requests: []const FamilyGeometryRow };
+        var capture = try std.json.parseFromSlice(Capture, a, capture_bytes, .{ .ignore_unknown_fields = true });
+        defer capture.deinit();
+        try std.testing.expectEqual(@as(usize, 11), capture.value.requests.len);
+        const identity = try familyIdentity(checkpoint);
+        for (capture.value.requests) |row| _ = try measureFamilyRow(a, tokenizer, identity, row, false);
+
+        inline for (.{
+            pipeline.multilingual_endpoint_checkpoints[checkpoint_index],
+            pipeline.multilingual_classification_floor_checkpoints[checkpoint_index],
+            pipeline.multilingual_general_classification_checkpoints[checkpoint_index],
+        }, 0..) |extra_checkpoint, capture_index| {
+            const extra_bytes = try fixtures.fixtureBytes(a, extra_checkpoint.capture_fixture);
+            defer a.free(extra_bytes);
+            var extra_capture = try std.json.parseFromSlice(Capture, a, extra_bytes, .{ .ignore_unknown_fields = true });
+            defer extra_capture.deinit();
+            try std.testing.expectEqual(extra_checkpoint.request_count, extra_capture.value.requests.len);
+            for (extra_capture.value.requests) |row| {
+                const group: FamilyClassificationGroup = if (capture_index == 0) .mixed else try classificationGroup(row.id);
+                _ = try measureFamilyClassificationRow(a, tokenizer, identity, row, group, .unicode_codepoints);
+                _ = try measureFamilyClassificationRow(a, tokenizer, identity, row, group, .utf8_bytes);
+            }
+        }
+
+        inline for (.{
+            pipeline.multilingual_general_entity_checkpoints[checkpoint_index],
+            pipeline.multilingual_clean_entity_short_checkpoints[checkpoint_index],
+            pipeline.multilingual_source_word_floor_checkpoints[checkpoint_index],
+        }) |entity_checkpoint| {
+            const entity_bytes = try fixtures.fixtureBytes(a, entity_checkpoint.capture_fixture);
+            defer a.free(entity_bytes);
+            var entity_capture = try std.json.parseFromSlice(Capture, a, entity_bytes, .{ .ignore_unknown_fields = true });
+            defer entity_capture.deinit();
+            try std.testing.expectEqual(entity_checkpoint.request_count, entity_capture.value.requests.len);
+            for (entity_capture.value.requests) |row| {
+                const group = try entityGroup(row.id);
+                _ = try measureFamilyEntityRow(a, tokenizer, identity, row, group, .unicode_codepoints);
+                _ = try measureFamilyEntityRow(a, tokenizer, identity, row, group, .utf8_bytes);
+            }
+        }
+    }
+
+    const directory = platform.env.getenv("ANTFLY_GLINER25_MULTI_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
+    const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(tokenizer_path);
+    const tokenizer_bytes = try c_file.readFileMax(a, tokenizer_path, pipeline.multilingual_family_checkpoints[1].sidecars.@"tokenizer.json".size_bytes);
+    defer a.free(tokenizer_bytes);
+    const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tokenizer.tokenizer().deinitTokenizer();
+    const decide_bytes = try fixtures.fixtureBytes(a, "family/multi_decide_decide_capture.json");
+    defer a.free(decide_bytes);
+    const DecideCapture = struct { requests: []const FamilyGeometryRow };
+    var decide_capture = try std.json.parseFromSlice(DecideCapture, a, decide_bytes, .{ .ignore_unknown_fields = true });
+    defer decide_capture.deinit();
+    try std.testing.expectEqual(@as(usize, 2), decide_capture.value.requests.len);
+    const identity = try familyIdentity(pipeline.multilingual_family_checkpoints[1]);
+    for (decide_capture.value.requests) |row| _ = try measureFamilyRow(a, tokenizer, identity, row, true);
 }
 
 // Evidence-gathering, not a synthetic contract check: this measures the exact

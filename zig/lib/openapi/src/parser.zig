@@ -168,6 +168,12 @@ pub const Parser = struct {
             op.security = try self.parseSecurityRequirements(sec_val);
         }
 
+        if (obj.get("x-antfly-response-streaming")) |value| {
+            op.response_streaming = switch (value) {
+                .bool => |enabled| enabled,
+                else => return ParseError.InvalidValue,
+            };
+        }
         if (obj.get("x-antfly-client-request-policy")) |policy| {
             op.client_request_policy = std.json.parseFromValueLeaky(types.ClientRequestPolicy, self.arena, policy, .{}) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -935,4 +941,17 @@ test "parse 3.1 webhooks" {
     try std.testing.expectEqual(@as(usize, 1), doc.webhooks.count());
     const webhook = doc.webhooks.get("newPet").?;
     try std.testing.expectEqualStrings("onNewPet", webhook.post.?.operation_id.?);
+}
+
+test "parse JSON transport streaming capability without changing response schemas" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var parser = Parser.init(arena.allocator());
+    const prefix = "{\"openapi\":\"3.0.3\",\"info\":{\"title\":\"test\",\"version\":\"1\"},\"paths\":{\"/query\":{\"post\":{\"operationId\":\"query\",\"x-antfly-response-streaming\":";
+    const suffix = "}}}}";
+    inline for (.{ "true", "false" }) |flag| {
+        const doc = try parser.parseDocument(prefix ++ flag ++ suffix);
+        try std.testing.expectEqual(std.mem.eql(u8, flag, "true"), doc.paths.get("/query").?.post.?.response_streaming);
+    }
+    try std.testing.expectError(error.InvalidValue, parser.parseDocument(prefix ++ "1" ++ suffix));
 }

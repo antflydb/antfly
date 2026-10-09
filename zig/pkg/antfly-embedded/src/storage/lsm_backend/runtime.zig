@@ -70,11 +70,13 @@ const VisibleBytes = union(enum) {
     none,
     owned: OwnedBytes,
     borrowed,
+    local: *SharedBytes,
 
     fn release(self: *@This()) void {
         switch (self.*) {
             .none, .borrowed => {},
             .owned => |*owned| owned.release(),
+            .local => |payload| payload.release(),
         }
         self.* = .none;
     }
@@ -85,22 +87,61 @@ const VisibleBytes = union(enum) {
     }
 };
 
+const SharedBytes = @import("shared_bytes.zig").SharedBytes;
+const LocalReader = @import("local_reader.zig").Pool;
+const RunSourceLease = @import("source_lease.zig").Lease;
+
+/// Transaction result pins share the same lifetime contract for both caches.
+const BlockPin = union(enum) {
+    cached: cache_mod.Handle,
+    local: *SharedBytes,
+    fn release(self: *@This()) void {
+        switch (self.*) {
+            .cached => |*handle| handle.release(),
+            .local => |payload| payload.release(),
+        }
+        self.* = undefined;
+    }
+};
+
+/// One owner-wide bound for cursor and point-result borrowing.
+fn retainLocalResultPin(backend: anytype, payload: *SharedBytes, held: *std.ArrayListUnmanaged(BlockPin)) !bool {
+    if (!payload.result_pins_allowed) return false;
+    var bytes: usize = 0;
+    var count: usize = 0;
+    for (held.items) |pin| if (pin == .local) {
+        if (pin.local == payload) return true;
+        bytes +|= pin.local.bytes.len;
+        count += 1;
+    };
+    if (count >= 64 or payload.bytes.len > (1024 * 1024) -| bytes) return false;
+    const owned = payload.retain();
+    errdefer owned.release();
+    try held.append(backend.allocator, .{ .local = owned });
+    return true;
+}
+
+const ResultBlockRetention = enum { unknown, pinned, copy };
+
 const SourceBlockLease = union(enum) {
     none,
     owned: OwnedBytes,
     cached: cache_mod.Handle,
+    local: *SharedBytes,
 
     fn bytes(self: *const @This()) ?[]const u8 {
         return switch (self.*) {
             .none => null,
             .owned => |owned| owned.bytes,
             .cached => |*handle| handle.runTableBlock(),
+            .local => |payload| payload.bytes,
         };
     }
 
-    fn retainCached(self: *const @This()) ?cache_mod.Handle {
+    fn retainPin(self: *const @This()) ?BlockPin {
         return switch (self.*) {
-            .cached => |*handle| handle.retain(),
+            .cached => |*handle| .{ .cached = handle.retain() },
+            .local => |payload| .{ .local = payload.retain() },
             else => null,
         };
     }
@@ -110,6 +151,7 @@ const SourceBlockLease = union(enum) {
             .none => {},
             .owned => |*owned| owned.release(),
             .cached => |*handle| handle.release(),
+            .local => |payload| payload.release(),
         }
         self.* = .none;
     }
@@ -270,7 +312,7 @@ fn bulkStateHasDuplicateKeys(allocator: Allocator, state: *const State) !bool {
     return false;
 }
 
-fn releaseHeldBlocks(held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle), allocator: Allocator) void {
+fn releaseHeldBlocks(held_blocks: *std.ArrayListUnmanaged(BlockPin), allocator: Allocator) void {
     for (held_blocks.items) |*handle| handle.release();
     held_blocks.deinit(allocator);
 }
@@ -916,6 +958,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         source_entries: []?SourceEntry,
         source_key_copies: []?[]u8 = &.{},
         source_blocks: []SourceBlockLease,
+        source_run_leases: []?*RunSourceLease = &.{},
+        source_result_retention: []ResultBlockRetention = &.{},
         source_block_indices: []?usize,
         source_table_indices: []?*const lsm_table_file.TableIndex,
         source_table_index_handles: []?cache_mod.Handle,
@@ -945,6 +989,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             cursorStorageAdvance(?SourceEntry, &offset, source_count);
             cursorStorageAdvance(?[]u8, &offset, source_count);
             cursorStorageAdvance(SourceBlockLease, &offset, source_count);
+            cursorStorageAdvance(?*RunSourceLease, &offset, source_count);
+            cursorStorageAdvance(ResultBlockRetention, &offset, source_count);
             cursorStorageAdvance(?usize, &offset, source_count);
             cursorStorageAdvance(?*const lsm_table_file.TableIndex, &offset, source_count);
             cursorStorageAdvance(?cache_mod.Handle, &offset, source_count);
@@ -1065,6 +1111,10 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             @memset(source_key_copies, null);
             const source_blocks = cursorStorageSlice(SourceBlockLease, storage, &offset, source_count);
             @memset(source_blocks, .none);
+            const source_run_leases = cursorStorageSlice(?*RunSourceLease, storage, &offset, source_count);
+            @memset(source_run_leases, null);
+            const source_result_retention = cursorStorageSlice(ResultBlockRetention, storage, &offset, source_count);
+            @memset(source_result_retention, .unknown);
             const source_block_indices = cursorStorageSlice(?usize, storage, &offset, source_count);
             @memset(source_block_indices, null);
             const source_table_indices = cursorStorageSlice(?*const lsm_table_file.TableIndex, storage, &offset, source_count);
@@ -1102,6 +1152,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .source_entries = source_entries,
                 .source_key_copies = source_key_copies,
                 .source_blocks = source_blocks,
+                .source_run_leases = source_run_leases,
+                .source_result_retention = source_result_retention,
                 .source_block_indices = source_block_indices,
                 .source_table_indices = source_table_indices,
                 .source_table_index_handles = source_table_index_handles,
@@ -1118,6 +1170,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         pub fn close(self: *@This()) void {
             defer if (self.cursor_reservation) |*lease| lease.release();
             for (0..self.source_blocks.len) |source_index| self.clearSourceBlock(source_index);
+            for (0..self.source_run_leases.len) |source_index| self.clearSourceRunLease(source_index);
+            if (comptime @hasDecl(BackendType, "trimRunSources")) self.backend.trimRunSources();
             for (0..self.source_key_copies.len) |source_index| self.clearSourceKeyCopy(source_index);
             for (self.source_table_index_handles) |*maybe_handle| {
                 if (maybe_handle.*) |*handle| handle.release();
@@ -1130,6 +1184,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             } else {
                 self.allocator.free(self.source_block_indices);
                 self.allocator.free(self.source_blocks);
+                self.allocator.free(self.source_run_leases);
+                self.allocator.free(self.source_result_retention);
                 self.allocator.free(self.source_entries);
                 self.allocator.free(self.source_key_copies);
                 self.allocator.free(self.positions);
@@ -1281,12 +1337,26 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             }
         }
 
-        pub fn retainCurrentValueForTxn(self: *@This(), held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle)) !bool {
+        pub fn retainCurrentValueForTxn(self: *@This(), held_blocks: *std.ArrayListUnmanaged(BlockPin)) !bool {
             const source_index = self.current_visible_source orelse return false;
-            if (self.source_blocks[source_index].retainCached()) |retained_block| {
+            if (self.source_result_retention.len != 0) switch (self.source_result_retention[source_index]) {
+                .pinned => return true,
+                .copy => return false,
+                .unknown => {},
+            };
+            // Local cache payloads are not backed by the external cache's pin
+            // budget. Bound retained amplification per result owner, then let
+            // the caller copy values. The count cap also bounds this scan.
+            if (self.source_blocks[source_index] == .local) {
+                const pinned = try retainLocalResultPin(self.backend, self.source_blocks[source_index].local, held_blocks);
+                if (self.source_result_retention.len != 0) self.source_result_retention[source_index] = if (pinned) .pinned else .copy;
+                return pinned;
+            }
+            if (self.source_blocks[source_index].retainPin()) |retained_block| {
                 var retained = retained_block;
                 errdefer retained.release();
                 try held_blocks.append(self.backend.allocator, retained);
+                if (self.source_result_retention.len != 0) self.source_result_retention[source_index] = .pinned;
                 return true;
             }
 
@@ -1483,6 +1553,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             const span = &self.run_spans[source_index];
             if (span.current == run_index) return;
             self.clearSourceBlock(source_index);
+            self.clearSourceRunLease(source_index);
             if (self.source_table_index_handles[source_index]) |*handle| handle.release();
             self.source_table_index_handles[source_index] = null;
             self.source_table_indices[source_index] = null;
@@ -2036,8 +2107,15 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             } };
         }
 
+        fn clearSourceRunLease(self: *@This(), source_index: usize) void {
+            if (self.source_run_leases.len == 0) return;
+            if (self.source_run_leases[source_index]) |lease| lease.release();
+            self.source_run_leases[source_index] = null;
+        }
+
         fn clearSourceBlock(self: *@This(), source_index: usize) void {
             self.source_blocks[source_index].release();
+            if (self.source_result_retention.len != 0) self.source_result_retention[source_index] = .unknown;
             self.source_block_indices[source_index] = null;
         }
 
@@ -2144,6 +2222,10 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 const block = handle.runTableBlock();
                 self.source_blocks[source_index] = .{ .cached = handle };
                 break :blk block;
+            } else if (localBlockCacheEnabled(self.backend)) blk: {
+                const payload = try loadLocalBlockLease(self.backend, run, index, window, self.backend_locked, self.namespace.retainDataBlocks());
+                self.source_blocks[source_index] = .{ .local = payload };
+                break :blk payload.bytes;
             } else blk: {
                 const owned = try loadOwnedBlockForWindowAllocMaybeLocked(
                     self.backend,
@@ -2156,6 +2238,11 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 self.source_blocks[source_index] = .{ .owned = .{ .allocator = self.backend.allocator, .bytes = owned } };
                 break :blk owned;
             };
+            // Retain only sources already opened by real I/O. A fully cached
+            // scan needs no extra descriptor or catalog publication.
+            if (comptime @hasDecl(BackendType, "retainCachedRunSource")) {
+                if (self.source_run_leases.len != 0 and self.source_run_leases[source_index] == null) self.source_run_leases[source_index] = self.backend.retainCachedRunSource(run.path.?);
+            }
             self.source_block_indices[source_index] = window.relative_offset;
             try self.prefetchNextSourceBlock(source_index, run, index, block_index);
             return bytes;
@@ -2438,7 +2525,7 @@ fn advanceSortedBatchCursorToKey(cursor: anytype, current: ?backend_adapter.Entr
 fn readManySortedFromCursor(
     backend: anytype,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     cursor: anytype,
     keys: []const []const u8,
@@ -2446,6 +2533,9 @@ fn readManySortedFromCursor(
 ) !BatchCursorReadResult {
     @memset(values, null);
     if (keys.len == 0) return .{};
+
+    // Pins belong to this result owner, even when a caller reuses its cursor.
+    if (comptime @hasField(@TypeOf(cursor.*), "source_result_retention")) @memset(cursor.source_result_retention, .unknown);
 
     var result: BatchCursorReadResult = .{};
     backend.recordPointGets(keys.len);
@@ -2487,7 +2577,7 @@ const PointResultLifetime = enum {
     snapshot_pinned,
     transaction_owned,
 
-    fn forBlockPins(blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle)) PointResultLifetime {
+    fn forBlockPins(blocks: ?*std.ArrayListUnmanaged(BlockPin)) PointResultLifetime {
         return if (blocks != null) .snapshot_pinned else .transaction_owned;
     }
 
@@ -2524,7 +2614,7 @@ fn readManySortedPointFromSnapshot(
     l0_groups: []const RunGroup,
     levels: []const RunLevel,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     namespace: backend_types.Namespace,
     keys: []const []const u8,
@@ -2548,7 +2638,7 @@ fn readManySortedPointFromSnapshot(
         PointResultLifetime.forBlockPins(held_blocks),
     )) |result| return result;
 
-    var local_held_blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
+    var local_held_blocks = std.ArrayListUnmanaged(BlockPin).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
     var batch_indexes = RunBatchIndexHandles{ .allocator = runtimeScratchAllocator(allocator) };
@@ -2607,14 +2697,14 @@ const RunBatchIndexState = struct {
         self.* = undefined;
     }
 
-    fn transferBlock(self: *@This(), allocator: Allocator, held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle)) !void {
+    fn transferBlock(self: *@This(), allocator: Allocator, held_blocks: *std.ArrayListUnmanaged(BlockPin)) !void {
         if (self.block_handle) |handle| {
             self.block_handle = null;
             self.block_index = null;
             if (self.block_has_values) {
                 var transfer = handle;
                 errdefer transfer.release();
-                try held_blocks.append(allocator, transfer);
+                try held_blocks.append(allocator, .{ .cached = transfer });
             } else {
                 var discard = handle;
                 discard.release();
@@ -2655,7 +2745,7 @@ const RunBatchIndexHandles = struct {
         unreachable;
     }
 
-    fn transferBlocks(self: *@This(), allocator: Allocator, held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle)) !void {
+    fn transferBlocks(self: *@This(), allocator: Allocator, held_blocks: *std.ArrayListUnmanaged(BlockPin)) !void {
         for (self.items.items) |*item| try item.transferBlock(allocator, held_blocks);
     }
 };
@@ -2668,7 +2758,7 @@ fn readManySortedByRunFromSnapshot(
     l0_groups: []const RunGroup,
     levels: []const RunLevel,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     namespace: backend_types.Namespace,
     keys: []const []const u8,
@@ -2676,7 +2766,7 @@ fn readManySortedByRunFromSnapshot(
     backend_locked: bool,
 ) !BatchCursorReadResult {
     @memset(values, null);
-    var local_held_blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
+    var local_held_blocks = std.ArrayListUnmanaged(BlockPin).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
 
@@ -2724,7 +2814,7 @@ fn readManyCurrentPointLocked(
     backend: *BackendType,
     namespace: backend_types.Namespace,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     keys: []const []const u8,
     values: []?[]const u8,
@@ -2754,7 +2844,7 @@ fn getCurrentPointRetainedLocked(
     backend: *BackendType,
     namespace: backend_types.Namespace,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     key: []const u8,
 ) !?[]const u8 {
@@ -2833,7 +2923,7 @@ fn getFromRunPointRetainedLocked(
     backend: anytype,
     run: *Run,
     run_index: usize,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -2853,7 +2943,7 @@ fn getFromRunPointRetainedLocked(
                 return located.entry.value;
             }
         }
-        const value = try getFromRunWithLocalIndex(backend, run, held_values, value_allocator, namespace, key, true) orelse return null;
+        const value = try getFromRunWithLocalIndex(backend, run, held_blocks, held_values, value_allocator, namespace, key, true) orelse return null;
         recordPointValueCopy(backend);
         if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
         return value;
@@ -2885,7 +2975,7 @@ fn getOwnedDirectoryPoint(
     namespace: backend_types.Namespace,
     key: []const u8,
 ) ![]const u8 {
-    var blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty;
+    var blocks: std.ArrayListUnmanaged(BlockPin) = .empty;
     defer releaseHeldBlocks(&blocks, backend.allocator);
     var hint: ?BorrowedReadHint = null;
     const first_owned = held_values.items.len;
@@ -2898,7 +2988,7 @@ fn readManyCurrentSortedPointByRunLocked(
     backend: *BackendType,
     namespace: backend_types.Namespace,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     keys: []const []const u8,
     values: []?[]const u8,
@@ -2953,7 +3043,7 @@ fn readManyCurrentSortedPointByRunLocked(
         }
     }
 
-    var local_held_blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
+    var local_held_blocks = std.ArrayListUnmanaged(BlockPin).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
     var batch_indexes = RunBatchIndexHandles{ .allocator = metadata_allocator };
@@ -2984,7 +3074,7 @@ fn readManyCurrentSortedPointByRunLocked(
                         continue;
                     }
                     break :blk located.entry.value;
-                } else getFromRunWithLocalIndex(backend, run, held_values, allocator, namespace, keys[key_index], true) catch |err| switch (err) {
+                } else getFromRunWithLocalIndex(backend, run, held_blocks, held_values, allocator, namespace, keys[key_index], true) catch |err| switch (err) {
                     error.NotFound => {
                         resolved[key_index] = true;
                         result.misses += 1;
@@ -3340,7 +3430,7 @@ fn readManySortedCurrentWithLayoutLocked(
     layout: *const CurrentReadLayout(BackendType),
     namespace: backend_types.Namespace,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     keys: []const []const u8,
     values: []?[]const u8,
@@ -3401,7 +3491,7 @@ fn readManySortedCurrentLocked(
     backend: *BackendType,
     namespace: backend_types.Namespace,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     keys: []const []const u8,
     values: []?[]const u8,
@@ -3428,13 +3518,13 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
         levels: []RunLevel = &.{},
         last_l0_group_index: ?usize = null,
         read_hint: ?BorrowedReadHint = null,
-        held_blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty,
+        held_blocks: std.ArrayListUnmanaged(BlockPin) = .empty,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
 
         pub const ReadScope = struct {
             parent: *BoundReadTxn(BackendType),
             allocator: Allocator,
-            held_blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty,
+            held_blocks: std.ArrayListUnmanaged(BlockPin) = .empty,
             held_values: std.ArrayListUnmanaged([]u8) = .empty,
             read_hint: ?BorrowedReadHint = null,
             last_l0_group_index: ?usize = null,
@@ -3453,6 +3543,24 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 p.backend.recordGetManySortedLocality(keys);
                 const result = try readManySortedFromReadView(p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, self.allocator, &self.held_blocks, &self.held_values, p.namespace, keys, values);
                 p.backend.recordGetManySortedResults(result.hits, result.misses);
+            }
+
+            /// Release payload ownership between streaming batches while
+            /// reusing bounded pin/value pointer arrays. Larger batches never
+            /// permanently inflate the next ordinary batch's scratch.
+            pub fn reset(self: *@This()) void {
+                for (self.held_blocks.items) |*handle| handle.release();
+                for (self.held_values.items) |value| self.allocator.free(value);
+                if (self.held_blocks.capacity * @sizeOf(BlockPin) > 64 * 1024) {
+                    self.held_blocks.deinit(self.parent.backend.allocator);
+                    self.held_blocks = .empty;
+                } else self.held_blocks.clearRetainingCapacity();
+                if (self.held_values.capacity * @sizeOf([]u8) > 64 * 1024) {
+                    self.held_values.deinit(self.allocator);
+                    self.held_values = .empty;
+                } else self.held_values.clearRetainingCapacity();
+                self.read_hint = null;
+                self.last_l0_group_index = null;
             }
 
             pub fn close(self: *@This()) void {
@@ -3703,7 +3811,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         levels: []RunLevel = &.{},
         last_l0_group_index: ?usize = null,
         read_hint: ?BorrowedReadHint = null,
-        held_blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty,
+        held_blocks: std.ArrayListUnmanaged(BlockPin) = .empty,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
 
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
@@ -3747,10 +3855,48 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             return owned;
         }
 
-        fn ownValues(self: *@This(), values: []?[]const u8) !void {
-            for (values) |*value| {
-                const present = value.* orelse continue;
-                value.* = try self.ownValue(present);
+        fn ownUnpinnedValues(self: *@This(), values: []?[]const u8, first_owned: usize) !void {
+            const Range = struct {
+                base: usize,
+                len: usize,
+                fn less(_: void, lhs: @This(), rhs: @This()) bool {
+                    return lhs.base < rhs.base;
+                }
+            };
+            const count = self.held_values.items.len - first_owned;
+            var inline_ranges: [128]Range = undefined;
+            const ranges = if (count <= inline_ranges.len) inline_ranges[0..count] else try self.metadata_allocator.alloc(Range, count);
+            defer if (count > inline_ranges.len) self.metadata_allocator.free(ranges);
+            for (self.held_values.items[first_owned..], ranges) |owned, *range| range.* = .{ .base = @intFromPtr(owned.ptr), .len = owned.len };
+            std.mem.sort(Range, ranges, {}, Range.less);
+            for (values) |*slot| {
+                const value = slot.* orelse continue;
+                const address = @intFromPtr(value.ptr);
+                var retained = false;
+                for (self.held_blocks.items) |*pin| {
+                    const bytes = switch (pin.*) {
+                        .local => |payload| payload.bytes,
+                        .cached => |*handle| handle.runTableBlock(),
+                    };
+                    const base = @intFromPtr(bytes.ptr);
+                    if (address >= base and address - base <= bytes.len and value.len <= bytes.len - (address - base)) {
+                        retained = true;
+                        break;
+                    }
+                }
+                if (retained) continue;
+                var lo: usize = 0;
+                var hi = ranges.len;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (ranges[mid].base <= address) lo = mid + 1 else hi = mid;
+                }
+                if (lo != 0) {
+                    const range = ranges[lo - 1];
+                    if (address - range.base <= range.len and value.len <= range.len - (address - range.base)) continue;
+                }
+                slot.* = try self.ownValue(value);
+                recordPointValueCopy(self.backend);
             }
         }
 
@@ -3893,6 +4039,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                 self.backend.recordGetManySortedLocality(keys);
             }
 
+            const first_owned = self.held_values.items.len;
             var result: BatchCursorReadResult = .{};
             if (self.stable_point_view) {
                 var offset: usize = 0;
@@ -4031,10 +4178,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             false,
                         ),
                     };
-                    try self.ownValues(unresolved_values);
-                    for (unresolved_values) |value| {
-                        if (value != null) recordPointValueCopy(self.backend);
-                    }
+                    try self.ownUnpinnedValues(unresolved_values, first_owned);
                     for (unresolved_values, unresolved_indexes) |value, index| values[index] = value;
                     result.add(unresolved_result);
                 }
@@ -4809,7 +4953,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     break :blk try CurrentReadLayout(BackendType).init(self.backend, self.allocator);
                 };
                 defer layout.deinitAfterUnlockedRead();
-                var blocks = std.ArrayListUnmanaged(cache_mod.Handle).empty;
+                var blocks = std.ArrayListUnmanaged(BlockPin).empty;
                 defer releaseHeldBlocks(&blocks, self.backend.allocator);
                 var values = std.ArrayListUnmanaged([]u8).empty;
                 defer {
@@ -5117,7 +5261,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
         levels: []RunLevel = &.{},
         last_l0_group_index: ?usize = null,
         read_hint: ?BorrowedReadHint = null,
-        held_blocks: std.ArrayListUnmanaged(cache_mod.Handle) = .empty,
+        held_blocks: std.ArrayListUnmanaged(BlockPin) = .empty,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
 
         pub fn open(backend: *BackendType) !@This() {
@@ -5251,7 +5395,7 @@ fn getFromDirectoryPoint(
     directory: *const @import("run_directory.zig").Directory,
     immutable_memtables: []const *const State,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -5282,7 +5426,7 @@ fn getFromDirectoryPointCandidates(
     backend: anytype,
     directory: *const @import("run_directory.zig").Directory,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     scratch: Allocator,
     value_allocator: Allocator,
@@ -5339,7 +5483,7 @@ fn getFromReadView(
     view: RunReadView,
     last_l0_group_index: *?usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -5363,7 +5507,7 @@ fn readManySortedFromReadView(
     immutable_memtables: []const *const State,
     view: RunReadView,
     allocator: Allocator,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     namespace: backend_types.Namespace,
     keys: []const []const u8,
@@ -5391,7 +5535,7 @@ fn readManySortedDirectoryBatch(
     immutable_memtables: []const *const State,
     directory: *const @import("run_directory.zig").Directory,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     namespace: backend_types.Namespace,
     keys: []const []const u8,
@@ -5419,7 +5563,7 @@ fn readManySortedDirectoryCandidates(
     directory: *const @import("run_directory.zig").Directory,
     scratch: Allocator,
     allocator: Allocator,
-    held_blocks: ?*std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     namespace: backend_types.Namespace,
     keys: []const []const u8,
@@ -5463,7 +5607,7 @@ fn getFromSnapshotRuns(
     levels: []const RunLevel,
     last_l0_group_index: *?usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -5792,7 +5936,7 @@ fn readPointRunCandidate(
     runs: []Run,
     candidate: PointRunCandidate,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -5815,7 +5959,7 @@ fn readPointRunCandidate(
         };
         return located.entry.value;
     }
-    if (try getFromRunWithLocalIndex(backend, run, held_values, value_allocator, namespace, key, backend_locked)) |value| {
+    if (try getFromRunWithLocalIndex(backend, run, held_blocks, held_values, value_allocator, namespace, key, backend_locked)) |value| {
         read_hint.* = null;
         return value;
     }
@@ -5827,7 +5971,7 @@ fn getFromPathRunIndicesPrechecked(
     runs: []Run,
     run_indices: []const usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -5907,7 +6051,7 @@ fn readPointRunCandidateWithStats(
     runs: []Run,
     candidate: PointRunCandidate,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6446,7 +6590,7 @@ fn getFromRunIndices(
     runs: []Run,
     run_indices: []const usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6500,7 +6644,7 @@ fn getFromRunIndices(
                 };
                 return located.entry.value;
             }
-            if (try getFromRunWithLocalIndex(backend, run, held_values, value_allocator, namespace, key, backend_locked)) |value| {
+            if (try getFromRunWithLocalIndex(backend, run, held_blocks, held_values, value_allocator, namespace, key, backend_locked)) |value| {
                 read_hint.* = null;
                 return value;
             }
@@ -6663,7 +6807,7 @@ fn loadRunTableIndexWithStats(backend: anytype, allocator: Allocator, path: []co
 
 fn loadRunTableBlockWithStats(backend: anytype, allocator: Allocator, path: []const u8, absolute_offset: u64, len: usize) ![]u8 {
     const start_ns = backend.readStatsNowNs();
-    const loaded = backend.storage.?.readFileRangeAlloc(allocator, path, absolute_offset, len);
+    const loaded = if (@hasDecl(@TypeOf(backend.*), "readRunRangeAlloc")) backend.readRunRangeAlloc(allocator, path, absolute_offset, len) else backend.storage.?.readFileRangeAlloc(allocator, path, absolute_offset, len);
     const elapsed_ns = backend.readStatsElapsedNs(start_ns);
     if (loaded) |bytes| backend.recordTableBlockLoad(bytes.len, elapsed_ns) else |_| backend.recordTableBlockLoad(len, elapsed_ns);
     return try loaded;
@@ -6689,7 +6833,7 @@ fn getFromRunWithBlockCache(
     run: *Run,
     run_index: usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6708,7 +6852,7 @@ fn getFromRunWithBlockCacheBatch(
     run: *Run,
     run_index: usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6728,7 +6872,7 @@ fn getFromRunWithBlockCacheIndex(
     run_index: usize,
     index: *const lsm_table_file.TableIndex,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6749,7 +6893,7 @@ fn getFromRunWithBlockCacheIndex(
     var pinned = located orelse return null;
     errdefer if (pinned.handle) |*handle| handle.release();
     if (pinned.handle) |handle| {
-        try held_blocks.append(backend.allocator, handle);
+        try held_blocks.append(backend.allocator, .{ .cached = handle });
     }
     return .{
         .entry_index = pinned.entry_index,
@@ -6763,7 +6907,7 @@ fn getFromRunWithBlockCacheBatchState(
     run_index: usize,
     state: *RunBatchIndexState,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6991,7 +7135,7 @@ fn loadBatchBlock(
     run: *Run,
     index: *const lsm_table_file.TableIndex,
     state: *RunBatchIndexState,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     block_index: usize,
     retain_block: bool,
 ) ![]const u8 {
@@ -7010,7 +7154,7 @@ fn findExactEntryInBatchBlocks(
     run: *Run,
     index: *const lsm_table_file.TableIndex,
     state: *RunBatchIndexState,
-    held_blocks: *std.ArrayListUnmanaged(cache_mod.Handle),
+    held_blocks: *std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -7071,10 +7215,13 @@ fn visibleEntryFromRunIndices(
         if (run.path != null) {
             const loaded = try loadVisibleEntryFromPathRunMaybeLocked(backend, run, namespace, key, backend_locked) orelse continue;
             if (loaded.entry.tombstone) {
-                backend.allocator.free(loaded.bytes);
+                loaded.deinit(backend.allocator);
                 return .tombstone;
             }
-            visible_entry_bytes.setOwned(backend.allocator, loaded.bytes);
+            if (loaded.local) |lease| {
+                visible_entry_bytes.release();
+                visible_entry_bytes.* = .{ .local = lease };
+            } else visible_entry_bytes.setOwned(backend.allocator, loaded.bytes);
             return .{ .value = .{
                 .key = loaded.entry.key,
                 .value = loaded.entry.value,
@@ -7173,8 +7320,44 @@ fn indexForRunNoCacheMaybeLocked(backend: anytype, run: *Run, backend_locked: bo
 
 const OwnedTableEntry = struct {
     entry: lsm_table_file.Entry,
-    bytes: []u8,
+    bytes: []u8 = &.{},
+    local: ?*SharedBytes = null,
+    fn deinit(self: @This(), allocator: Allocator) void {
+        if (self.local) |lease| lease.release() else allocator.free(self.bytes);
+    }
 };
+
+// Point-result ownership needs the selected row, never a duplicate of the
+// entire decoded block. Large rows can still transfer this compact buffer.
+fn copyTableEntry(allocator: Allocator, entry: lsm_table_file.Entry) !OwnedTableEntry {
+    const namespace_len = if (entry.namespace_name) |name| name.len else 0;
+    const bytes = try allocator.alloc(u8, namespace_len + entry.key.len + entry.value.len);
+    var copied = entry;
+    if (entry.namespace_name) |name| {
+        @memcpy(bytes[0..namespace_len], name);
+        copied.namespace_name = bytes[0..namespace_len];
+    }
+    copied.key = bytes[namespace_len..][0..entry.key.len];
+    @memcpy(@constCast(copied.key), entry.key);
+    copied.value = bytes[namespace_len + entry.key.len ..];
+    @memcpy(@constCast(copied.value), entry.value);
+    return .{ .entry = copied, .bytes = bytes };
+}
+
+fn findExactEntryInLocalLease(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, block_index: usize, namespace: backend_types.Namespace, key: []const u8, locked: bool) !?OwnedTableEntry {
+    const lease = try loadLocalBlockLease(backend, run, index, window, locked, namespace.retainDataBlocks());
+    return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+}
+
+/// Consumes the retained block reference, including on a miss or error.
+fn findExactEntryInBlockLease(lease: *SharedBytes, index: *const lsm_table_file.TableIndex, block_index: usize, namespace: backend_types.Namespace, key: []const u8) !?OwnedTableEntry {
+    errdefer lease.release();
+    const positioned = try lsm_table_file.findExactEntryInBlock(index, lease.bytes, block_index, namespace.name, key) orelse {
+        lease.release();
+        return null;
+    };
+    return .{ .entry = positioned.entry, .local = lease };
+}
 
 fn findExactEntryWithLocalIndex(
     backend: anytype,
@@ -7185,6 +7368,122 @@ fn findExactEntryWithLocalIndex(
     const index = try indexForRunNoCache(backend, run);
     try requireTableBlocks(index);
     return try findExactEntryWithLocalIndexBlockMeta(backend, run, index, namespace, key);
+}
+
+fn localBlockCacheEligible(backend: anytype, bytes: usize) bool {
+    if (comptime @hasDecl(@TypeOf(backend.*), "localBlockCacheEligible")) return backend.localBlockCacheEligible(bytes);
+    return localBlockCacheEnabled(backend);
+}
+
+fn beginLocalBlockPromotion(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, locked: bool) bool {
+    if (comptime !@hasDecl(@TypeOf(backend.*), "beginLocalBlockPromotion")) return false;
+    if (window.compression != .prefix and window.compression != .prefix_snappy) return false;
+    const path = run.path orelse return false;
+    const held = if (locked) false else lockBackend(@TypeOf(backend.*), backend);
+    defer unlockBackend(@TypeOf(backend.*), backend, held);
+    return backend.beginLocalBlockPromotion(path, run.id, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window.physicalLen(), window.len);
+}
+
+fn finishLocalBlockPromotion(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, locked: bool, admitted: bool) void {
+    if (comptime !@hasDecl(@TypeOf(backend.*), "finishLocalBlockPromotion")) return;
+    const path = run.path orelse return;
+    const held = if (locked) false else lockBackend(@TypeOf(backend.*), backend);
+    defer unlockBackend(@TypeOf(backend.*), backend, held);
+    backend.finishLocalBlockPromotion(path, run.id, @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset(), window.physicalLen(), admitted);
+}
+
+fn retainLocalCachedBlock(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool) ?*SharedBytes {
+    const path = run.path orelse return null;
+    const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+    const locked = if (backend_locked) false else lockBackend(@TypeOf(backend.*), backend);
+    defer unlockBackend(@TypeOf(backend.*), backend, locked);
+    if (backend.retainCachedRunBlock(path, run.id, offset, window.physicalLen())) |lease| {
+        backend.recordLocalBlockCacheHit();
+        return lease;
+    }
+    return null;
+}
+
+fn localDecodeWorkingBytes(window: lsm_table_file.EntryDataWindow) !usize {
+    const logical = std.math.mul(usize, window.len, 24) catch return error.InvalidTableFile;
+    const physical = std.math.mul(usize, window.physicalLen(), 4) catch return error.InvalidTableFile;
+    return std.math.add(usize, std.math.add(usize, logical, physical) catch return error.InvalidTableFile, LocalReader.retained_bytes_per_workspace + @sizeOf(SharedBytes)) catch return error.InvalidTableFile;
+}
+
+fn localWorkspace(backend: anytype, window: lsm_table_file.EntryDataWindow) !LocalReader.Workspace {
+    return backend.local_reader.acquire(backend.allocator, backend.options.resource_manager, backend.manifestCoordinationIo(), try localDecodeWorkingBytes(window), backend.options.local_decode_working_bytes, window.len + @sizeOf(SharedBytes));
+}
+
+fn loadDecodedLocalBlock(backend: anytype, allocator: Allocator, path: []const u8, offset: u64, window: lsm_table_file.EntryDataWindow) ![]u8 {
+    if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
+        var work = try localWorkspace(backend, window);
+        defer work.release();
+        const scratch = work.allocator();
+        const payload = try loadRunTableBlockWithStats(backend, scratch, path, offset, window.physicalLen());
+        return lsm_table_file.decodeBlockPayloadWithScratchAlloc(allocator, scratch, window.compression, payload, window.len, window.checksum);
+    }
+    return loadRunTableDecodedBlockWithStats(backend, allocator, path, offset, window.physicalLen(), window.compression, window.len, window.checksum);
+}
+
+fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool) !*SharedBytes {
+    const path = run.path orelse return error.RunStateUnavailable;
+    const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+    const len = window.physicalLen();
+    if (retainLocalCachedBlock(backend, run, index, window, backend_locked)) |lease| return lease;
+    backend.recordLocalBlockCacheMiss();
+    // Release decoder admission before taking the writer mutex to publish.
+    // A writer may wait for a workspace, but never for a cache publisher.
+    var read_credit: ?@import("../resource_manager.zig").Reservation = if (backend.options.resource_manager) |manager|
+        try manager.reserveWithoutReclaim(.lsm_read_working_set, @as(usize, window.len) + @sizeOf(SharedBytes))
+    else
+        null;
+    defer if (read_credit) |*credit| credit.release();
+    const bytes = try loadDecodedLocalBlock(backend, backend.allocator, path, offset, window);
+    errdefer backend.allocator.free(bytes);
+    const lease = try SharedBytes.create(backend.allocator, bytes);
+    lease.reservation = read_credit;
+    read_credit = null;
+    lease.result_pins_allowed = backend.options.resource_manager == null;
+    const locked = if (backend_locked) false else lockBackend(@TypeOf(backend.*), backend);
+    defer unlockBackend(@TypeOf(backend.*), backend, locked);
+    if (backend.retainCachedRunBlock(path, run.id, offset, len)) |winner| {
+        lease.release();
+        return winner;
+    }
+    if (admit) _ = backend.cacheRunBlockLease(path, run.id, offset, len, lease);
+    return lease;
+}
+
+fn joinLocalBlockDecode(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow) !?*SharedBytes {
+    if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
+        const path = run.path orelse return null;
+        const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+        const flight = backend.local_reader.join(path, run.id, offset, window.physicalLen(), true) orelse return null;
+        defer backend.local_reader.releaseFlight(flight);
+        return try backend.local_reader.wait(flight);
+    }
+    return null;
+}
+
+fn loadLocalBlockLease(backend: anytype, run: *Run, index: *const lsm_table_file.TableIndex, window: lsm_table_file.EntryDataWindow, backend_locked: bool, admit: bool) !*SharedBytes {
+    if (retainLocalCachedBlock(backend, run, index, window, backend_locked)) |lease| return lease;
+    if (comptime @hasField(@TypeOf(backend.*), "local_reader")) {
+        // Joining a publisher while holding the writer mutex would deadlock.
+        // Locked callers decode independently through the same bounded pool.
+        if (!backend_locked) {
+            const path = run.path orelse return error.RunStateUnavailable;
+            const offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
+            const ticket = backend.local_reader.begin(backend.allocator, backend.manifestCoordinationIo(), path, run.id, offset, window.physicalLen(), admit) catch null;
+            if (ticket) |owned| {
+                defer backend.local_reader.releaseFlight(owned.flight);
+                if (!owned.leader) return backend.local_reader.wait(owned.flight);
+                const payload = loadLocalBlockCandidate(backend, run, index, window, false, admit);
+                backend.local_reader.finish(owned.flight, payload);
+                return payload;
+            }
+        }
+    }
+    return loadLocalBlockCandidate(backend, run, index, window, backend_locked, admit);
 }
 
 fn loadOwnedBlockForWindowAlloc(
@@ -7226,21 +7525,12 @@ fn loadOwnedBlockForWindowAlloc(
         backend.recordLocalBlockCacheMiss();
     }
 
-    const bytes = try loadRunTableDecodedBlockWithStats(
-        backend,
-        allocator,
-        path,
-        absolute_offset,
-        physical_len,
-        window.compression,
-        window.len,
-        window.checksum,
-    );
+    const bytes = try loadDecodedLocalBlock(backend, allocator, path, absolute_offset, window);
     errdefer allocator.free(bytes);
     {
         const locked = lockBackend(@TypeOf(backend.*), backend);
         defer unlockBackend(@TypeOf(backend.*), backend, locked);
-        if (@hasField(@TypeOf(backend.*), "run_block_cache") and localBlockCacheEnabled(backend)) {
+        if (@hasField(@TypeOf(backend.*), "run_block_cache") and localBlockCacheEnabled(backend) and localBlockCacheEligible(backend, bytes.len)) {
             _ = try backend.putCachedRunBlock(path, run.id, absolute_offset, physical_len, try backend.allocator.dupe(u8, bytes));
         }
     }
@@ -7285,18 +7575,9 @@ fn loadOwnedBlockForWindowAllocMaybeLocked(
         backend.recordLocalBlockCacheMiss();
     }
 
-    const bytes = try loadRunTableDecodedBlockWithStats(
-        backend,
-        allocator,
-        path,
-        absolute_offset,
-        physical_len,
-        window.compression,
-        window.len,
-        window.checksum,
-    );
+    const bytes = try loadDecodedLocalBlock(backend, allocator, path, absolute_offset, window);
     errdefer allocator.free(bytes);
-    if (@hasField(@TypeOf(backend.*), "run_block_cache") and localBlockCacheEnabled(backend)) {
+    if (@hasField(@TypeOf(backend.*), "run_block_cache") and localBlockCacheEnabled(backend) and localBlockCacheEligible(backend, bytes.len)) {
         _ = try backend.putCachedRunBlock(path, run.id, absolute_offset, physical_len, try backend.allocator.dupe(u8, bytes));
     }
     return bytes;
@@ -7337,22 +7618,21 @@ fn findExactEntryInCompressedPrefixBlock(
     }
     const path = run.path orelse return error.RunStateUnavailable;
     const absolute_offset = @as(u64, @intCast(index.entry_data_start)) + window.physicalRelativeOffset();
-    const payload = try loadRunTableBlockWithStats(
-        backend,
+    var workspace: ?LocalReader.Workspace = if (comptime @hasField(@TypeOf(backend.*), "local_reader")) try localWorkspace(backend, window) else null;
+    defer if (workspace) |*work| work.release();
+    const scratch = if (workspace) |*work| work.allocator() else backend.allocator;
+    const payload = try loadRunTableBlockWithStats(backend, scratch, path, absolute_offset, window.physicalLen());
+    defer scratch.free(payload);
+    const positioned = try lsm_table_file.findExactEntryInCompressedBlockPayloadWithScratchAlloc(
         backend.allocator,
-        path,
-        absolute_offset,
-        window.physicalLen(),
-    );
-    defer backend.allocator.free(payload);
-    const positioned = try lsm_table_file.findExactEntryInCompressedBlockPayloadAlloc(
-        backend.allocator,
+        scratch,
         window.compression,
         payload,
         window.checksum,
         block.first_entry_index,
         namespace.name,
         key,
+        window.len,
     ) orelse return null;
     return .{
         .entry = positioned.entry,
@@ -7374,10 +7654,27 @@ fn findExactEntryWithLocalIndexBlockMeta(
         backend.recordBloomNegative();
         return null;
     }
-    if (try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key)) |entry| {
-        return entry;
-    }
     const window = index.blockWindow(block_index);
+    // Borrow a warm decoded block before allocating compressed lookup scratch.
+    // A miss preserves the compact direct-prefix lookup for cold point reads.
+    if (localBlockCacheEnabled(backend)) {
+        if (retainLocalCachedBlock(backend, run, index, window, false)) |lease| {
+            return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+        }
+        if (namespace.retainDataBlocks()) if (try joinLocalBlockDecode(backend, run, index, window)) |lease| {
+            return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+        };
+        if (namespace.retainDataBlocks() and beginLocalBlockPromotion(backend, run, index, window, false)) {
+            var admitted = false;
+            defer finishLocalBlockPromotion(backend, run, index, window, false, admitted);
+            const lease = try loadLocalBlockLease(backend, run, index, window, false, namespace.retainDataBlocks());
+            admitted = lease.cache_admitted;
+            return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+        }
+    }
+    if (window.compression == .prefix or window.compression == .prefix_snappy)
+        return try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key);
+    if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLease(backend, run, index, window, block_index, namespace, key, false);
     const bytes = try loadOwnedBlockForWindow(
         backend,
         run,
@@ -7418,10 +7715,24 @@ fn findExactEntryWithLocalIndexBlockMetaMaybeLocked(
         backend.recordBloomNegative();
         return null;
     }
-    if (try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key)) |entry| {
-        return entry;
-    }
     const window = index.blockWindow(block_index);
+    // Borrow a warm decoded block before allocating compressed lookup scratch.
+    // A miss preserves the compact direct-prefix lookup for cold point reads.
+    if (localBlockCacheEnabled(backend)) {
+        if (retainLocalCachedBlock(backend, run, index, window, true)) |lease| {
+            return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+        }
+        if (namespace.retainDataBlocks() and beginLocalBlockPromotion(backend, run, index, window, true)) {
+            var admitted = false;
+            defer finishLocalBlockPromotion(backend, run, index, window, true, admitted);
+            const lease = try loadLocalBlockLease(backend, run, index, window, true, namespace.retainDataBlocks());
+            admitted = lease.cache_admitted;
+            return findExactEntryInBlockLease(lease, index, block_index, namespace, key);
+        }
+    }
+    if (window.compression == .prefix or window.compression == .prefix_snappy)
+        return try findExactEntryInCompressedPrefixBlock(backend, run, index, block_index, namespace, key);
+    if (localBlockCacheEnabled(backend)) return try findExactEntryInLocalLease(backend, run, index, window, block_index, namespace, key, true);
     const bytes = try loadOwnedBlockForWindowMaybeLocked(
         backend,
         run,
@@ -7482,6 +7793,7 @@ fn loadVisibleEntryFromPathRunMaybeLocked(
 fn getFromRunWithLocalIndex(
     backend: anytype,
     run: *Run,
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *std.ArrayListUnmanaged([]u8),
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -7490,14 +7802,17 @@ fn getFromRunWithLocalIndex(
 ) !?[]const u8 {
     const loaded = try findExactEntryWithLocalIndexMaybeLocked(backend, run, namespace, key, backend_locked) orelse return null;
     var transferred = false;
-    defer if (!transferred) backend.allocator.free(loaded.bytes);
+    defer if (!transferred) loaded.deinit(backend.allocator);
     if (loaded.entry.tombstone) return error.NotFound;
+    if (namespace.borrow_local_point_results) if (held_blocks) |pins| if (loaded.local) |payload| {
+        if (try retainLocalResultPin(backend, payload, pins)) return loaded.entry.value;
+    };
 
     // Wide values dominate their block. Transfer the decoded allocation when
     // its owner matches rather than copying the row out and immediately
     // freeing it. Small metadata gets keep their compact value-only buffer;
     // retained amplification is at most 2x for this transfer path.
-    if (loaded.entry.value.len >= 4096 and loaded.entry.value.len >= loaded.bytes.len / 2 and
+    if (loaded.local == null and loaded.entry.value.len >= 4096 and loaded.entry.value.len >= loaded.bytes.len / 2 and
         value_allocator.ptr == backend.allocator.ptr and value_allocator.vtable == backend.allocator.vtable)
     {
         try held_values.append(value_allocator, loaded.bytes);
@@ -7780,7 +8095,9 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         cursor_runs: []Run = &.{},
         cursor_l0_groups: []RunGroup = &.{},
         cursor_levels: []RunLevel = &.{},
+        held_blocks: std.ArrayListUnmanaged(BlockPin) = .empty,
         held_values: std.ArrayListUnmanaged([]u8) = .empty,
+        batch_scratch: @import("write_batch_scratch.zig").Scratch = .{},
         batch_options: backend_types.BatchOptions = .{},
         cursor_reader_retained: bool = false,
         closed: bool = false,
@@ -7813,6 +8130,8 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             self.mutable.deinit(self.allocator);
             self.bulk_appends.deinit(self.allocator);
             self.invalidateCursorSnapshot();
+            self.batch_scratch.deinit(self.metadata_allocator);
+            releaseHeldBlocks(&self.held_blocks, self.allocator);
             releaseHeldValues(&self.held_values, self.allocator);
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
@@ -7827,6 +8146,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             defer if (self.closed) {
                 self.bulk_index.deinit(self.allocator);
                 self.prefix_index.deinit(self.allocator);
+                self.batch_scratch.deinit(self.metadata_allocator);
             };
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
             const locked = lockBackend(BackendType, self.backend);
@@ -7838,6 +8158,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.bulk_appends.deinit(self.allocator);
                 self.bulk_appends = .{};
                 self.invalidateCursorSnapshotLocked();
+                releaseHeldBlocks(&self.held_blocks, self.allocator);
                 releaseHeldValues(&self.held_values, self.allocator);
                 self.backend.finishBatchMode(self.batch_options);
                 if (self.cursor_reader_retained) releaseWriteReader(BackendType, self.backend, .current_scan);
@@ -7890,6 +8211,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             release_on_error = false;
             self.closed = true;
             self.invalidateCursorSnapshotLocked();
+            releaseHeldBlocks(&self.held_blocks, self.allocator);
             releaseHeldValues(&self.held_values, self.allocator);
             var finalize_err: ?anyerror = null;
             if (self.cursor_reader_retained) {
@@ -8117,10 +8439,13 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             if (keys.len != values.len) return error.InvalidBatch;
             @memset(values, null);
 
-            const miss_keys = try self.metadata_allocator.alloc([]const u8, keys.len);
-            defer self.metadata_allocator.free(miss_keys);
-            const miss_indexes = try self.metadata_allocator.alloc(usize, keys.len);
-            defer self.metadata_allocator.free(miss_indexes);
+            const Scratch = @import("write_batch_scratch.zig").Scratch;
+            var oversized: Scratch = .{};
+            defer oversized.deinit(self.metadata_allocator);
+            const scratch = if (keys.len <= Scratch.max_retained_keys) &self.batch_scratch else &oversized;
+            try scratch.prepareKeys(self.metadata_allocator, keys.len);
+            const miss_keys = scratch.keys.items;
+            const miss_indexes = scratch.indexes.items;
 
             var miss_count: usize = 0;
             var overlay_point_gets: usize = 0;
@@ -8141,18 +8466,26 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             self.backend.recordPointGets(overlay_point_gets);
             if (miss_count == 0) return;
 
-            const miss_values = try self.metadata_allocator.alloc(?[]const u8, miss_count);
-            defer self.metadata_allocator.free(miss_values);
-            var probe = NamespaceProbeTxn(BackendType).open(self.backend);
-            defer probe.abort();
-            try probe.getManySorted(namespace, miss_keys[0..miss_count], miss_values);
-            for (miss_values, 0..) |maybe_value, miss_index| {
-                const value = maybe_value orelse continue;
-                const owned = try self.allocator.dupe(u8, value);
-                errdefer self.allocator.free(owned);
-                try self.held_values.append(self.allocator, owned);
-                values[miss_indexes[miss_index]] = owned;
+            try scratch.prepareValues(self.metadata_allocator, miss_count);
+            const miss_values = scratch.values.items[0..miss_count];
+            var probe = try BoundProbeTxn(BackendType).open(self.backend, namespace);
+            // Preserve the transaction-wide unique pin budget across probes.
+            // All owned probe results use the writer's allocator, so their
+            // allocations can transfer directly without a namespace copy.
+            probe.allocator = self.allocator;
+            probe.namespace.borrow_local_point_results = true;
+            probe.held_blocks = self.held_blocks;
+            self.held_blocks = .empty;
+            defer {
+                self.held_blocks = probe.held_blocks;
+                probe.held_blocks = .empty;
+                probe.abort();
             }
+            try probe.getManySorted(miss_keys[0..miss_count], miss_values);
+            try self.held_values.appendSlice(self.allocator, probe.held_values.items);
+            probe.held_values.deinit(self.allocator);
+            probe.held_values = .empty;
+            for (miss_values, 0..) |value, miss_index| values[miss_indexes[miss_index]] = value;
         }
 
         pub fn put(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
@@ -8797,4 +9130,79 @@ test "bulk append index prefix cache releases partial allocations and invalidate
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "lsm local point result copies selected row instead of decoded block" {
+    const a = std.testing.allocator;
+    const block = try a.alloc(u8, 32 * 1024);
+    defer a.free(block);
+    @memset(block, 'x');
+    @memcpy(block[0..4], "docs");
+    @memcpy(block[4..7], "key");
+    @memcpy(block[7..12], "value");
+    var budget = @import("../lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 12 };
+    const copied = try copyTableEntry(budget.allocator(), .{ .namespace_name = block[0..4], .key = block[4..7], .value = block[7..12] });
+    defer budget.allocator().free(copied.bytes);
+    try std.testing.expectEqual(@as(usize, 12), budget.live);
+    try std.testing.expectEqual(@as(usize, 1), budget.alloc_calls);
+    @memset(block, 0);
+    try std.testing.expectEqualStrings("docs", copied.entry.namespace_name.?);
+    try std.testing.expectEqualStrings("key", copied.entry.key);
+    try std.testing.expectEqualStrings("value", copied.entry.value);
+}
+
+test "lsm local result block retention bounds bytes and pin metadata" {
+    const a = std.testing.allocator;
+    var backend = @import("../lsm_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    const large = try SharedBytes.create(a, try a.alloc(u8, 2 * 1024 * 1024));
+    defer large.release();
+    const small = try SharedBytes.create(a, try a.alloc(u8, 1024));
+    defer small.release();
+    var blocks = [_]SourceBlockLease{.{ .local = large }};
+    var cursor: MergeCursor(@TypeOf(backend), State) = undefined;
+    cursor.backend = &backend;
+    cursor.current_visible_source = 0;
+    cursor.source_result_retention = &.{};
+    cursor.source_blocks = &blocks;
+    var held: std.ArrayListUnmanaged(BlockPin) = .empty;
+    defer releaseHeldBlocks(&held, a);
+    try std.testing.expect(!try cursor.retainCurrentValueForTxn(&held));
+    try std.testing.expectEqual(@as(usize, 0), held.items.len);
+    blocks[0] = .{ .local = small };
+    try held.ensureTotalCapacity(a, 64);
+    for (0..64) |_| {
+        const distinct = try SharedBytes.create(a, try a.alloc(u8, 1024));
+        held.appendAssumeCapacity(.{ .local = distinct });
+    }
+    try std.testing.expect(!try cursor.retainCurrentValueForTxn(&held));
+    try std.testing.expectEqual(@as(usize, 64), held.items.len);
+}
+
+test "lsm local compressed absence reads once without promotion" {
+    const B = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var backend = try B.open(a, "/review-negative", .{ .storage = storage.storage(), .flush_threshold = 1 });
+    defer backend.close();
+    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer runtime.deinit();
+    var write = try runtime.beginWrite();
+    try write.put("document:long-shared-prefix-for-compression:00", "value");
+    try write.put("document:long-shared-prefix-for-compression:02", "other");
+    try write.commit();
+    const run = backend.runs.at(0);
+    const index = try indexForRunNoCache(&backend, run);
+    try std.testing.expectEqual(lsm_table_file.BlockCompression.prefix, index.blockWindow(0).compression);
+    // Model a Bloom false positive without depending on hash collision luck.
+    if (index.blocks[0].filter) |filter| @memset(filter.bytes, 255);
+    const loads = backend.read_stats.table_block_loads.load(.monotonic);
+    const absent = try findExactEntryWithLocalIndexBlockMeta(&backend, run, index, .{ .name = "docs" }, "document:long-shared-prefix-for-compression:01");
+    defer if (absent) |entry| entry.deinit(a);
+    const extra = backend.read_stats.table_block_loads.load(.monotonic) - loads;
+    std.debug.print("lite cold compressed absence: loads={d}, decoded cache blocks={d}\n", .{ extra, backend.run_block_cache.items.len });
+    try std.testing.expect(absent == null);
+    try std.testing.expectEqual(@as(u64, 1), extra);
+    try std.testing.expectEqual(@as(usize, 0), backend.run_block_cache.items.len);
 }

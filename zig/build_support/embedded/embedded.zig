@@ -106,7 +106,7 @@ pub const AddEmbeddedResult = struct {
     capi_root_mod: *std.Build.Module,
     capi_mod: *std.Build.Module,
     libantfly_link_mod: *std.Build.Module,
-    install_libantfly: *std.Build.Step.InstallArtifact,
+    install_libantfly: *std.Build.Step,
     install_capi_header: *std.Build.Step.InstallFile,
     run_capi_smoke: *std.Build.Step.Run,
     run_capi_conformance: *std.Build.Step.Run,
@@ -289,25 +289,15 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     libantfly_link_mod.linkLibrary(native_inference);
     libantfly_link_mod.linkLibrary(native_enrichment);
     addMacosSdkPaths(b, libantfly_link_mod, target);
-    const libantfly = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "antfly",
-        .root_module = libantfly_link_mod,
-        .max_rss = 12 * 1024 * 1024 * 1024,
-    });
-    libantfly.link_gc_sections = true;
-    // Homebrew rewrites the dylib ID to its absolute opt/lib path on install.
-    if (target.result.os.tag == .macos) {
-        libantfly.headerpad_max_install_names = true;
-    }
-    const install_libantfly = b.addInstallArtifact(libantfly, .{});
+    const libantfly = @import("shared_library.zig").add(b, libantfly_link_mod);
+    const install_libantfly = libantfly.install;
     b.dependOnFileContents(b.path("pkg/antfly-embedded/libantfly.pc.in"));
     const pc_path = b.root.join(b.allocator, "pkg/antfly-embedded/libantfly.pc.in") catch @panic("OOM");
     const pc_template = pc_path.root_dir.handle.readFileAlloc(b.graph.io, pc_path.sub_path, b.allocator, .limited(16 * 1024)) catch @panic("unable to read libantfly.pc.in");
     const pc_contents = std.mem.replaceOwned(u8, b.allocator, pc_template, "@VERSION@", options.version) catch @panic("OOM");
     const pc_file = b.addWriteFiles().add("libantfly.pc", pc_contents);
     const install_pkg_config = b.addInstallFileWithDir(pc_file, .lib, "pkgconfig/libantfly.pc");
-    install_libantfly.step.dependOn(&install_pkg_config.step);
+    install_libantfly.dependOn(&install_pkg_config.step);
     b.step("pkgconfig", "Install relocatable libantfly pkg-config metadata").dependOn(&install_pkg_config.step);
 
     const install_capi_header = b.addInstallFileWithDir(
@@ -332,7 +322,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     b.getInstallStep().dependOn(install_licenses);
     const capi_step = b.step("capi", "Build the public libantfly C ABI shared library");
     capi_step.dependOn(install_licenses);
-    capi_step.dependOn(&install_libantfly.step);
+    capi_step.dependOn(install_libantfly);
     capi_step.dependOn(&install_capi_header.step);
 
     const capi_smoke_mod = b.createModule(.{
@@ -349,10 +339,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .name = "antfly-c-smoke",
         .root_module = capi_smoke_mod,
     });
-    capi_smoke.root_module.linkLibrary(libantfly);
+    libantfly.link(capi_smoke.root_module);
     const run_capi_smoke = b.addRunArtifact(capi_smoke);
+    if (target.result.os.tag == .macos or target.result.ofmt == .elf) b.step("capi-exports-check", "Verify that libantfly exports exactly the public C header functions").dependOn(&libantfly.check.step);
     const capi_smoke_step = b.step("capi-smoke", "Compile and run a C consumer smoke test for libantfly");
     capi_smoke_step.dependOn(&run_capi_smoke.step);
+    if (target.result.os.tag == .macos or target.result.ofmt == .elf) capi_smoke_step.dependOn(&libantfly.check.step);
+    if (b.top_level_steps.get("capi-linkage-test")) |linkage| capi_smoke_step.dependOn(&linkage.step);
 
     // Reference runner for the shared conformance cases every binding runs
     // (pkg/antfly-embedded/capi-conformance/README.md). It calls libantfly only
@@ -376,7 +369,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .name = "antfly-capi-conformance",
         .root_module = capi_conformance_mod,
     });
-    capi_conformance.root_module.linkLibrary(libantfly);
+    libantfly.link(capi_conformance.root_module);
     const run_capi_conformance = b.addRunArtifact(capi_conformance);
     run_capi_conformance.addDirectoryArg2(b.path("pkg/antfly-embedded/capi-conformance/cases"), .{ .make_absolute = true });
     _ = run_capi_conformance.addOutputDirectoryArg2("capi-conformance-work", .{ .make_absolute = true });
@@ -395,7 +388,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     run_lite_go_tests.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
     run_lite_go_tests.setCwd(b.path("../go/pkg/embedded"));
-    run_lite_go_tests.step.dependOn(&install_libantfly.step);
+    run_lite_go_tests.step.dependOn(install_libantfly);
     run_lite_go_tests.step.dependOn(&install_capi_header.step);
     const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantfly");
     lite_go_test_step.dependOn(&run_lite_go_tests.step);
@@ -414,7 +407,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     run_lite_py_tests.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, ""), .prefix = "ANTFLY_LIB_DIR=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
     run_lite_py_tests.setCwd(b.path("../py/packages/embedded"));
-    run_lite_py_tests.step.dependOn(&install_libantfly.step);
+    run_lite_py_tests.step.dependOn(install_libantfly);
     const lite_py_test_step = b.step("lite-py-test", "Run Python Antfly Lite binding tests against libantfly");
     lite_py_test_step.dependOn(&run_lite_py_tests.step);
 
@@ -432,7 +425,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     run_lite_rs_tests.argv.insert(b.allocator, 1, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, ""), .prefix = "ANTFLY_LIB_DIR=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
     run_lite_rs_tests.setCwd(b.path("."));
-    run_lite_rs_tests.step.dependOn(&install_libantfly.step);
+    run_lite_rs_tests.step.dependOn(install_libantfly);
     const lite_rs_test_step = b.step("lite-rs-test", "Run Rust Antfly Lite binding tests against libantfly");
     lite_rs_test_step.dependOn(&run_lite_rs_tests.step);
 
@@ -445,7 +438,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     run_lite_ts_tests.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, ""), .prefix = "ANTFLY_LIB_DIR=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
     run_lite_ts_tests.setCwd(b.path("../ts/packages/embedded"));
-    run_lite_ts_tests.step.dependOn(&install_libantfly.step);
+    run_lite_ts_tests.step.dependOn(install_libantfly);
     const lite_ts_test_step = b.step("lite-ts-test", "Run TypeScript Antfly Lite binding tests against libantfly (needs pnpm install in ts/)");
     lite_ts_test_step.dependOn(&run_lite_ts_tests.step);
 
@@ -463,7 +456,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     run_lite_go_example.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
     run_lite_go_example.setCwd(b.path("../examples/antfly-lite-go"));
-    run_lite_go_example.step.dependOn(&install_libantfly.step);
+    run_lite_go_example.step.dependOn(install_libantfly);
     run_lite_go_example.step.dependOn(&install_capi_header.step);
     const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go Antfly Lite example app");
     lite_go_example_step.dependOn(&run_lite_go_example.step);
@@ -482,7 +475,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     run_lite_go_retrieval_template.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
     run_lite_go_retrieval_template.setCwd(b.path("../examples/antfly-lite-retrieval-go"));
-    run_lite_go_retrieval_template.step.dependOn(&install_libantfly.step);
+    run_lite_go_retrieval_template.step.dependOn(install_libantfly);
     run_lite_go_retrieval_template.step.dependOn(&install_capi_header.step);
     const lite_go_retrieval_template_step = b.step("lite-go-retrieval-template", "Run the embedded Go Antfly Lite retrieval template");
     lite_go_retrieval_template_step.dependOn(&run_lite_go_retrieval_template.step);
@@ -530,6 +523,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inference options are prefix compatible and reject unknown flags and reserved bits",
         "capi inference calls reject null, closed, and database handles",
         "capi inference lists models and reports route errors",
+        "capi inference decide validates requests and preserves error bodies",
         "capi inference embeds text with a local model",
         "capi inference reranks documents with a local model",
         "capi inference chunks text without a model",

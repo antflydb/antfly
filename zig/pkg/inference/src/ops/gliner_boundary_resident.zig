@@ -31,21 +31,31 @@ const memory = @import("../runtime/tier/memory.zig");
 pub const upload_chunk_bytes: usize = 4 * 1024 * 1024;
 pub const max_weights: usize = 334;
 pub const max_layers: usize = 12;
-pub const max_derived: usize = 1 + 2 * max_layers;
+pub const max_derived: usize = 1 + 3 * max_layers;
 
 pub const Geometry = struct {
     layers: usize,
     relative_rows: usize,
     hidden: usize,
+    packed_qkv: bool = false,
 
     pub fn published(backbone: model.Backbone) Geometry {
-        return .{ .layers = 12, .relative_rows = 512, .hidden = if (backbone == .small) 384 else 768 };
+        return .{ .layers = 12, .relative_rows = 512, .hidden = if (backbone == .small) 384 else 768, .packed_qkv = true };
     }
 
     fn bytes(self: Geometry) !usize {
         if (self.layers == 0 or self.layers > max_layers or self.relative_rows == 0 or self.hidden == 0)
             return error.InvalidGlinerBoundaryConfig;
         return std.math.mul(usize, try std.math.mul(usize, self.relative_rows, self.hidden), 4);
+    }
+
+    fn packedQkvBytes(self: Geometry) !usize {
+        if (!self.packed_qkv) return 0;
+        return std.math.mul(usize, try std.math.mul(usize, try std.math.mul(usize, 3, self.hidden), self.hidden), 4);
+    }
+
+    fn derivedCount(self: Geometry) usize {
+        return 1 + 2 * self.layers + @as(usize, @intFromBool(self.packed_qkv)) * self.layers;
     }
 };
 
@@ -95,13 +105,15 @@ fn estimateFor(comptime OwnerType: type, metadata_bytes: usize, specs: []const S
         largest = @max(largest, size);
     }
     const derived_one = try geometry.bytes();
-    const derived_count = 1 + 2 * geometry.layers;
-    const derived_bytes = try std.math.mul(usize, derived_one, derived_count);
+    const relative_derived_count = 1 + 2 * geometry.layers;
+    const relative_derived_bytes = try std.math.mul(usize, derived_one, relative_derived_count);
+    const packed_qkv_bytes = try std.math.mul(usize, try geometry.packedQkvBytes(), geometry.layers);
+    const derived_bytes = try std.math.add(usize, relative_derived_bytes, packed_qkv_bytes);
     return .{
         .weight_bytes = weight_bytes,
         .derived_bytes = derived_bytes,
         .model_device_bytes = try std.math.add(usize, weight_bytes, derived_bytes),
-        .host_metadata_bytes = try std.math.add(usize, @sizeOf(OwnerType), try std.math.mul(usize, specs.len + derived_count + 2, metadata_bytes)),
+        .host_metadata_bytes = try std.math.add(usize, @sizeOf(OwnerType), try std.math.mul(usize, specs.len + geometry.derivedCount() + 2, metadata_bytes)),
         .upload_staging_bytes = @min(largest, upload_chunk_bytes),
         .derived_preparation_device_bytes = try std.math.mul(usize, derived_one, 2),
     };
@@ -268,14 +280,54 @@ fn OwnerWithDevice(comptime Device: type) type {
                     cursor = end;
                 }
             }
+            if (self.geometry.packed_qkv) try self.preparePackedQkv(source, control);
             try check(control);
+        }
+
+        fn findSpec(self: *const Self, name: []const u8) !Spec {
+            for (self.specs) |spec| if (std.mem.eql(u8, spec.name, name)) return spec;
+            return error.MissingGlinerBoundaryResidentWeight;
+        }
+
+        fn preparePackedQkv(self: *Self, source: anytype, control: ?Control) !void {
+            const h = self.geometry.hidden;
+            const projection_bytes = try std.math.mul(usize, try std.math.mul(usize, h, h), 4);
+            const packed_bytes = try self.geometry.packedQkvBytes();
+            for (0..self.geometry.layers) |layer| {
+                try check(control);
+                var names: [3][192]u8 = undefined;
+                const prefixes = [_][]const u8{ "query_proj", "key_proj", "value_proj" };
+                const index = try self.derivedIndex(.{ .packed_qkv_weight = @intCast(layer) });
+                if (self.derived[index] != null) return error.DuplicateGlinerBoundaryDerivedTensor;
+                const dims = [_]i32{ @intCast(3 * h), @intCast(h) };
+                self.derived[index] = try Device.allocate(self.allocator, self.runtime_identity.?, packed_bytes, &dims);
+                self.counters.derived_bytes += packed_bytes;
+                self.counters.resident_model_live_bytes += packed_bytes;
+                for (prefixes, 0..) |prefix, projection| {
+                    const name = try std.fmt.bufPrint(&names[projection], "encoder.encoder.layer.{d}.attention.self.{s}.weight", .{ layer, prefix });
+                    const spec = try self.findSpec(name);
+                    if (!std.mem.eql(i64, spec.shape, &.{ @as(i64, @intCast(h)), @as(i64, @intCast(h)) }))
+                        return error.InvalidGlinerBoundaryWeightShape;
+                    const raw = try source.tensor(spec);
+                    if (raw.len != projection_bytes) return error.InvalidGlinerBoundaryTensorByteLength;
+                    var cursor: usize = 0;
+                    while (cursor < raw.len) {
+                        try check(control);
+                        const end = cursor + @min(upload_chunk_bytes, raw.len - cursor);
+                        try Device.upload(&self.derived[index].?, projection * projection_bytes + cursor, raw[cursor..end]);
+                        self.counters.weight_upload_bytes += end - cursor;
+                        self.counters.weight_upload_calls += 1;
+                        cursor = end;
+                    }
+                }
+            }
         }
 
         pub fn finishPreparation(self: *Self) !void {
             if (self.state != .preparing) return error.GlinerBoundaryResidentPreparationState;
             try Device.checkIdle(self.runtime_identity.?);
             for (self.weights[0..self.specs.len]) |tensor| if (tensor == null) return error.IncompleteGlinerBoundaryTensorInventory;
-            for (self.derived[0 .. 1 + 2 * self.geometry.layers]) |tensor| if (tensor == null) return error.IncompleteGlinerBoundaryDerivedInventory;
+            for (self.derived[0..self.geometry.derivedCount()]) |tensor| if (tensor == null) return error.IncompleteGlinerBoundaryDerivedInventory;
             self.state = .ready;
         }
 
@@ -330,17 +382,25 @@ fn OwnerWithDevice(comptime Device: type) type {
                 .relative_normalized => 0,
                 .relative_query => |layer| if (layer < self.geometry.layers) 1 + 2 * @as(usize, layer) else error.InvalidGlinerBoundaryDerivedKey,
                 .relative_key => |layer| if (layer < self.geometry.layers) 2 + 2 * @as(usize, layer) else error.InvalidGlinerBoundaryDerivedKey,
+                .packed_qkv_weight => |layer| if (self.geometry.packed_qkv and layer < self.geometry.layers)
+                    1 + 2 * self.geometry.layers + @as(usize, layer)
+                else
+                    error.InvalidGlinerBoundaryDerivedKey,
             };
         }
 
-        fn validateDerivedShape(self: *const Self, shape: []const i64) !void {
-            if (shape.len != 2 or shape[0] != @as(i64, @intCast(self.geometry.relative_rows)) or shape[1] != @as(i64, @intCast(self.geometry.hidden)))
-                return error.InvalidGlinerBoundaryWeightShape;
+        fn validateDerivedShape(self: *const Self, key: device.DerivedKey, shape: []const i64) !void {
+            if (shape.len != 2 or shape[1] != @as(i64, @intCast(self.geometry.hidden))) return error.InvalidGlinerBoundaryWeightShape;
+            const rows: usize = switch (key) {
+                .relative_normalized, .relative_query, .relative_key => self.geometry.relative_rows,
+                .packed_qkv_weight => try std.math.mul(usize, 3, self.geometry.hidden),
+            };
+            if (shape[0] != @as(i64, @intCast(rows))) return error.InvalidGlinerBoundaryWeightShape;
         }
 
         pub fn acquireDerived(self: *const Self, key: device.DerivedKey, shape: []const i64, runtime_identity: *anyopaque) !Tensor {
             try self.requireAccessible(runtime_identity);
-            try self.validateDerivedShape(shape);
+            try self.validateDerivedShape(key, shape);
             const index = try self.derivedIndex(key);
             const tensor = &(self.derived[index] orelse return error.GlinerBoundaryResidentNotReady);
             return Device.retain(tensor);
@@ -350,12 +410,15 @@ fn OwnerWithDevice(comptime Device: type) type {
             try self.checkRuntime(runtime_identity);
             if (self.state != .preparing) return error.GlinerBoundaryResidentPreparationState;
             try Device.checkIdle(runtime_identity);
-            try self.validateDerivedShape(shape);
+            try self.validateDerivedShape(key, shape);
             const index = try self.derivedIndex(key);
             if (self.derived[index] != null) return error.DuplicateGlinerBoundaryDerivedTensor;
             try Device.validatePersistent(tensor, self.allocator, runtime_identity, shape);
             self.derived[index] = try Device.retain(tensor);
-            const size = try self.geometry.bytes();
+            const size = switch (key) {
+                .relative_normalized, .relative_query, .relative_key => try self.geometry.bytes(),
+                .packed_qkv_weight => try self.geometry.packedQkvBytes(),
+            };
             self.counters.derived_bytes += size;
             self.counters.resident_model_live_bytes += size;
         }
@@ -787,6 +850,57 @@ test "gliner boundary resident model owns exact weights derived slots and runtim
     try std.testing.expectError(error.GlinerBoundaryResidentPoisoned, owner.acquire(test_specs[0].name, &.{ 2, 2 }, &ctx));
 }
 
+test "gliner boundary resident packs verified QKV rows into generation-owned storage" {
+    const Source = struct {
+        const specs = [_]Spec{
+            .{ .name = "encoder.encoder.layer.0.attention.self.query_proj.weight", .shape = &.{ 2, 2 }, .registration_order = 0 },
+            .{ .name = "encoder.encoder.layer.0.attention.self.key_proj.weight", .shape = &.{ 2, 2 }, .registration_order = 1 },
+            .{ .name = "encoder.encoder.layer.0.attention.self.value_proj.weight", .shape = &.{ 2, 2 }, .registration_order = 2 },
+        };
+        raw: [48]u8,
+
+        fn count(_: *const @This()) usize {
+            return specs.len;
+        }
+        fn artifactBytes(self: *const @This()) []const u8 {
+            return &self.raw;
+        }
+        fn tensor(self: *const @This(), spec: Spec) ![]const u8 {
+            for (specs, 0..) |candidate, index| {
+                if (std.mem.eql(u8, candidate.name, spec.name)) return self.raw[index * 16 ..][0..16];
+            }
+            return error.MissingGlinerBoundaryResidentWeight;
+        }
+        fn identity(self: *const @This()) bundle.Identity {
+            return .{ .backbone = .small, .precision = .fp32, .weight = bundle.Digest.of(&self.raw), .sidecars = @splat(bundle.Digest.of("sidecar")) };
+        }
+    };
+    var raw: [48]u8 = @splat(0);
+    raw[0] = 1;
+    raw[16] = 2;
+    raw[32] = 3;
+    const source = Source{ .raw = raw };
+    var ctx = TestDevice.Context{};
+    const PackedOwner = OwnerWithDevice(TestDevice);
+    const owner = try PackedOwner.createWithSpecs(
+        std.testing.allocator,
+        source.identity(),
+        &Source.specs,
+        .{ .layers = 1, .relative_rows = 2, .hidden = 2, .packed_qkv = true },
+    );
+    defer owner.destroy();
+    try owner.prepareSource(&source, &ctx, null);
+    var packed_weight = try owner.acquireDerived(.{ .packed_qkv_weight = 0 }, &.{ 6, 2 }, &ctx);
+    defer TestDevice.release(&packed_weight);
+    try std.testing.expectEqualSlices(u8, &source.raw, packed_weight.ref.raw);
+    try std.testing.expectEqual(@as(usize, 48), owner.stats().derived_bytes);
+    try std.testing.expectEqual(@as(usize, 96), owner.stats().resident_model_live_bytes);
+    try std.testing.expectEqual(@as(u64, 96), owner.stats().weight_upload_bytes);
+    try std.testing.expectEqual(@as(u64, 6), owner.stats().weight_upload_calls);
+    try std.testing.expectError(error.InvalidGlinerBoundaryWeightShape, owner.acquireDerived(.{ .packed_qkv_weight = 0 }, &.{ 2, 2 }, &ctx));
+    try std.testing.expectError(error.InvalidGlinerBoundaryDerivedKey, owner.acquireDerived(.{ .packed_qkv_weight = 1 }, &.{ 6, 2 }, &ctx));
+}
+
 test "gliner boundary resident rejects partial wrong identity and nonfinite before allocation" {
     const a = std.testing.allocator;
     var source = TestSource{};
@@ -869,7 +983,7 @@ fn testAllocationFailures(a: std.mem.Allocator) !void {
 }
 
 test "gliner boundary resident allocation failures release every owned tensor and metadata" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testAllocationFailures, .{});
 }
 
 test "gliner boundary resident model estimate includes constants and bounded upload staging" {
@@ -879,7 +993,9 @@ test "gliner boundary resident model estimate includes constants and bounded upl
         for (artifact.specs(backbone)) |spec| exact += try shapeBytes(spec.shape);
         const geometry = Geometry.published(backbone);
         try std.testing.expectEqual(exact, result.weight_bytes);
-        try std.testing.expectEqual((1 + 2 * geometry.layers) * geometry.relative_rows * geometry.hidden * 4, result.derived_bytes);
+        const relative_bytes = (1 + 2 * geometry.layers) * geometry.relative_rows * geometry.hidden * 4;
+        const packed_qkv_bytes = geometry.layers * 3 * geometry.hidden * geometry.hidden * 4;
+        try std.testing.expectEqual(relative_bytes + packed_qkv_bytes, result.derived_bytes);
         try std.testing.expectEqual(result.weight_bytes + result.derived_bytes, result.model_device_bytes);
         try std.testing.expect(result.host_metadata_bytes >= @sizeOf(Owner));
         try std.testing.expectEqual(upload_chunk_bytes, result.upload_staging_bytes);
@@ -1018,7 +1134,7 @@ fn testWorkspaceAllocationFailures(a: std.mem.Allocator) !void {
 }
 
 test "gliner boundary resident workspace allocation failures preserve leases and old storage" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testWorkspaceAllocationFailures, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testWorkspaceAllocationFailures, .{});
 }
 
 test "gliner boundary resident workspace cancellation keeps permit with caller" {

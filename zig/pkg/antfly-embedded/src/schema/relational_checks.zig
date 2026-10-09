@@ -33,7 +33,7 @@ pub fn valueFromJson(alloc: Allocator, kind: schema.RelationalColumnType, value:
             impl.documentIntegerToI64(value) orelse return error.InvalidBatchRequest },
         .number => .{ .number = impl.documentNumberToF64(value) orelse return error.InvalidBatchRequest },
         .boolean => if (value == .bool) .{ .boolean = value.bool } else error.InvalidBatchRequest,
-        .datetime => .{ .datetime = impl.documentDateTimeToNs(value) orelse return error.InvalidBatchRequest },
+        .datetime => .{ .datetime = signedDateTime(value) orelse return error.InvalidBatchRequest },
         .blob => blk: {
             if (value != .string) return error.InvalidBatchRequest;
             const decoder = std.base64.standard.Decoder;
@@ -299,4 +299,13 @@ pub const Set = struct {
 
 fn isDeterministicFailure(err: anyerror) bool {
     return @import("relational_expression_errors.zig").isInvalidInput(err) or err == error.RelationalIndexColumnTypeMismatch or err == error.InvalidBatchRequest;
+}
+
+pub fn signedDateTime(value: std.json.Value) ?i128 {
+    return switch (value) {
+        .integer => |n| n,
+        .string => |text| std.fmt.parseInt(i128, text, 10) catch @import("../datetime.zig").parseDateTimeToSignedNs(text),
+        .number_string => |text| std.fmt.parseInt(i128, text, 10) catch null,
+        else => if (impl.documentDateTimeToNs(value)) |n| n else null,
+    };
 }

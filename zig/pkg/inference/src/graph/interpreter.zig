@@ -6558,8 +6558,8 @@ test "native graph duplicate weight parameters preserve live siblings and borrow
 
 test "native graph weight acquisition unwinds allocation failures" {
     if (comptime !build_options.enable_native) return error.SkipZigTest;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testDuplicateWeightParameters, .{false});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testDuplicateWeightParameters, .{true});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testDuplicateWeightParameters, .{false});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testDuplicateWeightParameters, .{true});
 }
 
 test "execute lowered graph through native backend" {

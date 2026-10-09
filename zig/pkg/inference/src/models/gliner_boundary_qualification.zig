@@ -524,7 +524,141 @@ const fastino_gliner25_base_v1_fp16_encoder = bundle.Identity{
 // See zig/pkg/inference/models/gliner2/GLINER25.md's fp16-encoder
 // qualification sections for the full record.
 
-const production_entries: []const Entry = &.{
+// Released multilingual checkpoints, checked against pinned upstream captures
+// on native and resident Metal. Each row retains its measured request shape;
+// entity, mixed-task, structured-classification, and public Decide evidence
+// must not be combined to authorize an unmeasured feature union.
+const fastino_gliner25_multi_v1 = bundle.Identity{
+    .backbone = .multi,
+    .precision = .fp32,
+    .weight = .{ .size_bytes = 1149461028, .sha256 = "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395".* },
+    .sidecars = .{
+        .{ .size_bytes = 3151, .sha256 = "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146".* },
+        .{ .size_bytes = 857, .sha256 = "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716".* },
+        .{ .size_bytes = 16035853, .sha256 = "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a".* },
+        .{ .size_bytes = 645, .sha256 = "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1".* },
+    },
+};
+const fastino_gliner25_multi_decide = bundle.Identity{
+    .backbone = .multi,
+    .precision = .fp32,
+    .weight = .{ .size_bytes = 1149461028, .sha256 = "9efe0f88c99f2aa794452e9559dc60e98d60d9fa2bf1b60cf2710411b6da5b4e".* },
+    .sidecars = .{
+        .{ .size_bytes = 3152, .sha256 = "be5123080c0f3f01b938bc46a5dd0d7a2e515a34f6df798dfd70ed04c277c8bf".* },
+        .{ .size_bytes = 858, .sha256 = "d0ebbcb8b458e285a39e12cc315cbaf3d1c6f631e7281e6b22dd5b4071183f83".* },
+        .{ .size_bytes = 16035853, .sha256 = "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a".* },
+        .{ .size_bytes = 646, .sha256 = "fd4a31dc2f1f17e31638c5f0e783b81cdb2fbe6bddd116a8d9e5d50d78148cf1".* },
+    },
+};
+
+fn familyLengths(bytes: Range, words: Range, tokens: Range) LengthContract {
+    return .{
+        .request_items = Range.exact(1),
+        .document_bytes = bytes,
+        .document_words = words,
+        .window_count = Range.exact(1),
+        .window_words = words,
+        .padded_sequence_tokens = tokens,
+    };
+}
+
+fn classificationFamilyLengths(min_tokens: u64, max_tokens: u64) LengthContract {
+    return .{
+        .request_items = Range.exact(1),
+        .document_bytes = .{ .min = 1, .max = 658 },
+        .document_words = .{ .min = 1, .max = 114 },
+        .window_count = Range.exact(1),
+        .window_words = .{ .min = 2, .max = 114 },
+        .padded_sequence_tokens = .{ .min = min_tokens, .max = max_tokens },
+    };
+}
+
+const family_options = [_]Feature{ .word_whitespace, .overlap_flat, .offset_codepoints, .offset_utf8, .decoder_auto, .single_window, .confidence, .spans };
+const family_profiles = [_]struct { features: Features, lengths: LengthContract }{
+    .{
+        .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions })),
+        .lengths = .{
+            .request_items = Range.exact(1),
+            .document_bytes = .{ .min = 52, .max = 74 },
+            // Japanese has 8 source words; Spanish and Arabic each have 9.
+            // All three prepared body windows contain 9 processor words.
+            .document_words = .{ .min = 8, .max = 9 },
+            .window_count = Range.exact(1),
+            .window_words = Range.exact(9),
+            .padded_sequence_tokens = Range.exact(61),
+        },
+    },
+    .{ .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions, .classification_single, .legacy_structures, .relations })), .lengths = familyLengths(Range.exact(63), Range.exact(11), Range.exact(107)) },
+    .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured })), .lengths = .{
+        .request_items = Range.exact(1),
+        .document_bytes = .{ .min = 40, .max = 73 },
+        .document_words = .{ .min = 2, .max = 14 },
+        .window_count = Range.exact(1),
+        .window_words = .{ .min = 3, .max = 14 },
+        .padded_sequence_tokens = .{ .min = 27, .max = 39 },
+    } },
+    .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured, .schema_descriptions })), .lengths = familyLengths(Range.exact(69), Range.exact(16), Range.exact(92)) },
+    .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured, .classification_context })), .lengths = familyLengths(Range.exact(61), Range.exact(13), Range.exact(41)) },
+    // The same mixed schema exercises every listed learned feature together
+    // at one character and a real 658-byte document. ASCII endpoint
+    // parity is checked with both offset units. No long-window, batch, or
+    // public mode=multi permission is inferred from these observations.
+    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .entities, .relations, .legacy_structures, .classification_single, .classification_structured, .classification_context, .schema_descriptions })), .lengths = .{
+        .request_items = Range.exact(1),
+        .document_bytes = .{ .min = 1, .max = 658 },
+        .document_words = .{ .min = 1, .max = 114 },
+        .window_count = Range.exact(1),
+        .window_words = .{ .min = 2, .max = 114 },
+        .padded_sequence_tokens = .{ .min = 135, .max = 298 },
+    } },
+    // Each classifier feature combination has its own short and long
+    // captures. A bare 18-token prompt cannot widen a mixed-task row or a
+    // described/instructed classifier's measured sequence floor.
+    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured })), .lengths = classificationFamilyLengths(18, 183) },
+    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .schema_descriptions })), .lengths = classificationFamilyLengths(55, 218) },
+    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .schema_descriptions, .classification_context })), .lengths = classificationFamilyLengths(66, 229) },
+    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .classification_context })), .lengths = classificationFamilyLengths(31, 194) },
+    // Bare and described entity rows bind their own short one-source-word,
+    // clean two-byte, and realistic long captures on both public offset units.
+    .{ .features = Features.initMany(&(family_options ++ .{.entities})), .lengths = .{
+        .request_items = Range.exact(1),
+        .document_bytes = .{ .min = 2, .max = 663 },
+        .document_words = .{ .min = 1, .max = 114 },
+        .window_count = Range.exact(1),
+        .window_words = .{ .min = 2, .max = 114 },
+        .padded_sequence_tokens = .{ .min = 17, .max = 181 },
+    } },
+    .{ .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions })), .lengths = .{
+        .request_items = Range.exact(1),
+        .document_bytes = .{ .min = 2, .max = 663 },
+        .document_words = .{ .min = 1, .max = 114 },
+        .window_count = Range.exact(1),
+        .window_words = .{ .min = 2, .max = 114 },
+        .padded_sequence_tokens = .{ .min = 22, .max = 202 },
+    } },
+};
+const family_decide_features = Features.initMany(&.{ .classification_single, .classification_context, .schema_descriptions, .word_whitespace, .overlap_flat, .offset_utf8, .decoder_auto, .single_window, .confidence });
+const family_decide_lengths = familyLengths(.{ .min = 74, .max = 81 }, .{ .min = 14, .max = 17 }, .{ .min = 97, .max = 167 });
+
+fn multilingualEntries() [family_profiles.len * 4 + 2]Entry {
+    var entries: [family_profiles.len * 4 + 2]Entry = undefined;
+    var index: usize = 0;
+    for ([_]bundle.Identity{ fastino_gliner25_multi_v1, fastino_gliner25_multi_decide }) |identity| {
+        for ([_]Backend{ .native, .metal }) |backend| {
+            for (family_profiles) |profile| {
+                entries[index] = .{ .identity = identity, .backend = backend, .features = profile.features, .lengths = profile.lengths };
+                index += 1;
+            }
+        }
+    }
+    for ([_]Backend{ .native, .metal }) |backend| {
+        entries[index] = .{ .identity = fastino_gliner25_multi_decide, .backend = backend, .features = family_decide_features, .lengths = family_decide_lengths };
+        index += 1;
+    }
+    return entries;
+}
+
+const base_production_entries = [_]Entry{
     .{ .identity = fastino_gliner25_base_v1, .backend = .native, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
     .{ .identity = fastino_gliner25_base_v1, .backend = .metal, .features = fastino_gliner25_base_v1_features, .lengths = fastino_gliner25_base_v1_lengths },
     .{ .identity = fastino_gliner25_base_v1, .backend = .native, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
@@ -534,14 +668,14 @@ const production_entries: []const Entry = &.{
     .{ .identity = fastino_gliner25_base_v1_fp16_encoder, .backend = .native, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
     .{ .identity = fastino_gliner25_base_v1_fp16_encoder, .backend = .metal, .features = fastino_gliner25_base_v1_long_document_features, .lengths = fastino_gliner25_base_v1_long_document_lengths },
 };
+const production_entries: []const Entry = &(base_production_entries ++ multilingualEntries());
 
 comptime {
     // Each entry's five digests are hex-validated one character at a time
     // (validDigest); the default 1000-branch comptime quota covers roughly
     // three entries' worth of that work at 64 hex characters each. Eight
-    // reviewed rows (fp32 and fp16_encoder, each single-window +
-    // long-document, each native + Metal) need more room than the default.
-    @setEvalBranchQuota(1 << 14);
+    // base rows plus the multilingual profiles need more room than default.
+    @setEvalBranchQuota(1 << 17);
     if (!validEntries(production_entries)) @compileError("invalid GLiNER2.5 runtime qualification policy");
 }
 
@@ -564,6 +698,13 @@ pub fn hasQualifiedIdentity(consumed: bundle.Identity) bool {
         if (equalIdentity(entry.identity, consumed)) return true;
     }
     return false;
+}
+
+/// Typed decisions are a separate public wire contract. Extraction parity
+/// alone must not advertise this task for another boundary checkpoint.
+pub fn hasQualifiedTypedDecisionIdentity(consumed: bundle.Identity) bool {
+    if (!equalIdentity(fastino_gliner25_multi_decide, consumed)) return false;
+    return hasQualifiedIdentity(consumed);
 }
 
 /// Coarser still: true if some production row shares this backbone and
@@ -800,6 +941,35 @@ test "boundary qualification serves the reviewed fastino gliner2.5 base checkpoi
     observed = fastino_gliner25_base_v1_long_document_lengths;
     observed.request_items = Range.exact(2);
     try std.testing.expectError(error.GlinerBoundaryRequestItemsLimitExceeded, require(identity, .native, fastino_gliner25_base_v1_long_document_features, observed));
+}
+
+test "GLiNER multilingual production qualification binds exact artifacts and independent task rows" {
+    for ([_]bundle.Identity{ fastino_gliner25_multi_v1, fastino_gliner25_multi_decide }) |identity| {
+        try std.testing.expect(hasQualifiedIdentity(identity));
+        for ([_]Backend{ .native, .metal }) |backend| {
+            for (family_profiles) |profile| try require(identity, backend, profile.features, profile.lengths);
+            var mixed = family_profiles[0].features;
+            mixed.insert(.records_natural);
+            try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, backend, mixed, family_profiles[0].lengths));
+        }
+        var changed = identity;
+        changed.sidecars[1].size_bytes += 1;
+        try std.testing.expect(!hasQualifiedIdentity(changed));
+        changed = identity;
+        changed.weight.sha256[0] = '0';
+        try std.testing.expect(!hasQualifiedIdentity(changed));
+        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, require(identity, .cuda, family_profiles[0].features, family_profiles[0].lengths));
+        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, .native, Features.initOne(.long_document)));
+        try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, supportsFeatures(identity, .native, Features.initOne(.classification_multi)));
+    }
+    try std.testing.expect(hasQualifiedTypedDecisionIdentity(fastino_gliner25_multi_decide));
+    try std.testing.expect(!hasQualifiedTypedDecisionIdentity(fastino_gliner25_multi_v1));
+    try std.testing.expect(!hasQualifiedTypedDecisionIdentity(fastino_gliner25_base_v1));
+    try require(fastino_gliner25_multi_decide, .native, family_decide_features, family_decide_lengths);
+    try require(fastino_gliner25_multi_decide, .metal, family_decide_features, family_decide_lengths);
+    var outside = family_decide_lengths;
+    outside.padded_sequence_tokens = Range.exact(299);
+    try std.testing.expectError(error.GlinerBoundaryPaddedSequenceLimitExceeded, require(fastino_gliner25_multi_decide, .native, family_decide_features, outside));
 }
 
 test "boundary qualification matches all five consumed file sizes and hashes" {

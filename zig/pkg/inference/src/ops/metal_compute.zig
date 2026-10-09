@@ -5411,7 +5411,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn isImmutableGlinerF32Pair(self: *const MetalCompute, weight: CT, bias: CT) bool {
-        return self.data.allow_immutable_f32_weight_borrow and
+        return self.data.prefer_immutable_gliner_f32_mps and
             isBorrowedImmutableF32(toBuf(weight)) and isBorrowedImmutableF32(toBuf(bias));
     }
 
@@ -6767,11 +6767,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (bufHasAnyQuantizedStorage(buf) or buf.native_dense_bytes != null or buf.lazy_multiply != null or
             buf.view_strides != null or buf.logical_view_strides != null or buf.view_index_map != null or
             buf.view_base_offset != 0)
+        {
             return error.UnsupportedResidentTrainingPrimitive;
+        }
         const device = buf.metal_tensor orelse return error.ResidentTrainingRequiresDeviceTensor;
         if (!device.isDevice() or (dtype != null and device.dtype != dtype.?) or
             buf.integer_storage != (device.dtype == .i32))
+        {
             return error.UnsupportedResidentTrainingPrimitive;
+        }
         const logical = buf.logical_shape orelse return error.InvalidResidentTrainingShape;
         const count = try ops.resident_training.shapeElements(i64, logical, limits);
         if (device.elemCount() != count or device.deviceByteLen() != count * 4)
@@ -7441,6 +7445,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn boundaryEnsureWorkspaceRoom(self: *MetalCompute, request: *const ops.gliner_boundary_device.Request) !void {
         const elements = (try self.boundaryWorkspaceElements(request)) orelse return;
+        return self.boundaryEnsureWorkspaceElementsRoom(elements);
+    }
+
+    fn boundaryEnsureWorkspaceElementsRoom(self: *MetalCompute, elements: usize) !void {
+        const cursor = self.boundary_workspace_cursor orelse return error.InvalidGlinerBoundaryWorkspaceRange;
+        if (!try cursor.eligible(elements)) return error.InvalidGlinerBoundaryWorkspaceRange;
         if (!try self.boundary_workspace_cursor.?.needsDrain(elements)) return;
         // The caller still owns this logical scope token and dispatch budget.
         // Only its physical command buffer changes at this scratch fence.
@@ -7452,6 +7462,202 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.boundary_scope.stats.generation = generation;
         self.boundary_scope.scope_dispatches = dispatches;
         self.boundary_scope.stats.workspace_drains +|= 1;
+    }
+
+    fn boundaryEnsureWorkspaceSequenceRoom(self: *MetalCompute, elements: []const usize) !void {
+        var cursor = self.boundary_workspace_cursor orelse return error.InvalidGlinerBoundaryWorkspaceRange;
+        var total_bytes: usize = 0;
+        for (elements) |count| {
+            if (!try cursor.eligible(count)) return error.InvalidGlinerBoundaryWorkspaceRange;
+            total_bytes = try std.math.add(usize, total_bytes, try std.math.mul(usize, count, 4));
+        }
+        if (total_bytes > cursor.capacity_bytes) return error.InvalidGlinerBoundaryWorkspaceRange;
+        if (total_bytes <= cursor.capacity_bytes - cursor.used_bytes) return;
+        const generation = self.boundary_scope.stats.generation;
+        const dispatches = self.boundary_scope.scope_dispatches;
+        try self.boundaryFinishOwnedScope();
+        try metal_runtime.beginFrame(self.provider_impl.raw_decode_runtime);
+        self.boundary_scope.stats.active = true;
+        self.boundary_scope.stats.generation = generation;
+        self.boundary_scope.scope_dispatches = dispatches;
+        self.boundary_scope.stats.workspace_drains +|= 1;
+    }
+
+    fn boundaryPreparePackedQkv(self: *MetalCompute, request: *const ops.gliner_boundary_device.PackedQkvRequest) !void {
+        const runtime = self.provider_impl.raw_decode_runtime;
+        if (!self.boundary_scope.stats.active or !metal_runtime.hasActiveFrame(runtime) or metal_runtime.hasSubmittedFrame(runtime))
+            return error.GlinerBoundaryScopeFrameMismatch;
+        const inputs = [_]?CT{ request.input, request.packed_weight, request.biases[0], request.biases[1], request.biases[2], null, null, null, null, null };
+        var additional: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        var additional_count: usize = 0;
+        var new_bytes = try std.math.mul(usize, try std.math.mul(usize, try std.math.mul(usize, request.rows, request.hidden), 3), 4);
+        for (inputs) |maybe_input| {
+            const input = maybe_input orelse continue;
+            const tensor = (try self.boundaryScopeInput(input)) orelse continue;
+            if (self.boundaryScopeContains(tensor)) continue;
+            var duplicate = false;
+            for (additional[0..additional_count]) |held| if (held.?.device.?.ref == tensor.device.?.ref) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            new_bytes = try std.math.add(usize, new_bytes, tensor.device.?.ref.byte_len);
+            additional[additional_count] = tensor;
+            additional_count += 1;
+        }
+        // One retained arena allocation plus three ordinary final outputs.
+        if (additional_count + 4 > self.boundary_scope_buffers.capacity - self.boundary_scope_buffers.items.len)
+            return error.ResourceLimitExceeded;
+        try self.boundary_scope.reserve(new_bytes, 3);
+        for (additional[0..additional_count]) |tensor| self.boundary_scope_buffers.appendAssumeCapacity(try tensor.?.retainedCopy());
+    }
+
+    fn glinerBoundaryPackedQkvOp(ctx: *anyopaque, request: *const ops.gliner_boundary_device.PackedQkvRequest) anyerror!ops.gliner_boundary_device.PackedQkvResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.provider_impl.hasDecoderRuntime()) return error.UnsupportedGlinerBoundaryPackedQkv;
+        errdefer self.boundaryCancelOwnedScope() catch {};
+        try metal_runtime.requireGlinerBoundaryReady(self.provider_impl.raw_decode_runtime);
+        if (request.rows == 0 or request.hidden == 0 or request.rows > std.math.maxInt(i32) or request.hidden > std.math.maxInt(i32))
+            return error.InvalidBoundaryDeviceShape;
+        const packed_hidden = try std.math.mul(usize, 3, request.hidden);
+        if (packed_hidden > std.math.maxInt(i32)) return error.InvalidBoundaryDeviceShape;
+        const elements = try std.math.mul(usize, request.rows, request.hidden);
+        const packed_elements = try std.math.mul(usize, elements, 3);
+        try self.boundaryEnsureWorkspaceElementsRoom(packed_elements);
+        try self.boundaryPreparePackedQkv(request);
+
+        const input = try boundaryFloatDevice(request.input);
+        const packed_weight = try boundaryFloatDevice(request.packed_weight);
+        var biases: [3]MetalTensor = undefined;
+        for (request.biases, 0..) |bias, index| biases[index] = try boundaryFloatDevice(bias);
+        if (input.elemCount() != try std.math.mul(usize, request.rows, request.hidden) or
+            packed_weight.elemCount() != try std.math.mul(usize, try std.math.mul(usize, 3, request.hidden), request.hidden))
+            return error.InvalidBoundaryDeviceShape;
+        for (biases) |bias| if (bias.elemCount() != request.hidden) return error.InvalidBoundaryDeviceShape;
+
+        var scratch = try self.boundaryWorkspaceProduct(packed_elements, request.rows, packed_hidden);
+        defer scratch.deinit();
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedGlinerBoundaryPackedQkv;
+        const shape = [_]i32{ @intCast(request.rows), @intCast(request.hidden) };
+        var outputs: [3]MetalTensor = undefined;
+        var initialized: usize = 0;
+        var moved: [3]bool = @splat(false);
+        defer for (outputs[0..initialized], 0..) |*output, index| if (!moved[index]) output.deinit();
+        for (&outputs) |*output| {
+            output.* = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, try std.math.mul(usize, elements, 4), .private, &shape);
+            initialized += 1;
+        }
+        if (!try metal_runtime.decoderRuntimeGlinerBoundaryPackedQkvDeviceInto(
+            self.provider_impl,
+            input,
+            packed_weight,
+            biases,
+            scratch,
+            outputs,
+            request.rows,
+            request.hidden,
+        )) return error.UnsupportedGlinerBoundaryPackedQkv;
+
+        const query = try self.boundaryOwnedTensor(outputs[0]);
+        moved[0] = true;
+        errdefer freeOp(ctx, query);
+        const key = try self.boundaryOwnedTensor(outputs[1]);
+        moved[1] = true;
+        errdefer freeOp(ctx, key);
+        const value = try self.boundaryOwnedTensor(outputs[2]);
+        moved[2] = true;
+        self.boundary_scope.stats.workspace_products +|= 1;
+        self.boundary_scope.stats.workspace_product_bytes +|= @intCast(packed_elements * 4);
+        self.boundary_scope.stats.dispatches +|= 3;
+        return .{ .query = query, .key = key, .value = value };
+    }
+
+    fn glinerBoundaryFusedFfnOp(ctx: *anyopaque, request: *const ops.gliner_boundary_device.FusedFfnRequest) anyerror!CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!self.provider_impl.hasDecoderRuntime()) return error.UnsupportedGlinerBoundaryFusedFfn;
+        errdefer self.boundaryCancelOwnedScope() catch {};
+        try metal_runtime.requireGlinerBoundaryReady(self.provider_impl.raw_decode_runtime);
+        if (request.rows == 0 or request.hidden == 0 or request.intermediate < request.hidden or
+            request.rows > std.math.maxInt(i32) or request.hidden > std.math.maxInt(i32) or request.intermediate > std.math.maxInt(i32) or
+            !std.math.isFinite(request.eps) or request.eps <= 0) return error.InvalidBoundaryDeviceShape;
+        const hidden_elements = try std.math.mul(usize, request.rows, request.hidden);
+        const intermediate_elements = try std.math.mul(usize, request.rows, request.intermediate);
+        try self.boundaryEnsureWorkspaceSequenceRoom(&.{ intermediate_elements, hidden_elements });
+
+        const inputs = [_]?CT{ request.input, request.residual, request.first_weight, request.first_bias, request.second_weight, request.second_bias, request.norm_weight, request.norm_bias, null, null };
+        var additional: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        var additional_count: usize = 0;
+        var new_bytes = try std.math.mul(usize, hidden_elements, 4);
+        for (inputs) |maybe_input| {
+            const input_ct = maybe_input orelse continue;
+            const tensor = (try self.boundaryScopeInput(input_ct)) orelse continue;
+            if (self.boundaryScopeContains(tensor)) continue;
+            var duplicate = false;
+            for (additional[0..additional_count]) |held| if (held.?.device.?.ref == tensor.device.?.ref) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            new_bytes = try std.math.add(usize, new_bytes, tensor.device.?.ref.byte_len);
+            additional[additional_count] = tensor;
+            additional_count += 1;
+        }
+        if (additional_count + 3 > self.boundary_scope_buffers.capacity - self.boundary_scope_buffers.items.len)
+            return error.ResourceLimitExceeded;
+        try self.boundary_scope.reserve(new_bytes, 5);
+        for (additional[0..additional_count]) |tensor| self.boundary_scope_buffers.appendAssumeCapacity(try tensor.?.retainedCopy());
+
+        const input = try boundaryFloatDevice(request.input);
+        const residual = try boundaryFloatDevice(request.residual);
+        const first_weight = try boundaryFloatDevice(request.first_weight);
+        const first_bias = try boundaryFloatDevice(request.first_bias);
+        const second_weight = try boundaryFloatDevice(request.second_weight);
+        const second_bias = try boundaryFloatDevice(request.second_bias);
+        const norm_weight = try boundaryFloatDevice(request.norm_weight);
+        const norm_bias = try boundaryFloatDevice(request.norm_bias);
+        if (input.elemCount() != hidden_elements or residual.elemCount() != hidden_elements or
+            first_weight.elemCount() != try std.math.mul(usize, request.intermediate, request.hidden) or first_bias.elemCount() != request.intermediate or
+            second_weight.elemCount() != try std.math.mul(usize, request.hidden, request.intermediate) or second_bias.elemCount() != request.hidden or
+            norm_weight.elemCount() != request.hidden or norm_bias.elemCount() != request.hidden) return error.InvalidBoundaryDeviceShape;
+
+        var first_product = try self.boundaryWorkspaceProduct(intermediate_elements, request.rows, request.intermediate);
+        defer first_product.deinit();
+        var second_product = try self.boundaryWorkspaceProduct(hidden_elements, request.rows, request.hidden);
+        defer second_product.deinit();
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedGlinerBoundaryFusedFfn;
+        const shape = [_]i32{ @intCast(request.rows), @intCast(request.hidden) };
+        var output = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, try std.math.mul(usize, hidden_elements, 4), .private, &shape);
+        var output_moved = false;
+        defer if (!output_moved) output.deinit();
+        if (!try metal_runtime.decoderRuntimeGlinerBoundaryFusedFfnDeviceInto(self.provider_impl, .{
+            .input = input,
+            .residual = residual,
+            .first_weight = first_weight,
+            .first_bias = first_bias,
+            .second_weight = second_weight,
+            .second_bias = second_bias,
+            .norm_weight = norm_weight,
+            .norm_bias = norm_bias,
+            .first_product = first_product,
+            .second_product = second_product,
+            .output = output,
+            .rows = request.rows,
+            .hidden = request.hidden,
+            .intermediate = request.intermediate,
+            .eps = request.eps,
+        })) return error.UnsupportedGlinerBoundaryFusedFfn;
+        const result = try self.boundaryOwnedTensor(output);
+        output_moved = true;
+        self.boundary_scope.stats.fused_ffn_calls +|= 1;
+        self.boundary_scope.stats.workspace_products +|= 2;
+        self.boundary_scope.stats.workspace_product_bytes +|= @intCast(try std.math.mul(usize, try std.math.add(usize, intermediate_elements, hidden_elements), 4));
+        self.boundary_scope.stats.dispatches +|= 5;
+        return result;
+    }
+
+    fn glinerBoundaryFusedFfnAvailableOp(ctx: *anyopaque) bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return metal_runtime.decoderRuntimeGlinerBoundaryFusedFfnAvailable(self.provider_impl.raw_decode_runtime);
     }
 
     fn boundaryWorkspaceProduct(self: *MetalCompute, elements: usize, rows: usize, columns: usize) !MetalTensor {
@@ -8020,9 +8226,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .f32, .f16, .bf16, .f64 => .f32,
             inline .i8, .i16, .i32, .i64, .u8, .bool_ => |tag| @field(metal_tensor_mod.DType, @tagName(tag)),
         };
-        if (source.dtype == physical) return self.ctFromOwnedMetalTensor(try source.retainedCopy());
-        const output = (try metal_runtime.decoderRuntimeCastTypedDevice(self.provider_impl, source, physical)) orelse return null;
-        return self.ctFromOwnedMetalTensor(output);
+        const output = if (source.dtype == physical)
+            try source.retainedCopy()
+        else
+            (try metal_runtime.decoderRuntimeCastTypedDevice(self.provider_impl, source, physical)) orelse return null;
+        const result = try self.ctFromOwnedMetalTensor(output);
+        if (buf.integer_bounds) |bounds| {
+            if (physical == .i64 or (physical == .i32 and bounds.minimum >= std.math.minInt(i32) and bounds.maximum <= std.math.maxInt(i32)))
+                toBuf(result).integer_bounds = bounds;
+        }
+        return result;
     }
 
     fn toFloat32Op(ctx: *anyopaque, tensor: CT, allocator: std.mem.Allocator) anyerror![]f32 {
@@ -8730,7 +8943,25 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const dtype: ops.GraphDType = switch (exported.dtype) {
                 inline else => |tag| @field(ops.GraphDType, @tagName(tag)),
             };
-            return (try native_ctx.cb.fromConstantBytes(exported.payload.bytes, dtype, shape_i64)) orelse error.UnsupportedTensorType;
+            const host_tensor = (try native_ctx.cb.fromConstantBytes(exported.payload.bytes, dtype, shape_i64)) orelse return error.UnsupportedTensorType;
+            // Reuse the exact integer bytes already observed by this fallback.
+            // Backward scatter can then retain device values and indices
+            // instead of rejecting a dynamically converted index tensor.
+            if ((dtype == .i32 or dtype == .i64) and exported.payload.bytes.len != 0) {
+                const width: usize = if (dtype == .i32) 4 else 8;
+                var minimum: i64 = std.math.maxInt(i64);
+                var maximum: i64 = std.math.minInt(i64);
+                for (0..exported.payload.bytes.len / width) |i| {
+                    const value: i64 = if (dtype == .i32)
+                        std.mem.readInt(i32, exported.payload.bytes[i * width ..][0..4], .little)
+                    else
+                        std.mem.readInt(i64, exported.payload.bytes[i * width ..][0..8], .little);
+                    minimum = @min(minimum, value);
+                    maximum = @max(maximum, value);
+                }
+                buf.integer_bounds = .{ .minimum = minimum, .maximum = maximum };
+            }
+            return host_tensor;
         }
         const shape_i32 = try self.i32ShapeFromI64(shape_i64);
         defer self.allocator.free(shape_i32);
@@ -12331,7 +12562,36 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var rhs = if (toBuf(b).integer_storage) try toBuf(b).metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(b);
         defer rhs.deinit();
         const output = (try metal_runtime.decoderRuntimeIntegerBinaryDevice(self.provider_impl, lhs, rhs, kind)) orelse return error.UnsupportedTensorType;
-        return self.ctFromOwnedMetalTensor(output);
+        const result = try self.ctFromOwnedMetalTensor(output);
+        if (kind == 3) {
+            toBuf(result).integer_bounds = .{ .minimum = 0, .maximum = 1 };
+        } else if (toBuf(a).integer_bounds) |left| {
+            if (toBuf(b).integer_bounds) |right| {
+                const range: ?@TypeOf(left) = checked: {
+                    const minimum: i64, const maximum: i64 = switch (kind) {
+                        0 => .{ std.math.add(i64, left.minimum, right.minimum) catch break :checked null, std.math.add(i64, left.maximum, right.maximum) catch break :checked null },
+                        2 => .{ std.math.sub(i64, left.minimum, right.maximum) catch break :checked null, std.math.sub(i64, left.maximum, right.minimum) catch break :checked null },
+                        1 => products: {
+                            const products = [_]i64{
+                                std.math.mul(i64, left.minimum, right.minimum) catch break :checked null,
+                                std.math.mul(i64, left.minimum, right.maximum) catch break :checked null,
+                                std.math.mul(i64, left.maximum, right.minimum) catch break :checked null,
+                                std.math.mul(i64, left.maximum, right.maximum) catch break :checked null,
+                            };
+                            break :products .{ std.mem.min(i64, &products), std.mem.max(i64, &products) };
+                        },
+                        else => break :checked null,
+                    };
+                    // A wrapping narrow result cannot retain an unbounded
+                    // mathematical interval as an index admission proof.
+                    if (output.dtype == .i32 and (minimum < std.math.minInt(i32) or maximum > std.math.maxInt(i32))) break :checked null;
+                    if (output.dtype != .i32 and output.dtype != .i64) break :checked null;
+                    break :checked .{ .minimum = minimum, .maximum = maximum };
+                };
+                toBuf(result).integer_bounds = range;
+            }
+        }
+        return result;
     }
 
     fn lessThanOp(ctx: *anyopaque, a: CT, b: CT) anyerror!CT {
@@ -13959,7 +14219,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn primScatterAddOp(ctx: *anyopaque, input: CT, indices: CT, input_shape: []const i64, indices_shape: []const i64, axis: u8) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        if (toBuf(indices).integer_storage) return self.residentTrainingScatter(input, indices, input_shape, indices_shape, axis, .{}, null);
+        if (toBuf(indices).resident_index_storage != null) return self.residentTrainingScatter(input, indices, input_shape, indices_shape, axis, .{}, null);
         if (toBuf(input).integer_storage) return error.UnsupportedResidentTrainingPrimitive;
         if (axis != 0 or input_shape.len != 2 or indices_shape.len == 0) return error.UnsupportedPrimitiveOp;
         if (input_shape[0] <= 0 or input_shape[1] <= 0 or indices_shape[0] <= 0) return error.UnsupportedShape;
@@ -13967,13 +14227,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const value_rows: usize = @intCast(input_shape[0]);
         const dim: usize = @intCast(input_shape[1]);
         const out_rows: usize = @intCast(indices_shape[0]);
+        if (toBuf(indices).integer_storage) {
+            const bounds = toBuf(indices).integer_bounds orelse return error.UnsupportedResidentTrainingIndexProof;
+            if (bounds.minimum < -indices_shape[0] or bounds.maximum >= indices_shape[0]) return error.IndexOutOfBounds;
+        }
 
         var values_mt = self.ownedDeviceMetalTensorFromCt(input) catch |err| switch (err) {
             error.UnsupportedTensorType => return error.UnsupportedPrimitiveOp,
             else => return err,
         };
         defer values_mt.deinit();
-        var indices_mt = self.ownedDeviceMetalTensorFromCt(indices) catch |err| switch (err) {
+        var indices_mt = (if (toBuf(indices).integer_storage)
+            toBuf(indices).metal_tensor.?.retainedCopy()
+        else
+            self.ownedDeviceMetalTensorFromCt(indices)) catch |err| switch (err) {
             error.UnsupportedTensorType => return error.UnsupportedPrimitiveOp,
             else => return err,
         };
@@ -23304,6 +23571,124 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(output);
     }
 
+    fn denseDeviceF32(input: CT) ?MetalTensor {
+        const buf = toBuf(input);
+        if (bufHasAnyQuantizedStorage(buf) or buf.lazy_multiply != null or buf.view_index_map != null or
+            buf.view_strides != null or buf.logical_view_strides != null or buf.view_base_offset != 0) return null;
+        const tensor = buf.metal_tensor orelse return null;
+        if (!tensor.isDevice() or tensor.dtype != .f32) return null;
+        return tensor;
+    }
+
+    fn ownedDeviceView(self: *MetalCompute, tensor: *const MetalTensor, offset: usize, bytes: usize, shape: []const i32) !CT {
+        var view = try tensor.retainedView(offset, bytes, shape);
+        errdefer view.deinit();
+        return self.ctFromOwnedMetalTensor(view);
+    }
+
+    fn packedQkvRopeOp(ctx: *anyopaque, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) anyerror!?ops.SplitLastDim3Result {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (getenvBool("TERMITE_METAL_DISABLE_GLINER_QKV_ROPE")) return null;
+        const source = denseDeviceF32(input) orelse return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        metal_runtime.requireGlinerBoundaryReady(runtime) catch return null;
+        const position_buf = toBuf(positions);
+        const bounds = position_buf.resident_index_bounds orelse return null;
+        if (bounds.minimum < 0) return null;
+        const position_tensor = self.residentTrainingTensor(positions, .i32, .{}) catch |err| switch (err) {
+            error.ForeignResidentTrainingTensor, error.UnsupportedResidentTrainingPrimitive, error.ResidentTrainingRequiresDeviceTensor => return null,
+            else => return err,
+        };
+        const rows = position_tensor.elemCount();
+        if (rows == 0 or rows > std.math.maxInt(i32) or hidden > std.math.maxInt(i32) or head_dim > std.math.maxInt(i32)) return null;
+        const request = ops.gliner_boundary_device.Kernel{
+            .kind = .packed_qkv_rope,
+            .dims = .{ @intCast(rows), @intCast(hidden), @intCast(head_dim), 0, 0, 0, 0, 0 },
+            .scalars = .{ theta, 0, 0, 0 },
+        };
+        const layout = try request.layout();
+        if (source.elemCount() != layout.input_elements[0]) return null;
+        var inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        inputs[0] = source;
+        inputs[1] = position_tensor;
+        const plane_bytes = rows * hidden * @sizeOf(f32);
+        var output = try MetalTensor.deviceAllocate(runtime, plane_bytes * 3, .private, &.{ 3, @intCast(rows), @intCast(hidden) });
+        defer output.deinit();
+        if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, inputs, output)) return error.MetalKernelDispatchFailed;
+        const shape = [_]i32{ @intCast(rows), @intCast(hidden) };
+        const q = try self.ownedDeviceView(&output, 0, plane_bytes, &shape);
+        errdefer freeOp(ctx, q);
+        const k = try self.ownedDeviceView(&output, plane_bytes, plane_bytes, &shape);
+        errdefer freeOp(ctx, k);
+        const v = try self.ownedDeviceView(&output, 2 * plane_bytes, plane_bytes, &shape);
+        return .{ .first = q, .second = k, .third = v };
+    }
+
+    fn addLayerNormSumCenteredOp(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?ops.AddLayerNormSumResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (getenvBool("TERMITE_METAL_DISABLE_GLINER_ADD_NORM")) return null;
+        const left = denseDeviceF32(a) orelse return null;
+        const right = denseDeviceF32(b) orelse return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        metal_runtime.requireGlinerBoundaryReady(runtime) catch return null;
+        if (dim == 0 or dim > 4096 or left.elemCount() == 0 or left.elemCount() % dim != 0 or left.elemCount() != right.elemCount()) return null;
+        const rows = left.elemCount() / dim;
+        if (rows > std.math.maxInt(i32)) return null;
+        if (bufHasAnyQuantizedStorage(toBuf(gamma)) or bufHasAnyQuantizedStorage(toBuf(beta))) return null;
+        if (bufElemCount(toBuf(gamma)) != dim or bufElemCount(toBuf(beta)) != dim) return null;
+        var weight = try self.ownedDeviceMetalTensorFromCt(gamma);
+        defer weight.deinit();
+        var bias = try self.ownedDeviceMetalTensorFromCt(beta);
+        defer bias.deinit();
+        const request = ops.gliner_boundary_device.Kernel{
+            .kind = .add_norm_centered,
+            .dims = .{ @intCast(rows), @intCast(dim), 1, 0, 0, 0, 0, 0 },
+            .scalars = .{ eps, 0, 0, 0 },
+        };
+        const layout = try request.layout();
+        var inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        inputs[0] = left;
+        inputs[1] = right;
+        inputs[2] = weight;
+        inputs[3] = bias;
+        const bytes = left.elemCount() * @sizeOf(f32);
+        var output = try MetalTensor.deviceAllocate(runtime, layout.output_elements * 4, .private, &.{ 2, @intCast(rows), @intCast(dim) });
+        defer output.deinit();
+        if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, inputs, output)) return error.MetalKernelDispatchFailed;
+        const shape = [_]i32{ @intCast(rows), @intCast(dim) };
+        const normed = try self.ownedDeviceView(&output, 0, bytes, &shape);
+        errdefer freeOp(ctx, normed);
+        const sum = try self.ownedDeviceView(&output, bytes, bytes, &shape);
+        return .{ .sum = sum, .normed = normed };
+    }
+
+    fn packedGegluExactOp(ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (rows == 0 or width == 0 or rows > std.math.maxInt(i32) or width > std.math.maxInt(i32)) return null;
+        if (getenvBool("TERMITE_METAL_DISABLE_PACKED_GEGLU")) return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        metal_runtime.requireGlinerBoundaryReady(runtime) catch return null;
+        const count = try std.math.mul(usize, rows, width);
+        const buf = toBuf(input);
+        if (bufHasAnyQuantizedStorage(buf) or buf.lazy_multiply != null or buf.view_index_map != null or buf.view_strides != null or
+            buf.logical_view_strides != null or buf.view_base_offset != 0) return null;
+        const source = buf.metal_tensor orelse return null;
+        if (!source.isDevice() or source.dtype != .f32 or source.elemCount() != try std.math.mul(usize, count, 2)) return null;
+        const request = ops.gliner_boundary_device.Kernel{
+            .kind = .laya_geglu,
+            .dims = .{ @intCast(rows), @intCast(width), 0, 0, 0, 0, 0, 0 },
+        };
+        var inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        inputs[0] = source;
+        var output = try MetalTensor.deviceAllocate(runtime, try std.math.mul(usize, count, 4), .private, &.{ @intCast(rows), @intCast(width) });
+        errdefer output.deinit();
+        if (!(try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, inputs, output))) {
+            output.deinit();
+            return null;
+        }
+        return self.ctFromOwnedMetalTensor(output);
+    }
+
     fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
         return applyUnaryActivationOp(ctx, input, .gelu, activations_mod.gelu);
     }
@@ -30710,6 +31095,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.convertDType = convertDTypeOp;
         vt.cumulativeSum = cumulativeSumOp;
         vt.glinerBoundaryDevice = glinerBoundaryDeviceOp;
+        vt.glinerBoundaryPackedQkv = glinerBoundaryPackedQkvOp;
+        vt.glinerBoundaryFusedFfnAvailable = glinerBoundaryFusedFfnAvailableOp;
+        vt.glinerBoundaryFusedFfn = glinerBoundaryFusedFfnOp;
         vt.glinerBoundaryScope = glinerBoundaryScopeOp;
         vt.glinerBoundaryResidentPreparation = glinerBoundaryResidentPreparationOp;
         vt.glinerBoundaryDownload = glinerBoundaryDownloadOp;
@@ -30825,6 +31213,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.glinerLabelGruCombined = glinerLabelGruCombinedOp;
         vt.gelu = geluOp;
         vt.geluExact = geluExactOp;
+        vt.packedGegluExact = packedGegluExactOp;
+        vt.packedQkvRope = packedQkvRopeOp;
+        vt.addLayerNormSumCentered = addLayerNormSumCenteredOp;
         vt.geluNew = geluNewOp;
         vt.relu = reluOp;
         vt.silu = siluOp;
@@ -34042,7 +34433,7 @@ fn testNativeDenseMaterializationAllocationFailures(allocator: std.mem.Allocator
 
 test "metal_compute: native dense materialization cleans up allocation failures" {
     if (!build_options.enable_metal) return error.SkipZigTest;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testNativeDenseMaterializationAllocationFailures, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testNativeDenseMaterializationAllocationFailures, .{});
 }
 
 test "metal_compute: add native dense logits bias keeps single and batched rows resident" {
@@ -34494,6 +34885,45 @@ test "metal_compute: scatterAdd axis0 keeps two-input autodiff form resident" {
         0,   0,   0,   0,
         0,   0,   0,   0,
     }, out_data);
+    // Graph constants retain integer storage. Exercise duplicate reductions
+    // with both widths without downloading or reinterpreting them as floats.
+    inline for (.{ i32, i64 }) |T| {
+        const raw = [_]T{ 2, 0, 2 };
+        const typed = (try MetalCompute.fromConstantBytesOp(&metal_compute, std.mem.sliceAsBytes(&raw), if (T == i32) .i32 else .i64, &.{3})).?;
+        defer metal_cb.free(typed);
+        const typed_out = try metal_cb.primScatterAdd(values, typed, &.{ 3, 4 }, &.{ 5, 4 }, 0);
+        defer metal_cb.free(typed_out);
+        try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, typed_out));
+        const typed_data = try metal_cb.toFloat32(typed_out, allocator);
+        defer allocator.free(typed_data);
+        try std.testing.expectEqualSlices(f32, out_data, typed_data);
+        const zeros = [_]T{ 0, 0, 0 };
+        const zero_indices = (try MetalCompute.fromConstantBytesOp(&metal_compute, std.mem.sliceAsBytes(&zeros), if (T == i32) .i32 else .i64, &.{3})).?;
+        defer metal_cb.free(zero_indices);
+        const computed = try metal_compute.integerBinary(typed, zero_indices, 0);
+        defer metal_cb.free(computed);
+        const computed_out = try metal_cb.primScatterAdd(values, computed, &.{ 3, 4 }, &.{ 5, 4 }, 0);
+        defer metal_cb.free(computed_out);
+        const computed_data = try metal_cb.toFloat32(computed_out, allocator);
+        defer allocator.free(computed_data);
+        try std.testing.expectEqualSlices(f32, out_data, computed_data);
+        const negative = [_]T{ -3, -5, -3 };
+        const negative_indices = (try MetalCompute.fromConstantBytesOp(&metal_compute, std.mem.sliceAsBytes(&negative), if (T == i32) .i32 else .i64, &.{3})).?;
+        defer metal_cb.free(negative_indices);
+        const negative_out = try metal_cb.primScatterAdd(values, negative_indices, &.{ 3, 4 }, &.{ 5, 4 }, 0);
+        defer metal_cb.free(negative_out);
+        const negative_data = try metal_cb.toFloat32(negative_out, allocator);
+        defer allocator.free(negative_data);
+        try std.testing.expectEqualSlices(f32, out_data, negative_data);
+        const too_negative = [_]T{ 2, -6, 2 };
+        const bad_negative = (try MetalCompute.fromConstantBytesOp(&metal_compute, std.mem.sliceAsBytes(&too_negative), if (T == i32) .i32 else .i64, &.{3})).?;
+        defer metal_cb.free(bad_negative);
+        try std.testing.expectError(error.IndexOutOfBounds, metal_cb.primScatterAdd(values, bad_negative, &.{ 3, 4 }, &.{ 5, 4 }, 0));
+        const invalid = [_]T{ 2, 5, 2 };
+        const bad = (try MetalCompute.fromConstantBytesOp(&metal_compute, std.mem.sliceAsBytes(&invalid), if (T == i32) .i32 else .i64, &.{3})).?;
+        defer metal_cb.free(bad);
+        try std.testing.expectError(error.IndexOutOfBounds, metal_cb.primScatterAdd(values, bad, &.{ 3, 4 }, &.{ 5, 4 }, 0));
+    }
 }
 
 test "metal_compute: generic broadcast keeps device tensors resident" {
@@ -36508,7 +36938,7 @@ fn exerciseCompactDebertaRows(allocator: std.mem.Allocator) !void {
 test "metal_compute: compact DeBERTa rows validate indices and unwind allocation or cancellation" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     const a = std.testing.allocator;
-    try std.testing.checkAllAllocationFailures(a, exerciseCompactDebertaRows, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseCompactDebertaRows, .{});
     try std.testing.expectError(error.InvalidTensorShape, MetalCompute.compactEmbeddingRows(a, &.{ 1, 2 }, 2, 1, &.{-1}, null));
     try std.testing.expectError(error.InvalidTensorShape, MetalCompute.compactEmbeddingRows(a, &.{ 1, 2 }, 2, 1, &.{2}, null));
     try std.testing.expectError(error.InvalidTensorShape, MetalCompute.compactEmbeddingRows(a, &.{ 1, 2 }, 3, 1, &.{0}, null));
@@ -38065,8 +38495,8 @@ fn exerciseImmutableF32Borrow(allocator: std.mem.Allocator, enabled: bool) !void
 
 test "metal_compute: immutable F32 borrowing pins sources and unwinds allocation failures" {
     if (!build_options.enable_metal) return error.SkipZigTest;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseImmutableF32Borrow, .{false});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseImmutableF32Borrow, .{true});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseImmutableF32Borrow, .{false});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseImmutableF32Borrow, .{true});
 }
 
 test "metal_compute: legacy immutable F32 MPS policy excludes mutable reduced and narrow weights" {
@@ -38092,6 +38522,9 @@ test "metal_compute: legacy immutable F32 MPS policy excludes mutable reduced an
     try std.testing.expect(!compute.isImmutableGlinerF32Pair(tensor, tensor));
     try std.testing.expect(!compute.preferImmutableGlinerF32Mps(tensor, tensor, 64, 64));
     store.allow_immutable_f32_weight_borrow = true;
+    try std.testing.expect(!compute.isImmutableGlinerF32Pair(tensor, tensor));
+    try std.testing.expect(!compute.preferImmutableGlinerF32Mps(tensor, tensor, 64, 64));
+    store.prefer_immutable_gliner_f32_mps = true;
     try std.testing.expect(compute.isImmutableGlinerF32Pair(tensor, tensor));
     try std.testing.expect(compute.preferImmutableGlinerF32Mps(tensor, tensor, 64, 64));
     try std.testing.expect(!compute.preferImmutableGlinerF32Mps(tensor, tensor, 63, 64));
@@ -38168,6 +38601,7 @@ fn exerciseLegacyGlinerMps(mode: enum { parity, allocation }) !void {
     {
         var store = testMetalWeightStoreInit(a);
         store.allow_immutable_f32_weight_borrow = true;
+        store.prefer_immutable_gliner_f32_mps = true;
         defer store.lazy_weights.deinit(a);
         try addLegacyGlinerMpsTestWeight(&store, "a.weight", &weights_a, &.{ dim, dim });
         try addLegacyGlinerMpsTestWeight(&store, "b.weight", &weights_b, &.{ dim, dim });
@@ -38423,8 +38857,8 @@ test "metal_compute: weight handle lifetime bounds materializations and lazy pin
 
 test "metal_compute: weight handle lifetime unwinds allocation failures" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testMetalWeightHandleLifetime, .{false});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, testMetalWeightHandleLifetime, .{true});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testMetalWeightHandleLifetime, .{false});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testMetalWeightHandleLifetime, .{true});
 }
 
 test "metal_compute: dense cache owns native bytes independently of weight handles" {
@@ -39246,7 +39680,7 @@ test "strict GLiNER boundary scope allocation failures clean pending storage and
     const input = try cb.glinerBoundaryDevice(&.{ .upload_f32 = .{ .values = &.{ 3, 5 }, .shape = &.{2} } });
     defer cb.free(input);
     const before = metal_tensor_mod.memoryStatsSnapshot();
-    try std.testing.checkAllAllocationFailures(a, exerciseBoundaryScopeAllocationFailure, .{ &compute, input });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseBoundaryScopeAllocationFailure, .{ &compute, input });
     try std.testing.expectEqual(before.device_owned_live_bytes, metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes);
     try std.testing.expect(!metal_runtime_mod.hasActiveFrame(compute.provider_impl.raw_decode_runtime));
     try std.testing.expect(!metal_runtime_mod.hasSubmittedFrame(compute.provider_impl.raw_decode_runtime));
@@ -39290,7 +39724,7 @@ test "strict GLiNER boundary request allocation failures cover uploads and alloc
     var compute = try MetalCompute.init(a, &store, null);
     defer compute.deinit();
     const before = metal_tensor_mod.memoryStatsSnapshot();
-    try std.testing.checkAllAllocationFailures(a, exerciseBoundaryRequestAllocations, .{&compute});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseBoundaryRequestAllocations, .{&compute});
     try std.testing.expectEqual(before.device_owned_live_bytes, metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes);
     try std.testing.expect(!metal_runtime_mod.hasActiveFrame(compute.provider_impl.raw_decode_runtime));
     try std.testing.expect(!metal_runtime_mod.hasSubmittedFrame(compute.provider_impl.raw_decode_runtime));
@@ -39560,7 +39994,7 @@ test "strict GLiNER boundary scope workspace OOM cancellation and oversized prod
     const bias = try cb.glinerBoundaryDevice(&.{ .upload_f32 = .{ .values = &.{ 0.5, -0.5 }, .shape = &.{2} } });
     defer cb.free(bias);
     const before = metal_tensor_mod.memoryStatsSnapshot();
-    try std.testing.checkAllAllocationFailures(a, exerciseBoundaryWorkspaceAllocationFailure, .{ &compute, input, weight, bias });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseBoundaryWorkspaceAllocationFailure, .{ &compute, input, weight, bias });
     try std.testing.expectEqual(before.device_owned_live_bytes, metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes);
     try std.testing.expectEqual(@as(usize, 0), compute.boundary_workspace_cursor.?.used_bytes);
     try std.testing.expect(!metal_runtime_mod.hasActiveFrame(compute.provider_impl.raw_decode_runtime));
@@ -39584,6 +40018,82 @@ test "strict GLiNER boundary scope workspace OOM cancellation and oversized prod
     try std.testing.expectEqual(oversized_before.workspace_oversized_products + 1, oversized_after.workspace_oversized_products);
     try std.testing.expectEqual(before.device_owned_live_bytes, metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes);
     try borrow.finish();
+}
+
+test "strict GLiNER fused FFN workspace denial cancels ownership and final downloads reject nonfinite values" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const resident = @import("gliner_boundary_resident.zig");
+    const boundary_math = @import("../architectures/gliner/boundary_device_math.zig");
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer deinitSharedNativeProvider(&store);
+    var controller = runtime_root.tier.memory.AdmissionController{};
+    defer controller.deinit();
+    var owner: ?*resident.Owner = null;
+    defer if (owner) |value| value.destroy();
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    owner = try prepareBoundaryWorkspaceTestOwner(&compute, &controller, 32);
+    var borrow = try owner.?.workspace.begin(@ptrCast(compute.provider_impl.raw_decode_runtime.?), owner.?.generation);
+    defer borrow.finish() catch unreachable;
+    try compute.bindBoundaryWorkspace(&borrow, 6);
+    const cb = compute.computeBackend();
+    const input = try cb.glinerBoundaryDevice(&.{ .upload_f32 = .{ .values = &.{ 1, 2, 3, 4, 5, 6 }, .shape = &.{ 3, 2 } } });
+    defer cb.free(input);
+    const weight = try cb.glinerBoundaryDevice(&.{ .upload_f32 = .{ .values = &.{ 1, 0, 0, 1 }, .shape = &.{ 2, 2 } } });
+    defer cb.free(weight);
+    const bias = try cb.glinerBoundaryDevice(&.{ .upload_f32 = .{ .values = &.{ 0.1, -0.2 }, .shape = &.{2} } });
+    defer cb.free(bias);
+    const before = metal_tensor_mod.memoryStatsSnapshot();
+    _ = try cb.glinerBoundaryScope(&.{ .begin = .{ .max_pending_device_bytes = 1024, .max_dispatches = 8 } });
+    try std.testing.expectError(error.InvalidGlinerBoundaryWorkspaceRange, cb.glinerBoundaryFusedFfn(&.{
+        .input = input,
+        .residual = input,
+        .first_weight = weight,
+        .first_bias = bias,
+        .second_weight = weight,
+        .second_bias = bias,
+        .norm_weight = bias,
+        .norm_bias = bias,
+        .rows = 3,
+        .hidden = 2,
+        .intermediate = 2,
+        .eps = 1e-7,
+    }));
+    const cancelled = try cb.glinerBoundaryScope(&.snapshot);
+    try std.testing.expect(!cancelled.active);
+    try std.testing.expectEqual(@as(usize, 0), compute.boundary_workspace_cursor.?.used_bytes);
+    try std.testing.expect(!metal_runtime_mod.hasActiveFrame(compute.provider_impl.raw_decode_runtime));
+    try std.testing.expectEqual(before.device_owned_live_bytes, metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes);
+
+    const Availability = struct {
+        fn unavailable(_: *anyopaque) bool {
+            return false;
+        }
+    };
+    var unavailable_vtable = cb.vtable.*;
+    unavailable_vtable.glinerBoundaryFusedFfnAvailable = Availability.unavailable;
+    var unavailable_cb = cb;
+    unavailable_cb.vtable = &unavailable_vtable;
+    const unavailable_math = try boundary_math.Context.create(a, &unavailable_cb, .{ .max_device_bytes = 1024 }, null);
+    defer unavailable_math.destroy();
+    unavailable_math.configure(.optimized_v2);
+    const ledger_before = unavailable_math.stats;
+    const backend_before = try cb.glinerBoundaryScope(&.snapshot);
+    try std.testing.expect((try unavailable_math.fusedFfn(input, input, 3, 2, 2, 0, 1e-7)) == null);
+    try std.testing.expect(std.meta.eql(ledger_before, unavailable_math.stats));
+    try std.testing.expectEqual(@as(usize, 0), unavailable_math.current_bytes);
+    try std.testing.expectEqual(@as(usize, 0), unavailable_math.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), unavailable_math.weights.count());
+    try std.testing.expect(unavailable_math.scope_generation == null);
+    try std.testing.expect(std.meta.eql(backend_before, try cb.glinerBoundaryScope(&.snapshot)));
+
+    const math = try boundary_math.Context.create(a, &cb, .{ .max_device_bytes = 1024 }, null);
+    defer math.destroy();
+    const nonfinite = try math.execute(.{ .upload_f32 = .{ .values = &.{std.math.nan(f32)}, .shape = &.{1} } }, 1);
+    var downloaded: [1]f32 = undefined;
+    try std.testing.expectError(error.NonFiniteBoundaryScore, math.downloadInto(nonfinite, &downloaded, false));
 }
 
 test "metal_compute: imported weights accept exact integer gather indices" {
@@ -39813,5 +40323,129 @@ test "metal_compute: segment attention matches the host reference across ranges,
                 return err;
             };
         }
+    }
+}
+
+test "metal GLiNER fused QKV RoPE matches separate split and rotations" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_]usize{ 1, 7, 40, 87, 198 }) |rows| {
+        const hidden: usize = if (rows == 7) 18 else 1792;
+        const head: usize = if (rows == 7) 6 else 64;
+        const data = try a.alloc(f32, rows * hidden * 3);
+        defer a.free(data);
+        for (data, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.13);
+        const positions = try a.alloc(i32, rows);
+        defer a.free(positions);
+        const axes = try a.alloc(u32, rows * 3);
+        defer a.free(axes);
+        for (positions, 0..) |*p, i| {
+            p.* = @intCast((i * 137) % 7999);
+            for (0..3) |axis| axes[axis * rows + i] = @intCast(p.*);
+        }
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(data, &.{ @intCast(rows), @intCast(hidden * 3) }));
+        defer cb.free(input);
+        const device_positions = (try cb.fromInt32Shape(positions, &.{@intCast(rows)})).?;
+        defer cb.free(device_positions);
+        // Both operations join the caller's frame; neither submits it.
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        errdefer cb.decoderRuntimeCancelFrame() catch {};
+        const submissions = cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits;
+        const result = (try cb.packedQkvRope(input, device_positions, hidden, head, 160000)).?;
+        defer cb.free(result.first);
+        defer cb.free(result.second);
+        defer cb.free(result.third);
+        var reference: [3]CT = undefined;
+        for (&reference, 0..) |*target, part| {
+            const slice = try cb.sliceLastDim(input, part * hidden, (part + 1) * hidden);
+            if (part < 2) {
+                defer cb.free(slice);
+                target.* = (try cb.mrope(slice, rows, head, 160000, 1, axes, .{ @intCast(head / 2), 0, 0 })).?;
+            } else target.* = slice;
+        }
+        defer for (reference) |tensor| cb.free(tensor);
+        try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
+        try std.testing.expectEqual(submissions, cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits);
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        for ([_]CT{ result.first, result.second, result.third }, reference, 0..) |actual, expected, part| {
+            const got = try cb.toFloat32(actual, a);
+            defer a.free(got);
+            const want = try cb.toFloat32(expected, a);
+            defer a.free(want);
+            for (got, want) |x, y| try std.testing.expectApproxEqAbs(y, x, @as(f32, if (part == 2) 0 else 2e-5));
+        }
+        positions[0] = -1;
+        const negative_positions = (try cb.fromInt32Shape(positions, &.{@intCast(rows)})).?;
+        defer cb.free(negative_positions);
+        try std.testing.expect(try cb.packedQkvRope(input, negative_positions, hidden, head, 160000) == null);
+    }
+}
+
+test "metal GLiNER centered residual norm preserves sum and low variance" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_]usize{ 7, 64, 768, 1792 }) |hidden| {
+        const rows = 3;
+        const values = try a.alloc(f32, rows * hidden);
+        defer a.free(values);
+        const residual = try a.alloc(f32, rows * hidden);
+        defer a.free(residual);
+        const gamma = try a.alloc(f32, hidden);
+        defer a.free(gamma);
+        const beta = try a.alloc(f32, hidden);
+        defer a.free(beta);
+        for (gamma, beta, 0..) |*g, *b, i| {
+            g.* = 1 + @as(f32, @floatFromInt(i % 5)) * 0.1;
+            b.* = -0.2;
+        }
+        for (values, residual, 0..) |*v, *r, i| {
+            v.* = if (i / hidden == 1) 10000 + (if (i % 2 == 0) @as(f32, 0.25) else -0.25) else @sin(@as(f32, @floatFromInt(i)) * 0.17);
+            r.* = 0.25;
+        }
+        const x = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(values, &.{ rows, @intCast(hidden) }));
+        defer cb.free(x);
+        const r = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(residual, &.{ rows, @intCast(hidden) }));
+        defer cb.free(r);
+        const g = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(gamma, &.{@intCast(hidden)}));
+        defer cb.free(g);
+        const b = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(beta, &.{@intCast(hidden)}));
+        defer cb.free(b);
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        errdefer cb.decoderRuntimeCancelFrame() catch {};
+        const submissions = cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits;
+        const fused = (try cb.addLayerNormSumCentered(x, r, g, b, hidden, 1e-5)).?;
+        defer cb.free(fused.sum);
+        defer cb.free(fused.normed);
+        // Compare with the precise boundary norm, which uses centered variance.
+        const sum = try cb.add(x, r);
+        defer cb.free(sum);
+        const kernel = ops.gliner_boundary_device.Kernel{ .kind = .norm, .dims = .{ rows, @intCast(hidden), 0, 0, 0, 0, 0, 0 }, .scalars = .{ 1e-5, 0, 0, 0 } };
+        var inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        inputs[0] = MetalCompute.toBuf(sum).metal_tensor.?;
+        inputs[1] = MetalCompute.toBuf(g).metal_tensor.?;
+        inputs[2] = MetalCompute.toBuf(b).metal_tensor.?;
+        var expected = (try metal_runtime_mod.decoderRuntimeGlinerBoundaryDevice(compute.provider_impl, a, kernel, inputs)).?;
+        defer expected.deinit();
+        try std.testing.expectEqual(submissions, cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits);
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        const actual = try cb.toFloat32(fused.normed, a);
+        defer a.free(actual);
+        const wanted = try expected.toHostSlice();
+        for (actual, wanted) |got, want| try std.testing.expectApproxEqAbs(want, got, 2e-5);
+        const actual_sum = try cb.toFloat32(fused.sum, a);
+        defer a.free(actual_sum);
+        for (actual_sum, values, residual) |got, left, right| try std.testing.expectEqual(left + right, got);
     }
 }

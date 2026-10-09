@@ -425,7 +425,7 @@ test "gliner boundary decoder unwinds allocation failures and cancellation" {
             return error.Cancelled;
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
     try std.testing.expectError(error.Cancelled, resolveOverlaps(std.testing.allocator, &.{}, .flat, .{ .control = .{ .check_fn = Check.cancel } }));
     try std.testing.expectError(error.ExtractionCandidateLimitExceeded, decodeQuery(std.testing.allocator, &.{.{ .start = 0, .end = 1, .logit = 0 }}, .{ .limits = .{ .max_candidates = 0 } }));
 }

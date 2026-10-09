@@ -39,20 +39,9 @@ const typed_dv = @import("../section/typed_doc_values.zig");
 const geo = @import("geo.zig");
 const synonyms_mod = @import("../section/synonyms.zig");
 
-pub const FilterError = error{
-    OutOfMemory,
-    InvalidData,
-    InvalidMagic,
-    UnsupportedVersion,
-    InvalidFST,
-    SnappyError,
-    InvalidFormat,
-    InvalidAddress,
-    InvalidChunk,
-    CorruptInput,
-    InvalidSegment,
-    CrcMismatch,
-};
+// Range-backed codecs propagate storage failures as well as decode failures.
+// A failed read must never be converted into an empty filter result.
+pub const FilterError = anyerror;
 
 const geo_filter_earth_radius_meters: f64 = 6371008.8;
 
@@ -137,14 +126,15 @@ pub const TermFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: TermFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
+        var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
+        defer inv_reader.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
         // Look up the primary term
-        if (inv_reader.lookup(self.term)) |lookup_result| {
+        if ((try inv_reader.lookup(self.term))) |lookup_result| {
             switch (lookup_result) {
                 .postings => |p| {
                     var bm = try p.docBitmap(alloc);
@@ -168,7 +158,7 @@ pub const TermFilter = struct {
                 }
                 for (terms) |syn_term| {
                     if (std.mem.eql(u8, syn_term, self.term)) continue; // skip primary
-                    if (inv_reader.lookup(syn_term)) |syn_result| {
+                    if ((try inv_reader.lookup(syn_term))) |syn_result| {
                         switch (syn_result) {
                             .postings => |p| {
                                 var bm = try p.docBitmap(alloc);
@@ -335,10 +325,12 @@ pub const PrefixFilter = struct {
         stats: ?*ExecutionStats,
     ) FilterError!roaring.RoaringBitmap {
         if (self.indexed_field) |indexed_field| {
-            if (try seg.reader.invertedIndex(indexed_field)) |indexed_reader| {
+            if (try seg.reader.invertedIndexScoped(alloc, indexed_field)) |opened| {
+                var indexed_reader = opened;
+                defer indexed_reader.deinit();
                 var exact = roaring.RoaringBitmap.init(alloc);
                 errdefer exact.deinit();
-                if (indexed_reader.lookup(self.prefix)) |lookup| {
+                if ((try indexed_reader.lookup(self.prefix))) |lookup| {
                     if (comptime collect_stats) stats.?.matching_terms = 1;
                     switch (lookup) {
                         .postings => |postings| {
@@ -352,8 +344,9 @@ pub const PrefixFilter = struct {
                 return exact;
             }
         }
-        const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
+        var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
+        defer inv_reader.deinit();
 
         // Seek to the first dictionary block that can contain the prefix.
         // Starting from termIterator() makes every prefix query decode all
@@ -438,8 +431,9 @@ pub const PhraseFilter = struct {
             return multi.execute(alloc, seg);
         }
 
-        const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
+        var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
+        defer inv_reader.deinit();
 
         // Step 1: Intersect posting bitmaps of all terms to get candidate docs
         var candidate_bm: ?roaring.RoaringBitmap = null;
@@ -450,7 +444,7 @@ pub const PhraseFilter = struct {
         defer lookups.deinit(alloc);
 
         for (self.terms) |term| {
-            const lr = inv_reader.lookup(term) orelse {
+            const lr = (try inv_reader.lookup(term)) orelse {
                 // Term not found — no phrase match possible
                 return roaring.RoaringBitmap.init(alloc);
             };
@@ -588,7 +582,7 @@ fn unionTermEntry(alloc: Allocator, result: *roaring.RoaringBitmap, entry: inver
 /// diagnostics. `accept` gets a final say on each automaton-accepted term.
 fn collectAutomatonTerms(
     alloc: Allocator,
-    term_iter: *inverted.TermIterator,
+    term_iter: *inverted.ScopedInvertedIndexReader.Iterator,
     result: *roaring.RoaringBitmap,
     context: anytype,
     comptime accept: fn (@TypeOf(context), []const u8) bool,
@@ -605,7 +599,7 @@ fn collectAutomatonTerms(
         if (comptime collect_stats) stats.?.matching_terms += 1;
         try unionTermEntry(alloc, result, entry);
     }
-    if (comptime collect_stats) stats.?.blocks_pruned = term_iter.blocks_pruned;
+    if (comptime collect_stats) stats.?.blocks_pruned = term_iter.blocksPruned();
 }
 
 /// Fuzzy match: finds all terms within Levenshtein edit distance via FST automaton search.
@@ -643,8 +637,9 @@ pub const FuzzyFilter = struct {
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
     ) FilterError!roaring.RoaringBitmap {
-        const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
+        var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
+        defer inv_reader.deinit();
 
         // The Levenshtein automaton drives the dictionary walk: blocks whose
         // shared prefix is already more than `max_edits` away are skipped
@@ -717,8 +712,9 @@ pub const RegexpFilter = struct {
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
     ) FilterError!roaring.RoaringBitmap {
-        const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
+        var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
+        defer inv_reader.deinit();
 
         // Compile regex → automaton; the dictionary walk prunes whole blocks
         // whose shared prefix cannot reach an accepting state.
@@ -747,8 +743,9 @@ pub const TermRangeFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: TermRangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
+        var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
+        defer inv_reader.deinit();
 
         // Compute FST bounds: iterator uses [start, end) half-open interval.
         // `max ++ "\x00"` is the first byte string after `max` itself and
@@ -814,7 +811,9 @@ pub const IPRangeFilter = struct {
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
-        if (try seg.reader.invertedIndex(self.field)) |inv_reader| {
+        if (try seg.reader.invertedIndexScoped(alloc, self.field)) |opened| {
+            var inv_reader = opened;
+            defer inv_reader.deinit();
             var term_iter = try inv_reader.termIterator();
             defer term_iter.deinit();
 
@@ -909,16 +908,19 @@ pub const GeoShapeFilter = struct {
         // the segment or decode its typed doc values.
         if (self.relation == .contains) return roaring.RoaringBitmap.init(alloc);
 
-        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
-            return roaring.RoaringBitmap.init(alloc);
-        var reader = try typed_dv.TypedDocValuesReader.init(alloc, section_data);
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return roaring.RoaringBitmap.init(alloc);
+        defer reader.deinit();
         if (reader.value_type != .geo_point) return roaring.RoaringBitmap.init(alloc);
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
-        for (0..seg.reader.doc_count) |doc_id| {
-            const point = (try reader.getGeoPoint(@intCast(doc_id))) orelse continue;
+        var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
+        defer cursor.deinit();
+        while (try cursor.next()) |entry| {
+            if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
+            const doc_id = entry.doc_id;
+            const point = entry.value.geo_point;
             for (self.polygons) |polygon| {
                 if (geo.pointInPolygon(.{ .lat = point.lat, .lon = point.lon }, polygon)) {
                     try result.add(@intCast(doc_id));
@@ -942,21 +944,26 @@ pub const RangeFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: RangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
-            return roaring.RoaringBitmap.init(alloc);
-
-        const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
-            return roaring.RoaringBitmap.init(alloc);
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return roaring.RoaringBitmap.init(alloc);
+        defer reader.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
-        for (0..seg.reader.doc_count) |doc_id| {
-            const numeric_value: ?f64 = switch (reader.value_type) {
-                .f64_val => reader.getF64(@intCast(doc_id)) catch continue,
-                .i64_val => if (reader.getI64(@intCast(doc_id)) catch continue) |value| @floatFromInt(value) else null,
-                .u64_val => if (reader.getU64(@intCast(doc_id)) catch continue) |value| @floatFromInt(value) else null,
-                .numeric_val => if (reader.getNumeric(@intCast(doc_id)) catch continue) |value| typed_dv.numericValueAsF64(value) else null,
+        switch (reader.value_type) {
+            .u64_val, .i64_val, .f64_val, .numeric_val => {},
+            else => return result,
+        }
+        var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
+        defer cursor.deinit();
+        while (try cursor.next()) |entry| {
+            if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
+            const doc_id = entry.doc_id;
+            const numeric_value: ?f64 = switch (entry.value) {
+                .f64_val => |value| value,
+                .i64_val => |value| @floatFromInt(value),
+                .u64_val => |value| @floatFromInt(value),
+                .numeric_val => |value| typed_dv.numericValueAsF64(value),
                 else => null,
             };
             const value = numeric_value orelse continue;
@@ -986,11 +993,8 @@ pub const GeoDistanceFilter = struct {
     radius_meters: f64,
 
     pub fn execute(self: GeoDistanceFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
-            return roaring.RoaringBitmap.init(alloc);
-
-        const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
-            return roaring.RoaringBitmap.init(alloc);
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return roaring.RoaringBitmap.init(alloc);
+        defer reader.deinit();
         if (reader.value_type != .geo_point) return roaring.RoaringBitmap.init(alloc);
 
         var candidate_bm: ?roaring.RoaringBitmap = try self.candidateBitmapAlloc(alloc, seg);
@@ -1002,7 +1006,7 @@ pub const GeoDistanceFilter = struct {
         if (candidate_bm) |*candidates| {
             var it = candidates.iterator();
             while (it.next()) |doc_id| {
-                const point = reader.getGeoPoint(doc_id) catch continue;
+                const point = (try reader.getGeoPoint(doc_id));
                 if (point) |p| {
                     const gp = geo.GeoPoint{ .lat = p.lat, .lon = p.lon };
                     if (geo.haversineDistance(self.center, gp) <= self.radius_meters) {
@@ -1013,8 +1017,12 @@ pub const GeoDistanceFilter = struct {
             return result;
         }
 
-        for (0..seg.reader.doc_count) |doc_id| {
-            const point = reader.getGeoPoint(@intCast(doc_id)) catch continue;
+        var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
+        defer cursor.deinit();
+        while (try cursor.next()) |entry| {
+            if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
+            const doc_id = entry.doc_id;
+            const point = @as(?@TypeOf(entry.value.geo_point), entry.value.geo_point);
             if (point) |p| {
                 const gp = geo.GeoPoint{ .lat = p.lat, .lon = p.lon };
                 if (geo.haversineDistance(self.center, gp) <= self.radius_meters) {
@@ -1051,11 +1059,8 @@ pub const GeoBBoxFilter = struct {
     max_lon: f64,
 
     pub fn execute(self: GeoBBoxFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
-            return roaring.RoaringBitmap.init(alloc);
-
-        const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
-            return roaring.RoaringBitmap.init(alloc);
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return roaring.RoaringBitmap.init(alloc);
+        defer reader.deinit();
         if (reader.value_type != .geo_point) return roaring.RoaringBitmap.init(alloc);
 
         var candidate_bm: ?roaring.RoaringBitmap = try geoCandidateBitmapForBBoxAlloc(
@@ -1075,7 +1080,7 @@ pub const GeoBBoxFilter = struct {
         if (candidate_bm) |*candidates| {
             var it = candidates.iterator();
             while (it.next()) |doc_id| {
-                const point = reader.getGeoPoint(doc_id) catch continue;
+                const point = (try reader.getGeoPoint(doc_id));
                 if (point) |p| {
                     if (p.lat >= self.min_lat and p.lat <= self.max_lat and
                         geoLongitudeInRange(p.lon, self.min_lon, self.max_lon))
@@ -1087,8 +1092,12 @@ pub const GeoBBoxFilter = struct {
             return result;
         }
 
-        for (0..seg.reader.doc_count) |doc_id| {
-            const point = reader.getGeoPoint(@intCast(doc_id)) catch continue;
+        var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
+        defer cursor.deinit();
+        while (try cursor.next()) |entry| {
+            if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
+            const doc_id = entry.doc_id;
+            const point = @as(?@TypeOf(entry.value.geo_point), entry.value.geo_point);
             if (point) |p| {
                 if (p.lat >= self.min_lat and p.lat <= self.max_lat and
                     geoLongitudeInRange(p.lon, self.min_lon, self.max_lon))
@@ -1188,8 +1197,9 @@ fn geoCandidateBitmapForRangesAlloc(
     lon_ranges: GeoLongitudeRanges,
     precision: u8,
 ) FilterError!?roaring.RoaringBitmap {
-    const inv_reader = (try seg.reader.invertedIndex(field)) orelse
+    var inv_reader = (try seg.reader.invertedIndexScoped(alloc, field)) orelse
         return null;
+    defer inv_reader.deinit();
 
     var result = roaring.RoaringBitmap.init(alloc);
     errdefer result.deinit();
@@ -1287,14 +1297,14 @@ fn addLookupResultToBitmap(alloc: Allocator, result: *roaring.RoaringBitmap, loo
 
 fn addGeoCellCandidatesToBitmap(
     alloc: Allocator,
-    inv_reader: *const inverted.InvertedIndexReader,
+    inv_reader: *const inverted.ScopedInvertedIndexReader,
     result: *roaring.RoaringBitmap,
     cell_prefix: []const u8,
     profile: *GeoCandidateProfile,
 ) FilterError!bool {
     if (cell_prefix.len >= geo.index_geohash_precision) {
         profile.direct_lookups += 1;
-        if (inv_reader.lookup(cell_prefix[0..geo.index_geohash_precision])) |lookup_result| {
+        if ((try inv_reader.lookup(cell_prefix[0..geo.index_geohash_precision]))) |lookup_result| {
             try addLookupResultToBitmap(alloc, result, lookup_result);
         }
         return result.cardinality() <= profile.candidate_doc_budget;
@@ -1331,8 +1341,9 @@ pub const MultiPhraseFilter = struct {
     pub fn execute(self: MultiPhraseFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
         if (self.term_alternatives.len == 0) return roaring.RoaringBitmap.init(alloc);
 
-        const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
+        var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
+        defer inv_reader.deinit();
 
         // Step 1: For each position, collect all alternative terms' postings and intersect candidates
         var candidate_bm: ?roaring.RoaringBitmap = null;
@@ -1367,7 +1378,7 @@ pub const MultiPhraseFilter = struct {
                     errdefer alloc.free(owned_term);
                     try seen_terms.put(alloc, owned_term, {});
                     try owned_seen_terms.append(alloc, owned_term);
-                    const lr = inv_reader.lookup(term) orelse continue;
+                    const lr = (try inv_reader.lookup(term)) orelse continue;
                     try position_lookups[pos_idx].append(alloc, lr);
                     any_found = true;
                     switch (lr) {
@@ -1392,7 +1403,7 @@ pub const MultiPhraseFilter = struct {
                     errdefer alloc.free(owned_term);
                     try seen_terms.put(alloc, owned_term, {});
                     try owned_seen_terms.append(alloc, owned_term);
-                    const lr = inv_reader.lookup(expanded_term) orelse continue;
+                    const lr = (try inv_reader.lookup(expanded_term)) orelse continue;
                     try position_lookups[pos_idx].append(alloc, lr);
                     any_found = true;
                     switch (lr) {
@@ -1519,7 +1530,7 @@ fn fuzzyPrefixMatches(term: []const u8, candidate: []const u8, prefix_len: u8) b
 
 fn collectFuzzyCandidateTerms(
     alloc: Allocator,
-    inv_reader: inverted.InvertedIndexReader,
+    inv_reader: inverted.ScopedInvertedIndexReader,
     term: []const u8,
     max_edits: u8,
     prefix_len: u8,
@@ -1565,17 +1576,19 @@ pub const DateRangeFilter = struct {
     boost: f32 = 1.0,
 
     pub fn execute(self: DateRangeFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
-            return roaring.RoaringBitmap.init(alloc);
-
-        const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
-            return roaring.RoaringBitmap.init(alloc);
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return roaring.RoaringBitmap.init(alloc);
+        defer reader.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
-        for (0..seg.reader.doc_count) |doc_id| {
-            const val = reader.getU64(@intCast(doc_id)) catch continue;
+        if (reader.value_type != .u64_val) return result;
+        var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
+        defer cursor.deinit();
+        while (try cursor.next()) |entry| {
+            if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
+            const doc_id = entry.doc_id;
+            const val = @as(?@TypeOf(entry.value.u64_val), entry.value.u64_val);
             if (val) |v| {
                 const above_start = if (self.start_ns) |s|
                     (if (self.inclusive_start) v >= s else v > s)
@@ -1630,8 +1643,9 @@ pub const WildcardFilter = struct {
         comptime collect_stats: bool,
         stats: ?*ExecutionStats,
     ) FilterError!roaring.RoaringBitmap {
-        const inv_reader = (try seg.reader.invertedIndex(self.field)) orelse
+        var inv_reader = (try seg.reader.invertedIndexScoped(alloc, self.field)) orelse
             return roaring.RoaringBitmap.init(alloc);
+        defer inv_reader.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
@@ -1647,7 +1661,7 @@ pub const WildcardFilter = struct {
 
         if (plan.exact) {
             if (comptime collect_stats) stats.?.exact_lookup = true;
-            if (inv_reader.lookup(literal_prefix)) |lookup| {
+            if ((try inv_reader.lookup(literal_prefix))) |lookup| {
                 if (comptime collect_stats) stats.?.matching_terms = 1;
                 try unionTermEntry(alloc, &result, .{ .term = literal_prefix, .result = lookup });
             }
@@ -1695,15 +1709,16 @@ pub const DocIdFilter = struct {
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
-        // Scan stored docs and match IDs
+        if (self.doc_ids.len == 0) return result;
+        var wanted = std.StringHashMapUnmanaged(void).empty;
+        defer wanted.deinit(alloc);
+        for (self.doc_ids) |id| try wanted.put(alloc, id, {});
+        var identities = @import("../segment_source.zig").Scratch.init(alloc, 64 * 1024);
+        defer identities.deinit();
         for (0..seg.reader.doc_count) |doc_num| {
-            const stored = (try seg.reader.storedDoc(@intCast(doc_num))) orelse continue;
-            for (self.doc_ids) |wanted| {
-                if (std.mem.eql(u8, stored.id, wanted)) {
-                    try result.add(@intCast(doc_num));
-                    break;
-                }
-            }
+            identities.reset();
+            const id = (try seg.reader.storedIdAlloc(identities.allocator(), @intCast(doc_num))) orelse continue;
+            if (wanted.contains(id)) try result.add(@intCast(doc_num));
         }
 
         return result;
@@ -1713,12 +1728,21 @@ pub const DocIdFilter = struct {
 /// Global numeric document filter: matches documents by snapshot-global doc ID.
 pub const DocNumFilter = struct {
     doc_nums: []const u32,
+    bitmap: ?*const roaring.RoaringBitmap = null,
 
     pub fn executeWithOffset(self: DocNumFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry, doc_offset: u32) FilterError!roaring.RoaringBitmap {
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
         const upper = doc_offset + seg.reader.doc_count;
+        if (self.bitmap) |bitmap| {
+            var it = bitmap.iterator();
+            it.seek(doc_offset);
+            while (it.next()) |doc_num| {
+                if (doc_num >= upper) break;
+                if (doc_num >= doc_offset) try result.add(doc_num - doc_offset);
+            }
+        }
         for (self.doc_nums) |doc_num| {
             if (doc_num < doc_offset or doc_num >= upper) continue;
             try result.add(doc_num - doc_offset);
@@ -1734,17 +1758,19 @@ pub const BoolFieldFilter = struct {
     value: bool,
 
     pub fn execute(self: BoolFieldFilter, alloc: Allocator, seg: *const index_mod.SegmentEntry) FilterError!roaring.RoaringBitmap {
-        const section_data = (try seg.reader.getSection(self.field, .typed_doc_values)) orelse
-            return roaring.RoaringBitmap.init(alloc);
-
-        const reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch
-            return roaring.RoaringBitmap.init(alloc);
+        var reader = (try seg.reader.typedDocValuesScoped(alloc, self.field)) orelse return roaring.RoaringBitmap.init(alloc);
+        defer reader.deinit();
 
         var result = roaring.RoaringBitmap.init(alloc);
         errdefer result.deinit();
 
-        for (0..seg.reader.doc_count) |doc_id| {
-            const val = reader.getBool(@intCast(doc_id)) catch continue;
+        if (reader.value_type != .bool_val) return result;
+        var cursor = typed_dv.TypedDocValuesReader.Cursor.init(&reader);
+        defer cursor.deinit();
+        while (try cursor.next()) |entry| {
+            if (entry.doc_id >= seg.reader.doc_count) return error.InvalidSegment;
+            const doc_id = entry.doc_id;
+            const val = @as(?@TypeOf(entry.value.bool_val), entry.value.bool_val);
             if (val) |v| {
                 if (v == self.value) {
                     try result.add(@intCast(doc_id));

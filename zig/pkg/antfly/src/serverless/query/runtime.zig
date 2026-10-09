@@ -299,30 +299,41 @@ pub const QueryRuntime = struct {
     }
 
     pub fn openVersionSession(self: *QueryRuntime, namespace: []const u8, version: u64) !QuerySession {
-        var manifest = try self.manifests.getAlloc(namespace, version);
+        return self.openVersionSessionWithCancellation(namespace, version, .none);
+    }
+
+    pub fn openVersionSessionWithCancellation(self: *QueryRuntime, namespace: []const u8, version: u64, cancellation: CancellationToken) !QuerySession {
+        var manifest = try self.manifests.getAllocWithCancellation(namespace, version, cancellation);
         errdefer manifest.deinit(self.alloc);
         var lease: ?read_lease.Lease = null;
         for (manifest.artifacts) |artifact| {
             if (artifact.kind == .document_facts or (artifact.kind == .graph_segment and artifact.metadata_version == graph_segment_mod.page_graph.Root.metadata_version)) {
+                try cancellation.check();
                 lease = try self.read_leases.acquire(self.progress, namespace, version);
                 break;
             }
         }
+        try cancellation.check();
         return .{
             .alloc = self.alloc,
             .artifacts = self.artifacts,
             .cache = self.cache,
+            .cancellation = cancellation,
             .manifest = manifest,
             .read_lease = lease,
         };
     }
 
     pub fn openHeadSession(self: *QueryRuntime, namespace: []const u8) !QuerySession {
-        var version = try self.progress.getHead(namespace);
+        return self.openHeadSessionWithCancellation(namespace, .none);
+    }
+
+    pub fn openHeadSessionWithCancellation(self: *QueryRuntime, namespace: []const u8, cancellation: CancellationToken) !QuerySession {
+        var version = try self.progress.getHeadWithCancellation(namespace, cancellation);
         for (0..3) |_| {
-            return self.openVersionSession(namespace, version) catch |err| switch (err) {
+            return self.openVersionSessionWithCancellation(namespace, version, cancellation) catch |err| switch (err) {
                 error.FileNotFound, error.ManifestVersionRetired => {
-                    const next = try self.progress.getHead(namespace);
+                    const next = try self.progress.getHeadWithCancellation(namespace, cancellation);
                     if (next == version) return err;
                     version = next;
                     continue;
@@ -1488,7 +1499,7 @@ test "serverless query runtime metrics remain valid across every allocation fail
             }
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless query session validates content addresses and declared range bounds" {
@@ -1545,4 +1556,30 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "serverless HEAD session forwards cancellation before manifest acquisition" {
+    const Fixture = struct {
+        signal: std.atomic.Value(bool) = .init(false),
+        reads: usize = 0,
+        fn legacy(_: *anyopaque, _: []const u8) !u64 {
+            return error.NonCancellableHeadReadUsed;
+        }
+        fn read(ptr: *anyopaque, _: []const u8, cancellation: CancellationToken) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            self.signal.store(true, .release);
+            try cancellation.check();
+            return 1;
+        }
+    };
+    var fixture: Fixture = .{};
+    var vtable: catalog_mod.ProgressStore.VTable = undefined;
+    vtable.get_head = Fixture.legacy;
+    vtable.get_head_with_cancellation = Fixture.read;
+    var progress: catalog_mod.ProgressStore = .{ .allocator = std.testing.allocator, .ptr = &fixture, .vtable = &vtable };
+    var runtime: QueryRuntime = undefined;
+    runtime.progress = &progress;
+    try std.testing.expectError(error.Canceled, runtime.openHeadSessionWithCancellation("docs", CancellationToken.fromAtomic(&fixture.signal)));
+    try std.testing.expectEqual(@as(usize, 1), fixture.reads);
 }

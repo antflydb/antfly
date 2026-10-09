@@ -63,6 +63,9 @@ pub const SearchDiagnostics = struct {
     phrase_candidates_verified: u64 = 0,
     phrase_position_records_decoded: u64 = 0,
     phrase_matches_scored: u64 = 0,
+    stored_block_decodes: u64 = 0,
+    stored_body_copies: u64 = 0,
+    stored_body_bytes: u64 = 0,
 
     pub fn addWand(self: *SearchDiagnostics, wand: *const WANDScorer) void {
         self.postings_iterators_opened +|= @intCast(wand.terms.items.len);

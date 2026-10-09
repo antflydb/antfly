@@ -2679,7 +2679,19 @@ pub fn highlightTextFieldsFromValue(
     text_analysis: introducer_mod.TextAnalysisConfig,
     schema: ?runtime_schema.TableSchema,
 ) ![]const HighlightTextField {
-    const extracted = try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null);
+    return highlightTextFieldsFromValueWithSelectedField(alloc, root, text_analysis, schema, null);
+}
+
+/// Keep highlight provenance identical to TextProjectionBatchBuilder, including
+/// explicit field indexes that override the table's general text mapping.
+pub fn highlightTextFieldsFromValueWithSelectedField(
+    alloc: Allocator,
+    root: std.json.Value,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    schema: ?runtime_schema.TableSchema,
+    selected_field: ?[]const u8,
+) ![]const HighlightTextField {
+    const extracted = if (selected_field) |field| try extractSelectedTextField(alloc, root, field) else try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null);
     var fields = std.ArrayListUnmanaged(HighlightTextField).empty;
     for (extracted.fields) |field| {
         try fields.append(alloc, .{
@@ -3825,7 +3837,7 @@ fn parseDenseEmbeddingValue(alloc: Allocator, value: std.json.Value) ![]f32 {
     };
 }
 
-fn parseSparseValue(alloc: Allocator, value: std.json.Value) !SparseVectorData {
+pub fn parseSparseValue(alloc: Allocator, value: std.json.Value) !SparseVectorData {
     if (value != .object) return error.InvalidEmbeddingField;
     if (value.object.get("packed_indices") != null or value.object.get("packed_values") != null) {
         const packed_indices = value.object.get("packed_indices") orelse return error.InvalidSparseVector;
@@ -3874,16 +3886,17 @@ fn parseSparseValue(alloc: Allocator, value: std.json.Value) !SparseVectorData {
     }
 
     // Re-sort sparse coordinates by index for deterministic downstream behavior.
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        var j = i + 1;
-        while (j < count) : (j += 1) {
-            if (indices[j] < indices[i]) {
-                std.mem.swap(u32, &indices[i], &indices[j]);
-                std.mem.swap(f32, &values[i], &values[j]);
-            }
+    std.sort.pdqContext(0, count, struct {
+        indices: []u32,
+        values: []f32,
+        pub fn lessThan(self: @This(), left: usize, right: usize) bool {
+            return self.indices[left] < self.indices[right];
         }
-    }
+        pub fn swap(self: @This(), left: usize, right: usize) void {
+            std.mem.swap(u32, &self.indices[left], &self.indices[right]);
+            std.mem.swap(f32, &self.values[left], &self.values[right]);
+        }
+    }{ .indices = indices, .values = values });
 
     return .{
         .indices = indices,

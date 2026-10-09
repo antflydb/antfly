@@ -51,14 +51,18 @@ if [[ -n "${ANTFLY_E2E_REPORT_DIR:-}" ]]; then
   mkdir -p "$ANTFLY_E2E_REPORT_DIR"
   report_args+=("--junitxml=$ANTFLY_E2E_REPORT_DIR/junit.xml")
 fi
+uv_extras=()
+if [[ "${ANTFLY_E2E_FULL_LAKE:-}" == "1" ]]; then
+  uv_extras+=(--extra lake --extra iceberg)
+fi
 cd "$repo_root/zig"
 if (( workers > 1 )); then
   # Isolation groups preserve shared fixture lifecycles; independent tests are
   # scheduled longest-first without exceeding the Antfly process budget.
   # Keep test identities visible even if the job is cancelled before pytest's
   # final summary; quiet progress dots hide the failing or stalled scenario.
-  exec uv run --project e2e/antfly pytest -v --tb=short --continue-on-collection-errors "${report_args[@]}" \
+  exec uv run --project e2e/antfly "${uv_extras[@]}" pytest -v --tb=short --continue-on-collection-errors "${report_args[@]}" \
     -n "$workers" --dist=loadgroup --e2e-process-slots "$process_slots" "$@"
 fi
 
-exec uv run --project e2e/antfly pytest -v --tb=short --continue-on-collection-errors "${report_args[@]}" "$@"
+exec uv run --project e2e/antfly "${uv_extras[@]}" pytest -v --tb=short --continue-on-collection-errors "${report_args[@]}" "$@"

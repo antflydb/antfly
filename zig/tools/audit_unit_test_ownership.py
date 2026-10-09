@@ -22,6 +22,7 @@ import argparse
 from collections import defaultdict
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -34,7 +35,11 @@ def inventory(text: str) -> list[str]:
     return [
         line.partition("TEST\t")[2]
         for line in text.splitlines()
-        if "TEST\t" in line and not line.endswith(".test_0")
+        if "TEST\t" in line
+        and (
+            ".test." in line.partition("TEST\t")[2]
+            or not re.search(r"\.test_[0-9]+$", line)
+        )
     ]
 
 

@@ -2242,6 +2242,11 @@ pub const TransitionCommand = union(enum) {
         expected: metadata.TableRecord,
         replacement: metadata.TableRecord,
     },
+    mutate_lake_index_lifecycle: struct {
+        table_id: u64,
+        expected_revision: u64,
+        mutation: @import("../lake_index_lifecycle.zig").Mutation,
+    },
     remove_table: struct {
         table_id: u64,
         expected_transition_generation: u64,
@@ -2468,12 +2473,16 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             )) return error.InvalidStoreReporterFence;
         },
         .compare_and_replace_table => |replacement| {
+            try metadata_table_manager.validateObjectTableMutation(std.heap.page_allocator, replacement.expected, replacement.replacement);
             if (replacement.expected.table_id == 0 or
                 replacement.replacement.table_id != replacement.expected.table_id or
                 !std.mem.eql(u8, replacement.replacement.name, replacement.expected.name))
             {
                 return error.InvalidTableDefinitionReplacement;
             }
+        },
+        .mutate_lake_index_lifecycle => |mutation| {
+            if (mutation.table_id == 0) return error.InvalidTableId;
         },
         .remove_table => |record| {
             if (record.table_id == 0) return error.InvalidTableId;
@@ -2482,11 +2491,13 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
             .create => |create| {
                 if (create.table.table_id == 0 or
                     create.table.name.len == 0 or
-                    create.ranges.len == 0 or
+                    (create.ranges.len == 0 and create.table.storage.engine != .object) or
                     create.ranges.len > topology_protocol.max_initial_ranges or
                     create.ranges.len != @as(usize, create.table.min_ranges))
                     return error.InvalidTableTopologyMutation;
-                metadata_table_manager.validateCompleteKeyspaceRanges(create.ranges) catch
+                if (create.table.storage.engine == .object) {
+                    if (create.ranges.len != 0 or create.table.desired_replica_count != 0 or create.table.storage.dense_embeddings != .primary_lsm or create.table.storage_migration != null) return error.InvalidTableTopologyMutation;
+                } else metadata_table_manager.validateCompleteKeyspaceRanges(create.ranges) catch
                     return error.InvalidTableTopologyMutation;
                 for (create.ranges) |record| {
                     try group_ids.requireDataGroupId(record.group_id);
@@ -9903,6 +9914,99 @@ pub const RaftApplyStore = struct {
         return try decodeTableRecord(alloc, encoded);
     }
 
+    pub fn getLakeIndexLifecycle(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, table_id: u64) ![]u8 {
+        var buffer: [160]u8 = undefined;
+        return self.store.get(a, try lakeIndexLifecycleKeyForGroup(&buffer, group_id, table_id)) catch |err| switch (err) {
+            error.NotFound => blk: {
+                const table = (try self.getTable(a, group_id, table_id)) orelse return error.TableNotFound;
+                defer metadata_table_manager.freeTable(a, table);
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                var catalog_state = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(arena.allocator(), table.lake_index_catalog_json);
+                defer catalog_state.deinit();
+                const state = try (@import("../lake_index_lifecycle.zig").State{}).synchronize(arena.allocator(), catalog_state.value);
+                break :blk try @import("../lake_index_lifecycle.zig").encode(a, state);
+            },
+            else => return err,
+        };
+    }
+    /// Independent retained rows include DROP tombstones. A single bounded
+    /// point-sized page avoids cloning the visible table inventory or losing
+    /// collection obligations when their logical table has disappeared.
+    pub fn lakeIndexLifecycleWork(self: *RaftApplyStore, a: std.mem.Allocator, group_id: u64, after: ?u64) ![]u8 {
+        const lifecycle = @import("../lake_index_lifecycle.zig");
+        var prefix_buffer: [160]u8 = undefined;
+        const prefix = try lakeIndexLifecyclePrefixForGroup(&prefix_buffer, group_id);
+        var after_buffer: [160]u8 = undefined;
+        const rows = try self.store.scanPrefixPage(a, prefix, if (after) |id| try lakeIndexLifecycleKeyForGroup(&after_buffer, group_id, id) else null, 1);
+        defer docstore.DocStore.freeResults(a, rows);
+        if (rows.len == 0) return std.json.Stringify.valueAlloc(a, lifecycle.WorkPage{}, .{});
+        const id = std.fmt.parseInt(u64, rows[0].key[prefix.len..], 10) catch return error.InvalidLakeIndexLifecycle;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const state = try lifecycle.parse(arena.allocator(), rows[0].value);
+        return std.json.Stringify.valueAlloc(a, lifecycle.WorkPage{ .item = .{ .table_id = id, .state = state }, .after = id }, .{});
+    }
+    fn loadLakeIndexLifecycleTxn(_: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !@import("../lake_index_lifecycle.zig").State {
+        var buffer: [160]u8 = undefined;
+        const bytes = try stagingGet(txn, try lakeIndexLifecycleKeyForGroup(&buffer, group_id, table_id));
+        if (bytes) |encoded| return @import("../lake_index_lifecycle.zig").parse(a, encoded);
+        var table_buffer: [160]u8 = undefined;
+        const table_bytes = (try stagingGet(txn, try tableKeyForGroup(&table_buffer, group_id, table_id))) orelse return error.TableNotFound;
+        const table = try decodeTableRecord(a, table_bytes);
+        var catalog_state = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
+        defer catalog_state.deinit();
+        return (@import("../lake_index_lifecycle.zig").State{}).synchronize(a, catalog_state.value);
+    }
+    fn putLakeIndexLifecycleTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64, state: @import("../lake_index_lifecycle.zig").State) !void {
+        var buffer: [160]u8 = undefined;
+        const bytes = try @import("../lake_index_lifecycle.zig").encode(self.alloc, state);
+        defer self.alloc.free(bytes);
+        try txn.put(try lakeIndexLifecycleKeyForGroup(&buffer, group_id, table_id), bytes);
+    }
+    fn synchronizeLakeIndexLifecycleTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !void {
+        // Legacy/native tables without lake state don't create maintenance rows.
+        var buffer: [160]u8 = undefined;
+        const prior = try stagingGet(txn, try lakeIndexLifecycleKeyForGroup(&buffer, group_id, table.table_id));
+        if (prior == null and table.lake_index_catalog_json.len == 0) return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const state = if (prior) |bytes| try @import("../lake_index_lifecycle.zig").parse(a, bytes) else @import("../lake_index_lifecycle.zig").State{};
+        var catalog_state = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(a, table.lake_index_catalog_json);
+        defer catalog_state.deinit();
+        try self.putLakeIndexLifecycleTxn(txn, group_id, table.table_id, try state.synchronize(a, catalog_state.value));
+    }
+    fn dropLakeIndexLifecycleTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table: metadata.TableRecord) !void {
+        var buffer: [160]u8 = undefined;
+        const prior = try stagingGet(txn, try lakeIndexLifecycleKeyForGroup(&buffer, group_id, table.table_id));
+        if (prior == null and table.lake_index_catalog_json.len == 0) return;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const state = try self.loadLakeIndexLifecycleTxn(arena.allocator(), txn, group_id, table.table_id);
+        try self.putLakeIndexLifecycleTxn(txn, group_id, table.table_id, try state.drop());
+    }
+    fn applyLakeIndexLifecycleTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64, revision: u64, mutation: @import("../lake_index_lifecycle.zig").Mutation) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const state = self.loadLakeIndexLifecycleTxn(a, txn, group_id, table_id) catch |err| switch (err) {
+            error.TableNotFound => return,
+            else => return err,
+        };
+        if (state.revision != revision) return;
+        const next = mutation.apply(a, state) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        };
+        const bounded = @import("../lake_index_lifecycle.zig").encode(a, next) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        };
+        _ = bounded;
+        try self.putLakeIndexLifecycleTxn(txn, group_id, table_id, next);
+    }
+
     pub fn getRange(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,
@@ -12747,6 +12851,7 @@ pub const RaftApplyStore = struct {
         store_report_generation,
         table,
         table_transition_fence,
+        lake_index_lifecycle,
         schema_progress,
         restore_progress,
         replication_source_status,
@@ -12803,6 +12908,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .store_report_baseline, .key = .{ .prefix = baselinePrefixForGroup } },
         .{ .projection = .store_report_generation, .key = .{ .prefix = baselinePagesPrefixForGroup } },
         .{ .projection = .table, .key = .{ .prefix = tablePrefixForGroup } },
+        .{ .projection = .lake_index_lifecycle, .key = .{ .prefix = lakeIndexLifecyclePrefixForGroup } },
         .{ .projection = .table_transition_fence, .key = .{ .prefix = tableTransitionFencePrefixForGroup } },
         .{ .projection = .schema_progress, .key = .{ .prefix = schemaProgressPrefixForGroup } },
         .{ .projection = .restore_progress, .key = .{ .prefix = restoreProgressPrefixForGroup } },
@@ -12848,7 +12954,7 @@ pub const RaftApplyStore = struct {
     /// classes that must survive a metadata Raft snapshot. Adding a command
     /// without classifying its durable output is therefore a compile error.
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) MetadataSnapshotProjectionMask {
-        return switch (tag) {
+        const mask = switch (tag) {
             .apply_restore_staging => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.restore_staging) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.range) | metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
             .publish_secret_collection => metadataSnapshotProjectionBit(.secret_collection),
@@ -12874,9 +12980,10 @@ pub const RaftApplyStore = struct {
                 metadataSnapshotProjectionBit(.fk_initial_replica) | metadataSnapshotProjectionBit(.fk_initial_replica_live) | metadataSnapshotProjectionBit(.fk_initial_replica_live_count) | metadataSnapshotProjectionBit(.fk_initial_retire) | metadataSnapshotProjectionBit(.fk_initial_replica_count),
             .remove_replica_intent, .remove_fk_initial_replica_intent => metadataSnapshotProjectionBit(.placement) |
                 metadataSnapshotProjectionBit(.placement_version) | metadataSnapshotProjectionBit(.fk_initial_replica_live) | metadataSnapshotProjectionBit(.fk_initial_replica_live_count),
-            .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
+            .mutate_lake_index_lifecycle => metadataSnapshotProjectionBit(.lake_index_lifecycle),
+            .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.catalog_revision),
-            .apply_table_topology => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
+            .apply_table_topology => metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.range) |
                 metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_schema_progress_batch, .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
@@ -12908,13 +13015,15 @@ pub const RaftApplyStore = struct {
             .upsert_installed_extension, .remove_installed_extension => metadataSnapshotProjectionBit(.installed_extension),
             .upsert_extension_member, .remove_extension_member => metadataSnapshotProjectionBit(.extension_member) | metadataSnapshotProjectionBit(.catalog_revision),
             .upsert_extension_dependency, .remove_extension_dependency => metadataSnapshotProjectionBit(.extension_dependency),
-            .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => metadataSnapshotProjectionBit(.table) |
+            .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.table_transition_fence) |
                 metadataSnapshotProjectionBit(.installed_extension) |
                 metadataSnapshotProjectionBit(.extension_member) |
                 metadataSnapshotProjectionBit(.extension_dependency) |
                 metadataSnapshotProjectionBit(.catalog_revision),
         };
+        // Table publication and DROP update lifecycle roots in the same cut.
+        return if ((mask & metadataSnapshotProjectionBit(.table)) != 0) mask | metadataSnapshotProjectionBit(.lake_index_lifecycle) else mask;
     }
 
     const PreparedSnapshot = struct {
@@ -13588,6 +13697,9 @@ pub const RaftApplyStore = struct {
                     replacement.replacement,
                 );
             },
+            .mutate_lake_index_lifecycle => |mutation| {
+                try self.applyLakeIndexLifecycleTxn(txn, group_id, mutation.table_id, mutation.expected_revision, mutation.mutation);
+            },
             .remove_table => |record| {
                 // Replicated stale/rejected commands are deterministic no-ops;
                 // standalone callers use the same guard but retain its reason.
@@ -14176,6 +14288,7 @@ pub const RaftApplyStore = struct {
             const existing = try decodeTableRecord(self.alloc, encoded);
             defer metadata_table_manager.freeTable(self.alloc, existing);
             if (try self.relationalDropBlockedTxn(txn, group_id, existing)) return error.ConstraintRetirementRequired;
+            try self.dropLakeIndexLifecycleTxn(txn, group_id, existing);
         }
         const existing_table_name = try self.lookupTableNameTxn(txn, group_id, table_id);
         defer if (existing_table_name) |name| self.alloc.free(name);
@@ -14213,19 +14326,31 @@ pub const RaftApplyStore = struct {
             error.NotFound => null,
             else => return err,
         };
+        var retained: ?metadata.TableRecord = null;
+        defer if (retained) |existing| metadata_table_manager.freeTable(self.alloc, existing);
+        var admission = record;
         if (encoded_existing) |encoded| {
             const existing = try decodeTableRecord(self.alloc, encoded);
-            defer metadata_table_manager.freeTable(self.alloc, existing);
-            if (metadata_table_manager.tableDefinitionsEqual(existing, record)) return;
-            if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, existing, record)) return;
-            if ((existing.relational_retirement_json.len != 0 or record.relational_retirement_json.len != 0) and
-                !try @import("../relational_retirement.zig").permitsMigrationCleanup(self.alloc, existing, record)) return;
-            if (!std.mem.eql(u8, existing.name, record.name) and
+            retained = existing;
+            metadata_table_manager.validateObjectTableMutation(self.alloc, existing, record) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return,
+            };
+            // Reconciliation may retain a generation but never publish, clear,
+            // or steal one through an unconditional table upsert. Omission
+            // retains internal state so schema reconciliation can continue
+            // without taking ownership of the publication lifecycle.
+            if (record.lake_index_catalog_json.len == 0) admission.lake_index_catalog_json = existing.lake_index_catalog_json else if (!std.mem.eql(u8, existing.lake_index_catalog_json, record.lake_index_catalog_json)) return;
+            if (metadata_table_manager.tableDefinitionsEqual(existing, admission)) return;
+            if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, existing, admission)) return;
+            if ((existing.relational_retirement_json.len != 0 or admission.relational_retirement_json.len != 0) and
+                !try @import("../relational_retirement.zig").permitsMigrationCleanup(self.alloc, existing, admission)) return;
+            if (!std.mem.eql(u8, existing.name, admission.name) and
                 try self.relationalDropBlockedTxn(txn, group_id, existing)) return;
-            if (!try self.relationalDefinitionsRetainedForMutationTxn(txn, group_id, existing, record)) return;
-        } else if (record.relational_retirement_json.len != 0) return;
+            if (!try self.relationalDefinitionsRetainedForMutationTxn(txn, group_id, existing, admission)) return;
+        } else if (record.relational_retirement_json.len != 0 or record.lake_index_catalog_json.len != 0) return;
         if ((try self.loadTableTransitionFenceTxn(txn, group_id, record.table_id)).active()) return;
-        try self.putTableRecordTxn(txn, group_id, key, record);
+        try self.putTableRecordTxn(txn, group_id, key, admission);
     }
 
     fn indexedTableRangeIdsTxn(
@@ -15738,6 +15863,32 @@ pub const RaftApplyStore = struct {
         const current = try decodeTableRecord(self.alloc, encoded);
         defer metadata_table_manager.freeTable(self.alloc, current);
         if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return;
+        metadata_table_manager.validateObjectTableMutation(self.alloc, current, replacement) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return,
+        };
+        const lake_transition_allowed = @import("antfly_local_sources").metadata_lake_index_catalog.transitionAllowed(self.alloc, current, replacement) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => false,
+        };
+        if (!lake_transition_allowed) return;
+        if (replacement.lake_index_catalog_json.len != 0 or current.lake_index_catalog_json.len != 0) {
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const lifecycle = @import("../lake_index_lifecycle.zig");
+            const state = try self.loadLakeIndexLifecycleTxn(a, txn, group_id, current.table_id);
+            var catalog_state = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(a, replacement.lake_index_catalog_json);
+            defer catalog_state.deinit();
+            const next = state.synchronize(a, catalog_state.value) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return,
+            };
+            _ = lifecycle.encode(a, next) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return,
+            };
+        }
         if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, current, replacement)) return;
         var admission = replacement;
         // A completed subtract-only retirement changes active policy, not
@@ -16036,6 +16187,7 @@ pub const RaftApplyStore = struct {
                 return error.RowPolicyUnsupported;
             try self.deleteTableNameIndexTxn(txn, group_id, existing.name);
         } else if (!published_fk_generation and try self.fkGenerationTableLockedTxn(txn, group_id, record.table_id)) return;
+        try self.synchronizeLakeIndexLifecycleTxn(txn, group_id, record);
         const value = try encodeTableRecord(self.alloc, record);
         defer self.alloc.free(value);
         try txn.put(key, value);
@@ -18025,6 +18177,7 @@ fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
 }
 
 const TransitionTag = enum(u8) {
+    mutate_lake_index_lifecycle = 75,
     publish_secret_collection = 60,
     upsert_schema_progress_batch = 59,
     activate_topology_protocol = 57,
@@ -18275,6 +18428,12 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try out.append(alloc, @backingInt(TransitionTag.compare_and_replace_table));
             try appendFramedTableRecord(alloc, &out, replacement.expected);
             try appendFramedTableRecord(alloc, &out, replacement.replacement);
+        },
+        .mutate_lake_index_lifecycle => |mutation| {
+            try out.append(alloc, @backingInt(TransitionTag.mutate_lake_index_lifecycle));
+            try appendInt(alloc, &out, u64, mutation.table_id);
+            try appendInt(alloc, &out, u64, mutation.expected_revision);
+            try appendJsonRecord(alloc, &out, mutation.mutation);
         },
         .remove_table => |record| {
             try out.append(alloc, @backingInt(TransitionTag.remove_table));
@@ -18704,6 +18863,12 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 .replacement = replacement,
             } };
         },
+        .mutate_lake_index_lifecycle => blk: {
+            const table_id = try readInt(encoded, &pos, u64);
+            const expected_revision = try readInt(encoded, &pos, u64);
+            const mutation = try readJsonRecord(@import("../lake_index_lifecycle.zig").Mutation, alloc, encoded, &pos);
+            break :blk .{ .mutate_lake_index_lifecycle = .{ .table_id = table_id, .expected_revision = expected_revision, .mutation = mutation } };
+        },
         .remove_table => .{
             .remove_table = .{
                 .table_id = try readInt(encoded, &pos, u64),
@@ -18722,7 +18887,7 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 const table = try readFramedTableRecord(alloc, encoded, &pos);
                 errdefer metadata_table_manager.freeTable(alloc, table);
                 const range_count = try readInt(encoded, &pos, u32);
-                if (range_count == 0 or range_count > topology_protocol.max_initial_ranges)
+                if ((range_count == 0 and table.storage.engine != .object) or range_count > topology_protocol.max_initial_ranges)
                     return error.InvalidMetadataTransitionEncoding;
                 const ranges = try alloc.alloc(metadata.RangeRecord, range_count);
                 var decoded_count: usize = 0;
@@ -18749,7 +18914,7 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                 const table = try readFramedTableRecord(alloc, encoded, &pos);
                 errdefer metadata_table_manager.freeTable(alloc, table);
                 const range_count = try readInt(encoded, &pos, u32);
-                if (range_count == 0 or range_count > topology_protocol.max_initial_ranges)
+                if ((range_count == 0 and table.storage.engine != .object) or range_count > topology_protocol.max_initial_ranges)
                     return error.InvalidMetadataTransitionEncoding;
                 const ranges = try alloc.alloc(metadata.RangeRecord, range_count);
                 var decoded_count: usize = 0;
@@ -19320,6 +19485,8 @@ fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: en
     errdefer alloc.free(name);
     var fields: [8][]const u8 = undefined;
     var count: usize = 0;
+    var storage: @import("antfly_local_sources").common_table_storage.Settings = .{};
+    var lake_index_catalog_json: []const u8 = "";
     while (pos < encoded.len and count < fields.len) : (count += 1) {
         const length = try readInt(encoded, &pos, u32);
         if (length > encoded.len - pos) return error.InvalidMetadataTransitionEncoding;
@@ -19333,16 +19500,19 @@ fn decodeTableProjection(alloc: std.mem.Allocator, encoded: []const u8, mode: en
             if (length > encoded.len - pos) return error.InvalidMetadataTransitionEncoding;
             pos += length;
         }
-        _ = try readTableStorageExtension(encoded, &pos);
+        lake_index_catalog_json = try readLakeIndexCatalogExtension(encoded, &pos);
+        storage = (try readTableStorageExtension(encoded, &pos)).storage;
     }
     // Legacy, read-schema, and restore-intent records respectively. Borrow all
     // framed fields to validate the encoding, but copy only query-owned data.
     if (count != 5 and count != 6 and count != 8) return error.InvalidMetadataTransitionEncoding;
     return .{ .table_id = table_id, .name = name, .query_definition = if (mode != .identity) try (system_catalog.QueryDefinition{
         .table_id = table_id,
+        .storage_engine = storage.engine,
         .schema_json = fields[1],
         .read_schema_json = if (mode == .schema or count == 5) "" else fields[2],
         .indexes_json = if (mode == .schema) "" else fields[if (count == 5) 2 else 3],
+        .lake_index_catalog_json = if (mode == .query) lake_index_catalog_json else "",
     }).clone(alloc) else null };
 }
 
@@ -20888,6 +21058,8 @@ fn appendPlacementIntent(
 
 const table_storage_metadata_magic: u32 = 0x31535441; // ATS1
 const table_storage_metadata_version: u16 = 1;
+const lake_index_catalog_magic: u32 = 0x31434c41; // ALC1
+const max_lake_index_catalog_bytes: usize = 256 * 1024;
 
 fn appendTableRecord(
     alloc: std.mem.Allocator,
@@ -20919,9 +21091,21 @@ fn appendTableRecord(
         try appendInt(alloc, out, u32, 0x31524941);
         try appendRequiredString(alloc, out, record.relational_retirement_json);
     }
+    if (record.lake_index_catalog_json.len != 0) {
+        if (record.lake_index_catalog_json.len > max_lake_index_catalog_bytes) return error.InvalidMetadataTransitionEncoding;
+        var validated = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(alloc, record.lake_index_catalog_json);
+        defer validated.deinit();
+        try appendInt(alloc, out, u32, lake_index_catalog_magic);
+        try appendRequiredString(alloc, out, record.lake_index_catalog_json);
+    }
     if (record.requiresStorageMetadataExtension()) {
         try appendInt(alloc, out, u32, table_storage_metadata_magic);
-        try appendInt(alloc, out, u16, table_storage_metadata_version);
+        try appendInt(alloc, out, u16, if (record.storage.engine == .object) 2 else table_storage_metadata_version);
+        if (record.storage.engine == .object) {
+            try out.append(alloc, 1);
+            try appendInt(alloc, out, u64, record.object_storage_generation);
+            try out.appendSlice(alloc, &record.object_storage_identity);
+        }
         try out.append(alloc, switch (record.storage.dense_embeddings) {
             .primary_lsm => 0,
             .vector_store => 1,
@@ -21346,17 +21530,36 @@ fn readTableRecordWithReadSchema(
 }
 
 const BorrowedTableStorage = struct {
+    object_storage_generation: u64 = 0,
+    object_storage_identity: [32]u8 = @splat(0),
     storage: @import("antfly_local_sources").common_table_storage.Settings = .{},
     migration: ?@import("antfly_local_sources").common_vector_migration.Admission = null,
 };
 
 /// Shared strict extension decoder. Point projections validate the entire
 /// framing without allocating unrelated schemas, retirement jobs or indexes.
+fn readLakeIndexCatalogExtension(encoded: []const u8, pos: *usize) ![]const u8 {
+    if (encoded.len - pos.* < 4 or std.mem.readInt(u32, encoded[pos.*..][0..4], .little) != lake_index_catalog_magic) return "";
+    pos.* += 4;
+    const length = try readInt(encoded, pos, u32);
+    if (length == 0 or length > max_lake_index_catalog_bytes or length > encoded.len - pos.*) return error.InvalidMetadataTransitionEncoding;
+    const result = encoded[pos.*..][0..length];
+    pos.* += length;
+    return result;
+}
+
 fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableStorage {
     var result: BorrowedTableStorage = .{};
     if (pos.* == encoded.len) return result;
-    if (try readInt(encoded, pos, u32) != table_storage_metadata_magic or
-        try readInt(encoded, pos, u16) != table_storage_metadata_version) return error.InvalidMetadataTransitionEncoding;
+    if (try readInt(encoded, pos, u32) != table_storage_metadata_magic) return error.InvalidMetadataTransitionEncoding;
+    const version = try readInt(encoded, pos, u16);
+    if (version != table_storage_metadata_version and version != 2) return error.InvalidMetadataTransitionEncoding;
+    if (version == 2) {
+        if (try readInt(encoded, pos, u8) != 1) return error.InvalidMetadataTransitionEncoding;
+        result.storage.engine = .object;
+        result.object_storage_generation = try readInt(encoded, pos, u64);
+        for (&result.object_storage_identity) |*byte| byte.* = try readInt(encoded, pos, u8);
+    }
     result.storage.dense_embeddings = switch (try readInt(encoded, pos, u8)) {
         0 => .primary_lsm,
         1 => .vector_store,
@@ -21384,7 +21587,8 @@ fn readTableStorageExtension(encoded: []const u8, pos: *usize) !BorrowedTableSto
         },
         else => return error.InvalidMetadataTransitionEncoding,
     }
-    if (pos.* != encoded.len or (result.storage.dense_embeddings == .primary_lsm and result.migration == null)) return error.InvalidMetadataTransitionEncoding;
+    if (pos.* != encoded.len or (result.storage.engine == .local and result.storage.dense_embeddings == .primary_lsm and result.migration == null)) return error.InvalidMetadataTransitionEncoding;
+    if (result.storage.engine == .object and (result.storage.dense_embeddings != .primary_lsm or result.migration != null)) return error.InvalidMetadataTransitionEncoding;
     return result;
 }
 
@@ -21419,12 +21623,17 @@ fn readTableRecordWithRestoreIntent(
         break :blk try readRequiredString(alloc, encoded, pos);
     } else try alloc.dupe(u8, "");
     errdefer alloc.free(relational_retirement_json);
+    const lake_index_catalog_json = try alloc.dupe(u8, try readLakeIndexCatalogExtension(encoded, pos));
+    errdefer alloc.free(lake_index_catalog_json);
     var extension = try readTableStorageExtension(encoded, pos);
     if (extension.migration) |*migration| migration.request.job_id = try alloc.dupe(u8, migration.request.job_id);
     return .{
         .storage = extension.storage,
+        .object_storage_generation = extension.object_storage_generation,
+        .object_storage_identity = extension.object_storage_identity,
         .storage_migration = extension.migration,
         .relational_retirement_json = relational_retirement_json,
+        .lake_index_catalog_json = lake_index_catalog_json,
         .table_id = table_id,
         .name = name,
         .description = description,
@@ -22729,6 +22938,12 @@ fn mergeTransitionKeyForGroup(buf: []u8, group_id: u64, transition_id: u64) ![]c
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_transition:merge:{d}:{d}", .{ group_id, transition_id });
 }
 
+fn lakeIndexLifecyclePrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:lake_index_lifecycle:{d}:", .{group_id});
+}
+fn lakeIndexLifecycleKeyForGroup(buf: []u8, group_id: u64, table_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:lake_index_lifecycle:{d}:{d}", .{ group_id, table_id });
+}
 fn tableKeyForGroup(buf: []u8, group_id: u64, table_id: u64) ![]const u8 {
     return try std.fmt.bufPrint(buf, "\x00\x00__metadata__:metadata_table:{d}:{d}", .{ group_id, table_id });
 }
@@ -30871,6 +31086,178 @@ test "system catalog borrowed authority retains ownership and recovers a failed 
     try std.testing.expectEqualStrings("{\"recovered\":true}", recovered);
 }
 
+test "metadata.lake index catalog extension pins generations and preserves legacy records" {
+    const a = std.testing.allocator;
+    const base: metadata.TableRecord = .{ .table_id = 9, .name = "lake", .schema_json = "{}", .indexes_json = "{}" };
+    const old_bytes = try encodeTableRecord(a, base);
+    defer a.free(old_bytes);
+    inline for (.{ false, true }) |storage_extension| inline for (.{ false, true }) |retirement| {
+        var table = base;
+        table.lake_index_catalog_json = "{\"version\":1,\"generation\":7}";
+        if (storage_extension) table.storage.dense_embeddings = .vector_store;
+        if (retirement) table.relational_retirement_json = "retiring";
+        const encoded = try encodeTableRecord(a, table);
+        defer a.free(encoded);
+        const decoded = try decodeTableRecord(a, encoded);
+        defer metadata_table_manager.freeTable(a, decoded);
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, decoded));
+        const query = try decodeTableQueryProjection(a, encoded, true);
+        defer query.deinit(a);
+        try std.testing.expectEqualStrings(table.lake_index_catalog_json, query.query_definition.?.lake_index_catalog_json);
+        const identity = try decodeTableIdentity(a, encoded);
+        defer identity.deinit(a);
+        try std.testing.expect(identity.query_definition == null);
+        try std.testing.expect(!std.mem.eql(u8, &metadata_table_manager.tableDefinitionFingerprint(base), &metadata_table_manager.tableDefinitionFingerprint(table)));
+        try std.testing.expectError(error.InvalidMetadataTransitionEncoding, decodeTableRecord(a, encoded[0 .. encoded.len - 1]));
+    };
+    const round_trip = try decodeTableRecord(a, old_bytes);
+    defer metadata_table_manager.freeTable(a, round_trip);
+    try std.testing.expectEqualStrings("", round_trip.lake_index_catalog_json);
+    const reencoded = try encodeTableRecord(a, round_trip);
+    defer a.free(reencoded);
+    try std.testing.expectEqualSlices(u8, old_bytes, reencoded);
+}
+
+test "metadata.lake index Raft CAS rejects stale builders and unconditional catalog writes" {
+    const a = std.testing.allocator;
+    const lake = @import("antfly_local_sources").metadata_lake_index_catalog;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/lake-catalog", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group_id = 22;
+    const table: metadata.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = "{}" };
+    const signature: lake.Signature = .{ .desired = lake.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
+    const first = try (lake.State{}).begin(signature, @splat(5), 100, 20);
+    const first_bytes = try lake.encode(a, first);
+    defer a.free(first_bytes);
+    var building = table;
+    building.lake_index_catalog_json = first_bytes;
+    var txn = try store.store.beginWriteTxn();
+    defer txn.abort();
+    try store.applyTableUpsertTxn(&txn, group_id, table);
+    var key_buf: [160]u8 = undefined;
+    const key = try tableKeyForGroup(&key_buf, group_id, table.table_id);
+    try store.applyTableUpsertTxn(&txn, group_id, building);
+    {
+        const current = try decodeTableRecord(a, try txn.get(key));
+        defer metadata_table_manager.freeTable(a, current);
+        try std.testing.expectEqualStrings("", current.lake_index_catalog_json);
+    }
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, table, building);
+    {
+        const current = try decodeTableRecord(a, try txn.get(key));
+        defer metadata_table_manager.freeTable(a, current);
+        try std.testing.expectEqualStrings(first_bytes, current.lake_index_catalog_json);
+    }
+    const retry = try first.begin(signature, @splat(6), 120, 20);
+    const retry_bytes = try lake.encode(a, retry);
+    defer a.free(retry_bytes);
+    var retrying = building;
+    retrying.lake_index_catalog_json = retry_bytes;
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, building, retrying);
+    const stale_failure = try first.fail(@splat(5), "late worker", 200);
+    const stale_bytes = try lake.encode(a, stale_failure);
+    defer a.free(stale_bytes);
+    var failed = building;
+    failed.lake_index_catalog_json = stale_bytes;
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, building, failed);
+    // Even with a fresh expected record, the old generation cannot publish.
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, retrying, failed);
+    try store.applyTableUpsertTxn(&txn, group_id, table);
+    {
+        const current = try decodeTableRecord(a, try txn.get(key));
+        defer metadata_table_manager.freeTable(a, current);
+        try std.testing.expectEqualStrings(retry_bytes, current.lake_index_catalog_json);
+    }
+    const valid_failure = try retry.fail(@splat(6), "source changed", 300);
+    const valid_bytes = try lake.encode(a, valid_failure);
+    defer a.free(valid_bytes);
+    failed.lake_index_catalog_json = valid_bytes;
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, retrying, failed);
+    {
+        const current = try decodeTableRecord(a, try txn.get(key));
+        defer metadata_table_manager.freeTable(a, current);
+        try std.testing.expectEqualStrings(valid_bytes, current.lake_index_catalog_json);
+    }
+    var malformed = failed;
+    malformed.lake_index_catalog_json = "{invalid";
+    try store.applyTableCompareAndReplaceTxn(&txn, group_id, failed, malformed);
+    const current = try decodeTableRecord(a, try txn.get(key));
+    defer metadata_table_manager.freeTable(a, current);
+    try std.testing.expectEqualStrings(valid_bytes, current.lake_index_catalog_json);
+    var reconciled = table;
+    reconciled.description = "updated by reconciliation";
+    try store.applyTableUpsertTxn(&txn, group_id, reconciled);
+    const updated = try decodeTableRecord(a, try txn.get(key));
+    defer metadata_table_manager.freeTable(a, updated);
+    try std.testing.expectEqualStrings(reconciled.description, updated.description);
+    try std.testing.expectEqualStrings(valid_bytes, updated.lake_index_catalog_json);
+}
+
+test "metadata.lake reader authority survives DROP and snapshots without changing definition fences" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const lake = @import("antfly_local_sources").metadata_lake_index_catalog;
+    const lifecycle = @import("../lake_index_lifecycle.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/lake-reader-authority", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group_id = 22;
+    const table: metadata.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = "{}" };
+    try store.applyStandaloneCommand(group_id, .{ .upsert_table = table });
+    const signature: lake.Signature = .{ .desired = lake.desiredFingerprint(table), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
+    const pending = try (lake.State{}).begin(signature, @splat(5), 100, 20);
+    var building = table;
+    building.lake_index_catalog_json = try lake.encode(ca, pending);
+    try store.applyStandaloneCommand(group_id, .{ .compare_and_replace_table = .{ .expected = table, .replacement = building } });
+    const publication: lake.Publication = .{ .reader_protocol = pending.pending.?.reader_protocol, .generation = 1, .token = @splat(5), .signature = signature, .published_at_ms = 101, .base_source = .{ .external_parquet = .{ .format = .parquet_prefix, .source_uri = "s3://bucket/lake", .snapshot_id = "snapshot", .schema_fingerprint = "schema", .file_inventory_artifact = "inventory" } }, .inventory = .{ .kind = .external_base_source, .artifact_id = "inventory", .byte_len = 42, .checksum = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } };
+    var published = building;
+    const ready = try pending.publish(publication, 101);
+    published.lake_index_catalog_json = try lake.encode(ca, ready);
+    try store.applyStandaloneCommand(group_id, .{ .compare_and_replace_table = .{ .expected = building, .replacement = published } });
+    var control = try lifecycle.parse(ca, try store.getLakeIndexLifecycle(ca, group_id, 4));
+    const command: TransitionCommand = .{ .mutate_lake_index_lifecycle = .{ .table_id = 4, .expected_revision = control.revision, .mutation = .{ .acquire = .{ .token = @splat(9), .generation = 1, .now_ms = 102 } } } };
+    const encoded = try encodeTransitionCommand(ca, command);
+    var decoded = (try decodeTransitionCommand(a, encoded)).?;
+    defer decoded.deinit(a);
+    try store.applyStandaloneCommand(group_id, decoded);
+    control = try lifecycle.parse(ca, try store.getLakeIndexLifecycle(ca, group_id, 4));
+    try std.testing.expectEqual(@as(usize, 1), control.readers.len);
+    const definition = (try store.getTable(a, group_id, 4)).?;
+    defer metadata_table_manager.freeTable(a, definition);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(published, definition));
+    var rebuilding = published;
+    rebuilding.lake_index_catalog_json = try lake.encode(ca, try ready.begin(signature, @splat(6), 103, 20));
+    try store.applyStandaloneCommand(group_id, .{ .compare_and_replace_table = .{ .expected = published, .replacement = rebuilding } });
+    control = try lifecycle.parse(ca, try store.getLakeIndexLifecycle(ca, group_id, 4));
+    try std.testing.expectEqual(@as(u64, 2), control.pending.?.generation);
+    try std.testing.expectEqual(@as(usize, 1), control.readers.len);
+    try store.applyStandaloneCommand(group_id, .{ .remove_table = .{ .table_id = 4, .expected_transition_generation = 0 } });
+    control = try lifecycle.parse(ca, try store.getLakeIndexLifecycle(ca, group_id, 4));
+    try std.testing.expect(control.dropped);
+    try std.testing.expectEqual(@as(usize, 1), control.publications.len);
+    const work = try std.json.parseFromSliceLeaky(lifecycle.WorkPage, ca, try store.lakeIndexLifecycleWork(ca, group_id, null), .{ .allocate = .alloc_always });
+    try std.testing.expectEqual(@as(u64, 4), work.item.?.table_id);
+    try std.testing.expect(work.item.?.state.dropped);
+    const exhausted = try std.json.parseFromSliceLeaky(lifecycle.WorkPage, ca, try store.lakeIndexLifecycleWork(ca, group_id, work.after), .{});
+    try std.testing.expect(exhausted.item == null);
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group_id);
+    defer a.free(snapshot);
+    try RaftApplyStore.installSnapshotFromRaft(&store, a, group_id, 10, snapshot);
+    control = try lifecycle.parse(ca, try store.getLakeIndexLifecycle(ca, group_id, 4));
+    try std.testing.expect(control.dropped);
+    try std.testing.expectEqual(@as(usize, 1), control.readers.len);
+    try std.testing.expectEqual(@as(usize, 1), control.publications.len);
+}
+
 test "metadata runtime index source producer completion uses framed extension and missing proof stays pending" {
     const alloc = std.testing.allocator;
     const sources = [_]metadata.RuntimeIndexSourceReplayStatusReport{
@@ -30888,4 +31275,74 @@ test "metadata runtime index source producer completion uses framed extension an
         try std.testing.expectEqual(version == runtime_status_protocol.framed_index_record_version, decoded.source_replay[0].producer_complete);
         try std.testing.expect(!decoded.source_replay[1].producer_complete);
     }
+}
+
+test "metadata.lake index object table engine framing preserves empty topology and incarnation" {
+    const a = std.testing.allocator;
+    const table: metadata.TableRecord = .{
+        .table_id = 19,
+        .name = "object_docs",
+        .storage = .{ .engine = .object },
+        .schema_json = @import("../../api/tables.zig").default_schema_json,
+        .min_ranges = 0,
+        .desired_replica_count = 0,
+        .object_storage_generation = 37,
+        .object_storage_identity = @splat(9),
+    };
+    const bytes = try encodeTableRecord(a, table);
+    defer a.free(bytes);
+    const decoded = try decodeTableRecord(a, bytes);
+    defer metadata_table_manager.freeTable(a, decoded);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, decoded));
+    const cloned = try metadata_table_manager.cloneTable(a, decoded);
+    defer metadata_table_manager.freeTable(a, cloned);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, cloned));
+    const command: TransitionCommand = .{ .apply_table_topology = .{ .create = .{ .expected_transition_generation = 37, .table = table, .ranges = &.{} } } };
+    try validateTransitionCommandDataGroupIds(command);
+    const wire = try encodeTransitionCommand(a, command);
+    defer a.free(wire);
+    const table_bytes = try encodeTableRecord(a, table);
+    defer a.free(table_bytes);
+    const projection = try decodeTableQueryProjection(a, table_bytes, true);
+    defer projection.deinit(a);
+    try std.testing.expectEqual(.object, projection.query_definition.?.storage_engine);
+    var roundtrip = (try decodeTransitionCommand(a, wire)).?;
+    defer roundtrip.deinit(a);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, roundtrip.apply_table_topology.create.table));
+    try std.testing.expectEqual(@as(usize, 0), roundtrip.apply_table_topology.create.ranges.len);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/object-topology", .{tmp.sub_path});
+    defer a.free(root);
+    var applied = table;
+    applied.object_storage_generation = 0;
+    const create = try encodeTransitionCommand(a, .{ .apply_table_topology = .{ .create = .{ .expected_transition_generation = 0, .table = applied, .ranges = &.{} } } });
+    defer a.free(create);
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        const entries = try raft_state_machine.encodeCommittedEntries(a, &.{.{ .term = 1, .index = 1, .entry_type = .normal, .data = create }});
+        defer a.free(entries);
+        try store.snapshotBuilder().applyBatch(.{ .group_id = 21, .commit_index = 1, .entries_bytes = entries });
+    }
+    {
+        var reopened = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer reopened.deinit();
+        const tables = try reopened.listTables(a, 21);
+        defer reopened.freeTables(a, tables);
+        const ranges = try reopened.listRanges(a, 21);
+        defer reopened.freeRanges(a, ranges);
+        try std.testing.expectEqual(@as(usize, 1), tables.len);
+        try std.testing.expectEqual(@as(usize, 0), ranges.len);
+        try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(applied, tables[0]));
+    }
+    var invalid = table;
+    invalid.storage.engine = .local;
+    try std.testing.expectError(error.InvalidTableTopologyMutation, validateTransitionCommandDataGroupIds(.{ .apply_table_topology = .{ .create = .{ .table = invalid, .ranges = &.{}, .expected_transition_generation = 37 } } }));
+    invalid = table;
+    invalid.object_storage_identity = @splat(8);
+    try std.testing.expectError(error.ImmutableTableStorageSettings, metadata_table_manager.validateObjectTableMutation(a, table, invalid));
+    invalid = table;
+    invalid.indexes_json = "{\"new\":{\"type\":\"full_text\"}}";
+    try std.testing.expectError(error.ObjectTableDefinitionConflict, metadata_table_manager.validateObjectTableMutation(a, table, invalid));
 }

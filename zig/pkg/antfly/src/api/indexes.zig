@@ -705,6 +705,104 @@ pub fn encodeIndexList(
     return try out.toOwnedSlice(alloc);
 }
 
+/// Remote readiness is catalog owned. Empty native shard indexes cannot prove
+/// external coverage. Queryability is supplied only by a serving proof.
+pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, index_name: []const u8, config: std.json.Value, queryable: bool) ![]u8 {
+    const lake = @import("antfly_local_sources").metadata_lake_index_catalog;
+    var state = try lake.parse(alloc, table.lake_index_catalog_json);
+    defer state.deinit();
+    const desired = lake.desiredFingerprint(table);
+    const failure = if (state.value.failure) |value| if (std.mem.eql(u8, &value.desired, &desired)) value else null else null;
+    const published: ?u64 = if (state.value.published) |value| published: {
+        if (!std.mem.eql(u8, &value.signature.desired, &desired)) break :published null;
+        if (value.directory != null) break :published value.generation;
+        const algebraic = if (config == .object) if (config.object.get("type")) |kind| kind == .string and std.mem.eql(u8, kind.string, "algebraic") else false else false;
+        if (!algebraic) for (value.declarations) |declaration| {
+            if (std.mem.eql(u8, declaration.name, index_name)) break :published value.generation;
+        };
+        if (config == .object) if (config.object.get("materializations")) |mats| {
+            if (mats == .array and mats.array.items.len != 0) {
+                for (mats.array.items) |mat| {
+                    if (mat != .object) break :published null;
+                    const name = mat.object.get("name") orelse break :published null;
+                    if (name != .string) break :published null;
+                    const found = for (value.declarations) |declaration| {
+                        if (declaration.artifact.kind == .algebraic_segment and try @import("lake_index_names.zig").matches(alloc, declaration.name, index_name, name.string, declaration.artifact.metadata_version)) break true;
+                    } else false;
+                    if (!found) break :published null;
+                }
+                break :published value.generation;
+            }
+        };
+        break :published null;
+    } else null;
+    const serving_ready = queryable and published != null;
+    const readiness: indexes_openapi.IndexReadinessStatus = .{
+        .state = if (serving_ready) .ready else if (failure != null) .failed else .pending,
+        .queryable = serving_ready,
+        .complete = serving_ready,
+        .target_revision = if (state.value.generation > 0) state.value.generation else null,
+        .published_revision = published,
+        .pending_reasons = if (serving_ready) &.{} else if (failure != null) &.{.load_failure} else &.{.publication},
+    };
+    const status = try std.json.Stringify.valueAlloc(alloc, .{
+        .index_type = indexTypeName(inferIndexType(index_name, config) orelse return error.InvalidTableIndexMetadata),
+        .readiness = readiness,
+        .target_revision = readiness.target_revision,
+        .published_revision = published,
+        .@"error" = if (failure) |value| @as(?[]const u8, value.reason) else null,
+    }, .{ .emit_null_optional_fields = false });
+    defer alloc.free(status);
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"config\":");
+    try appendIndexConfig(alloc, &out, index_name, config);
+    try out.appendSlice(alloc, ",\"status\":");
+    try out.appendSlice(alloc, status);
+    try out.appendSlice(alloc, ",\"shard_status\":[]}");
+    return out.toOwnedSlice(alloc);
+}
+
+pub fn encodeLakeIndexList(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord) ![]u8 {
+    return encodeLakeIndexListWithProof(alloc, table, &.{});
+}
+pub fn encodeLakeIndexListWithProof(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, queryable_names: []const []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configs = try std.json.parseFromSliceLeaky(std.json.Value, a, indexesJsonSource(table.indexes_json), .{});
+    if (configs != .object) return error.InvalidTableIndexMetadata;
+    if (table.schema_json.len != 0) {
+        var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, table.schema_json);
+        defer schema.deinit(a);
+        var columns: @import("relational_expression_contract.zig").ColumnTypes = .{ .alloc = a, .source = .{ .parsed = &schema } };
+        defer columns.deinit();
+        if (schema.relational_indexes) |definitions| for (definitions.value) |definition| {
+            if (configs.object.contains(definition.name)) return error.InvalidTableIndexMetadata;
+            const json = try @import("relational_index_mutation.zig").configForDefinition(a, definition, &columns);
+            try configs.object.put(a, definition.name, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{}));
+        };
+    }
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    try out.append(alloc, '[');
+    var it = configs.object.iterator();
+    var first = true;
+    while (it.next()) |entry| {
+        if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;
+        const queryable = for (queryable_names) |name| {
+            if (std.mem.eql(u8, name, entry.key_ptr.*)) break true;
+        } else false;
+        const resource = try encodeLakeIndexResource(alloc, table, entry.key_ptr.*, entry.value_ptr.*, queryable);
+        defer alloc.free(resource);
+        if (!first) try out.append(alloc, ',');
+        first = false;
+        try out.appendSlice(alloc, resource);
+    }
+    try out.append(alloc, ']');
+    return out.toOwnedSlice(alloc);
+}
+
 pub fn encodeSingleIndex(
     alloc: std.mem.Allocator,
     snapshot: *const metadata_api.AdminSnapshot,
@@ -3164,13 +3262,13 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
     if (if (observation_current) enrichment else null) |stats| {
         const index_applied_sequence = view.replay_applied_sequence;
         const index_target_sequence = view.replay_target_sequence;
-        view.replay_target_sequence = @max(index_target_sequence, stats.target_sequence);
-        view.replay_applied_sequence = if (index_target_sequence == 0)
-            stats.applied_sequence
-        else if (stats.target_sequence == 0)
-            index_applied_sequence
-        else
-            @min(index_applied_sequence, stats.applied_sequence);
+        // Artifact commits advance the index ledger independently from the
+        // source producer ledger. Compare each owner with its own target;
+        // combining their watermarks invents debt after both have settled.
+        if (index_target_sequence == 0 and index_applied_sequence == 0) {
+            view.replay_target_sequence = stats.target_sequence;
+            view.replay_applied_sequence = stats.applied_sequence;
+        }
         if (view.replay_applied_sequence < view.replay_target_sequence) {
             view.replay_catch_up_required = true;
             view.backfill_active = true;
@@ -3179,6 +3277,10 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
                 @as(f64, @floatFromInt(view.replay_applied_sequence)) /
                     @as(f64, @floatFromInt(view.replay_target_sequence)),
             );
+        } else if (stats.applied_sequence < stats.target_sequence) {
+            view.backfill_active = true;
+            view.backfill_progress = @min(1.0, @as(f64, @floatFromInt(stats.applied_sequence)) /
+                @as(f64, @floatFromInt(stats.target_sequence)));
         } else if (stats.retrying) {
             view.backfill_active = true;
             if (view.backfill_progress >= 1.0) view.backfill_progress = 0.999;
@@ -5199,6 +5301,22 @@ fn consumerTests() type {
             }, true);
             try std.testing.expect(!view.backfill_active);
             try std.testing.expectEqual(@as(f64, 1.0), view.backfill_progress);
+            // Both owners are settled, but generated artifact commits have
+            // advanced the index beyond the source-only producer watermark.
+            const separate_ledgers = embeddingsRuntimeView(item, 3, .strict, false, 42, 99, .{
+                .enabled = true,
+                .applied_sequence = 1,
+                .target_sequence = 1,
+            }, true);
+            try std.testing.expect(!separate_ledgers.backfill_active);
+            try std.testing.expectEqual(@as(u64, 5), separate_ledgers.replay_applied_sequence);
+            try std.testing.expectEqual(@as(u64, 5), separate_ledgers.replay_target_sequence);
+            const pending_producer = embeddingsRuntimeView(item, 3, .strict, false, 42, 99, .{
+                .enabled = true,
+                .applied_sequence = 1,
+                .target_sequence = 2,
+            }, true);
+            try std.testing.expect(pending_producer.backfill_active);
         }
 
         test "derived coverage source totals ignore derived index fan out" {

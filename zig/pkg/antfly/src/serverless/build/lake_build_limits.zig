@@ -107,6 +107,7 @@ pub const WorkingSetAllocator = struct {
 
 pub const Budget = struct {
     limits: Limits,
+    mutex: std.atomic.Mutex = .unlocked,
     batches: usize = 0,
     rows: u64 = 0,
     input_bytes: usize = 0,
@@ -117,6 +118,10 @@ pub const Budget = struct {
     }
 
     pub fn admitBatch(self: *Budget, batch: rowsource.ColumnBatch) !void {
+        // Parallel file reducers share total-work admission, independently
+        // of each worker's private spill and allocator lifetime.
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
         self.batches = std.math.add(usize, self.batches, 1) catch return error.LakeSidecarBuildBudgetExceeded;
         if (self.batches > self.limits.max_batches) return error.LakeSidecarBuildBudgetExceeded;
         self.rows = std.math.add(u64, self.rows, batch.rowCount()) catch return error.LakeSidecarBuildBudgetExceeded;
@@ -152,6 +157,7 @@ pub fn estimateBatchBytes(batch: rowsource.ColumnBatch) usize {
     for (batch.columns) |column| {
         total = addOrMax(total, addOrMax(column.name.len, column.nulls.bytes.len));
         const value_bytes = switch (column.values) {
+            inline .dictionary_i64, .dictionary_f64 => |values| addOrMax(std.math.mul(usize, values.indices.len, @sizeOf(u32)) catch std.math.maxInt(usize), std.math.mul(usize, values.values.len, 8) catch std.math.maxInt(usize)),
             .dictionary_bytes => |values| blk: {
                 var bytes = std.math.mul(usize, values.indices.len, @sizeOf(u32)) catch break :blk std.math.maxInt(usize);
                 bytes = addOrMax(bytes, std.math.mul(usize, values.values.len, @sizeOf([]const u8)) catch break :blk std.math.maxInt(usize));

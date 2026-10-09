@@ -46,6 +46,7 @@ describe("InferenceClient", () => {
     expect(typeof client.chunk).toBe("function");
     expect(typeof client.rerank).toBe("function");
     expect(typeof client.extract).toBe("function");
+    expect(typeof client.decide).toBe("function");
     expect(typeof client.extractRaw).toBe("function");
     expect(typeof client.classify).toBe("function");
     expect(typeof client.extractEntities).toBe("function");
@@ -90,6 +91,55 @@ describe("InferenceClient", () => {
 
 describe("InferenceClient with mock fetch", () => {
   const originalFetch = global.fetch;
+
+  it("decide sends named questions and preserves complete answers", async () => {
+    const request = {
+      model: "decision-model",
+      state: "Refund the charge.",
+      questions: {
+        route: {
+          type: "choice" as const,
+          instructions: "Which team?",
+          criteria: { billing: "Charges", support: "Product" },
+        },
+        urgency: {
+          type: "score" as const,
+          instructions: "How urgent?",
+          criteria: ["Routine", "Soon"],
+        },
+        refund: { type: "noul" as const, instructions: "Refund requested?" },
+      },
+    };
+    const response = {
+      model: "decision-model",
+      answers: {
+        route: { type: "choice", choice: "billing", probabilities: { billing: 0.9, support: 0.1 } },
+        urgency: {
+          type: "score",
+          score: 0.7,
+          probabilities: { "0": 0.3, "1": 0.7 },
+          legend: { "0": "Routine", "1": "Soon" },
+        },
+        refund: { type: "noul", noul: 0.95 },
+      },
+      usage: { input_tokens: 20, output_tokens: 0 },
+    };
+    vi.mocked(global.fetch).mockImplementation(async (input) => {
+      const sent = input as Request;
+      expect(sent.url).toBe("http://localhost:8080/ai/v1/decide");
+      expect(sent.method).toBe("POST");
+      expect(sent.headers.get("Authorization")).toBe("Bearer secret");
+      expect(await sent.json()).toEqual(request);
+      return new Response(JSON.stringify(response), {
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    const client = new InferenceClient({
+      baseUrl: "http://localhost:8080",
+      headers: { Authorization: "Bearer secret" },
+    });
+    expect(await client.decide(request)).toEqual(response);
+  });
 
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn());

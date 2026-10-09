@@ -485,6 +485,19 @@ fn replaceTableDefinitionStampedWithReceipt(
         !std.mem.eql(u8, replacement.name, expected.name))
         return error.InvalidTableDefinitionReplacement;
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+        if (replacement.lake_index_catalog_json.len != 0 or expected.lake_index_catalog_json.len != 0) {
+            try service.ensureLinearizableRead();
+            var arena = std.heap.ArenaAllocator.init(service.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const lifecycle = @import("lake_index_lifecycle.zig");
+            const prior = try lifecycle.parse(a, try store.getLakeIndexLifecycle(a, service.metadata_group_id, expected.table_id));
+            var catalog = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(a, replacement.lake_index_catalog_json);
+            defer catalog.deinit();
+            _ = try lifecycle.encode(a, try prior.synchronize(a, catalog.value));
+        }
+    }
     if (!std.mem.eql(u8, expected.schema_json, replacement.schema_json) or
         !std.mem.eql(u8, expected.read_schema_json, replacement.read_schema_json) or
         !std.mem.eql(u8, expected.indexes_json, replacement.indexes_json))
@@ -3236,6 +3249,39 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const object_engine = switch (command) {
+        .upsert_table => |table| table.storage.engine == .object,
+        .compare_and_replace_table => |cas| cas.expected.storage.engine == .object or cas.replacement.storage.engine == .object,
+        .apply_table_topology => |mutation| switch (mutation) {
+            .create => |create| create.table.storage.engine == .object,
+            .drop => false,
+        },
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| blk: {
+            for (delta.upsert_tables) |table| if (table.storage.engine == .object) break :blk true;
+            break :blk false;
+        },
+        else => false,
+    };
+    if (object_engine) return metadata_topology_protocol.object_table_engine_version;
+    switch (command) {
+        .mutate_lake_index_lifecycle, .remove_table => return metadata_topology_protocol.lake_index_catalog_version,
+        .apply_table_topology => |mutation| if (mutation == .drop) return metadata_topology_protocol.lake_index_catalog_version,
+        else => {},
+    }
+    const has_lake_catalog = switch (command) {
+        .upsert_table => |table| table.lake_index_catalog_json.len != 0,
+        .compare_and_replace_table => |cas| cas.expected.lake_index_catalog_json.len != 0 or cas.replacement.lake_index_catalog_json.len != 0,
+        .apply_table_topology => |mutation| switch (mutation) {
+            .create => |create| create.table.lake_index_catalog_json.len != 0,
+            .drop => false,
+        },
+        .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| blk: {
+            for (delta.upsert_tables) |table| if (table.lake_index_catalog_json.len != 0) break :blk true;
+            break :blk false;
+        },
+        else => false,
+    };
+    if (has_lake_catalog) return metadata_topology_protocol.lake_index_catalog_version;
     const requires_v11 = switch (command) {
         .apply_store_root_enrollment, .ack_initial_fk_retirement => return metadata_topology_protocol.store_root_enrollment_version,
         .apply_fk_generation_publication => return metadata_topology_protocol.fk_generation_publication_version,
@@ -21598,6 +21644,12 @@ test "metadata http service linearizable reads leave elections to the cadence dr
     try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
     try svc.upsertTable(.{ .table_id = 99, .name = "cadence_contract" });
     try svc.runRaftProgressOnly();
+    // The topology decoder gate requires the cluster incarnation normally
+    // established by the lifecycle driver. Initialize it through progress-only
+    // work here so the test keeps ownership of election cadence explicit.
+    _ = try svc.ensureMetadataIncarnation();
+    try svc.runRaftProgressOnly();
+    try std.testing.expect(try svc.metadataIncarnation() != null);
     try svc.removeTable(99);
     try std.testing.expectEqual(before_read, svc.raft.host.http_host.host.runtime_host.virtualTimeMs());
     try advanceCdcLeaseRaft(&svc);
@@ -22310,4 +22362,19 @@ test "metadata service store report workload benchmark reconciliation view first
         std.mem.sort(u64, &samples, {}, std.sort.asc(u64));
         std.debug.print("GROUP_CACHE_FIRST_READER_BENCH groups={d} p50_ms={d:.6}\n", .{ count, @as(f64, @floatFromInt(samples[4])) / 1e6 });
     }
+}
+
+test "metadata.lake index publication requires its own decoder capability" {
+    const base: metadata_table_manager.TableRecord = .{ .table_id = 9, .name = "lake" };
+    var next = base;
+    next.lake_index_catalog_json = "{\"version\":1}";
+    try std.testing.expectEqual(@as(u16, 0), transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = base }));
+    try std.testing.expectEqual(metadata_topology_protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = next }));
+    try std.testing.expectEqual(metadata_topology_protocol.lake_index_catalog_version, transitionRequiredCoordinatedDecoderVersion(.{ .compare_and_replace_table = .{ .expected = next, .replacement = base } }));
+}
+
+test "metadata.lake index object table engine requires its own decoder capability" {
+    const table: metadata_table_manager.TableRecord = .{ .table_id = 9, .name = "objects", .storage = .{ .engine = .object }, .min_ranges = 0, .desired_replica_count = 0 };
+    try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = table }));
+    try std.testing.expectEqual(metadata_topology_protocol.object_table_engine_version, transitionRequiredCoordinatedDecoderVersion(.{ .apply_table_topology = .{ .create = .{ .table = table, .ranges = &.{}, .expected_transition_generation = 0 } } }));
 }

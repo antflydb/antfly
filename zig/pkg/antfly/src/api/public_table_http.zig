@@ -163,6 +163,8 @@ pub const TableApi = struct {
         ModelNotFound,
         UnsupportedExactSort,
         GraphMetricGlobalMaterializationRequired,
+        MetricNotReady,
+        MetricStale,
         GraphMetricPersonalizationUnsupported,
         GraphMetricFeatureNotEnabled,
         GraphMetricMaterializationRejected,
@@ -821,6 +823,8 @@ pub const QueryTemporarilyUnavailableReason = enum {
     distributed_query_unavailable,
     storage_read_temporarily_unavailable,
     index_rebuilding,
+    metric_not_ready,
+    metric_stale,
     query_embedding_temporarily_unavailable,
     reranker_temporarily_unavailable,
 };
@@ -837,6 +841,8 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
         .distributed_query_unavailable => "distributed query unavailable",
         .storage_read_temporarily_unavailable => "storage read temporarily unavailable",
         .index_rebuilding => "required index is rebuilding",
+        .metric_not_ready => "graph metric has no published generation",
+        .metric_stale => "graph metric is awaiting a fresh generation",
         .query_embedding_temporarily_unavailable => "query embedding temporarily unavailable",
         .reranker_temporarily_unavailable => "reranker temporarily unavailable",
     };
@@ -1931,6 +1937,8 @@ pub fn handleTableQueryRequest(
                 std.log.info("public table query index rebuilding table={s}", .{table_name});
                 return try queryTemporarilyUnavailableOwnedResponse(alloc, .index_rebuilding);
             },
+            error.MetricNotReady => return try queryTemporarilyUnavailableOwnedResponse(alloc, .metric_not_ready),
+            error.MetricStale => return try queryTemporarilyUnavailableOwnedResponse(alloc, .metric_stale),
             error.ModelNotFound => {
                 std.log.warn("public table query model not found table={s} err={}", .{ table_name, err });
                 return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") };
@@ -4331,6 +4339,8 @@ test "public table query handler preserves retryable failure status" {
         unavailable_message: []const u8 = "",
     };
     const cases = [_]Case{
+        .{ .err = error.MetricNotReady, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "metric_not_ready", .unavailable_message = "graph metric has no published generation" },
+        .{ .err = error.MetricStale, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "metric_stale", .unavailable_message = "graph metric is awaiting a fresh generation" },
         .{ .err = error.QueryEmbeddingInputTooLarge, .status = 413, .body = "{\"code\":\"query_embedding_input_too_large\",\"error\":\"query_embedding_input_too_large\",\"message\":\"query embedding input too large\",\"retryable\":false}", .json = true },
         .{ .err = error.RerankTransientFailure, .status = 503, .body = "", .json = true, .retry_after_seconds = 1, .unavailable_code = "reranker_temporarily_unavailable", .unavailable_message = "reranker temporarily unavailable" },
         .{ .err = error.RerankRateLimited, .status = 429, .body = "{\"code\":\"reranker_rate_limited\",\"error\":\"reranker_rate_limited\",\"message\":\"reranker rate limited\",\"retryable\":true}", .json = true, .retry_after_seconds = 1 },

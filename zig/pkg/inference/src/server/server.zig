@@ -45,6 +45,7 @@ const embedding_trace = @import("../embedding_trace.zig");
 const model_caps = @import("../models/capabilities.zig");
 const manifest_mod = @import("../models/manifest.zig");
 const gliner_boundary_model = @import("../models/gliner_boundary.zig");
+const gliner_decide_qualification = @import("../models/gliner_decide_qualification.zig");
 const safetensors_mod = @import("../models/safetensors.zig");
 const gpt_model_mod = @import("../models/gpt.zig");
 const model_compatibility = @import("../models/compatibility.zig");
@@ -550,7 +551,7 @@ test "transcription response survives an allocation failure at any step" {
             transcribing_api.deinitResponse(allocator, &response);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "transcription response carries every speaker it labelled" {
@@ -3657,6 +3658,157 @@ test "direct generation rejects non-generator manifests before execution" {
     );
 }
 
+fn usesDeclaredSpanV2Route(manifest: manifest_mod.ModelManifest) bool {
+    return manifest.gliner_architecture == .span and manifest.gliner_span_declared;
+}
+
+fn spanRequiresQualifiedDecisionIdentity(manifest: manifest_mod.ModelManifest) bool {
+    return manifest.gliner_span_encoder_family == .modern_bert or
+        manifest.hasCapability("typed_decisions");
+}
+
+fn requiresQualifiedSpanClassification(manifest: manifest_mod.ModelManifest) bool {
+    return usesDeclaredSpanV2Route(manifest) and spanRequiresQualifiedDecisionIdentity(manifest);
+}
+
+/// A cheap listing selects the V2 route; the consumed manifest closes the
+/// fallback if that listing changed before the model was acquired.
+fn requireLegacyClassification(manifest: manifest_mod.ModelManifest) !void {
+    if (requiresQualifiedSpanClassification(manifest)) return error.UnsupportedClassificationExtraction;
+}
+
+fn spanV2BackendSupported(config: span_v2_executor.EncoderConfig, backend: backends_mod.BackendType) bool {
+    return switch (backend) {
+        .native, .metal => true,
+        .cuda => config == .modern_bert,
+        else => false,
+    };
+}
+
+test "GLiNER span backend selection preserves the DeBERTa CUDA exclusion" {
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .native));
+    try std.testing.expect(spanV2BackendSupported(.{ .deberta = .{} }, .metal));
+    try std.testing.expect(!spanV2BackendSupported(.{ .deberta = .{} }, .cuda));
+    try std.testing.expect(spanV2BackendSupported(.{ .modern_bert = .{} }, .cuda));
+    try std.testing.expect(!spanV2BackendSupported(.{ .modern_bert = .{} }, .onnx));
+}
+
+test "GLiNER span identity gate preserves ordinary DeBERTa classification" {
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .gliner_architecture = .span,
+        .gliner_span_declared = true,
+        .gliner_span_encoder_family = .deberta,
+    };
+    try std.testing.expect(!spanRequiresQualifiedDecisionIdentity(manifest));
+    var capabilities = [_][]const u8{"typed_decisions"};
+    manifest.capabilities = &capabilities;
+    try std.testing.expect(spanRequiresQualifiedDecisionIdentity(manifest));
+    manifest.capabilities = &.{};
+    manifest.gliner_span_encoder_family = .modern_bert;
+    try std.testing.expect(spanRequiresQualifiedDecisionIdentity(manifest));
+}
+
+test "qualified GLiNER classification routes close legacy fallback and preserve ordinary models" {
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .gliner_architecture = .span,
+        .gliner_span_declared = true,
+        .gliner_span_encoder_family = .modern_bert,
+    };
+    try std.testing.expect(requiresQualifiedSpanClassification(manifest));
+    try std.testing.expectError(error.UnsupportedClassificationExtraction, requireLegacyClassification(manifest));
+    manifest.gliner_span_encoder_family = .deberta;
+    try std.testing.expect(!requiresQualifiedSpanClassification(manifest));
+    try requireLegacyClassification(manifest);
+    var capabilities = [_][]const u8{"typed_decisions"};
+    manifest.capabilities = &capabilities;
+    try std.testing.expect(requiresQualifiedSpanClassification(manifest));
+    try std.testing.expectError(error.UnsupportedClassificationExtraction, requireLegacyClassification(manifest));
+    manifest.gliner_architecture = .unknown;
+    manifest.laya_declared = true;
+    try std.testing.expect(!requiresQualifiedSpanClassification(manifest));
+    try requireLegacyClassification(manifest);
+}
+
+fn decideExecutionContract(manifest: manifest_mod.ModelManifest) ?decide_mod.ExecutionContract {
+    // Boundary listings deliberately fail hasCapability(): they do not carry
+    // the consumed artifact identity or selected backend needed for public
+    // qualification.  A pull-generated manifest may still declare this
+    // reserved capability after exact-byte qualification, so admit only a
+    // recognized, reviewed load candidate here.  extractV2 remains the
+    // authoritative per-request identity/backend/feature/geometry gate.
+    if (manifest.gliner_architecture == .boundary) {
+        if (!model_caps.hasCapability(manifest.capabilities, "typed_decisions")) return null;
+        if (!manifest.mayLoadQualifiedGlinerBoundaryRuntime()) return null;
+        return .boundary;
+    }
+    // A raw ModernBERT span directory has no Antfly-owned model manifest yet.
+    // Its nested encoder contract may select the qualified route, but it gains
+    // no advertised capability: extractV2Span still requires the exact loaded
+    // artifact identity, backend, and request geometry before learned work.
+    if (requiresQualifiedSpanClassification(manifest)) return .span_marker;
+    if (!manifest.hasCapability("typed_decisions")) return null;
+    if (manifest.laya_declared) return .laya;
+    return null;
+}
+
+test "declared marker-head span model selects span v2 before legacy decision routing" {
+    const manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .gliner_architecture = .span,
+        .gliner_span_declared = true,
+        .gliner_classification_head = .label_marker_mlp,
+    };
+    try std.testing.expect(usesDeclaredSpanV2Route(manifest));
+}
+
+test "typed decision execution contracts distinguish span boundary and Laya" {
+    var capabilities = [_][]const u8{"typed_decisions"};
+    var manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator, .capabilities = &capabilities };
+    try std.testing.expect(decideExecutionContract(manifest) == null);
+    manifest.gliner_architecture = .span;
+    manifest.gliner_span_declared = true;
+    try std.testing.expectEqual(decide_mod.ExecutionContract.span_marker, decideExecutionContract(manifest).?);
+    manifest.gliner_architecture = .boundary;
+    try std.testing.expect(decideExecutionContract(manifest) == null);
+    manifest.gliner_boundary_config = .{
+        .version = @import("../models/gliner_boundary.zig").config_version,
+        .architecture_version = @import("../models/gliner_boundary.zig").architecture_version,
+        .max_len = 4096,
+        .backbone = .multi,
+        .head = .{},
+        .encoder = undefined,
+    };
+    try std.testing.expectEqual(decide_mod.ExecutionContract.boundary, decideExecutionContract(manifest).?);
+    manifest.gliner_boundary_config.?.backbone = .small;
+    try std.testing.expect(decideExecutionContract(manifest) == null);
+    manifest.gliner_boundary_config.?.backbone = .multi;
+    manifest.gliner_architecture = .unknown;
+    manifest.laya_declared = true;
+    try std.testing.expectEqual(decide_mod.ExecutionContract.laya, decideExecutionContract(manifest).?);
+    manifest.capabilities = &.{};
+    try std.testing.expect(decideExecutionContract(manifest) == null);
+}
+
+test "raw ModernBERT span listing selects only the qualified decision route" {
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .gliner_architecture = .span,
+        .gliner_span_declared = true,
+        .gliner_span_encoder_family = .modern_bert,
+    };
+    try std.testing.expectEqual(@as(usize, 0), manifest.capabilities.len);
+    try std.testing.expectEqual(decide_mod.ExecutionContract.span_marker, decideExecutionContract(manifest).?);
+
+    // Family similarity selects a fail-closed exact-identity gate only for the
+    // reviewed ModernBERT route. It does not advertise arbitrary span models.
+    manifest.gliner_span_encoder_family = .deberta;
+    try std.testing.expect(decideExecutionContract(manifest) == null);
+    manifest.gliner_span_encoder_family = .unknown;
+    try std.testing.expect(decideExecutionContract(manifest) == null);
+}
+
 pub const Node = struct {
     config: NodeConfig,
     allocator: std.mem.Allocator,
@@ -4754,11 +4906,6 @@ pub const Node = struct {
         multi_label: bool,
     ) ![]const []const DirectClassificationScore {
         try validateClassificationInvocation(texts, labels);
-        try self.acquireAdmissionUnits(1);
-        defer self.releaseAdmission();
-        self.metrics.incRequest("classify.local");
-        defer self.metrics.decActive();
-
         var owned_io: ?std.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
@@ -4767,8 +4914,20 @@ pub const Node = struct {
             .missing => null,
             .invalid, .ambiguous, .internal => return err,
         };
-        if (classifier_path) |model_path| {
-            defer self.allocator.free(model_path);
+        const model_path = classifier_path orelse try self.resolveModelPath(io, requested, "extractors");
+        defer self.allocator.free(model_path);
+        var listing = try manifest_mod.loadListingFromDir(allocator, model_path);
+        defer listing.deinit();
+        if (requiresQualifiedSpanClassification(listing)) {
+            if (hypothesis_template != null) return error.UnsupportedDecisionHypothesisTemplate;
+            return self.classifyQualifiedSpanTexts(allocator, model_path, texts, labels, multi_label);
+        }
+        try self.acquireAdmissionUnits(1);
+        defer self.releaseAdmission();
+        self.metrics.incRequest("classify.local");
+        defer self.metrics.decActive();
+
+        if (classifier_path != null) {
             const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "extract");
             const hypothesis = hypothesis_template orelse "This example is {}.";
             const additional_text_bytes = std.math.add(usize, maxTextBytes(labels), hypothesis.len) catch
@@ -4785,6 +4944,7 @@ pub const Node = struct {
             var model_handle = try self.model_manager.acquireFromDir(model_path);
             defer model_handle.release();
             const model = model_handle.get();
+            try requireLegacyClassification(model.manifest);
             const entailment_idx: ?usize = if (model.manifest.id2label) |manifest_labels| blk: {
                 for (manifest_labels, 0..) |label, i| {
                     if (std.ascii.eqlIgnoreCase(label, "entailment")) break :blk i;
@@ -4816,8 +4976,6 @@ pub const Node = struct {
             return try copyDirectClassificationResults(allocator, results);
         }
 
-        const model_path = try self.resolveModelPath(io, requested, "extractors");
-        defer self.allocator.free(model_path);
         const executor_contract = try resolvedInferenceExecutorContractFromDir(self, allocator, model_path, "extract");
         try validateTextExecutorInvocation(
             executor_contract,
@@ -4832,6 +4990,7 @@ pub const Node = struct {
         defer model_handle.release();
         const model = model_handle.get();
         if (!model.isGlinerModel() or !model.supportsClassification()) return error.UnsupportedClassifierProvider;
+        try requireLegacyClassification(model.manifest);
         if (model.manifest.gliner_classification_head == .label_marker_mlp and hypothesis_template != null)
             return error.UnsupportedDecisionHypothesisTemplate;
         var pipeline = createGlinerPipeline(self, allocator, model);
@@ -4854,6 +5013,50 @@ pub const Node = struct {
             allocator.free(results);
         }
         return try copyDirectClassificationResults(allocator, results);
+    }
+
+    fn classifyQualifiedSpanTexts(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        texts: []const []const u8,
+        labels: []const []const u8,
+        multi_label: bool,
+    ) ![]const []const DirectClassificationScore {
+        const schema_json = try std.json.Stringify.valueAlloc(allocator, .{
+            .classifications = .{.{
+                .name = "classification",
+                .labels = labels,
+                .multi_label = multi_label,
+                .threshold = @as(f64, 0.0),
+                .top_k = if (multi_label) labels.len else @as(usize, 1),
+            }},
+        }, .{});
+        defer allocator.free(schema_json);
+        const inputs = try allocator.alloc(extracting_api.Input, texts.len);
+        var initialized: usize = 0;
+        defer {
+            for (inputs[0..initialized]) |input| allocator.free(input.content_json);
+            allocator.free(inputs);
+        }
+        for (texts, inputs) |text, *input| {
+            input.* = .{ .content_json = try std.json.Stringify.valueAlloc(allocator, text, .{}) };
+            initialized += 1;
+        }
+        var failure = extraction_v2.FailureContext{};
+        var response = try self.extractV2WithAdmission(allocator, .{ .typed = .{
+            .model_name = "classification",
+            .resolved_span_path = model_path,
+            .classification_compatibility = .provider,
+            .request = .{
+                .inputs = inputs,
+                .schema_json = schema_json,
+                .options_json = "{\"include_confidence\":true}",
+                .schema_version = 2,
+            },
+        } }, .direct, null, &failure, null, "classify");
+        defer response.deinit();
+        return qualifiedClassificationScores(allocator, response.json, texts.len, labels, multi_label);
     }
 
     fn copyDirectClassificationResults(
@@ -8772,9 +8975,27 @@ pub const Node = struct {
     }
 
     const ExtractionAdmissionOwner = enum { direct, http_route };
+    const ClassificationCompatibility = enum { none, legacy_extraction, provider };
+    const DecideSpanInput = struct {
+        request: decide_mod.Request,
+        envelope: std.json.Value,
+        // Only decideJsonWithAdmission creates this after name containment and
+        // listing validation. Execution still requires the live artifact identity.
+        resolved_path: []const u8,
+    };
     const ExtractionV2Input = union(enum) {
         json: []const u8,
-        typed: struct { model_name: []const u8, request: extracting_api.Request },
+        decide_span: DecideSpanInput,
+        // An origin marker owned by the legacy HTTP upgrade; never a wire field.
+        legacy_classification_json: []const u8,
+        typed: struct {
+            model_name: []const u8,
+            request: extracting_api.Request,
+            // Only the trusted provider adapter sets this private field. HTTP
+            // and public extraction requests always resolve a validated name.
+            resolved_span_path: ?[]const u8 = null,
+            classification_compatibility: ClassificationCompatibility = .none,
+        },
     };
 
     /// Versioned mixed-task extraction for embedded callers. Raw JSON preserves
@@ -8801,6 +9022,8 @@ pub const Node = struct {
     ) !extracting_api.Response {
         self.metrics.incRequest(if (std.mem.eql(u8, metric_task, "decide"))
             (if (admission_owner == .direct) "decide.local" else "decide")
+        else if (std.mem.eql(u8, metric_task, "classify"))
+            (if (admission_owner == .direct) "classify.local" else "classify")
         else
             (if (admission_owner == .direct) "extract.local" else "extract"));
         defer self.metrics.decActive();
@@ -8830,7 +9053,7 @@ pub const Node = struct {
         const control: ?InferenceExecutionControl = self.extractionExecutionControl(supplied_control);
         if (control) |active| try active.check();
         const serialized: ?[]u8 = switch (input) {
-            .json => null,
+            .json, .legacy_classification_json, .decide_span => null,
             .typed => |typed| blk: {
                 observer.emit(.{ .phase = .parsing });
                 if (typed.request.attachments.len != 0) return error.UnsupportedExtractionInput;
@@ -8840,7 +9063,9 @@ pub const Node = struct {
         defer if (serialized) |bytes| allocator.free(bytes);
         const request_json = switch (input) {
             .json => |bytes| bytes,
+            .legacy_classification_json => |bytes| bytes,
             .typed => serialized.?,
+            .decide_span => "",
         };
         observer.emit(.{ .phase = .admission });
         switch (admission_owner) {
@@ -8867,8 +9092,19 @@ pub const Node = struct {
         var allocation_failure = ExtractionAllocationFailure{};
         const scratch = allocation_failure.allocator(&bounded);
         defer std.debug.assert(bounded.live == 0);
-        const json = self.extractV2InMemory(scratch, request_json, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure) catch |err|
-            return allocation_failure.translate(err);
+        const resolved_span_path = switch (input) {
+            .json, .legacy_classification_json, .decide_span => null,
+            .typed => |typed| typed.resolved_span_path,
+        };
+        const classification_compatibility: ClassificationCompatibility = switch (input) {
+            .json, .decide_span => .none,
+            .legacy_classification_json => .legacy_extraction,
+            .typed => |typed| typed.classification_compatibility,
+        };
+        const json = (switch (input) {
+            .decide_span => |decision| self.extractDecideSpanInMemory(scratch, decision, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure),
+            else => self.extractV2InMemory(scratch, request_json, resolved_span_path, classification_compatibility, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure),
+        }) catch |err| return allocation_failure.translate(err);
         defer scratch.free(json);
         observer.emit(.{ .phase = .teardown });
         // Inner teardown can outlast the last execution check. Discard the
@@ -8877,6 +9113,27 @@ pub const Node = struct {
         // This allocation belongs to the caller, after all model/backend work
         // has drained. Its genuine backing OOM is not a request-heap denial.
         return .{ .allocator = allocator, .json = try allocator.dupe(u8, json) };
+    }
+
+    fn extractDecideSpanInMemory(
+        self: *Node,
+        scratch: std.mem.Allocator,
+        decision: DecideSpanInput,
+        control: ?InferenceExecutionControl,
+        failure: *extraction_v2.FailureContext,
+        response_limit: ?usize,
+        observer: metrics_mod.extraction.observation.Observer,
+        budget: *runtime.tier.memory.RunBudget,
+        working_bytes: usize,
+        allocation_failure: *ExtractionAllocationFailure,
+    ) ![]u8 {
+        observer.emit(.{ .phase = .parsing });
+        // The trusted envelope has fixed depth; all input/schema/option limits
+        // and schema compiler checks remain identical to the JSON entry point.
+        var request = try extraction_v2.parseValue(scratch, decision.envelope, .{ .failure = failure });
+        defer request.deinit();
+        observer.emit(.{ .parsed = .{ .items = request.items.len, .input_bytes = decision.request.state.len } });
+        return self.extractV2Span(scratch, decision.resolved_path, &request, true, .none, control, failure, response_limit, budget, working_bytes, allocation_failure, observer, decision.request);
     }
 
     fn tryExtractLayaV2(self: *Node, scratch: std.mem.Allocator, request_json: []const u8, control: ?InferenceExecutionControl, response_limit: ?usize, failure: *extraction_v2.FailureContext) !?[]u8 {
@@ -8934,6 +9191,8 @@ pub const Node = struct {
         self: *Node,
         scratch: std.mem.Allocator,
         request_json: []const u8,
+        resolved_span_path: ?[]const u8,
+        classification_compatibility: ClassificationCompatibility,
         control: ?InferenceExecutionControl,
         failure: *extraction_v2.FailureContext,
         response_limit: ?usize,
@@ -8943,7 +9202,9 @@ pub const Node = struct {
         allocation_failure: *ExtractionAllocationFailure,
     ) ![]u8 {
         // Each architecture retains its own schema validation and qualification.
-        if (try self.tryExtractLayaV2(scratch, request_json, control, response_limit, failure)) |json| return json;
+        if (resolved_span_path == null and classification_compatibility == .none) {
+            if (try self.tryExtractLayaV2(scratch, request_json, control, response_limit, failure)) |json| return json;
+        }
         const regex = @import("../pipelines/extraction_regex.zig");
         var validators = regex.Context.init(scratch, .{
             .compile_options = .{ .control = control },
@@ -8951,7 +9212,9 @@ pub const Node = struct {
         });
         defer validators.deinit();
         observer.emit(.{ .phase = .parsing });
-        var request = try extraction_v2.parseJson(scratch, request_json, .{ .failure = failure, .compiler = validators.compilerOptions(.{}) });
+        var request = try extraction_v2.parseJson(scratch, request_json, .{ .failure = failure, .compiler = validators.compilerOptions(.{
+            .allow_legacy_classification_threshold_endpoints = classification_compatibility != .none,
+        }) });
         defer request.deinit();
         var parsed_bytes: usize = 0;
         for (request.items) |item| parsed_bytes +|= item.text.len;
@@ -8960,7 +9223,11 @@ pub const Node = struct {
             .control = control,
             .failure = failure,
             .observer = observer,
-            .pipeline = .{ .regex_context = &validators, .validate_value_fn = regex.Context.validateValue },
+            .pipeline = .{
+                .regex_context = &validators,
+                .validate_value_fn = regex.Context.validateValue,
+                .classification_multi_label_fallback = classification_compatibility != .legacy_extraction,
+            },
             .max_response_bytes = @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024),
         };
         var owned_io: ?std.Io.Threaded = null;
@@ -8968,7 +9235,10 @@ pub const Node = struct {
         const io = self.inferenceIo(scratch, null, &owned_io);
         failure.* = .{ .stage = "model" };
         observer.emit(.{ .phase = .model });
-        const model_path = try self.resolveRequestModelPath(scratch, io, request.model, "extractors");
+        const model_path = if (resolved_span_path) |path|
+            try scratch.dupe(u8, path)
+        else
+            try self.resolveRequestModelPath(scratch, io, request.model, "extractors");
         defer scratch.free(model_path);
         // Only architecture/configuration and capability are needed here.
         // Full tokenizer JSON materialization belongs to the admitted managed
@@ -8976,6 +9246,12 @@ pub const Node = struct {
         // this gate, even for an otherwise small extraction request.
         var manifest = try manifest_mod.loadListingFromDir(scratch, model_path);
         defer manifest.deinit();
+        if (resolved_span_path != null and !requiresQualifiedSpanClassification(manifest)) return error.UnsupportedClassificationExtraction;
+        // Declared SpanExtractor wrappers use the schema-v2 classifier route
+        // on every qualified backend. The legacy decision executor below is
+        // reserved for non-span label-marker bundles.
+        if (usesDeclaredSpanV2Route(manifest))
+            return self.extractV2Span(scratch, model_path, &request, resolved_span_path != null, classification_compatibility, control, failure, response_limit, budget, working_bytes, allocation_failure, observer, null);
         if (manifest.gliner_classification_head == .label_marker_mlp) {
             try decision_executor.preflight(&request);
             failure.* = .{ .stage = "model" };
@@ -8995,8 +9271,6 @@ pub const Node = struct {
         // Only a declared gliner2 2.x span checkpoint has the upstream
         // classifier head and processor contract this route executes; other
         // span models keep the prior unsupported-model response.
-        if (manifest.gliner_architecture == .span and manifest.gliner_span_declared)
-            return self.extractV2Span(scratch, model_path, &request, control, failure, response_limit, budget, working_bytes, allocation_failure);
         if (manifest.gliner_architecture != .boundary) return error.UnsupportedExtractionModel;
         const test_qualification = if (builtin.is_test) self.test_allow_unqualified_gliner_boundary else false;
         // Reject unqualified bundles at the model gate before the boundary
@@ -9119,20 +9393,28 @@ pub const Node = struct {
         scratch: std.mem.Allocator,
         model_path: []const u8,
         request: *const extraction_v2.Request,
+        require_qualification: bool,
+        classification_compatibility: ClassificationCompatibility,
         control: ?InferenceExecutionControl,
         failure: *extraction_v2.FailureContext,
         response_limit: ?usize,
         budget: *runtime.tier.memory.RunBudget,
         working_bytes: usize,
         allocation_failure: *ExtractionAllocationFailure,
+        observer: metrics_mod.extraction.observation.Observer,
+        decision: ?decide_mod.Request,
     ) ![]u8 {
         var options = span_v2_executor.Options{
             .control = control,
+            .observer = observer,
+            .decide_request = decision,
             .failure = failure,
+            .pipeline = .{ .classification_multi_label_fallback = classification_compatibility != .legacy_extraction },
             .max_response_bytes = @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024),
         };
         try span_v2_executor.preflight(request, options);
         failure.* = .{ .stage = "model" };
+        observer.emit(.{ .phase = .model });
         allocation_failure.clear();
         var handle = self.model_manager.acquireFromDirWithControl(model_path, control orelse .{}) catch |err| {
             allocation_failure.clear();
@@ -9141,14 +9423,37 @@ pub const Node = struct {
         defer handle.release();
         const loaded = handle.get();
         const backend = loaded.session.backend();
-        if (backend != .native and backend != .metal) return error.UnsupportedExtractionBackend;
-        const config = try session_factory.getGlinerSpanConfig(loaded.session);
-        // Same per-sequence ceiling as the legacy span route: the model's
-        // position budget (512 for DeBERTa-v3).
-        const max_sequence = if (config.max_position_embeddings == 0) 512 else @min(@as(usize, config.max_position_embeddings), options.processor.max_sequence_tokens);
+        if (backend != .native and backend != .metal and backend != .cuda) return error.UnsupportedExtractionBackend;
+        const qualified_variant: ?gliner_decide_qualification.QualifiedVariant = if (require_qualification or spanRequiresQualifiedDecisionIdentity(loaded.manifest))
+            try gliner_decide_qualification.require(try session_factory.getGlinerDecisionIdentity(loaded.session))
+        else
+            null;
+        const qualified_backend: gliner_decide_qualification.Backend = switch (backend) {
+            .native => .native,
+            .metal => .metal,
+            .cuda => .cuda,
+            else => .other,
+        };
+        // Reject an unmeasured backend or request cardinality before parsing
+        // model inputs. Sequence geometry is checked again after exact planning.
+        if (qualified_variant) |variant|
+            try gliner_decide_qualification.requireRequest(variant, qualified_backend, request.items.len, 1, 1);
+        const session_config = try session_factory.getGlinerSpanConfig(loaded.session);
+        const config: span_v2_executor.EncoderConfig = switch (session_config) {
+            .deberta => |value| .{ .deberta = value },
+            .modern_bert => |value| .{ .modern_bert = value },
+        };
+        if (!spanV2BackendSupported(config, backend)) return error.UnsupportedExtractionBackend;
+        const max_sequence = span_v2_executor.sequenceTokenCeiling(config, options.processor.max_sequence_tokens, backend == .cuda);
         options.processor.max_sequence_tokens = max_sequence;
         options.processor.max_batch_tokens = max_sequence;
         options.max_prompt_tokens = @min(options.max_prompt_tokens, max_sequence);
+        if (qualified_variant == .decide_1b) {
+            options.processor.max_sequence_tokens = @min(options.processor.max_sequence_tokens, 198);
+            options.processor.max_batch_tokens = @min(options.processor.max_batch_tokens, 198);
+            options.max_prompt_tokens = @min(options.max_prompt_tokens, 198);
+            options.max_sequences_per_item = 1;
+        }
 
         const texts = try scratch.alloc([]const u8, request.items.len);
         defer scratch.free(texts);
@@ -9165,18 +9470,24 @@ pub const Node = struct {
         // Tokenize and split before any model lock, like the boundary
         // route's workspace geometry pass.
         failure.* = .{ .stage = "tokenizing" };
+        observer.emit(.{ .phase = .tokenizing });
         var request_plan = try span_v2_executor.plan(scratch, loaded.getTokenizer(), request, options);
         defer request_plan.deinit(scratch);
         const longest = span_v2_executor.maxPlannedSequenceTokens(&request_plan);
+        var prepared_sequences: usize = 0;
+        for (request_plan.items) |item| prepared_sequences += item.batches.len;
+        if (qualified_variant) |variant|
+            try gliner_decide_qualification.requireRequest(variant, qualified_backend, request.items.len, prepared_sequences, longest);
         try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, longest, max_labels, 0);
         failure.* = .{ .stage = "model" };
+        observer.emit(.{ .phase = .model });
 
         // Metal work is admitted like the boundary route: a GPU run budget
         // and a process-wide backend-scratch lease, acquired before the
         // execution lock because admission can evict other models.
         var device_lease: ?runtime.tier.memory.AdmissionLease = null;
         defer if (device_lease) |*owned| owned.release();
-        if (backend == .metal) {
+        if (backend == .metal or backend == .cuda) {
             const device_limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu));
             const device_bytes = try span_v2_executor.deviceScratchUpperBound(config, longest);
             budget.* = runtime.tier.memory.RunBudget.init(device_limits);
@@ -9214,27 +9525,38 @@ pub const Node = struct {
         // this internal detail. Any resolution failure leaves the request unmodified.
         var request = supplied_request;
         var upgraded_schema_json: ?[]u8 = null;
+        var classification_compatibility: ClassificationCompatibility = .none;
         defer if (upgraded_schema_json) |bytes| allocator.free(bytes);
-        if (request.schema_version == null) upgrade: {
+        if (request.schema_version == 1) try validateLegacyDirectExtractionExtensions(self, request);
+        if (request.schema_version == null or request.schema_version == 1) upgrade: {
             const io = self.session_manager.io orelse break :upgrade;
-            if (self.resolvesToNativeExtractionV2(io, model_name)) {
-                request.schema_version = 2;
-                break :upgrade;
-            }
+            const explicit_v1 = request.schema_version != null;
+            const native_v2 = !explicit_v1 and self.resolvesToNativeExtractionV2(io, model_name);
             var schema = std.json.parseFromSlice(std.json.Value, allocator, request.schema_json, .{}) catch break :upgrade;
             defer schema.deinit();
-            if (!self.resolvesToSpanClassification(io, model_name, schema.value)) break :upgrade;
+            if (!native_v2 and !self.resolvesToSpanClassification(io, model_name, schema.value, explicit_v1)) break :upgrade;
             var options = std.json.parseFromSlice(std.json.Value, allocator, if (request.options_json.len > 0) request.options_json else "{}", .{}) catch break :upgrade;
             defer options.deinit();
-            if (carryV1ClassificationThreshold(schema.arena.allocator(), &schema.value, options.value) catch break :upgrade)
-                upgraded_schema_json = std.json.Stringify.valueAlloc(allocator, schema.value, .{}) catch break :upgrade;
+            const legacy_classification = schemaIsClassificationOnly(schema.value) and legacy: {
+                validateLegacyDirectExtractionExtensions(self, supplied_request) catch break :legacy false;
+                break :legacy true;
+            };
+            if (legacy_classification) {
+                if (carryV1ClassificationThreshold(schema.arena.allocator(), &schema.value, options.value) catch break :upgrade)
+                    upgraded_schema_json = std.json.Stringify.valueAlloc(allocator, schema.value, .{}) catch break :upgrade;
+                classification_compatibility = .legacy_extraction;
+            }
             if (upgraded_schema_json) |bytes| request.schema_json = bytes;
             request.schema_version = 2;
         }
         const schema_version = request.schema_version orelse 1;
         if (schema_version == 2) {
             var failure = extraction_v2.FailureContext{};
-            return self.extractV2WithAdmission(allocator, .{ .typed = .{ .model_name = model_name, .request = request } }, admission_owner, supplied_control, &failure, request.max_response_bytes, "extract");
+            return self.extractV2WithAdmission(allocator, .{ .typed = .{
+                .model_name = model_name,
+                .request = request,
+                .classification_compatibility = classification_compatibility,
+            } }, admission_owner, supplied_control, &failure, request.max_response_bytes, "extract");
         }
         if (supplied_control) |active| try active.check();
         if (schema_version != 1) return error.UnsupportedExtractionSchemaVersion;
@@ -9325,13 +9647,15 @@ pub const Node = struct {
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
-        const extractor_ctx = extractors_mod.Context{
+        var reader_admission = ExtractionReaderAdmission{ .node = self, .allocator = allocator };
+        var extractor_ctx = extractors_mod.Context{
             .allocator = allocator,
             .io = io,
             .models_dir = self.config.models_dir,
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
             .reader_resolver = &self.extraction_reader_resolver,
+            .reader_admission = .{ .ptr = &reader_admission, .validate = ExtractionReaderAdmission.validate },
             .gliner_pipeline_factory = .{ .ptr = self, .create = createGlinerPipeline },
             .execution_control = execution_control,
         };
@@ -9342,8 +9666,29 @@ pub const Node = struct {
         defer extractor.deinit(allocator);
         var admission_manifest = try manifest_mod.loadFromDir(allocator, extractor.modelPath());
         defer admission_manifest.deinit();
-        const executor_contract = try resolvedInferenceExecutorContract(self, "extract", &admission_manifest);
-        config.max_input_tokens_per_item = executor_contract.batch.max_input_tokens_per_item;
+        const extraction_contract = try resolvedInferenceExecutorContract(self, "extract", &admission_manifest);
+        var text_admission = ExtractionTextAdmission{ .contract = extraction_contract, .schema_bytes = request.schema_json.len };
+        extractor_ctx.text_admission = .{ .ptr = &text_admission, .validate = ExtractionTextAdmission.validate };
+        config.max_input_tokens_per_item = extraction_contract.batch.max_input_tokens_per_item;
+        var image_manifest: ?manifest_mod.ModelManifest = null;
+        defer if (image_manifest) |*manifest| manifest.deinit();
+        const composed_reader = media_shape.image_count > 0 and extractor == .extractor;
+        if (composed_reader) {
+            const reader_path = try extractor.imageModelPath(extractor_ctx);
+            defer allocator.free(reader_path);
+            image_manifest = try manifest_mod.loadFromDir(allocator, reader_path);
+            // The extractor consumes OCR text, not the original images.
+            try validateInferenceExecutorInvocation(extraction_contract, .{
+                .item_count = request.inputs.len,
+                .schema_bytes = request.schema_json.len,
+                .has_text = true,
+            });
+        }
+        const media_manifest = if (image_manifest) |*manifest| manifest else &admission_manifest;
+        const executor_contract = if (composed_reader)
+            try resolvedInferenceExecutorContract(self, "read", media_manifest)
+        else
+            extraction_contract;
 
         // Fetch and decode request media only after resolver preflight succeeds.
         var parsed_inputs = try parseDirectExtractionInputs(
@@ -9366,7 +9711,7 @@ pub const Node = struct {
                 return error.InferenceEncodedBytesExceeded;
             const physical_mime = image_pipeline.mimeEssenceForEncoded(image_bytes) orelse
                 return error.InvalidInferenceMedia;
-            if (!manifestAcceptsExecutorMime(&admission_manifest, physical_mime))
+            if (!manifestAcceptsExecutorMime(media_manifest, physical_mime))
                 return error.UnsupportedInferenceMimeType;
             const info = image_pipeline.inspectEncodedForInference(image_bytes, null) catch
                 return error.InvalidInferenceMedia;
@@ -9384,7 +9729,7 @@ pub const Node = struct {
             .encoded_media_bytes = encoded_media_bytes,
             .decoded_pixels = decoded_pixels,
             .media_parts_per_item = if (parsed_inputs.images.items.len > 0) 1 else 0,
-            .schema_bytes = request.schema_json.len,
+            .schema_bytes = if (composed_reader) 0 else request.schema_json.len,
             .has_text = parsed_inputs.texts.items.len > 0,
             .has_image = parsed_inputs.images.items.len > 0,
         });
@@ -9625,6 +9970,7 @@ pub const Node = struct {
         defer model_handle.release();
         const model = model_handle.get();
         if (!model.supportsClassification()) return error.UnsupportedClassificationExtraction;
+        try requireLegacyClassification(model.manifest);
 
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
@@ -11988,9 +12334,9 @@ pub const Node = struct {
             const parsed_tool_calls = if (tool_parser) |*parser| blk: {
                 parser.reset();
                 _ = parser.feed(result.text) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    return generationErrorResponse(ctx, err);
                 tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                    return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                    return generationErrorResponse(ctx, err);
                 response_text = tool_response_text.?;
                 if (response_text.len == 0) response_text = result.text;
                 const calls = parser.toolCalls();
@@ -12131,9 +12477,9 @@ pub const Node = struct {
                 const parsed_tool_calls = if (tool_parser) |*parser| blk: {
                     parser.reset();
                     _ = parser.feed(result.text) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                        return generationErrorResponse(ctx, err);
                     tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                        return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                        return generationErrorResponse(ctx, err);
                     response_text = tool_response_text.?;
                     if (response_text.len == 0) response_text = result.text;
                     const calls = parser.toolCalls();
@@ -12974,9 +13320,9 @@ pub const Node = struct {
         const parsed_tool_calls = if (tool_parser) |*parser| blk: {
             parser.reset();
             _ = parser.feed(result.text) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                return generationErrorResponse(ctx, err);
             tool_response_text = parser.finishText(ctx.allocator) catch |err|
-                return ctx.status(500).json(.{ .@"error" = "GENERATION_FAILED", .message = @errorName(err) });
+                return generationErrorResponse(ctx, err);
             response_text = tool_response_text.?;
             if (response_text.len == 0) response_text = result.text;
             const calls = parser.toolCalls();
@@ -18826,7 +19172,7 @@ pub const Node = struct {
     /// checkpoint runs the upstream `classifier` head on schema_version:2.
     /// The legacy route scores span logits of `[C]` markers instead, which is
     /// not the checkpoint's classification semantics.
-    fn resolvesToSpanClassification(self: *Node, io: std.Io, model_name: []const u8, schema: std.json.Value) bool {
+    fn resolvesToSpanClassification(self: *Node, io: std.Io, model_name: []const u8, schema: std.json.Value, qualified_only: bool) bool {
         if (model_name.len == 0 or !schemaIsClassificationOnly(schema)) return false;
         var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
         defer arena.deinit();
@@ -18834,15 +19180,16 @@ pub const Node = struct {
         const model_path = self.resolveRequestModelPath(scratch, io, model_name, "extractors") catch return false;
         var manifest = manifest_mod.loadListingFromDir(scratch, model_path) catch return false;
         defer manifest.deinit();
-        return manifest.gliner_architecture == .span and manifest.gliner_span_declared;
+        return usesDeclaredSpanV2Route(manifest) and (!qualified_only or requiresQualifiedSpanClassification(manifest));
     }
 
-    /// If `request_json` names a native GLiNER extraction model and does not
-    /// already declare a schema version, returns a new allocation (owned by
-    /// `result_allocator`) with `"schema_version":2` stamped on, so
+    /// If `request_json` names a native GLiNER extraction model with an
+    /// omitted version, or qualified span classification with explicit v1,
+    /// returns a new allocation (owned by `result_allocator`) with
+    /// `"schema_version":2` stamped on, so
     /// extractJSON routes it through extractV2InMemory instead of the
     /// legacy dispatcher. Returns null on any failure (bad JSON, unresolved
-    /// model, unsupported model, already-versioned request) so the caller
+    /// model, unsupported model or version, invalid v1 extensions) so the caller
     /// falls through to its existing, unmodified behavior; this must never
     /// itself decide extraction is unsupported.
     ///
@@ -18856,13 +19203,15 @@ pub const Node = struct {
     /// operation switch, is what keeps this file's one other legacy
     /// entities/relations implementation (extractEntitiesAndRelations) out
     /// of the boundary architecture's path entirely.
+    const UpgradedExtractionRequest = struct { json: []u8, legacy_classification: bool };
+
     fn nativeUpgradeRequestJsonIfNeeded(
         self: *Node,
         result_allocator: std.mem.Allocator,
         io: std.Io,
         request_json: []const u8,
         max_request_bytes: usize,
-    ) !?[]u8 {
+    ) !?UpgradedExtractionRequest {
         if (request_json.len == 0 or request_json.len > max_request_bytes) return null;
         var arena = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
         defer arena.deinit();
@@ -18870,16 +19219,29 @@ pub const Node = struct {
         var parsed = std.json.parseFromSlice(std.json.Value, scratch, request_json, .{}) catch return null;
         defer parsed.deinit();
         if (parsed.value != .object) return null;
-        if (parsed.value.object.contains("schema_version")) return null;
+        const explicit_v1 = if (parsed.value.object.get("schema_version")) |version| blk: {
+            if (version != .integer or version.integer != 1) return null;
+            break :blk true;
+        } else false;
+        if (explicit_v1) extraction_v2.validateLegacy(parsed.value) catch return null;
         const model_value = parsed.value.object.get("model") orelse return null;
         if (model_value != .string or model_value.string.len == 0) return null;
-        if (!self.resolvesToNativeExtractionV2(io, model_value.string)) {
-            const schema = parsed.value.object.getPtr("schema") orelse return null;
-            if (!self.resolvesToSpanClassification(io, model_value.string, schema.*)) return null;
+        const schema = parsed.value.object.getPtr("schema") orelse return null;
+        if (explicit_v1 or !self.resolvesToNativeExtractionV2(io, model_value.string)) {
+            if (!self.resolvesToSpanClassification(io, model_value.string, schema.*, explicit_v1)) return null;
+        }
+        const legacy_classification = schemaIsClassificationOnly(schema.*) and legacy: {
+            extraction_v2.validateLegacy(parsed.value) catch break :legacy false;
+            break :legacy true;
+        };
+        if (legacy_classification) {
             _ = carryV1ClassificationThreshold(scratch, schema, parsed.value.object.get("options") orelse .null) catch return null;
         }
         parsed.value.object.put(scratch, "schema_version", .{ .integer = 2 }) catch return null;
-        return std.json.Stringify.valueAlloc(result_allocator, parsed.value, .{}) catch null;
+        return .{
+            .json = std.json.Stringify.valueAlloc(result_allocator, parsed.value, .{}) catch return null,
+            .legacy_classification = legacy_classification,
+        };
     }
 
     pub fn extractJSON(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -18912,8 +19274,8 @@ pub const Node = struct {
             nativeUpgradeRequestJsonIfNeeded(self, ctx.allocator, ctx.io, request_json, ctx.max_request_body_size) catch null
         else
             null;
-        defer if (boundary_upgraded) |bytes| ctx.allocator.free(bytes);
-        const effective_request_json = boundary_upgraded orelse request_json;
+        defer if (boundary_upgraded) |upgraded| ctx.allocator.free(upgraded.json);
+        const effective_request_json = if (boundary_upgraded) |upgraded| upgraded.json else request_json;
         const version = extractionSchemaVersion(self, effective_request_json, ctx.max_request_body_size) catch |err| {
             self.metrics.extraction_v2.envelopeFailure(err);
             self.metrics.incError();
@@ -18930,7 +19292,11 @@ pub const Node = struct {
                 return extractionV2FailureResponse(ctx, error.UnsupportedExtractionInput, .{});
             };
             var failure = extraction_v2.FailureContext{};
-            var response = self.extractV2WithAdmission(ctx.allocator, .{ .json = effective_request_json }, .http_route, execution_control, &failure, null, "extract") catch |err|
+            const v2_input: ExtractionV2Input = if (boundary_upgraded != null and boundary_upgraded.?.legacy_classification)
+                .{ .legacy_classification_json = effective_request_json }
+            else
+                .{ .json = effective_request_json };
+            var response = self.extractV2WithAdmission(ctx.allocator, v2_input, .http_route, execution_control, &failure, null, "extract") catch |err|
                 return extractionV2FailureResponse(ctx, err, failure);
             defer response.deinit();
             try ctx.setHeader("content-type", "application/json");
@@ -19095,6 +19461,7 @@ pub const Node = struct {
         if (!model.supportsClassification()) {
             return ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = "model does not support classification extraction" });
         }
+        requireLegacyClassification(model.manifest) catch |err| return extractionDirectFailureResponse(ctx, err);
 
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
@@ -19218,18 +19585,21 @@ pub const Node = struct {
         const path = try self.resolveRequestModelPath(a, io, request.model, "extractors");
         var manifest = try manifest_mod.loadListingFromDir(a, path);
         defer manifest.deinit();
-        const gliner = manifest.isGlinerDecisionModel();
-        if (!gliner and !manifest.hasCapability("typed_decisions")) return error.UnsupportedDecideModel;
-        if (!gliner and !manifest.laya_declared) return error.UnsupportedDecideModel;
-        const extraction_input = try decide_mod.extractionInput(a, request, gliner);
+        const decision_contract = decideExecutionContract(manifest) orelse return error.UnsupportedDecideModel;
+        const extraction_input = try decide_mod.extractionValue(a, request, decision_contract);
         const contract = try resolvedInferenceExecutorContract(self, "decide", &manifest);
         var max_labels: usize = 0;
         for (request.questions) |question| max_labels = @max(max_labels, question.labels.len);
         try validateTextExecutorInvocation(contract, 1, &.{request.state}, 0, 0, max_labels, extraction_input.schema_bytes);
         var failure = extraction_v2.FailureContext{};
-        var extraction = try self.extractV2WithAdmission(a, .{ .json = extraction_input.json }, owner, control, &failure, null, "decide");
+        const typed_span = decision_contract == .span_marker and usesDeclaredSpanV2Route(manifest);
+        const input: ExtractionV2Input = if (typed_span)
+            .{ .decide_span = .{ .request = request, .envelope = extraction_input.value, .resolved_path = path } }
+        else
+            .{ .json = try std.json.Stringify.valueAlloc(a, extraction_input.value, .{}) };
+        var extraction = try self.extractV2WithAdmission(a, input, owner, control, &failure, null, "decide");
         defer extraction.deinit();
-        const response_json = try decide_mod.responseJson(a, request, extraction.json, gliner);
+        const response_json = if (typed_span) extraction.json else try decide_mod.responseJson(a, request, extraction.json, decision_contract);
         return allocator.dupe(u8, response_json);
     }
 
@@ -19895,6 +20265,50 @@ fn freeClassificationBatch(allocator: std.mem.Allocator, results: anytype) void 
     allocator.free(results);
 }
 
+/// Own only the score arrays. Label slices continue to belong to the provider
+/// caller, so destroying the parsed response cannot invalidate the result.
+fn qualifiedClassificationScores(
+    allocator: std.mem.Allocator,
+    response_json: []const u8,
+    input_count: usize,
+    labels: []const []const u8,
+    multi_label: bool,
+) ![]const []const Node.DirectClassificationScore {
+    var parsed = try std.json.parseFromSlice(extraction_api.ExtractionResponse, allocator, response_json, .{});
+    defer parsed.deinit();
+    if (parsed.value.data.len != input_count) return error.InvalidExtractionResponse;
+    const output = try allocator.alloc([]const Node.DirectClassificationScore, input_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (output[0..initialized]) |row| allocator.free(row);
+        allocator.free(output);
+    }
+    for (parsed.value.data, output) |item, *out| {
+        const classifications = item.classifications orelse return error.InvalidExtractionResponse;
+        if (classifications.len != (if (multi_label) labels.len else @as(usize, 1))) return error.InvalidExtractionResponse;
+        const scores = try allocator.alloc(Node.DirectClassificationScore, classifications.len);
+        errdefer allocator.free(scores);
+        for (classifications, scores, 0..) |classification, *score, i| {
+            if (!std.mem.eql(u8, classification.name, "classification")) return error.InvalidExtractionResponse;
+            const probability = classification.score orelse return error.InvalidExtractionResponse;
+            if (!std.math.isFinite(probability) or probability < 0 or probability > 1) return error.InvalidExtractionResponse;
+            const label = for (labels) |expected| {
+                if (std.mem.eql(u8, expected, classification.label)) break expected;
+            } else return error.InvalidExtractionResponse;
+            for (scores[0..i]) |prior| if (std.mem.eql(u8, prior.label, label)) return error.InvalidExtractionResponse;
+            score.* = .{ .label = label, .score = probability };
+        }
+        std.mem.sort(Node.DirectClassificationScore, scores, {}, struct {
+            fn lessThan(_: void, left: Node.DirectClassificationScore, right: Node.DirectClassificationScore) bool {
+                return left.score > right.score;
+            }
+        }.lessThan);
+        out.* = scores;
+        initialized += 1;
+    }
+    return output;
+}
+
 fn appendExtractionClassificationBatch(
     allocator: std.mem.Allocator,
     lists: []std.ArrayListUnmanaged(extraction_api.ExtractionClassification),
@@ -19922,6 +20336,45 @@ fn appendExtractionClassificationBatch(
     }
 }
 
+test "qualified classification provider scores preserve borrowed labels and fail closed" {
+    const a = std.testing.allocator;
+    const labels = [_][]const u8{ "yes", "no" };
+    const prefix = "{\"object\":\"extraction\",\"model\":\"model\",\"data\":[{\"classifications\":";
+    const suffix = "}]}";
+    const valid = prefix ++ "[{\"name\":\"classification\",\"label\":\"no\",\"score\":0.25},{\"name\":\"classification\",\"label\":\"yes\",\"score\":0.75}]" ++ suffix;
+    const result = try qualifiedClassificationScores(a, valid, 1, &labels, true);
+    defer freeClassificationBatch(a, result);
+    try std.testing.expectEqual(@as(usize, 2), result[0].len);
+    try std.testing.expectEqual(@intFromPtr(labels[0].ptr), @intFromPtr(result[0][0].label.ptr));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), result[0][0].score, 1e-6);
+    try std.testing.expectError(error.InvalidExtractionResponse, qualifiedClassificationScores(a, valid, 2, &labels, true));
+    try std.testing.expectError(error.InvalidExtractionResponse, qualifiedClassificationScores(a, valid, 1, &labels, false));
+    inline for (.{
+        "[]",
+        "[{\"name\":\"classification\",\"label\":\"yes\",\"score\":0.5}]",
+        "[{\"name\":\"other\",\"label\":\"yes\",\"score\":0.5},{\"name\":\"classification\",\"label\":\"no\",\"score\":0.5}]",
+        "[{\"name\":\"classification\",\"label\":\"unknown\",\"score\":0.5},{\"name\":\"classification\",\"label\":\"no\",\"score\":0.5}]",
+        "[{\"name\":\"classification\",\"label\":\"yes\",\"score\":0.5},{\"name\":\"classification\",\"label\":\"yes\",\"score\":0.5}]",
+        "[{\"name\":\"classification\",\"label\":\"yes\"},{\"name\":\"classification\",\"label\":\"no\",\"score\":0.5}]",
+        "[{\"name\":\"classification\",\"label\":\"yes\",\"score\":1.1},{\"name\":\"classification\",\"label\":\"no\",\"score\":0.5}]",
+    }) |malformed| try std.testing.expectError(error.InvalidExtractionResponse, qualifiedClassificationScores(a, prefix ++ malformed ++ suffix, 1, &labels, true));
+    const single = prefix ++ "[{\"name\":\"classification\",\"label\":\"yes\",\"score\":0.9}]" ++ suffix;
+    const selected = try qualifiedClassificationScores(a, single, 1, &labels, false);
+    defer freeClassificationBatch(a, selected);
+    try std.testing.expectEqualStrings("yes", selected[0][0].label);
+}
+
+test "qualified classification provider score ownership survives allocation failures" {
+    const Runner = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const json = "{\"object\":\"extraction\",\"model\":\"model\",\"data\":[{\"classifications\":[{\"name\":\"classification\",\"label\":\"yes\",\"score\":0.7}]},{\"classifications\":[{\"name\":\"classification\",\"label\":\"no\",\"score\":0.8}]}]}";
+            const result = try qualifiedClassificationScores(a, json, 2, &.{ "yes", "no" }, false);
+            defer freeClassificationBatch(a, result);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
 const CanonicalExtractionOperation = enum {
     entities_relations,
     classifications,
@@ -19931,18 +20384,22 @@ const CanonicalExtractionOperation = enum {
 /// schema_version 1 gates multi-label classification labels with the
 /// request-level `options.threshold`; schema_version 2 uses a per-task
 /// `threshold` (default 0.5). When a v1 classification request is upgraded,
-/// carry an explicit request threshold into every task that sets none, so the
+/// carry the legacy default or explicit request threshold into every task that sets none, so the
 /// caller's cut-off keeps its meaning. Returns whether the schema changed.
 fn carryV1ClassificationThreshold(allocator: std.mem.Allocator, schema: *std.json.Value, options: std.json.Value) !bool {
-    if (options != .object) return false;
-    const threshold = options.object.get("threshold") orelse return false;
-    if (threshold != .float and threshold != .integer) return false;
+    const threshold: std.json.Value = if (options == .object) blk: {
+        const value = options.object.get("threshold") orelse break :blk .{ .float = 0.0 };
+        if (value == .null) break :blk .{ .float = 0.0 };
+        if (value != .float and value != .integer) return false;
+        break :blk value;
+    } else if (options == .null) .{ .float = 0.0 } else return false;
     if (schema.* != .object) return false;
     const tasks = schema.object.getPtr("classifications") orelse return false;
     if (tasks.* != .array) return false;
     var changed = false;
     for (tasks.array.items) |*task| {
-        if (task.* != .object or task.object.contains("threshold")) continue;
+        if (task.* != .object) continue;
+        if (task.object.get("threshold")) |value| if (value != .null) continue;
         try task.object.put(allocator, "threshold", threshold);
         changed = true;
     }
@@ -19963,6 +20420,19 @@ test "v1 classification upgrade keeps the request threshold per task" {
     try std.testing.expectEqual(@as(f64, 0.7), tasks[1].object.get("threshold").?.float);
     const none = try std.json.parseFromSliceLeaky(std.json.Value, a, "{}", .{});
     try std.testing.expect(!try carryV1ClassificationThreshold(a, &schema, none));
+    var omitted = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"classifications":[{"name":"multi","labels":["x","y"],"multi_label":true},{"name":"nullable","labels":["x","y"],"threshold":null}]}
+    , .{});
+    try std.testing.expect(try carryV1ClassificationThreshold(a, &omitted, none));
+    for (omitted.object.get("classifications").?.array.items) |task|
+        try std.testing.expectEqual(@as(f64, 0.0), task.object.get("threshold").?.float);
+    // Exercise the receiving compiler as well as the JSON shim: ordinary
+    // probability cutoffs include zero, unlike structured logit calibration.
+    const upgraded_json = try std.json.Stringify.valueAlloc(a, omitted, .{});
+    var compiled = try @import("../pipelines/extraction_schema.zig").compile(a, upgraded_json, .{ .allow_legacy_classification_threshold_endpoints = true });
+    defer compiled.deinit();
+    for (compiled.schema.classifications) |classification|
+        try std.testing.expectEqual(@as(f64, 0.0), classification.task.threshold);
 }
 
 /// Whether an extraction schema declares classification tasks and nothing else.
@@ -20683,8 +21153,14 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
         error.UnsupportedClassificationExtraction,
         error.UnsupportedInput,
         error.UnsupportedRelationExtraction,
+        error.UnsupportedGlinerDecisionGeometry,
         error.InvalidMaxTokens,
         => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+        error.GlinerDecisionArtifactMismatch,
+        error.MissingGlinerDecisionIdentity,
+        error.UnsupportedGlinerDecisionArtifact,
+        error.UnsupportedGlinerDecisionBackend,
+        => ctx.status(400).json(.{ .@"error" = "INVALID_MODEL", .message = @errorName(err) }),
         error.UnsupportedRebelEntityLabels,
         error.UnsupportedRebelRelationEndpoints,
         => rebelSchemaFailureResponse(ctx, err),
@@ -20700,6 +21176,8 @@ fn extractionDirectFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Re
 
 test {
     _ = @import("gliner_boundary_service_test.zig");
+    _ = @import("gliner_family_service_test.zig");
+    _ = @import("gliner_decide_1b_service_test.zig");
     _ = @import("gliner_boundary_socket_test.zig");
     _ = @import("gliner_boundary_concurrency_test.zig");
     _ = @import("gliner_boundary_metal_socket_test.zig");
@@ -21093,7 +21571,7 @@ test "gliner boundary v2 enum work retry releases every failed allocation" {
             defer a.free(bytes);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&fixture});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&fixture});
 }
 
 fn rebelSchemaFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
@@ -23319,6 +23797,45 @@ fn measureDirectGenerateDecodedPixels(
     return decoded_pixels;
 }
 
+const ExtractionTextAdmission = struct {
+    contract: ResolvedInferenceExecutorContract,
+    schema_bytes: usize,
+
+    fn validate(ptr: *anyopaque, texts: []const []const u8) !void {
+        const self: *ExtractionTextAdmission = @ptrCast(@alignCast(ptr));
+        try validateInferenceExecutorInvocation(self.contract, .{
+            .item_count = texts.len,
+            .text_bytes_per_item = maxTextBytes(texts),
+            .schema_bytes = self.schema_bytes,
+            .has_text = true,
+        });
+    }
+};
+
+const ExtractionReaderAdmission = struct {
+    node: *Node,
+    allocator: std.mem.Allocator,
+
+    fn validate(ptr: *anyopaque, model_path: []const u8, images: []const []const u8, options: readers_mod.ReadOptions) !void {
+        const self: *ExtractionReaderAdmission = @ptrCast(@alignCast(ptr));
+        var manifest = try manifest_mod.loadFromDir(self.allocator, model_path);
+        defer manifest.deinit();
+        const contract = try resolvedInferenceExecutorContract(self.node, "read", &manifest);
+        var encoded_bytes: usize = 0;
+        for (images) |image| encoded_bytes = std.math.add(usize, encoded_bytes, image.len) catch
+            return error.InferenceEncodedBytesExceeded;
+        try validateInferenceExecutorInvocation(contract, .{
+            .item_count = images.len,
+            .text_bytes_per_item = if (options.prompt) |prompt| prompt.len else 0,
+            .output_tokens_per_item = options.max_tokens orelse 0,
+            .encoded_media_bytes = encoded_bytes,
+            .decoded_pixels = try measureExecutorDecodedImages(&manifest, images),
+            .media_parts_per_item = 1,
+            .has_image = true,
+        });
+    }
+};
+
 const GenerateExecutorContractFailure = struct {
     status: u16,
     batch: api.GenerateBatchError,
@@ -23800,6 +24317,13 @@ test "task-neutral executor contract enforces every resolved resource dimension"
     try std.testing.expectError(error.InferenceCandidateLimitExceeded, validateInferenceExecutorInvocation(contract, .{ .candidates_per_request = 3 }));
     try std.testing.expectError(error.InferenceSchemaBytesExceeded, validateInferenceExecutorInvocation(contract, .{ .schema_bytes = 17 }));
     try std.testing.expectError(error.UnsupportedInferenceModality, validateInferenceExecutorInvocation(contract, .{ .has_audio = true }));
+    var text_contract = contract;
+    text_contract.accepts_image = false;
+    var ocr_admission = ExtractionTextAdmission{ .contract = text_contract, .schema_bytes = 16 };
+    try ExtractionTextAdmission.validate(&ocr_admission, &.{"12345678"});
+    try std.testing.expectError(error.InferenceTextBytesExceeded, ExtractionTextAdmission.validate(&ocr_admission, &.{"123456789"}));
+    ocr_admission.schema_bytes = 17;
+    try std.testing.expectError(error.InferenceSchemaBytesExceeded, ExtractionTextAdmission.validate(&ocr_admission, &.{"OCR"}));
 }
 
 test "generate executor contract error maps unqualified GLiNER boundary runtime to a dedicated response" {
@@ -26916,7 +27440,7 @@ test "Qwen3-VL encoded read results own page identities and report serial execut
             try std.testing.expectEqual(@as(usize, 0), batch.execution.fallback_items);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "read admission units scale with image batch and decode length" {
@@ -28405,6 +28929,15 @@ test "generation live pressure is an actionable retryable capacity error" {
     const saturated_batch_error = batchGenerationError(error.ConcurrencyUnavailable);
     try std.testing.expectEqualStrings("MODEL_RESOURCE_BUSY", saturated_batch_error.code);
     try std.testing.expect(saturated_batch_error.retryable);
+
+    var malformed = try generationErrorResponse(&ctx, error.InvalidToolArguments);
+    defer malformed.deinit();
+    try std.testing.expectEqual(@as(u16, 502), malformed.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, malformed.body.?, "\"error\":\"TOOL_ARGUMENTS_INVALID\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, malformed.body.?, "\"retryable\":true") != null);
+    const malformed_batch = batchGenerationError(error.InvalidToolArguments);
+    try std.testing.expectEqualStrings("TOOL_ARGUMENTS_INVALID", malformed_batch.code);
+    try std.testing.expect(malformed_batch.retryable);
 }
 
 test "registerRoutesOn supports alternate prefixes through the shared router" {
@@ -28710,6 +29243,11 @@ test "decide maps model resolution errors to client responses" {
         .{ error.ModelOutsideModelsDir, 400, "INVALID_REQUEST" },
         .{ error.ModelNotFound, 404, "MODEL_NOT_FOUND" },
         .{ error.AmbiguousModelIdentifier, 409, "AMBIGUOUS_MODEL" },
+        .{ error.MissingGlinerDecisionIdentity, 400, "INVALID_MODEL" },
+        .{ error.GlinerDecisionArtifactMismatch, 400, "INVALID_MODEL" },
+        .{ error.UnsupportedGlinerDecisionArtifact, 400, "INVALID_MODEL" },
+        .{ error.UnsupportedGlinerDecisionBackend, 400, "INVALID_MODEL" },
+        .{ error.UnsupportedGlinerDecisionGeometry, 400, "INVALID_REQUEST" },
         .{ error.InvalidDecideOutput, 500, "INFERENCE_FAILED" },
     };
     for (cases) |case| {
@@ -31458,7 +31996,7 @@ test "Antfly inference numeric HTTP response ownership is allocation failure saf
             try std.testing.expectEqual(@as(f32, 0.75), view.value(1));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn buildEmbedDenseResponse(
@@ -33344,6 +33882,12 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         .retryable = true,
     };
     return switch (err) {
+        error.InvalidToolArguments => .{
+            .status = 502,
+            .code = "TOOL_ARGUMENTS_INVALID",
+            .message = "model generated malformed tool arguments; request a corrected tool call",
+            .retryable = true,
+        },
         error.PromptTooLong => .{
             .status = 400,
             .code = "INVALID_REQUEST",

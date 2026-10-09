@@ -506,7 +506,7 @@ test "generated extractors: route table covers public API" {
 
 test "generated route policy inventory is unique and describes wire modes" {
     const server = public_server_generated.server;
-    var found_buffered_query = false;
+    var found_streaming_queries: usize = 0;
     var found_streaming_retrieval = false;
     var found_streaming_research = false;
     var found_streaming_inference_connection = false;
@@ -516,8 +516,11 @@ test "generated route policy inventory is unique and describes wire modes" {
                 std.mem.eql(u8, route.path, other.path)));
             try std.testing.expect(!std.mem.eql(u8, route.operation_id, other.operation_id));
         }
-        if (std.mem.eql(u8, route.operation_id, "globalQuery"))
-            found_buffered_query = route.request_body == .buffered and !route.streaming_response;
+        if (std.mem.eql(u8, route.operation_id, "globalQuery") or std.mem.eql(u8, route.operation_id, "queryTable") or std.mem.eql(u8, route.operation_id, "queryNamespaceTable")) {
+            try std.testing.expectEqual(.buffered, route.request_body);
+            try std.testing.expect(route.streaming_response);
+            found_streaming_queries += 1;
+        }
         if (std.mem.eql(u8, route.operation_id, "retrievalAgent"))
             found_streaming_retrieval = route.request_body == .buffered and route.streaming_response;
         if (std.mem.eql(u8, route.operation_id, "researchAgent"))
@@ -525,7 +528,7 @@ test "generated route policy inventory is unique and describes wire modes" {
         if (std.mem.eql(u8, route.operation_id, "invokeInferenceConnection"))
             found_streaming_inference_connection = route.request_body == .buffered and route.streaming_response;
     }
-    try std.testing.expect(found_buffered_query);
+    try std.testing.expectEqual(@as(usize, 3), found_streaming_queries);
     try std.testing.expect(found_streaming_retrieval);
     try std.testing.expect(found_streaming_research);
     try std.testing.expect(found_streaming_inference_connection);

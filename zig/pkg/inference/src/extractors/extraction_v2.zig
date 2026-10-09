@@ -1022,5 +1022,5 @@ fn wireAllocationLifecycle(a: Allocator) !void {
     defer a.free(json);
 }
 test "extraction v2 wire allocation failures release every owned schema and response" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, wireAllocationLifecycle, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, wireAllocationLifecycle, .{});
 }

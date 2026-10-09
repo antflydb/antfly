@@ -1,0 +1,1035 @@
+{
+  "baseline_commit": "848659238794469a9d5c86c0db27751d58b026c6",
+  "candidate_implementation_commit": "e5857402c61107886dc4ebf6b6367e17c080c628",
+  "baseline_changes": "Test-only benchmark fixtures; production code unchanged.",
+  "qualification": "Local ReleaseSafe fixtures. Performance measurements are not production throughput, storage-device I/O, or process RSS. Baseline and candidate use the same host; other development activity contributes timing variability.",
+  "extended_comparison": {
+    "method": "32 alternating-order ReleaseSafe runs; discard first as warmup. Same host with other development activity; fixture timings rather than production throughput or RSS.",
+    "fixtures": {
+      "streamed common postings merge matches": {
+        "before": {
+          "constant_metrics": {
+            "LITE_POSTINGS_MERGE.documents": 50000,
+            "LITE_POSTINGS_MERGE.streamed_peak": 416045,
+            "LITE_POSTINGS_MERGE.fallback_peak": 3799515,
+            "LITE_POSTINGS_MERGE.writes": 1
+          },
+          "variable_samples": {
+            "LITE_POSTINGS_MERGE.streamed_ns": [
+              5060000,
+              5701000,
+              5073000,
+              4871000,
+              5505000,
+              4784000,
+              4733000,
+              4712000,
+              4972000,
+              5316000,
+              5285000,
+              5150000,
+              5019000,
+              4606000,
+              4764000,
+              4750000,
+              4676000,
+              5830000,
+              5033000,
+              5512000,
+              5489000,
+              5788000,
+              6798000,
+              5317000,
+              5385000,
+              7334000,
+              5561000,
+              6156000,
+              5970000,
+              6620000,
+              8082000
+            ],
+            "LITE_POSTINGS_MERGE.fallback_ns": [
+              4692000,
+              5544000,
+              5314000,
+              4875000,
+              4904000,
+              4643000,
+              5091000,
+              4775000,
+              4896000,
+              4677000,
+              4960000,
+              4896000,
+              5027000,
+              4639000,
+              4671000,
+              4853000,
+              4703000,
+              4650000,
+              4979000,
+              5088000,
+              6227000,
+              4693000,
+              9323000,
+              5476000,
+              4666000,
+              5250000,
+              8758000,
+              7239000,
+              7335000,
+              5242000,
+              5252000
+            ]
+          },
+          "sample_count": 31
+        },
+        "after": {
+          "constant_metrics": {
+            "LITE_POSTINGS_MERGE.documents": 50000,
+            "LITE_POSTINGS_MERGE.streamed_peak": 416045,
+            "LITE_POSTINGS_MERGE.fallback_peak": 3799515,
+            "LITE_POSTINGS_MERGE.writes": 1
+          },
+          "variable_samples": {
+            "LITE_POSTINGS_MERGE.streamed_ns": [
+              5811000,
+              4975000,
+              4714000,
+              5008000,
+              4937000,
+              5116000,
+              5054000,
+              5073000,
+              4814000,
+              5485000,
+              4715000,
+              4832000,
+              4737000,
+              4697000,
+              4746000,
+              4850000,
+              4941000,
+              4841000,
+              4798000,
+              5984000,
+              5172000,
+              4713000,
+              5263000,
+              5124000,
+              6621000,
+              5341000,
+              8701000,
+              7905000,
+              7740000,
+              4712000,
+              5812000
+            ],
+            "LITE_POSTINGS_MERGE.fallback_ns": [
+              4803000,
+              4931000,
+              5036000,
+              5437000,
+              4573000,
+              5121000,
+              4760000,
+              5005000,
+              4797000,
+              5152000,
+              4580000,
+              4685000,
+              4851000,
+              4896000,
+              5029000,
+              4825000,
+              5016000,
+              4738000,
+              4578000,
+              6059000,
+              6704000,
+              4959000,
+              5476000,
+              9314000,
+              9240000,
+              4941000,
+              9986000,
+              8666000,
+              6265000,
+              4573000,
+              5161000
+            ]
+          },
+          "sample_count": 31
+        }
+      },
+      "v23 positional merges and historical spills": {
+        "before": {
+          "constant_metrics": {
+            "LITE_LEGACY_PACKED_false.docs": 256,
+            "LITE_LEGACY_PACKED_false.positions": 4096,
+            "LITE_LEGACY_PACKED_false.peak": 67168,
+            "LITE_LEGACY_PACKED_false.source_reads": 0,
+            "LITE_LEGACY_PACKED_false.source_bytes": 0,
+            "LITE_LEGACY_SPILL_false.peak": 458727,
+            "LITE_LEGACY_SPILL_false.input_bytes": 138496,
+            "LITE_LEGACY_PACKED_true.docs": 256,
+            "LITE_LEGACY_PACKED_true.positions": 4096,
+            "LITE_LEGACY_PACKED_true.peak": 84232,
+            "LITE_LEGACY_PACKED_true.source_reads": 1280,
+            "LITE_LEGACY_PACKED_true.source_bytes": 262912,
+            "LITE_LEGACY_SPILL_true.peak": 458727,
+            "LITE_LEGACY_SPILL_true.input_bytes": 138496
+          },
+          "variable_samples": {
+            "LITE_LEGACY_PACKED_false.elapsed_ns": [
+              643000,
+              402000,
+              383000,
+              385000,
+              580000,
+              484000,
+              430000,
+              673000,
+              403000,
+              578000,
+              389000,
+              1171000,
+              661000,
+              817000,
+              376000,
+              423000,
+              386000,
+              428000,
+              394000,
+              735000,
+              380000,
+              379000,
+              382000,
+              430000,
+              568000,
+              426000,
+              385000,
+              7381000,
+              424000,
+              428000,
+              379000
+            ],
+            "LITE_LEGACY_SPILL_false.elapsed_ns": [
+              1221000,
+              959000,
+              1096000,
+              868000,
+              1969000,
+              1917000,
+              886000,
+              1597000,
+              919000,
+              987000,
+              907000,
+              1016000,
+              1982000,
+              1275000,
+              857000,
+              882000,
+              876000,
+              1060000,
+              10758000,
+              1207000,
+              861000,
+              885000,
+              1020000,
+              1024000,
+              1759000,
+              868000,
+              965000,
+              1038000,
+              915000,
+              1985000,
+              919000
+            ],
+            "LITE_LEGACY_PACKED_true.elapsed_ns": [
+              1487000,
+              2030000,
+              1579000,
+              1497000,
+              1853000,
+              1915000,
+              1749000,
+              1622000,
+              1780000,
+              2323000,
+              1556000,
+              2022000,
+              1917000,
+              1479000,
+              1466000,
+              1879000,
+              1529000,
+              1459000,
+              1500000,
+              3193000,
+              1537000,
+              1542000,
+              1456000,
+              2983000,
+              1911000,
+              1524000,
+              1517000,
+              2030000,
+              1607000,
+              1879000,
+              1578000
+            ],
+            "LITE_LEGACY_SPILL_true.elapsed_ns": [
+              2540000,
+              2172000,
+              2139000,
+              2644000,
+              2201000,
+              2476000,
+              4449000,
+              3236000,
+              4360000,
+              2008000,
+              3728000,
+              2173000,
+              4193000,
+              6432000,
+              2154000,
+              2061000,
+              6008000,
+              4007000,
+              7245000,
+              5487000,
+              2007000,
+              5344000,
+              3403000,
+              3924000,
+              1977000,
+              4741000,
+              2396000,
+              2908000,
+              2201000,
+              2372000,
+              2026000
+            ]
+          },
+          "sample_count": 31
+        },
+        "after": {
+          "constant_metrics": {
+            "LITE_LEGACY_PACKED_false.docs": 256,
+            "LITE_LEGACY_PACKED_false.positions": 4096,
+            "LITE_LEGACY_PACKED_false.peak": 67168,
+            "LITE_LEGACY_PACKED_false.source_reads": 0,
+            "LITE_LEGACY_PACKED_false.source_bytes": 0,
+            "LITE_LEGACY_SPILL_false.peak": 458727,
+            "LITE_LEGACY_SPILL_false.input_bytes": 138496,
+            "LITE_LEGACY_PACKED_true.docs": 256,
+            "LITE_LEGACY_PACKED_true.positions": 4096,
+            "LITE_LEGACY_PACKED_true.peak": 84232,
+            "LITE_LEGACY_PACKED_true.source_reads": 1280,
+            "LITE_LEGACY_PACKED_true.source_bytes": 262912,
+            "LITE_LEGACY_SPILL_true.peak": 458727,
+            "LITE_LEGACY_SPILL_true.input_bytes": 138496
+          },
+          "variable_samples": {
+            "LITE_LEGACY_PACKED_false.elapsed_ns": [
+              157000,
+              156000,
+              173000,
+              151000,
+              148000,
+              150000,
+              154000,
+              552000,
+              163000,
+              156000,
+              160000,
+              159000,
+              155000,
+              250000,
+              155000,
+              148000,
+              147000,
+              851000,
+              153000,
+              168000,
+              155000,
+              240000,
+              200000,
+              152000,
+              153000,
+              153000,
+              178000,
+              156000,
+              159000,
+              158000,
+              165000
+            ],
+            "LITE_LEGACY_SPILL_false.elapsed_ns": [
+              719000,
+              644000,
+              667000,
+              603000,
+              609000,
+              618000,
+              623000,
+              815000,
+              855000,
+              648000,
+              633000,
+              725000,
+              3009000,
+              891000,
+              689000,
+              744000,
+              653000,
+              753000,
+              692000,
+              1529000,
+              666000,
+              650000,
+              677000,
+              649000,
+              671000,
+              815000,
+              1314000,
+              3141000,
+              1543000,
+              1573000,
+              750000
+            ],
+            "LITE_LEGACY_PACKED_true.elapsed_ns": [
+              175000,
+              185000,
+              161000,
+              224000,
+              167000,
+              326000,
+              166000,
+              161000,
+              165000,
+              587000,
+              215000,
+              353000,
+              887000,
+              356000,
+              157000,
+              189000,
+              180000,
+              305000,
+              158000,
+              404000,
+              886000,
+              172000,
+              161000,
+              220000,
+              179000,
+              237000,
+              828000,
+              181000,
+              198000,
+              228000,
+              166000
+            ],
+            "LITE_LEGACY_SPILL_true.elapsed_ns": [
+              676000,
+              640000,
+              673000,
+              756000,
+              785000,
+              791000,
+              681000,
+              1776000,
+              748000,
+              3374000,
+              707000,
+              1201000,
+              3643000,
+              1600000,
+              862000,
+              730000,
+              816000,
+              702000,
+              932000,
+              4592000,
+              942000,
+              821000,
+              911000,
+              747000,
+              666000,
+              1943000,
+              676000,
+              661000,
+              697000,
+              984000,
+              686000
+            ]
+          },
+          "sample_count": 31
+        }
+      },
+      "packed position width proofs": {
+        "before": {
+          "constant_metrics": {
+            "LITE_WIDTH_PROOF.cases": 32,
+            "LITE_WIDTH_PROOF.full_scan_bytes": 270336,
+            "LITE_WIDTH_PROOF.proof_bytes": 270336
+          },
+          "variable_samples": {},
+          "sample_count": 31
+        },
+        "after": {
+          "constant_metrics": {
+            "LITE_WIDTH_PROOF.cases": 32,
+            "LITE_WIDTH_PROOF.full_scan_bytes": 270336,
+            "LITE_WIDTH_PROOF.proof_bytes": 8192
+          },
+          "variable_samples": {},
+          "sample_count": 31
+        }
+      },
+      "spill preparation reuses bounded iterator scratch": {
+        "before": {
+          "constant_metrics": {
+            "LITE_SPILL_WORKSPACE_false.warm_terms": 6,
+            "LITE_SPILL_WORKSPACE_false.allocations": 195,
+            "LITE_SPILL_WORKSPACE_false.peak": 91017,
+            "LITE_SPILL_WORKSPACE_true.warm_terms": 6,
+            "LITE_SPILL_WORKSPACE_true.allocations": 181,
+            "LITE_SPILL_WORKSPACE_true.peak": 91164
+          },
+          "variable_samples": {},
+          "sample_count": 31
+        },
+        "after": {
+          "constant_metrics": {
+            "LITE_SPILL_WORKSPACE_false.warm_terms": 6,
+            "LITE_SPILL_WORKSPACE_false.allocations": 195,
+            "LITE_SPILL_WORKSPACE_false.peak": 91017,
+            "LITE_SPILL_WORKSPACE_true.warm_terms": 6,
+            "LITE_SPILL_WORKSPACE_true.allocations": 163,
+            "LITE_SPILL_WORKSPACE_true.peak": 92332
+          },
+          "variable_samples": {},
+          "sample_count": 31
+        }
+      }
+    },
+    "medians": {
+      "streamed common postings merge matches": {
+        "before": {
+          "LITE_POSTINGS_MERGE.documents": 50000,
+          "LITE_POSTINGS_MERGE.streamed_peak": 416045,
+          "LITE_POSTINGS_MERGE.fallback_peak": 3799515,
+          "LITE_POSTINGS_MERGE.streamed_ns": 5316000,
+          "LITE_POSTINGS_MERGE.fallback_ns": 4960000,
+          "LITE_POSTINGS_MERGE.writes": 1
+        },
+        "after": {
+          "LITE_POSTINGS_MERGE.documents": 50000,
+          "LITE_POSTINGS_MERGE.streamed_peak": 416045,
+          "LITE_POSTINGS_MERGE.fallback_peak": 3799515,
+          "LITE_POSTINGS_MERGE.streamed_ns": 5008000,
+          "LITE_POSTINGS_MERGE.fallback_ns": 5005000,
+          "LITE_POSTINGS_MERGE.writes": 1
+        }
+      },
+      "v23 positional merges and historical spills": {
+        "before": {
+          "LITE_LEGACY_PACKED_false.docs": 256,
+          "LITE_LEGACY_PACKED_false.positions": 4096,
+          "LITE_LEGACY_PACKED_false.peak": 67168,
+          "LITE_LEGACY_PACKED_false.elapsed_ns": 426000,
+          "LITE_LEGACY_PACKED_false.source_reads": 0,
+          "LITE_LEGACY_PACKED_false.source_bytes": 0,
+          "LITE_LEGACY_SPILL_false.elapsed_ns": 1016000,
+          "LITE_LEGACY_SPILL_false.peak": 458727,
+          "LITE_LEGACY_SPILL_false.input_bytes": 138496,
+          "LITE_LEGACY_PACKED_true.docs": 256,
+          "LITE_LEGACY_PACKED_true.positions": 4096,
+          "LITE_LEGACY_PACKED_true.peak": 84232,
+          "LITE_LEGACY_PACKED_true.elapsed_ns": 1607000,
+          "LITE_LEGACY_PACKED_true.source_reads": 1280,
+          "LITE_LEGACY_PACKED_true.source_bytes": 262912,
+          "LITE_LEGACY_SPILL_true.elapsed_ns": 2644000,
+          "LITE_LEGACY_SPILL_true.peak": 458727,
+          "LITE_LEGACY_SPILL_true.input_bytes": 138496
+        },
+        "after": {
+          "LITE_LEGACY_PACKED_false.docs": 256,
+          "LITE_LEGACY_PACKED_false.positions": 4096,
+          "LITE_LEGACY_PACKED_false.peak": 67168,
+          "LITE_LEGACY_PACKED_false.elapsed_ns": 156000,
+          "LITE_LEGACY_PACKED_false.source_reads": 0,
+          "LITE_LEGACY_PACKED_false.source_bytes": 0,
+          "LITE_LEGACY_SPILL_false.elapsed_ns": 692000,
+          "LITE_LEGACY_SPILL_false.peak": 458727,
+          "LITE_LEGACY_SPILL_false.input_bytes": 138496,
+          "LITE_LEGACY_PACKED_true.docs": 256,
+          "LITE_LEGACY_PACKED_true.positions": 4096,
+          "LITE_LEGACY_PACKED_true.peak": 84232,
+          "LITE_LEGACY_PACKED_true.elapsed_ns": 189000,
+          "LITE_LEGACY_PACKED_true.source_reads": 1280,
+          "LITE_LEGACY_PACKED_true.source_bytes": 262912,
+          "LITE_LEGACY_SPILL_true.elapsed_ns": 785000,
+          "LITE_LEGACY_SPILL_true.peak": 458727,
+          "LITE_LEGACY_SPILL_true.input_bytes": 138496
+        }
+      },
+      "packed position width proofs": {
+        "before": {
+          "LITE_WIDTH_PROOF.cases": 32,
+          "LITE_WIDTH_PROOF.full_scan_bytes": 270336,
+          "LITE_WIDTH_PROOF.proof_bytes": 270336
+        },
+        "after": {
+          "LITE_WIDTH_PROOF.cases": 32,
+          "LITE_WIDTH_PROOF.full_scan_bytes": 270336,
+          "LITE_WIDTH_PROOF.proof_bytes": 8192
+        }
+      },
+      "spill preparation reuses bounded iterator scratch": {
+        "before": {
+          "LITE_SPILL_WORKSPACE_false.warm_terms": 6,
+          "LITE_SPILL_WORKSPACE_false.allocations": 195,
+          "LITE_SPILL_WORKSPACE_false.peak": 91017,
+          "LITE_SPILL_WORKSPACE_true.warm_terms": 6,
+          "LITE_SPILL_WORKSPACE_true.allocations": 181,
+          "LITE_SPILL_WORKSPACE_true.peak": 91164
+        },
+        "after": {
+          "LITE_SPILL_WORKSPACE_false.warm_terms": 6,
+          "LITE_SPILL_WORKSPACE_false.allocations": 195,
+          "LITE_SPILL_WORKSPACE_false.peak": 91017,
+          "LITE_SPILL_WORKSPACE_true.warm_terms": 6,
+          "LITE_SPILL_WORKSPACE_true.allocations": 163,
+          "LITE_SPILL_WORKSPACE_true.peak": 92332
+        }
+      }
+    }
+  },
+  "contended_pilot": {
+    "method": "Eight alternating-order ReleaseSafe runs; discard first as warmup. Same host with other builds active. Measures fixtures rather than production throughput or RSS.",
+    "fixtures": {
+      "streamed common postings merge matches": {
+        "before": {
+          "constant_metrics": {
+            "LITE_POSTINGS_MERGE.documents": 50000,
+            "LITE_POSTINGS_MERGE.streamed_peak": 416045,
+            "LITE_POSTINGS_MERGE.fallback_peak": 3799515,
+            "LITE_POSTINGS_MERGE.writes": 1
+          },
+          "variable_samples": {
+            "LITE_POSTINGS_MERGE.streamed_ns": [
+              9029000,
+              7665000,
+              5361000,
+              7746000,
+              10478000,
+              7255000,
+              9790000
+            ],
+            "LITE_POSTINGS_MERGE.fallback_ns": [
+              9437000,
+              27241000,
+              6654000,
+              10777000,
+              9250000,
+              8625000,
+              16481000
+            ]
+          },
+          "sample_count": 7
+        },
+        "after": {
+          "constant_metrics": {
+            "LITE_POSTINGS_MERGE.documents": 50000,
+            "LITE_POSTINGS_MERGE.streamed_peak": 416045,
+            "LITE_POSTINGS_MERGE.fallback_peak": 3799515,
+            "LITE_POSTINGS_MERGE.writes": 1
+          },
+          "variable_samples": {
+            "LITE_POSTINGS_MERGE.streamed_ns": [
+              5625000,
+              11463000,
+              5111000,
+              8677000,
+              7201000,
+              7256000,
+              7779000
+            ],
+            "LITE_POSTINGS_MERGE.fallback_ns": [
+              7382000,
+              12493000,
+              7565000,
+              12874000,
+              10828000,
+              14462000,
+              8093000
+            ]
+          },
+          "sample_count": 7
+        }
+      },
+      "v23 positional merges and historical spills": {
+        "before": {
+          "constant_metrics": {
+            "LITE_LEGACY_PACKED_false.docs": 256,
+            "LITE_LEGACY_PACKED_false.positions": 4096,
+            "LITE_LEGACY_PACKED_false.peak": 67168,
+            "LITE_LEGACY_PACKED_false.source_reads": 0,
+            "LITE_LEGACY_PACKED_false.source_bytes": 0,
+            "LITE_LEGACY_SPILL_false.peak": 458727,
+            "LITE_LEGACY_SPILL_false.input_bytes": 138496,
+            "LITE_LEGACY_PACKED_true.docs": 256,
+            "LITE_LEGACY_PACKED_true.positions": 4096,
+            "LITE_LEGACY_PACKED_true.peak": 84232,
+            "LITE_LEGACY_PACKED_true.source_reads": 1280,
+            "LITE_LEGACY_PACKED_true.source_bytes": 262912,
+            "LITE_LEGACY_SPILL_true.peak": 458727,
+            "LITE_LEGACY_SPILL_true.input_bytes": 138496
+          },
+          "variable_samples": {
+            "LITE_LEGACY_PACKED_false.elapsed_ns": [
+              746000,
+              795000,
+              1417000,
+              797000,
+              1482000,
+              1809000,
+              2214000
+            ],
+            "LITE_LEGACY_SPILL_false.elapsed_ns": [
+              2498000,
+              2630000,
+              1846000,
+              1445000,
+              3986000,
+              7518000,
+              9265000
+            ],
+            "LITE_LEGACY_PACKED_true.elapsed_ns": [
+              2914000,
+              1708000,
+              1855000,
+              2817000,
+              6128000,
+              3322000,
+              4880000
+            ],
+            "LITE_LEGACY_SPILL_true.elapsed_ns": [
+              6939000,
+              4161000,
+              2444000,
+              2438000,
+              4377000,
+              11009000,
+              10378000
+            ]
+          },
+          "sample_count": 7
+        },
+        "after": {
+          "constant_metrics": {
+            "LITE_LEGACY_PACKED_false.docs": 256,
+            "LITE_LEGACY_PACKED_false.positions": 4096,
+            "LITE_LEGACY_PACKED_false.peak": 67168,
+            "LITE_LEGACY_PACKED_false.source_reads": 0,
+            "LITE_LEGACY_PACKED_false.source_bytes": 0,
+            "LITE_LEGACY_SPILL_false.peak": 458727,
+            "LITE_LEGACY_SPILL_false.input_bytes": 138496,
+            "LITE_LEGACY_PACKED_true.docs": 256,
+            "LITE_LEGACY_PACKED_true.positions": 4096,
+            "LITE_LEGACY_PACKED_true.peak": 84232,
+            "LITE_LEGACY_PACKED_true.source_reads": 1280,
+            "LITE_LEGACY_PACKED_true.source_bytes": 262912,
+            "LITE_LEGACY_SPILL_true.peak": 458727,
+            "LITE_LEGACY_SPILL_true.input_bytes": 138496
+          },
+          "variable_samples": {
+            "LITE_LEGACY_PACKED_false.elapsed_ns": [
+              170000,
+              632000,
+              161000,
+              713000,
+              199000,
+              643000,
+              675000
+            ],
+            "LITE_LEGACY_SPILL_false.elapsed_ns": [
+              858000,
+              2165000,
+              697000,
+              2568000,
+              2165000,
+              689000,
+              6615000
+            ],
+            "LITE_LEGACY_PACKED_true.elapsed_ns": [
+              3036000,
+              156000,
+              5135000,
+              1676000,
+              541000,
+              1857000,
+              1284000
+            ],
+            "LITE_LEGACY_SPILL_true.elapsed_ns": [
+              9989000,
+              864000,
+              5083000,
+              7925000,
+              1416000,
+              11930000,
+              3672000
+            ]
+          },
+          "sample_count": 7
+        }
+      },
+      "packed position width proofs": {
+        "before": {
+          "constant_metrics": {
+            "LITE_WIDTH_PROOF.cases": 32,
+            "LITE_WIDTH_PROOF.full_scan_bytes": 270336,
+            "LITE_WIDTH_PROOF.proof_bytes": 270336
+          },
+          "variable_samples": {},
+          "sample_count": 7
+        },
+        "after": {
+          "constant_metrics": {
+            "LITE_WIDTH_PROOF.cases": 32,
+            "LITE_WIDTH_PROOF.full_scan_bytes": 270336,
+            "LITE_WIDTH_PROOF.proof_bytes": 8192
+          },
+          "variable_samples": {},
+          "sample_count": 7
+        }
+      },
+      "spill preparation reuses bounded iterator scratch": {
+        "before": {
+          "constant_metrics": {
+            "LITE_SPILL_WORKSPACE_false.warm_terms": 6,
+            "LITE_SPILL_WORKSPACE_false.allocations": 195,
+            "LITE_SPILL_WORKSPACE_false.peak": 91017,
+            "LITE_SPILL_WORKSPACE_true.warm_terms": 6,
+            "LITE_SPILL_WORKSPACE_true.allocations": 181,
+            "LITE_SPILL_WORKSPACE_true.peak": 91164
+          },
+          "variable_samples": {},
+          "sample_count": 7
+        },
+        "after": {
+          "constant_metrics": {
+            "LITE_SPILL_WORKSPACE_false.warm_terms": 6,
+            "LITE_SPILL_WORKSPACE_false.allocations": 195,
+            "LITE_SPILL_WORKSPACE_false.peak": 91017,
+            "LITE_SPILL_WORKSPACE_true.warm_terms": 6,
+            "LITE_SPILL_WORKSPACE_true.allocations": 163,
+            "LITE_SPILL_WORKSPACE_true.peak": 92332
+          },
+          "variable_samples": {},
+          "sample_count": 7
+        }
+      }
+    },
+    "medians": {
+      "streamed common postings merge matches": {
+        "before": {
+          "LITE_POSTINGS_MERGE.documents": 50000,
+          "LITE_POSTINGS_MERGE.streamed_peak": 416045,
+          "LITE_POSTINGS_MERGE.fallback_peak": 3799515,
+          "LITE_POSTINGS_MERGE.streamed_ns": 7746000,
+          "LITE_POSTINGS_MERGE.fallback_ns": 9437000,
+          "LITE_POSTINGS_MERGE.writes": 1
+        },
+        "after": {
+          "LITE_POSTINGS_MERGE.documents": 50000,
+          "LITE_POSTINGS_MERGE.streamed_peak": 416045,
+          "LITE_POSTINGS_MERGE.fallback_peak": 3799515,
+          "LITE_POSTINGS_MERGE.streamed_ns": 7256000,
+          "LITE_POSTINGS_MERGE.fallback_ns": 10828000,
+          "LITE_POSTINGS_MERGE.writes": 1
+        }
+      },
+      "v23 positional merges and historical spills": {
+        "before": {
+          "LITE_LEGACY_PACKED_false.docs": 256,
+          "LITE_LEGACY_PACKED_false.positions": 4096,
+          "LITE_LEGACY_PACKED_false.peak": 67168,
+          "LITE_LEGACY_PACKED_false.elapsed_ns": 1417000,
+          "LITE_LEGACY_PACKED_false.source_reads": 0,
+          "LITE_LEGACY_PACKED_false.source_bytes": 0,
+          "LITE_LEGACY_SPILL_false.elapsed_ns": 2630000,
+          "LITE_LEGACY_SPILL_false.peak": 458727,
+          "LITE_LEGACY_SPILL_false.input_bytes": 138496,
+          "LITE_LEGACY_PACKED_true.docs": 256,
+          "LITE_LEGACY_PACKED_true.positions": 4096,
+          "LITE_LEGACY_PACKED_true.peak": 84232,
+          "LITE_LEGACY_PACKED_true.elapsed_ns": 2914000,
+          "LITE_LEGACY_PACKED_true.source_reads": 1280,
+          "LITE_LEGACY_PACKED_true.source_bytes": 262912,
+          "LITE_LEGACY_SPILL_true.elapsed_ns": 4377000,
+          "LITE_LEGACY_SPILL_true.peak": 458727,
+          "LITE_LEGACY_SPILL_true.input_bytes": 138496
+        },
+        "after": {
+          "LITE_LEGACY_PACKED_false.docs": 256,
+          "LITE_LEGACY_PACKED_false.positions": 4096,
+          "LITE_LEGACY_PACKED_false.peak": 67168,
+          "LITE_LEGACY_PACKED_false.elapsed_ns": 632000,
+          "LITE_LEGACY_PACKED_false.source_reads": 0,
+          "LITE_LEGACY_PACKED_false.source_bytes": 0,
+          "LITE_LEGACY_SPILL_false.elapsed_ns": 2165000,
+          "LITE_LEGACY_SPILL_false.peak": 458727,
+          "LITE_LEGACY_SPILL_false.input_bytes": 138496,
+          "LITE_LEGACY_PACKED_true.docs": 256,
+          "LITE_LEGACY_PACKED_true.positions": 4096,
+          "LITE_LEGACY_PACKED_true.peak": 84232,
+          "LITE_LEGACY_PACKED_true.elapsed_ns": 1676000,
+          "LITE_LEGACY_PACKED_true.source_reads": 1280,
+          "LITE_LEGACY_PACKED_true.source_bytes": 262912,
+          "LITE_LEGACY_SPILL_true.elapsed_ns": 5083000,
+          "LITE_LEGACY_SPILL_true.peak": 458727,
+          "LITE_LEGACY_SPILL_true.input_bytes": 138496
+        }
+      },
+      "packed position width proofs": {
+        "before": {
+          "LITE_WIDTH_PROOF.cases": 32,
+          "LITE_WIDTH_PROOF.full_scan_bytes": 270336,
+          "LITE_WIDTH_PROOF.proof_bytes": 270336
+        },
+        "after": {
+          "LITE_WIDTH_PROOF.cases": 32,
+          "LITE_WIDTH_PROOF.full_scan_bytes": 270336,
+          "LITE_WIDTH_PROOF.proof_bytes": 8192
+        }
+      },
+      "spill preparation reuses bounded iterator scratch": {
+        "before": {
+          "LITE_SPILL_WORKSPACE_false.warm_terms": 6,
+          "LITE_SPILL_WORKSPACE_false.allocations": 195,
+          "LITE_SPILL_WORKSPACE_false.peak": 91017,
+          "LITE_SPILL_WORKSPACE_true.warm_terms": 6,
+          "LITE_SPILL_WORKSPACE_true.allocations": 181,
+          "LITE_SPILL_WORKSPACE_true.peak": 91164
+        },
+        "after": {
+          "LITE_SPILL_WORKSPACE_false.warm_terms": 6,
+          "LITE_SPILL_WORKSPACE_false.allocations": 195,
+          "LITE_SPILL_WORKSPACE_false.peak": 91017,
+          "LITE_SPILL_WORKSPACE_true.warm_terms": 6,
+          "LITE_SPILL_WORKSPACE_true.allocations": 163,
+          "LITE_SPILL_WORKSPACE_true.peak": 92332
+        }
+      }
+    }
+  },
+  "native_cursor_scratch": {
+    "fixture": "lite native immutable value traversal needs no heap scratch for ordinary extents",
+    "value_bytes": 1048576,
+    "shared_comparison_traversals": 16,
+    "baseline_heap_allocations": 16,
+    "candidate_heap_allocations": 0,
+    "inline_levels": 4,
+    "inline_stack_bytes": 6240,
+    "maximum_wire_levels": 63,
+    "maximum_overflow_bytes": 98280,
+    "deep_overflow_allocations": 1,
+    "notes": "Heap counts cover the NativeFile allocator with shared native page caching disabled. Four inline frames replace ordinary traversal heap scratch; deeper trees use one exact allocation bounded by the validated root height. They do not establish zero allocations elsewhere or a process RSS reduction.",
+    "candidate_total_traversals": 24,
+    "candidate_extra_misaligned_traversals": 8,
+    "misaligned_range_offset": 123,
+    "misaligned_range_length": 65536,
+    "misaligned_range_maximum_backing_bytes": 81920
+  },
+  "authentication_io": {
+    "fixture": "fused authentication shares native cached reads without duplicate slabs",
+    "read_lengths_bytes": [
+      8,
+      65536
+    ],
+    "native_page_cache_enabled": false,
+    "plain_provider": {
+      "cold_page_requests": [
+        22,
+        22
+      ],
+      "cold_backing_read_calls": [
+        7,
+        7
+      ],
+      "cold_backing_read_bytes": [
+        90112,
+        90112
+      ],
+      "warm_backing_read_calls": [
+        0,
+        0
+      ],
+      "warm_backing_read_bytes": [
+        0,
+        0
+      ]
+    },
+    "bounded_fused_provider": {
+      "cold_page_requests": [
+        22,
+        22
+      ],
+      "cold_backing_read_calls": [
+        6,
+        6
+      ],
+      "cold_backing_read_bytes": [
+        86016,
+        86016
+      ],
+      "warm_backing_read_calls": [
+        0,
+        0
+      ],
+      "warm_backing_read_bytes": [
+        0,
+        0
+      ]
+    },
+    "counter_semantics": "Page requests include cursor-local cache hits. Backing counters cover exact page-read attempts and requested bytes after both shared and cursor-local cache lookup, including direct page reads and read-ahead. Successful fixture reads are not measurements of storage-device cache misses."
+  },
+  "bounds_and_compatibility": {
+    "iterator_retention_limit_bytes": 262144,
+    "encoding_and_compact_retention_limit_bytes": 262144,
+    "spill_warm_terms": 6,
+    "spill_baseline_allocations": 181,
+    "spill_candidate_allocations": 163,
+    "spill_baseline_peak_bytes": 91164,
+    "spill_candidate_peak_bytes": 92332,
+    "position_width_cases": 32,
+    "position_width_baseline_logical_bytes": 270336,
+    "position_width_candidate_logical_bytes": 8192,
+    "overwide_and_zero_records": "Still narrow to the minimum exact width. Mixed-width decoded/packed crossover and allocation failure fixtures pass.",
+    "encoded_legacy_spill_input_bytes": 138496,
+    "legacy_range_source_reads": 1280,
+    "legacy_range_source_bytes": 262912,
+    "legacy_range_note": "Source read counts/bytes and encoded size remain equal despite the CPU reduction; the width-proof direct-range fixture is a separate logical-read measurement."
+  },
+  "validation": {
+    "native_reader_search_tests_passed": 334,
+    "lite_storage_tests_passed": 367,
+    "lite_storage_tests_skipped": 5,
+    "persistent_artifact_tests_passed": 7,
+    "persistent_root_smoke_tests_passed": 1,
+    "publication_runtime_tests_passed": 2,
+    "bounded_database_integration_tests_passed": 5,
+    "wasm_platform_and_embedded_smoke": "passed",
+    "authored_source_boundary_sources": 743,
+    "format_and_diff_checks": "passed",
+    "misaligned_native_range_test": "passed, including backing-read bound and CRC delivery under a zero-heap-scratch limit",
+    "final_native_source_storage_suite_passed": 371,
+    "final_native_source_storage_suite_skipped": 5
+  }
+}

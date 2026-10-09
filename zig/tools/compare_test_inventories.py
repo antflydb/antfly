@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 from pathlib import Path
 from typing import Sequence
@@ -41,7 +42,11 @@ def parse_inventory(output: str, *, include_unnamed: bool = False) -> frozenset[
             f"test executable produced duplicate inventory entries: {duplicates}"
         )
     if not include_unnamed:
-        names = [name for name in names if not name.endswith(".test_0")]
+        names = [
+            name
+            for name in names
+            if ".test." in name or not re.search(r"\.test_[0-9]+$", name)
+        ]
     return frozenset(names)
 
 

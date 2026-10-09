@@ -340,7 +340,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const run_sql_tests = b.addRunArtifact(sql_tests);
     // The native SQL contract corpus is larger than the parser-only owner but
     // remains below the full database compilation and integration test roots.
-    sql_tests.step.max_rss = 1536 * 1024 * 1024;
+    sql_tests.step.max_rss = 3072 * 1024 * 1024;
     // The complete compiler/executor corpus includes exhaustive allocation-fault
     // runs and parallel partition lifecycle checks. This scheduling estimate
     // is independent of the executor's per-statement memory admission tests.
@@ -572,6 +572,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     });
     regex_mod.addImport("antfly_fst", fst_mod);
+    regex_mod.addImport("antfly_platform", platform_mod);
     const jsonschema_mod = b.createModule(.{
         .root_source_file = b.path("lib/jsonschema/src/mod.zig"),
         .target = target,
@@ -972,6 +973,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     inference_worker_wire_mod.addImport("antfly_inference_bridge", inference_bridge_mod);
     inference_worker_wire_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
+    inference_worker_wire_mod.addImport("antfly_platform", platform_mod);
     inference_worker_wire_mod.addImport("httpx", httpx_mod);
     inference_worker_wire_mod.addImport("antfly_inference_worker_rpc", inference_worker_rpc_mod);
     inference_worker_wire_mod.addImport("antfly_inference_work", inference_work_mod);

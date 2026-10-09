@@ -80,6 +80,8 @@ pub const Config = struct {
     backup: BackupConfig = .{},
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
+    lake_cache: LakeCacheConfig = .{},
+    lake_indexes: LakeIndexConfig = .{},
     transaction_sessions: TransactionSessionConfig = .{},
     ha: ?HotStandbyConfig = null,
     inference: InferenceConfig = .{},
@@ -167,6 +169,27 @@ pub const Config = struct {
         if (tls != null) return error.ServerTlsUnsupported;
     }
 
+    pub const LakeCacheConfig = struct {
+        enabled: bool = true,
+        root: ?[]u8 = null,
+        max_memory_bytes: usize = 64 * 1024 * 1024,
+        max_disk_bytes: usize = 10 * 1024 * 1024 * 1024,
+        max_entries: usize = 16_384,
+        max_write_queue_bytes: usize = 32 * 1024 * 1024,
+        max_write_queue_entries: usize = 16,
+        protected_bytes: usize = 256 * 1024 * 1024,
+    };
+    pub const LakeIndexConfig = struct {
+        artifact_gc: struct {
+            enabled: bool = true,
+            dry_run: bool = false,
+            interval_ms: u64 = 30_000,
+            max_deleted: usize = 4096,
+            max_marked: usize = 262144,
+            max_read_bytes: u64 = 512 * 1024 * 1024,
+        } = .{},
+    };
+
     pub const StorageConfig = struct {
         engine: common_openapi.StorageEngine = .local,
         lite_path: ?[]u8 = null,
@@ -176,6 +199,7 @@ pub const Config = struct {
         object_bucket: ?[]u8 = null,
         object_prefix: ?[]u8 = null,
         object_lanes: ObjectStorageLanes = .{},
+        artifacts: ObjectStorageLocation = .{},
 
         pub fn deinit(self: *StorageConfig, alloc: std.mem.Allocator) void {
             if (self.lite_path) |value| alloc.free(value);
@@ -184,6 +208,7 @@ pub const Config = struct {
             if (self.object_bucket) |value| alloc.free(value);
             if (self.object_prefix) |value| alloc.free(value);
             self.object_lanes.deinit(alloc);
+            self.artifacts.deinit(alloc);
             self.* = undefined;
         }
     };
@@ -825,6 +850,9 @@ pub const Config = struct {
 
         const deployment_mode = try deploymentModeFromObject(root, expected_deployment);
         try validateStorageFromOpenApi(deployment_mode, root, validated.value.storage);
+        const lake_cache = try parseLakeCacheConfig(alloc, root.get("lake_cache"));
+        const lake_indexes = try parseLakeIndexConfig(alloc, root.get("lake_indexes"));
+        errdefer if (lake_cache.root) |path| alloc.free(path);
         var storage_config = try storageFromOpenApi(alloc, validated.value.storage, root.get("storage"));
         errdefer storage_config.deinit(alloc);
         var connections = try parseConnectionsConfig(alloc, root.get("connections"));
@@ -944,6 +972,8 @@ pub const Config = struct {
                 if (validated.value.metadata) |metadata| metadata.orchestration_urls else null,
             ),
             .storage = storage_config,
+            .lake_cache = lake_cache,
+            .lake_indexes = lake_indexes,
             .transaction_sessions = try transactionSessionConfigFromOpenApi(validated.value.transaction_sessions),
             // `hot_standby` is the current config key; `ha` is accepted for one
             // minor release as a deprecated alias. If both are set, `hot_standby`
@@ -992,6 +1022,16 @@ pub const Config = struct {
 
         const value = storage orelse return parsed;
         parsed.engine = value.engine;
+        if (raw_storage) |raw| {
+            if (raw != .object) return error.InvalidConfig;
+            if (raw.object.get("artifacts")) |location| {
+                if (location != .object or !objectContainsOnly(location.object, &.{ "connection", "bucket", "prefix" })) return error.InvalidConfig;
+                const connection = location.object.get("connection") orelse return error.InvalidConfig;
+                const bucket = location.object.get("bucket") orelse return error.InvalidConfig;
+                if (connection != .string or connection.string.len == 0 or bucket != .string or bucket.string.len < 3 or bucket.string.len > 63) return error.InvalidConfig;
+            }
+            parsed.artifacts = try parseObjectStorageLocation(alloc, raw.object.get("artifacts"));
+        }
 
         switch (parsed.engine) {
             .lite => {
@@ -1119,7 +1159,7 @@ pub const Config = struct {
             .object => |object| object,
             else => return error.InvalidConfig,
         };
-        if (!objectContainsOnly(storage_object, &.{ "engine", "lite", "local", "object" })) return error.InvalidConfig;
+        if (!objectContainsOnly(storage_object, &.{ "engine", "lite", "local", "object", "artifacts" })) return error.InvalidConfig;
         const engine = value.engine;
         const has_lite = value.lite != null;
         const has_local = value.local != null;
@@ -1179,6 +1219,7 @@ pub const Config = struct {
         if (self.cors) |*cors| cors.deinit(self.registry.allocator);
         self.metadata.deinit(self.registry.allocator);
         self.storage.deinit(self.registry.allocator);
+        if (self.lake_cache.root) |path| self.registry.allocator.free(path);
         self.inference.deinit(self.registry.allocator);
         if (self.ha) |*ha| ha.deinit(self.registry.allocator);
         self.transcribers.deinit();
@@ -1463,6 +1504,37 @@ test "common config resolves capability-scoped object storage connections and la
         \\  "storage": { "engine": "object", "object": { "connection": "data", "bucket": "data-bucket" } }
         \\}
     ));
+}
+
+test "common config native artifact storage is independent and capability scoped" {
+    const alloc = std.testing.allocator;
+    const template =
+        \\{{"deployment_mode":"distributed","storage":{{"engine":"local","local":{{}},"artifacts":{s}}},
+        \\"connections":{{"artifacts":{{"kind":"external_io","capabilities":["{s}"],"external_io":{{"protocol":"s3","buckets":["artifact-bucket"],"prefix":"cluster"}}}}}}}}
+    ;
+    const valid = try std.fmt.allocPrint(alloc, template, .{ "{\"connection\":\"artifacts\",\"bucket\":\"artifact-bucket\",\"prefix\":\"cluster/native-lake-indexes\"}", "storage.primary" });
+    defer alloc.free(valid);
+    var cfg = try Config.parseFromSlice(alloc, valid);
+    defer cfg.deinit();
+    try std.testing.expectEqual(common_openapi.StorageEngine.local, cfg.storage.engine);
+    try std.testing.expectEqualStrings("artifacts", cfg.storage.artifacts.connection.?);
+    try std.testing.expectEqualStrings("cluster/native-lake-indexes", cfg.storage.artifacts.prefix.?);
+    const invalid = [_][]const u8{
+        "{}",
+        "{\"connection\":\"artifacts\"}",
+        "{\"connection\":\"\",\"bucket\":\"artifact-bucket\"}",
+        "{\"connection\":\"artifacts\",\"bucket\":\"other-bucket\",\"prefix\":\"cluster/native-lake-indexes\"}",
+        "{\"connection\":\"artifacts\",\"bucket\":\"artifact-bucket\",\"prefix\":\"cluster-other\"}",
+        "{\"connection\":\"artifacts\",\"bucket\":\"artifact-bucket\",\"prefix\":\"cluster/native-lake-indexes\",\"typo\":true}",
+    };
+    for (invalid) |location| {
+        const json = try std.fmt.allocPrint(alloc, template, .{ location, "storage.primary" });
+        defer alloc.free(json);
+        try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, json));
+    }
+    const read_only = try std.fmt.allocPrint(alloc, template, .{ "{\"connection\":\"artifacts\",\"bucket\":\"artifact-bucket\",\"prefix\":\"cluster/native-lake-indexes\"}", "lake_read" });
+    defer alloc.free(read_only);
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, read_only));
 }
 
 test "common config isolates named AWS credential sources and rejects credential typos" {
@@ -1844,6 +1916,9 @@ fn validateStorageConnections(
     storage: *const Config.StorageConfig,
     connections: *const Config.ConnectionsConfig,
 ) !void {
+    if (storage.artifacts.connection != null or storage.artifacts.bucket != null or storage.artifacts.prefix != null) {
+        try validateStorageConnection(connections, storage.artifacts.connection orelse return error.InvalidConfig, storage.artifacts.bucket orelse return error.InvalidConfig, storage.artifacts.prefix, "", "native-lake-indexes");
+    }
     if (storage.engine != .object) return;
     const default_connection = storage.object_connection orelse return error.InvalidConfig;
     const default_bucket = storage.object_bucket orelse return error.InvalidConfig;
@@ -3803,6 +3878,73 @@ test "common config bootstraps named secret sources before resolving credentials
     defer alloc.free(resolved);
     try std.testing.expectEqualStrings("credential", resolved);
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, "{\"secrets\":{\"environment\":\"false\"}}"));
+}
+
+fn parseLakeCacheConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.LakeCacheConfig {
+    var config: Config.LakeCacheConfig = .{};
+    const input = value orelse return config;
+    if (input != .object) return error.InvalidConfig;
+    var fields = input.object.iterator();
+    while (fields.next()) |field| {
+        var known = false;
+        inline for (@typeInfo(Config.LakeCacheConfig).@"struct".field_names) |name| {
+            if (std.mem.eql(u8, field.key_ptr.*, name)) known = true;
+        }
+        if (!known) return error.InvalidConfig;
+    }
+    config.enabled = try optionalBoolField(input.object, "enabled") orelse config.enabled;
+    inline for (.{ "max_memory_bytes", "max_disk_bytes", "max_entries", "max_write_queue_bytes", "max_write_queue_entries", "protected_bytes" }) |name| {
+        const number = try optionalU64Field(input.object, name) orelse @field(config, name);
+        if (number == 0 and !std.mem.eql(u8, name, "protected_bytes")) return error.InvalidConfig;
+        @field(config, name) = std.math.cast(usize, number) orelse return error.InvalidConfig;
+    }
+    config.root = try optionalStringFieldDup(a, input.object, "root");
+    errdefer if (config.root) |path| a.free(path);
+    if (config.root) |path| if (path.len == 0) return error.InvalidConfig;
+    return config;
+}
+
+fn parseLakeIndexConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.LakeIndexConfig {
+    const input = value orelse return .{};
+    var parsed = std.json.parseFromValue(Config.LakeIndexConfig, a, input, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidConfig;
+    defer parsed.deinit();
+    const gc = parsed.value.artifact_gc;
+    if (gc.interval_ms < 1000 or gc.interval_ms > std.time.ms_per_day or gc.max_deleted == 0 or gc.max_deleted > 65536 or gc.max_marked == 0 or gc.max_marked > 1048576 or gc.max_read_bytes == 0 or gc.max_read_bytes > 1024 * 1024 * 1024) return error.InvalidConfig;
+    return parsed.value;
+}
+
+test "external lake native artifact collection config validates bounded operator controls" {
+    const a = std.testing.allocator;
+    var configured = try Config.parseFromSlice(a, "{\"lake_indexes\":{\"artifact_gc\":{\"dry_run\":true,\"interval_ms\":15000,\"max_deleted\":32}}}");
+    defer configured.deinit();
+    try std.testing.expect(configured.lake_indexes.artifact_gc.enabled);
+    try std.testing.expect(configured.lake_indexes.artifact_gc.dry_run);
+    try std.testing.expectEqual(@as(usize, 32), configured.lake_indexes.artifact_gc.max_deleted);
+    for ([_][]const u8{
+        "{\"lake_indexes\":{\"artifact_gc\":{\"interval_ms\":0}}}",
+        "{\"lake_indexes\":{\"artifact_gc\":{\"max_deleted\":0}}}",
+        "{\"lake_indexes\":{\"artifact_gc\":{\"unknown\":1}}}",
+        "{\"lake_indexes\":{\"unknown\":1}}",
+    }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, invalid));
+}
+
+test "common config persistent lake cache defaults overrides and bounds" {
+    const a = std.testing.allocator;
+    var defaults = try Config.parseFromSlice(a, "{}");
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), defaults.lake_cache.max_write_queue_bytes);
+    var configured = try Config.parseFromSlice(a, "{\"lake_cache\":{\"enabled\":false,\"root\":\"/tmp/lake-cache\",\"max_disk_bytes\":10737418240,\"max_entries\":256,\"protected_bytes\":0}}");
+    defer configured.deinit();
+    try std.testing.expect(!configured.lake_cache.enabled);
+    try std.testing.expectEqualStrings("/tmp/lake-cache", configured.lake_cache.root.?);
+    try std.testing.expectEqual(@as(usize, 256), configured.lake_cache.max_entries);
+    try std.testing.expectEqual(@as(usize, 0), configured.lake_cache.protected_bytes);
+    for ([_][]const u8{
+        "{\"lake_cache\":{\"max_disk_bytes\":0}}",
+        "{\"lake_cache\":{\"max_entries\":-1}}",
+        "{\"lake_cache\":{\"root\":\"\"}}",
+        "{\"lake_cache\":{\"unknown\":1}}",
+    }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, invalid));
 }
 
 test "common config parses ChatGPT connector policy and rejects misspellings" {

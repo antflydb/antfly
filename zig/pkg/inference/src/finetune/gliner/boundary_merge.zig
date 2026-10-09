@@ -659,7 +659,7 @@ test "boundary immutable merge cleans every allocation failure and cancelled pub
     defer a.free(parent);
     const output = try std.fs.path.join(a, &.{ parent, "merged" });
     defer a.free(output);
-    try std.testing.checkAllAllocationFailures(a, testAllocationFailures, .{output});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, testAllocationFailures, .{output});
     var iterator = temporary.dir.iterate();
     try std.testing.expect((try iterator.next(io)) == null);
     const Cancel = struct {
