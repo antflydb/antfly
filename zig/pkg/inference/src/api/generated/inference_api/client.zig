@@ -127,10 +127,10 @@ pub const Client = struct {
         return ApiResponse(types.ChunkResponse).fromResponse(self.allocator, &resp);
     }
 
-    /// Answer named choice, ordinal score, and Boolean questions
-    /// POST /decide
+    /// Answer named decision questions
+    /// POST /decisions
     pub fn decide(self: *@This(), body: types.DecideRequest) !ApiResponse(types.DecideResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/decide", .{self.base_url});
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/decisions", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);

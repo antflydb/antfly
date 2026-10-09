@@ -20,6 +20,7 @@ var bindings: std.ArrayList(Binding) = .empty;
 /// One local source owner per consumer profile. Source files are never copied
 /// into a server root; source selection remains explicit at the module boundary.
 pub fn attach(consumer: *std.Build.Module) void {
+    consumer.addImport("antfly_decisions", @import("../../lib/decisions/build.zig").create(consumer.owner, consumer.owner.path("lib/decisions/root.zig")));
     if (consumer.import_table.contains("antfly_local_sources")) return;
     const b = consumer.owner;
     const root = consumer.root_source_file orelse return;

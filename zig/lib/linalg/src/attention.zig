@@ -67,14 +67,31 @@ pub fn ropeCore(output: []f32, positions: []const usize, head_dim: usize, rope_d
     const total_tokens = output.len / head_dim;
     const half = rope_dim / 2;
     const head_half = head_dim / 2;
+    // Repeated heads share their position, and all tokens share frequencies.
+    // Keep a bounded stack cache; larger geometries retain the scalar path.
+    var frequencies: [256]f32 = undefined;
+    var cosines: [256]f32 = undefined;
+    var sines: [256]f32 = undefined;
+    const cached = half <= frequencies.len;
+    if (cached) for (0..half) |j| {
+        frequencies[j] = 1.0 / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * j)) / @as(f32, @floatFromInt(rope_dim)));
+    };
+    var previous_position: ?usize = null;
     for (0..total_tokens) |tok| {
         const pos = positions[tok];
         const base = tok * head_dim;
+        if (cached and (previous_position == null or previous_position.? != pos)) {
+            for (0..half) |j| {
+                const angle = @as(f32, @floatFromInt(pos)) * freq_scale * frequencies[j];
+                cosines[j] = @cos(angle);
+                sines[j] = @sin(angle);
+            }
+            previous_position = pos;
+        }
         for (0..half) |j| {
-            const freq = 1.0 / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * j)) / @as(f32, @floatFromInt(rope_dim)));
-            const angle = @as(f32, @floatFromInt(pos)) * freq_scale * freq;
-            const cos_val = @cos(angle);
-            const sin_val = @sin(angle);
+            const angle = if (cached) 0 else @as(f32, @floatFromInt(pos)) * freq_scale * (1.0 / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * j)) / @as(f32, @floatFromInt(rope_dim))));
+            const cos_val = if (cached) cosines[j] else @cos(angle);
+            const sin_val = if (cached) sines[j] else @sin(angle);
             const idx0 = if (consecutive_pairs) 2 * j else j;
             const idx1 = if (consecutive_pairs) 2 * j + 1 else j + head_half;
             const x0 = output[base + idx0];
@@ -597,119 +614,308 @@ pub fn segmentAttentionHost(
     num_heads: usize,
     head_dim: usize,
 ) ![]f32 {
+    return segmentAttentionHostWithGemm(struct {
+        pub const sgemmTransBSync = gemm.sgemmTransBSequential;
+        pub const sgemmSync = gemm.sgemmSequential;
+    }, allocator, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim);
+}
+
+/// The same bounded online-softmax algorithm with caller-selected F32 GEMM.
+/// A system BLAS backend can accelerate its score/value tiles while the
+/// portable entry point retains its sequential arithmetic and scheduling.
+pub fn segmentAttentionHostWithGemm(
+    comptime Gemm: type,
+    allocator: std.mem.Allocator,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    ranges: []const u32,
+    query_positions: []const i32,
+    key_positions: []const i32,
+    window: u32,
+    queries: usize,
+    keys: usize,
+    num_heads: usize,
+    head_dim: usize,
+) ![]f32 {
+    return segmentAttentionHostWithGemmImpl(Gemm, allocator, null, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim);
+}
+
+/// Independent heads share immutable inputs and use caller-preallocated scratch.
+/// Every job is drained before output or scratch ownership can be released.
+pub fn segmentAttentionHostWithGemmParallelIo(
+    comptime Gemm: type,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    ranges: []const u32,
+    query_positions: []const i32,
+    key_positions: []const i32,
+    window: u32,
+    queries: usize,
+    keys: usize,
+    num_heads: usize,
+    head_dim: usize,
+) ![]f32 {
+    return segmentAttentionHostWithGemmImpl(Gemm, allocator, io, Q, K, V, ranges, query_positions, key_positions, window, queries, keys, num_heads, head_dim);
+}
+
+fn segmentAttentionHostWithGemmImpl(
+    comptime Gemm: type,
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    ranges: []const u32,
+    query_positions: []const i32,
+    key_positions: []const i32,
+    window: u32,
+    queries: usize,
+    keys: usize,
+    num_heads: usize,
+    head_dim: usize,
+) ![]f32 {
+    const block_q = if (@hasDecl(Gemm, "query_block")) Gemm.query_block else BLOCK_Q;
+    const block_kv = if (@hasDecl(Gemm, "key_block")) Gemm.key_block else BLOCK_KV;
     if (num_heads == 0 or head_dim == 0 or queries == 0 or keys == 0) return error.InvalidAttentionShape;
     const H = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
-    if (Q.len != queries * H or K.len != keys * H or V.len != keys * H or ranges.len != queries * 6 or
+    const q_count = std.math.mul(usize, queries, H) catch return error.InvalidAttentionShape;
+    const k_count = std.math.mul(usize, keys, H) catch return error.InvalidAttentionShape;
+    const range_count = std.math.mul(usize, queries, 6) catch return error.InvalidAttentionShape;
+    const lanes = if (io != null) num_heads else 1;
+    const tile_count = std.math.mul(usize, block_q, block_kv) catch return error.InvalidAttentionShape;
+    const score_count = std.math.mul(usize, tile_count, lanes) catch return error.InvalidAttentionShape;
+    if (block_q == 0 or block_kv == 0 or Q.len != q_count or K.len != k_count or V.len != k_count or ranges.len != range_count or
         query_positions.len != queries or key_positions.len != keys) return error.InvalidAttentionShape;
     for (ranges) |bound| if (bound > keys) return error.InvalidAttentionShape;
+    if (io) |handle| try handle.checkCancel();
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
     const output = try allocator.alloc(f32, queries * H);
     errdefer allocator.free(output);
-    const qh = try allocator.alloc(f32, queries * head_dim);
-    defer allocator.free(qh);
-    const kh = try allocator.alloc(f32, keys * head_dim);
-    defer allocator.free(kh);
-    const vh = try allocator.alloc(f32, keys * head_dim);
-    defer allocator.free(vh);
-    const oh = try allocator.alloc(f32, queries * head_dim);
-    defer allocator.free(oh);
-    const score_tile = try allocator.alloc(f32, BLOCK_Q * BLOCK_KV);
-    defer allocator.free(score_tile);
-    var row_max: [BLOCK_Q]f32 = undefined;
-    var row_sum: [BLOCK_Q]f32 = undefined;
-    var intervals: [BLOCK_Q * 3][2]u32 = undefined;
-
-    for (0..num_heads) |h| {
-        for (0..queries) |i| @memcpy(qh[i * head_dim ..][0..head_dim], Q[i * H + h * head_dim ..][0..head_dim]);
-        for (0..keys) |k| {
-            @memcpy(kh[k * head_dim ..][0..head_dim], K[k * H + h * head_dim ..][0..head_dim]);
-            @memcpy(vh[k * head_dim ..][0..head_dim], V[k * H + h * head_dim ..][0..head_dim]);
+    const qhs = try allocator.alloc(f32, queries * head_dim * lanes);
+    defer allocator.free(qhs);
+    const khs = try allocator.alloc(f32, keys * head_dim * lanes);
+    defer allocator.free(khs);
+    const vhs = try allocator.alloc(f32, khs.len);
+    defer allocator.free(vhs);
+    const ohs = try allocator.alloc(f32, qhs.len);
+    defer allocator.free(ohs);
+    const scores = try allocator.alloc(f32, score_count);
+    defer allocator.free(scores);
+    const Head = SegmentHeadWork(Gemm);
+    if (io) |handle| {
+        const heads = try allocator.alloc(Head, num_heads);
+        defer allocator.free(heads);
+        const jobs = try allocator.alloc(pool.Job, num_heads);
+        defer allocator.free(jobs);
+        for (heads, jobs, 0..) |*ctx, *job, h| {
+            ctx.* = .{ .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .h = h, .scale = scale, .output = output, .qh = qhs[h * queries * head_dim ..][0 .. queries * head_dim], .kh = khs[h * keys * head_dim ..][0 .. keys * head_dim], .vh = vhs[h * keys * head_dim ..][0 .. keys * head_dim], .oh = ohs[h * queries * head_dim ..][0 .. queries * head_dim], .score_tile = scores[h * block_q * block_kv ..][0 .. block_q * block_kv] };
+            job.* = .{ .fn_ptr = Head.run, .ctx = ctx };
         }
-        @memset(oh, 0);
-        var q_start: usize = 0;
-        while (q_start < queries) : (q_start += BLOCK_Q) {
-            const cur_bq = @min(BLOCK_Q, queries - q_start);
-            for (0..cur_bq) |r| {
-                row_max[r] = -std.math.inf(f32);
-                row_sum[r] = 0;
-            }
-            // Union of the block's ranges as sorted, disjoint intervals.
-            var count: usize = 0;
-            for (0..cur_bq) |r| for (0..3) |j| {
-                const lo = ranges[(q_start + r) * 6 + 2 * j];
-                const hi = ranges[(q_start + r) * 6 + 2 * j + 1];
-                if (lo < hi) {
-                    intervals[count] = .{ lo, hi };
-                    count += 1;
-                }
-            };
-            std.mem.sort([2]u32, intervals[0..count], {}, struct {
-                fn less(_: void, a: [2]u32, b: [2]u32) bool {
-                    return a[0] < b[0];
-                }
-            }.less);
-            var merged: usize = 0;
-            for (intervals[0..count]) |interval| {
-                if (merged > 0 and interval[0] <= intervals[merged - 1][1]) {
-                    intervals[merged - 1][1] = @max(intervals[merged - 1][1], interval[1]);
-                } else {
-                    intervals[merged] = interval;
-                    merged += 1;
-                }
-            }
-            const q_block = qh[q_start * head_dim ..][0 .. cur_bq * head_dim];
-            const out_block = oh[q_start * head_dim ..][0 .. cur_bq * head_dim];
-            for (intervals[0..merged]) |interval| {
-                var kv_start: usize = interval[0];
-                while (kv_start < interval[1]) {
-                    const kv_end = @min(kv_start + BLOCK_KV, interval[1]);
-                    const cur_bkv = kv_end - kv_start;
-                    const tile = score_tile[0 .. cur_bq * cur_bkv];
-                    gemm.sgemmTransBSequential(cur_bq, cur_bkv, head_dim, scale, q_block, kh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 0.0, tile);
-                    for (0..cur_bq) |r| {
-                        const qi = q_start + r;
-                        const own = ranges[qi * 6 ..][0..6];
-                        const qp = query_positions[qi];
-                        const row = tile[r * cur_bkv ..][0..cur_bkv];
-                        for (row, kv_start..) |*score, k| {
-                            const in_range = (k >= own[0] and k < own[1]) or (k >= own[2] and k < own[3]) or (k >= own[4] and k < own[5]);
-                            const near = window == std.math.maxInt(u32) or @abs(@as(i64, qp) - key_positions[k]) <= window;
-                            if (!in_range or !near) score.* = -std.math.inf(f32);
-                        }
-                        var block_max: f32 = -std.math.inf(f32);
-                        for (row) |score| block_max = @max(block_max, score);
-                        const new_max = @max(row_max[r], block_max);
-                        if (new_max == -std.math.inf(f32)) {
-                            @memset(row, 0);
-                            continue;
-                        }
-                        if (row_sum[r] != 0) {
-                            const rescale = @exp(row_max[r] - new_max);
-                            if (rescale != 1.0) {
-                                for (out_block[r * head_dim ..][0..head_dim]) |*o| o.* *= rescale;
-                                row_sum[r] *= rescale;
-                            }
-                        }
-                        row_sum[r] += primitives.expSubtractAndSum(row, new_max);
-                        row_max[r] = new_max;
-                    }
-                    gemm.sgemmSequential(cur_bq, head_dim, cur_bkv, 1.0, tile, vh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 1.0, out_block);
-                    kv_start = kv_end;
-                }
-            }
-            for (0..cur_bq) |r| {
-                const out_row = out_block[r * head_dim ..][0..head_dim];
-                if (row_sum[r] == 0) {
-                    @memset(out_row, 0);
-                    continue;
-                }
-                const inv = 1.0 / row_sum[r];
-                for (out_row) |*o| o.* *= inv;
-            }
+        try pool.dispatchJobsIo(handle, jobs);
+        try handle.checkCancel();
+    } else {
+        for (0..num_heads) |h| {
+            var ctx = Head{ .Q = Q, .K = K, .V = V, .ranges = ranges, .query_positions = query_positions, .key_positions = key_positions, .window = window, .queries = queries, .keys = keys, .head_dim = head_dim, .H = H, .h = h, .scale = scale, .output = output, .qh = qhs, .kh = khs, .vh = vhs, .oh = ohs, .score_tile = scores };
+            Head.run(&ctx);
         }
-        for (0..queries) |i| @memcpy(output[i * H + h * head_dim ..][0..head_dim], oh[i * head_dim ..][0..head_dim]);
     }
     return output;
+}
+
+fn SegmentHeadWork(comptime Gemm: type) type {
+    const block_q = if (@hasDecl(Gemm, "query_block")) Gemm.query_block else BLOCK_Q;
+    const block_kv = if (@hasDecl(Gemm, "key_block")) Gemm.key_block else BLOCK_KV;
+    return struct {
+        Q: []const f32,
+        K: []const f32,
+        V: []const f32,
+        ranges: []const u32,
+        query_positions: []const i32,
+        key_positions: []const i32,
+        window: u32,
+        queries: usize,
+        keys: usize,
+        head_dim: usize,
+        H: usize,
+        h: usize,
+        scale: f32,
+        output: []f32,
+        qh: []f32,
+        kh: []f32,
+        vh: []f32,
+        oh: []f32,
+        score_tile: []f32,
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const Q = self.Q;
+            const K = self.K;
+            const V = self.V;
+            const ranges = self.ranges;
+            const query_positions = self.query_positions;
+            const key_positions = self.key_positions;
+            const window = self.window;
+            const queries = self.queries;
+            const keys = self.keys;
+            const head_dim = self.head_dim;
+            const H = self.H;
+            const h = self.h;
+            const scale = self.scale;
+            const output = self.output;
+            const qh = self.qh;
+            const kh = self.kh;
+            const vh = self.vh;
+            const oh = self.oh;
+            const score_tile = self.score_tile;
+            var row_max: [block_q]f32 = undefined;
+            var row_sum: [block_q]f32 = undefined;
+            var intervals: [block_q * 3][2]u32 = undefined;
+            for (0..queries) |i| @memcpy(qh[i * head_dim ..][0..head_dim], Q[i * H + h * head_dim ..][0..head_dim]);
+            for (0..keys) |k| {
+                @memcpy(kh[k * head_dim ..][0..head_dim], K[k * H + h * head_dim ..][0..head_dim]);
+                @memcpy(vh[k * head_dim ..][0..head_dim], V[k * H + h * head_dim ..][0..head_dim]);
+            }
+            @memset(oh, 0);
+            var q_start: usize = 0;
+            while (q_start < queries) : (q_start += block_q) {
+                const cur_bq = @min(block_q, queries - q_start);
+                for (0..cur_bq) |r| {
+                    row_max[r] = -std.math.inf(f32);
+                    row_sum[r] = 0;
+                }
+                // Union of the block's ranges as sorted, disjoint intervals.
+                var count: usize = 0;
+                for (0..cur_bq) |r| for (0..3) |j| {
+                    const lo = ranges[(q_start + r) * 6 + 2 * j];
+                    const hi = ranges[(q_start + r) * 6 + 2 * j + 1];
+                    if (lo < hi) {
+                        intervals[count] = .{ lo, hi };
+                        count += 1;
+                    }
+                };
+                std.mem.sort([2]u32, intervals[0..count], {}, struct {
+                    fn less(_: void, a: [2]u32, b: [2]u32) bool {
+                        return a[0] < b[0];
+                    }
+                }.less);
+                var merged: usize = 0;
+                for (intervals[0..count]) |interval| {
+                    if (merged > 0 and interval[0] <= intervals[merged - 1][1]) {
+                        intervals[merged - 1][1] = @max(intervals[merged - 1][1], interval[1]);
+                    } else {
+                        intervals[merged] = interval;
+                        merged += 1;
+                    }
+                }
+                const q_block = qh[q_start * head_dim ..][0 .. cur_bq * head_dim];
+                const out_block = oh[q_start * head_dim ..][0 .. cur_bq * head_dim];
+                for (intervals[0..merged]) |interval| {
+                    var kv_start: usize = interval[0];
+                    while (kv_start < interval[1]) {
+                        const kv_end = @min(kv_start + block_kv, interval[1]);
+                        const cur_bkv = kv_end - kv_start;
+                        const tile = score_tile[0 .. cur_bq * cur_bkv];
+                        Gemm.sgemmTransBSync(cur_bq, cur_bkv, head_dim, scale, q_block, kh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 0.0, tile);
+                        for (0..cur_bq) |r| {
+                            const qi = q_start + r;
+                            const own = ranges[qi * 6 ..][0..6];
+                            const qp = query_positions[qi];
+                            const row = tile[r * cur_bkv ..][0..cur_bkv];
+                            if (window == std.math.maxInt(u32)) {
+                                maskSegmentRangeGaps(row, kv_start, own);
+                            } else {
+                                for (row, kv_start..) |*score, k| {
+                                    const in_range = (k >= own[0] and k < own[1]) or (k >= own[2] and k < own[3]) or (k >= own[4] and k < own[5]);
+                                    const near = @abs(@as(i64, qp) - key_positions[k]) <= window;
+                                    if (!in_range or !near) score.* = -std.math.inf(f32);
+                                }
+                            }
+                            var block_max: f32 = -std.math.inf(f32);
+                            for (row) |score| block_max = @max(block_max, score);
+                            const new_max = @max(row_max[r], block_max);
+                            if (new_max == -std.math.inf(f32)) {
+                                @memset(row, 0);
+                                continue;
+                            }
+                            if (row_sum[r] != 0) {
+                                const rescale = @exp(row_max[r] - new_max);
+                                if (rescale != 1.0) {
+                                    for (out_block[r * head_dim ..][0..head_dim]) |*o| o.* *= rescale;
+                                    row_sum[r] *= rescale;
+                                }
+                            }
+                            row_sum[r] += primitives.expSubtractAndSum(row, new_max);
+                            row_max[r] = new_max;
+                        }
+                        Gemm.sgemmSync(cur_bq, head_dim, cur_bkv, 1.0, tile, vh[kv_start * head_dim ..][0 .. cur_bkv * head_dim], 1.0, out_block);
+                        kv_start = kv_end;
+                    }
+                }
+                for (0..cur_bq) |r| {
+                    const out_row = out_block[r * head_dim ..][0..head_dim];
+                    if (row_sum[r] == 0) {
+                        @memset(out_row, 0);
+                        continue;
+                    }
+                    const inv = 1.0 / row_sum[r];
+                    for (out_row) |*o| o.* *= inv;
+                }
+            }
+            for (0..queries) |i| @memcpy(output[i * H + h * head_dim ..][0..head_dim], oh[i * head_dim ..][0..head_dim]);
+        }
+    };
+}
+
+// Mask the complement of up to three half-open ranges. Sorting their starts
+// permits overlapping, duplicate and unordered intervals without per-key tests.
+fn maskSegmentRangeGaps(row: []f32, start: usize, own: []const u32) void {
+    var spans = [3][2]usize{
+        .{ own[0], own[1] }, .{ own[2], own[3] }, .{ own[4], own[5] },
+    };
+    if (spans[0][0] > spans[1][0]) std.mem.swap([2]usize, &spans[0], &spans[1]);
+    if (spans[1][0] > spans[2][0]) std.mem.swap([2]usize, &spans[1], &spans[2]);
+    if (spans[0][0] > spans[1][0]) std.mem.swap([2]usize, &spans[0], &spans[1]);
+    const end = start + row.len;
+    var cursor = start;
+    for (spans) |span| {
+        if (span[0] >= span[1] or span[1] <= start or span[0] >= end) continue;
+        const lo = @max(start, span[0]);
+        const hi = @min(end, span[1]);
+        if (lo > cursor) @memset(row[cursor - start .. lo - start], -std.math.inf(f32));
+        cursor = @max(cursor, hi);
+    }
+    if (cursor < end) @memset(row[cursor - start ..], -std.math.inf(f32));
+}
+
+test "embeddinggemma2 segment range gap masking preserves independent visibility and lane bits" {
+    const cases = [_][6]u32{
+        .{ 0, 0, 0, 0, 0, 0 },
+        .{ 0, 64, 0, 0, 0, 0 },
+        .{ 9, 17, 0, 4, 23, 31 },
+        .{ 9, 17, 0, 12, 3, 11 },
+        .{ 7, 7, 13, 3, 2, 8 },
+        .{ 4, 17, 4, 17, 4, 17 },
+        .{ 4, 17, 4, 9, 9, 24 },
+        .{ 0, std.math.maxInt(u32), 0, 0, 0, 0 },
+    };
+    const lanes = [_]f32{ 0.0, -0.0, std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32), 0.25, -2.0 };
+    var values: [64]f32 = undefined;
+    for (cases) |own| for ([_]usize{ 0, 1, 6, 13, 23, 63 }) |start| {
+        for ([_]usize{ 0, 1, 3, 9, 17, 64 }) |length| {
+            for (values[0..length], 0..) |*value, i| value.* = lanes[i % lanes.len];
+            maskSegmentRangeGaps(values[0..length], start, &own);
+            for (values[0..length], start..) |value, key| {
+                const visible = (key >= own[0] and key < own[1]) or
+                    (key >= own[2] and key < own[3]) or
+                    (key >= own[4] and key < own[5]);
+                const expected = if (visible) lanes[(key - start) % lanes.len] else -std.math.inf(f32);
+                try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(value)));
+            }
+        }
+    };
 }
 
 /// Sorted, disjoint union of the (up to 3) ranges of every query in
@@ -2160,6 +2366,158 @@ test "debertaDisentangledAttentionHost threaded path matches scalar reference" {
     defer allocator.free(got);
 
     for (ref, got) |a, b| try std.testing.expect(@abs(a - b) < 1e-5);
+}
+
+const SegmentParallelTestGemm = struct {
+    // Cross both tile boundaries without relying on the production tile policy.
+    pub const query_block = 17;
+    pub const key_block = 23;
+    pub const sgemmTransBSync = gemm.sgemmTransBSequential;
+    pub const sgemmSync = gemm.sgemmSequential;
+};
+
+test "segmentAttentionHost parallel heads match independent F64 visibility and serial bits" {
+    const a = std.testing.allocator;
+    const queries = 131;
+    const keys = 197;
+    const hd = 7;
+    var q_storage: [queries * 4 * hd]f32 = undefined;
+    var k_storage: [keys * 4 * hd]f32 = undefined;
+    var v_storage: [keys * 4 * hd]f32 = undefined;
+    var ranges: [queries * 6]u32 = undefined;
+    var qpos: [queries]i32 = undefined;
+    var kpos: [keys]i32 = undefined;
+    for (&q_storage, 0..) |*value, i| value.* = @sin(@as(f32, @floatFromInt(i % 53))) * 0.3;
+    for (&k_storage, &v_storage, 0..) |*key, *value, i| {
+        key.* = @cos(@as(f32, @floatFromInt(i % 47))) * 0.25;
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18)) / 19;
+    }
+    for (&qpos, 0..) |*position, i| position.* = @as(i32, @intCast(i % 23)) - 11;
+    for (&kpos, 0..) |*position, i| position.* = @as(i32, @intCast(i % 29)) - 14;
+    for (0..queries) |i| ranges[i * 6 ..][0..6].* = switch (i % 4) {
+        0 => .{ 0, 0, 0, 0, 0, 0 },
+        1 => .{ 131, keys, 0, 31, 23, 79 }, // Unordered, overlapping ranges.
+        2 => .{ 3, 23, 53, 79, 131, keys }, // Gaps and partial key tiles.
+        else => .{ 79, 23, 53, 53, 17, 23 }, // Inverted and empty ranges.
+    };
+    for ([_]usize{ 1, 2, 4 }) |heads| {
+        const hidden = heads * hd;
+        const Q = q_storage[0 .. queries * hidden];
+        const K = k_storage[0 .. keys * hidden];
+        const V = v_storage[0 .. keys * hidden];
+        for ([_]u32{ std.math.maxInt(u32), 3 }) |window| {
+            const got = try segmentAttentionHostWithGemmParallelIo(SegmentParallelTestGemm, a, std.testing.io, Q, K, V, &ranges, &qpos, &kpos, window, queries, keys, heads, hd);
+            defer a.free(got);
+            const serial = try segmentAttentionHostWithGemm(SegmentParallelTestGemm, a, Q, K, V, &ranges, &qpos, &kpos, window, queries, keys, heads, hd);
+            defer a.free(serial);
+            for (got, serial) |actual, expected| try std.testing.expectEqual(@as(u32, @bitCast(expected)), @as(u32, @bitCast(actual)));
+            // Separate dense F64 dot/softmax/value calculation. Visibility is
+            // evaluated per key, without the tiled interval union or gap mask.
+            for (0..queries) |i| for (0..heads) |h| {
+                var scores: [keys]f64 = undefined;
+                var best: f64 = -std.math.inf(f64);
+                for (0..keys) |k| {
+                    const own = ranges[i * 6 ..][0..6];
+                    const visible = ((k >= own[0] and k < own[1]) or (k >= own[2] and k < own[3]) or (k >= own[4] and k < own[5])) and
+                        (window == std.math.maxInt(u32) or @abs(@as(i64, qpos[i]) - kpos[k]) <= window);
+                    var dot: f64 = 0;
+                    for (0..hd) |d| dot += @as(f64, Q[i * hidden + h * hd + d]) * K[k * hidden + h * hd + d];
+                    scores[k] = if (visible) dot / @sqrt(@as(f64, hd)) else -std.math.inf(f64);
+                    best = @max(best, scores[k]);
+                }
+                var sum: f64 = 0;
+                for (&scores) |*score| {
+                    score.* = if (score.* == -std.math.inf(f64)) 0 else @exp(score.* - best);
+                    sum += score.*;
+                }
+                for (0..hd) |d| {
+                    var expected: f64 = 0;
+                    if (sum != 0) for (0..keys) |k| {
+                        expected += scores[k] / sum * V[k * hidden + h * hd + d];
+                    };
+                    try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), got[i * hidden + h * hd + d], 1e-6);
+                }
+            };
+        }
+    }
+}
+
+test "segmentAttentionHost parallel scratch allocation failures clean up and cancellation permits retry" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator, io: std.Io) !void {
+            const Q: [12]f32 = @splat(0.25);
+            const K: [18]f32 = @splat(-0.5);
+            const V: [18]f32 = @splat(0.75);
+            const output = try segmentAttentionHostWithGemmParallelIo(SegmentParallelTestGemm, a, io, &Q, &K, &V, &.{ 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, &.{ 0, 1 }, &.{ 0, 1, 2 }, std.math.maxInt(u32), 2, 3, 2, 3);
+            defer a.free(output);
+            for (output[0..6]) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.75), value, 1e-6);
+            for (output[6..]) |value| try std.testing.expectEqual(@as(f32, 0), value);
+        }
+        fn canceled(_: ?*anyopaque) std.Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{std.testing.io});
+    var vtable = std.Io.failing.vtable.*;
+    vtable.checkCancel = Case.canceled;
+    try std.testing.expectError(error.Canceled, Case.run(std.testing.allocator, .{ .vtable = &vtable, .userdata = null }));
+    try Case.run(std.testing.allocator, std.testing.io);
+}
+
+test "segmentAttentionHost cancellation drains running parallel heads before scratch release" {
+    const Lifecycle = struct {
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        finished: std.atomic.Value(usize) = .init(0),
+    };
+    const BlockingGemm = struct {
+        var lifecycle: *Lifecycle = undefined;
+        pub fn sgemmTransBSync(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c: []f32) void {
+            lifecycle.entered.set(lifecycle.io);
+            // Model an already-running BLAS call, which cannot be interrupted.
+            lifecycle.release.waitUncancelable(lifecycle.io);
+            gemm.sgemmTransBSequential(m, n, k, alpha, a, b, beta, c);
+        }
+        pub fn sgemmSync(m: usize, n: usize, k: usize, alpha: f32, a: []const f32, b: []const f32, beta: f32, c: []f32) void {
+            gemm.sgemmSequential(m, n, k, alpha, a, b, beta, c);
+            _ = lifecycle.finished.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Case = struct {
+        fn run(io: std.Io) !void {
+            const Q: [24]f32 = @splat(0.25);
+            const K: [36]f32 = @splat(-0.5);
+            const V: [36]f32 = @splat(0.75);
+            const output = try segmentAttentionHostWithGemmParallelIo(BlockingGemm, std.testing.allocator, io, &Q, &K, &V, &.{ 0, 3, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0 }, &.{ 0, 1 }, &.{ 0, 1, 2 }, std.math.maxInt(u32), 2, 3, 4, 3);
+            defer std.testing.allocator.free(output);
+            for (output) |value| try std.testing.expectApproxEqAbs(@as(f32, 0.75), value, 1e-6);
+        }
+        fn release(lifecycle: *Lifecycle) void {
+            std.Io.sleep(lifecycle.io, .fromMilliseconds(20), .awake) catch unreachable;
+            lifecycle.release.set(lifecycle.io);
+        }
+    };
+    var runtime = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(4), .concurrent_limit = .limited(8) });
+    defer runtime.deinit();
+    const io = runtime.io();
+    var lifecycle = Lifecycle{ .io = io };
+    BlockingGemm.lifecycle = &lifecycle;
+    var request = try io.concurrent(Case.run, .{io});
+    var pending = true;
+    defer if (pending) {
+        lifecycle.release.set(io);
+        _ = request.cancel(io) catch {};
+    };
+    lifecycle.entered.waitUncancelable(io);
+    var releaser = try io.concurrent(Case.release, .{&lifecycle});
+    defer releaser.await(io);
+    const result = request.cancel(io);
+    pending = false;
+    try std.testing.expectError(error.Canceled, result);
+    try std.testing.expectEqual(@as(usize, 4), lifecycle.finished.load(.acquire));
+    try Case.run(io);
+    try std.testing.expectEqual(@as(usize, 8), lifecycle.finished.load(.acquire));
 }
 
 test "segmentAttentionHost matches dense masked softmax with ranges, window, and fewer queries" {

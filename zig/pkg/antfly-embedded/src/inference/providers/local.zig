@@ -27,6 +27,8 @@ const template_mod = @import("antfly_template_content");
 
 const EmbedWireRequest = struct {
     model: []const u8,
+    model_identity: ?[]const u8 = null,
+    dimensions: ?u32 = null,
     input: std.json.Value,
     encoding_format: []const u8 = "float",
     task_type: ?[]const u8 = null,
@@ -86,6 +88,8 @@ fn embedPartsRequestSize(
     parts: []const template_mod.ContentPart,
     task_type: ?[]const u8,
     instruction: ?[]const u8,
+    model_identity: ?[]const u8,
+    dimensions: ?u32,
 ) !usize {
     var total: usize = "{\"model\":".len + ",\"input\":[".len + "],\"encoding_format\":\"float\"}".len;
     try addRequestSize(&total, try jsonStringEncodedSize(model));
@@ -115,6 +119,13 @@ fn embedPartsRequestSize(
         try addRequestSize(&total, ",\"instruction\":".len);
         try addRequestSize(&total, try jsonStringEncodedSize(value));
     }
+    if (model_identity) |value| {
+        try addRequestSize(&total, ",\"model_identity\":".len);
+        try addRequestSize(&total, try jsonStringEncodedSize(value));
+    }
+    if (dimensions) |value| {
+        try addRequestSize(&total, ",\"dimensions\":".len + std.fmt.count("{d}", .{value}));
+    }
     return total;
 }
 
@@ -128,16 +139,26 @@ fn embedPartsRequestJsonAlloc(
     parts: []const template_mod.ContentPart,
     task_type: ?[]const u8,
     instruction: ?[]const u8,
+    model_identity: ?[]const u8,
+    dimensions: ?u32,
 ) ![]u8 {
     var output: std.Io.Writer.Allocating = try .initCapacity(
         alloc,
-        try embedPartsRequestSize(model, parts, task_type, instruction),
+        try embedPartsRequestSize(model, parts, task_type, instruction, model_identity, dimensions),
     );
     defer output.deinit();
     var stringify: std.json.Stringify = .{ .writer = &output.writer };
     try stringify.beginObject();
     try stringify.objectField("model");
     try stringify.write(model);
+    if (model_identity) |value| {
+        try stringify.objectField("model_identity");
+        try stringify.write(value);
+    }
+    if (dimensions) |value| {
+        try stringify.objectField("dimensions");
+        try stringify.write(value);
+    }
     try stringify.objectField("input");
     try stringify.beginArray();
     for (parts) |part| {
@@ -211,6 +232,8 @@ fn embedPartsAttachmentEnvelopeAlloc(
     parts: []const template_mod.ContentPart,
     task_type: ?[]const u8,
     instruction: ?[]const u8,
+    model_identity: ?[]const u8,
+    dimensions: ?u32,
 ) !SegmentedAttachmentBody {
     var attachments = std.ArrayListUnmanaged(httpx.attachment_envelope.Attachment).empty;
     defer attachments.deinit(alloc);
@@ -220,6 +243,14 @@ fn embedPartsAttachmentEnvelopeAlloc(
     try stringify.beginObject();
     try stringify.objectField("model");
     try stringify.write(model);
+    if (model_identity) |value| {
+        try stringify.objectField("model_identity");
+        try stringify.write(value);
+    }
+    if (dimensions) |value| {
+        try stringify.objectField("dimensions");
+        try stringify.write(value);
+    }
     try stringify.objectField("input");
     try stringify.beginArray();
     for (parts) |part| {
@@ -372,6 +403,8 @@ fn rerankDocumentsRequestJsonAlloc(
 }
 
 pub const Provider = struct {
+    model_identity: ?[]const u8 = null,
+    requested_dense_dimensions: ?u32 = null,
     allocator: std.mem.Allocator,
     http: *httpx.Client,
     attempt_observer: ?httpx.AttemptObserver = null,
@@ -677,7 +710,7 @@ pub const Provider = struct {
         instruction: ?[]const u8,
     ) !inference.EmbedResult {
         if (self.framed_attachments and hasBinaryPart(parts)) {
-            var body = try embedPartsAttachmentEnvelopeAlloc(alloc, model, parts, task_type, instruction);
+            var body = try embedPartsAttachmentEnvelopeAlloc(alloc, model, parts, task_type, instruction, self.model_identity, self.requested_dense_dimensions);
             defer body.deinit(alloc);
             return try self.embedBody(
                 alloc,
@@ -689,7 +722,7 @@ pub const Provider = struct {
                 parts.len,
             );
         }
-        const json_body = try embedPartsRequestJsonAlloc(alloc, model, parts, task_type, instruction);
+        const json_body = try embedPartsRequestJsonAlloc(alloc, model, parts, task_type, instruction, self.model_identity, self.requested_dense_dimensions);
         defer alloc.free(json_body);
         return try self.embedJsonBody(alloc, json_body, parts.len);
     }
@@ -730,6 +763,8 @@ pub const Provider = struct {
     ) !inference.EmbedResult {
         const json_body = try httpx.json.Json.stringifyRequest(alloc, EmbedWireRequest{
             .model = model,
+            .model_identity = self.model_identity,
+            .dimensions = self.requested_dense_dimensions,
             .input = input,
             .task_type = task_type,
             .instruction = instruction,
@@ -748,6 +783,7 @@ pub const Provider = struct {
         options: httpx.RequestOptions,
         expected_count: usize,
     ) !inference.EmbedResult {
+        if (self.model_identity != null) self.numeric_dense_dimensions = null;
         const url = try std.fmt.allocPrint(self.allocator, "{s}/embed", .{self.base_url});
         defer self.allocator.free(url);
         var resp = try self.http.post(url, self.numericRequestOptions(options));
@@ -761,6 +797,13 @@ pub const Provider = struct {
         }
 
         const body = resp.body orelse return error.EmptyResponse;
+        if (self.model_identity) |expected| {
+            const parsed_identity = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+            defer parsed_identity.deinit();
+            if (parsed_identity.value != .object) return error.InvalidEmbeddingIdentity;
+            const actual = parsed_identity.value.object.get("model_identity") orelse return error.InvalidEmbeddingIdentity;
+            if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.EmbeddingIdentityMismatch;
+        }
         if (resp.contentType()) |ct| if (std.ascii.eqlIgnoreCase(ct, httpx.numeric_response.content_type)) {
             const view = try httpx.numeric_response.parse(body, .dense, expected_count, self.numeric_dense_dimensions);
             return .{ .vectors = try view.denseAlloc(alloc), .dimension = view.columns, .allocator = alloc };
@@ -1097,15 +1140,18 @@ test "antfly embed parts request sizing is exact for escaped strings" {
         &parts,
         "RETRIEVAL_DOCUMENT",
         "find diagrams",
+        null,
+        128,
     );
     defer std.testing.allocator.free(body);
     try std.testing.expectEqual(
-        try embedPartsRequestSize("clip\"clap", &parts, "RETRIEVAL_DOCUMENT", "find diagrams"),
+        try embedPartsRequestSize("clip\"clap", &parts, "RETRIEVAL_DOCUMENT", "find diagrams", null, 128),
         body.len,
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);
+    try std.testing.expectEqual(@as(i64, 128), parsed.value.object.get("dimensions").?.integer);
 }
 
 test "antfly dense JSON response cleanup is allocation-failure safe" {

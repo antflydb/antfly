@@ -6,6 +6,8 @@ const antfly_provider_openapi = @import("antfly_provider_openapi");
 
 /// Configuration for the Antfly inference embedding provider. Antfly inference is Antfly's built-in ML service for local embeddings using ONNX models. **Features:** - Local ONNX-based embedding generation - Query-time embeddings are served from an in-memory cache (64 MiB budget, 5-minute TTL by default) with concurrent identical requests coalesced onto a single computation; there is no persistent on-disk cache tier **Example Models:** bge-base-en-v1.5 (768 dims), all-MiniLM-L6-v2 (384 dims) Models are loaded from the `models/embedders/{name}/` directory.
 pub const AntflyEmbedderConfig = struct {
+    /// Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector publication.
+    model_identity: ?[]const u8 = null,
     provider: []const u8,
     /// The embedding model name (maps to models/embedders/{name}/ directory).
     model: []const u8,
@@ -15,6 +17,7 @@ pub const AntflyEmbedderConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "model_identity", "model_identity", true },
         .{ "provider", "provider", false },
         .{ "model", "model", false },
         .{ "api_url", "api_url", true },
@@ -31,6 +34,10 @@ pub const AntflyEmbedderConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.model_identity) |value| {
+            try jw.objectField("model_identity");
+            try jw.write(value);
+        }
         try jw.objectField("provider");
         try jw.write(self.provider);
         try jw.objectField("model");
@@ -228,6 +235,8 @@ pub const EmbedderConfig = struct {
     strip_new_lines: ?bool = null,
     /// The batch size for embedding requests to optimize throughput.
     batch_size: ?i64 = null,
+    /// Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector publication.
+    model_identity: ?[]const u8 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
     rate_limit: ?antfly_provider_openapi.RateLimitConfig = null,
@@ -258,6 +267,7 @@ pub const EmbedderConfig = struct {
         .{ "truncate", "truncate", true },
         .{ "strip_new_lines", "strip_new_lines", true },
         .{ "batch_size", "batch_size", true },
+        .{ "model_identity", "model_identity", true },
         .{ "api_url", "api_url", true },
         .{ "rate_limit", "rate_limit", false },
         .{ "inputs", "inputs", true },
@@ -338,6 +348,10 @@ pub const EmbedderConfig = struct {
         }
         if (self.batch_size) |value| {
             try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        if (self.model_identity) |value| {
+            try jw.objectField("model_identity");
             try jw.write(value);
         }
         if (self.api_url) |value| {

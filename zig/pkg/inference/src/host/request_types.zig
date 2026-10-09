@@ -31,6 +31,8 @@ pub const EmbeddingRequestContext = struct {
     request: RequestContext,
     task_type: EmbeddingTaskType = .retrieval_document,
     instruction: ?[]const u8 = null,
+    model_identity: ?[]const u8 = null,
+    dimensions: ?u32 = null,
 
     pub fn check(self: EmbeddingRequestContext) !void {
         return self.request.check();

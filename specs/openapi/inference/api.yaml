@@ -1118,10 +1118,15 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
-  /decide:
+  /decisions:
     post:
-      summary: Answer named choice, ordinal score, and Boolean questions
       operationId: decide
+      summary: Answer named decision questions
+      description: Execute one text input or an Antfly batch. Embedding similarity supports choice and multi_choice;
+        trained decision models support choice, score and predicate. Answer variants distinguish trained
+        probabilities from raw cosine similarities.
+      tags:
+      - Inference
       requestBody:
         required: true
         content:
@@ -1130,7 +1135,7 @@ paths:
               $ref: '#/components/schemas/DecideRequest'
       responses:
         '200':
-          description: Decision distributions and derived answers
+          description: Named decision answers, diagnostics and aggregate token usage
           content:
             application/json:
               schema:
@@ -1155,6 +1160,7 @@ paths:
                 $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/TransientCapacity'
+
   /extract:
     post:
       summary: Extract entities, relations, classifications, and structures
@@ -1612,13 +1618,32 @@ components:
       $ref: '../shared/generating.yaml#/components/schemas/MediaContentPart'
     ContentPart:
       $ref: '../shared/generating.yaml#/components/schemas/ContentPart'
+    EmbeddingGroup:
+      type: object
+      additionalProperties: false
+      required: [content]
+      description: EmbeddingGemma 2 ordered text, image and audio parts producing one joint vector. Video is unsupported. The expanded sequence including all media soft tokens must fit 8192 tokens.
+      properties:
+        title:
+          type: string
+          description: Document title, allowed only with RETRIEVAL_DOCUMENT and at least one text part.
+        content:
+          type: array
+          minItems: 1
+          maxItems: 64
+          items:
+            $ref: '../shared/generating.yaml#/components/schemas/ContentPart'
     EmbedRequest:
       type: object
-      description: OpenAI-compatible embedding request with inference multimodal content-part extension
+      description: OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized vectors.
       required:
         - model
         - input
       properties:
+        model_identity:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Optional exact asset identity pin. A mismatch returns 409 before inference.
         model:
           type: string
           description: Model name to use for embedding generation
@@ -1629,6 +1654,7 @@ components:
             - a single string
             - an array of strings
             - an array of OpenAI-style content parts for multimodal embedding
+            - an array of ordered groups for EmbeddingGemma 2, one vector per group
           oneOf:
             - type: string
               description: Single text string
@@ -1640,6 +1666,12 @@ components:
               description: Array of multimodal content parts
               items:
                 $ref: '../shared/generating.yaml#/components/schemas/ContentPart'
+            - type: array
+              minItems: 1
+              maxItems: 128
+              description: Ordered groups. Legacy flat content parts continue to produce one vector per part.
+              items:
+                $ref: '#/components/schemas/EmbeddingGroup'
         encoding_format:
           type: string
           description: Encoding format for the embeddings (only "float" supported)
@@ -1648,10 +1680,10 @@ components:
             - float
         dimensions:
           type: integer
-          description: Optional truncation size for dense embeddings. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models.
+          description: Optional truncation size for dense embeddings. EmbeddingGemma 2 supports 768, 512, 256, or 128 only. Must be a positive integer no larger than the model embedding size. For normalized models the truncated vector is L2-re-normalized (Matryoshka semantics, matching the OpenAI dimensions parameter). Not supported for sparse models.
         task_type:
           type: string
-          description: "Optional embedding task type using Google embedding task-type names. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction."
+          description: "Optional embedding task type using Google embedding task-type names. EmbeddingGemma 2 uses the official prefix for each listed task, defaulting to RETRIEVAL_DOCUMENT. For Jina v5 text embeddings, query-side tasks use the query prefix and RETRIEVAL_DOCUMENT uses the document prefix. For Qwen3-Embedding models, RETRIEVAL_QUERY uses the model's built-in web-retrieval instruction, RETRIEVAL_DOCUMENT is embedded raw, and every other task type requires an explicit instruction."
           enum:
             - RETRIEVAL_QUERY
             - RETRIEVAL_DOCUMENT
@@ -1696,6 +1728,9 @@ components:
         - model
         - usage
       properties:
+        model_identity:
+          type: string
+          description: EmbeddingGemma 2 SHA256 identity of actual weights, tokenizer, processor and recipe. Dimensions and retrieval roles must also match index configuration.
         object:
           type: string
           description: Object type, always "list"
@@ -3032,93 +3067,16 @@ components:
           items:
             type: string
           description: List of input modalities this model accepts, such as `text`, `image`, or `audio`
+    EmbeddingDecisionOptions:
+      $ref: '../ai/decision.yaml#/components/schemas/EmbeddingDecisionOptions'
     DecideRequest:
-      type: object
-      additionalProperties: false
-      required: [model, state, questions]
-      properties:
-        model:
-          type: string
-          minLength: 1
-        state:
-          type: string
-          minLength: 1
-          maxLength: 1048576
-        questions:
-          type: object
-          minProperties: 1
-          maxProperties: 64
-          additionalProperties:
-            $ref: '#/components/schemas/DecideQuestion'
+      $ref: '../ai/decision.yaml#/components/schemas/DecideRequest'
     DecideQuestion:
-      type: object
-      additionalProperties: false
-      required: [type, instructions]
-      properties:
-        type:
-          type: string
-          enum: [choice, score, noul]
-        instructions:
-          type: string
-          minLength: 1
-        criteria:
-          description: Choice uses option IDs mapped to descriptions; score uses ordered descriptions; noul omits criteria.
-          oneOf:
-            - type: object
-              minProperties: 2
-              maxProperties: 64
-              additionalProperties:
-                type: string
-            - type: array
-              minItems: 2
-              maxItems: 64
-              items:
-                type: string
+      $ref: '../ai/decision.yaml#/components/schemas/DecideQuestion'
     DecideResponse:
-      type: object
-      required: [model, answers, usage]
-      properties:
-        model:
-          type: string
-        answers:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/DecideAnswer'
-        usage:
-          type: object
-          required: [input_tokens, output_tokens]
-          properties:
-            input_tokens:
-              type: integer
-              description: Encoded prompt tokens consumed by the executor, including repeated state text for split GLiNER tasks.
-            output_tokens:
-              type: integer
-              description: Zero for classifier executors, which emit no generated tokens.
+      $ref: '../ai/decision.yaml#/components/schemas/DecideResponse'
     DecideAnswer:
-      type: object
-      required: [type]
-      properties:
-        type:
-          type: string
-          enum: [choice, score, noul]
-        choice:
-          type: string
-        score:
-          type: number
-        noul:
-          type: number
-          minimum: 0
-          maximum: 1
-        legend:
-          type: object
-          additionalProperties:
-            type: string
-        probabilities:
-          type: object
-          additionalProperties:
-            type: number
-            minimum: 0
-            maximum: 1
+      $ref: '../ai/decision.yaml#/components/schemas/DecideAnswer'
     ModelsResponse:
       type: object
       required:
@@ -3177,7 +3135,7 @@ components:
           type: object
           additionalProperties:
             $ref: '#/components/schemas/ModelInfo'
-          description: Models declaring the decide task and typed_decisions capability
+          description: Models declaring the decide task and either typed_decisions or embedding_similarity capability
         generators:
           type: object
           additionalProperties:

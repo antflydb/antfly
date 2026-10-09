@@ -120,8 +120,8 @@ def test_decide_errors_and_closed_handle(tmp_path: Path) -> None:
             inf.decide(
                 {
                     "model": "no/such-model",
-                    "state": "refund",
-                    "questions": {"refund": {"type": "noul", "instructions": "Refund?"}},
+                    "input": "refund",
+                    "questions": [{"name": "refund", "type": "predicate", "instructions": "Refund?"}],
                 }
             )
     finally:
@@ -135,26 +135,39 @@ def test_decide_real_runtime_returns_all_answer_types_and_raw_json(tmp_path: Pat
     model = subprocess.check_output([sys.executable, str(script), str(tmp_path)], text=True).strip()
     request = {
         "model": model,
-        "state": "Refund the duplicate charge.",
-        "questions": {
-            "route": {
+        "input": "Refund the duplicate charge.",
+        "questions": [
+            {
+                "name": "route",
                 "type": "choice",
                 "instructions": "Which team?",
-                "criteria": {"billing": "Charges", "support": "Product"},
+                "choices": [
+                    {"value": "billing", "description": "Charges"},
+                    {"value": "support", "description": "Product"},
+                ],
             },
-            "urgency": {"type": "score", "instructions": "How urgent?", "criteria": ["Routine", "Soon", "Immediate"]},
-            "refund": {"type": "noul", "instructions": "Refund requested?"},
-        },
+            {
+                "name": "urgency",
+                "type": "score",
+                "instructions": "How urgent?",
+                "levels": [{"label": "Routine"}, {"label": "Soon"}, {"label": "Immediate"}],
+            },
+            {"name": "refund", "type": "predicate", "instructions": "Refund requested?"},
+        ],
     }
     with antfly_embedded.Inference.open(models_dir=tmp_path) as inf:
         result = inf.decide(request)
         assert result["model"] == model
-        assert result["answers"]["route"]["choice"] == "billing"
-        assert result["answers"]["route"]["probabilities"] == {"billing": 0.5, "support": 0.5}
-        assert result["answers"]["urgency"]["score"] == pytest.approx(1.0)
-        assert result["answers"]["urgency"]["legend"] == {"0": "Routine", "1": "Soon", "2": "Immediate"}
-        assert sum(result["answers"]["urgency"]["probabilities"].values()) == pytest.approx(1.0)
-        assert result["answers"]["refund"]["noul"] == pytest.approx(0.5)
+        route, urgency, refund = result["answers"]
+        assert route["name"] == "route" and route["choice"] == "billing"
+        assert route["probabilities"] == [
+            {"value": "billing", "probability": 0.5},
+            {"value": "support", "probability": 0.5},
+        ]
+        assert urgency["score"] == pytest.approx(1.0)
+        assert [level["label"] for level in urgency["probabilities"]] == ["Routine", "Soon", "Immediate"]
+        assert sum(level["probability"] for level in urgency["probabilities"]) == pytest.approx(1.0)
+        assert refund["type"] == "predicate" and refund["probability"] == pytest.approx(0.5)
         assert result["usage"]["input_tokens"] > 0
         assert result["usage"]["output_tokens"] == 0
         raw = inf.decide(json.dumps(request), raw=True)

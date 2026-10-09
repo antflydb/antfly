@@ -140,7 +140,7 @@ fn decide_validates_requests_and_reports_missing_models() {
         assert_eq!(err.error, Error::InvalidArgument);
         assert!(err.body.contains("INVALID_REQUEST"), "{err:?}");
 
-        let request = r#"{"model":"no/such-model","state":"Refund requested","questions":{"refund":{"type":"noul","instructions":"Does this request ask for a refund?"}}}"#;
+        let request = r#"{"model":"no/such-model","input":"Refund requested","questions":[{"name":"refund","type":"predicate","instructions":"Does this request ask for a refund?"}]}"#;
         let err = inference
             .decide(request)
             .expect_err("missing decision model");

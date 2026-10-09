@@ -200,32 +200,57 @@ def test_generate_bounds_success_response(monkeypatch: pytest.MonkeyPatch) -> No
 def decision_request() -> dict:
     return {
         "model": "decision-model",
-        "state": "Refund the duplicate charge. 🐜",
-        "questions": {
-            "route": {
+        "input": "Refund the duplicate charge. 🐜",
+        "questions": [
+            {
+                "name": "route",
                 "type": "choice",
                 "instructions": "Which team?",
-                "criteria": {"billing": "Charges", "support": "Product"},
+                "choices": [
+                    {"value": "billing", "description": "Charges"},
+                    {"value": "support", "description": "Product"},
+                ],
             },
-            "urgency": {"type": "score", "instructions": "How urgent?", "criteria": ["Routine", "Soon", "Immediate"]},
-            "refund": {"type": "noul", "instructions": "Refund requested?"},
-        },
+            {
+                "name": "urgency",
+                "type": "score",
+                "instructions": "How urgent?",
+                "levels": [{"label": "Routine"}, {"label": "Soon"}, {"label": "Immediate"}],
+            },
+            {"name": "refund", "type": "predicate", "instructions": "Refund requested?"},
+        ],
     }
 
 
 def decision_response() -> dict:
     return {
         "model": "decision-model",
-        "answers": {
-            "route": {"type": "choice", "choice": "billing", "probabilities": {"billing": 0.9, "support": 0.1}},
-            "urgency": {
-                "type": "score",
-                "score": 1.1,
-                "probabilities": {"0": 0.1, "1": 0.7, "2": 0.2},
-                "legend": {"0": "Routine", "1": "Soon", "2": "Immediate"},
+        "answers": [
+            {
+                "name": "route",
+                "type": "choice",
+                "decision_method": "typed",
+                "choice": "billing",
+                "confidence": 0.5,
+                "confidence_method": "normalized_inverse_entropy",
+                "act_probability": 0.8,
+                "probabilities": [{"value": "billing", "probability": 0.9}, {"value": "support", "probability": 0.1}],
             },
-            "refund": {"type": "noul", "noul": 0.95},
-        },
+            {
+                "name": "urgency",
+                "type": "score",
+                "decision_method": "typed",
+                "score": 1.1,
+                "confidence": 0.3,
+                "confidence_method": "normalized_inverse_entropy",
+                "probabilities": [
+                    {"value": 0, "label": "Routine", "probability": 0.1},
+                    {"value": 1, "label": "Soon", "probability": 0.7},
+                    {"value": 2, "label": "Immediate", "probability": 0.2},
+                ],
+            },
+            {"name": "refund", "type": "predicate", "decision_method": "typed", "probability": 0.95},
+        ],
         "usage": {"input_tokens": 20, "output_tokens": 0},
     }
 
@@ -236,7 +261,7 @@ def test_decide_preserves_requests_auth_and_all_answer_types(typed: bool) -> Non
 
     def handle(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"
-        assert request.url.path == "/ai/v1/decide"
+        assert request.url.path == "/ai/v1/decisions"
         assert request.headers["authorization"] == "Bearer secret"
         assert request.headers["accept"] == "application/json"
         assert json.loads(request.read()) == decision_request()

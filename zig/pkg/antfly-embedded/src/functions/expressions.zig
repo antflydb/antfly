@@ -186,7 +186,8 @@ const Validator = struct {
         _ = try d.text(obj.get("decider") orelse return error.InvalidFunctionExpression);
         const args = try callArgs(self.a, desc.function, obj, .null);
         const questions = try d.questionsFor(self.a, desc.function, args);
-        try d.validateQuestions(questions, d.capabilities(.antfly));
+        // Provider preflight validates supported kinds; named arrays were parsed above.
+        if (desc.function != .ai_decide) try d.validateQuestions(questions, d.capabilities(.antfly));
     }
     fn predicate(self: *@This(), value: Json, depth: usize) anyerror!void {
         try self.check(depth);

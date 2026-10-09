@@ -532,7 +532,7 @@ impl Inference {
     }
 
     /// Answers named choice, ordinal score, and Boolean questions.
-    /// `POST /decide`; accepts DecideRequest and returns DecideResponse JSON
+    /// `POST /decisions`; accepts DecideRequest and returns DecideResponse JSON
     /// from `specs/openapi/inference/api.yaml`. Models must support typed decisions.
     pub fn decide(&self, request: impl AsRef<[u8]>) -> InferenceResult<Vec<u8>> {
         self.call_json(request.as_ref(), |h, req, out| unsafe {

@@ -173,8 +173,8 @@ def prepare(source: Path, output: Path, origin: str, revision: str) -> None:
             json.dumps(
                 {
                     "type": "classifier",
-                    "tasks": ["extract"],
-                    "capabilities": ["classification", "typed_decisions"],
+                    "tasks": ["decide"],
+                    "capabilities": ["typed_decisions"],
                     "inputs": ["text"],
                     "source": {"repository": origin, "revision": revision},
                 },

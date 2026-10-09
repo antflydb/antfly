@@ -106,9 +106,9 @@ pub const ExtractionClassificationSchema = struct {
     multi_label: ?bool = null,
     /// Version 1 NLI hypothesis template with {} as the label placeholder; the server uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit hypothesis_template; use prompt/instruction and label_definitions for model conditioning.
     hypothesis_template: ?[]const u8 = null,
-    /// Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained or ordinal selection uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options.
+    /// Maximum labels for ordinary single-label classification; the server uses 1 when omitted. Version 2 constrained classification uses min_labels/max_labels. Advanced set-selection options or cross-task constraints on any classification in the collection reject every explicit top_k in that collection, including 1. Omit top_k when using these options.
     top_k: ?i64 = null,
-    /// Version 2 classification mode. Ordinal labels are ordered from lowest to highest. Typed-decision extractors support boolean with labels ["false", "true"] in that order. Each model rejects modes it does not support.
+    /// Version 2 ordinary classification mode. Standalone ordinal scores use the decision API. Each model rejects modes it does not support.
     mode: ?[]const u8 = null,
     label_definitions: ?std.json.ArrayHashMap(ExtractionLabelDefinition) = null,
     min_labels: ?i64 = null,
@@ -237,6 +237,9 @@ pub const ExtractionClassificationSchema = struct {
         try jw.endObject();
     }
 };
+
+/// Finite centered-logit decisions require a threshold strictly between zero and one.
+pub const ExtractionClassificationThreshold = f64;
 
 pub const ExtractionConfig = struct {
     provider: ExtractionProvider,
@@ -433,77 +436,6 @@ pub const ExtractionConstraintOr = struct {
     type: []const u8,
     children: []const ExtractionClassificationConstraint,
 };
-
-/// Version 2 typed classification decision. Probabilities follow request label order; ordinal levels are zero-based.
-pub const ExtractionDecision = struct {
-    name: []const u8,
-    type: []const u8,
-    /// Highest-probability label. This is distinct from the expected ordinal value.
-    label: []const u8,
-    probabilities: []const ExtractionLabelProbability,
-    confidence: f32,
-    /// Entropy confidence is not the probability that the selected label is correct.
-    confidence_method: []const u8,
-    /// Score decisions only; sum of zero-based level index times probability.
-    expected_value: ?f32 = null,
-    /// Boolean decisions only; probability of the true label.
-    true_probability: ?f32 = null,
-    /// Auxiliary model estimate for acting, from models with an action head (Laya). Does not authorize or execute a tool call.
-    act_probability: ?f32 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "name", "name", false },
-        .{ "type", "type", false },
-        .{ "label", "label", false },
-        .{ "probabilities", "probabilities", false },
-        .{ "confidence", "confidence", false },
-        .{ "confidence_method", "confidence_method", false },
-        .{ "expected_value", "expected_value", true },
-        .{ "true_probability", "true_probability", true },
-        .{ "act_probability", "act_probability", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("name");
-        try jw.write(self.name);
-        try jw.objectField("type");
-        try jw.write(self.type);
-        try jw.objectField("label");
-        try jw.write(self.label);
-        try jw.objectField("probabilities");
-        try jw.write(self.probabilities);
-        try jw.objectField("confidence");
-        try jw.write(self.confidence);
-        try jw.objectField("confidence_method");
-        try jw.write(self.confidence_method);
-        if (self.expected_value) |value| {
-            try jw.objectField("expected_value");
-            try jw.write(value);
-        }
-        if (self.true_probability) |value| {
-            try jw.objectField("true_probability");
-            try jw.write(value);
-        }
-        if (self.act_probability) |value| {
-            try jw.objectField("act_probability");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Finite centered-logit decisions require a threshold strictly between zero and one.
-pub const ExtractionDecisionProbability = f64;
 
 /// Bounded classification and JointIE selection. Exact optimality is with respect to admitted candidates. A completed beam may be feasible without an optimality proof. By default exhausted search is an error; best_effort permits only a validated feasible witness and reports exhausted:true.
 pub const ExtractionDecoderOptions = struct {
@@ -1297,11 +1229,6 @@ pub const ExtractionLabelDefinition = struct {
     }
 };
 
-pub const ExtractionLabelProbability = struct {
-    label: []const u8,
-    probability: f32,
-};
-
 pub const ExtractionLongDocumentMetadata = struct {
     version: i64,
     window_count: i64,
@@ -1367,8 +1294,6 @@ pub const ExtractionLongDocumentOptions = struct {
 };
 
 pub const ExtractionObject = struct {
-    /// Typed decision results from capable extractors, alongside compatible per-label classifications.
-    decisions: ?[]const ExtractionDecision = null,
     id: ?[]const u8 = null,
     offset_unit: ?std.json.Value = null,
     entities: ?[]const ExtractionEntity = null,
@@ -1383,7 +1308,6 @@ pub const ExtractionObject = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
-        .{ "decisions", "decisions", true },
         .{ "id", "id", true },
         .{ "offset_unit", "offset_unit", true },
         .{ "entities", "entities", true },
@@ -1405,10 +1329,6 @@ pub const ExtractionObject = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
-        if (self.decisions) |value| {
-            try jw.objectField("decisions");
-            try jw.write(value);
-        }
         if (self.id) |value| {
             try jw.objectField("id");
             try jw.write(value);

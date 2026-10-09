@@ -94,7 +94,7 @@ antfly inference export ~/.antfly/inference/models/fastino/GLiNER2.5-Decide \
 This converted bundle retains the historically qualified ordinary
 `POST /ai/v1/extract` classification route. Export removes the reserved
 `decide` task and `typed_decisions` capability from its copied manifest, so
-the source FP32 checkpoint's exact-artifact public `/decide` grant does not
+the source FP32 checkpoint's exact-artifact public `/decisions` grant does not
 carry over to Q8_0. A converted bundle needs its own public Decide
 qualification before those fields may be restored.
 

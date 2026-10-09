@@ -35,8 +35,10 @@ Decision providers are `antfly` (Antfly inference), `jev`, and `openai`
 | Physical decision operator | `DecisionEval` |
 | Evaluation scopes | `candidates`, `matches` |
 
-Use identical built-in names across query languages. Preserve `/decide`, the
-public proxy route `/ai/v1/decide`, and `noul` in the inference contract.
+Use identical built-in names across query languages. Standalone decisions use
+`/decisions` and `/ai/v1/decisions`, text `input`, named question and answer
+arrays, and predicate `probability`. Jev/Laya wire names remain private adapter
+details. See [the current contract](../docs/guides/decisions.md).
 Query users access Boolean probability through `ai_probability`.
 
 ## Shared expressions and binding
@@ -155,14 +157,14 @@ later improve member access and metadata. Convenience calls return scalar types.
 
 ```sql
 WITH classified AS (
-  SELECT id, ai_decide(transcript, $1, 'support-decider') AS decision
+  SELECT id, ai_probability(transcript,
+    'The input requests a refund.', 'support-decider') AS refund_probability
   FROM conversations
   WHERE status = 'open'
 )
-SELECT id, decision
+SELECT id, refund_probability
 FROM classified
-WHERE CAST(decision -> 'answers' -> 'asks_for_refund' ->> 'noul'
-           AS DOUBLE PRECISION) >= 0.8;
+WHERE refund_probability >= 0.8;
 ```
 
 This example uses matches scope. SQL never introduces a hidden candidate cap;
@@ -278,9 +280,9 @@ published decisions. Use pinned models and secret references for durable specs.
     "config": {
       "version": "support-v1",
       "decider": {"provider": "antfly", "model": "your-decision-model"},
-      "questions": {
-        "refund": {"type": "noul", "instructions": "The customer asks for a refund."}
-      }
+      "questions": [
+        {"name": "refund", "type": "predicate", "instructions": "The customer asks for a refund."}
+      ]
     }
   }
 }
@@ -333,10 +335,11 @@ Custom `url` values are base URLs including `/v1` when required; the adapter
 appends `/decisions`. Requests and responses use generated types from the
 vendored official OpenAPI spec in `specs/openai-openapi.yaml`.
 
-The adapter maps `noul` to OpenAI `predicate`, named choice criteria to string
-choice values and descriptions, and score levels to zero-based string labels
-and descriptions. It validates response order, names, types, and complete
-distributions before returning Antfly’s existing answer shapes. Detailed usage
+`ai_decide` accepts the public named question array with `choice`, `score`, and
+`predicate` kinds. The adapter maps convenience-function arguments to that
+contract and preserves explicit score labels. It validates response order,
+names, types, and complete distributions before returning the public named
+answer array. Jev's map and `noul` vocabulary stay private to its adapter. Detailed usage
 fields and the resolved model are preserved. A refusal produces
 `InvalidDecisionOutput` and fails the query; it never becomes zero or NULL.
 

@@ -1,0 +1,2558 @@
+{
+  "version": 1,
+  "recorded_utc": "2026-10-07T06:43:06.881460+00:00",
+  "qualification": "compact_matched_f32_parity_and_local_latency",
+  "production_qualified": false,
+  "checkpoint": {
+    "model": "google/embeddinggemma-2",
+    "revision": "914f7f89142e33e77833254d9c9b90c3cef7303b",
+    "recipe": "embeddinggemma2-f32-mean-v1",
+    "files": [
+      {
+        "path": "1_Pooling/config.json",
+        "sha256": "8759bdf7c77efc7df7723f64856a593c8943b71ee38baf2a88771fbaf78438f9",
+        "bytes": 90
+      },
+      {
+        "path": "2_Normalize/config.json",
+        "sha256": "cdb09dfca347a56aa2d691744e38d5ad3c7cbc2834e7181272b9a15328b82524",
+        "bytes": 97
+      },
+      {
+        "path": "README.md",
+        "sha256": "b677a0ee2818c36f091b65fd3d9b4baea9f04d53b02b49cae916c74bf9682037",
+        "bytes": 21730
+      },
+      {
+        "path": "config.json",
+        "sha256": "b8f1e9931b57fbc054acdb445c41765d55b0074c58d145fa82839941ad1b5bb3",
+        "bytes": 4455
+      },
+      {
+        "path": "config_sentence_transformers.json",
+        "sha256": "031e56a498d33c349ab489a21885bcfe25b4fcba841149dc99e1e90d4a7c28f5",
+        "bytes": 1565
+      },
+      {
+        "path": "model.safetensors",
+        "sha256": "197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79",
+        "bytes": 1488915288
+      },
+      {
+        "path": "modules.json",
+        "sha256": "3d02572a0455b832de67fb8e63a54981bc7e8b46e337c95e917bd8122a533bfd",
+        "bytes": 413
+      },
+      {
+        "path": "preprocessor_config.json",
+        "sha256": "ea2ae257e901064abdd98dceb19f2b0da06af600bed15e0f99f5c85c37ee9d78",
+        "bytes": 511
+      },
+      {
+        "path": "processor_config.json",
+        "sha256": "168f6a08522f3ce5dea596d94d003af2fd691742d4f41fe1f9d8cce76bfbf69c",
+        "bytes": 1788
+      },
+      {
+        "path": "sentence_bert_config.json",
+        "sha256": "b1bcd9f2dce3ae863b359e87d0710b5dbc3314a59ecb4e2f97c7778fc8e4b228",
+        "bytes": 747
+      },
+      {
+        "path": "tokenizer.json",
+        "sha256": "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4",
+        "bytes": 32170510
+      },
+      {
+        "path": "tokenizer.model",
+        "sha256": "e594c8a90eb08d8bda498ff4747977dc827ae0c3c56b5c0d41a605a22d02ef03",
+        "bytes": 4689013
+      },
+      {
+        "path": "tokenizer_config.json",
+        "sha256": "17bd5d6e9364ca49a534e1502076593317c298d4a663623091ed45388f004874",
+        "bytes": 1599
+      }
+    ],
+    "receipt_sha256": "ac45c79dbad7752950dc5c731ee4e9d214540d290b63082e12ce3f51b1fd064e",
+    "all_receipt_files_rehashed": true,
+    "model_identity": "2e3ab9d26dcdc60ebb4d0d6b2c744e0285545358eb6945b8fbbe9c0b1a6c2081",
+    "source": "https://huggingface.co/google/embeddinggemma-2/tree/914f7f89142e33e77833254d9c9b90c3cef7303b"
+  },
+  "reference": {
+    "transformers_revision": "92cd495f2720c064bc78eb2d93e28704c5bce51f",
+    "versions": {
+      "torch": "2.10.0",
+      "transformers": "5.19.0.dev0",
+      "tokenizers": "0.23.2",
+      "huggingface_hub": "1.33.0",
+      "safetensors": "0.8.0",
+      "torchvision": "0.25.0"
+    },
+    "precision": "float32",
+    "implementation_sha256": {
+      "models/embedding_gemma2/modeling_embedding_gemma2.py": "132d8714852fa8f0c376af797229e7b48fe94e0cf6cae6f6640681e934062923",
+      "models/embedding_gemma2/processing_embedding_gemma2.py": "6bc770072c6c1df02c3cde4f79c65720c84e1d7f76ca4092baa0dbd217151b52",
+      "models/gemma4/modeling_gemma4.py": "edc123ab83fbb25548ec65536eaecee998c088653adf683be3ef69d62e2bfea9",
+      "models/gemma4/image_processing_gemma4.py": "5d280d5448b1c219183a27e95b6aa7178b350275772d07881c91c65f13fa815e",
+      "models/gemma4/feature_extraction_gemma4.py": "40545340a144aad4d74c6cedb4eae5daa4efd54ae432649583e19b5d756c02c7"
+    },
+    "implementation_files_rehashed": true,
+    "oracles": {
+      "oracle.json": {
+        "sha256": "b027d365d0c6afef763c3e9396d42f9dd93b43d275ea3d16b3b8536167ddfa33",
+        "bytes": 110387,
+        "case_count": 5,
+        "precision": "float32",
+        "cases": [
+          "title: none | text: A fox jumps over a log.",
+          "task: search result | query: What animal jumps?",
+          "task: clustering | query: Instruction: Route the request\nInput: Reset my password",
+          "task: clustering | query: Instruction: Route the request\nCategory: Account access problems",
+          "task: classification | query: A multilingual sentence: Bonjour \u4e16\u754c \u0645\u0631\u062d\u0628\u0627."
+        ],
+        "token_counts": [
+          15,
+          13,
+          19,
+          19,
+          16
+        ]
+      },
+      "media-oracle.json": {
+        "sha256": "d3b89eab8c4dd45a283df2ff79500c62a467dfc71c033b528c0c177c617c9b7b",
+        "bytes": 134996,
+        "case_count": 5,
+        "precision": "float32",
+        "cases": [
+          {
+            "name": "image",
+            "expanded_tokens": 264
+          },
+          {
+            "name": "audio",
+            "expanded_tokens": 29
+          },
+          {
+            "name": "text_image",
+            "expanded_tokens": 275
+          },
+          {
+            "name": "image_text",
+            "expanded_tokens": 276
+          },
+          {
+            "name": "mixed",
+            "expanded_tokens": 303
+          }
+        ]
+      },
+      "long-oracle.json": {
+        "sha256": "30ed54da92af6d0da9753f21a2fc76b5b20160968882d51c4cd227d32fabed97",
+        "bytes": 179119,
+        "case_count": 3,
+        "precision": "float32",
+        "cases": [
+          "128-token passage",
+          "512-token passage",
+          "8192-token passage"
+        ],
+        "token_counts": [
+          128,
+          512,
+          8192
+        ]
+      }
+    },
+    "media_assets": {
+      "image.png": {
+        "sha256": "33b8436f88b1614b48014b8363f6a225c13a282fdc86b5ffeb6807cd4226fafd",
+        "bytes": 551
+      },
+      "audio.wav": {
+        "sha256": "cb9568ee93b04dba4a309580b45a0369e486682e2e57305ac8f302630bb8e2ea",
+        "bytes": 32044
+      }
+    }
+  },
+  "suite_sha256": "7c3eaf3afd2ee3864c32d100bc1e1d49355cc6ba2f67c9af9c710c5a9bcd7515",
+  "source_snapshot": {
+    "base_git_head": "b79388a7d67f812f46d34c75cabe404836ed2a6a",
+    "changed_source_content_sha256": "6735c084c8fedd154eeecf9119cabe6edd5b964c0ca68b73befc829240ad7aa2",
+    "files_sha256": {
+      "openapi.yaml": "9b2e1462c084343f4242c246c084e712ffc1c3ad8ad4a8c36ee9c208a250d00e",
+      "py/packages/sdk/fix_generated_client.py": "efe59994169c5240c39ca21b00d3490412398c7649393f66513301a55c576a8d",
+      "py/packages/sdk/src/antfly/client_generated/api/default/create_embedding.py": "c8376a56f597d28d442a6e71bdc06d42d8b9ad6779ae521f5ee3bd54fbef047c",
+      "py/packages/sdk/src/antfly/client_generated/api/default/generate_embeddings.py": "e3eb48c9fb26d9b13da2317599028b49f7626223844172a4dfdde2f1d7f5f80d",
+      "py/packages/sdk/src/antfly/client_generated/models/__init__.py": "756b940ee4103f88c2e8ca0e7635302950e7568b61ce055baa8ecfede7a7512c",
+      "py/packages/sdk/src/antfly/client_generated/models/antfly_embedder_config.py": "ae23330c9abf480197598bfa41a56c66049d2b1bea5e2076325ff38418163816",
+      "py/packages/sdk/src/antfly/client_generated/models/embedding_extraction_decision.py": "fc5effbe1f887bfcbb01d91a2748de06a9458f27c455ab733d7985263606c47f",
+      "py/packages/sdk/src/antfly/client_generated/models/embedding_extraction_decision_decision_method.py": "023a22098d88220a0a3b70ca6e49bbfa69e70a09b6c5eedbb8a9f5f09bcea635",
+      "py/packages/sdk/src/antfly/client_generated/models/embedding_extraction_decision_mode.py": "22184160fabd3e46d706f52826d03dbe76a50e4d0608d8be6904d52da5c565c4",
+      "py/packages/sdk/src/antfly/client_generated/models/embedding_extraction_decision_similarities.py": "7d3ca8bc2436b68a3376c06f79b43ec57c7b95f3abb3aa340c9836379636afe9",
+      "py/packages/sdk/src/antfly/client_generated/models/embedding_extraction_decision_status.py": "30f7ed03e60ee0cd81298edaf4c4c941acd66a41605344edbaf418e3617b52c7",
+      "py/packages/sdk/src/antfly/client_generated/models/extraction_classification.py": "b154bc65570d84cd4aa06619c5497ce0e2be9186f427440428ab9390846c92cf",
+      "py/packages/sdk/src/antfly/client_generated/models/extraction_classification_schema.py": "3a86eac4a6550f90371d510baa780d2d2a9b6246dbdefe474a0b12f6e56a70a7",
+      "py/packages/sdk/src/antfly/client_generated/models/extraction_classification_schema_similarity_thresholds_type_1.py": "3004c48deae1d6c599239b29b24859ad5fe069a6b0c9e0f7f3b46ef54443b50a",
+      "py/packages/sdk/src/antfly/client_generated/models/extraction_decision.py": "1c9a013c84a0d290e3bb526cb8f22c49020be9aa6ac06c58578658bc34aff021",
+      "py/packages/sdk/src/antfly/client_generated/models/extraction_decision_confidence_method.py": "871e8a204eb028dbf3d757e181ff068023d279173c4f47024bc6d8153a48f47c",
+      "py/packages/sdk/src/antfly/client_generated/models/extraction_decision_type.py": "ccf764b648a0721fb4aef8a50bd3b7ac2b192a434c3406a62a41371aec7e10a7",
+      "py/packages/sdk/src/antfly/client_generated/models/extraction_object.py": "fd0628054cbf8f6ac3a4967791a56a487e5b5fbdea60fd472339f552d1d2d93d",
+      "py/packages/sdk/src/antfly/client_generated/models/extraction_options.py": "395eebcbd62861a2f7ce38fa1643c16a3d717e632b684373890dbd17ddb1c36d",
+      "py/packages/sdk/src/antfly/client_generated/models/extraction_options_embedding.py": "c1018b54b9d4810bb6b5d51cddc524c4ae1ada7a02f379ebe4faf0d48365b86f",
+      "py/packages/sdk/src/antfly/client_generated/models/extraction_options_embedding_dimensions.py": "a05a6963e40c123d91b6d93bac38c80e2d59b637353f0ed55950c5984bfdbb07",
+      "py/packages/sdk/src/antfly/client_generated/models/extraction_options_embedding_task_type.py": "7a6a56ef3133302f15b92dc2b84dc5cfc3bacda18c4e7c67b8dc550eaf0f38b8",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_decide_answer.py": "3c93e038e8a4c0dff75f7884d92bd0cc14662c7a32878da7092dd6641a05e7dc",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_decide_answer_abstention_reason.py": "6100c9026fb5760df598d31f18f886e2f1128a7e4e306a3d583849013d3110c7",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_decide_answer_decision_method.py": "14927b3ac6d29757a31d47c4e33cef752ab79d77178cf03609ecfc3571472af3",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_decide_answer_similarities.py": "bb970fe1ea57f49313badc86a97a2f45bc6bb0afb8830ea0179e5b491408bc5c",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_decide_answer_status.py": "bbdf3c954fc8140c7761ee955d7cdfcb39dcc8d73cf8d431ee18ec2e9382791b",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_decide_question_criteria_type_0.py": "b8f03f8d57bb0e572e9fca08291fdca0c7673f36611d83eee25e5d2916ee6e84",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_decide_request.py": "58bf6853624536602453eddcd325da21fe4152d118f1dcf4efd34d2f5286767f",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_decide_response.py": "1ee839d4f6cf7293a3a17670f68ca578b759c7fd139a88431bbf2aec3160cdf2",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_embed_request.py": "30c81d16bb232cf916c96d05c15ac80f4acaabf46d581c7d32fcb1794c3906ab",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_embed_response.py": "d9796f62a70f1f5fa64de215243ba23db2d33008dcfd4cd47b489af246adccb5",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_embedding_decision_category.py": "a0f9124fd7ce10afdf7671aa142c2cde2be7c5a88a2c6319e02f825e17e87090",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_embedding_decision_options.py": "663a4c260e9809cc4b4fa9e652f54d892a0bc7eecb100db62cc449d86397ebb2",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_embedding_decision_options_dimensions.py": "2fd3e4ed89a348effd2405b3965a6989c909f9c64cd52953faa9cb7f595e5de6",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_embedding_decision_options_task_type.py": "cb4a28e7610c90930d7008de02d02669b66b158026a0e4b50eaaa6e9472eee6e",
+      "py/packages/sdk/src/antfly/client_generated/models/inference_embedding_group.py": "758d24e7072e902691d11660e767a08519dc12b31b9c4ce71834c8413f10e30d",
+      "py/packages/sdk/src/antfly/client_generated/models/trained_extraction_decision.py": "94b685a8c72a7e5f1c95f88dd9f57781ffdccd640a50d3f0a5488f9da3f41ad1",
+      "py/packages/sdk/src/antfly/client_generated/models/trained_extraction_decision_confidence_method.py": "10677e8f0a1f8964b6ea71db9718126f2d6a149b307d502fc9a011dd45a3c87e",
+      "py/packages/sdk/src/antfly/client_generated/models/trained_extraction_decision_type.py": "5ce42a608dddf7df96fe4c4eb10b4f56949c51efe377b3752a9a559fa8829258",
+      "py/packages/sdk/tests/test_embeddinggemma2.py": "60b069c6d129dcd34b01d819174a1800196b525335fcf17d4c7a22c5d9940ebe",
+      "py/packages/sdk/tests/test_fix_generated_client.py": "2f05e6f41981b44089583144d2cd775b70ef165689950c6c5f9e3788b9a39593",
+      "specs/openapi/ai/extraction.yaml": "ddd48752396b0f29eda58bc0af9298e55c574c045cda43e26a0b96e3aa553e49",
+      "specs/openapi/antfly/config.yaml": "f81f59377aa95b67bdd82966d8d4a859e7ec3bc07ff6479cac46148ff260b991",
+      "specs/openapi/antfly/embeddings.yaml": "0eed6f86066301f6849078dc63a7bfaae76f5b71b8c742e1ab29aed6d55ee66f",
+      "specs/openapi/inference/api.yaml": "705b09088997d28353601f08cc0593837780e31387d7b1fa28bae05d1faf0b2b",
+      "ts/packages/sdk/src/public-api.d.ts": "81b2ba98c8190f57324130de4dcd13d87ebcd9ef68ff2072f3f8ae0c5db030fd",
+      "ts/packages/sdk/type-test/embeddinggemma2.ts": "da9101e9d0d97e340306b25ff8323f82d9f2308c68a87763e8ff91becb8d97a7",
+      "zig/lib/embeddings/src/mod.zig": "9e557990d0a782f12f501bf810ccbcf735df54ddc020ba7a5ff8c722573fd43d",
+      "zig/lib/image/src/processing.zig": "58b6b444a1c2ce15419579b2ccf06245b30b71e6a04996ca7762be7cabef0fa4",
+      "zig/pkg/antfly-client/src/openapi/generated/antfly_client_openapi/root.zig": "baf4eb67ddb4c493ad3614d130c88dc145889f7eb78087a07b637ec70b56687a",
+      "zig/pkg/antfly-client/src/openapi/generated/antfly_client_openapi/types.zig": "94547038565f94511acf00ca27cd48fc94db886ab671dde9c38fe29b2eac2cf0",
+      "zig/pkg/antfly-embedded/src/asset_producer_runtime.zig": "318f4706fe84a48da0a13abb781285fed38bc24460022c5229291b5360341152",
+      "zig/pkg/antfly-embedded/src/functions/decisions.zig": "68e1be4eaba15f6de9a6f370de38faad5b895d107560804e3d417c05e5c57b8e",
+      "zig/pkg/antfly-embedded/src/functions/materialization.zig": "baa13755032be21cf59a51b24def6e384834e3f83ab62a0296265ef4f798a933",
+      "zig/pkg/antfly-embedded/src/functions/runtime.zig": "f8d81c46202ac326963a68e70a30686ebe4dfd928aa799e5fed223f7d4c6590b",
+      "zig/pkg/antfly-embedded/src/inference/managed_embedder.zig": "18a89ae506c254fc6f07deb8c12d15bec1f99b5ac975a339a3e4abec48eac41b",
+      "zig/pkg/antfly-embedded/src/inference/providers/local.zig": "c5ccf97883246e6541bd2cd187d52934fbeab6b293e8783a4dead0221626be30",
+      "zig/pkg/antfly-embedded/src/openapi/generated/antfly_common_openapi/types.zig": "e33d0336e1500c9bdfd7afd56c3e8f17d8efac702ad84b83c0b9f57697bda462",
+      "zig/pkg/antfly-embedded/src/openapi/generated/antfly_embeddings_openapi/types.zig": "9c95f72be4fd900095bd146a4b7929c9356ab18cca5cef5583fec2e59f6f37f4",
+      "zig/pkg/antfly-embedded/src/openapi/generated/antfly_extraction_openapi/root.zig": "18fb81885a91fc38d6eb0b90ee2c87635be400092cffae4822a63e8b57ddb0b0",
+      "zig/pkg/antfly-embedded/src/openapi/generated/antfly_extraction_openapi/types.zig": "1421d1dd6b2fa25787262fa7d8b646f1a7f3243f0cd6a0d15ac936282169b80b",
+      "zig/pkg/antfly-embedded/src/storage/inference_provider.zig": "2bc47f4a076716a85464e780e24ad8f427dd37da709d6734be27e7b771aa2850",
+      "zig/pkg/inference/build/runtime.zig": "f729cc4681ad55eb37a921b68795a123604d435d2263f7fea9217fc08f2e36d3",
+      "zig/pkg/inference/src/api/generated/inference_api/root.zig": "81fe7ef0f3762312d8810525d1facc98149d3890233bd355ed9fda905794b657",
+      "zig/pkg/inference/src/api/generated/inference_api/types.zig": "6d5646ceafe268f3e2b8e378d18acde37f723116148e189275c436b6ce1e92d0",
+      "zig/pkg/inference/src/architectures/embedding_gemma2.zig": "cef8c53b95d47fbcb59d1ec4e17e13dff898b8bb7a34767566700da313eb2ae8",
+      "zig/pkg/inference/src/architectures/embedding_gemma2_config.json": "b8f1e9931b57fbc054acdb445c41765d55b0074c58d145fa82839941ad1b5bb3",
+      "zig/pkg/inference/src/architectures/embedding_gemma2_media_weights.zig": "7a3add8b4730bef6e29867b87ce8bf1dc7f0532ca051a0976a90d64cffcdf81b",
+      "zig/pkg/inference/src/architectures/gemma4_projector.zig": "8c91f9cb126004970648599a33371316e304f3582e6cbd770c1cfbce0b32cdf8",
+      "zig/pkg/inference/src/architectures/session_factory.zig": "1c497feb34a92bd69f78219d9600992b12a3be416b3a2055b962c83dfe6f6623",
+      "zig/pkg/inference/src/backends/metal_kernels.m": "de22b5ba1c420e8ab07ae99599d1c22cbbb13f54b56e69ae37d919fd96da59d6",
+      "zig/pkg/inference/src/extractors/decide.zig": "ae964503e46306588f00dcbeb38584289b3757269407fad932d095e7357bb9cf",
+      "zig/pkg/inference/src/extractors/embedding_calibration.zig": "9e9e649f88aa4ef3e01fccde6447e11a4c9af805b38dc24e5924f33b986c2c1a",
+      "zig/pkg/inference/src/extractors/embedding_classification.zig": "15fc32808d234b00ebd82663def4c79284c1cfda19316c94719b793b0b2d4f32",
+      "zig/pkg/inference/src/extractors/embedding_decisions.zig": "1c77f55cadb1fef1299c088c87451dee01d5ee7e2e47a45af93cfcfc3448421c",
+      "zig/pkg/inference/src/extractors/embedding_prototypes.zig": "9d144f3ab2117d9681cbf32680851deed4b22c903e5823861ba7c72ff040cb41",
+      "zig/pkg/inference/src/extractors/extraction_v2.zig": "4207192b16864ceca2ce802aa716a4f686d9cb8b01927e703ff4f9d94dc4a397",
+      "zig/pkg/inference/src/host/embedding_wire.zig": "558ed6fc464d1fa7d005eb4c3aa3daadca4556f0e19565db8ba4718ed6887880",
+      "zig/pkg/inference/src/host/host.zig": "446e4e9bc5bc8556c650e246bf54d8a873dcc9e2797c242a06cdf39dce1e04e3",
+      "zig/pkg/inference/src/host/request_types.zig": "393d3be3fc2d77714ae0c162e21aff6190f4507b32baa18044584076ddff0815",
+      "zig/pkg/inference/src/inference.zig": "36468c5387fc0960274bef670918dcde27f2d4ff9400d01813d4684bea334f4a",
+      "zig/pkg/inference/src/main.zig": "36488529c9ea453739c4dd614d244e56ede5dca68bd67e645902e14a601cd9be",
+      "zig/pkg/inference/src/models/compatibility.zig": "4d8e569615b20647d99805c979da475e87a58e4724d9376bd474b66ddbc7cbd3",
+      "zig/pkg/inference/src/models/embedding_gemma2_identity.zig": "b9e59dd3e9ce92785644f461e5d651331c57ef3588bfd088b09993bd0b3bb195",
+      "zig/pkg/inference/src/models/embedding_gemma2_processor.json": "168f6a08522f3ce5dea596d94d003af2fd691742d4f41fe1f9d8cce76bfbf69c",
+      "zig/pkg/inference/src/models/manifest.zig": "6fc030ed9703bf9aab92bfe503a8bef422191f72627b771141b1ab303a1d85b4",
+      "zig/pkg/inference/src/native_decide.zig": "874a28e940e632c8806c3b86f0d8584fb88eff565d947c1c41d0e7a5f8f4e363",
+      "zig/pkg/inference/src/native_embed.zig": "9e1911370c32e7058eead9d2494df20fa0d7a30bb6ad19b20c1734a926f4a62a",
+      "zig/pkg/inference/src/ops/metal_compute.zig": "53c1d83bf29c8353a92f823cd0a54f23218752eac588a0d4457b354e86a9bf6d",
+      "zig/pkg/inference/src/ops/native_compute.zig": "9b8a6a42cbc8d0eae1ce1c7feadd76cedfb057192b472429593c5d7311b9ee19",
+      "zig/pkg/inference/src/ops/ops.zig": "c5b169db4161ce243b9b28960bba32f96f99257b0d05c454872e9a27096f82ca",
+      "zig/pkg/inference/src/pipelines/embedding.zig": "5fd9bc8fa9550667198ae18f08332ede1761b103b5662cfcfaf96dceb071a828",
+      "zig/pkg/inference/src/pipelines/embedding_gemma2.zig": "8c0da04c0b1285644e2fab5b4965742045dcd916fe126b393491984ec53bf709",
+      "zig/pkg/inference/src/registry/registry.zig": "8009e61cafa3ab176cb55c01ce20d08cb47dd7920876d4a8bc1cfdf6fc5fcaba",
+      "zig/pkg/inference/src/server/model_manager.zig": "f6636912abaa0838f83d832542292140a6ba1a82b7a173cb77556d4abfdff105",
+      "zig/pkg/inference/src/server/server.zig": "eb6a1509c27828ccc8e64e97f7ae4235951154b55fdfc97c30a46b60ca9a8340",
+      "zig/pkg/inference/tools/embeddinggemma2_calibrate.py": "3b8c90e7d03c9ac7a0f59f651790ddc11e9d759d1c9a1f6ae2ef787678ddadfc",
+      "zig/pkg/inference/tools/embeddinggemma2_compare.py": "88956bb50b692f9a5b6739a43b3df7069f1e121ac01f5b12b86dac21c8523f5d",
+      "zig/pkg/inference/tools/embeddinggemma2_qualify.py": "32f231e3a21114b3d7145844b40d822e935635f1246aa507926aa1c2ecdd1f0f",
+      "zig/pkg/inference/tools/embeddinggemma2_reference.py": "d6d1e0a5eea29d03e5ede9a9e0de5e48fdb15703563353f132dcef5df9e26668",
+      "zig/pkg/inference/tools/test_embeddinggemma2_calibrate.py": "61817bf41f1f1101938f1ba761ef9b0626ac9ef6f29f451f4faa952008fce5ae",
+      "zig/pkg/inference/tools/test_embeddinggemma2_compare.py": "71891cda960e2d7962c256d7d84b666ac8e2c59c60bd4c81c3250f16eb5ec457"
+    }
+  },
+  "baseline_binary_sha256": "20ca9bca80af8bd5672f02a6891b6993119f46e7559fed4948a4e15aba714bd0",
+  "optimized_binary_sha256": "07fb4e8448ab9dfdc71f00fed4d20fc9bdbe2941e9e12184b1757c91f06b8805",
+  "optimized_test_binary_sha256": "10c71fdc4c7062d920bed9653c5b7e5ef8521cf3d9410706fc8757be150ebafe",
+  "encoder_validation_binary_sha256": "2bad36decfdc20501ee97bc221af1a2f4b0ded477e12e28dd970cd5283da8515",
+  "encoder_validation_source_note": "The real-model layer/media/padded/cancellation and bounded-long logs use the retained pre-stage-fix ReleaseFast test binary. Encoder, media, compute and manifest sources are byte-identical to the final source. Final changes affect only extraction config-probe OOM error labeling and its metric phase; focused final Debug regression and final CLI HTTP/benchmark results validate those changes.",
+  "method": {
+    "dataset_required": false,
+    "cases": 8,
+    "routing_categories": 3,
+    "sequential_runtime_processes": true,
+    "pytorch_cpu_threads": 4,
+    "blas_thread_environment": {
+      "VECLIB_MAXIMUM_THREADS": 4,
+      "OMP_NUM_THREADS": 4
+    },
+    "native_linalg_max_workers": 8,
+    "gpu_synchronized": true,
+    "native_scope": "Warm HTTP, JSON, tokenization/media preprocessing, admitted encoder, pooling and CPU output.",
+    "pytorch_scope": "Official F32 encoder, pooling and CPU output; additional preprocessing-plus-inference metric includes tokenization/media preparation and device input transfer; excludes HTTP.",
+    "warmups": 2,
+    "text_samples": 10,
+    "media_samples": 3,
+    "long_context_samples": 1,
+    "long_context_note": "Single warm-encoder observation; not a p50/p95 distribution.",
+    "cached_routing_samples": 10,
+    "soak_requests_per_native_backend": 64,
+    "clean_host": false,
+    "host_note": "No concurrent owned compiler or inference phases during timings. Existing host swap and desktop processes were present; VM counters are system-wide."
+  },
+  "parity": {
+    "native": {
+      "document_short": {
+        "cosine": 0.9999999999994208,
+        "max_abs": 1.1920928955078125e-07,
+        "actual_norm": 0.9999998998181571
+      },
+      "query_short": {
+        "cosine": 0.9999999999997401,
+        "max_abs": 8.940696716308594e-08,
+        "actual_norm": 0.9999998284809823
+      },
+      "document_128": {
+        "cosine": 0.9999999999993212,
+        "max_abs": 1.5087425708770752e-07,
+        "actual_norm": 1.0000000885328149
+      },
+      "document_512": {
+        "cosine": 0.9999999999985193,
+        "max_abs": 2.1606683731079102e-07,
+        "actual_norm": 0.9999998161281886
+      },
+      "document_8192": {
+        "cosine": 0.9999999999946738,
+        "max_abs": 7.748603820800781e-07,
+        "actual_norm": 1.0000001466579356
+      },
+      "image": {
+        "cosine": 0.999999999999586,
+        "max_abs": 1.1920928955078125e-07,
+        "actual_norm": 0.9999999953959567
+      },
+      "audio": {
+        "cosine": 0.9999999975476213,
+        "max_abs": 9.117648005485535e-06,
+        "actual_norm": 1.0000000011626384
+      },
+      "mixed": {
+        "cosine": 0.9999999999118839,
+        "max_abs": 1.5422701835632324e-06,
+        "actual_norm": 0.9999999944851493
+      },
+      "choice": {
+        "selected": "account",
+        "max_score_abs": 1.592256055893415e-07,
+        "margin_abs": 1.3245071905920724e-07
+      }
+    },
+    "metal": {
+      "document_short": {
+        "cosine": 0.9999999999997564,
+        "max_abs": 9.872019290924072e-08,
+        "actual_norm": 0.9999997696793624
+      },
+      "query_short": {
+        "cosine": 0.9999999999998461,
+        "max_abs": 8.940696716308594e-08,
+        "actual_norm": 0.9999999396872344
+      },
+      "document_128": {
+        "cosine": 0.9999999999994087,
+        "max_abs": 1.2665987014770508e-07,
+        "actual_norm": 1.000000044367701
+      },
+      "document_512": {
+        "cosine": 0.9999999999972612,
+        "max_abs": 2.868473529815674e-07,
+        "actual_norm": 0.9999999546546221
+      },
+      "document_8192": {
+        "cosine": 0.9999999999982614,
+        "max_abs": 8.642673492431641e-07,
+        "actual_norm": 1.0000003331022083
+      },
+      "image": {
+        "cosine": 0.9999999999993746,
+        "max_abs": 1.2293457984924316e-07,
+        "actual_norm": 1.000000001497547
+      },
+      "audio": {
+        "cosine": 0.9999999977726166,
+        "max_abs": 8.825212717056274e-06,
+        "actual_norm": 1.0000000048930078
+      },
+      "mixed": {
+        "cosine": 0.9999999999173299,
+        "max_abs": 1.4640390872955322e-06,
+        "actual_norm": 0.9999999925014116
+      },
+      "choice": {
+        "selected": "account",
+        "max_score_abs": 1.258020991823372e-07,
+        "margin_abs": 1.234924220661071e-07
+      }
+    }
+  },
+  "latency_comparison": {
+    "native": {
+      "document_short": {
+        "optimized_seconds": 0.23865387495607138,
+        "baseline_seconds": 0.22470210399478674,
+        "pytorch_preprocessing_and_inference_seconds": 0.021917583188042045,
+        "baseline_over_optimized": 0.9415397258315931,
+        "optimized_over_pytorch": 10.888694839597001,
+        "samples": 10
+      },
+      "query_short": {
+        "optimized_seconds": 0.239279541419819,
+        "baseline_seconds": 0.22587691666558385,
+        "pytorch_preprocessing_and_inference_seconds": 0.021682312479242682,
+        "baseline_over_optimized": 0.9439875859226925,
+        "optimized_over_pytorch": 11.035702102757286,
+        "samples": 10
+      },
+      "document_128": {
+        "optimized_seconds": 0.36193050001747906,
+        "baseline_seconds": 0.33976302086375654,
+        "pytorch_preprocessing_and_inference_seconds": 0.05967585393227637,
+        "baseline_over_optimized": 0.9387521108261062,
+        "optimized_over_pytorch": 6.064940443553918,
+        "samples": 10
+      },
+      "document_512": {
+        "optimized_seconds": 1.069591416278854,
+        "baseline_seconds": 1.0285346251912415,
+        "pytorch_preprocessing_and_inference_seconds": 0.14493881235830486,
+        "baseline_over_optimized": 0.9616145095568824,
+        "optimized_over_pytorch": 7.379606600023085,
+        "samples": 10
+      },
+      "document_8192": {
+        "optimized_seconds": 46.17055579088628,
+        "baseline_seconds": 109.60413504205644,
+        "pytorch_preprocessing_and_inference_seconds": 6.813918749801815,
+        "baseline_over_optimized": 2.3738968085736465,
+        "optimized_over_pytorch": 6.775918159022541,
+        "samples": 1
+      },
+      "image": {
+        "optimized_seconds": 7.231921833008528,
+        "baseline_seconds": 6.573694082908332,
+        "pytorch_preprocessing_and_inference_seconds": 0.9146601250395179,
+        "baseline_over_optimized": 0.9089830109756084,
+        "optimized_over_pytorch": 7.906676627775888,
+        "samples": 3
+      },
+      "audio": {
+        "optimized_seconds": 0.45920525025576353,
+        "baseline_seconds": 0.44930941611528397,
+        "pytorch_preprocessing_and_inference_seconds": 0.2083733337931335,
+        "baseline_over_optimized": 0.9784500849348567,
+        "optimized_over_pytorch": 2.2037620740456556,
+        "samples": 3
+      },
+      "mixed": {
+        "optimized_seconds": 7.483464915771037,
+        "baseline_seconds": 6.8366499580442905,
+        "pytorch_preprocessing_and_inference_seconds": 1.1345029999502003,
+        "baseline_over_optimized": 0.9135674497031963,
+        "optimized_over_pytorch": 6.596249561349356,
+        "samples": 3
+      },
+      "cached_choice": {
+        "optimized_seconds": 0.16394131258130074,
+        "baseline_seconds": 0.1617232912685722,
+        "pytorch_seconds": 0.023580749984830618,
+        "baseline_over_optimized": 0.9864706383168149,
+        "optimized_over_pytorch": 6.9523366596381955
+      }
+    },
+    "metal": {
+      "document_short": {
+        "optimized_seconds": 0.2552985835354775,
+        "baseline_seconds": 0.3435010211542249,
+        "pytorch_preprocessing_and_inference_seconds": 0.017007625428959727,
+        "baseline_over_optimized": 1.3454873755948211,
+        "optimized_over_pytorch": 15.010830559612865,
+        "samples": 10
+      },
+      "query_short": {
+        "optimized_seconds": 0.2538222917355597,
+        "baseline_seconds": 0.34011629200540483,
+        "pytorch_preprocessing_and_inference_seconds": 0.01679472904652357,
+        "baseline_over_optimized": 1.339978020369263,
+        "optimized_over_pytorch": 15.11321147441195,
+        "samples": 10
+      },
+      "document_128": {
+        "optimized_seconds": 0.270895937923342,
+        "baseline_seconds": 0.36577137489803135,
+        "pytorch_preprocessing_and_inference_seconds": 0.02403672900982201,
+        "baseline_over_optimized": 1.350228348575449,
+        "optimized_over_pytorch": 11.27008328848102,
+        "samples": 10
+      },
+      "document_512": {
+        "optimized_seconds": 0.45586670842021704,
+        "baseline_seconds": 0.5627939375117421,
+        "pytorch_preprocessing_and_inference_seconds": 0.08005158393643796,
+        "baseline_over_optimized": 1.2345581002439858,
+        "optimized_over_pytorch": 5.6946619417572215,
+        "samples": 10
+      },
+      "document_8192": {
+        "optimized_seconds": 34.919066874776036,
+        "baseline_seconds": 35.833523041103035,
+        "pytorch_preprocessing_and_inference_seconds": 3.425235708244145,
+        "baseline_over_optimized": 1.0261878752260578,
+        "optimized_over_pytorch": 10.194646397831804,
+        "samples": 1
+      },
+      "image": {
+        "optimized_seconds": 3.681643709074706,
+        "baseline_seconds": 3.7579193343408406,
+        "pytorch_preprocessing_and_inference_seconds": 0.5552891250699759,
+        "baseline_over_optimized": 1.0207178182609378,
+        "optimized_over_pytorch": 6.6301383240861345,
+        "samples": 3
+      },
+      "audio": {
+        "optimized_seconds": 0.7826312920078635,
+        "baseline_seconds": 0.8599667502567172,
+        "pytorch_preprocessing_and_inference_seconds": 0.03594929166138172,
+        "baseline_over_optimized": 1.0988146768965081,
+        "optimized_over_pytorch": 21.77042316660163,
+        "samples": 3
+      },
+      "mixed": {
+        "optimized_seconds": 4.244000417180359,
+        "baseline_seconds": 4.2531692921184,
+        "pytorch_preprocessing_and_inference_seconds": 0.5780532918870449,
+        "baseline_over_optimized": 1.0021604321481505,
+        "optimized_over_pytorch": 7.341884350015366,
+        "samples": 3
+      },
+      "cached_choice": {
+        "optimized_seconds": 0.16171633289195597,
+        "baseline_seconds": 0.2528986460529268,
+        "pytorch_seconds": 0.01725210389122367,
+        "baseline_over_optimized": 1.563841088468723,
+        "optimized_over_pytorch": 9.373716615178907
+      }
+    }
+  },
+  "runs": {
+    "native": {
+      "version": 1,
+      "status": "pass",
+      "backend": "native",
+      "production_qualified": false,
+      "precision": "float32",
+      "suite_sha256": "7c3eaf3afd2ee3864c32d100bc1e1d49355cc6ba2f67c9af9c710c5a9bcd7515",
+      "timing_scope": "HTTP request including serialization/tokenization and output transfer",
+      "cases": {
+        "document_short": {
+          "tokens": 15,
+          "timing": {
+            "samples_seconds": [
+              0.22432275023311377,
+              0.22455816715955734,
+              0.22559279156848788,
+              0.22389483265578747,
+              0.22523612482473254,
+              0.22471537487581372,
+              0.22417312487959862,
+              0.22489758394658566,
+              0.22468883311375976,
+              0.22594199981540442
+            ],
+            "count": 10,
+            "p50_seconds": 0.22470210399478674,
+            "p95_seconds": 0.22594199981540442,
+            "mean_seconds": 0.22480215830728412
+          },
+          "vector_sha256": "fe376c4178bd8242ecaa774985ed41d024e5467c0d0e070df7c1bf0eefc65f41"
+        },
+        "query_short": {
+          "tokens": 13,
+          "timing": {
+            "samples_seconds": [
+              0.2265562079846859,
+              0.22441408317536116,
+              0.22534333309158683,
+              0.2272580829448998,
+              0.22485312493517995,
+              0.2263129591010511,
+              0.2260822500102222,
+              0.2251794170588255,
+              0.22822158318012953,
+              0.2256715833209455
+            ],
+            "count": 10,
+            "p50_seconds": 0.22587691666558385,
+            "p95_seconds": 0.22822158318012953,
+            "mean_seconds": 0.22598926248028875
+          },
+          "vector_sha256": "fa8cb95d504def4872305460a6ab070784dfc65996e3d7608fb0935fbd7e067c"
+        },
+        "document_128": {
+          "tokens": 128,
+          "timing": {
+            "samples_seconds": [
+              0.3396241660229862,
+              0.33732649963349104,
+              0.33995825005695224,
+              0.339566582813859,
+              0.3392130001448095,
+              0.3401232911273837,
+              0.3397757918573916,
+              0.34051520796492696,
+              0.34020612481981516,
+              0.3397502498701215
+            ],
+            "count": 10,
+            "p50_seconds": 0.33976302086375654,
+            "p95_seconds": 0.34051520796492696,
+            "mean_seconds": 0.33960591643117366
+          },
+          "vector_sha256": "415bd5fcf13e1381f6f377f7c5ea7fc911207a88c32ea95822a5e1bd7fe37849"
+        },
+        "document_512": {
+          "tokens": 512,
+          "timing": {
+            "samples_seconds": [
+              1.0290496665984392,
+              1.0249328748323023,
+              1.026237666606903,
+              1.0275642918422818,
+              1.027091917116195,
+              1.0297084166668355,
+              1.0301055000163615,
+              1.0280195837840438,
+              1.0309244999662042,
+              1.0301537499763072
+            ],
+            "count": 10,
+            "p50_seconds": 1.0285346251912415,
+            "p95_seconds": 1.0309244999662042,
+            "mean_seconds": 1.0283788167405874
+          },
+          "vector_sha256": "e8adddcfd1c2d19a779f8c91cbfd379caf5d99c64455136ec8d0b9e13592cd0f"
+        },
+        "document_8192": {
+          "tokens": 8192,
+          "timing": {
+            "samples_seconds": [
+              109.60413504205644
+            ],
+            "count": 1,
+            "p50_seconds": 109.60413504205644,
+            "p95_seconds": 109.60413504205644,
+            "mean_seconds": 109.60413504205644
+          },
+          "vector_sha256": "0c7ab77a100f132b011dc10f2b6d67f393257843fcc931195a6a13ab7847c1d6"
+        },
+        "image": {
+          "tokens": 264,
+          "timing": {
+            "samples_seconds": [
+              6.573694082908332,
+              6.5799400000832975,
+              6.5620460831560194
+            ],
+            "count": 3,
+            "p50_seconds": 6.573694082908332,
+            "p95_seconds": 6.5799400000832975,
+            "mean_seconds": 6.571893388715883
+          },
+          "vector_sha256": "66263f71364b7634c9eb3a2086fa0ba434e1b2dbd554659bfbf3666311d4b29d"
+        },
+        "audio": {
+          "tokens": 29,
+          "timing": {
+            "samples_seconds": [
+              0.44808595813810825,
+              0.44930941611528397,
+              0.4499327503144741
+            ],
+            "count": 3,
+            "p50_seconds": 0.44930941611528397,
+            "p95_seconds": 0.4499327503144741,
+            "mean_seconds": 0.4491093748559554
+          },
+          "vector_sha256": "d24b36dcd7778b556755264c4e883d824c50c2a710b6d479f18745423d676036"
+        },
+        "mixed": {
+          "tokens": 303,
+          "timing": {
+            "samples_seconds": [
+              6.841572874691337,
+              6.833238458260894,
+              6.8366499580442905
+            ],
+            "count": 3,
+            "p50_seconds": 6.8366499580442905,
+            "p95_seconds": 6.841572874691337,
+            "mean_seconds": 6.8371537636655075
+          },
+          "vector_sha256": "8f1f01dce7c3c79a8d2b5379179d32f1a9872771d992b6f09ed6b750b5b0a3a8"
+        }
+      },
+      "before": {
+        "utc": "2026-10-07T05:10:58Z",
+        "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+        "swap": "vm.swapusage: total = 4096.00M  used = 2530.12M  free = 1565.88M  (encrypted)\n",
+        "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              778470.\nPages active:                            101244.\nPages inactive:                          352041.\nPages speculative:                        17096.\nPages throttled:                              0.\nPages wired down:                        181994.\nPages purgeable:                           2100.\n\"Translation faults\":               10390116634.\nPages copy-on-write:                  268105023.\nPages zero filled:                  16146253648.\nPages reactivated:                    397357248.\nPages purged:                          61992611.\nFile-backed pages:                       376881.\nAnonymous pages:                          93500.\nPages stored in compressor:              555520.\nPages occupied by compressor:            106721.\nDecompressions:                      1837755095.\nCompressions:                        2150108080.\nPageins:                             2609838239.\nPageouts:                                897375.\nSwapins:                               90001641.\nSwapouts:                             108965430.\n",
+        "threads": {
+          "VECLIB_MAXIMUM_THREADS": "4",
+          "OMP_NUM_THREADS": "4"
+        }
+      },
+      "binary_sha256": "20ca9bca80af8bd5672f02a6891b6993119f46e7559fed4948a4e15aba714bd0",
+      "first_request_seconds": 1.1146436659619212,
+      "model_identity": "2e3ab9d26dcdc60ebb4d0d6b2c744e0285545358eb6945b8fbbe9c0b1a6c2081",
+      "decision": {
+        "prototype_cold_seconds": 0.6428702920675278,
+        "timing": {
+          "samples_seconds": [
+            0.16666524996981025,
+            0.16155237471684813,
+            0.1622292920947075,
+            0.1614368329755962,
+            0.1618942078202963,
+            0.1612362079322338,
+            0.16073324996978045,
+            0.16190824983641505,
+            0.16130520915612578,
+            0.16229595802724361
+          ],
+          "count": 10,
+          "p50_seconds": 0.1617232912685722,
+          "p95_seconds": 0.16666524996981025,
+          "mean_seconds": 0.1621256832499057
+        },
+        "answer": {
+          "type": "choice",
+          "choice": "account",
+          "decision_method": "embedding_similarity",
+          "prototype_set_hash": "dd136f6cd75a089a8d0d265d1dbf4b490c14b983371621e03aba67c638360c56",
+          "similarities": {
+            "account": 0.9681580314982986,
+            "billing": 0.8967264621398299,
+            "delivery": 0.8827455522966413
+          },
+          "margin": 0.07143156935846873,
+          "status": "selected"
+        }
+      },
+      "soak": {
+        "requests": 64,
+        "rss": [
+          {
+            "request": 1,
+            "process_rss_bytes": [
+              [
+                95739,
+                7913472
+              ],
+              [
+                95740,
+                1662009344
+              ]
+            ]
+          },
+          {
+            "request": 17,
+            "process_rss_bytes": [
+              [
+                95739,
+                7913472
+              ],
+              [
+                95740,
+                1662074880
+              ]
+            ]
+          },
+          {
+            "request": 33,
+            "process_rss_bytes": [
+              [
+                95739,
+                7913472
+              ],
+              [
+                95740,
+                1662091264
+              ]
+            ]
+          },
+          {
+            "request": 49,
+            "process_rss_bytes": [
+              [
+                95739,
+                7913472
+              ],
+              [
+                95740,
+                1662091264
+              ]
+            ]
+          },
+          {
+            "request": 64,
+            "process_rss_bytes": [
+              [
+                95739,
+                7913472
+              ],
+              [
+                95740,
+                1645395968
+              ]
+            ]
+          }
+        ],
+        "rss_growth_bytes": {
+          "95739": 0,
+          "95740": -16613376
+        }
+      },
+      "server_log_sha256": "5e14ab4c4a85d73501818f777e64afc88a6a89c87751eac6ad4e395b73b81df0",
+      "after": {
+        "utc": "2026-10-07T05:14:33Z",
+        "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+        "swap": "vm.swapusage: total = 4096.00M  used = 2530.12M  free = 1565.88M  (encrypted)\n",
+        "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              757050.\nPages active:                            123576.\nPages inactive:                          352306.\nPages speculative:                        18786.\nPages throttled:                              0.\nPages wired down:                        182281.\nPages purgeable:                           2640.\n\"Translation faults\":               10408042282.\nPages copy-on-write:                  268112091.\nPages zero filled:                  16163958275.\nPages reactivated:                    397357499.\nPages purged:                          61993716.\nFile-backed pages:                       378887.\nAnonymous pages:                         115781.\nPages stored in compressor:              547046.\nPages occupied by compressor:            103844.\nDecompressions:                      1837763277.\nCompressions:                        2150108080.\nPageins:                             2609838889.\nPageouts:                                897375.\nSwapins:                               90001665.\nSwapouts:                             108965430.\n",
+        "threads": {
+          "VECLIB_MAXIMUM_THREADS": "4",
+          "OMP_NUM_THREADS": "4"
+        }
+      },
+      "artifact_sha256": "8f1039bfb3878f0716cf80554a308ba8643c8b2dca2ecd2db3ac4b313df8ac26",
+      "vm_counter_delta_pages": {
+        "Pageouts": 0,
+        "Swapins": 24,
+        "Swapouts": 0
+      }
+    },
+    "metal": {
+      "version": 1,
+      "status": "pass",
+      "backend": "metal",
+      "production_qualified": false,
+      "precision": "float32",
+      "suite_sha256": "7c3eaf3afd2ee3864c32d100bc1e1d49355cc6ba2f67c9af9c710c5a9bcd7515",
+      "timing_scope": "HTTP request including serialization/tokenization and output transfer",
+      "cases": {
+        "document_short": {
+          "tokens": 15,
+          "timing": {
+            "samples_seconds": [
+              0.3409996251575649,
+              0.3382062497548759,
+              0.3481572503224015,
+              0.3486576252616942,
+              0.3442171667702496,
+              0.3438282501883805,
+              0.34774749958887696,
+              0.34317379212006927,
+              0.3415128327906132,
+              0.3416470834054053
+            ],
+            "count": 10,
+            "p50_seconds": 0.3435010211542249,
+            "p95_seconds": 0.3486576252616942,
+            "mean_seconds": 0.3438147375360131
+          },
+          "vector_sha256": "dbe6a4ccfc5316153673ec94302b2f4b66d934cb79eb220d06cad9c8baf4e9cb"
+        },
+        "query_short": {
+          "tokens": 13,
+          "timing": {
+            "samples_seconds": [
+              0.3429758748970926,
+              0.3449424998834729,
+              0.3393197078257799,
+              0.33763300022110343,
+              0.3418304999358952,
+              0.3341117911040783,
+              0.34002395905554295,
+              0.3402086249552667,
+              0.3410002076998353,
+              0.33915850007906556
+            ],
+            "count": 10,
+            "p50_seconds": 0.34011629200540483,
+            "p95_seconds": 0.3449424998834729,
+            "mean_seconds": 0.34012046656571326
+          },
+          "vector_sha256": "ab818ffa9f1fd5d61b7e530d90cfc4e8ac643aa3a48978a5f210e451b5dec286"
+        },
+        "document_128": {
+          "tokens": 128,
+          "timing": {
+            "samples_seconds": [
+              0.36667579179629683,
+              0.3621753752231598,
+              0.3648669579997659,
+              0.36823424976319075,
+              0.36894158413633704,
+              0.359782500192523,
+              0.36901749996468425,
+              0.3668120000511408,
+              0.362442959100008,
+              0.35140645783394575
+            ],
+            "count": 10,
+            "p50_seconds": 0.36577137489803135,
+            "p95_seconds": 0.36901749996468425,
+            "mean_seconds": 0.3640355376061052
+          },
+          "vector_sha256": "b5b9b35a37937e42f0751e79b0683baf2e1f1249ea4851ded1671f92b1d0f5bf"
+        },
+        "document_512": {
+          "tokens": 512,
+          "timing": {
+            "samples_seconds": [
+              0.5571889588609338,
+              0.5566532080993056,
+              0.5586759583093226,
+              0.5630620829761028,
+              0.5625257920473814,
+              0.5631683748215437,
+              0.5652186251245439,
+              0.5661415001377463,
+              0.5549876252189279,
+              0.5698152920231223
+            ],
+            "count": 10,
+            "p50_seconds": 0.5627939375117421,
+            "p95_seconds": 0.5698152920231223,
+            "mean_seconds": 0.561743741761893
+          },
+          "vector_sha256": "03257661b7c6013d38b46fc52a5db318f4fc8dd425b5db40e3208cca252d0edf"
+        },
+        "document_8192": {
+          "tokens": 8192,
+          "timing": {
+            "samples_seconds": [
+              35.833523041103035
+            ],
+            "count": 1,
+            "p50_seconds": 35.833523041103035,
+            "p95_seconds": 35.833523041103035,
+            "mean_seconds": 35.833523041103035
+          },
+          "vector_sha256": "05fb37ca57458c6f81fdac8da31f8891df9ac83f7c3309f79838bb3e78cbd240"
+        },
+        "image": {
+          "tokens": 264,
+          "timing": {
+            "samples_seconds": [
+              3.7570023336447775,
+              3.768638249952346,
+              3.7579193343408406
+            ],
+            "count": 3,
+            "p50_seconds": 3.7579193343408406,
+            "p95_seconds": 3.768638249952346,
+            "mean_seconds": 3.7611866393126547
+          },
+          "vector_sha256": "f6a2b1f510ea2472a8ff0e0e8530e9531622212d586c4a33e0cf0383ca990843"
+        },
+        "audio": {
+          "tokens": 29,
+          "timing": {
+            "samples_seconds": [
+              0.8567258752882481,
+              0.8601579577662051,
+              0.8599667502567172
+            ],
+            "count": 3,
+            "p50_seconds": 0.8599667502567172,
+            "p95_seconds": 0.8601579577662051,
+            "mean_seconds": 0.8589501944370568
+          },
+          "vector_sha256": "5c4a431fb99dbb18c47b1415ce1f52538f331b0a58fca87d649668f559ea78a6"
+        },
+        "mixed": {
+          "tokens": 303,
+          "timing": {
+            "samples_seconds": [
+              4.2531692921184,
+              4.251890665851533,
+              4.324273791629821
+            ],
+            "count": 3,
+            "p50_seconds": 4.2531692921184,
+            "p95_seconds": 4.324273791629821,
+            "mean_seconds": 4.276444583199918
+          },
+          "vector_sha256": "e75bef74b07d9a98d35663d6732754463d59c5bc799d66ead9800f8e6684042b"
+        }
+      },
+      "before": {
+        "utc": "2026-10-07T05:07:08Z",
+        "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+        "swap": "vm.swapusage: total = 4096.00M  used = 2530.12M  free = 1565.88M  (encrypted)\n",
+        "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              901892.\nPages active:                             81852.\nPages inactive:                          253513.\nPages speculative:                         7723.\nPages throttled:                              0.\nPages wired down:                        181740.\nPages purgeable:                           2828.\n\"Translation faults\":               10381458992.\nPages copy-on-write:                  268090714.\nPages zero filled:                  16137632904.\nPages reactivated:                    397357012.\nPages purged:                          61891239.\nFile-backed pages:                       260837.\nAnonymous pages:                          82251.\nPages stored in compressor:              567579.\nPages occupied by compressor:            110959.\nDecompressions:                      1837743208.\nCompressions:                        2150108080.\nPageins:                             2609729972.\nPageouts:                                897375.\nSwapins:                               90001609.\nSwapouts:                             108965430.\n",
+        "threads": {
+          "VECLIB_MAXIMUM_THREADS": "4",
+          "OMP_NUM_THREADS": "4"
+        }
+      },
+      "binary_sha256": "20ca9bca80af8bd5672f02a6891b6993119f46e7559fed4948a4e15aba714bd0",
+      "first_request_seconds": 3.1734053338877857,
+      "model_identity": "2e3ab9d26dcdc60ebb4d0d6b2c744e0285545358eb6945b8fbbe9c0b1a6c2081",
+      "decision": {
+        "prototype_cold_seconds": 1.0074062081985176,
+        "timing": {
+          "samples_seconds": [
+            0.24357191612944007,
+            0.25279387505725026,
+            0.2543303747661412,
+            0.2530034170486033,
+            0.25439999997615814,
+            0.2541054580360651,
+            0.24612524965777993,
+            0.2527230829000473,
+            0.25425704196095467,
+            0.25120216701179743
+          ],
+          "count": 10,
+          "p50_seconds": 0.2528986460529268,
+          "p95_seconds": 0.25439999997615814,
+          "mean_seconds": 0.25165125825442375
+        },
+        "answer": {
+          "type": "choice",
+          "choice": "account",
+          "decision_method": "embedding_similarity",
+          "prototype_set_hash": "dd136f6cd75a089a8d0d265d1dbf4b490c14b983371621e03aba67c638360c56",
+          "similarities": {
+            "account": 0.968158053860619,
+            "billing": 0.8967266274215683,
+            "delivery": 0.8827458061963064
+          },
+          "margin": 0.07143142643905076,
+          "status": "selected"
+        }
+      },
+      "soak": {
+        "requests": 64,
+        "rss": [
+          {
+            "request": 1,
+            "process_rss_bytes": [
+              [
+                95656,
+                7913472
+              ],
+              [
+                95657,
+                1728806912
+              ]
+            ]
+          },
+          {
+            "request": 17,
+            "process_rss_bytes": [
+              [
+                95656,
+                7913472
+              ],
+              [
+                95657,
+                1728806912
+              ]
+            ]
+          },
+          {
+            "request": 33,
+            "process_rss_bytes": [
+              [
+                95656,
+                7913472
+              ],
+              [
+                95657,
+                1728839680
+              ]
+            ]
+          },
+          {
+            "request": 49,
+            "process_rss_bytes": [
+              [
+                95656,
+                7913472
+              ],
+              [
+                95657,
+                1728839680
+              ]
+            ]
+          },
+          {
+            "request": 64,
+            "process_rss_bytes": [
+              [
+                95656,
+                7913472
+              ],
+              [
+                95657,
+                1728839680
+              ]
+            ]
+          }
+        ],
+        "rss_growth_bytes": {
+          "95656": 0,
+          "95657": 32768
+        }
+      },
+      "server_log_sha256": "81f42cb5f1a23f5799b4ae6692e9fa7e3ded32705a7aaeb0e6950f4b5078383f",
+      "after": {
+        "utc": "2026-10-07T05:09:11Z",
+        "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+        "swap": "vm.swapusage: total = 4096.00M  used = 2530.12M  free = 1565.88M  (encrypted)\n",
+        "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              798184.\nPages active:                            149690.\nPages inactive:                          292722.\nPages speculative:                         8735.\nPages throttled:                              0.\nPages wired down:                        181070.\nPages purgeable:                           3010.\n\"Translation faults\":               10389584993.\nPages copy-on-write:                  268095801.\nPages zero filled:                  16145328096.\nPages reactivated:                    397357143.\nPages purged:                          61891864.\nFile-backed pages:                       356110.\nAnonymous pages:                          95037.\nPages stored in compressor:              558972.\nPages occupied by compressor:            107834.\nDecompressions:                      1837751728.\nCompressions:                        2150108080.\nPageins:                             2609824688.\nPageouts:                                897375.\nSwapins:                               90001625.\nSwapouts:                             108965430.\n",
+        "threads": {
+          "VECLIB_MAXIMUM_THREADS": "4",
+          "OMP_NUM_THREADS": "4"
+        }
+      },
+      "artifact_sha256": "e088743d8e41b87c2090a94919f79e91413eeefc58e34bb3b754682bfef621ec",
+      "vm_counter_delta_pages": {
+        "Pageouts": 0,
+        "Swapins": 16,
+        "Swapouts": 0
+      }
+    },
+    "native-optimized": {
+      "version": 1,
+      "status": "pass",
+      "backend": "native",
+      "tool_sha256": "88956bb50b692f9a5b6739a43b3df7069f1e121ac01f5b12b86dac21c8523f5d",
+      "reference_tool_sha256": "d6d1e0a5eea29d03e5ede9a9e0de5e48fdb15703563353f132dcef5df9e26668",
+      "checkpoint_receipt_sha256": "ac45c79dbad7752950dc5c731ee4e9d214540d290b63082e12ce3f51b1fd064e",
+      "production_qualified": false,
+      "precision": "float32",
+      "suite_sha256": "7c3eaf3afd2ee3864c32d100bc1e1d49355cc6ba2f67c9af9c710c5a9bcd7515",
+      "timing_scope": "HTTP request including serialization/tokenization and output transfer",
+      "cases": {
+        "document_short": {
+          "tokens": 15,
+          "timing": {
+            "samples_seconds": [
+              0.23859591595828533,
+              0.23739620810374618,
+              0.23871183395385742,
+              0.23758491734042764,
+              0.23834970826283097,
+              0.23836741596460342,
+              0.2397021660581231,
+              0.24029295798391104,
+              0.23922312539070845,
+              0.23872433323413134
+            ],
+            "count": 10,
+            "p50_seconds": 0.23865387495607138,
+            "p95_seconds": 0.24029295798391104,
+            "mean_seconds": 0.23869485822506248
+          },
+          "vector_sha256": "fe376c4178bd8242ecaa774985ed41d024e5467c0d0e070df7c1bf0eefc65f41"
+        },
+        "query_short": {
+          "tokens": 13,
+          "timing": {
+            "samples_seconds": [
+              0.23893704218789935,
+              0.23947262484580278,
+              0.2410247502848506,
+              0.23913933290168643,
+              0.23965345788747072,
+              0.23982283426448703,
+              0.23883200017735362,
+              0.2390593751333654,
+              0.23893462494015694,
+              0.23941974993795156
+            ],
+            "count": 10,
+            "p50_seconds": 0.239279541419819,
+            "p95_seconds": 0.2410247502848506,
+            "mean_seconds": 0.23942957925610245
+          },
+          "vector_sha256": "fa8cb95d504def4872305460a6ab070784dfc65996e3d7608fb0935fbd7e067c"
+        },
+        "document_128": {
+          "tokens": 128,
+          "timing": {
+            "samples_seconds": [
+              0.3606974589638412,
+              0.36372304195538163,
+              0.36071899998933077,
+              0.36102408403530717,
+              0.36163433315232396,
+              0.3619982497766614,
+              0.3628101251088083,
+              0.36186275025829673,
+              0.3621538751758635,
+              0.3626288748346269
+            ],
+            "count": 10,
+            "p50_seconds": 0.36193050001747906,
+            "p95_seconds": 0.36372304195538163,
+            "mean_seconds": 0.36192517932504414
+          },
+          "vector_sha256": "415bd5fcf13e1381f6f377f7c5ea7fc911207a88c32ea95822a5e1bd7fe37849"
+        },
+        "document_512": {
+          "tokens": 512,
+          "timing": {
+            "samples_seconds": [
+              1.06980983261019,
+              1.0704473750665784,
+              1.0678228340111673,
+              1.0698153339326382,
+              1.069372999947518,
+              1.071863958146423,
+              1.0702270842157304,
+              1.0679409592412412,
+              1.0660742912441492,
+              1.068786125164479
+            ],
+            "count": 10,
+            "p50_seconds": 1.069591416278854,
+            "p95_seconds": 1.071863958146423,
+            "mean_seconds": 1.0692160793580114
+          },
+          "vector_sha256": "e8adddcfd1c2d19a779f8c91cbfd379caf5d99c64455136ec8d0b9e13592cd0f"
+        },
+        "document_8192": {
+          "tokens": 8192,
+          "timing": {
+            "samples_seconds": [
+              46.17055579088628
+            ],
+            "count": 1,
+            "p50_seconds": 46.17055579088628,
+            "p95_seconds": 46.17055579088628,
+            "mean_seconds": 46.17055579088628
+          },
+          "vector_sha256": "09330953a348e805e4802bacb284b5ef3036ecf5070b84b3be34f89f74a65ca4"
+        },
+        "image": {
+          "tokens": 264,
+          "timing": {
+            "samples_seconds": [
+              7.233991084154695,
+              7.231921833008528,
+              7.226257416885346
+            ],
+            "count": 3,
+            "p50_seconds": 7.231921833008528,
+            "p95_seconds": 7.233991084154695,
+            "mean_seconds": 7.230723444682856
+          },
+          "vector_sha256": "66263f71364b7634c9eb3a2086fa0ba434e1b2dbd554659bfbf3666311d4b29d"
+        },
+        "audio": {
+          "tokens": 29,
+          "timing": {
+            "samples_seconds": [
+              0.4601165410131216,
+              0.4580399999395013,
+              0.45920525025576353
+            ],
+            "count": 3,
+            "p50_seconds": 0.45920525025576353,
+            "p95_seconds": 0.4601165410131216,
+            "mean_seconds": 0.4591205970694621
+          },
+          "vector_sha256": "d24b36dcd7778b556755264c4e883d824c50c2a710b6d479f18745423d676036"
+        },
+        "mixed": {
+          "tokens": 303,
+          "timing": {
+            "samples_seconds": [
+              7.483464915771037,
+              7.487696249969304,
+              7.4753373330459
+            ],
+            "count": 3,
+            "p50_seconds": 7.483464915771037,
+            "p95_seconds": 7.487696249969304,
+            "mean_seconds": 7.48216616626208
+          },
+          "vector_sha256": "8f1f01dce7c3c79a8d2b5379179d32f1a9872771d992b6f09ed6b750b5b0a3a8"
+        }
+      },
+      "before": {
+        "utc": "2026-10-07T06:33:29Z",
+        "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+        "swap": "vm.swapusage: total = 4096.00M  used = 2506.12M  free = 1589.88M  (encrypted)\n",
+        "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              800126.\nPages active:                            123530.\nPages inactive:                          313837.\nPages speculative:                         3653.\nPages throttled:                              0.\nPages wired down:                        181749.\nPages purgeable:                           1426.\n\"Translation faults\":               10478947218.\nPages copy-on-write:                  268523925.\nPages zero filled:                  16222839358.\nPages reactivated:                    399583961.\nPages purged:                          62238038.\nFile-backed pages:                       363222.\nAnonymous pages:                          77798.\nPages stored in compressor:              580113.\nPages occupied by compressor:            114603.\nDecompressions:                      1842075172.\nCompressions:                        2154972128.\nPageins:                             2610625434.\nPageouts:                                899961.\nSwapins:                               90003181.\nSwapouts:                             108965430.\n",
+        "threads": {
+          "VECLIB_MAXIMUM_THREADS": "4",
+          "OMP_NUM_THREADS": "4"
+        }
+      },
+      "binary_sha256": "07fb4e8448ab9dfdc71f00fed4d20fc9bdbe2941e9e12184b1757c91f06b8805",
+      "first_request_seconds": 1.161724915727973,
+      "model_identity": "2e3ab9d26dcdc60ebb4d0d6b2c744e0285545358eb6945b8fbbe9c0b1a6c2081",
+      "decision": {
+        "prototype_cold_seconds": 0.6542903748340905,
+        "timing": {
+          "samples_seconds": [
+            0.16399916633963585,
+            0.16403299989178777,
+            0.16330799972638488,
+            0.1643549157306552,
+            0.16467429185286164,
+            0.16290733311325312,
+            0.16316508362069726,
+            0.16293416684493423,
+            0.1639151251874864,
+            0.16396749997511506
+          ],
+          "count": 10,
+          "p50_seconds": 0.16394131258130074,
+          "p95_seconds": 0.16467429185286164,
+          "mean_seconds": 0.16372585822828115
+        },
+        "answer": {
+          "type": "choice",
+          "choice": "account",
+          "decision_method": "embedding_similarity",
+          "prototype_set_hash": "dd136f6cd75a089a8d0d265d1dbf4b490c14b983371621e03aba67c638360c56",
+          "similarities": {
+            "account": 0.9681580314982986,
+            "billing": 0.8967264621398299,
+            "delivery": 0.8827455522966413
+          },
+          "margin": 0.07143156935846873,
+          "status": "selected"
+        }
+      },
+      "soak": {
+        "requests": 64,
+        "rss": [
+          {
+            "request": 1,
+            "process_rss_bytes": [
+              [
+                98540,
+                7995392
+              ],
+              [
+                98541,
+                1642692608
+              ]
+            ]
+          },
+          {
+            "request": 17,
+            "process_rss_bytes": [
+              [
+                98540,
+                7995392
+              ],
+              [
+                98541,
+                1627144192
+              ]
+            ]
+          },
+          {
+            "request": 33,
+            "process_rss_bytes": [
+              [
+                98540,
+                7995392
+              ],
+              [
+                98541,
+                1627701248
+              ]
+            ]
+          },
+          {
+            "request": 49,
+            "process_rss_bytes": [
+              [
+                98540,
+                7995392
+              ],
+              [
+                98541,
+                1627799552
+              ]
+            ]
+          },
+          {
+            "request": 64,
+            "process_rss_bytes": [
+              [
+                98540,
+                7995392
+              ],
+              [
+                98541,
+                1627914240
+              ]
+            ]
+          }
+        ],
+        "rss_growth_bytes": {
+          "98540": 0,
+          "98541": -14778368
+        }
+      },
+      "server_log_sha256": "b1f37472ea23c4a47f0b884418daea44d1499625118bc3373214a74c831c7d13",
+      "after": {
+        "utc": "2026-10-07T06:36:08Z",
+        "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+        "swap": "vm.swapusage: total = 4096.00M  used = 2506.12M  free = 1589.88M  (encrypted)\n",
+        "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              782178.\nPages active:                             94742.\nPages inactive:                          359475.\nPages speculative:                         6359.\nPages throttled:                              0.\nPages wired down:                        182450.\nPages purgeable:                           3783.\n\"Translation faults\":               10496826321.\nPages copy-on-write:                  268526659.\nPages zero filled:                  16240521942.\nPages reactivated:                    399584109.\nPages purged:                          62238561.\nFile-backed pages:                       366293.\nAnonymous pages:                          94283.\nPages stored in compressor:              572728.\nPages occupied by compressor:            112527.\nDecompressions:                      1842082524.\nCompressions:                        2154972128.\nPageins:                             2610627054.\nPageouts:                                899961.\nSwapins:                               90003213.\nSwapouts:                             108965430.\n",
+        "threads": {
+          "VECLIB_MAXIMUM_THREADS": "4",
+          "OMP_NUM_THREADS": "4"
+        }
+      },
+      "artifact_sha256": "6e2b85fa91391454115d676fde18ee1543dd7d3c27095422d494c41726036b24",
+      "vm_counter_delta_pages": {
+        "Pageouts": 0,
+        "Swapins": 32,
+        "Swapouts": 0
+      }
+    },
+    "metal-optimized": {
+      "version": 1,
+      "status": "pass",
+      "backend": "metal",
+      "tool_sha256": "88956bb50b692f9a5b6739a43b3df7069f1e121ac01f5b12b86dac21c8523f5d",
+      "reference_tool_sha256": "d6d1e0a5eea29d03e5ede9a9e0de5e48fdb15703563353f132dcef5df9e26668",
+      "checkpoint_receipt_sha256": "ac45c79dbad7752950dc5c731ee4e9d214540d290b63082e12ce3f51b1fd064e",
+      "production_qualified": false,
+      "precision": "float32",
+      "suite_sha256": "7c3eaf3afd2ee3864c32d100bc1e1d49355cc6ba2f67c9af9c710c5a9bcd7515",
+      "timing_scope": "HTTP request including serialization/tokenization and output transfer",
+      "cases": {
+        "document_short": {
+          "tokens": 15,
+          "timing": {
+            "samples_seconds": [
+              0.25782316690310836,
+              0.2545140841975808,
+              0.2593890829011798,
+              0.2612774157896638,
+              0.25496416725218296,
+              0.2531048753298819,
+              0.25403241673484445,
+              0.2556329998187721,
+              0.2537406668998301,
+              0.25797274988144636
+            ],
+            "count": 10,
+            "p50_seconds": 0.2552985835354775,
+            "p95_seconds": 0.2612774157896638,
+            "mean_seconds": 0.25624516257084906
+          },
+          "vector_sha256": "dbe6a4ccfc5316153673ec94302b2f4b66d934cb79eb220d06cad9c8baf4e9cb"
+        },
+        "query_short": {
+          "tokens": 13,
+          "timing": {
+            "samples_seconds": [
+              0.25727054197341204,
+              0.25539950001984835,
+              0.2548775412142277,
+              0.2516897921450436,
+              0.25591358402743936,
+              0.25035875011235476,
+              0.25282599963247776,
+              0.25021791690960526,
+              0.25457499967888,
+              0.2530695837922394
+            ],
+            "count": 10,
+            "p50_seconds": 0.2538222917355597,
+            "p95_seconds": 0.25727054197341204,
+            "mean_seconds": 0.2536198209505528
+          },
+          "vector_sha256": "ab818ffa9f1fd5d61b7e530d90cfc4e8ac643aa3a48978a5f210e451b5dec286"
+        },
+        "document_128": {
+          "tokens": 128,
+          "timing": {
+            "samples_seconds": [
+              0.27049658400937915,
+              0.27047979226335883,
+              0.2748097921721637,
+              0.27129529183730483,
+              0.2637753328308463,
+              0.2734460411593318,
+              0.2729974170215428,
+              0.2690477501600981,
+              0.2681097500026226,
+              0.2749548340216279
+            ],
+            "count": 10,
+            "p50_seconds": 0.270895937923342,
+            "p95_seconds": 0.2749548340216279,
+            "mean_seconds": 0.2709412585478276
+          },
+          "vector_sha256": "b5b9b35a37937e42f0751e79b0683baf2e1f1249ea4851ded1671f92b1d0f5bf"
+        },
+        "document_512": {
+          "tokens": 512,
+          "timing": {
+            "samples_seconds": [
+              0.4553336249664426,
+              0.4596101250499487,
+              0.45068420795723796,
+              0.4535372075624764,
+              0.46216204203665257,
+              0.4563997918739915,
+              0.4596126670949161,
+              0.4521440411917865,
+              0.45404770923778415,
+              0.46247920766472816
+            ],
+            "count": 10,
+            "p50_seconds": 0.45586670842021704,
+            "p95_seconds": 0.46247920766472816,
+            "mean_seconds": 0.45660106246359644
+          },
+          "vector_sha256": "03257661b7c6013d38b46fc52a5db318f4fc8dd425b5db40e3208cca252d0edf"
+        },
+        "document_8192": {
+          "tokens": 8192,
+          "timing": {
+            "samples_seconds": [
+              34.919066874776036
+            ],
+            "count": 1,
+            "p50_seconds": 34.919066874776036,
+            "p95_seconds": 34.919066874776036,
+            "mean_seconds": 34.919066874776036
+          },
+          "vector_sha256": "4d25156c4518e6e27982d16e2185334b8d1c65a8369fa7268c9e99d17ad964b7"
+        },
+        "image": {
+          "tokens": 264,
+          "timing": {
+            "samples_seconds": [
+              3.681643709074706,
+              3.6815999997779727,
+              3.706589042209089
+            ],
+            "count": 3,
+            "p50_seconds": 3.681643709074706,
+            "p95_seconds": 3.706589042209089,
+            "mean_seconds": 3.6899442503539226
+          },
+          "vector_sha256": "f6a2b1f510ea2472a8ff0e0e8530e9531622212d586c4a33e0cf0383ca990843"
+        },
+        "audio": {
+          "tokens": 29,
+          "timing": {
+            "samples_seconds": [
+              0.7813263749703765,
+              0.783507667016238,
+              0.7826312920078635
+            ],
+            "count": 3,
+            "p50_seconds": 0.7826312920078635,
+            "p95_seconds": 0.783507667016238,
+            "mean_seconds": 0.782488444664826
+          },
+          "vector_sha256": "5c4a431fb99dbb18c47b1415ce1f52538f331b0a58fca87d649668f559ea78a6"
+        },
+        "mixed": {
+          "tokens": 303,
+          "timing": {
+            "samples_seconds": [
+              4.245774459093809,
+              4.179688457865268,
+              4.244000417180359
+            ],
+            "count": 3,
+            "p50_seconds": 4.244000417180359,
+            "p95_seconds": 4.245774459093809,
+            "mean_seconds": 4.2231544447131455
+          },
+          "vector_sha256": "e75bef74b07d9a98d35663d6732754463d59c5bc799d66ead9800f8e6684042b"
+        }
+      },
+      "before": {
+        "utc": "2026-10-07T06:31:39Z",
+        "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+        "swap": "vm.swapusage: total = 4096.00M  used = 2506.12M  free = 1589.88M  (encrypted)\n",
+        "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              901581.\nPages active:                             65917.\nPages inactive:                          263576.\nPages speculative:                         5031.\nPages throttled:                              0.\nPages wired down:                        182392.\nPages purgeable:                           6310.\n\"Translation faults\":               10470829691.\nPages copy-on-write:                  268520376.\nPages zero filled:                  16215151223.\nPages reactivated:                    399583838.\nPages purged:                          62237431.\nFile-backed pages:                       267876.\nAnonymous pages:                          66648.\nPages stored in compressor:              593042.\nPages occupied by compressor:            118853.\nDecompressions:                      1842062261.\nCompressions:                        2154972128.\nPageins:                             2610530712.\nPageouts:                                899961.\nSwapins:                               90003181.\nSwapouts:                             108965430.\n",
+        "threads": {
+          "VECLIB_MAXIMUM_THREADS": "4",
+          "OMP_NUM_THREADS": "4"
+        }
+      },
+      "binary_sha256": "07fb4e8448ab9dfdc71f00fed4d20fc9bdbe2941e9e12184b1757c91f06b8805",
+      "first_request_seconds": 3.1582058747299016,
+      "model_identity": "2e3ab9d26dcdc60ebb4d0d6b2c744e0285545358eb6945b8fbbe9c0b1a6c2081",
+      "decision": {
+        "prototype_cold_seconds": 0.6400825413875282,
+        "timing": {
+          "samples_seconds": [
+            0.16239120811223984,
+            0.1611125417985022,
+            0.16048654215410352,
+            0.16162254195660353,
+            0.161209334153682,
+            0.16163045773282647,
+            0.16180220805108547,
+            0.16279333317652345,
+            0.1619268748909235,
+            0.16294895904138684
+          ],
+          "count": 10,
+          "p50_seconds": 0.16171633289195597,
+          "p95_seconds": 0.16294895904138684,
+          "mean_seconds": 0.1617924001067877
+        },
+        "answer": {
+          "type": "choice",
+          "choice": "account",
+          "decision_method": "embedding_similarity",
+          "prototype_set_hash": "dd136f6cd75a089a8d0d265d1dbf4b490c14b983371621e03aba67c638360c56",
+          "similarities": {
+            "account": 0.968158053860619,
+            "billing": 0.8967266274215683,
+            "delivery": 0.8827458061963064
+          },
+          "margin": 0.07143142643905076,
+          "status": "selected"
+        }
+      },
+      "soak": {
+        "requests": 64,
+        "rss": [
+          {
+            "request": 1,
+            "process_rss_bytes": [
+              [
+                98517,
+                7995392
+              ],
+              [
+                98518,
+                1719042048
+              ]
+            ]
+          },
+          {
+            "request": 17,
+            "process_rss_bytes": [
+              [
+                98517,
+                7995392
+              ],
+              [
+                98518,
+                1719091200
+              ]
+            ]
+          },
+          {
+            "request": 33,
+            "process_rss_bytes": [
+              [
+                98517,
+                7995392
+              ],
+              [
+                98518,
+                1719156736
+              ]
+            ]
+          },
+          {
+            "request": 49,
+            "process_rss_bytes": [
+              [
+                98517,
+                7995392
+              ],
+              [
+                98518,
+                1719222272
+              ]
+            ]
+          },
+          {
+            "request": 64,
+            "process_rss_bytes": [
+              [
+                98517,
+                7995392
+              ],
+              [
+                98518,
+                1719304192
+              ]
+            ]
+          }
+        ],
+        "rss_growth_bytes": {
+          "98517": 0,
+          "98518": 262144
+        }
+      },
+      "server_log_sha256": "c0292d0889a6c90dec8afcee22f789578a5a15e49149bc962ed1f07bf84a755a",
+      "after": {
+        "utc": "2026-10-07T06:33:29Z",
+        "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+        "swap": "vm.swapusage: total = 4096.00M  used = 2506.12M  free = 1589.88M  (encrypted)\n",
+        "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              800038.\nPages active:                            123774.\nPages inactive:                          313623.\nPages speculative:                         3868.\nPages throttled:                              0.\nPages wired down:                        181751.\nPages purgeable:                           1426.\n\"Translation faults\":               10478941779.\nPages copy-on-write:                  268523305.\nPages zero filled:                  16222837750.\nPages reactivated:                    399583961.\nPages purged:                          62238038.\nFile-backed pages:                       363222.\nAnonymous pages:                          78043.\nPages stored in compressor:              580120.\nPages occupied by compressor:            114604.\nDecompressions:                      1842075165.\nCompressions:                        2154972128.\nPageins:                             2610625387.\nPageouts:                                899961.\nSwapins:                               90003181.\nSwapouts:                             108965430.\n",
+        "threads": {
+          "VECLIB_MAXIMUM_THREADS": "4",
+          "OMP_NUM_THREADS": "4"
+        }
+      },
+      "artifact_sha256": "5475259f86a2586d10d33e7438fdbf9a8eb3dd54eefa5e120d7ed167c47a0cfc",
+      "vm_counter_delta_pages": {
+        "Pageouts": 0,
+        "Swapins": 0,
+        "Swapouts": 0
+      }
+    },
+    "pytorch-cpu-final": {
+      "version": 1,
+      "status": "pass",
+      "backend": "cpu",
+      "tool_sha256": "88956bb50b692f9a5b6739a43b3df7069f1e121ac01f5b12b86dac21c8523f5d",
+      "reference_tool_sha256": "d6d1e0a5eea29d03e5ede9a9e0de5e48fdb15703563353f132dcef5df9e26668",
+      "checkpoint_receipt_sha256": "ac45c79dbad7752950dc5c731ee4e9d214540d290b63082e12ce3f51b1fd064e",
+      "production_qualified": false,
+      "precision": "float32",
+      "suite_sha256": "7c3eaf3afd2ee3864c32d100bc1e1d49355cc6ba2f67c9af9c710c5a9bcd7515",
+      "timing_scope": "encoder, pooling and output transfer; excludes input preprocessing and HTTP",
+      "cases": {
+        "document_short": {
+          "tokens": 15,
+          "timing": {
+            "samples_seconds": [
+              0.021876125130802393,
+              0.021973999682813883,
+              0.021803165785968304,
+              0.021867624949663877,
+              0.021780709270387888,
+              0.021883167326450348,
+              0.021680875215679407,
+              0.021826916839927435,
+              0.021814916748553514,
+              0.021740540862083435
+            ],
+            "count": 10,
+            "p50_seconds": 0.021820916794240475,
+            "p95_seconds": 0.021973999682813883,
+            "mean_seconds": 0.02182480418123305
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              0.0219805003143847,
+              0.022073458414524794,
+              0.02189700026065111,
+              0.021979582961648703,
+              0.02189112501218915,
+              0.021976917050778866,
+              0.021776500158011913,
+              0.021920083090662956,
+              0.021915083285421133,
+              0.02183637535199523
+            ],
+            "count": 10,
+            "p50_seconds": 0.021917583188042045,
+            "p95_seconds": 0.022073458414524794,
+            "mean_seconds": 0.021924662590026855
+          },
+          "vector_sha256": "76591c79ad038f3f7039320e490d4560dd98a345efb24d1abe31fc8b148391f2"
+        },
+        "query_short": {
+          "tokens": 13,
+          "timing": {
+            "samples_seconds": [
+              0.02153566712513566,
+              0.021499458700418472,
+              0.021449583116918802,
+              0.021493416745215654,
+              0.02154458314180374,
+              0.021703333128243685,
+              0.02164454199373722,
+              0.022173291072249413,
+              0.021718415897339582,
+              0.02201720792800188
+            ],
+            "count": 10,
+            "p50_seconds": 0.02159456256777048,
+            "p95_seconds": 0.022173291072249413,
+            "mean_seconds": 0.02167794988490641
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              0.021628332789987326,
+              0.02158633340150118,
+              0.021538374945521355,
+              0.02158062532544136,
+              0.021634167060256004,
+              0.021788124926388264,
+              0.02173045789822936,
+              0.022261583246290684,
+              0.021804375108331442,
+              0.022100833244621754
+            ],
+            "count": 10,
+            "p50_seconds": 0.021682312479242682,
+            "p95_seconds": 0.022261583246290684,
+            "mean_seconds": 0.021765320794656873
+          },
+          "vector_sha256": "1e0ba2338ec2513578a645088a9f7ea3cd7402cb1dcf96bc57a556112688a27e"
+        },
+        "document_128": {
+          "tokens": 128,
+          "timing": {
+            "samples_seconds": [
+              0.059578957967460155,
+              0.05962829105556011,
+              0.05956966616213322,
+              0.05915762484073639,
+              0.0594544168561697,
+              0.059286416973918676,
+              0.05904366681352258,
+              0.059457582887262106,
+              0.059347540605813265,
+              0.05959091614931822
+            ],
+            "count": 10,
+            "p50_seconds": 0.0594559998717159,
+            "p95_seconds": 0.05962829105556011,
+            "mean_seconds": 0.05941150803118944
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              0.05981200002133846,
+              0.0598543337546289,
+              0.0597935002297163,
+              0.059381207916885614,
+              0.05967420805245638,
+              0.05950058391317725,
+              0.05925812479108572,
+              0.05967749981209636,
+              0.05957408342510462,
+              0.05982570769265294
+            ],
+            "count": 10,
+            "p50_seconds": 0.05967585393227637,
+            "p95_seconds": 0.0598543337546289,
+            "mean_seconds": 0.059635124960914256
+          },
+          "vector_sha256": "e99bec7285b8bd14b95e1786f78d4fe38e6345862229bcccd18db8bec4d19584"
+        },
+        "document_512": {
+          "tokens": 512,
+          "timing": {
+            "samples_seconds": [
+              0.14385699992999434,
+              0.14401008281856775,
+              0.14432941656559706,
+              0.1443186248652637,
+              0.14436387503519654,
+              0.14372229110449553,
+              0.1441359999589622,
+              0.15329333394765854,
+              0.1451840829104185,
+              0.14519033255055547
+            ],
+            "count": 10,
+            "p50_seconds": 0.14432402071543038,
+            "p95_seconds": 0.15329333394765854,
+            "mean_seconds": 0.14524050396867097
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              0.14447629218921065,
+              0.14462779182940722,
+              0.14493741700425744,
+              0.14494020771235228,
+              0.14498075004667044,
+              0.1443570419214666,
+              0.14474745886400342,
+              0.15390249993652105,
+              0.1457953341305256,
+              0.14586716704070568
+            ],
+            "count": 10,
+            "p50_seconds": 0.14493881235830486,
+            "p95_seconds": 0.15390249993652105,
+            "mean_seconds": 0.14586319606751202
+          },
+          "vector_sha256": "4136a0ea168a16d575928f7c803714a598b15a6b2996da03dad0eba782054977"
+        },
+        "document_8192": {
+          "tokens": 8192,
+          "timing": {
+            "samples_seconds": [
+              6.804165999870747
+            ],
+            "count": 1,
+            "p50_seconds": 6.804165999870747,
+            "p95_seconds": 6.804165999870747,
+            "mean_seconds": 6.804165999870747
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              6.813918749801815
+            ],
+            "count": 1,
+            "p50_seconds": 6.813918749801815,
+            "p95_seconds": 6.813918749801815,
+            "mean_seconds": 6.813918749801815
+          },
+          "vector_sha256": "fe3813bc1fe03eea9495021ae9ee982fe06937ef0068efdf43cd01b12829a2f9"
+        },
+        "image": {
+          "tokens": 264,
+          "timing": {
+            "samples_seconds": [
+              0.9079333748668432,
+              0.9224706250242889,
+              0.9112674579955637
+            ],
+            "count": 3,
+            "p50_seconds": 0.9112674579955637,
+            "p95_seconds": 0.9224706250242889,
+            "mean_seconds": 0.913890485962232
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              0.9113439172506332,
+              0.9257872076705098,
+              0.9146601250395179
+            ],
+            "count": 3,
+            "p50_seconds": 0.9146601250395179,
+            "p95_seconds": 0.9257872076705098,
+            "mean_seconds": 0.917263749986887
+          },
+          "vector_sha256": "a4c199b6cc2ed0bcf2d607464668fb62069a59a05b102a1e7868c9b4bf7389f2"
+        },
+        "audio": {
+          "tokens": 29,
+          "timing": {
+            "samples_seconds": [
+              0.20764470798894763,
+              0.20771312480792403,
+              0.2077435408718884
+            ],
+            "count": 3,
+            "p50_seconds": 0.20771312480792403,
+            "p95_seconds": 0.2077435408718884,
+            "mean_seconds": 0.2077004578895867
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              0.20831925002858043,
+              0.2083733337931335,
+              0.20839475002139807
+            ],
+            "count": 3,
+            "p50_seconds": 0.2083733337931335,
+            "p95_seconds": 0.20839475002139807,
+            "mean_seconds": 0.20836244461437067
+          },
+          "vector_sha256": "dcb6bb479653d1e708617ceeaf7d9de1cc972246a4dd0cbbb2af0a065b76f16b"
+        },
+        "mixed": {
+          "tokens": 303,
+          "timing": {
+            "samples_seconds": [
+              1.111239458899945,
+              1.1541354577057064,
+              1.1310043749399483
+            ],
+            "count": 3,
+            "p50_seconds": 1.1310043749399483,
+            "p95_seconds": 1.1541354577057064,
+            "mean_seconds": 1.1321264305152
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              1.1150202499702573,
+              1.157188666984439,
+              1.1345029999502003
+            ],
+            "count": 3,
+            "p50_seconds": 1.1345029999502003,
+            "p95_seconds": 1.157188666984439,
+            "mean_seconds": 1.135570638968299
+          },
+          "vector_sha256": "7209b6d3e6f05258e35535777a53a3995905bc08d97e64361e52b4072fbb4325"
+        }
+      },
+      "before": {
+        "utc": "2026-10-07T06:02:39Z",
+        "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+        "swap": "vm.swapusage: total = 4096.00M  used = 2506.12M  free = 1589.88M  (encrypted)\n",
+        "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              733244.\nPages active:                             61659.\nPages inactive:                          439797.\nPages speculative:                        14849.\nPages throttled:                              0.\nPages wired down:                        183309.\nPages purgeable:                           2014.\n\"Translation faults\":               10461703859.\nPages copy-on-write:                  268397133.\nPages zero filled:                  16208032367.\nPages reactivated:                    399210220.\nPages purged:                          62122815.\nFile-backed pages:                       414056.\nAnonymous pages:                         102249.\nPages stored in compressor:              558413.\nPages occupied by compressor:            105003.\nDecompressions:                      1841277945.\nCompressions:                        2154058525.\nPageins:                             2610466491.\nPageouts:                                899761.\nSwapins:                               90003078.\nSwapouts:                             108965430.\n",
+        "threads": {
+          "VECLIB_MAXIMUM_THREADS": "4",
+          "OMP_NUM_THREADS": "4"
+        }
+      },
+      "model_load_seconds": 0.3255262500606477,
+      "decision": {
+        "similarities": {
+          "account": 0.9681581907239042,
+          "billing": 0.8967264889147164,
+          "delivery": 0.8827455907170193
+        },
+        "choice": "account",
+        "margin": 0.07143170180918779,
+        "timing": {
+          "samples_seconds": [
+            0.023599209263920784,
+            0.023577583022415638,
+            0.023583916947245598,
+            0.023630500305444002,
+            0.023573707789182663,
+            0.02356279082596302,
+            0.02350058313459158,
+            0.02404633304104209,
+            0.02362600015476346,
+            0.023492875043302774
+          ],
+          "count": 10,
+          "p50_seconds": 0.023580749984830618,
+          "p95_seconds": 0.02404633304104209,
+          "mean_seconds": 0.02361934995278716
+        }
+      },
+      "torch": "2.10.0",
+      "torch_threads": 4,
+      "attention_implementation": "sdpa",
+      "after": {
+        "utc": "2026-10-07T06:03:07Z",
+        "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+        "swap": "vm.swapusage: total = 4096.00M  used = 2506.12M  free = 1589.88M  (encrypted)\n",
+        "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              663780.\nPages active:                            120598.\nPages inactive:                          444392.\nPages speculative:                        20373.\nPages throttled:                              0.\nPages wired down:                        183844.\nPages purgeable:                           3628.\n\"Translation faults\":               10462315235.\nPages copy-on-write:                  268399210.\nPages zero filled:                  16208518340.\nPages reactivated:                    399210250.\nPages purged:                          62122817.\nFile-backed pages:                       439398.\nAnonymous pages:                         145965.\nPages stored in compressor:              558051.\nPages occupied by compressor:            104886.\nDecompressions:                      1841278307.\nCompressions:                        2154058525.\nPageins:                             2610483802.\nPageouts:                                899761.\nSwapins:                               90003078.\nSwapouts:                             108965430.\n",
+        "threads": {
+          "VECLIB_MAXIMUM_THREADS": "4",
+          "OMP_NUM_THREADS": "4"
+        }
+      },
+      "artifact_sha256": "751687ed353bc890d42a58942bd59a7ebb7dec004d5681ecdca16c4945837578",
+      "vm_counter_delta_pages": {
+        "Pageouts": 0,
+        "Swapins": 0,
+        "Swapouts": 0
+      }
+    },
+    "pytorch-mps-current": {
+      "version": 1,
+      "status": "pass",
+      "backend": "mps",
+      "tool_sha256": "88956bb50b692f9a5b6739a43b3df7069f1e121ac01f5b12b86dac21c8523f5d",
+      "reference_tool_sha256": "d6d1e0a5eea29d03e5ede9a9e0de5e48fdb15703563353f132dcef5df9e26668",
+      "checkpoint_receipt_sha256": "ac45c79dbad7752950dc5c731ee4e9d214540d290b63082e12ce3f51b1fd064e",
+      "production_qualified": false,
+      "precision": "float32",
+      "suite_sha256": "7c3eaf3afd2ee3864c32d100bc1e1d49355cc6ba2f67c9af9c710c5a9bcd7515",
+      "timing_scope": "encoder, pooling and output transfer; excludes input preprocessing and HTTP",
+      "cases": {
+        "document_short": {
+          "tokens": 15,
+          "timing": {
+            "samples_seconds": [
+              0.01671687513589859,
+              0.01668399991467595,
+              0.0166920842602849,
+              0.016597250010818243,
+              0.01680579222738743,
+              0.016567165963351727,
+              0.01630591694265604,
+              0.016641750000417233,
+              0.016338457819074392,
+              0.016663416288793087
+            ],
+            "count": 10,
+            "p50_seconds": 0.01665258314460516,
+            "p95_seconds": 0.01680579222738743,
+            "mean_seconds": 0.01660127085633576
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              0.017051459290087223,
+              0.017007834278047085,
+              0.017062542028725147,
+              0.016963500063866377,
+              0.017191875260323286,
+              0.01691062469035387,
+              0.016675167251378298,
+              0.0170375844463706,
+              0.01669650012627244,
+              0.01700741657987237
+            ],
+            "count": 10,
+            "p50_seconds": 0.017007625428959727,
+            "p95_seconds": 0.017191875260323286,
+            "mean_seconds": 0.01696045040152967
+          },
+          "vector_sha256": "6ea31fa443c3928cd909767deeefdbaef149d7d6712d3810d13537d940c1ee3e"
+        },
+        "query_short": {
+          "tokens": 13,
+          "timing": {
+            "samples_seconds": [
+              0.01645374996587634,
+              0.01664087502285838,
+              0.01648387499153614,
+              0.016333458945155144,
+              0.01642116717994213,
+              0.016779166646301746,
+              0.016425832640379667,
+              0.016373374965041876,
+              0.016229374799877405,
+              0.016835457645356655
+            ],
+            "count": 10,
+            "p50_seconds": 0.016439791303128004,
+            "p95_seconds": 0.016835457645356655,
+            "mean_seconds": 0.01649763328023255
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              0.016815375071018934,
+              0.017014625016599894,
+              0.01681629102677107,
+              0.016686332877725363,
+              0.016774083022028208,
+              0.017126958817243576,
+              0.0167672922834754,
+              0.01670691603794694,
+              0.016547792125493288,
+              0.01708474988117814
+            ],
+            "count": 10,
+            "p50_seconds": 0.01679472904652357,
+            "p95_seconds": 0.017126958817243576,
+            "mean_seconds": 0.01683404161594808
+          },
+          "vector_sha256": "1af10176c62e95c9081aab8fdb267ea115ec87fc77f3332a5415752727163b42"
+        },
+        "document_128": {
+          "tokens": 128,
+          "timing": {
+            "samples_seconds": [
+              0.031411875039339066,
+              0.028917458839714527,
+              0.026455833110958338,
+              0.024680541828274727,
+              0.02355708321556449,
+              0.023576917126774788,
+              0.023519415874034166,
+              0.02359137497842312,
+              0.02345837512984872,
+              0.02348199998959899
+            ],
+            "count": 10,
+            "p50_seconds": 0.023584146052598953,
+            "p95_seconds": 0.031411875039339066,
+            "mean_seconds": 0.02526508751325309
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              0.03191616619005799,
+              0.029385332949459553,
+              0.026920416858047247,
+              0.025137290824204683,
+              0.02402616711333394,
+              0.024025083053857088,
+              0.02396558318287134,
+              0.02404729090631008,
+              0.02388087473809719,
+              0.023928750306367874
+            ],
+            "count": 10,
+            "p50_seconds": 0.02403672900982201,
+            "p95_seconds": 0.03191616619005799,
+            "mean_seconds": 0.0257232956122607
+          },
+          "vector_sha256": "c36878943df3fc9a361950c2e6675e75648e712ccd6bdded118d5bc4f4d0e28c"
+        },
+        "document_512": {
+          "tokens": 512,
+          "timing": {
+            "samples_seconds": [
+              0.07890766626223922,
+              0.07920904224738479,
+              0.07897508284077048,
+              0.07884120801463723,
+              0.07850658381357789,
+              0.078748291824013,
+              0.07877675024792552,
+              0.0788012077100575,
+              0.07860487513244152,
+              0.07882412476465106
+            ],
+            "count": 10,
+            "p50_seconds": 0.07881266623735428,
+            "p95_seconds": 0.07920904224738479,
+            "mean_seconds": 0.07881948328576982
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              0.07994179101660848,
+              0.08049387531355023,
+              0.08012674981728196,
+              0.08006070787087083,
+              0.07984345825389028,
+              0.08002458373084664,
+              0.08005220862105489,
+              0.08005095925182104,
+              0.07984966691583395,
+              0.08012733282521367
+            ],
+            "count": 10,
+            "p50_seconds": 0.08005158393643796,
+            "p95_seconds": 0.08049387531355023,
+            "mean_seconds": 0.0800571333616972
+          },
+          "vector_sha256": "fc5aa9e0f33e9f494a30cb8b11ea931de3be5f49d7d2c88efeff686328f7c405"
+        },
+        "document_8192": {
+          "tokens": 8192,
+          "timing": {
+            "samples_seconds": [
+              3.409793958067894
+            ],
+            "count": 1,
+            "p50_seconds": 3.409793958067894,
+            "p95_seconds": 3.409793958067894,
+            "mean_seconds": 3.409793958067894
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              3.425235708244145
+            ],
+            "count": 1,
+            "p50_seconds": 3.425235708244145,
+            "p95_seconds": 3.425235708244145,
+            "mean_seconds": 3.425235708244145
+          },
+          "vector_sha256": "625be9348ea2cec4ad6b087c07c7d7f7df65fe8d62a5f92503075dc54e43a756"
+        },
+        "image": {
+          "tokens": 264,
+          "timing": {
+            "samples_seconds": [
+              0.5492309997789562,
+              0.5507624582387507,
+              0.5504851671867073
+            ],
+            "count": 3,
+            "p50_seconds": 0.5504851671867073,
+            "p95_seconds": 0.5507624582387507,
+            "mean_seconds": 0.5501595417348047
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              0.5540126669220626,
+              0.5553421247750521,
+              0.5552891250699759
+            ],
+            "count": 3,
+            "p50_seconds": 0.5552891250699759,
+            "p95_seconds": 0.5553421247750521,
+            "mean_seconds": 0.5548813055890301
+          },
+          "vector_sha256": "e2a911c6fe66d73aa7bb3895b48d5c7fb47c5229168d1a1f5c641d06c394aa33"
+        },
+        "audio": {
+          "tokens": 29,
+          "timing": {
+            "samples_seconds": [
+              0.034990249667316675,
+              0.03478379175066948,
+              0.03477437514811754
+            ],
+            "count": 3,
+            "p50_seconds": 0.03478379175066948,
+            "p95_seconds": 0.034990249667316675,
+            "mean_seconds": 0.034849472188701235
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              0.03615479078143835,
+              0.03590308362618089,
+              0.03594929166138172
+            ],
+            "count": 3,
+            "p50_seconds": 0.03594929166138172,
+            "p95_seconds": 0.03615479078143835,
+            "mean_seconds": 0.036002388689666986
+          },
+          "vector_sha256": "5e1bb7d0007b31273541d114b647e24ab3677567918054820fad4d24a82e89bc"
+        },
+        "mixed": {
+          "tokens": 303,
+          "timing": {
+            "samples_seconds": [
+              0.5721757500432432,
+              0.5704634580761194,
+              0.5729827499017119
+            ],
+            "count": 3,
+            "p50_seconds": 0.5721757500432432,
+            "p95_seconds": 0.5729827499017119,
+            "mean_seconds": 0.5718739860070249
+          },
+          "preprocessing_and_inference_timing": {
+            "samples_seconds": [
+              0.5780532918870449,
+              0.5766337499953806,
+              0.5782371247187257
+            ],
+            "count": 3,
+            "p50_seconds": 0.5780532918870449,
+            "p95_seconds": 0.5782371247187257,
+            "mean_seconds": 0.5776413888670504
+          },
+          "vector_sha256": "9f7310e9d358cc6369f53cef425d00436781c72310bda8aa7bdbce30b8f73111"
+        }
+      },
+      "before": {
+        "utc": "2026-10-07T06:03:08Z",
+        "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+        "swap": "vm.swapusage: total = 4096.00M  used = 2506.12M  free = 1589.88M  (encrypted)\n",
+        "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              706415.\nPages active:                             78116.\nPages inactive:                          444224.\nPages speculative:                        20362.\nPages throttled:                              0.\nPages wired down:                        183769.\nPages purgeable:                           3116.\n\"Translation faults\":               10462336601.\nPages copy-on-write:                  268399867.\nPages zero filled:                  16208519974.\nPages reactivated:                    399210250.\nPages purged:                          62122817.\nFile-backed pages:                       439360.\nAnonymous pages:                         103342.\nPages stored in compressor:              558051.\nPages occupied by compressor:            104886.\nDecompressions:                      1841278307.\nCompressions:                        2154058525.\nPageins:                             2610483849.\nPageouts:                                899761.\nSwapins:                               90003078.\nSwapouts:                             108965430.\n",
+        "threads": {
+          "VECLIB_MAXIMUM_THREADS": "4",
+          "OMP_NUM_THREADS": "4"
+        }
+      },
+      "model_load_seconds": 0.6489730407483876,
+      "decision": {
+        "similarities": {
+          "account": 0.9681580515509419,
+          "billing": 0.8967265016194691,
+          "delivery": 0.882745755383256
+        },
+        "choice": "account",
+        "margin": 0.07143154993147283,
+        "timing": {
+          "samples_seconds": [
+            0.017710166051983833,
+            0.01730012521147728,
+            0.01725937519222498,
+            0.01724483259022236,
+            0.01732387486845255,
+            0.017289415933191776,
+            0.017113333102315664,
+            0.017021209001541138,
+            0.01717991614714265,
+            0.017037541139870882
+          ],
+          "count": 10,
+          "p50_seconds": 0.01725210389122367,
+          "p95_seconds": 0.017710166051983833,
+          "mean_seconds": 0.017247978923842312
+        }
+      },
+      "torch": "2.10.0",
+      "torch_threads": 4,
+      "attention_implementation": "sdpa",
+      "mps_allocated_bytes": 2977624064,
+      "mps_driver_bytes": 7240122368,
+      "after": {
+        "utc": "2026-10-07T06:03:23Z",
+        "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+        "swap": "vm.swapusage: total = 4096.00M  used = 2506.12M  free = 1589.88M  (encrypted)\n",
+        "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              165976.\nPages active:                            268186.\nPages inactive:                          449388.\nPages speculative:                        15311.\nPages throttled:                              0.\nPages wired down:                        534056.\nPages purgeable:                           2070.\n\"Translation faults\":               10462779097.\nPages copy-on-write:                  268404428.\nPages zero filled:                  16209412383.\nPages reactivated:                    399210251.\nPages purged:                          62123057.\nFile-backed pages:                       440981.\nAnonymous pages:                         291904.\nPages stored in compressor:              557537.\nPages occupied by compressor:            104784.\nDecompressions:                      1841278812.\nCompressions:                        2154058525.\nPageins:                             2610485712.\nPageouts:                                899761.\nSwapins:                               90003078.\nSwapouts:                             108965430.\n",
+        "threads": {
+          "VECLIB_MAXIMUM_THREADS": "4",
+          "OMP_NUM_THREADS": "4"
+        }
+      },
+      "artifact_sha256": "3e5877181d428b591ceadab8da8fa5d8cc9f1992b4da11a9f7249d327cb3db58",
+      "vm_counter_delta_pages": {
+        "Pageouts": 0,
+        "Swapins": 0,
+        "Swapouts": 0
+      }
+    }
+  },
+  "validation": {
+    "optimized-release-build-final.log": {
+      "sha256": "9996435fa9ca9403d7768f84bd78dec34fcec98ec7d2db695b240c533856bf21",
+      "content": "Build Summary: 26/26 steps succeeded\ninstall success\n+- licenses-antfly-inference success\n|  +- install ../../../LICENSES/Apache-2.0.txt to share/licenses/antfly-inference/LICENSE cached\n|  +- install ../../../LICENSES/Apache-2.0.txt to share/licenses/antfly-inference/LICENSES/Apache-2.0.txt cached\n|  +- install ../../../THIRD_PARTY_NOTICES.md to share/licenses/antfly-inference/THIRD_PARTY_NOTICES.md cached\n|  +- install ../../../scripts/apache_engine_files.txt to share/licenses/antfly-inference/scripts/apache_engine_files.txt cached\n|  +- install ../../../scripts/source_license_roots.json to share/licenses/antfly-inference/scripts/source_license_roots.json cached\n|  +- install ../../../scripts/embedded_asset_licenses.json to share/licenses/antfly-inference/scripts/embedded_asset_licenses.json cached\n|  +- install ../../../LICENSES/third-party/ cached\n+- install antfly-inference success\n|  +- compile exe antfly-inference fast native success 6m MaxRSS:14G\n|     +- WriteFile macos-sdk-libc.txt cached\n|     +- WriteFile cached\n|     +- compile obj antfly-build-info fast native cached 27ms MaxRSS:31M\n|     |  +- WriteFile macos-sdk-libc.txt (reused)\n|     |  +- options cached\n|     +- compile obj antfly-build-info fast native (+2 more reused dependencies)\n|     +- options cached\n|     +- run exe jit-source-identity (metal_identity.zig) cached\n|     |  +- compile exe jit-source-identity safe native cached 28ms MaxRSS:31M\n|     |     +- WriteFile macos-sdk-libc.txt (reused)\n|     +- WriteFile tokenizer.json cached\n|     +- run exe patch_sentencepiece_proto (sentencepiece_proto) cached\n|     |  +- compile exe patch_sentencepiece_proto safe native cached 27ms MaxRSS:31M\n|     |  |  +- WriteFile macos-sdk-libc.txt (reused)\n|     |  +- run exe protoc-zig (sentencepiece_proto_raw) cached\n|     |  |  +- compile exe protoc-zig safe native cached 28ms MaxRSS:31M\n|     |  |     +- WriteFile macos-sdk-libc.txt (reused)\n|     |  +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)\n|     +- options cached\n+- install antfly-kernel-jit-package cached\n   +- compile exe antfly-kernel-jit-package fast native cached 28ms MaxRSS:31M\n      +- WriteFile macos-sdk-libc.txt (reused)\n\n"
+    },
+    "stage-fix-debug-build.log": {
+      "sha256": "c7a50bf19580a727d728e2e2cee9a10060b9be60b23ed9a1e7d7ef97a9b656c0",
+      "content": "Build Summary: 13/13 steps succeeded\ntest-bin success\n+- install test success\n   +- compile test debug native success 3m MaxRSS:5G\n      +- WriteFile macos-sdk-libc.txt cached\n      +- run exe jit-source-identity (metal_identity.zig) cached\n      |  +- compile exe jit-source-identity safe native cached 27ms MaxRSS:31M\n      |     +- WriteFile macos-sdk-libc.txt (reused)\n      +- options cached\n      +- WriteFile tokenizer.json cached\n      +- run exe patch_sentencepiece_proto (sentencepiece_proto) cached\n      |  +- compile exe patch_sentencepiece_proto safe native cached 27ms MaxRSS:31M\n      |  |  +- WriteFile macos-sdk-libc.txt (reused)\n      |  +- run exe protoc-zig (sentencepiece_proto_raw) cached\n      |  |  +- compile exe protoc-zig safe native cached 28ms MaxRSS:31M\n      |  |     +- WriteFile macos-sdk-libc.txt (reused)\n      |  +- run exe protoc-zig (sentencepiece_proto_raw) (+1 more reused dependencies)\n      +- options cached\n\n"
+    },
+    "stage-fix-focused-tests.log": {
+      "sha256": "9eebb2e51384064850c5790050baf915e414c7a0a0b8be0e49acc4e1a14663ed",
+      "content": "1/61 inference.test_0...OK\n2/61 inference.test.embeddinggemma2 declarations compile...OK\n3/61 architectures.embedding_gemma2.test.embeddinggemma2 sliding ranges preserve positions holes and batch isolation...OK\n4/61 architectures.embedding_gemma2.test.embeddinggemma2 native Metal layer parity...SKIP\n5/61 architectures.embedding_gemma2.test.embeddinggemma2 visibility preserves padding holes and batch boundaries...OK\n6/61 architectures.embedding_gemma2.test.embeddinggemma2 official task prefixes and matryoshka dimensions...OK\n7/61 architectures.embedding_gemma2.test.embeddinggemma2 real official checkpoint matches F32 oracle...SKIP\n8/61 architectures.embedding_gemma2.test.embeddinggemma2 real padded batch is invariant and cancellation permits retry...SKIP\n9/61 architectures.embedding_gemma2.test.embeddinggemma2 rejects incompatible checkpoint semantics...OK\n10/61 extractors.embedding_decisions.test.embeddinggemma2 decisions abstain on ties and threshold failures...OK\n11/61 extractors.embedding_decisions.test.embeddinggemma2 centroid normalizes each example before averaging...OK\n12/61 architectures.embedding_gemma2_media_weights.test.embeddinggemma2 HF media mapping preserves original linear and scalar names...OK\n13/61 server.server.test_0...OK\n14/61 server.server.test.embeddinggemma2 grouped media executor limits remain family scoped...OK\n15/61 server.server.test.embeddinggemma2 managed text tokenizer and HTTP choice abstention...SKIP\n16/61 server.server.test.embeddinggemma2 ordered media matches official F32 oracle...SKIP\n17/61 runtime.root.test_0...OK\n18/61 runtime.kv.root.test_0...OK\n19/61 ops.metal_compute.test.embeddinggemma2 BF16 row slice converts only the requested rows...OK\n20/61 runtime.moe.root.test_0...OK\n21/61 runtime.tier.root.test_0...OK\n22/61 backends.backends.test_0...OK\n23/61 ops.native_compute.test.embeddinggemma2 CPU vocabulary lookup widens selected BF16 rows within a bounded workspace...OK\n24/61 gguf.root.test_0...OK\n25/61 pipelines.pipelines.test_0...OK\n26/61 extractors.mod.test_0...OK\n27/61 registry.registry.test_0...OK\n28/61 tabular.root.test_0...OK\n29/61 models.models.test_0...OK\n30/61 util.util.test_0...OK\n31/61 graph.root.test_0...OK\n32/61 ops.wasm_compute.test_0...OK\n33/61 finetune.root.test_0...OK\n34/61 finetune.cli.root.test_0...OK\n35/61 quantize.root.test_0...OK\n36/61 native_export.test_0...OK\n37/61 native_quantize.test_0...OK\n38/61 finetune.gliner.boundary_train_step.test_0...OK\n39/61 finetune.gliner.boundary_training_source.test_0...OK\n40/61 models.manifest.test.embeddinggemma2 unused tokenizer scan preserves wrappers fresh reads and file errors...OK\n41/61 models.manifest.test.Qwen3 embedder tokenizer scan policy preserves wrappers and undeclared models...OK\n42/61 models.manifest.test.Qwen3 embedder unused tokenizer scan preserves fresh manifests GGUF and file errors...OK\n43/61 models.manifest.test.manifest reads gliner special tokens from tokenizer json...OK\n44/61 pipelines.tasks.test_0...OK\n45/61 pipelines.documents.test_0...OK\n46/61 pipelines.multimodal_reranker.test_0...OK\n47/61 pipelines.document_preprocessing.test_0...OK\n48/61 pipelines.document_classification.test_0...OK\n49/61 pipelines.document_token_classification.test_0...OK\n50/61 pipelines.adapters.test_0...OK\n51/61 pipelines.multimodal_qwen_adapter.test_0...OK\n52/61 pipelines.document_preprocessing_runtime.test_0...OK\n53/61 runtime.scheduler.root.test_0...OK\n54/61 server.metrics.test_0...OK\n55/61 extractors.embedding_prototypes.test.embeddinggemma2 prototype reservations bound capacity and survive aborted owners...OK\n56/61 extractors.embedding_prototypes.test.embeddinggemma2 concurrent prototype waiters coalesce and cancel independently...OK\n57/61 models.embedding_gemma2_identity.test.embeddinggemma2 processor changes fail closed...OK\n58/61 extractors.embedding_classification.test.embeddinggemma2 multi-label requires explicit raw cosine thresholds...OK\n59/61 extractors.embedding_calibration.test.embeddinggemma2 unqualified calibration cannot supply thresholds...OK\n60/61 extractors.embedding_calibration.test.embeddinggemma2 calibration binds prototypes and independently checks heldout metrics...OK\n61/61 server.gliner_boundary_service_test.test.gliner boundary v2 lightweight model preflight avoids vocabulary and recovers model budget denial...OK\n61 selected; 56 passed; 5 skipped.\n"
+    },
+    "optimized-metal-tests.log": {
+      "sha256": "ce7880c33eaa5a7aaf0b622e611ce748bcb58cde1c405cfeaebba624b19b8596",
+      "content": "1/4960 architectures.embedding_gemma2.test.embeddinggemma2 native Metal layer parity...embeddinggemma2 stage=embedding cosine=1.000000000 max_abs=0.000000000\nembeddinggemma2 stage=input_norm cosine=1.000000000 max_abs=0.000030518\nembeddinggemma2 stage=q_linear cosine=1.000000000 max_abs=0.000083923\nembeddinggemma2 stage=attention cosine=1.000000000 max_abs=0.000008583\nembeddinggemma2 stage=layer_0 cosine=1.000000000 max_abs=0.000007629\nembeddinggemma2 stage=layer_1 cosine=1.000000000 max_abs=0.000008106\nembeddinggemma2 stage=layer_2 cosine=1.000000000 max_abs=0.000007391\nembeddinggemma2 stage=layer_3 cosine=1.000000000 max_abs=0.000011206\nembeddinggemma2 stage=layer_4 cosine=1.000000000 max_abs=0.000017881\nembeddinggemma2 stage=layer_5 cosine=1.000000000 max_abs=0.000031233\nembeddinggemma2 stage=layer_6 cosine=1.000000000 max_abs=0.000034332\nembeddinggemma2 stage=layer_7 cosine=1.000000000 max_abs=0.000038147\nembeddinggemma2 stage=layer_8 cosine=1.000000000 max_abs=0.000034332\nembeddinggemma2 stage=layer_9 cosine=1.000000000 max_abs=0.000041306\nembeddinggemma2 stage=layer_10 cosine=1.000000000 max_abs=0.000033975\nembeddinggemma2 stage=layer_11 cosine=1.000000000 max_abs=0.000028372\nembeddinggemma2 stage=layer_12 cosine=1.000000000 max_abs=0.000038147\nembeddinggemma2 stage=layer_13 cosine=1.000000000 max_abs=0.000035286\nembeddinggemma2 stage=layer_14 cosine=1.000000000 max_abs=0.000053406\nembeddinggemma2 stage=layer_15 cosine=1.000000000 max_abs=0.000095367\nembeddinggemma2 stage=layer_16 cosine=1.000000000 max_abs=0.000049591\nembeddinggemma2 stage=layer_17 cosine=1.000000000 max_abs=0.000038147\nembeddinggemma2 stage=layer_18 cosine=1.000000000 max_abs=0.000049591\nembeddinggemma2 stage=layer_19 cosine=1.000000000 max_abs=0.000053406\nembeddinggemma2 stage=layer_20 cosine=1.000000000 max_abs=0.000053406\nembeddinggemma2 stage=layer_21 cosine=1.000000000 max_abs=0.000061035\nembeddinggemma2 stage=layer_22 cosine=1.000000000 max_abs=0.000053406\nembeddinggemma2 stage=layer_23 cosine=1.000000000 max_abs=0.000091553\nOK\n2/4960 architectures.embedding_gemma2.test.embeddinggemma2 real official checkpoint matches F32 oracle...embeddinggemma2 oracle case=0 metal=true cosine=1.000000000 max_abs=0.000000106\nembeddinggemma2 oracle case=1 metal=true cosine=1.000000000 max_abs=0.000000089\nembeddinggemma2 oracle case=2 metal=true cosine=1.000000000 max_abs=0.000000119\nembeddinggemma2 oracle case=3 metal=true cosine=1.000000000 max_abs=0.000000119\nembeddinggemma2 oracle case=4 metal=true cosine=1.000000000 max_abs=0.000000190\nOK\n3/4960 architectures.embedding_gemma2.test.embeddinggemma2 real padded batch is invariant and cancellation permits retry...embeddinggemma2 padded batch=0 metal=true max_abs=0.000000115\nembeddinggemma2 padded batch=1 metal=true max_abs=0.000000115\nOK\n4/4960 server.server.test.embeddinggemma2 managed text tokenizer and HTTP choice abstention...embeddinggemma2 decision soak repetitions=64 prototype_builds=2 hits=128\nOK\n5/4960 server.server.test.embeddinggemma2 ordered media matches official F32 oracle...embeddinggemma2 media=image metal=true cosine=1.000000000 max_abs=0.000000130\nembeddinggemma2 media=audio metal=true cosine=0.999999998 max_abs=0.000008903\nembeddinggemma2 media=text_image metal=true cosine=1.000000000 max_abs=0.000000648\nembeddinggemma2 media=image_text metal=true cosine=1.000000000 max_abs=0.000000268\nembeddinggemma2 media=mixed metal=true cosine=1.000000000 max_abs=0.000001520\nOK\n5 selected; 5 passed; 0 skipped.\n"
+    },
+    "optimized-native-tests.log": {
+      "sha256": "00e42b203addc5b2a40256e646eb39686284d29a1a8a5a6c4d3463f32b51f444",
+      "content": "1/4960 architectures.embedding_gemma2.test.embeddinggemma2 real official checkpoint matches F32 oracle...embeddinggemma2 oracle case=0 metal=false cosine=1.000000000 max_abs=0.000000117\nembeddinggemma2 oracle case=1 metal=false cosine=1.000000000 max_abs=0.000000085\nembeddinggemma2 oracle case=2 metal=false cosine=1.000000000 max_abs=0.000000089\nembeddinggemma2 oracle case=3 metal=false cosine=1.000000000 max_abs=0.000000089\nembeddinggemma2 oracle case=4 metal=false cosine=1.000000000 max_abs=0.000000217\nOK\n2/4960 architectures.embedding_gemma2.test.embeddinggemma2 real padded batch is invariant and cancellation permits retry...embeddinggemma2 padded batch=0 metal=false max_abs=0.000000138\nembeddinggemma2 padded batch=1 metal=false max_abs=0.000000087\nOK\n3/4960 server.server.test.embeddinggemma2 managed text tokenizer and HTTP choice abstention...embeddinggemma2 decision soak repetitions=2 prototype_builds=2 hits=4\nOK\n4/4960 server.server.test.embeddinggemma2 ordered media matches official F32 oracle...embeddinggemma2 media=image metal=false cosine=1.000000000 max_abs=0.000000119\nembeddinggemma2 media=audio metal=false cosine=0.999999998 max_abs=0.000009118\nembeddinggemma2 media=text_image metal=false cosine=1.000000000 max_abs=0.000000311\nembeddinggemma2 media=image_text metal=false cosine=1.000000000 max_abs=0.000000216\nembeddinggemma2 media=mixed metal=false cosine=1.000000000 max_abs=0.000001542\nOK\n4 selected; 4 passed; 0 skipped.\n"
+    },
+    "optimized-native-long.log": {
+      "sha256": "5c088eb3fcec80262e0890493ffae226d1f11dac0e1e77c0d9d40d4132f8e8ec",
+      "content": "1/4960 architectures.embedding_gemma2.test.embeddinggemma2 real official checkpoint matches F32 oracle...embeddinggemma2 bounded tokens=128 peak_bytes=35926838\nembeddinggemma2 oracle case=0 metal=false cosine=1.000000000 max_abs=0.000000082\nembeddinggemma2 bounded tokens=512 peak_bytes=52469558\nembeddinggemma2 oracle case=1 metal=false cosine=1.000000000 max_abs=0.000000164\nembeddinggemma2 bounded tokens=8192 peak_bytes=429525998\nembeddinggemma2 oracle case=2 metal=false cosine=1.000000000 max_abs=0.000000864\nOK\n1 selected; 1 passed; 0 skipped.\n"
+    },
+    "optimized-metal-long.log": {
+      "sha256": "64cf746593af993cefeca63b8a4247b627cd67f3f1e81d7ad86c859eee968f73",
+      "content": "1/4960 architectures.embedding_gemma2.test.embeddinggemma2 real official checkpoint matches F32 oracle...embeddinggemma2 bounded tokens=128 peak_bytes=1915087\nembeddinggemma2 oracle case=0 metal=true cosine=1.000000000 max_abs=0.000000091\nembeddinggemma2 bounded tokens=512 peak_bytes=3945691\nembeddinggemma2 oracle case=1 metal=true cosine=1.000000000 max_abs=0.000000179\nembeddinggemma2 bounded tokens=8192 peak_bytes=51131611\nembeddinggemma2 oracle case=2 metal=true cosine=1.000000000 max_abs=0.000000805\nOK\n1 selected; 1 passed; 0 skipped.\n"
+    },
+    "optimized-live.log": {
+      "sha256": "f8e6d780954b3f9853cef41b59202e159e6eb6fbb6a972d401feccc0f9308dfb",
+      "content": "{\"version\": 1, \"production_qualified\": false, \"qualification\": \"numerical_and_http_contracts\", \"model\": \"model\", \"model_identity\": \"2e3ab9d26dcdc60ebb4d0d6b2c744e0285545358eb6945b8fbbe9c0b1a6c2081\", \"oracle_sha256\": \"b027d365d0c6afef763c3e9396d42f9dd93b43d275ea3d16b3b8536167ddfa33\", \"dimension_max_abs\": {\"768\": 1.3686691997805145e-07, \"512\": 1.362329408310936e-07, \"256\": 1.7145416708608252e-07, \"128\": 1.9678126964017828e-07}, \"media_max_abs\": {\"image\": 1.30385160446167e-07, \"audio\": 8.903443813323975e-06, \"text_image\": 6.48200511932373e-07, \"image_text\": 2.6798807084560394e-07, \"mixed\": 1.519918441772461e-06}, \"requests\": 36, \"concurrency\": 4, \"latency_seconds\": {\"median\": 0.7105724792927504, \"maximum\": 2.8403244158253074}, \"remaining_gates\": [\"application retrieval and classification holdouts\", \"qualified deployment calibration\", \"clean-host resource and latency campaign\", \"index migration and retrieval qualification\"]}\n"
+    }
+  },
+  "live_contracts": {
+    "version": 1,
+    "production_qualified": false,
+    "qualification": "numerical_and_http_contracts",
+    "model": "model",
+    "model_identity": "2e3ab9d26dcdc60ebb4d0d6b2c744e0285545358eb6945b8fbbe9c0b1a6c2081",
+    "oracle_sha256": "b027d365d0c6afef763c3e9396d42f9dd93b43d275ea3d16b3b8536167ddfa33",
+    "dimension_max_abs": {
+      "768": 1.3686691997805145e-07,
+      "512": 1.362329408310936e-07,
+      "256": 1.7145416708608252e-07,
+      "128": 1.9678126964017828e-07
+    },
+    "media_max_abs": {
+      "image": 1.30385160446167e-07,
+      "audio": 8.903443813323975e-06,
+      "text_image": 6.48200511932373e-07,
+      "image_text": 2.6798807084560394e-07,
+      "mixed": 1.519918441772461e-06
+    },
+    "requests": 36,
+    "concurrency": 4,
+    "latency_seconds": {
+      "median": 0.7105724792927504,
+      "maximum": 2.8403244158253074
+    },
+    "remaining_gates": [
+      "application retrieval and classification holdouts",
+      "qualified deployment calibration",
+      "clean-host resource and latency campaign",
+      "index migration and retrieval qualification"
+    ]
+  },
+  "live_conditions": {
+    "binary_sha256": "07fb4e8448ab9dfdc71f00fed4d20fc9bdbe2941e9e12184b1757c91f06b8805",
+    "before": {
+      "utc": "2026-10-07T06:36:08Z",
+      "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+      "swap": "vm.swapusage: total = 4096.00M  used = 2506.12M  free = 1589.88M  (encrypted)\n",
+      "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              783568.\nPages active:                             93273.\nPages inactive:                          359476.\nPages speculative:                         6361.\nPages throttled:                              0.\nPages wired down:                        182449.\nPages purgeable:                           3783.\n\"Translation faults\":               10496833870.\nPages copy-on-write:                  268527292.\nPages zero filled:                  16240525667.\nPages reactivated:                    399584109.\nPages purged:                          62238561.\nFile-backed pages:                       366296.\nAnonymous pages:                          92814.\nPages stored in compressor:              572724.\nPages occupied by compressor:            112527.\nDecompressions:                      1842082528.\nCompressions:                        2154972128.\nPageins:                             2610627101.\nPageouts:                                899961.\nSwapins:                               90003213.\nSwapouts:                             108965430.\n",
+      "threads": {
+        "VECLIB_MAXIMUM_THREADS": "4",
+        "OMP_NUM_THREADS": "4"
+      }
+    },
+    "backend": "metal",
+    "after": {
+      "utc": "2026-10-07T06:36:35Z",
+      "hardware": "hw.model: Mac16,11\nhw.memsize: 25769803776\nhw.ncpu: 12\nmachdep.cpu.brand_string: Apple M4 Pro\n",
+      "swap": "vm.swapusage: total = 4096.00M  used = 2498.12M  free = 1597.88M  (encrypted)\n",
+      "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                              781995.\nPages active:                             95482.\nPages inactive:                          359486.\nPages speculative:                         6458.\nPages throttled:                              0.\nPages wired down:                        181942.\nPages purgeable:                           2708.\n\"Translation faults\":               10499649257.\nPages copy-on-write:                  268529656.\nPages zero filled:                  16243068716.\nPages reactivated:                    399584174.\nPages purged:                          62238802.\nFile-backed pages:                       366469.\nAnonymous pages:                          94957.\nPages stored in compressor:              571923.\nPages occupied by compressor:            112385.\nDecompressions:                      1842083329.\nCompressions:                        2154972128.\nPageins:                             2610627253.\nPageouts:                                899961.\nSwapins:                               90003313.\nSwapouts:                             108965430.\n",
+      "threads": {
+        "VECLIB_MAXIMUM_THREADS": "4",
+        "OMP_NUM_THREADS": "4"
+      }
+    },
+    "server_log_sha256": "e2c34e4ef21d71145416be204fa54f7e612376682406594d8245eb5e134d7707"
+  },
+  "performance_changes": [
+    "Restrict sliding-layer work to original-position window ranges while retaining batch isolation and padding holes.",
+    "Batch one Metal encoder layer per owned frame; expire transient slots only after completion or cancellation.",
+    "Allow skipping the GLiNER tokenizer tree for verified EmbeddingGemma 2 manifests without wrapper markers or Unicode escapes; retain file reads, identity validation and wrapper fallback."
+  ],
+  "serving_diagnostic": {
+    "binary_sha256": "00028407cfdfa555886a400d5d960ba1d8b48b1bdad1787a4b9edaa395bcfcc3",
+    "trace_log_sha256": "2839fe236e66b7c52efe9fed43ff29fd3918407d5a11b10319e22ffd124f9174",
+    "trace_log": "embed-def58b41a6238-0.json [{'items': 1, 'token_lengths': [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 'max_tokens': 13, 'active_tokens': 13, 'padded_tokens': 13}] {'total': 1166837000, 'admission': 3000, 'resolve_manifest': 102604000, 'model_acquire': 888538000, 'asset_prepare': 8000, 'tokenize': 41000, 'execution_lock': 0, 'execute_pool_normalize': 169573000}\nembed-def58f9b571e8-1.json [{'items': 1, 'token_lengths': [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 'max_tokens': 13, 'active_tokens': 13, 'padded_tokens': 13}] {'total': 242150000, 'admission': 1000, 'resolve_manifest': 86502000, 'model_acquire': 1000, 'asset_prepare': 3000, 'tokenize': 36000, 'execution_lock': 0, 'execute_pool_normalize': 152576000}\nembed-def5908320858-2.json [{'items': 1, 'token_lengths': [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 'max_tokens': 13, 'active_tokens': 13, 'padded_tokens': 13}] {'total': 243350000, 'admission': 0, 'resolve_manifest': 86016000, 'model_acquire': 3000, 'asset_prepare': 3000, 'tokenize': 38000, 'execution_lock': 0, 'execute_pool_normalize': 154257000}\nembed-def5916bfe890-3.json [{'items': 1, 'token_lengths': [13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 'max_tokens': 13, 'active_tokens': 13, 'padded_tokens': 13}] {'total': 242618000, 'admission': 0, 'resolve_manifest': 88464000, 'model_acquire': 1000, 'asset_prepare': 3000, 'tokenize': 48000, 'execution_lock': 0, 'execute_pool_normalize': 151062000}\n",
+    "note": "Four CPU query requests with opt-in tracing, after the first benchmark campaign and before the extraction OOM stage fix. Warm manifest resolution remains about 86-88 ms. The official tokenizer vocabulary includes a Unicode escape and therefore takes the conservative GLiNER scan fallback; the conditional fast path did not eliminate this cost for the pinned checkpoint."
+  },
+  "additional_package_diagnostic": {
+    "scope": "Diagnostic follow-up of an accidentally unfiltered ReleaseFast run from the repository root. This is not final-source whole-package qualification.",
+    "initial_wrong_cwd": "repository root",
+    "initial_summary": "4960 selected; 4727 passed; 183 skipped; 50 failed; 0 leaked.",
+    "initial_log_sha256": "2544ba78881253e383e163f02bfe5364147e73478dfedbcd75daaa100814b9f2",
+    "retry_cwd": "zig/pkg/inference",
+    "release_correct_cwd": {
+      "binary_sha256": "2bad36decfdc20501ee97bc221af1a2f4b0ded477e12e28dd970cd5283da8515",
+      "returncode": 1,
+      "log_sha256": "92cff3b047f59522428fa4c185c63ccb188ac9f98d14156dbdc2cba4d16d6be4",
+      "failed_names": [
+        "pipelines.gliner_boundary_long_document.test.gliner boundary long document records preserve whole alternatives and solve global exclusivity",
+        "pipelines.gliner_boundary_long_relations.test.gliner boundary long relations rebase Unicode before global repeated mention selection",
+        "server.gliner_boundary_service_test.test.gliner boundary v2 lightweight model preflight avoids vocabulary and recovers model budget denial",
+        "architectures.gliner.boundary_graph_test.test.boundary training graph releases descriptors and graph on allocation failures",
+        "architectures.gliner.boundary_graph_test.test.boundary training graph candidate scratch and descriptors survive allocation failures",
+        "finetune.gliner.boundary_training_export.test.boundary training export bounds cancellation and all allocation failures reclaim private staging"
+      ],
+      "summary": "50 selected; 44 passed; 0 skipped; 6 failed; 0 leaked."
+    },
+    "debug_diagnostic": {
+      "binary_sha256": "0f1e79aca0f1d7de61b7c75dd541f29a206ba1ced9b6122fd387ae8b8c838f4e",
+      "returncode": 1,
+      "log_sha256": "8d01b06511c7991f5afb2229b0773747c1c22ce5ac6aa4612adefa506d509c56",
+      "failed_names": [
+        "server.gliner_boundary_service_test.test.gliner boundary v2 lightweight model preflight avoids vocabulary and recovers model budget denial"
+      ],
+      "summary": "6 selected; 5 passed; 0 skipped; 1 failed; 0 leaked.",
+      "source_note": "Earlier Debug binary, including window restriction and Metal frames, before final frame-owner guard and EmbeddingGemma2 tokenizer scan changes. Shared non-family code is unchanged; this is diagnostic evidence, not final-binary release qualification."
+    },
+    "resolution": "44 of the 50 initial failures passed from the correct package cwd in ReleaseFast; five more allocation-failure checks passed in the earlier Debug diagnostic. The remaining GLiNER preflight response/metric stage regression was fixed and passes in the final focused Debug run. This is not a whole-package final Debug qualification."
+  },
+  "production_hardening": [
+    "Model-config allocation failures in the EmbeddingGemma2 extraction family probe retain the model-stage HTTP error and metric classification; existing GLiNER denial/recovery regression passes.",
+    "Mac CLI compiler memory estimate raised to 14 GiB after observed roughly 13 GiB ReleaseFast compilation; final build log confirms the declared estimate admits the build."
+  ],
+  "remaining_gates": [
+    "Native latency and throughput targets for the intended deployment remain unspecified. This compact campaign measures observed local latency, not an SLO pass.",
+    "No labeled application dataset was evaluated; routing correctness here is numerical agreement with PyTorch, not measured application accuracy or calibrated coverage.",
+    "Clean-host concurrency and longer operating-duration resource qualification remain outside this compact check."
+  ],
+  "artifact_retention": "Measured vectors and full runtime logs are in ignored .tmp/embeddinggemma2/production. This durable report retains their hashes, numerical agreements, timing samples, conditions and focused validation logs. The pinned checkpoint and source oracles can be regenerated using the reference tool. Historical broad API/SDK qualification is retained locally in ignored .benchmark-results/embeddinggemma2/embeddinggemma2-qualification.json."
+}

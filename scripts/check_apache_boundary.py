@@ -143,6 +143,10 @@ SOURCE_MODULES = {
     "antfly_embedded_api": ("zig/pkg/antfly-embedded/src/engine/api.zig",),
     "antfly_embedded_db": ("zig/pkg/antfly-embedded/src/engine/db.zig",),
     "antfly_embeddings": ("zig/lib/embeddings/src/mod.zig",),
+    "antfly_decisions": ("zig/lib/decisions/root.zig",),
+    "antfly_decision_openapi": (
+        "zig/pkg/antfly-embedded/src/openapi/generated/antfly_decision_openapi/root.zig",
+    ),
     "antfly_embeddings_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_embeddings_openapi/root.zig",
     ),

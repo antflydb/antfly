@@ -135,7 +135,7 @@ pub const Route = struct {
 pub const routes = [_]Route{
     .{ .method = "POST", .path = "/chat/completions", .operation_id = "chatCompletions", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/chunk", .operation_id = "chunkText", .request_body = .buffered, .streaming_response = false },
-    .{ .method = "POST", .path = "/decide", .operation_id = "decide", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/decisions", .operation_id = "decide", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/dictate", .operation_id = "dictate", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/embed", .operation_id = "generateEmbeddings", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/embeddings", .operation_id = "createEmbedding", .request_body = .buffered, .streaming_response = false },
@@ -203,7 +203,7 @@ pub fn ServerRouter(comptime Impl: type) type {
         pub fn register(self: *const @This(), server: anytype) !void {
             try server.post("/chat/completions", httpx.Handler.bind(self.impl, chatCompletions));
             try server.post("/chunk", httpx.Handler.bind(self.impl, chunkText));
-            try server.post("/decide", httpx.Handler.bind(self.impl, decide));
+            try server.post("/decisions", httpx.Handler.bind(self.impl, decide));
             try server.post("/dictate", httpx.Handler.bind(self.impl, dictate));
             try server.post("/embed", httpx.Handler.bind(self.impl, generateEmbeddings));
             try server.post("/embeddings", httpx.Handler.bind(self.impl, createEmbedding));
@@ -237,8 +237,8 @@ pub fn ServerRouter(comptime Impl: type) type {
             return impl.chunkText(ctx);
         }
 
-        /// Answer named choice, ordinal score, and Boolean questions
-        /// POST /decide
+        /// Answer named decision questions
+        /// POST /decisions
         fn decide(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
             return impl.decide(ctx);
         }

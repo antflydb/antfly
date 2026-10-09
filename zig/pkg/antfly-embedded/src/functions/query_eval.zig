@@ -282,8 +282,8 @@ test "decision functions candidate filtering sorting and aggregates reuse a name
             _ = self.calls.fetchAdd(1, .monotonic);
             const parsed = try std.json.parseFromSlice(Json, alloc, body, .{});
             defer parsed.deinit();
-            const score: f64 = if (std.mem.eql(u8, parsed.value.object.get("state").?.string, "refund")) 0.9 else 0.1;
-            return std.fmt.allocPrint(alloc, "{{\"model\":\"mock\",\"answers\":{{\"answer\":{{\"type\":\"noul\",\"noul\":{d}}}}},\"usage\":{{\"input_tokens\":2,\"output_tokens\":0}}}}", .{score});
+            const score: f64 = if (std.mem.eql(u8, parsed.value.object.get("input").?.string, "refund")) 0.9 else 0.1;
+            return std.fmt.allocPrint(alloc, "{{\"model\":\"mock\",\"answers\":[{{\"name\":\"answer\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":{d}}}],\"usage\":{{\"input_tokens\":2,\"output_tokens\":0}}}}", .{score});
         }
     };
     var fake: Fake = .{};

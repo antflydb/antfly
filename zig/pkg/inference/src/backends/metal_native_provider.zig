@@ -32,6 +32,13 @@ const MetalTensor = metal_tensor.MetalTensor;
 const QuantizedStorage = weight_source_mod.QuantizedStorage;
 const RawMetalProvider = metal_runtime.RawMetalProvider;
 const RawMetalDecodeRuntime = metal_runtime.RawMetalDecodeRuntime;
+const tier_cache_mod = @import("../runtime/tier/cache.zig");
+pub const EmbeddingGemma2LinearCacheEntry = struct {
+    slot: usize,
+    in_dim: usize,
+    out_dim: usize,
+    bytes: usize,
+};
 const decoder_runtime_layer_norm_slot_capacity = metal_runtime.decoder_runtime_layer_norm_slot_capacity;
 const decoder_runtime_rms_norm_slot_capacity = metal_runtime.decoder_runtime_rms_norm_slot_capacity;
 const decoder_runtime_linear_slot_capacity = metal_runtime.decoder_runtime_linear_slot_capacity;
@@ -83,6 +90,12 @@ comptime {
 pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     raw_provider: ?*RawMetalProvider,
     raw_decode_runtime: ?*RawMetalDecodeRuntime,
+    /// Protected by the model's shared-provider execution lease. Entries own
+    /// their names and raw slots, never a request tensor or allocator. The
+    /// admission pointer belongs to the same drained model WeightStore.
+    embeddinggemma2_linear_cache: std.StringHashMapUnmanaged(EmbeddingGemma2LinearCacheEntry) = .empty,
+    embeddinggemma2_linear_cache_bytes: usize = 0,
+    embeddinggemma2_cache_admission: ?*tier_cache_mod.SharedCache = null,
     jit_mode: kernel_jit.Mode = .off,
     jit_scope: metal_runtime.MetalJitRouteScope = metal_runtime.MetalJitRouteScope.none(),
     jit_session: ?*metal_runtime.MetalJitSession = null,
@@ -216,6 +229,14 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         self.deberta_relative_embedding_cache.deinit();
         for (&self.deberta_relative_projection_cache) |*entry| entry.deinit();
         for (0..decoder_runtime_linear_slot_capacity) |slot| metal_runtime.releaseRawLinearSlot(self, slot);
+        var embeddinggemma2_it = self.embeddinggemma2_linear_cache.iterator();
+        while (embeddinggemma2_it.next()) |entry| {
+            std.heap.c_allocator.free(entry.key_ptr.*);
+            if (self.embeddinggemma2_cache_admission) |cache| cache.noteRelease(.backend, entry.value_ptr.bytes);
+        }
+        self.embeddinggemma2_linear_cache.deinit(std.heap.c_allocator);
+        self.embeddinggemma2_linear_cache = .empty;
+        self.embeddinggemma2_linear_cache_bytes = 0;
         for (0..decoder_runtime_layer_norm_slot_capacity) |slot| metal_runtime.releaseRawLayerNormSlot(self, slot);
         for (0..decoder_runtime_rms_norm_slot_capacity) |slot| metal_runtime.releaseRawRmsNormSlot(self, slot);
         metal_runtime.termite_metal_provider_destroy(self.raw_provider);

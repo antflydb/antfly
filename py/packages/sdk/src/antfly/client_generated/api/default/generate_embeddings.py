@@ -118,7 +118,9 @@ def sync_detailed(
     Args:
         accept (str | Unset):
         body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
-            multimodal content-part extension
+            multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task
+            prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized
+            vectors.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -159,7 +161,9 @@ def sync(
     Args:
         accept (str | Unset):
         body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
-            multimodal content-part extension
+            multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task
+            prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized
+            vectors.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -195,7 +199,9 @@ async def asyncio_detailed(
     Args:
         accept (str | Unset):
         body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
-            multimodal content-part extension
+            multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task
+            prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized
+            vectors.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -234,7 +240,9 @@ async def asyncio(
     Args:
         accept (str | Unset):
         body (InferenceEmbedRequest): OpenAI-compatible embedding request with inference
-            multimodal content-part extension
+            multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task
+            prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized
+            vectors.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

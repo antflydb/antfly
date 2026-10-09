@@ -846,10 +846,10 @@ class AntflyClient:
         return encoded
 
     def decide(self, request: InferenceDecideRequest | Mapping[str, Any]) -> InferenceDecideResponse:
-        """Answer named choice, ordinal score, and Boolean questions."""
+        """Answer named choice, multi-choice, score, and predicate questions."""
         body = request.to_dict() if isinstance(request, InferenceDecideRequest) else dict(request)
         with self._client.get_httpx_client().stream(
-            "POST", "/ai/v1/decide", json=body, headers={"Accept": "application/json"}
+            "POST", "/ai/v1/decisions", json=body, headers={"Accept": "application/json"}
         ) as response:
             if response.status_code < 200 or response.status_code >= 300:
                 _raise_inference_error(response)

@@ -26,6 +26,7 @@ SQL_OPERATIONS = [
     Path(f"api/data_operations/{operation}.py")
     for operation in ("execute_sql", "prepare_sql", "execute_prepared_sql", "close_prepared_sql")
 ]
+EMBED_REQUEST = Path("models/inference_embed_request.py")
 NDJSON_RESPONSE = "response_200 = cast(str, response.content)"
 
 
@@ -70,6 +71,33 @@ def fix_generated_client(root: Path) -> None:
                 raise RuntimeError(f"unexpected generated shape in {operation}: {original}")
             source = source.replace(original, replacement)
         updates[path] = source
+
+    # Primitive-array union branches must check their element types. Without
+    # this, list[str] swallows grouped/media objects, and to_dict leaves attrs
+    # objects unencoded. Keep this correction scoped to the embed contract.
+    path = root / EMBED_REQUEST
+    source = path.read_text(encoding="utf-8")
+    serializer = re.compile(r"        input_: .*?        model_identity = self.model_identity", re.S)
+    matches = list(serializer.finditer(source))
+    primitive = "                input_type_1 = cast(list[str], data)"
+    if len(matches) != 1 or matches[0].group().count("isinstance(self.input_, list)") != 3 or source.count(primitive) != 1 or source.count("            return cast(") != 1:
+        raise RuntimeError(f"unexpected generated shape in {EMBED_REQUEST}: embedding input union")
+    source = serializer.sub(
+        "        input_: list[dict[str, Any]] | list[str] | str\n"
+        "        if isinstance(self.input_, list):\n"
+        "            input_ = [item if isinstance(item, str) else item.to_dict() for item in self.input_]\n"
+        "        else:\n"
+        "            input_ = self.input_\n\n"
+        "        model_identity = self.model_identity", source,
+    )
+    source = source.replace(primitive,
+        "                if any(not isinstance(item, str) for item in data):\n"
+        "                    raise TypeError()\n" + primitive)
+    source = source.replace("            return cast(",
+        "            if not isinstance(data, str):\n"
+        "                raise TypeError(\"embedding input must be text, content parts or groups\")\n"
+        "            return cast(")
+    updates[path] = source
 
     for path, source in updates.items():
         path.write_text(source, encoding="utf-8")

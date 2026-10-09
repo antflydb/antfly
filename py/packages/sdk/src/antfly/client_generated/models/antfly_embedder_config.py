@@ -38,6 +38,8 @@ class AntflyEmbedderConfig:
         Attributes:
             provider (AntflyEmbedderConfigProvider):
             model (str): The embedding model name (maps to models/embedders/{name}/ directory). Example: bge-base-en-v1.5.
+            model_identity (str | Unset): Immutable EmbeddingGemma 2 asset and recipe identity returned by /embed. Pin this
+                when indexing; a changed checkpoint, tokenizer, or processor rejects embedding before vector publication.
             api_url (str | Unset): The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL
                 environment variable. Example: http://localhost:8082.
             retrieval (EmbeddingRetrievalConfig | Unset): Advanced retrieval-role overrides. Antfly assigns canonical task
@@ -49,6 +51,7 @@ class AntflyEmbedderConfig:
 
     provider: AntflyEmbedderConfigProvider
     model: str
+    model_identity: str | Unset = UNSET
     api_url: str | Unset = UNSET
     retrieval: EmbeddingRetrievalConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -57,6 +60,8 @@ class AntflyEmbedderConfig:
         provider = self.provider.value
 
         model = self.model
+
+        model_identity = self.model_identity
 
         api_url = self.api_url
 
@@ -72,6 +77,8 @@ class AntflyEmbedderConfig:
                 "model": model,
             }
         )
+        if model_identity is not UNSET:
+            field_dict["model_identity"] = model_identity
         if api_url is not UNSET:
             field_dict["api_url"] = api_url
         if retrieval is not UNSET:
@@ -88,6 +95,8 @@ class AntflyEmbedderConfig:
 
         model = d.pop("model")
 
+        model_identity = d.pop("model_identity", UNSET)
+
         api_url = d.pop("api_url", UNSET)
 
         _retrieval = d.pop("retrieval", UNSET)
@@ -100,6 +109,7 @@ class AntflyEmbedderConfig:
         antfly_embedder_config = cls(
             provider=provider,
             model=model,
+            model_identity=model_identity,
             api_url=api_url,
             retrieval=retrieval,
         )

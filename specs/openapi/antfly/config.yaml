@@ -14,9 +14,43 @@ components:
         provider:
           type: string
           enum: [antfly, jev, openai]
+        decision_method:
+          type: string
+          enum: [typed, embedding_similarity]
+          default: typed
+          description: Explicit result contract. embedding_similarity is available with Antfly EmbeddingGemma 2 choice and multi_choice questions; rejects score and predicate requests and returns raw cosine similarities.
         model:
           type: string
           description: Required for Antfly and OpenAI; Jev defaults to jev-latest.
+        model_identity:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: Pin the exact EmbeddingGemma 2 assets and recipe. Requires embedding_similarity.
+        embedding_options:
+          type: object
+          additionalProperties: false
+          description: EmbeddingGemma 2 geometry and acceptance defaults. Acceptance is serialized onto each question and can be overridden per question. Other models reject these options. Raw cosine similarities never represent probabilities.
+          properties:
+            calibration_id:
+              type: string
+              pattern: '^[A-Za-z0-9_-]{1,64}$'
+              description: Qualified fitted raw thresholds in model/calibrations/{id}.json. Bound to the exact asset identity, task, renderer, dimensions and category prototypes; mutually exclusive with manual thresholds. Does not produce probabilities.
+            task_type:
+              type: string
+              enum: [CLUSTERING, CLASSIFICATION]
+              default: CLUSTERING
+            dimensions:
+              type: integer
+              enum: [768, 512, 256, 128]
+              default: 768
+            min_similarity:
+              type: number
+              minimum: -1
+              maximum: 1
+            min_margin:
+              type: number
+              minimum: 0
+              maximum: 2
         url:
           type: string
           description: Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1 and appends /decisions.

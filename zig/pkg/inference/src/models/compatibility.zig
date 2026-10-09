@@ -279,6 +279,7 @@ fn assessWithRuntimeFacts(
                 "standalone CLAP graph conversion is not compatible; use ClipClap",
             ),
             else => {
+                if (man.embedding_style == .embedding_gemma2 and @import("../architectures/embedding_gemma2.zig").isModel(architecture)) return makeCompatible(architecture, "EmbeddingGemma 2 native CPU/Metal F32 runtime");
                 // Qwen3-Embedding checkpoints resolve to the qwen3 decoder
                 // arch (unknown to the encoder list below) but serve through
                 // the resident last-token embedding runtime.

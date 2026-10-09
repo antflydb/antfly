@@ -20,6 +20,8 @@ const envelope = @import("httpx").attachment_envelope;
 
 pub const Options = struct {
     model: []const u8 = "",
+    model_identity: ?[]const u8 = null,
+    dimensions: ?u32 = null,
     task_type: ?[]const u8 = null,
     instruction: ?[]const u8 = null,
 };
@@ -31,6 +33,8 @@ pub fn Request(comptime Part: type) type {
         attachment_count: usize,
         task_type: ?[]const u8,
         instruction: ?[]const u8,
+        model_identity: ?[]const u8 = null,
+        dimensions: ?u32 = null,
     };
 }
 
@@ -59,6 +63,8 @@ pub const Sizer = struct {
     pub fn init(comptime Part: type, options: Options) !Sizer {
         return .{ .base_bytes = try jsonSize(Request(Part){
             .model = options.model,
+            .model_identity = options.model_identity,
+            .dimensions = options.dimensions,
             .parts = &.{},
             .attachment_count = 0,
             .task_type = options.task_type,

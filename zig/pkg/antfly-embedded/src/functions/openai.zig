@@ -27,6 +27,7 @@ pub fn requestBody(a: std.mem.Allocator, model: []const u8, input: []const u8, q
         const instructions = spec.get("instructions").?.string;
         const kind = std.meta.stringToEnum(d.Kind, spec.get("type").?.string).?;
         out.* = switch (kind) {
+            .multi_choice => return error.UnsupportedDecisionKind,
             .noul => .{ .question_param_predicate = .{ .type = "predicate", .name = name, .instructions = instructions } },
             .choice => blk: {
                 const criteria = spec.get("criteria").?.object;
@@ -41,7 +42,7 @@ pub fn requestBody(a: std.mem.Allocator, model: []const u8, input: []const u8, q
                 const levels = try a.alloc(api.ScoreLevelParam, criteria.len);
                 for (criteria, levels, 0..) |description, *level, index| {
                     // Stable labels preserve ordinal identities even when descriptions repeat.
-                    level.* = .{ .label = try std.fmt.allocPrint(a, "{d}", .{index}), .description = description.string };
+                    level.* = .{ .label = if (spec.get("level_labels")) |labels| labels.array.items[index].string else try std.fmt.allocPrint(a, "{d}", .{index}), .description = description.string };
                 }
                 break :blk .{ .question_param_score = .{ .type = "score", .name = name, .instructions = instructions, .levels = levels } };
             },
@@ -96,7 +97,7 @@ pub fn response(a: std.mem.Allocator, questions: d.Json, source: d.Json) !d.Json
                 for (score.probabilities) |entry| {
                     if (entry.value < 0 or entry.value >= count) return error.InvalidDecisionOutput;
                     const key = try std.fmt.allocPrint(a, "{d}", .{entry.value});
-                    if (!std.mem.eql(u8, entry.label, key)) return error.InvalidDecisionOutput;
+                    if (!std.mem.eql(u8, entry.label, if (question.object.get("level_labels")) |labels| labels.array.items[@intCast(entry.value)].string else key)) return error.InvalidDecisionOutput;
                     try addProbability(a, &distribution, key, entry.probability);
                 }
                 try d.put(a, &answer, "score", .{ .float = score.score });
@@ -151,12 +152,12 @@ test "decision functions OpenAI generated wire types preserve instructions and o
     const source = try std.json.parseFromSliceLeaky(d.Json, a, test_response, .{});
     const result = try response(a, questions, source);
     try std.testing.expectEqualStrings("resolved-model", result.object.get("model").?.string);
-    const answers = result.object.get("answers").?.object;
-    try std.testing.expectApproxEqAbs(@as(f64, 0.95), answers.get("safe").?.object.get("noul").?.float, 1e-9);
+    const answers = result.object.get("answers").?.array.items;
+    try std.testing.expectApproxEqAbs(@as(f64, 0.95), answers[0].object.get("probability").?.float, 1e-9);
     // The shared normalizer derives values from complete distributions.
-    try std.testing.expectEqualStrings("read", answers.get("intent").?.object.get("choice").?.string);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.3), answers.get("risk").?.object.get("score").?.float, 1e-9);
-    try std.testing.expectEqualStrings("High", answers.get("risk").?.object.get("legend").?.object.get("1").?.string);
+    try std.testing.expectEqualStrings("read", answers[1].object.get("choice").?.string);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.3), answers[2].object.get("score").?.float, 1e-9);
+    try std.testing.expectEqualStrings("High", answers[2].object.get("probabilities").?.array.items[0].object.get("label").?.string);
     const usage = result.object.get("usage").?.object;
     try std.testing.expectEqual(@as(i64, 42), usage.get("input_tokens").?.integer);
     try std.testing.expectEqual(@as(i64, 4), usage.get("input_tokens_details").?.object.get("cached_tokens").?.integer);

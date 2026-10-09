@@ -123,6 +123,11 @@ def main():
         cls_token_id=2,
         sep_token_id=3,
         reference_compile=False,
+        # Released Laya encoder configs retain this legacy metadata, although
+        # ModernBERT uses RoPE. Exercise prepare_laya.py and native loading
+        # with the same declaration so strict GLiNER config checks cannot
+        # silently break prepared Laya checkpoints again.
+        position_embedding_type="absolute",
     )
     cfg._attn_implementation = "eager"
     cfg.save_pretrained(source / "encoder")

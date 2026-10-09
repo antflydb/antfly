@@ -15,6 +15,40 @@
 
 const std = @import("std");
 
+/// Lossless widening of checkpoint BF16 bits, including unaligned file views.
+/// Explicit vectors avoid scalar byte assembly in the hot weight-load path.
+pub fn widenBf16LittleEndian(bytes: []const u8, output: []f32) void {
+    std.debug.assert(bytes.len == output.len * 2);
+    var i: usize = 0;
+    if (comptime @import("builtin").cpu.arch.endian() == .little) {
+        const source: [*]align(1) const u16 = @ptrCast(bytes.ptr);
+        const shift: @Vector(8, u32) = @splat(16);
+        while (i + 8 <= output.len) : (i += 8) {
+            const narrow: @Vector(8, u16) = source[i..][0..8].*;
+            const wide: @Vector(8, u32) = narrow;
+            output[i..][0..8].* = @as(@Vector(8, f32), @bitCast(wide << shift));
+        }
+    }
+    while (i < output.len) : (i += 1) {
+        output[i] = @bitCast(@as(u32, std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little)) << 16);
+    }
+}
+
+test "embeddinggemma2 BF16 widening preserves every bit pattern unaligned views and tails" {
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, 65536 * 2 + 1);
+    defer a.free(bytes);
+    const output = try a.alloc(f32, 65536);
+    defer a.free(output);
+    for ([_]usize{ 0, 1 }) |offset| {
+        for (0..65536) |i| std.mem.writeInt(u16, bytes[offset + i * 2 ..][0..2], @intCast(i), .little);
+        for ([_]usize{ 0, 1, 7, 8, 9, 65535, 65536 }) |count| {
+            widenBf16LittleEndian(bytes[offset..][0 .. count * 2], output[0..count]);
+            for (output[0..count], 0..) |x, i| try std.testing.expectEqual(@as(u32, @intCast(i)) << 16, @as(u32, @bitCast(x)));
+        }
+    }
+}
+
 pub const DType = enum {
     f32,
     f16,

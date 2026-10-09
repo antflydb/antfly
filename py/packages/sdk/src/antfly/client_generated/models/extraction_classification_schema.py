@@ -33,12 +33,11 @@ class ExtractionClassificationSchema:
             server uses "This example is {}." when omitted. Version 2 GLiNER boundary extraction rejects an explicit
             hypothesis_template; use prompt/instruction and label_definitions for model conditioning.
         top_k (int | Unset): Maximum labels for ordinary single-label classification; the server uses 1 when omitted.
-            Version 2 constrained or ordinal selection uses min_labels/max_labels. Advanced set-selection options or cross-
-            task constraints on any classification in the collection reject every explicit top_k in that collection,
-            including 1. Omit top_k when using these options.
-        mode (ExtractionClassificationSchemaMode | Unset): Version 2 classification mode. Ordinal labels are ordered
-            from lowest to highest.
-            Typed-decision extractors support boolean with labels ["false", "true"] in that order.
+            Version 2 constrained classification uses min_labels/max_labels. Advanced set-selection options or cross-task
+            constraints on any classification in the collection reject every explicit top_k in that collection, including 1.
+            Omit top_k when using these options.
+        mode (ExtractionClassificationSchemaMode | Unset): Version 2 ordinary classification mode. Standalone ordinal
+            scores use the decision API.
             Each model rejects modes it does not support.
         label_definitions (ExtractionClassificationSchemaLabelDefinitions | Unset):
         min_labels (int | Unset):

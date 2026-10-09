@@ -251,6 +251,12 @@ pub fn executeWithTokenLimit(a: std.mem.Allocator, session: Session, tok: Tokeni
 /// intermediate across encoder layers even after ComputeBackend.free, which can
 /// exhaust the bounded serving heap on the released 28-layer CPU checkpoint.
 pub fn executeWithScratch(a: std.mem.Allocator, scratch: std.mem.Allocator, session: Session, tok: Tokenizer, cfg: model.Config, tasks: []const Task, control: ?Control, max_input_tokens: ?usize) !Result {
+    return executeWithScratchLimit(a, scratch, session, tok, cfg, tasks, control, max_input_tokens, null);
+}
+
+/// Bound each unpacked forward's workspace when its scratch allocator has a tighter
+/// ceiling than the session's process-wide admission limits.
+pub fn executeWithScratchLimit(a: std.mem.Allocator, scratch: std.mem.Allocator, session: Session, tok: Tokenizer, cfg: model.Config, tasks: []const Task, control: ?Control, max_input_tokens: ?usize, max_workspace_bytes: ?usize) !Result {
     if (tasks.len == 0 or tasks.len > 512) return error.ExtractionRequestLimitExceeded;
     if (cfg.packing.enabled()) return executePacked(a, scratch, session, tok, cfg, tasks, control, max_input_tokens);
     var permit = try session.admitHostPreprocess(tasks.len * cfg.max_len * 64);
@@ -306,7 +312,7 @@ pub fn executeWithScratch(a: std.mem.Allocator, scratch: std.mem.Allocator, sess
             while (end < tasks.len and lengthBucket(execution_sequences[end]) == lengthBucket(execution_sequences[finished])) : (end += 1) {}
         }
         const remaining = execution_sequences[finished..end];
-        var admitted = try admitChunk(session, remaining, retained);
+        var admitted = try admitChunk(session, remaining, retained, max_workspace_bytes);
         defer admitted.permit.deinit();
         try executeChunk(a, scratch, &admitted.permit, cfg, execution_tasks[finished..][0..admitted.count], remaining[0..admitted.count], tok.specialTokens().pad_id, decisions[finished..][0..admitted.count], control);
         execution_chunks += 1;
@@ -587,15 +593,15 @@ fn bucketOrder(a: std.mem.Allocator, sequences: []const Sequence) !?[]usize {
 const ChunkShape = struct { sequence: usize = 0, options: usize = 0 };
 const AdmittedChunk = struct { count: usize, permit: @import("../backends/session.zig").RunPermit };
 
-fn admitChunk(session: Session, sequences: []const Sequence, retained: usize) !AdmittedChunk {
-    var count = if (session.backend() == .cuda) try selectChunk(session, sequences, retained) else sequences.len;
+fn admitChunk(session: Session, sequences: []const Sequence, retained: usize, max_workspace_bytes: ?usize) !AdmittedChunk {
+    var count = if (session.backend() == .cuda or max_workspace_bytes != null) try selectChunk(session, sequences, retained, max_workspace_bytes) else sequences.len;
     while (true) {
         const request = try chunkPlan(session, sequences[0..count], retained);
         const permit = session.admit(request) catch |err| {
             // fitsRun checks permanent limits. HTTP preprocessing and other
             // live leases can leave less room at admission time. Both capacity
             // errors are safe to retry here, before any forward has started.
-            if ((err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable) or count == 1 or session.backend() != .cuda) return err;
+            if ((err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable) or count == 1 or (session.backend() != .cuda and max_workspace_bytes == null)) return err;
             count = (count + 1) / 2;
             continue;
         };
@@ -630,10 +636,12 @@ fn chunkPlan(session: Session, sequences: []const Sequence, retained: usize) !@i
     return request;
 }
 
-fn selectChunk(session: Session, sequences: []const Sequence, retained: usize) !usize {
+fn selectChunk(session: Session, sequences: []const Sequence, retained: usize, max_workspace_bytes: ?usize) !usize {
     var count: usize = 0;
     while (count < @min(128, sequences.len)) {
-        if (!try session.fitsRun(try chunkPlan(session, sequences[0 .. count + 1], retained))) break;
+        const request = try chunkPlan(session, sequences[0 .. count + 1], retained);
+        if (max_workspace_bytes) |limit| if (request.workspace_bytes > limit) break;
+        if (!try session.fitsRun(request)) break;
         count += 1;
     }
     if (count == 0) return error.ResourceLimitExceeded;
@@ -755,29 +763,29 @@ test "laya CUDA chunk planning uses padded shape retained memory and 128 task ce
     var ids = [_]i64{ 1, 2, 3, 4, 5, 6, 7, 8 };
     var markers = [_]i64{ 0, 1 };
     var sequences = @as([512]Sequence, @splat(.{ .ids = ids[0..2], .markers = &markers }));
-    try std.testing.expectEqual(@as(usize, 128), try selectChunk(session, &sequences, 1024));
+    try std.testing.expectEqual(@as(usize, 128), try selectChunk(session, &sequences, 1024, null));
     session.run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = 1024 * 1024, .backend_limit_bytes = 2 * 2 * 4096 }, .static_workspace_bytes = 0, .check_live_memory = false };
     sequences[2].ids = &ids;
-    try std.testing.expectEqual(@as(usize, 2), try selectChunk(session, &sequences, 1024));
+    try std.testing.expectEqual(@as(usize, 2), try selectChunk(session, &sequences, 1024, null));
     const plan = try chunkPlan(session, sequences[0..3], 1024);
     try std.testing.expectEqual(@as(usize, 8), plan.sequence);
     try std.testing.expectEqual(@as(usize, 1024), plan.pre_admitted_host_bytes);
     session.run_admission.?.limits.backend_limit_bytes = 4096;
-    try std.testing.expectError(error.ResourceLimitExceeded, selectChunk(session, &sequences, 1024));
+    try std.testing.expectError(error.ResourceLimitExceeded, selectChunk(session, &sequences, 1024, null));
     session.run_admission.?.limits.backend_limit_bytes = 1024 * 1024;
     session.run_admission.?.limits.host_limit_bytes = 1023;
-    try std.testing.expectError(error.ResourceLimitExceeded, selectChunk(session, &sequences, 1024));
+    try std.testing.expectError(error.ResourceLimitExceeded, selectChunk(session, &sequences, 1024, null));
 
     // Permanent limits fit four rows, but an outer HTTP scratch lease leaves
     // room for only two. Admission must shrink before executing any model work.
     session.run_admission.?.limits.host_limit_bytes = 1024 * 1024;
     session.run_admission.?.limits.scratch_limit_bytes = 40_000;
     sequences[2].ids = ids[0..2];
-    try std.testing.expectEqual(@as(usize, 4), try selectChunk(session, sequences[0..4], 0));
+    try std.testing.expectEqual(@as(usize, 4), try selectChunk(session, sequences[0..4], 0, null));
     {
         var outer = try session.admitHostPreprocess(18_000);
         defer outer.deinit();
-        var admitted = try admitChunk(session, sequences[0..4], 0);
+        var admitted = try admitChunk(session, sequences[0..4], 0, null);
         defer admitted.permit.deinit();
         try std.testing.expectEqual(@as(usize, 2), admitted.count);
     }
@@ -785,9 +793,40 @@ test "laya CUDA chunk planning uses padded shape retained memory and 128 task ce
     {
         var outer = try session.admitHostPreprocess(39_500);
         defer outer.deinit();
-        try std.testing.expectError(error.ResourceTemporarilyUnavailable, admitChunk(session, sequences[0..4], 0));
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, admitChunk(session, sequences[0..4], 0, null));
     }
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "laya native chunk planning respects a bounded request workspace" {
+    const sessions = @import("../backends/session.zig");
+    const TensorInfo = @import("../backends/tensor.zig").TensorInfo;
+    const Probe = struct {
+        fn backend(_: *anyopaque) @import("../backends/backends.zig").BackendType {
+            return .native;
+        }
+        fn info(_: *anyopaque) []const TensorInfo {
+            return &.{.{ .name = "logits", .dtype = .f32, .shape = &.{ -1, 2 } }};
+        }
+        fn geometry(_: *anyopaque, inputs: sessions.ShapeInputs, batch: usize) !?sessions.RunGeometry {
+            const sequence: usize = @intCast(inputs.get(0).shape[1]);
+            return .{ .sequence = sequence, .output_bytes = batch * 16, .workspace_bytes = batch * sequence * 4096 };
+        }
+    };
+    var marker: u8 = 0;
+    const session = Session{ .ptr = &marker, .vtable = &.{ .run = undefined, .inputInfo = undefined, .outputInfo = Probe.info, .backend = Probe.backend, .close = undefined, .runGeometry = Probe.geometry } };
+    var ids = [_]i64{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var markers = [_]i64{ 0, 1 };
+    var sequences = @as([192]Sequence, @splat(.{ .ids = ids[0..2], .markers = &markers }));
+    {
+        var admitted = try admitChunk(session, &sequences, 1024, 32 * 1024);
+        defer admitted.permit.deinit();
+        try std.testing.expectEqual(@as(usize, 4), admitted.count);
+    }
+    // Padding to a longer question changes the admitted batch before execution.
+    sequences[2].ids = &ids;
+    try std.testing.expectEqual(@as(usize, 2), try selectChunk(session, &sequences, 1024, 32 * 1024));
+    try std.testing.expectError(error.ResourceLimitExceeded, admitChunk(session, &sequences, 1024, 4096));
 }
 
 test "laya decoding rejects nonfinite logits without leaking probabilities" {

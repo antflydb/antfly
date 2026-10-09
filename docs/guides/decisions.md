@@ -1,196 +1,114 @@
-# Typed decisions
+# Decisions
 
-Use decisions to classify input, rank it against an ordered rubric, or estimate
-whether a statement is true. The contract is independent of the checkpoint:
-applications supply named questions and consume named answers. Select a model
-that advertises `typed_decisions` and the `decide` task in model discovery.
+Standalone decisions use `POST /decisions` (`/ai/v1/decisions` on the standalone
+server). Named question and answer arrays, `input`, `choices`, `levels` and
+predicate `probability` follow the [OpenAI Decisions conventions](https://developers.openai.com/api/docs/guides/decisions).
+Antfly adds embedding similarity answers, multi-choice selection and text
+batches. This is a text-only subset: choice values are strings and every
+question needs a unique name. See the [decision schema](../../specs/openapi/ai/decision.yaml).
 
-The same `DecideRequest` and `DecideResponse` JSON contracts from
-[`specs/openapi/inference/api.yaml`](../../specs/openapi/inference/api.yaml)
-are available through HTTP and embedded inference. SQL functions use the same
-question and answer semantics through a named decision provider.
+`/extract` retains entities, relations, attributes, structured records and
+ordinary classification. Standalone Laya, OpenDecider and EmbeddingGemma
+workflows use `/decisions`. The unreleased extraction decision output and
+Boolean and ordinal decision modes have been removed.
 
-| Interface | Entry point | Model selection |
-| --- | --- | --- |
-| Standalone HTTP | `POST /ai/v1/decide` | Request `model` |
-| Inference service HTTP | `POST /decide` | Request `model` |
-| C embedded inference | `antfly_inference_decide_json` | Request `model` |
-| Rust embedded inference | `Inference::decide` | Request `model` |
-| Go embedded inference | `Inference.Decide` | Request `model` |
-| Python embedded inference | `Inference.decide` | Request `model` |
-| TypeScript embedded inference | `Inference.decide` / `decideRaw` | Request `model` |
-| Python HTTP SDK | `AntflyClient.decide` | Request `model` |
-| TypeScript HTTP SDK | `InferenceClient.decide` | Request `model` |
-| SQL | `ai_decide`, `ai_choice`, `ai_score`, `ai_probability` | Named `DeciderConfig` |
-
-## Request and answer semantics
-
-A request contains a model, a nonempty text `state`, and a map of questions.
-Each question needs a `type` and `instructions`.
-
-| Type | Criteria | Answer |
-| --- | --- | --- |
-| `choice` | Object mapping stable option IDs to descriptions | `choice` option ID and full `probabilities` by ID |
-| `score` | Array of descriptions ordered from lowest to highest | Expected zero-based `score`, `probabilities` by numeric string index, and `legend` |
-| `noul` | Omit criteria | `noul`, the probability that the statement is true, from 0 to 1 |
-
-Choice IDs are application values: changing a description does not require
-changing the ID. A score is the probability-weighted mean of the level indices,
-so it can be fractional. For three levels its range is 0–2. Boolean `noul` is a
-probability, not a thresholded Boolean. The application chooses its threshold.
+## Questions and answers
 
 ```json
 {
   "model": "decision-model",
-  "state": "Please refund my duplicate charge before tomorrow.",
-  "questions": {
-    "route": {
-      "type": "choice",
-      "instructions": "Which team should handle this request?",
-      "criteria": {
-        "billing": "Payments, charges, and refunds",
-        "support": "Product usage and troubleshooting"
-      }
-    },
-    "urgency": {
-      "type": "score",
-      "instructions": "How urgent is this request?",
-      "criteria": ["Routine", "Time sensitive", "Immediate"]
-    },
-    "refund": {
-      "type": "noul",
-      "instructions": "The request asks for a refund."
-    }
-  }
+  "input": "Please refund the duplicate charge before tomorrow.",
+  "questions": [
+    {"name": "route", "type": "choice", "instructions": "Which team?", "choices": [{"value": "billing", "description": "Charges and refunds"}, {"value": "support", "description": "Product troubleshooting"}]},
+    {"name": "urgency", "type": "score", "instructions": "How urgent?", "levels": [{"label": "routine"}, {"label": "soon"}, {"label": "immediate"}]},
+    {"name": "refund", "type": "predicate", "instructions": "The input requests a refund."}
+  ]
 }
 ```
 
-Responses contain `model`, an `answers` map with the same question names, and
-`usage.input_tokens` / `usage.output_tokens`. For example, the answer portion
-could be:
+Trained answers include `name`, `type`, `decision_method: "typed"` and:
 
-```json
-{
-  "route": {"type": "choice", "choice": "billing", "probabilities": {"billing": 0.9, "support": 0.1}},
-  "urgency": {"type": "score", "score": 1.1, "probabilities": {"0": 0.1, "1": 0.7, "2": 0.2}, "legend": {"0": "Routine", "1": "Time sensitive", "2": "Immediate"}},
-  "refund": {"type": "noul", "noul": 0.95}
-}
-```
+| Type | Fields |
+| --- | --- |
+| `choice` | `choice`, `probabilities: [{value, probability}]`, `confidence`, `confidence_method` |
+| `score` | `score`, `probabilities: [{value, label, probability}]`, `confidence`, `confidence_method` |
+| `predicate` | `probability`, optional confidence diagnostics |
 
-There can be up to 64 questions and 2–64 options or score levels per question.
-The complete request JSON is limited to 1 MiB. Model token budgets and executor
-limits can be smaller; oversized inputs fail instead of being silently truncated. A model
-must explicitly support typed decisions. An arbitrary extractor or generator
-is not interchangeable with a decider.
+Scores are expected zero-based ordinal indices and can be fractional. A
+predicate estimates whether the statement is true. Confidence is a model
+diagnostic, not the probability that a chosen label is correct. Models with
+an action head retain `act_probability`. Applications apply acceptance policy
+and validate arguments before executing an action.
 
-## HTTP and command hooks
+A single response contains `model`, an `answers` array in question order, and
+aggregate token `usage`. For batches, replace `input` with
+`inputs: [{"id": "first", "input": "..."}, {"input": "..."}]`. The response uses
+`data: [{input_index, id?, answers}]` instead of top-level `answers`. Questions
+are shared; IDs and order are preserved. Limits: 128 inputs, 64 questions,
+2–64 choices or levels, 1 MiB per input and 16 MiB per request. Model and
+executor limits can be smaller.
 
-Save the request as `decision.json`, using an installed model's ID, and start
-`antfly standalone --models-dir ./models`. Then call:
+## Embedding similarity and multi-choice
+
+[EmbeddingGemma 2](embeddinggemma2.md) advertises `embedding_similarity` and
+supports `choice` and `multi_choice`. Answers include
+`decision_method: "embedding_similarity"`, `similarity_metric: "cosine"` and
+`similarities: [{value, similarity}]`. Raw cosine values range from -1 to 1;
+these answers have no probability or confidence fields. Cosine is fixed because
+thresholds, margins and calibration depend on its units. Another metric would
+require a separately qualified contract.
+
+Request-wide `embedding_options` supplies only geometry defaults: `task_type`
+(`CLUSTERING` or `CLASSIFICATION`) and `dimensions` (768, 512, 256 or 128).
+Each question has its own acceptance `embedding_options`: `min_similarity`,
+`min_margin` or `calibration_id`. The embedding endpoint also accepts
+`task_type`; decision routing restricts the supported prompt profiles.
+
+`calibration_id` is a public identifier for a qualified artifact at
+`<model-dir>/calibrations/<id>.json`. The runtime verifies model identity,
+prompt profile, dimensions, renderer, mode and that question's prototypes.
+Calibration is mutually exclusive with manual thresholds. See the model guide
+for fitting; thresholds must be evaluated on application data.
+
+For single choice, `min_margin` is the top-two cosine gap. Ties abstain:
+`choice` is null and `status` is `abstained`. Multi-choice requires
+`similarity_thresholds` (one cosine threshold or a complete value-to-threshold
+map), unless calibration supplies them. Its `min_margin` is the nearest absolute
+distance to any label's threshold. The answer includes effective thresholds and
+`choices`: `selected` means a nonempty accepted set, `empty` is a valid empty
+set, and `abstained` means the boundary margin failed. These states are distinct.
+
+## HTTP, CLI and bindings
 
 ```sh
-curl --fail-with-body http://127.0.0.1:8080/ai/v1/decide \
-  -H 'Content-Type: application/json' \
-  --data-binary @decision.json
+curl --fail-with-body http://127.0.0.1:8080/ai/v1/decisions \
+  -H 'Content-Type: application/json' --data-binary @decision.json
+antfly-inference decisions ./models --request decision.json --backend metal
 ```
 
-For `antfly inference run`, use its inference listener (default
-`http://127.0.0.1:8090/decide`). A command invoked once per tool call can reuse
-this HTTP service and its loaded models. Consume the named answers, then apply
-application policy and validate arguments before executing an action. A
-decision does not itself execute tools or supply free-form arguments.
-
-The Python and TypeScript HTTP SDKs accept the same request:
+The inference listener serves `/decisions` directly (default port 8090).
+Existing binding methods consume the same JSON: C `antfly_inference_decide_json`,
+Rust `Inference::decide`, Go `Inference.Decide`, Python `Inference.decide`,
+TypeScript `Inference.decide` / `decideRaw`. HTTP methods remain Python
+`AntflyClient.decide` and TypeScript `InferenceClient.decide`.
 
 ```python
-import json
-from antfly import AntflyClient
-
-with open("decision.json") as file:
-    request = json.load(file)
-response = AntflyClient("http://127.0.0.1:8080").decide(request)
-print(response.answers["route"].choice)
+response = client.decide(request)
+route = next(answer for answer in response.answers if answer.name == "route")
+print(route.choice)
 ```
 
 ```typescript
-import { readFileSync } from "node:fs";
-import { InferenceClient } from "@antfly/sdk";
-
-const request = JSON.parse(readFileSync("decision.json", "utf8"));
-const client = new InferenceClient({ baseUrl: "http://127.0.0.1:8080" });
 const response = await client.decide(request);
-console.log(response.answers.route.choice);
+const route = response.answers?.find(answer => answer.name === "route");
+if (route?.type === "choice") console.log(route.choice);
 ```
 
-## Embedded inference
-
-Open one inference handle and reuse it. No database or HTTP server is required.
-Models load on first use and remain cached for the handle's lifetime.
-
-```c
-antfly_inference *inference = NULL;
-antfly_error_code code = antfly_inference_open(NULL, &inference);
-if (code == ANTFLY_OK) {
-    antfly_buffer response = {0};
-    /* request_bytes contains a DecideRequest JSON object. */
-    code = antfly_inference_decide_json(inference, request_bytes, &response);
-    /* Inspect response on success or failure, then release it either way. */
-    antfly_buffer_free(&response);
-    antfly_inference_close(inference);
-}
-```
-
-```rust,no_run
-use antfly_embedded::{Inference, InferenceOptions};
-
-fn decide(request_json: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let inference = Inference::open(&InferenceOptions::new().models_dir("./models"))?;
-    let response = inference.decide(request_json)?;
-    inference.close()?;
-    Ok(response)
-}
-```
-
-```python
-import json
-from antfly_embedded import Inference
-
-with open("decision.json") as file:
-    request = json.load(file)
-with Inference.open(models_dir="./models") as inference:
-    response = inference.decide(request)
-    print(response["answers"]["route"]["choice"])
-    # Use raw=True to receive JSON bytes.
-```
-
-```typescript
-import { readFileSync } from "node:fs";
-import { Inference } from "@antfly/embedded";
-
-const inference = await Inference.open({ modelsDir: "./models" });
-try {
-  // decideRaw returns JSON bytes as a Buffer; decide returns parsed JSON.
-  const response = await inference.decideRaw(readFileSync("decision.json"));
-  console.log(JSON.parse(response.toString("utf8")).answers.route.choice);
-} finally {
-  await inference.close();
-}
-```
-
-Python embedded calls raise the matching exception class on failure. TypeScript
-embedded calls throw `AntflyError` with the parsed runtime error in `.body`.
-The HTTP SDKs preserve inference errors and capacity retry metadata.
-
-The C call returns the runtime's JSON error body even when its return code is
-an error; always free the output buffer. Rust exposes the code and body through
-`InferenceError`. See [the C API contract](../../zig/CAPI.md) for resource budgets,
-timeouts, handle lifetime, and thread requirements. Go exposes the corresponding
-error through `InferenceError`. Install models before calling; these methods do
-not download them on demand.
+Reuse handles for cached execution. Bindings preserve error bodies and retry
+metadata. Free C output buffers on success and failure and close handles; see
+[C API ownership](../../zig/CAPI.md).
 
 ## SQL providers
-
-Configure a named decider in the server configuration, for example:
 
 ```yaml
 deciders:
@@ -202,39 +120,32 @@ deciders:
     batch_size: 32
 ```
 
-With an embedded Antfly inference runtime, omitting `url` uses that runtime.
-For a separate inference service, set `url: http://127.0.0.1:8090`; for standalone
-HTTP set `url: http://127.0.0.1:8080/ai/v1`. The provider appends `/decide`.
-`DeciderConfig` also supports `jev`, provider credentials, and rate limits;
-see [the configuration schema](../../specs/openapi/antfly/config.yaml).
-
-SQL functions reference the configured **name**, not an inline configuration:
+SQL references the configured name. Omitting `url` uses linked inference when
+available. For HTTP use `http://127.0.0.1:8090`, or the standalone base including
+`/ai/v1`; the provider appends `/decisions`. OpenAI uses `/decisions`; Jev's
+private adapter retains its upstream wire format. Responses normalize to the
+same public answer arrays.
 
 ```sql
-SELECT ai_decide(
-  'Please refund my duplicate charge.',
-  '{"refund":{"type":"noul","instructions":"The request asks for a refund."}}'::jsonb,
-  'triage'
-);
-
-SELECT ai_choice('Duplicate charge', 'Which team handles this?',
-  '{"billing":"Payments and refunds","support":"Product troubleshooting"}'::jsonb,
+SELECT ai_decide('Please refund my charge.',
+  '[{"name":"refund","type":"predicate","instructions":"The input requests a refund."}]'::jsonb,
   'triage');
-
-SELECT ai_score('Please respond before tomorrow.', 'How urgent is this?',
-  '["Routine","Time sensitive","Immediate"]'::jsonb, 'triage');
-
-SELECT ai_probability('Please refund my charge.',
-  'The request asks for a refund.', 'triage');
+SELECT ai_choice('Duplicate charge', 'Which team?',
+  '{"billing":"Payments and refunds","support":"Product troubleshooting"}'::jsonb, 'triage');
+SELECT ai_score('Respond before tomorrow.', 'How urgent?',
+  '["Routine","Soon","Immediate"]'::jsonb, 'triage');
+SELECT ai_probability('Please refund my charge.', 'The input requests a refund.', 'triage');
 ```
 
-`ai_decide` returns the complete response; the convenience functions return the
-selected option ID, expected score, or true probability. Embedded SQL execution
-requires a decision provider supplied by the host. Opening a C or Rust database
-handle alone does not configure named deciders; use the standalone inference
-handle for direct decisions without that SQL setup.
+`ai_decide` accepts named question arrays and returns the full response.
+Convenience functions return a choice, expected score or true probability.
+Embedding deciders use `decision_method: embedding_similarity`; trusted config
+can supply geometry and acceptance defaults. Serialization moves acceptance
+onto each question; question policies override those defaults. `ai_choice`
+returns SQL NULL on abstention, and `ai_decide` supports multi-choice. Scores and
+predicates require trained deciders. A database handle alone does not configure
+SQL providers.
 
-Benchmark accuracy and calibration on your application inputs before selecting
-models or thresholds. Keep policy, argument validation, and action execution in
-the application. Model-specific preparation belongs in guides such as
-[Laya](laya.md); the decision request remains the same across supported models.
+Validate quality, thresholds and resource limits on your workload before
+deployment. Preparation and limits are in [Laya](laya.md) and
+[EmbeddingGemma 2](embeddinggemma2.md).

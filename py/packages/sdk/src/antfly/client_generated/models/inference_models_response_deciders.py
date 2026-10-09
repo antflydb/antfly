@@ -15,7 +15,7 @@ T = TypeVar("T", bound="InferenceModelsResponseDeciders")
 
 @_attrs_define
 class InferenceModelsResponseDeciders:
-    """Models declaring the decide task and typed_decisions capability"""
+    """Models declaring the decide task and either typed_decisions or embedding_similarity capability"""
 
     additional_properties: dict[str, InferenceModelInfo] = _attrs_field(init=False, factory=dict)
 
