@@ -598,9 +598,20 @@ test "system catalog relation namespace transaction source epoch fences schema c
             try page.apply(&txn, current);
             try txn.commit();
         }
-        var verified = try r.Page.prepareSource(a, page.after, epoch, &rows);
+        var verified = try store.prepareRelationReconciliationPage(a, page.after);
         defer verified.deinit();
+        const PreparationFault = struct {
+            fn run(alloc: std.mem.Allocator, owner: *RaftApplyStore, state: r.State) !void {
+                var prepared = try owner.prepareRelationReconciliationPage(alloc, state);
+                defer prepared.deinit();
+            }
+        };
+        // Numbered allocation faults need deterministic arena growth; whether
+        // the backing heap can resize in place depends on its current layout.
+        var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(no_resize.allocator(), PreparationFault.run, .{ &store, page.after });
         try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = table.table_id, .name = "renamed", .schema_json = table.schema_json } });
+        try std.testing.expectError(error.CatalogGenerationChanged, store.prepareRelationReconciliationPage(a, page.after));
         {
             var txn = try store.store.beginWriteTxn();
             defer txn.abort();
@@ -1078,46 +1089,6 @@ test "system catalog relation namespace transaction reconciliation is isolated a
     const epoch: r.Epoch = .{ .incarnation = @splat(1), .revision = 17 };
     const initial = try r.State.init(group, @splat(3), epoch);
     const T = struct {
-        const Source = struct {
-            txn: *docstore.DocStore.Txn,
-            cursor: docstore.DocStore.Txn.CursorAdapter,
-            prefix: []const u8,
-            started: bool = false,
-            cut: ?RaftApplyStore.RelationSnapshot = null,
-            fn deinit(self: *@This()) void {
-                if (self.cut) |*cut| cut.deinit();
-                self.cursor.close();
-            }
-            pub fn nextAfter(self: *@This(), after: []const u8) !?r.SourceRow {
-                if (self.cut) |*cut| cut.deinit();
-                self.cut = null;
-                const row = (if (!self.started) blk: {
-                    self.started = true;
-                    const found = (try self.cursor.seekAtOrAfter(if (after.len == 0) self.prefix else after)) orelse return null;
-                    break :blk if (std.mem.eql(u8, found.key, after)) try self.cursor.next() else found;
-                } else try self.cursor.next()) orelse return null;
-                if (!std.mem.startsWith(u8, row.key, self.prefix)) return null;
-                const id = (try RaftApplyStore.capturedRelationTableId(row.key, group)) orelse return error.InvalidCatalogRecord;
-                self.cut = try RaftApplyStore.relationSnapshot(std.testing.allocator, self.txn, group, id, true);
-                return .{ .key = row.key, .table_id = id, .claims = self.cut.?.claims() };
-            }
-        };
-        const Candidates = struct {
-            cursor: docstore.DocStore.Txn.CursorAdapter,
-            prefix: []const u8,
-            expected_start: ?[]const u8 = null,
-            started: bool = false,
-            pub fn nextAfter(self: *@This(), after: []const u8) !?r.CandidateRow {
-                const row = (if (!self.started) blk: {
-                    if (self.expected_start) |expected| try std.testing.expectEqualSlices(u8, expected, after);
-                    self.started = true;
-                    const found = (try self.cursor.seekAtOrAfter(if (after.len == 0) self.prefix else after)) orelse return null;
-                    break :blk if (std.mem.eql(u8, found.key, after)) try self.cursor.next() else found;
-                } else try self.cursor.next()) orelse return null;
-                if (!std.mem.startsWith(u8, row.key, self.prefix)) return null;
-                return .{ .key = row.key, .value = row.value };
-            }
-        };
         const Fault = struct {
             txn: *docstore.DocStore.Txn,
             job_key: []const u8,
@@ -1164,9 +1135,7 @@ test "system catalog relation namespace transaction reconciliation is isolated a
             defer read.abort();
             var buf: [r.max_cursor_bytes]u8 = undefined;
             const retirement = try r.Retirement.decode(try read.get(try r.retirementKey(&buf, r.Generation.of(state))));
-            var candidates: Candidates = .{ .cursor = try read.openCursor(), .prefix = try r.candidatePrefix(&buf, state), .expected_start = retirement.cursor() };
-            defer candidates.cursor.close();
-            return r.GarbagePage.prepare(std.testing.allocator, retirement, &candidates);
+            return store.prepareRelationGarbagePage(std.testing.allocator, retirement);
         }
     };
     var tmp = std.testing.tmpDir(.{});
@@ -1178,6 +1147,7 @@ test "system catalog relation namespace transaction reconciliation is isolated a
     {
         var store = try RaftApplyStore.init(a, .{ .root_dir = root });
         defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
         const tables = try a.alloc(metadata.TableRecord, r.max_tables_per_page + 1);
         defer a.free(tables);
         var count: usize = 0;
@@ -1189,9 +1159,11 @@ test "system catalog relation namespace transaction reconciliation is isolated a
         tables[0].schema_json =
             \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_key","keys":[{"column":"email"}]}]}
         ;
-        try store.replaceStandaloneCatalog(group, 0, tables, &.{}, "{}");
+        try store.replaceStandaloneCatalog(group, try store.standaloneRevision(), tables, &.{}, "{}");
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
+        // Internal fixture adoption; production adoption is capability gated.
+        for (0..epoch.revision) |_| try r.advanceSource(&txn, group);
         try r.start(&txn, &initial, epoch, null);
         try txn.commit();
     }
@@ -1292,16 +1264,24 @@ test "system catalog relation namespace transaction reconciliation is isolated a
             }
             break;
         }
-        var prefix_buf: [r.max_cursor_bytes]u8 = undefined;
-        var page = if (state.phase == .verifying_candidate) blk: {
-            var source: T.Candidates = .{ .cursor = try read.openCursor(), .prefix = try r.candidatePrefix(&prefix_buf, &state) };
-            defer source.cursor.close();
-            break :blk try r.Page.prepareCandidate(a, state, epoch, &source);
-        } else blk: {
-            var source: T.Source = .{ .txn = &read, .cursor = try read.openCursor(), .prefix = try tablePrefixForGroup(&prefix_buf, group) };
+        if (pages == 0) {
+            var prefix_buf: [r.max_cursor_bytes]u8 = undefined;
+            var source: RaftApplyStore.RelationTableSource = .{
+                .a = a,
+                .txn = &read,
+                .group_id = group,
+                .raw = .{ .cursor = try read.openCursor(), .prefix = try tablePrefixForGroup(&prefix_buf, group) },
+            };
             defer source.deinit();
-            break :blk try r.Page.prepareSource(a, state, epoch, &source);
-        };
+            const first = try a.dupe(u8, (try source.nextAfter("")).?.key);
+            defer a.free(first);
+            const second = try a.dupe(u8, (try source.nextAfter(first)).?.key);
+            defer a.free(second);
+            // Byte/claim-budget lookahead can rewind without losing a row.
+            try std.testing.expectEqualStrings(first, (try source.nextAfter("")).?.key);
+            try std.testing.expectEqualStrings(second, (try source.nextAfter(first)).?.key);
+        }
+        var page = try store.prepareRelationReconciliationPage(a, state);
         defer page.deinit();
         if (pages == 0) {
             var txn = try store.store.beginWriteTxn();
@@ -1357,6 +1337,7 @@ test "system catalog relation namespace transaction reconciliation is isolated a
             defer txn.abort();
             try std.testing.expectError(error.CatalogGenerationChanged, page.apply(&txn, epoch));
         }
+        try std.testing.expectError(error.CatalogGenerationChanged, store.prepareRelationReconciliationPage(a, state));
         pages += 1;
         try std.testing.expect(pages <= 6);
     }
@@ -15451,6 +15432,95 @@ pub const RaftApplyStore = struct {
             },
         }
     }
+    /// Owns the prepared page independently of the pinned read transaction.
+    /// Call before acquiring apply_mutex: source decoding and allocation must
+    /// not extend the serialized metadata commit section. Apply still checks
+    /// this exact job cut and the actual source epoch in its write transaction.
+    pub fn prepareRelationReconciliationPage(self: *RaftApplyStore, a: std.mem.Allocator, expected: relation_reconciliation.State) !relation_reconciliation.Page {
+        var read = try self.store.beginReadTxn();
+        defer read.abort();
+        var buf: [relation_reconciliation.max_cursor_bytes]u8 = undefined;
+        const bytes = (try stagingGet(&read, try relation_reconciliation.jobKey(&buf, expected.group_id))) orelse return error.CatalogGenerationChanged;
+        if (!std.mem.eql(u8, bytes, &(try expected.encode()))) return error.CatalogGenerationChanged;
+        const epoch = try relationSourceEpochTxn(&read, expected.group_id);
+        if (expected.phase == .ready) return error.InvalidCatalogRecord;
+        if (expected.phase == .verifying_candidate) {
+            var source: RelationCursor = .{ .cursor = try read.openCursor(), .prefix = try relation_reconciliation.candidatePrefix(&buf, &expected) };
+            defer source.cursor.close();
+            return relation_reconciliation.Page.prepareCandidate(a, expected, epoch, &source);
+        }
+        var source: RelationTableSource = .{
+            .a = a,
+            .txn = &read,
+            .group_id = expected.group_id,
+            .raw = .{ .cursor = try read.openCursor(), .prefix = try tablePrefixForGroup(&buf, expected.group_id) },
+        };
+        defer source.deinit();
+        return relation_reconciliation.Page.prepareSource(a, expected, epoch, &source);
+    }
+
+    /// GC uses the same exclusive lexical cursor as source/candidate pages;
+    /// it never materializes the complete retired generation or restarts at
+    /// its tombstoned prefix. The write-side root/high-water/CAS fences remain
+    /// authoritative even if publication changes after this read snapshot.
+    pub fn prepareRelationGarbagePage(self: *RaftApplyStore, a: std.mem.Allocator, expected: relation_reconciliation.Retirement) !relation_reconciliation.GarbagePage {
+        var read = try self.store.beginReadTxn();
+        defer read.abort();
+        var buf: [relation_reconciliation.max_cursor_bytes]u8 = undefined;
+        const bytes = (try stagingGet(&read, try relation_reconciliation.retirementKey(&buf, expected.generation))) orelse return error.CatalogGenerationChanged;
+        if (!std.mem.eql(u8, bytes, &(try expected.encode()))) return error.CatalogGenerationChanged;
+        var source: RelationCursor = .{ .cursor = try read.openCursor(), .prefix = try relation_reconciliation.candidateGenerationPrefix(&buf, expected.generation) };
+        defer source.cursor.close();
+        return relation_reconciliation.GarbagePage.prepare(a, expected, &source);
+    }
+
+    const RelationCursor = struct {
+        cursor: docstore.DocStore.Txn.CursorAdapter,
+        prefix: []const u8,
+        started: bool = false,
+        last_len: usize = 0,
+        last: [relation_reconciliation.max_cursor_bytes]u8 = undefined,
+        pub fn nextAfter(self: *@This(), after: []const u8) !?relation_reconciliation.CandidateRow {
+            // Sequential consumption performs one initial seek. An admission
+            // lookahead may not fit a page, so an older cursor must rewind,
+            // rather than silently skipping that source row on retry.
+            const row = (if (self.started and std.mem.eql(u8, after, self.last[0..self.last_len]))
+                try self.cursor.next()
+            else blk: {
+                const found = (try self.cursor.seekAtOrAfter(if (after.len == 0) self.prefix else after)) orelse return null;
+                break :blk if (std.mem.eql(u8, found.key, after)) try self.cursor.next() else found;
+            }) orelse return null;
+            if (!std.mem.startsWith(u8, row.key, self.prefix)) return null;
+            if (row.key.len > self.last.len) return error.InvalidCatalogRecord;
+            // A subsequent point lookup may use engine scratch. Preserve the
+            // lexical key before loading the table's typed/name projection.
+            @memcpy(self.last[0..row.key.len], row.key);
+            self.last_len = row.key.len;
+            self.started = true;
+            return .{ .key = self.last[0..self.last_len], .value = row.value };
+        }
+    };
+
+    const RelationTableSource = struct {
+        a: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        raw: RelationCursor,
+        cut: ?RelationSnapshot = null,
+        fn deinit(self: *@This()) void {
+            if (self.cut) |*cut| cut.deinit();
+            self.raw.cursor.close();
+        }
+        pub fn nextAfter(self: *@This(), after: []const u8) !?relation_reconciliation.SourceRow {
+            if (self.cut) |*cut| cut.deinit();
+            self.cut = null;
+            const row = (try self.raw.nextAfter(after)) orelse return null;
+            const id = (try capturedRelationTableId(row.key, self.group_id)) orelse return error.InvalidCatalogRecord;
+            self.cut = try relationSnapshot(self.a, self.txn, self.group_id, id, true);
+            return .{ .key = row.key, .table_id = id, .claims = self.cut.?.claims() };
+        }
+    };
+
     // Writer adoption is separate from serving readiness. Only verified
     // migration/bootstrap may install this marker; it does not advertise
     // unqualified SQL index resolution or bypass a serving capability barrier.

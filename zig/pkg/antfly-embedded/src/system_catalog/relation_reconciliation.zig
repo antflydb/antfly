@@ -209,7 +209,7 @@ pub fn candidatePrefix(buf: []u8, state: *const State) ![]const u8 {
     try state.validate();
     return candidateGenerationPrefix(buf, Generation.of(state));
 }
-fn candidateGenerationPrefix(buf: []u8, generation: Generation) ![]const u8 {
+pub fn candidateGenerationPrefix(buf: []u8, generation: Generation) ![]const u8 {
     try generation.validate();
     if (buf.len < candidate_prefix.len + 24) return error.NoSpaceLeft;
     @memcpy(buf[0..candidate_prefix.len], candidate_prefix);

@@ -1604,8 +1604,17 @@ admission tests cover initial controls, ordinary tracked source writes and
 adoption between preparation and final validation.
 `zig build antfly-relation-coordinator-test system-catalog-relation-store-test`
 exercises these control/admission paths. Source adoption is not automatic;
-source/candidate/GC page-intent preparation, leader scheduling and end-to-end
-coordinator retries remain to be wired. Pending-generation reservation sources,
+native source/candidate/GC page preparation now streams from pinned read
+transactions and returns owned bounded plans, without acquiring the apply
+mutex. One reusable physical cursor performs sequential reads, rewinds correctly
+after admission lookahead, and preserves lexical keys across point projections.
+The native 65-table restart/fault regression uses these production preparers
+through build, source verification, independent candidate verification and
+retirement GC; stale job preparation rejects before source decoding. Native
+allocation-fault coverage unwinds pinned readers and owned source projections,
+and a real rename rejects both stale preparation and stale page application.
+Leader scheduling, durable page-intent admission and end-to-end coordinator
+retries remain to be wired. Pending-generation reservation sources,
 Raft page commands, GC scheduling,
 capability barriers and atomic active-root publication still
 precede writer adoption and SQL point resolution. No original SQL case is
