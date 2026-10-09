@@ -33,6 +33,7 @@ const reader_config = @import("antfly_reader_config");
 const session_factory = @import("../architectures/session_factory.zig");
 const florence_arch = @import("../architectures/florence.zig");
 const backends = @import("../backends/backends.zig");
+const session_mod = @import("../backends/session.zig");
 const ops = @import("../ops/ops.zig");
 const tokenizer_mod = @import("inference_tokenizer");
 const image = @import("image.zig");
@@ -551,6 +552,8 @@ pub const ReadingPipeline = struct {
         debug_cuda_session: bool,
     ) ![]ReadResult {
         const allocator = self.allocator;
+        var run_permit: ?session_mod.RunPermit = null;
+        defer if (run_permit) |*permit| permit.deinit();
 
         const prompt_text = self.config.prompt orelse "<OCR>";
         const prompt_i32 = try buildFlorencePromptIds(
@@ -568,6 +571,16 @@ pub const ReadingPipeline = struct {
         for (0..batch) |b| {
             for (prompt_i32, 0..) |id, i| prompt_i64[b * prompt_len + i] = id;
         }
+
+        // Direct compute bypasses Session.run, so retain its admission permit
+        // through both encoder/decoder execution and backend cleanup.
+        run_permit = try self.vision_encoder.admit(try nativeFlorenceRunRequest(
+            florence_cfg,
+            batch,
+            pixel_values.len,
+            prompt_i32.len,
+            self.config.max_length,
+        ));
 
         var managed = try session_factory.getComputeBackendWithControl(self.vision_encoder, allocator, self.execution_control);
         defer managed.deinit();
@@ -1086,6 +1099,8 @@ pub const ReadingPipeline = struct {
 
     fn readNativeFlorencePixelValues(self: *ReadingPipeline, pixel_values: []const f32, florence_cfg: florence_arch.Config) !ReadResult {
         const allocator = self.allocator;
+        var run_permit: ?session_mod.RunPermit = null;
+        defer if (run_permit) |*permit| permit.deinit();
         const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
         const prompt_text = self.config.prompt orelse "<OCR>";
         if (debug_cuda_session) std.log.info("reading: native florence prompt ids start prompt={s}", .{prompt_text});
@@ -1101,6 +1116,16 @@ pub const ReadingPipeline = struct {
         const prompt_i64 = try allocator.alloc(i64, prompt_i32.len);
         defer allocator.free(prompt_i64);
         for (prompt_i32, 0..) |id, i| prompt_i64[i] = id;
+
+        // Direct compute bypasses Session.run, so retain its admission permit
+        // through both encoder/decoder execution and backend cleanup.
+        run_permit = try self.vision_encoder.admit(try nativeFlorenceRunRequest(
+            florence_cfg,
+            1,
+            pixel_values.len,
+            prompt_i32.len,
+            self.config.max_length,
+        ));
 
         var managed = try session_factory.getComputeBackendWithControl(self.vision_encoder, allocator, self.execution_control);
         defer managed.deinit();
@@ -1229,9 +1254,8 @@ pub const ReadingPipeline = struct {
         const florence_cfg = session_factory.getFlorenceConfig(self.vision_encoder) orelse return null;
         last_read_telemetry.resident_decoder = true;
         const allocator = self.allocator;
-        var managed = try session_factory.getComputeBackendWithControl(self.vision_encoder, allocator, self.execution_control);
-        defer managed.deinit();
-        const cb = &managed.backend;
+        var run_permit: ?session_mod.RunPermit = null;
+        defer if (run_permit) |*permit| permit.deinit();
 
         const prompt_text = self.config.prompt orelse "<OCR>";
         const prompt_i32 = try buildFlorencePromptIds(
@@ -1245,6 +1269,20 @@ pub const ReadingPipeline = struct {
         const prompt_i64 = try allocator.alloc(i64, prompt_i32.len);
         defer allocator.free(prompt_i64);
         for (prompt_i32, 0..) |id, i| prompt_i64[i] = id;
+
+        // Direct compute bypasses Session.run, so retain its admission permit
+        // through both encoder/decoder execution and backend cleanup.
+        run_permit = try self.vision_encoder.admit(try nativeFlorenceRunRequest(
+            florence_cfg,
+            1,
+            pixel_values.len,
+            prompt_i32.len,
+            self.config.max_length,
+        ));
+
+        var managed = try session_factory.getComputeBackendWithControl(self.vision_encoder, allocator, self.execution_control);
+        defer managed.deinit();
+        const cb = &managed.backend;
 
         const encoder = (try session_factory.runFlorenceEncoderResident(
             self.vision_encoder,
@@ -1752,6 +1790,57 @@ pub const ReadingPipeline = struct {
         // Sessions and tokenizer are borrowed — caller manages their lifetime.
     }
 };
+
+/// Reserve the complete native reader invocation, including the encoder
+/// output, full-prefix decoder fallback, and self/cross KV retained across steps.
+/// Use checked scalar geometry before constructing any compute backend.
+fn nativeFlorenceRunRequest(
+    cfg: florence_arch.Config,
+    batch: usize,
+    pixel_count: usize,
+    prompt_length: usize,
+    max_length: usize,
+) !session_mod.RunRequest {
+    const Checked = struct {
+        fn add(a: usize, b: usize) !usize {
+            return std.math.add(usize, a, b) catch error.ResourceLimitExceeded;
+        }
+        fn mul(a: usize, b: usize) !usize {
+            return std.math.mul(usize, a, b) catch error.ResourceLimitExceeded;
+        }
+    };
+    if (batch == 0) return error.InvalidInputShape;
+    var side: usize = cfg.image_size;
+    for (cfg.patch_size, cfg.patch_stride, cfg.patch_padding) |patch, stride, padding| {
+        if (stride == 0) return error.InvalidInputShape;
+        const padded = try Checked.add(side, try Checked.mul(padding, 2));
+        if (padded < patch) return error.InvalidInputShape;
+        side = try Checked.add((padded - patch) / stride, 1);
+    }
+    if (cfg.image_feature_source_count > cfg.image_feature_sources.len) return error.InvalidInputShape;
+    const spatial_tokens = try Checked.mul(side, side);
+    var image_tokens: usize = 0;
+    for (cfg.image_feature_sources[0..cfg.image_feature_source_count]) |source| {
+        image_tokens = try Checked.add(image_tokens, switch (source) {
+            .spatial_avg_pool => 1,
+            .temporal_avg_pool, .last_frame => spatial_tokens,
+        });
+    }
+    const encoder_length = try Checked.add(image_tokens, prompt_length);
+    const decoder_length = @max(max_length, 1);
+    const encoder_bytes = try Checked.mul(try Checked.mul(batch, encoder_length), try Checked.mul(cfg.d_model, @sizeOf(f32)));
+    const logits_bytes = try Checked.mul(try Checked.mul(batch, decoder_length), try Checked.mul(cfg.vocab_size, @sizeOf(f32)));
+    const cache_length = try Checked.add(encoder_length, decoder_length);
+    const kv_bytes = try Checked.mul(try Checked.mul(batch, cache_length), try Checked.mul(cfg.decoder_layers, try Checked.mul(cfg.d_model, 2 * @sizeOf(f32))));
+    const prompt_bytes = try Checked.mul(prompt_length, try Checked.add(try Checked.mul(batch, @sizeOf(i64)), @sizeOf(i32)));
+    return .{
+        .batch = batch,
+        .sequence = @max(encoder_length, decoder_length),
+        .input_bytes = try Checked.add(try Checked.mul(pixel_count, @sizeOf(f32)), prompt_bytes),
+        .output_bytes = try Checked.add(try Checked.add(encoder_bytes, logits_bytes), kv_bytes),
+        .output_kv_bytes = kv_bytes,
+    };
+}
 
 fn compactDecoderInputIds(
     allocator: std.mem.Allocator,
@@ -2610,4 +2699,55 @@ test "Florence fallback policy exposes unsupported native CPU paths" {
     try std.testing.expectEqual(@as(usize, 0), last_read_telemetry.cuda_graph_capture_steps);
     try std.testing.expectEqual(@as(usize, 0), last_read_telemetry.cuda_graph_replay_steps);
     try std.testing.expectEqualStrings("florence_incremental_decode_unsupported", last_read_telemetry.cuda_graph_fallback_reason.?);
+}
+
+test "native Florence admission covers batched encoder logits and retained KV" {
+    const cfg = florence_arch.Config{
+        .image_size = 8,
+        .patch_size = .{ 1, 1, 1, 1 },
+        .patch_stride = .{ 2, 2, 1, 1 },
+        .patch_padding = .{ 0, 0, 0, 0 },
+        .d_model = 4,
+        .vocab_size = 8,
+        .decoder_layers = 2,
+    };
+    const request = try nativeFlorenceRunRequest(cfg, 2, 384, 3, 6);
+    try std.testing.expectEqual(@as(usize, 8), request.sequence);
+    try std.testing.expectEqual(@as(usize, 1596), request.input_bytes);
+    try std.testing.expectEqual(@as(usize, 1792), request.output_kv_bytes);
+    try std.testing.expectEqual(@as(usize, 2432), request.output_bytes.?);
+    try std.testing.expectError(error.ResourceLimitExceeded, nativeFlorenceRunRequest(cfg, 2, std.math.maxInt(usize), 3, 6));
+    try std.testing.expectError(error.ResourceLimitExceeded, nativeFlorenceRunRequest(cfg, 2, 384, 3, std.math.maxInt(usize)));
+    var invalid = cfg;
+    invalid.patch_stride[1] = 0;
+    try std.testing.expectError(error.InvalidInputShape, nativeFlorenceRunRequest(invalid, 2, 384, 3, 6));
+}
+
+test "native Florence direct admission denies before execution and recovers without leaked leases" {
+    const memory = @import("../runtime/tier/memory.zig");
+    for ([_]memory.BackendClass{ .cpu, .gpu }) |backend_class| {
+        var controller = memory.AdmissionController{};
+        defer controller.deinit();
+        controller.configureForcedRunDenialsForTesting(3);
+        var fake = AdmissionDenyingFlorenceSession{};
+        var session = fake.session();
+        session.run_admission = .{
+            .controller = &controller,
+            .backend_class = backend_class,
+            .limits = .{},
+            .static_workspace_bytes = 4096,
+            .check_live_memory = false,
+        };
+        const request = try nativeFlorenceRunRequest(.{}, 1, 3 * 768 * 768, 3, 1);
+        for (0..3) |_| {
+            try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admit(request));
+            try std.testing.expect(std.meta.eql(memory.AdmissionAmounts{}, controller.admitted));
+        }
+        var permit = try session.admit(request);
+        defer permit.deinit();
+        try std.testing.expect(!std.meta.eql(memory.AdmissionAmounts{}, controller.admitted));
+        try std.testing.expect(!fake.run_called);
+        permit.deinit();
+        try std.testing.expect(std.meta.eql(memory.AdmissionAmounts{}, controller.admitted));
+    }
 }
