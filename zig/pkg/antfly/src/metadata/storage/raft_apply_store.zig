@@ -154,6 +154,245 @@ fn verifyRelationRecoveryForTest(store: *RaftApplyStore, a: std.mem.Allocator, g
     try verifyRelationCheckpointTxn(a, &read);
 }
 
+/// Test bootstrap supplies the capability/lifecycle barrier externally, but
+/// obtains the actual native source/candidate proof before installing a root.
+fn adoptLiveRelationWriterForTest(store: *RaftApplyStore, a: std.mem.Allocator, group: u64) !relation_reconciliation.State {
+    try adoptRelationWriterForTest(store, a, group);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        if (try relation_reconciliation.readSourceRevision(&txn, group) == 0) try relation_reconciliation.advanceSource(&txn, group);
+        try txn.commit();
+    }
+    const epoch = blk: {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        break :blk try RaftApplyStore.relationSourceEpochTxn(&read, group);
+    };
+    const initial = try relation_reconciliation.State.init(group, try relation_reconciliation.nextJobId(null), epoch);
+    const ready = try reconcileRestoreNamesForTest(store, a, initial);
+    const proof = try store.prepareRelationPublicationProof(a, ready);
+    var txn = try store.store.beginWriteTxn();
+    errdefer txn.abort();
+    try std.testing.expect(try proof.matchesTxn(&txn));
+    _ = try relation_reconciliation.publishVerifiedRoot(&txn, ready, epoch, null);
+    try verifyRelationCheckpointTxn(a, &txn);
+    try txn.commit();
+    return ready;
+}
+
+test "system catalog relation namespace transaction live writers pin roots recover and ignore obsolete registry bytes" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/live-writer", .{tmp.sub_path});
+    defer a.free(root);
+    const restored_root = try std.fmt.allocPrint(a, "{s}-restored", .{root});
+    defer a.free(restored_root);
+    const checkpoint_path = try std.fmt.allocPrint(a, "{s}.checkpoint", .{root});
+    defer a.free(checkpoint_path);
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "before", .schema_json = "{\"version\":1,\"relational_indexes\":[{\"name\":\"old_idx\"}]}" };
+    var artifact: RaftApplyStore.metadata_hot_standby.CheckpointArtifact = undefined;
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
+        try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+        const ready = try adoptLiveRelationWriterForTest(&store, a, group);
+        var pinned = try store.store.beginReadTxn();
+        defer pinned.abort();
+        var before = try RaftApplyStore.RelationRegistry(docstore.DocStore.Txn).init(a, &pinned, group);
+        try std.testing.expect(before.live != null);
+        const initial = before.live.?.root;
+        var changed = table;
+        changed.name = "after";
+        changed.schema_json = "{\"version\":2,\"relational_indexes\":[{\"name\":\"new_idx\"}]}";
+        try store.applyStandaloneCommand(group, .{ .upsert_table = changed });
+        try std.testing.expect((try before.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = table.name })) != null);
+        try std.testing.expect((try before.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = changed.name })) == null);
+        {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            var after = try RaftApplyStore.RelationRegistry(docstore.DocStore.Txn).init(a, &read, group);
+            try std.testing.expectEqual(initial.sequence + 1, after.live.?.root.sequence);
+            try std.testing.expectEqual(@as(u64, 2), after.live.?.root.claims);
+            try std.testing.expect((try after.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "old_idx" })) == null);
+            try std.testing.expectEqual(@as(u32, 2), (try after.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "new_idx" })).?.schema_version);
+            // No bulk migration/copy or cleanup is needed for root publication.
+            var obsolete: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &read, .alloc = a, .group_id = group };
+            try std.testing.expect((try obsolete.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = table.name })) != null);
+            var buf: [128]u8 = undefined;
+            try std.testing.expectEqualSlices(u8, &(try ready.encode()), try read.get(try relation_reconciliation.jobKey(&buf, group)));
+        }
+        try verifyRelationRecoveryForTest(&store, a, group);
+        const revision = try store.standaloneRevision();
+        try std.testing.expectError(error.CatalogAlreadyExists, store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "other", .schema_json = "{\"version\":1,\"relational_indexes\":[{\"name\":\"new_idx\"}]}" } }));
+        try std.testing.expectEqual(revision, try store.standaloneRevision());
+        try verifyRelationRecoveryForTest(&store, a, group);
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&txn, group)).?;
+            const key: relation_names.Key = .{ .namespace_id = system_catalog.default_namespace_id, .name = "new_idx" };
+            const prior = (try live.getEntry(key)).?;
+            var forged = prior;
+            forged.active.?.schema_digest[0] ^= 1;
+            var plan = try relation_names.Plan.init(a, &.{try relation_names.Claim.fromEntry(key, prior)}, &.{try relation_names.Claim.fromEntry(key, forged)});
+            defer plan.deinit();
+            try relation_reconciliation.advanceSource(&txn, group);
+            try live.apply(&plan, try RaftApplyStore.relationSourceEpochTxn(&txn, group));
+            // The attacker supplied a self-consistent count/hash and source
+            // clock. Native recovery must still authenticate the owner schema.
+            try verifyReconciliationGroupTxn(&txn, group);
+            try std.testing.expectError(error.InvalidMetadataHACheckpoint, verifyRelationCheckpointTxn(a, &txn));
+            try std.testing.expectError(error.InvalidMetadataSnapshot, store.buildMetadataSnapshotTxn(a, &txn, group, null));
+        }
+        artifact = try store.exportHotStandbyCheckpoint(store.io_impl.io(), checkpoint_path);
+    }
+    {
+        var restored = try RaftApplyStore.init(a, .{ .root_dir = restored_root });
+        defer restored.deinit();
+        try restored.importHotStandbyCheckpoint(restored.io_impl.io(), checkpoint_path, artifact.size_bytes);
+        try verifyRelationRecoveryForTest(&restored, a, group);
+        try restored.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 7, .name = "recovered", .schema_json = "{}" } });
+        try verifyRelationRecoveryForTest(&restored, a, group);
+    }
+    var reopened = try RaftApplyStore.init(a, .{ .root_dir = restored_root });
+    defer reopened.deinit();
+    try verifyRelationRecoveryForTest(&reopened, a, group);
+    var read = try reopened.store.beginReadTxn();
+    defer read.abort();
+    var registry = try RaftApplyStore.RelationRegistry(docstore.DocStore.Txn).init(a, &read, group);
+    try std.testing.expect((try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "recovered" })) != null);
+    try std.testing.expect((try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "before" })) == null);
+}
+
+test "system catalog relation namespace transaction live replay authenticates producer cuts and aborts incomplete effects" {
+    const a = std.testing.allocator;
+    const group = group_ids.main_metadata_group_id;
+    const T = struct {
+        const Variant = enum { valid, missing_owner, missing_delete, missing_manifest, forged, extra, obsolete, disable, swap };
+        fn effect(store: *RaftApplyStore, variant: Variant) ![]u8 {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var capture = @import("antfly_local_sources").storage_txn_mutation_capture.Capture.init(a);
+            defer capture.deinit();
+            txn.mutation_capture = &capture;
+            var outcome: CommittedApplyOutcome = .{ .alloc = a };
+            defer outcome.deinit();
+            store.active_outcome = &outcome;
+            defer store.active_outcome = null;
+            if (variant == .swap) {
+                var buf: [128]u8 = undefined;
+                const ready = try relation_reconciliation.State.decode(try txn.get(try relation_reconciliation.jobKey(&buf, group)));
+                // Exclusive test fixture: obtain independent authority to
+                // demonstrate that native receiver activation is still gated,
+                // not merely rejected because of an invalid candidate seal.
+                const proof = try RaftApplyStore.prepareRelationPublicationProofTxn(a, &txn, ready);
+                try std.testing.expect(try proof.matchesTxn(&txn));
+                const prior = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&txn, group)).?;
+                _ = try relation_reconciliation.publishVerifiedRoot(&txn, ready, ready.epoch, prior.root);
+                return RaftApplyStore.metadata_hot_standby.encode(a, &capture, &txn, .{ .source = @splat(1), .sequence = 1, .group_id = group, .count = 0 });
+            }
+            try store.applyTransitionCommandTxn(&txn, group, .{ .upsert_table = .{ .table_id = 7, .name = "after", .schema_json = "{}" } });
+            var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&txn, group)).?;
+            const key: relation_names.Key = .{ .namespace_id = system_catalog.default_namespace_id, .name = "after" };
+            var buf: [relation_reconciliation.max_cursor_bytes]u8 = undefined;
+            switch (variant) {
+                .valid => {},
+                .missing_owner => try std.testing.expect(capture.keys.remove(try relation_reconciliation.candidateGenerationKey(&buf, live.root.generation, key))),
+                .missing_delete => try std.testing.expect(capture.keys.remove(try relation_reconciliation.candidateGenerationKey(&buf, live.root.generation, .{ .namespace_id = key.namespace_id, .name = "before" }))),
+                .missing_manifest => try std.testing.expect(capture.keys.remove(try relation_reconciliation.liveKey(&buf, group))),
+                .forged => {
+                    var entry = (try live.getEntry(key)).?;
+                    entry.active.?.schema_digest[0] ^= 1;
+                    try txn.put(try relation_reconciliation.candidateGenerationKey(&buf, live.root.generation, key), &(try entry.encode()));
+                },
+                .extra => try txn.put(try relation_reconciliation.candidateGenerationKey(&buf, live.root.generation, .{ .namespace_id = key.namespace_id, .name = "injected" }), &(try (try live.getEntry(key)).?.encode())),
+                .obsolete => {
+                    var obsolete: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = group };
+                    try obsolete.putEntry(.{ .namespace_id = key.namespace_id, .name = "injected" }, (try live.getEntry(key)).?);
+                },
+                .disable => try txn.delete(try RaftApplyStore.relationWriterKeyForGroup(&buf, group)),
+                .swap => unreachable,
+            }
+            return RaftApplyStore.metadata_hot_standby.encode(a, &capture, &txn, .{ .source = @splat(1), .sequence = 1, .group_id = group, .count = 0 });
+        }
+        fn replay(store: *RaftApplyStore, bytes: []const u8) !void {
+            const descriptor = try RaftApplyStore.metadata_chunks.Descriptor.fromEffect(bytes);
+            try std.testing.expectEqual(@as(u32, 1), descriptor.chunk_count);
+            const frame = try RaftApplyStore.metadata_chunks.encodeFrame(a, descriptor, 0, bytes);
+            defer a.free(frame);
+            try store.applyHotStandbyRecord(.{ .kind = .metadata_mutation, .payload_codec = .binary, .cluster_id = 7, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = frame });
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/live-replay-source", .{tmp.sub_path});
+    defer a.free(root);
+    var source = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer source.deinit();
+    try source.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
+    try source.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 7, .name = "before", .schema_json = "{}" } });
+    const original = try adoptLiveRelationWriterForTest(&source, a, group);
+    const replacement = try relation_reconciliation.State.init(group, try relation_reconciliation.nextJobId(&original), original.epoch);
+    {
+        var txn = try source.store.beginWriteTxn();
+        errdefer txn.abort();
+        try relation_reconciliation.start(&txn, &replacement, original.epoch, &(try original.encode()));
+        try txn.commit();
+    }
+    _ = try reconcileRestoreNamesForTest(&source, a, replacement);
+    const snapshot = try source.snapshotBuilder().buildSnapshot(a, group);
+    defer a.free(snapshot);
+    const valid = try T.effect(&source, .valid);
+    defer a.free(valid);
+    for ([_]T.Variant{ .missing_owner, .missing_delete, .missing_manifest, .forged, .extra, .obsolete, .disable, .swap }) |variant| {
+        const target_root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/live-replay-{s}", .{ tmp.sub_path, @tagName(variant) });
+        defer a.free(target_root);
+        const invalid = try T.effect(&source, variant);
+        defer a.free(invalid);
+        {
+            var receiver = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+            defer receiver.deinit();
+            try RaftApplyStore.installSnapshotFromRaft(&receiver, a, group, 10, snapshot);
+            var signals: MetadataReplayTest.Capture = .{};
+            try signals.register(&receiver);
+            const expected = switch (variant) {
+                .missing_owner, .missing_delete, .forged => error.CatalogGenerationChanged,
+                else => error.InvalidCatalogRecord,
+            };
+            try std.testing.expectError(expected, T.replay(&receiver, invalid));
+            try std.testing.expectEqual(@as(usize, 0), signals.projections);
+            try std.testing.expectEqual(@as(usize, 0), signals.keys);
+            {
+                var read = try receiver.store.beginReadTxn();
+                defer read.abort();
+                var registry = try RaftApplyStore.RelationRegistry(docstore.DocStore.Txn).init(a, &read, group);
+                try std.testing.expectEqual(@as(u64, 1), registry.live.?.root.sequence);
+                try std.testing.expect((try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "before" })) != null);
+                try std.testing.expect((try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "after" })) == null);
+                try std.testing.expectError(error.NotFound, read.get(RaftApplyStore.metadata_hot_standby.sequence_key));
+                try std.testing.expectError(error.NotFound, read.get(RaftApplyStore.metadata_hot_standby.replay_key));
+                try verifyRelationCheckpointTxn(a, &read);
+            }
+            try T.replay(&receiver, valid);
+            try verifyRelationRecoveryForTest(&receiver, a, group);
+        }
+        var recovered = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+        defer recovered.deinit();
+        try T.replay(&recovered, valid); // Receipt-fenced idempotence after restart.
+        try verifyRelationRecoveryForTest(&recovered, a, group);
+        var read = try recovered.store.beginReadTxn();
+        defer read.abort();
+        var registry = try RaftApplyStore.RelationRegistry(docstore.DocStore.Txn).init(a, &read, group);
+        try std.testing.expectEqual(@as(u64, 2), registry.live.?.root.sequence);
+        try std.testing.expect((try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "after" })) != null);
+        try std.testing.expect((try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "injected" })) == null);
+    }
+}
+
 test "system catalog compound writer registry never hides successor reservations from admission or checkpoint validation" {
     const a = std.testing.allocator;
     const group: u64 = 41;
@@ -6749,6 +6988,12 @@ test "system catalog active restore cursor resumes bounded target pages without 
 fn reconcileRestoreNamesForTest(store: *RaftApplyStore, a: std.mem.Allocator, initial: relation_reconciliation.State) !relation_reconciliation.State {
     const r = relation_reconciliation;
     const group = initial.group_id;
+    const prior_root = blk: {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        var buf: [128]u8 = undefined;
+        break :blk if (try RaftApplyStore.stagingGet(&read, try r.rootKey(&buf, group))) |bytes| try r.Generation.decode(bytes) else null;
+    };
     {
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
@@ -6790,7 +7035,8 @@ fn reconcileRestoreNamesForTest(store: *RaftApplyStore, a: std.mem.Allocator, in
     var read = try store.store.beginReadTxn();
     defer read.abort();
     var buf: [128]u8 = undefined;
-    try std.testing.expectError(error.NotFound, read.get(try r.rootKey(&buf, group)));
+    const observed_root = if (try RaftApplyStore.stagingGet(&read, try r.rootKey(&buf, group))) |bytes| try r.Generation.decode(bytes) else null;
+    try std.testing.expect(std.meta.eql(prior_root, observed_root));
     return state;
 }
 
@@ -7438,7 +7684,8 @@ test "relational integrity restore staging publishes all targets only after exac
     var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
     defer store.deinit();
     const group_id = group_ids.main_metadata_group_id;
-    try adoptRelationWriterForTest(&store, alloc, group_id);
+    try store.applyStandaloneCommand(group_id, .{ .initialize_metadata_incarnation = "01010101010101010101010101010101".* });
+    _ = try adoptLiveRelationWriterForTest(&store, alloc, group_id);
     var targets = [_]restore_staging.Target{
         .{ .source_table_id = 1, .table = .{ .table_id = 11, .name = "new_parent", .schema_json = "{}" }, .ranges = &.{.{ .table_id = 11, .group_id = 701, .range_id = 701, .doc_identity_shard_id = 701, .doc_identity_range_id = 701, .start_key = "" }} },
         .{ .source_table_id = 2, .table = .{ .table_id = 12, .name = "new_child", .schema_json = "{}" }, .ranges = &.{.{ .table_id = 12, .group_id = 702, .range_id = 702, .doc_identity_shard_id = 702, .doc_identity_range_id = 702, .start_key = "" }} },
@@ -7460,7 +7707,8 @@ test "relational integrity restore staging publishes all targets only after exac
     var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
     const reservation = try txn.get(try restore_staging.nameKey(&key_buf, group_id, targets[0].table.name));
     try std.testing.expectEqualSlices(u8, &plan.id, reservation);
-    var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = alloc, .group_id = group_id };
+    var registry = try RaftApplyStore.RelationRegistry(docstore.DocStore.Txn).init(alloc, &txn, group_id);
+    try std.testing.expect(registry.live != null);
     for (targets) |target| {
         const key: relation_names.Key = .{ .namespace_id = target.catalog_binding.?.parent_id, .name = target.catalog_binding.?.name };
         const entry = (try registry.getEntry(key)).?;
@@ -9904,10 +10152,28 @@ pub const RaftApplyStore = struct {
             var plan = try self.capturedRelationsPlanTxn(&txn, descriptor.group_id, &relation_journal, true);
             defer plan.deinit();
             var before = relation_journal.beforeReader();
-            var before_registry: relation_names.Store(command_journal.Journal.BeforeReader) = .{ .txn = &before, .alloc = self.alloc, .group_id = descriptor.group_id };
+            var before_registry = try RelationRegistry(command_journal.Journal.BeforeReader).init(self.alloc, &before, descriptor.group_id);
             try plan.validate(&before_registry);
-            var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = self.alloc, .group_id = descriptor.group_id };
+            var registry = try RelationRegistry(docstore.DocStore.Txn).init(self.alloc, &txn, descriptor.group_id);
             try plan.verifyPublished(&registry);
+        }
+        if (reconciliation_changed) {
+            // A ready fingerprint is not independent publication authority.
+            // Mutable-root effects are supported after a verified seed, but
+            // generation adoption needs the forthcoming receiver-side staged
+            // publication proof/capability protocol, never a scan under this
+            // serialized replay transaction or trust in the sender's seal.
+            var buf: [128]u8 = undefined;
+            const key = try relation_reconciliation.liveKey(&buf, descriptor.group_id);
+            if (try stagingGet(&txn, key)) |bytes| {
+                var before = relation_journal.beforeReader();
+                const prior_bytes = before.get(key) catch |err| {
+                    if (err == error.NotFound) return error.InvalidCatalogRecord;
+                    return err;
+                };
+                const prior = try relation_reconciliation.LiveRoot.decode(prior_bytes);
+                if (!prior.generation.eql((try relation_reconciliation.LiveRoot.decode(bytes)).generation)) return error.InvalidCatalogRecord;
+            }
         }
         if (reconciliation_changed) {
             var before = relation_journal.beforeReader();
@@ -16221,6 +16487,7 @@ pub const RaftApplyStore = struct {
         relation_candidates,
         relation_retirements,
         relation_root,
+        relation_live,
         topology_activation,
         metadata_incarnation,
         split_transition,
@@ -16287,6 +16554,7 @@ pub const RaftApplyStore = struct {
         .{ .projection = .relation_candidates, .key = .{ .prefix = relation_reconciliation.candidatesForGroup } },
         .{ .projection = .relation_retirements, .key = .{ .prefix = relation_reconciliation.retirementsForGroup } },
         .{ .projection = .relation_root, .key = .{ .point = relation_reconciliation.rootKey } },
+        .{ .projection = .relation_live, .key = .{ .point = relation_reconciliation.liveKey } },
         .{ .projection = .metadata_incarnation, .key = .{ .point = metadataIncarnationKeyForGroup } },
         .{ .projection = .split_transition, .key = .{ .prefix = splitTransitionPrefixForGroup } },
         .{ .projection = .merge_transition, .key = .{ .prefix = mergeTransitionPrefixForGroup } },
@@ -16346,7 +16614,7 @@ pub const RaftApplyStore = struct {
     fn transitionCommandProjectionMask(tag: std.meta.Tag(TransitionCommand)) MetadataSnapshotProjectionMask {
         const mask = switch (tag) {
             .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
-                metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_root) |
+                metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) |
                 metadataSnapshotProjectionBit(.topology_activation) | metadataSnapshotProjectionBit(.metadata_incarnation),
             .apply_restore_staging => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.restore_staging) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.range) | metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
@@ -16419,7 +16687,7 @@ pub const RaftApplyStore = struct {
         return if ((mask & metadataSnapshotProjectionBit(.table)) != 0)
             mask | metadataSnapshotProjectionBit(.lake_index_lifecycle) | metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.relation_names) |
                 metadataSnapshotProjectionBit(.relation_reconciliation) | metadataSnapshotProjectionBit(.relation_candidates) |
-                metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_source)
+                metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) | metadataSnapshotProjectionBit(.relation_source)
         else
             mask;
     }
@@ -16512,6 +16780,11 @@ pub const RaftApplyStore = struct {
         const incoming_root: ?relation_reconciliation.Generation = for (rows) |row| {
             if (std.mem.eql(u8, row.key, root_key)) break try relation_reconciliation.Generation.decode(row.value);
         } else null;
+        var live_key_buf: [128]u8 = undefined;
+        const live_key = try relation_reconciliation.liveKey(&live_key_buf, group_id);
+        const incoming_live: ?relation_reconciliation.LiveRoot = for (rows) |row| {
+            if (std.mem.eql(u8, row.key, live_key)) break try relation_reconciliation.LiveRoot.decode(row.value);
+        } else null;
 
         var source_key_buf: [128]u8 = undefined;
         const source_key = try relation_reconciliation.sourceKey(&source_key_buf, group_id);
@@ -16557,6 +16830,14 @@ pub const RaftApplyStore = struct {
                 const local = try relation_reconciliation.Generation.decode(bytes);
                 const incoming = incoming_root orelse return error.InvalidMetadataSnapshot;
                 if (local.group_id != group_id or std.mem.order(u8, &incoming.job_id, &local.job_id) == .lt) return error.InvalidMetadataSnapshot;
+            }
+            if (try stagingGet(&read_txn, live_key)) |bytes| {
+                const local = try relation_reconciliation.LiveRoot.decode(bytes);
+                const incoming = incoming_live orelse return error.InvalidMetadataSnapshot;
+                if (!std.mem.eql(u8, &local.epoch.incarnation, &incoming.epoch.incarnation) or incoming.epoch.revision < local.epoch.revision) return error.InvalidMetadataSnapshot;
+                if (local.generation.eql(incoming.generation)) {
+                    if (incoming.sequence < local.sequence or (incoming.sequence == local.sequence and !std.meta.eql(local, incoming))) return error.InvalidMetadataSnapshot;
+                }
             }
             if (try relationWriterEnabledTxn(&read_txn, group_id)) {
                 var writer_buf: [160]u8 = undefined;
@@ -17558,11 +17839,44 @@ pub const RaftApplyStore = struct {
         return true;
     }
 
+    /// Pin the physical namespace once per transaction. A live root never
+    /// falls back to the obsolete standalone registry on a missing name.
+    fn RelationRegistry(comptime Reader: type) type {
+        return struct {
+            live: ?relation_reconciliation.LiveStore(Reader),
+            legacy: relation_names.Store(Reader),
+            fn init(a: std.mem.Allocator, reader: *Reader, group: u64) !@This() {
+                return .{ .live = try relation_reconciliation.LiveStore(Reader).open(reader, group), .legacy = .{ .txn = reader, .alloc = a, .group_id = group } };
+            }
+            pub fn getEntry(self: *@This(), key: relation_names.Key) !?relation_names.Entry {
+                return if (self.live) |*live| live.getEntry(key) else self.legacy.getEntry(key);
+            }
+            pub fn getClaim(self: *@This(), key: relation_names.Key) !?relation_names.Owner {
+                return if (try self.getEntry(key)) |entry| entry.active else null;
+            }
+        };
+    }
+    fn relationRegistryLogicalKey(group: u64, key: []const u8, live: ?relation_reconciliation.LiveRoot) !?relation_names.Key {
+        if (try relation_names.Key.fromStorageKey(key, group)) |logical| {
+            // Old physical registry bytes may remain after activation, but
+            // cannot be mutated by subsequent authenticated namespace writes.
+            if (live != null) return error.InvalidCatalogRecord;
+            return logical;
+        }
+        const root = live orelse return null;
+        const record = (try relation_reconciliation.classify(key)) orelse return null;
+        if (record.kind != .candidate or record.group_id != group or !record.generation.?.eql(root.generation)) return null;
+        return try relation_reconciliation.logicalCandidateKey(key, root.generation);
+    }
+
     /// Read from the same pinned transaction as the source rows. An absent
     /// cluster identity cannot authorize a durable reconciliation generation.
-    fn relationSourceEpochTxn(txn: *docstore.DocStore.Txn, group_id: u64) !relation_reconciliation.Epoch {
+    fn relationSourceEpochTxn(txn: anytype, group_id: u64) !relation_reconciliation.Epoch {
         var buf: [160]u8 = undefined;
-        const bytes = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&buf, group_id))) orelse return error.InvalidMetadataIncarnation;
+        const bytes = txn.get(try metadataIncarnationKeyForGroup(&buf, group_id)) catch |err| {
+            if (err == error.NotFound) return error.InvalidMetadataIncarnation;
+            return err;
+        };
         const record = try decodeMetadataIncarnationRecord(bytes);
         var incarnation: [16]u8 = undefined;
         _ = std.fmt.hexToBytes(&incarnation, &record.incarnation) catch return error.InvalidMetadataIncarnation;
@@ -18266,12 +18580,19 @@ pub const RaftApplyStore = struct {
         var targets: std.AutoHashMapUnmanaged(u64, Group) = .empty;
         var restores: RelationRestoreProofCache = .{ .a = self.alloc, .txn = txn, .group_id = group_id };
         defer restores.deinit();
+        const live = try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id);
+        if (live) |value| {
+            if (!try relationWriterEnabledTxn(txn, group_id) or !value.root.epoch.eql(try relationSourceEpochTxn(txn, group_id))) return error.InvalidCatalogRecord;
+        }
         var state: ?relation_reconciliation.State = null;
         var count: usize = 0;
         var entries = journal.originals.iterator();
         while (entries.next()) |entry| {
             const record = (try relation_reconciliation.classify(entry.key_ptr.*)) orelse continue;
             if (record.kind != .candidate) continue;
+            // Live effects are independently checked as complete producer
+            // before/after cuts by capturedRelationsPlanTxn, including deletes.
+            if (live) |value| if (record.generation.?.eql(value.root.generation)) continue;
             const bytes = (try stagingGet(txn, entry.key_ptr.*)) orelse continue;
             // A later source may add a reservation to a name created by an
             // earlier page. Authenticate that update too; only byte-identical
@@ -18331,13 +18652,18 @@ pub const RaftApplyStore = struct {
     fn publishCapturedRelationsTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, journal: *command_journal.Journal) !void {
         var plan = try self.capturedRelationsPlanTxn(txn, group_id, journal, false);
         defer plan.deinit();
-        var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = txn, .alloc = self.alloc, .group_id = group_id };
-        try plan.apply(&registry);
+        var registry = try RelationRegistry(docstore.DocStore.Txn).init(self.alloc, txn, group_id);
+        if (registry.live) |*live| {
+            try live.apply(&plan, try relationSourceEpochTxn(txn, group_id));
+        } else try plan.apply(&registry.legacy);
     }
     fn capturedRelationsPlanTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, journal: *command_journal.Journal, include_registry: bool) !relation_names.Plan {
         var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer ids.deinit(self.alloc);
         var before_reader = journal.beforeReader();
+        const before_live = if (include_registry) try relation_reconciliation.LiveStore(command_journal.Journal.BeforeReader).open(&before_reader, group_id) else null;
+        const after_live = if (include_registry) try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(txn, group_id) else null;
+        const live_root = if (after_live) |value| value.root else if (before_live) |value| value.root else null;
         var before_restores: RelationRestoreOwnerCache(command_journal.Journal.BeforeReader) = .{ .a = self.alloc, .txn = &before_reader, .group_id = group_id, .check_progress = false };
         defer before_restores.deinit();
         var after_restores: RelationRestoreProofCache = .{ .a = self.alloc, .txn = txn, .group_id = group_id };
@@ -18395,7 +18721,7 @@ pub const RaftApplyStore = struct {
                     },
                 };
             }
-            if (include_registry and try relation_names.Key.fromStorageKey(key.*, group_id) != null) {
+            if (include_registry and try relationRegistryLogicalKey(group_id, key.*, live_root) != null) {
                 if (journal.originals.get(key.*)) |before| if (before) |bytes| try addRelationEntryTableIds(self.alloc, &ids, bytes);
                 if (try stagingGet(txn, key.*)) |bytes| try addRelationEntryTableIds(self.alloc, &ids, bytes);
             }
@@ -18428,7 +18754,7 @@ pub const RaftApplyStore = struct {
         errdefer plan.deinit();
         if (include_registry) {
             keys = journal.capture.keys.keyIterator();
-            while (keys.next()) |key| if (try relation_names.Key.fromStorageKey(key.*, group_id)) |logical| {
+            while (keys.next()) |key| if (try relationRegistryLogicalKey(group_id, key.*, live_root)) |logical| {
                 if (!plan.before_by_name.contains(logical) and !plan.after_by_name.contains(logical)) return error.InvalidCatalogRecord;
             };
         }
@@ -27688,14 +28014,22 @@ fn validateRelationSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []
     var reconciliation = try relation_reconciliation.Verifier(Reader).init(&reader, group_id);
     var buf: [160]u8 = undefined;
     const writer = values.get(try RaftApplyStore.relationWriterKeyForGroup(&buf, group_id));
+    var live_prefix_buf: [relation_reconciliation.max_cursor_bytes]u8 = undefined;
+    const live_prefix = if (reconciliation.live) |live| blk: {
+        if (writer == null or !live.epoch.eql(try RaftApplyStore.relationSourceEpochTxn(&reader, group_id))) return error.InvalidMetadataSnapshot;
+        break :blk try relation_reconciliation.candidateGenerationPrefix(&live_prefix_buf, live.generation);
+    } else null;
     var received: usize = 0;
     for (rows) |row| {
         if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
         try reconciliation.feed(row.key, row.value);
         if (try relation_names.Key.fromStorageKey(row.key, group_id) != null) {
             _ = try relation_names.Entry.decode(row.value);
-            received += 1;
+            if (live_prefix == null) received += 1;
         }
+        if (live_prefix) |prefix| if (std.mem.startsWith(u8, row.key, prefix)) {
+            received += 1;
+        };
     }
     try reconciliation.finish();
     if (writer == null) {
@@ -27703,6 +28037,7 @@ fn validateRelationSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []
         return;
     }
     if (!std.mem.eql(u8, writer.?, "AFRW01")) return error.InvalidMetadataSnapshot;
+    var registry = try RaftApplyStore.RelationRegistry(Reader).init(alloc, &reader, group_id);
     var restores: RaftApplyStore.RelationRestoreOwnerCache(Reader) = .{ .a = alloc, .txn = &reader, .group_id = group_id };
     defer restores.deinit();
     var restored: std.AutoHashMapUnmanaged(u64, void) = .empty;
@@ -27728,51 +28063,50 @@ fn validateRelationSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []
         const prefix = try tablePrefixForGroup(&buf, group_id);
         const count = if (std.mem.startsWith(u8, row.key, prefix)) blk: {
             const id = (try RaftApplyStore.capturedRelationTableId(row.key, group_id)) orelse return error.InvalidMetadataSnapshot;
-            break :blk try verifyRelationWriterTableCut(alloc, &reader, group_id, id, &restores, &restored);
+            break :blk try verifyRelationWriterTableCut(alloc, &reader, group_id, id, &restores, &restored, &registry);
         } else if (try RaftApplyStore.relationInitialWorkTableId(row.key, group_id)) |id|
-            try verifyRelationInitialCut(alloc, &reader, group_id, id)
+            try verifyRelationInitialCut(alloc, &reader, group_id, id, &registry)
         else
             continue;
         expected = std.math.add(usize, expected, count) catch return error.InvalidMetadataSnapshot;
     }
-    expected = std.math.add(usize, expected, try verifyRelationRestoreRemainder(alloc, &reader, group_id, &restores, &restored, cancelled)) catch return error.InvalidMetadataSnapshot;
+    expected = std.math.add(usize, expected, try verifyRelationRestoreRemainder(alloc, &reader, group_id, &restores, &restored, cancelled, &registry)) catch return error.InvalidMetadataSnapshot;
     if (expected != received) return error.InvalidMetadataSnapshot;
 }
 
-fn verifyRelationTableCut(alloc: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64) !usize {
+fn verifyRelationTableCut(alloc: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64, registry: anytype) !usize {
     var table = try RaftApplyStore.relationWriterSnapshot(alloc, reader, group_id, table_id, true);
     defer table.deinit();
-    return verifyRelationClaims(alloc, reader, group_id, table.claims());
+    return verifyRelationClaims(registry, table.claims());
 }
-fn verifyRelationWriterTableCut(alloc: std.mem.Allocator, reader: anytype, group: u64, table_id: u64, restores: anytype, seen: *std.AutoHashMapUnmanaged(u64, void)) !usize {
-    if (try restores.lookup(table_id, null)) |proof| return verifyRelationRestoreTarget(alloc, reader, group, proof.plan_id, proof.target, seen);
-    return verifyRelationTableCut(alloc, reader, group, table_id);
+fn verifyRelationWriterTableCut(alloc: std.mem.Allocator, reader: anytype, group: u64, table_id: u64, restores: anytype, seen: *std.AutoHashMapUnmanaged(u64, void), registry: anytype) !usize {
+    if (try restores.lookup(table_id, null)) |proof| return verifyRelationRestoreTarget(alloc, reader, group, proof.plan_id, proof.target, seen, registry);
+    return verifyRelationTableCut(alloc, reader, group, table_id, registry);
 }
-fn verifyRelationRestoreTarget(alloc: std.mem.Allocator, reader: anytype, group: u64, plan_id: [16]u8, target: RaftApplyStore.RelationRestoreProjection.Target, seen: *std.AutoHashMapUnmanaged(u64, void)) !usize {
+fn verifyRelationRestoreTarget(alloc: std.mem.Allocator, reader: anytype, group: u64, plan_id: [16]u8, target: RaftApplyStore.RelationRestoreProjection.Target, seen: *std.AutoHashMapUnmanaged(u64, void), registry: anytype) !usize {
     if (seen.contains(target.table.table_id)) return 0;
     var cut = try RaftApplyStore.relationRestoreTargetSnapshot(alloc, reader, group, plan_id, target, false);
     defer cut.deinit();
-    const count = try verifyRelationClaims(alloc, reader, group, cut.claims());
+    const count = try verifyRelationClaims(registry, cut.claims());
     try seen.put(alloc, target.table.table_id, {});
     return count;
 }
-fn verifyRelationRestoreRemainder(alloc: std.mem.Allocator, reader: anytype, group: u64, restores: anytype, seen: *std.AutoHashMapUnmanaged(u64, void), cancelled: ?*const std.atomic.Value(bool)) !usize {
+fn verifyRelationRestoreRemainder(alloc: std.mem.Allocator, reader: anytype, group: u64, restores: anytype, seen: *std.AutoHashMapUnmanaged(u64, void), cancelled: ?*const std.atomic.Value(bool), registry: anytype) !usize {
     var count: usize = 0;
     var jobs = restores.jobs.valueIterator();
     while (jobs.next()) |job| for (job.value.plan.targets) |target| {
         if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
-        count = std.math.add(usize, count, try verifyRelationRestoreTarget(alloc, reader, group, job.value.plan.id, target, seen)) catch return error.InvalidCatalogRecord;
+        count = std.math.add(usize, count, try verifyRelationRestoreTarget(alloc, reader, group, job.value.plan.id, target, seen, registry)) catch return error.InvalidCatalogRecord;
     };
     return count;
 }
-fn verifyRelationInitialCut(alloc: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64) !usize {
+fn verifyRelationInitialCut(alloc: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64, registry: anytype) !usize {
     var hidden = try RaftApplyStore.relationInitialSnapshot(alloc, reader, group_id, table_id);
     defer hidden.deinit();
     if (hidden.claims().len == 0) return error.InvalidCatalogRecord;
-    return verifyRelationClaims(alloc, reader, group_id, hidden.claims());
+    return verifyRelationClaims(registry, hidden.claims());
 }
-fn verifyRelationClaims(alloc: std.mem.Allocator, reader: anytype, group_id: u64, claims: []const relation_names.Claim) !usize {
-    var registry: relation_names.Store(@TypeOf(reader.*)) = .{ .txn = reader, .alloc = alloc, .group_id = group_id };
+fn verifyRelationClaims(registry: anytype, claims: []const relation_names.Claim) !usize {
     for (claims) |claim| {
         const entry = (try registry.getEntry(claim.key)) orelse return error.InvalidCatalogRecord;
         if (!entry.eql(try claim.entry())) return error.InvalidCatalogRecord;
@@ -27785,6 +28119,9 @@ fn verifyRelationClaims(alloc: std.mem.Allocator, reader: anytype, group_id: u64
 /// independent transaction, repair, or user-data scan is needed.
 fn verifyRelationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) !void {
     if (!try RaftApplyStore.relationWriterEnabledTxn(txn, group_id)) return error.InvalidCatalogRecord;
+    var registry = try RaftApplyStore.RelationRegistry(docstore.DocStore.Txn).init(alloc, txn, group_id);
+    const live = registry.live;
+    if (live) |value| if (!value.root.epoch.eql(try RaftApplyStore.relationSourceEpochTxn(txn, group_id))) return error.InvalidCatalogRecord;
     var cursor = try txn.openCursor();
     defer cursor.close();
     var buf: [160]u8 = undefined;
@@ -27812,8 +28149,8 @@ fn verifyRelationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
         defer scratch.deinit();
         // Cache/seen allocations must outlive this one-table scratch arena.
         if (try restores.lookup(id, null)) |proof| {
-            expected = std.math.add(usize, expected, try verifyRelationRestoreTarget(alloc, txn, group_id, proof.plan_id, proof.target, &restored)) catch return error.InvalidCatalogRecord;
-        } else expected = std.math.add(usize, expected, try verifyRelationTableCut(scratch.allocator(), txn, group_id, id)) catch return error.InvalidCatalogRecord;
+            expected = std.math.add(usize, expected, try verifyRelationRestoreTarget(alloc, txn, group_id, proof.plan_id, proof.target, &restored, &registry)) catch return error.InvalidCatalogRecord;
+        } else expected = std.math.add(usize, expected, try verifyRelationTableCut(scratch.allocator(), txn, group_id, id, &registry)) catch return error.InvalidCatalogRecord;
     }
     const initial = try fk_generation_publication.initialWorkPrefixForGroup(&buf, group_id);
     entry = try cursor.seekAtOrAfter(initial);
@@ -27824,7 +28161,7 @@ fn verifyRelationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
         defer scratch.deinit();
         // A hidden work row may never double-count a public table. Its exact
         // reservation pointers and absence of public identity are dependencies.
-        expected = std.math.add(usize, expected, try verifyRelationInitialCut(scratch.allocator(), txn, group_id, id)) catch return error.InvalidCatalogRecord;
+        expected = std.math.add(usize, expected, try verifyRelationInitialCut(scratch.allocator(), txn, group_id, id, &registry)) catch return error.InvalidCatalogRecord;
     }
     const bindings = try system_catalog_storage.tableRecordPrefixForGroup(&buf, group_id);
     entry = try cursor.seekAtOrAfter(bindings);
@@ -27834,22 +28171,24 @@ fn verifyRelationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
         var physical_buf: [160]u8 = undefined;
         _ = try txn.get(try tableKeyForGroup(&physical_buf, group_id, id));
     }
-    const claims = try relation_names.Key.prefixForGroup(&buf, group_id);
+    const claims = if (live) |value| try relation_reconciliation.candidateGenerationPrefix(&buf, value.root.generation) else try relation_names.Key.prefixForGroup(&buf, group_id);
     var received: usize = 0;
     entry = try cursor.seekAtOrAfter(claims);
     while (entry) |row| : (entry = try cursor.next()) {
         if (!std.mem.startsWith(u8, row.key, claims)) break;
-        _ = (try relation_names.Key.fromStorageKey(row.key, group_id)) orelse return error.InvalidCatalogRecord;
+        if (live) |value| {
+            _ = try relation_reconciliation.logicalCandidateKey(row.key, value.root.generation);
+        } else _ = (try relation_names.Key.fromStorageKey(row.key, group_id)) orelse return error.InvalidCatalogRecord;
         _ = try relation_names.Entry.decode(row.value);
         received += 1;
     }
-    expected = std.math.add(usize, expected, try verifyRelationRestoreRemainder(alloc, txn, group_id, &restores, &restored, null)) catch return error.InvalidCatalogRecord;
+    expected = std.math.add(usize, expected, try verifyRelationRestoreRemainder(alloc, txn, group_id, &restores, &restored, null, &registry)) catch return error.InvalidCatalogRecord;
     if (expected != received) return error.InvalidCatalogRecord;
 }
 
 fn verifyRelationCheckpointTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn) !void {
     verifyRelationCheckpointGroupsTxn(alloc, txn) catch |err| switch (err) {
-        error.InvalidCatalogRecord, error.InvalidCatalogName, error.NotFound, error.CatalogAlreadyExists, error.CatalogCommandTooLarge => return error.InvalidMetadataHACheckpoint,
+        error.InvalidCatalogRecord, error.InvalidCatalogName, error.InvalidMetadataIncarnation, error.CatalogSourceUntracked, error.NotFound, error.CatalogAlreadyExists, error.CatalogCommandTooLarge => return error.InvalidMetadataHACheckpoint,
         else => return err,
     };
 }
@@ -27911,6 +28250,11 @@ fn verifyReconciliationCheckpointTxn(txn: *docstore.DocStore.Txn) !void {
         while (entry) |row| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, row.key, prefix)) break;
             const record = (try r.classify(row.key)) orelse return error.InvalidCatalogRecord;
+            if (kind == .live) {
+                const live = try r.LiveRoot.decode(row.value);
+                if (!try RaftApplyStore.relationWriterEnabledTxn(txn, record.group_id) or
+                    !live.epoch.eql(try RaftApplyStore.relationSourceEpochTxn(txn, record.group_id))) return error.InvalidCatalogRecord;
+            }
             // Source-only groups are valid before any job. Validate their
             // point value without rescanning every candidate a second time;
             // the job pass verifies complete cuts, later passes catch orphans.

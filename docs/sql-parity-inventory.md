@@ -2017,6 +2017,37 @@ and 10 coordinator tests (57/57 build steps), without failures or leaks.
 Inventory, control-catalog, formatting and whitespace checks also pass; the
 original inventory remains 475 implemented, 136 rejected, 73 superseded and
 902 unresolved.
+Native writers now route prepared producer cuts into an installed live
+generation, updating its exact manifest in the same metadata transaction and
+command journal. They do not copy names at publication or fall back to obsolete
+standalone registry entries on a live miss. Native snapshots/checkpoints retain
+the manifest and independently authenticate the root's full active/pending
+entries against table, FK and restore cuts, including distinct-name coverage;
+the count/hash alone is not accepted as ownership authority. Recovery pins one
+registry per verification pass rather than reloading the root per table.
+Snapshot installation fences live-manifest retention, source incarnation and
+revision, and same-generation sequence monotonicity. Old registry bytes can
+remain physically present but cannot affect live reads or authenticated writes.
+Standby replay derives and checks complete before/after producer cuts for live
+generation keys, including deletions and older published roots while a newer
+candidate exists. Native coverage exercises pinned reads, schema/index rename,
+collision rollback, checkpoint export/import, self-consistent forged hashes/clocks,
+and reopen. Eight correctly framed replay fault variants cover missing writes,
+deletes/manifests, forged/extra owners, obsolete registry mutations, disabled
+writers and root swaps lacking receiver publication authority; rejection leaves
+the old root, namespace, receipts and notifications unchanged. The multi-target
+restore publication fixture now uses a live root for hidden reservations,
+promotion, validation failures and restart.
+Native activation remains deliberately incomplete: automatic capability-fenced
+writer adoption/root publication, receiver-side staged publication proof and
+public unqualified SQL resolution are not enabled. Replay rejects a root
+generation switch until that proof/capability protocol exists; it must not
+replace independent authority with a ready fingerprint or a full scan under
+the serialized apply lock. No original SQL case is credited for this integration.
+The final gate passes all 172 native catalog tests, 22 linked storage tests and
+10 coordinator tests (63/63 build steps); the 53 reconciliation and 27 name
+component tests also succeed from cache. Inventory, control-catalog, formatting
+and whitespace checks pass with the original dispositions unchanged.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,
