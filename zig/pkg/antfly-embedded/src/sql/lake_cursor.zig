@@ -134,7 +134,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
         estimated_rows +|= file.row_count;
         estimated_bytes +|= file.byte_len;
     }
-    return .{ .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .split_scan = Owner.splitScan, .split_ordered = Owner.splitOrdered, .close = Owner.close };
+    return .{ .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .split_scan = Owner.splitScan, .split_ordered = Owner.splitOrdered, .bind_execution = Owner.bindExecution, .close = Owner.close };
 }
 
 fn appendColumn(alloc: Allocator, columns: *std.ArrayList([]const u8), table: catalog.Table, name: []const u8) !void {
@@ -419,6 +419,16 @@ const Owner = struct {
         _ = self;
         return .{ .rows = output, .owned_arena = arena, .after = page.after };
     }
+    fn bindExecution(raw: *anyopaque, execution: *@import("../common/runnable_scheduler.zig").Execution) !void {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        // Only split children own independent source/reader state. The parent
+        // remains the statement's stable snapshot and authority owner.
+        const source = self.partition_source orelse return error.InvalidChildScanBinding;
+        const reader = source.scanner.shared_reader orelse return error.InvalidChildScanBinding;
+        self.stream.context = self.stream.context.withExecution(execution);
+        reader.context = reader.context.withExecution(execution);
+        reader.base.wait = reader.context.wait;
+    }
     fn splitOrdered(raw: *anyopaque, a: Allocator, maximum: usize) !?[]catalog.Cursor {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (self.stream.selection != null) return null;
@@ -534,6 +544,7 @@ const Owner = struct {
                 if (source.delete_lease) |lease| lease.release() else if (source.prepared_deletes) |prepared| prepared.destroy(source.alloc);
             }
             if (self.partition_versions_owned) freeVersionState(self.alloc, source);
+            source.scanner.shared_reader.?.drain(true);
             self.alloc.destroy(source.scanner.shared_reader.?);
             self.alloc.destroy(source);
         }
@@ -644,6 +655,9 @@ const TestLake = struct {
         active: usize = 0,
         peak: usize = 0,
         delay_reads: bool = false,
+        execution_owner: ?*@import("../common/runnable_scheduler.zig").Scheduler = null,
+        parked_reads: std.atomic.Value(usize) = .init(0),
+        control_reads: std.atomic.Value(usize) = .init(0),
         mutex: std.atomic.Mutex = .unlocked,
         fn lock(self: *Meter) void {
             while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -678,6 +692,15 @@ const TestLake = struct {
                 self.mutex.unlock();
             }
             if (self.delay_reads) try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+            if (self.execution_owner) |scheduler| {
+                if (scheduler.stats().runnable_slots == 0 and scheduler.stats().resource_blocked >= 2)
+                    _ = self.parked_reads.fetchAdd(1, .monotonic);
+                var control: @import("../common/runnable_scheduler.zig").Execution = .{};
+                try control.start(scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+                defer control.finish();
+                try control.checkpoint();
+                _ = self.control_reads.fetchAdd(1, .monotonic);
+            }
             const result = try base.getObject(bucket, key, options);
             self.lock();
             self.bytes += result.body.len;
@@ -1594,4 +1617,79 @@ test "lake SQL candidate windows share owned projected reader plans after cursor
         }
         previous = plan;
     }
+}
+
+test "lake SQL scoped ordered cursors park physical object reads and retire independent contexts" {
+    const Runnable = @import("../common/runnable_scheduler.zig");
+    const Parallel = @import("parallel_scheduler.zig");
+    const Worker = struct {
+        parent: *Runnable.Execution,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.parent.checkpoint();
+            try self.parent.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.parent.enter(.query);
+        }
+        fn scan(cursor: catalog.Cursor, execution: *Runnable.Execution) anyerror!usize {
+            defer cursor.close(cursor.ptr);
+            try cursor.bind_execution.?(cursor.ptr, execution);
+            const child: *Owner = @ptrCast(@alignCast(cursor.ptr));
+            try std.testing.expect(child.stream.context.execution == execution);
+            try std.testing.expect(child.partition_source.?.scanner.shared_reader.?.context.execution == execution);
+            var count: usize = 0;
+            while (true) {
+                const page = try cursor.next(cursor.ptr, std.testing.allocator, 2);
+                defer page.deinit();
+                for (page.rows) |row| {
+                    try std.testing.expect(row.value.object.get("amount").?.integer >= 1);
+                    count += 1;
+                }
+                if (page.after == null) break;
+            }
+            return count;
+        }
+        fn discard(_: Allocator, _: usize) void {}
+    };
+    const a = std.testing.allocator;
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 3, &.{ 1, 2, 3 });
+    defer lake.deinit(a);
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
+    var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+    var parent_execution: Runnable.Execution = .{};
+    try parent_execution.start(&scheduler, .{ .io = std.testing.io }, .query);
+    defer parent_execution.finish();
+    var worker = Worker{ .parent = &parent_execution };
+    const scope = Parallel.ExecutionScope{ .execution = &parent_execution, .allocator = a, .io = std.testing.io, .wait = .{ .ptr = &worker, .begin = Worker.begin, .end = Worker.end } };
+    const parent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 4 }, .{}, &lake.source);
+    defer parent.close(parent.ptr);
+    const children = (try parent.split_ordered.?(parent.ptr, a, 2)).?;
+    var published: usize = 0;
+    defer {
+        for (children[published..]) |child| child.close(child.ptr);
+        a.free(children);
+    }
+    lake.meter.execution_owner = &scheduler;
+    var count: usize = 0;
+    for (children) |child| {
+        var task = (try scope.submit(8 * 1024 * 1024, a, Worker.scan, .{child}, Worker.discard)).?;
+        published += 1;
+        defer if (task.future != null) {
+            _ = task.cancel(std.testing.io) catch {};
+        };
+        count += try task.await(std.testing.io);
+        try parent_execution.checkpoint();
+        try std.testing.expectEqual(@as(usize, 0), parent_execution.entry.?.children);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        try std.testing.expect(lake.source.scanner.shared_reader.?.context.execution == null);
+        try std.testing.expect(lake.source.scanner.shared_reader.?.context.wait == null);
+    }
+    try std.testing.expectEqual(@as(usize, 9), count);
+    try std.testing.expect(lake.meter.parked_reads.load(.acquire) > 0);
+    try std.testing.expectEqual(lake.meter.reads, lake.meter.control_reads.load(.acquire));
 }

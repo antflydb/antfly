@@ -243,6 +243,10 @@ pub const Cursor = struct {
     /// Provider estimate of retained metadata per ordered child. Planning
     /// limits fan-out before cloning a large immutable inventory.
     ordered_split_bytes: usize = 0,
+    /// Explicit capability for an exclusively owned scan child. The provider
+    /// replaces mutable parent callbacks with this worker's independent CPU/IO
+    /// receiver and closes the cursor before that receiver physically retires.
+    bind_execution: ?*const fn (*anyopaque, *@import("../common/runnable_scheduler.zig").Execution) anyerror!void = null,
     /// Exact snapshot count; null means the retained cursor must be scanned.
     /// Providers may use metadata only after accounting for filters/deletes.
     count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,

@@ -28,6 +28,7 @@ const Allocator = std.mem.Allocator;
 pub const ObjectStorageRangeReader = struct {
     client: object_storage.ObjectStorage,
     retry_policy: RetryPolicy = .{},
+    wait: ?@import("../../sql/execution_wait.zig").Boundary = null,
     cancellation: ?object_storage.CancellationToken = null,
 
     pub const RetryPolicy = struct {
@@ -91,6 +92,10 @@ pub const ObjectStorageRangeReader = struct {
         return try alloc.dupe(u8, result.body);
     }
 
+    fn discardRead(value: object_storage.GetResult, alloc: Allocator) void {
+        var result = value;
+        result.deinit(alloc);
+    }
     fn getObjectWithRetry(
         self: *@This(),
         alloc: Allocator,
@@ -107,7 +112,7 @@ pub const ObjectStorageRangeReader = struct {
             attempt += 1;
             var client = self.client;
             client.allocator = alloc;
-            return client.getObject(bucket, key, options) catch |err| {
+            return @import("../../sql/execution_wait.zig").runOwned(self.wait, object_storage.ObjectStorage.getObject, .{ &client, bucket, key, options }, discardRead, .{alloc}) catch |err| {
                 if (attempt >= max_attempts or !isRetryableObjectReadError(err)) return err;
                 continue;
             };

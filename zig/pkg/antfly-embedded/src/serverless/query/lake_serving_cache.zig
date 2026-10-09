@@ -447,7 +447,7 @@ pub const Cache = struct {
                     defer self.finish(waiting, io);
                     while (!waiting.flight.event.isSet()) {
                         try context.ensureActive();
-                        waiting.flight.event.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| switch (err) {
+                        @import("../../sql/execution_wait.zig").run(context.wait, std.Io.Event.waitTimeout, .{ &waiting.flight.event, io, std.Io.Timeout{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } } }) catch |err| switch (err) {
                             error.Timeout => continue,
                             else => return err,
                         };
@@ -583,11 +583,26 @@ pub const Reader = struct {
         for (reads[0..@min(reads.len, self.pending.len)], 0..) |read, i| {
             if (read.range.len > 32 * 1024 * 1024 -| self.prefetch_bytes) break;
             self.prefetch_bytes += @intCast(read.range.len);
-            self.pending[i] = @import("../../sql/parallel_scheduler.zig").global().submit(io, @intCast(read.range.len *| 2), warm, .{ self, read }) orelse break;
+            self.pending[i] = if (self.context.execution) |execution|
+                try (@import("../../sql/parallel_scheduler.zig").ExecutionScope{ .execution = execution, .allocator = self.cache.alloc, .io = io, .wait = @import("../../sql/spill.zig").childWait(execution) }).submit(@intCast(read.range.len *| 2), self.cache.alloc, warmChild, .{ self, read }, discardWarm)
+            else
+                @import("../../sql/parallel_scheduler.zig").global().submit(io, @intCast(read.range.len *| 2), warm, .{ self, read });
+            if (self.pending[i] == null) break;
         }
     }
+    fn warmChild(self: *Reader, read: ranges.RangeRead, execution: *@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
+        return self.warmFor(read, execution);
+    }
+    fn discardWarm(_: Allocator, _: void) void {}
     fn warm(self: *Reader, read: ranges.RangeRead) anyerror!void {
+        return self.warmFor(read, null);
+    }
+    fn warmFor(self: *Reader, read: ranges.RangeRead, execution: ?*@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
         var worker: Reader = .{ .cache = self.cache, .base = self.base, .scope = self.scope, .context = self.context };
+        if (execution) |child| {
+            worker.context = self.context.withExecution(child);
+            worker.base.wait = worker.context.wait;
+        }
         const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = prefetchCanceled };
         worker.context.cancellation = token;
         worker.base.cancellation = token;
@@ -602,7 +617,7 @@ pub const Reader = struct {
     fn prefetchCanceled(raw: *const anyopaque) bool {
         const self: *const Reader = @ptrCast(@alignCast(raw));
         if (self.prefetch_cancelled.load(.acquire)) return true;
-        self.context.ensureActive() catch return true;
+        self.context.checkLifetime() catch return true;
         return false;
     }
     /// Prefetch failures are speculative. Required reads preserve their own
@@ -702,7 +717,7 @@ pub const Reader = struct {
                     defer self.cache.finish(waiting, io);
                     while (!waiting.flight.event.isSet()) {
                         try self.context.ensureActive();
-                        waiting.flight.event.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| switch (err) {
+                        @import("../../sql/execution_wait.zig").run(self.context.wait, std.Io.Event.waitTimeout, .{ &waiting.flight.event, io, std.Io.Timeout{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } } }) catch |err| switch (err) {
                             error.Timeout => continue,
                             else => return err,
                         };

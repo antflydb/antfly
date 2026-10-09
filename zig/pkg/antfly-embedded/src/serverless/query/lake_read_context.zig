@@ -24,9 +24,24 @@ pub const Context = struct {
     deadline_ns: ?u64 = null,
     cancellation: ?storage.CancellationToken = null,
     checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
-    pub fn ensureActive(self: Context) !void {
+    execution: ?*@import("../../common/runnable_scheduler.zig").Execution = null,
+    wait: ?@import("../../sql/execution_wait.zig").Boundary = null,
+    pub fn withExecution(self: Context, execution: *@import("../../common/runnable_scheduler.zig").Execution) Context {
+        var child = self;
+        child.execution = execution;
+        child.wait = @import("../../sql/spill.zig").childWait(execution);
+        child.checkpoint = .{ .ptr = execution, .check = executionCheckpoint };
+        return child;
+    }
+    fn executionCheckpoint(raw: *anyopaque) !void {
+        try @as(*@import("../../common/runnable_scheduler.zig").Execution, @ptrCast(@alignCast(raw))).checkpoint();
+    }
+    pub fn checkLifetime(self: Context) !void {
         if (self.cancellation) |token| try token.check();
         if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+    }
+    pub fn ensureActive(self: Context) !void {
+        try self.checkLifetime();
         if (self.checkpoint) |hook| try hook.check(hook.ptr);
     }
 };

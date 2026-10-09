@@ -136,6 +136,9 @@ pub const Join = struct {
     // Parent-owned Join retains every prepared result and closes it on errors;
     // task result is only status, with no separately transferred allocation.
     fn discardStatus(_: A, _: bool) void {}
+    fn retiredOutput(args: anytype, failure: ?anyerror) void {
+        if (failure != null) args[0].output.?.abort(failure);
+    }
     fn spoolPartition(self: *Join, file: *@import("parallel_output.zig").Pipe) !void {
         const evaluation = self.evaluation.?;
         var arena = std.heap.ArenaAllocator.init(self.a);
@@ -241,7 +244,7 @@ pub const Join = struct {
                 if (self.evaluation != null) {
                     child.output = try @import("parallel_output.zig").Pipe.create(self.manager, child.limits.bytes / 64);
                     child.output_task = if (self.manager.cpu_scope) |scope|
-                        try scope.submit(child.limits.bytes +| @sizeOf(Join), self.a, Join.executeChild, .{child}, discardStatus)
+                        try scope.submitNotified(child.limits.bytes +| @sizeOf(Join), self.a, Join.executeChild, .{child}, discardStatus, retiredOutput)
                     else
                         self.manager.submit(child.limits.bytes, Join.executePartition, .{child});
                     if (child.output_task == null) {

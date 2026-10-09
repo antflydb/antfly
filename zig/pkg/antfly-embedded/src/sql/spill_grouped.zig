@@ -51,6 +51,9 @@ pub const Grouped = struct {
             return self.run();
         }
         fn discard(_: Allocator, _: void) void {}
+        fn retired(args: anytype, failure: ?anyerror) void {
+            if (failure != null) args[0].output.?.abort(failure);
+        }
         fn reduceInto(self: *Reduction, output: *@import("parallel_output.zig").Pipe) !void {
             var arena = std.heap.ArenaAllocator.init(self.child.a);
             defer arena.deinit();
@@ -213,7 +216,7 @@ pub const Grouped = struct {
                 self.partitions[index] = null;
                 job.output = try @import("parallel_output.zig").Pipe.create(self.sort.manager, self.bytes / 128);
                 job.task = if (self.sort.manager.cpu_scope) |scope|
-                    try scope.submit(workspace +| @sizeOf(Reduction), self.a, Reduction.runChild, .{job}, Reduction.discard)
+                    try scope.submitNotified(workspace +| @sizeOf(Reduction), self.a, Reduction.runChild, .{job}, Reduction.discard, Reduction.retired)
                 else
                     self.sort.manager.submit(workspace, Reduction.run, .{job});
                 if (job.task == null) {

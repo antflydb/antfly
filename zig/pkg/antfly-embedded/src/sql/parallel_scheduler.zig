@@ -32,6 +32,13 @@ pub const ExecutionScope = struct {
     wait: @import("execution_wait.zig").Boundary,
 
     pub fn submit(self: ExecutionScope, bytes: usize, result_allocator: A, comptime function: anytype, args: anytype, comptime discard: anytype) !?Task(@TypeOf(@call(.auto, function, args ++ .{@as(*Runnable.Execution, undefined)}))) {
+        return self.submitNotified(bytes, result_allocator, function, args, discard, ignoreRetirement);
+    }
+    fn ignoreRetirement(_: anytype, _: ?anyerror) void {}
+    /// Mandatory notification runs even if activation fails before application
+    /// code starts. Streaming consumers can close their queues and then join;
+    /// no new CPU grant is required merely to publish terminal ownership.
+    pub fn submitNotified(self: ExecutionScope, bytes: usize, result_allocator: A, comptime function: anytype, args: anytype, comptime discard: anytype, comptime retired: anytype) !?Task(@TypeOf(@call(.auto, function, args ++ .{@as(*Runnable.Execution, undefined)}))) {
         const Result = @TypeOf(@call(.auto, function, args ++ .{@as(*Runnable.Execution, undefined)}));
         const retained = std.math.add(u64, bytes, @sizeOf(ScopeControl)) catch return error.InvalidRunnableDemand;
         const control = try self.allocator.create(ScopeControl);
@@ -50,6 +57,11 @@ pub const ExecutionScope = struct {
                 if (result) |value| discard(allocator, value) else |_| {}
             }
             fn run(owner: *ScopeControl, arguments: @TypeOf(args)) Result {
+                const result = execute(owner, arguments);
+                retired(arguments, if (result) |_| null else |err| err);
+                return result;
+            }
+            fn execute(owner: *ScopeControl, arguments: @TypeOf(args)) Result {
                 try owner.execution.activateChild();
                 // Finished CPU work still retains metadata and result ownership
                 // until joining, but must not prevent the coordinator resuming.
@@ -448,4 +460,66 @@ test "SQL adaptive fanout respects useful work, occupied leases and workspace" {
     try std.testing.expectEqual(@as(usize, 1), scheduler.fanout(16, 1024, 128));
     scheduler.release(896);
     try std.testing.expectEqual(@as(usize, 8), scheduler.fanout(16, 1024, 128));
+}
+
+test "SQL scoped streaming retirement notifies before activation failure and preserves the coordinator" {
+    const Clock = struct {
+        var now_ns: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return now_ns.load(.acquire);
+        }
+    };
+    const Fixture = struct {
+        parent: *Runnable.Execution,
+        calls: std.atomic.Value(usize) = .init(0),
+        retired: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.parent.checkpoint();
+            try self.parent.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.parent.enter(.query);
+        }
+        fn work(self: *@This(), _: *Runnable.Execution) anyerror!void {
+            _ = self.calls.fetchAdd(1, .monotonic);
+        }
+        fn notify(args: anytype, failure: ?anyerror) void {
+            const self: *@This() = args[0];
+            self.failure = failure;
+            self.retired.set(std.testing.io);
+        }
+        fn discard(_: A, _: void) void {}
+    };
+    Clock.now_ns.store(0, .release);
+    var owner = try Runnable.Scheduler.init(.{ .slots = 2, .max_wait_ms = 10 });
+    var parent: Runnable.Execution = .{};
+    try parent.start(&owner, .{ .io = std.testing.io, .native_now_ns = Clock.now }, .query);
+    defer parent.finish();
+    var fixture = Fixture{ .parent = &parent };
+    const scope = ExecutionScope{ .execution = &parent, .allocator = std.testing.allocator, .io = std.testing.io, .wait = .{ .ptr = &fixture, .begin = Fixture.begin, .end = Fixture.end } };
+    var task = (try scope.submitNotified(8192, std.testing.allocator, Fixture.work, .{&fixture}, Fixture.discard, Fixture.notify)).?;
+    defer if (task.future != null) {
+        _ = task.cancel(std.testing.io) catch {};
+    };
+    var queued = false;
+    for (0..2000) |_| {
+        if (owner.stats().queued != 0) {
+            queued = true;
+            break;
+        }
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expect(queued);
+    Clock.now_ns.store(10 * std.time.ns_per_ms, .release);
+    try fixture.retired.waitTimeout(std.testing.io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(2) } });
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls.load(.acquire));
+    try std.testing.expectEqual(error.RunnableWaitTimeout, fixture.failure.?);
+    try std.testing.expectEqual(@as(usize, 1), parent.entry.?.children);
+    try std.testing.expectError(error.RunnableWaitTimeout, task.await(std.testing.io));
+    try parent.checkpoint();
+    try std.testing.expectEqual(@as(usize, 0), parent.entry.?.children);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
 }

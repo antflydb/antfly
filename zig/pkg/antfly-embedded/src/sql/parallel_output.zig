@@ -199,6 +199,12 @@ pub const Pipe = struct {
         for (@constCast(row.keys)) |*value| value.* = try operators.cloneDatum(a, value.*);
         return row;
     }
+    /// Terminal notification must also work when a producer never activated.
+    /// Its pending block remains producer-owned until the physical join.
+    pub fn abort(self: *Pipe, failure: ?anyerror) void {
+        self.terminal_error = self.terminal_error orelse failure;
+        self.stop();
+    }
     pub fn stop(self: *Pipe) void {
         self.queue.close(self.manager.io);
     }

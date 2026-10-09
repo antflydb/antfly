@@ -1391,7 +1391,13 @@ pub const Adapter = struct {
                 .estimated_rows = child.estimated_rows,
                 .estimated_bytes = child.estimated_bytes,
                 .ordered_split_bytes = child.ordered_split_bytes,
+                .bind_execution = if (child.bind_execution != null) bindExecution else null,
             };
+        }
+        fn bindExecution(raw: *anyopaque, execution: *http_server.RunnableScheduler.Execution) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const child = self.statement.cursors[0];
+            try child.bind_execution.?(child.ptr, execution);
         }
         fn countRows(raw: *anyopaque) !?u64 {
             const self: *@This() = @ptrCast(@alignCast(raw));
