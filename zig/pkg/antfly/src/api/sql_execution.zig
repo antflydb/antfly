@@ -1847,8 +1847,10 @@ pub const Adapter = struct {
         try self.context.ensureActive();
         if (self.context.execution_team) |team| {
             if (team.state == .active) return error.InvalidRunnableTransition;
-            const execution_backend = self.server.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
-            const io = execution_backend.io() orelse return error.SqlWriteCapacityUnavailable;
+            // The durable executor is supplied by its owner across the kernel
+            // boundary. An unavailable imported capability is authoritative;
+            // never reconstruct its Threaded vtable from the raw runtime.
+            const io = http_server.ApiHttpServer.configuredDurableIo(self.server.cfg) orelse return error.SqlWriteCapacityUnavailable;
             const runtime = @import("antfly_runtime_abi");
             const borrowed_io = runtime.native_abi.IoBorrow.init(&io);
             var completion = NativeBatchCompletion{ .adapter = self, .alloc = alloc, .table_name = table_name, .batch = batch };
@@ -3950,55 +3952,87 @@ test "SQL stateless completion reserves before native entry and owns ambiguous r
             return .{ .committed = .{ .participant_count = 1 } };
         }
     };
-    for (0..8) |scenario| {
-        const alloc = std.testing.allocator;
-        var threaded = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(if (scenario == 4) 0 else 2) });
-        defer threaded.deinit();
-        Fake.completion_now.store(0, .release);
-        var io_vtable = threaded.io().vtable.*;
-        io_vtable.now = Fake.now;
-        const io: std.Io = .{ .userdata = threaded.io().userdata, .vtable = &io_vtable };
-        var backend = try background.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = io } });
-        defer backend.deinit();
-        var scheduling = try scheduler.Scheduler.init(.{ .slots = 3 });
-        var execution: scheduler.Execution = .{};
-        defer execution.finish();
-        var signal = std.atomic.Value(bool).init(false);
-        const original_deadline = platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
-        try execution.start(&scheduling, .{ .io = std.testing.io, .deadline_ns = original_deadline, .native_now_ns = platform_time.monotonicNs, .cancellation = .{ .ptr = &signal, .requested = Fake.canceled } }, .write);
-        var memory: @import("../common/allocation_budget.zig").Shared = .{ .child = alloc, .limit = if (scenario == 0) 0 else 16384 };
-        var bridge = try @import("runnable_write_team.zig").Completion.init(&execution, memory.allocator());
-        var team = try bridge.team();
-        var fake = Fake{ .scheduling = &scheduling, .signal = &signal, .scenario = scenario };
-        var server = http_server.ApiHttpServer.init(alloc, .{ .backend_runtime = &backend }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, null, .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .commit_batch_with_control = Fake.commit } });
-        defer server.deinit();
-        var identity: ?http_server.AuthenticatedIdentity = null;
-        var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{ .execution_team = &team, .deadline_ns = original_deadline, .cancellation = .fromAtomic(&signal) } };
-        if (scenario == 7) adapter.context.deadline_ns = platform_time.monotonicNs() -| 1;
-        fake.expected = distributed.CommitControl.fromRequest(adapter.context);
-        if (scenario == 3) signal.store(true, .release);
-        const result = adapter.completeNativeBatch(alloc, "docs", .{ .schema_version = 7, .writes = &.{.{ .key = "a", .value = "{\"id\":1}" }} });
-        if (scenario == 0) {
-            try std.testing.expectError(error.OutOfMemory, result);
-        } else if (scenario == 3) {
-            try std.testing.expectError(error.Canceled, result);
-        } else if (scenario == 4) {
-            try std.testing.expectError(error.ConcurrencyUnavailable, result);
-        } else if (scenario == 7) {
-            try std.testing.expectError(error.DeadlineExceeded, result);
-        } else {
-            var response = try result;
-            defer response.deinit(alloc);
-            if (scenario == 5 or scenario == 6) {
-                try std.testing.expectEqual(@as(u16, 409), response.status);
-                const failure = classifyMutationFailure(response.status, response.body);
-                try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, failure.err);
-                try std.testing.expectEqualDeep(@as(?[32]u8, "00112233445566778899aabbccddeeff".*), failure.transaction_id);
-            } else try std.testing.expectEqual(@as(u16, 201), response.status);
+    const Forward = struct {
+        const Dispatch = @FieldType(runtime.native_abi.IoBorrow, "dispatch");
+        var owner_dispatch: Dispatch = undefined;
+        var calls: std.atomic.Value(usize) = .init(0);
+        const P = @typeInfo(@typeInfo(Dispatch).pointer.child).@"fn".param_types;
+        fn dispatch(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?, f: P[5].?) callconv(.c) void {
+            _ = calls.fetchAdd(1, .monotonic);
+            owner_dispatch(a, b, c, d, e, f);
         }
-        try std.testing.expectEqual(@as(usize, if (scenario == 0 or scenario == 3 or scenario == 4 or scenario == 7) 0 else 1), fake.calls);
-        try std.testing.expectEqual(@as(usize, 0), memory.stats().used_bytes);
-        try std.testing.expectEqual(@as(usize, 1), scheduling.stats().operations);
+    };
+    // Exercise the same admission, cancellation, expiry and ambiguous-outcome
+    // matrix with native IO, foreign C-dispatch IO, and unavailable durable IO.
+    for (0..3) |mode| {
+        for (0..8) |scenario| {
+            const alloc = std.testing.allocator;
+            var threaded = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(if (scenario == 4) 0 else 2) });
+            defer threaded.deinit();
+            Fake.completion_now.store(0, .release);
+            var io_vtable = threaded.io().vtable.*;
+            io_vtable.now = Fake.now;
+            const io: std.Io = .{ .userdata = threaded.io().userdata, .vtable = &io_vtable };
+            var imported_borrow = runtime.native_abi.IoBorrow.init(&io);
+            Forward.owner_dispatch = imported_borrow.dispatch;
+            Forward.calls.store(0, .release);
+            imported_borrow.dispatch = Forward.dispatch;
+            var receiver = try imported_borrow.receive();
+            const imported_io = receiver.io();
+            try std.testing.expect(imported_io.vtable != io.vtable);
+            var backend = try background.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = io } });
+            defer backend.deinit();
+            var scheduling = try scheduler.Scheduler.init(.{ .slots = 3 });
+            var execution: scheduler.Execution = .{};
+            defer execution.finish();
+            var signal = std.atomic.Value(bool).init(false);
+            const original_deadline = platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+            try execution.start(&scheduling, .{ .io = std.testing.io, .deadline_ns = original_deadline, .native_now_ns = platform_time.monotonicNs, .cancellation = .{ .ptr = &signal, .requested = Fake.canceled } }, .write);
+            var memory: @import("../common/allocation_budget.zig").Shared = .{ .child = alloc, .limit = if (scenario == 0) 0 else 16384 };
+            var bridge = try @import("runnable_write_team.zig").Completion.init(&execution, memory.allocator());
+            var team = try bridge.team();
+            var fake = Fake{ .scheduling = &scheduling, .signal = &signal, .scenario = scenario };
+            var server = http_server.ApiHttpServer.init(alloc, .{ .backend_runtime = &backend }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, null, .{ .ptr = &fake, .vtable = &.{ .batch = Fake.batch, .commit_batch_with_control = Fake.commit } });
+            defer server.deinit();
+            var identity: ?http_server.AuthenticatedIdentity = null;
+            var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{ .execution_team = &team, .deadline_ns = original_deadline, .cancellation = .fromAtomic(&signal) } };
+            if (scenario == 7) adapter.context.deadline_ns = platform_time.monotonicNs() -| 1;
+            fake.expected = distributed.CommitControl.fromRequest(adapter.context);
+            if (scenario == 3) signal.store(true, .release);
+            if (mode != 0) {
+                server.cfg.imported_runtime_io = .{ .api = io, .api_network = io, .api_filesystem = io, .durable = if (mode == 1) imported_io else null };
+                // All setup and unrelated teardown retain their ordinary owner.
+                // Only completion executes with a deliberately inaccessible pointer.
+                server.cfg.backend_runtime = @ptrFromInt(0x1000);
+            }
+            const result = adapter.completeNativeBatch(alloc, "docs", .{ .schema_version = 7, .writes = &.{.{ .key = "a", .value = "{\"id\":1}" }} });
+            server.cfg.backend_runtime = &backend;
+            if (mode == 2 and scenario != 3 and scenario != 7) {
+                try std.testing.expectError(error.SqlWriteCapacityUnavailable, result);
+            } else if (scenario == 0) {
+                try std.testing.expectError(error.OutOfMemory, result);
+            } else if (scenario == 3) {
+                try std.testing.expectError(error.Canceled, result);
+            } else if (scenario == 4) {
+                try std.testing.expectError(error.ConcurrencyUnavailable, result);
+            } else if (scenario == 7) {
+                try std.testing.expectError(error.DeadlineExceeded, result);
+            } else {
+                var response = try result;
+                defer response.deinit(alloc);
+                if (scenario == 5 or scenario == 6) {
+                    try std.testing.expectEqual(@as(u16, 409), response.status);
+                    const failure = classifyMutationFailure(response.status, response.body);
+                    try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, failure.err);
+                    try std.testing.expectEqualDeep(@as(?[32]u8, "00112233445566778899aabbccddeeff".*), failure.transaction_id);
+                } else try std.testing.expectEqual(@as(u16, 201), response.status);
+            }
+            try std.testing.expectEqual(@as(usize, if (mode == 2 or scenario == 0 or scenario == 3 or scenario == 4 or scenario == 7) 0 else 1), fake.calls);
+            if (mode == 1 and scenario != 3 and scenario != 7) try std.testing.expect(Forward.calls.load(.acquire) != 0);
+            if (mode == 2) try std.testing.expectEqual(@as(usize, 0), Forward.calls.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), memory.stats().used_bytes);
+            try std.testing.expectEqual(@as(usize, 1), scheduling.stats().operations);
+        }
     }
 }
 
