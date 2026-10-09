@@ -490,7 +490,10 @@ pub const Scheduler = struct {
         // A blocked operation still owns its reservations, but cancellation,
         // expiry or family failure must be observed before dispatch can grant
         // CPU. Waiting checks authority again after any actual suspension.
-        try self.checkAuthority(e);
+        self.checkAuthority(e) catch |err| {
+            self.failWait(e, err, true);
+            return err;
+        };
         const now = e.options.now();
         self.lock();
         defer self.mutex.unlock();
@@ -943,7 +946,10 @@ pub const Execution = struct {
         }
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, false);
-        try owner.checkAuthority(e);
+        owner.checkAuthority(e) catch |err| {
+            owner.failWait(e, err, true);
+            return err;
+        };
         try owner.reclassifyBlocked(e, class);
         try owner.unblock(e);
         try owner.waitRetained(e);

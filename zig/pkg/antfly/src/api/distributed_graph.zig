@@ -15591,7 +15591,14 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
                 .raw = .fromNanoseconds(10 * std.time.ns_per_ms),
             }, state.io_impl.io());
 
-            try std.testing.expectEqual(@as(usize, 1), req.frontier.len);
+            // Entity-owned outgoing rows may reside on either source shard,
+            // so each owner receives the full frontier. This fixture owns one
+            // edge per shard and must return its matching frontier identity.
+            try std.testing.expectEqual(@as(usize, 2), req.frontier.len);
+            const owner_key = if (group_id == 11) "doc:a" else "doc:n";
+            const owner_frontier = for (req.frontier) |item| {
+                if (std.mem.eql(u8, item.key, owner_key)) break item;
+            } else return error.TestMissingOwnerFrontier;
             const node_key = if (group_id == 11) "doc:b" else "doc:o";
             const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
             nodes[0] = .{
@@ -15603,8 +15610,8 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
             };
             const expansions = try alloc.alloc(GraphExpansion, 1);
             expansions[0] = .{
-                .frontier_id = req.frontier[0].id,
-                .frontier_key = try alloc.dupe(u8, req.frontier[0].key),
+                .frontier_id = owner_frontier.id,
+                .frontier_key = try alloc.dupe(u8, owner_frontier.key),
                 .graph_result = .{
                     .name = try alloc.dupe(u8, req.name),
                     .nodes = nodes,
