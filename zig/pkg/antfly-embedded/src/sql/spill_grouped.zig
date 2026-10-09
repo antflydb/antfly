@@ -42,7 +42,9 @@ pub const Grouped = struct {
         fn runChild(self: *Reduction, execution: *@import("../common/runnable_scheduler.zig").Execution) anyerror!void {
             self.child.sort.execution = execution;
             defer self.child.sort.execution = null;
-            for (&self.child.partitions) |*file| if (file.*) |*open| open.file.execution = execution;
+            for (&self.child.partitions) |*file| {
+                if (file.*) |*open| open.file.execution = execution;
+            }
             self.output.?.producer_execution = execution;
             defer self.output.?.producer_execution = null;
             // run closes every exclusive child file before this scope retires.
