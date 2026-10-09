@@ -264,6 +264,26 @@ pub const SearchTextStatsExecutor = struct {
         alloc: Allocator,
         keys: []const []const u8,
     ) anyerror![]?[]u8 = null,
+    load_many_stored_controlled: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        keys: []const []const u8,
+        controls: types.SearchRequest,
+    ) anyerror![]?[]u8 = null,
+
+    fn loadManyStored(self: @This(), alloc: Allocator, keys: []const []const u8) ![]?[]u8 {
+        try checkSearchRequestDeadline(self.controls);
+        const loaded = if (self.load_many_stored_controlled) |load|
+            try load(self.ctx, alloc, keys, self.controls)
+        else blk: {
+            if (self.controls.execution_runnable != null or self.controls.execution_deadline_ns != null or self.controls.cancellation != null)
+                return error.ExecutionWaitUnsupported;
+            break :blk try (self.load_many_stored orelse return error.ExecutionWaitUnsupported)(self.ctx, alloc, keys);
+        };
+        errdefer freeOptionalOwnedBytes(alloc, loaded);
+        try checkSearchRequestDeadline(self.controls);
+        return loaded;
+    }
 };
 
 pub const ExplicitTextStatRequest = control_contract.ExplicitTextStatRequest;
@@ -12726,9 +12746,9 @@ fn collectFilteredExplicitTextStats(
     // duplicated source JSON. Hydrate only the filtered documents from the
     // primary store, preserving exact projection without a full-index postings
     // scan or restoring the duplicate text-segment copy.
-    if (executor.load_many_stored) |load_many| {
+    if (executor.load_many_stored != null or executor.load_many_stored_controlled != null) {
         try checkSearchRequestDeadline(executor.controls);
-        const loaded = try load_many(executor.ctx, alloc, selected_doc_keys.items);
+        const loaded = try executor.loadManyStored(alloc, selected_doc_keys.items);
         defer freeOptionalOwnedBytes(alloc, loaded);
         if (loaded.len != selected_doc_keys.items.len) return error.InvalidData;
         for (loaded) |maybe_stored| {
@@ -32402,4 +32422,49 @@ test "external lake signed native datetime cursors retain their concrete domain"
         try std.testing.expectEqual(@as(i128, -1), key.datetime_ns);
         try std.testing.expectEqual(std.math.Order.lt, compareSortValues(key, .{ .datetime_ns = 0 }));
     }
+}
+
+test "statistics primary hydration adapter preserves controls and retires rejected publication" {
+    const Fixture = struct {
+        canceled: bool = false,
+        cancel_on_return: bool = false,
+        legacy_calls: usize = 0,
+        deadline: u64,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).canceled;
+        }
+        fn entry(_: ?*anyopaque, _: ?[]const u8) !?*index_manager_mod.IndexManager.TextIndex {
+            return error.TestUnexpectedResult;
+        }
+        fn legacy(raw: ?*anyopaque, _: Allocator, _: []const []const u8) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.legacy_calls += 1;
+            return error.TestUnexpectedResult;
+        }
+        fn controlled(raw: ?*anyopaque, a: Allocator, keys: []const []const u8, controls: types.SearchRequest) ![]?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(@as(?u64, self.deadline), controls.execution_deadline_ns);
+            try std.testing.expect(controls.cancellation.?.ptr == @as(*const anyopaque, @ptrCast(self)));
+            try std.testing.expectEqualStrings("doc:a", keys[0]);
+            const rows = try a.alloc(?[]u8, 1);
+            @memset(rows, null);
+            errdefer freeOptionalOwnedBytes(a, rows);
+            rows[0] = try a.dupe(u8, "stored alpha");
+            if (self.cancel_on_return) self.canceled = true;
+            return rows;
+        }
+        fn run(a: Allocator) !void {
+            var fixture: @This() = .{ .deadline = platform_time.monotonicNs() + 60 * std.time.ns_per_s };
+            var executor: SearchTextStatsExecutor = .{ .ctx = &fixture, .text_index_entry = entry, .load_many_stored = legacy, .controls = .{ .execution_deadline_ns = fixture.deadline, .cancellation = .{ .ptr = &fixture, .is_cancelled_fn = requested } } };
+            try std.testing.expectError(error.ExecutionWaitUnsupported, executor.loadManyStored(a, &.{"doc:a"}));
+            try std.testing.expectEqual(@as(usize, 0), fixture.legacy_calls);
+            executor.load_many_stored_controlled = controlled;
+            const rows = try executor.loadManyStored(a, &.{"doc:a"});
+            defer freeOptionalOwnedBytes(a, rows);
+            try std.testing.expectEqualStrings("stored alpha", rows[0].?);
+            fixture.cancel_on_return = true;
+            try std.testing.expectError(error.Cancelled, executor.loadManyStored(a, &.{"doc:a"}));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

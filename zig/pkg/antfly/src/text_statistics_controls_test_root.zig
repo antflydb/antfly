@@ -144,3 +144,83 @@ test "text statistics trusted controls cross checked callbacks and retire reject
         try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
     };
 }
+
+fn checkReadBudget(req: types.SearchRequest) !void {
+    if (req.execution_runnable) |borrow| try checked(borrow);
+    if (req.cancellation) |token| try token.check();
+    if (req.execution_deadline_ns) |deadline| if (clock.monotonicNs() >= deadline) return error.DeadlineExceeded;
+}
+
+test "text statistics trusted controls retain original authority during primary read admission waits" {
+    const Budget = sources.common_read_execution_budget.Budget(types.SearchRequest, checkReadBudget);
+    const Case = enum { success, cancel, expire, shutdown, sleep_failure, shutdown_and_sleep_failure };
+    const Fixture = struct {
+        scheduler: *native.Scheduler,
+        canceled: *std.atomic.Value(bool),
+        case: Case,
+        calls: usize = 0,
+        fn sleep(raw: ?*anyopaque, _: std.Io.Timeout) std.Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            const stats = self.scheduler.stats();
+            std.debug.assert(stats.runnable_slots == 0 and stats.resource_blocked == 1 and stats.operations == 1 and stats.retained_bytes == 23);
+            var control: native.Execution = .{};
+            defer control.finish();
+            control.start(self.scheduler, .{ .io = std.testing.io }, .control) catch unreachable;
+            control.checkpoint() catch unreachable;
+            control.finish();
+            switch (self.case) {
+                .success => try std.testing.io.sleep(.fromMilliseconds(1), .awake),
+                .cancel => self.canceled.store(true, .release),
+                .expire => try std.testing.io.sleep(.fromMilliseconds(100), .awake),
+                .shutdown => self.scheduler.close(),
+                .sleep_failure => return error.Canceled,
+                .shutdown_and_sleep_failure => {
+                    self.scheduler.close();
+                    return error.Canceled;
+                },
+            }
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| for (std.enums.values(Case)) |case| {
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var canceled = std.atomic.Value(bool).init(false);
+        var parent: native.Execution = .{};
+        defer parent.finish();
+        const deadline = clock.monotonicNs() + 50 * std.time.ns_per_ms;
+        try parent.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+        var read: Read = .{ .execution = &parent, .allocator = std.testing.allocator };
+        const team = try read.team();
+        var fixture: Fixture = .{ .scheduler = &scheduler, .canceled = &canceled, .case = case };
+        var vtable = std.testing.io.vtable.*;
+        vtable.sleep = Fixture.sleep;
+        const io: std.Io = .{ .userdata = &fixture, .vtable = &vtable };
+        var budget: Budget = .{ .controls = .{ .execution_runnable = team.borrow, .execution_deadline_ns = deadline, .cancellation = .{ .ptr = &canceled, .is_cancelled_fn = requested } }, .io = io };
+        const result = budget.waitForProgress();
+        const failure: ?anyerror = switch (case) {
+            .success => null,
+            .cancel, .sleep_failure => error.Canceled,
+            .expire => error.DeadlineExceeded,
+            .shutdown, .shutdown_and_sleep_failure => error.SchedulerClosed,
+        };
+        if (failure) |cause| {
+            try std.testing.expectError(cause, result);
+            const grants = scheduler.stats().grants;
+            try std.testing.expectError(cause, budget.checkpoint());
+            try std.testing.expectError(cause, budget.waitForProgress());
+            try std.testing.expectEqual(grants, scheduler.stats().grants);
+        } else {
+            try result;
+            try budget.checkpoint();
+        }
+        try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+        try std.testing.expectEqual(phase, try parent.retainedClass());
+        try std.testing.expectEqual(@as(?u64, deadline), parent.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    };
+}

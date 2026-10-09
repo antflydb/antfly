@@ -39518,7 +39518,7 @@ pub const DB = struct {
             .ctx = self,
             .controls = controls,
             .text_index_entry = textIndexEntryCallback,
-            .load_many_stored = loadStoredSearchDocumentManyCallback,
+            .load_many_stored_controlled = loadStoredSearchDocumentManyControlledCallback,
         });
     }
 
@@ -42979,6 +42979,17 @@ fn loadStoredSearchDocumentsMany(
     keys: []const []const u8,
     direct_fields: ?[]const []const u8,
 ) ![]?[]u8 {
+    return loadStoredSearchDocumentsManyControlled(self, alloc, keys, direct_fields, null);
+}
+
+fn loadStoredSearchDocumentsManyControlled(
+    self: *DB,
+    alloc: Allocator,
+    keys: []const []const u8,
+    direct_fields: ?[]const []const u8,
+    controls: ?types.SearchRequest,
+) ![]?[]u8 {
+    if (controls) |request| try db_query_search.checkSearchRequestDeadline(request);
     const bench_profile = benchQueryProfileEnabled();
     const total_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     var key_ns: u64 = 0;
@@ -43172,10 +43183,10 @@ fn loadStoredSearchDocumentsMany(
 
     const key_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     for (keys, 0..) |key, i| {
-        try pending.append(alloc, .{
-            .original_index = i,
-            .store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view),
-        });
+        if (i % 64 == 0) if (controls) |request| try db_query_search.checkSearchRequestDeadline(request);
+        const store_key = try encodeStoreLookupKeyWithPinnedSchemaAlloc(self, alloc, key, schema_view);
+        errdefer alloc.free(store_key);
+        try pending.append(alloc, .{ .original_index = i, .store_key = store_key });
     }
     if (bench_profile) key_ns = platform_time.monotonicNs() - key_start_ns;
 
@@ -43187,24 +43198,6 @@ fn loadStoredSearchDocumentsMany(
     }.lessThan);
     if (bench_profile) sort_ns = platform_time.monotonicNs() - sort_start_ns;
 
-    const read_keys = try alloc.alloc([]const u8, pending.items.len);
-    defer alloc.free(read_keys);
-    const read_values = try alloc.alloc(?[]const u8, pending.items.len);
-    defer alloc.free(read_values);
-    @memset(read_values, null);
-
-    for (pending.items, 0..) |item, i| read_keys[i] = item.store_key;
-
-    const txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    var txn = try self.core.store.beginProbeTxn();
-    defer txn.abort();
-    if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
-    const get_many_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    try txn.getManySorted(read_keys, read_values);
-    if (bench_profile) get_many_ns = platform_time.monotonicNs() - get_many_start_ns;
-
-    const materialize_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    const values_authenticated = self.core.store.valuesAreAuthenticated();
     var schema_plans = SearchSchemaPlans{
         .db = self,
         .alloc = alloc,
@@ -43212,13 +43205,54 @@ fn loadStoredSearchDocumentsMany(
         .pinned = if (schema_view) |*view| view else null,
     };
     defer schema_plans.deinit();
-    for (pending.items, 0..) |item, i| {
-        const value = read_values[i] orelse continue;
-        loaded[item.original_index] = try schema_plans.materialize(
-            item.store_key,
-            value,
-            values_authenticated,
-        );
+    const values_authenticated = self.core.store.valuesAreAuthenticated();
+    const txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+    const bounded = if (controls) |request| request.execution_runnable != null or request.execution_deadline_ns != null or request.cancellation != null else false;
+    var materialize_start_ns: u64 = 0;
+    if (bounded) {
+        // A single snapshot preserves batch consistency. Cursor scratch is
+        // copied into the result before the next seek can invalidate it.
+        var wait_io = std.Io.Threaded.init(alloc, .{});
+        defer wait_io.deinit();
+        const ReadBudget = @import("../../common/read_execution_budget.zig").Budget(types.SearchRequest, db_query_search.checkSearchRequestDeadline);
+        var budget = ReadBudget{ .controls = controls.?, .io = wait_io.io() };
+        var txn = try self.core.store.beginReadTxnWithBudget(.retain, &budget);
+        defer txn.abort();
+        var cursor = try txn.openCursorWithBudget(&budget);
+        defer cursor.close();
+        const admission = @import("../../common/read_admission.zig");
+        var adapter = admission.Adapter(*ReadBudget){ .budget = &budget };
+        const payload = adapter.payload();
+        const port = admission.Port.init(&payload);
+        if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
+        materialize_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        for (pending.items) |item| {
+            try budget.checkpoint();
+            const value = (try cursor.seekAtOrAfterWithAdmission(item.store_key, port)) orelse continue;
+            if (!std.mem.eql(u8, value.key, item.store_key)) continue;
+            loaded[item.original_index] = try schema_plans.materialize(item.store_key, value.value, values_authenticated);
+        }
+        try budget.checkpoint();
+    } else {
+        const read_keys = try alloc.alloc([]const u8, pending.items.len);
+        defer alloc.free(read_keys);
+        const read_values = try alloc.alloc(?[]const u8, pending.items.len);
+        defer alloc.free(read_values);
+        @memset(read_values, null);
+
+        for (pending.items, 0..) |item, i| read_keys[i] = item.store_key;
+
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
+        const get_many_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        try txn.getManySorted(read_keys, read_values);
+        if (bench_profile) get_many_ns = platform_time.monotonicNs() - get_many_start_ns;
+        materialize_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        for (pending.items, 0..) |item, i| {
+            const value = read_values[i] orelse continue;
+            loaded[item.original_index] = try schema_plans.materialize(item.store_key, value, values_authenticated);
+        }
     }
     if (bench_profile) dupe_ns = platform_time.monotonicNs() - materialize_start_ns;
     if (bench_profile) {
@@ -43227,7 +43261,54 @@ fn loadStoredSearchDocumentsMany(
             .{ (platform_time.monotonicNs() - total_start_ns) / 1000, key_ns / 1000, sort_ns / 1000, txn_ns / 1000, get_many_ns / 1000, dupe_ns / 1000, keys.len },
         );
     }
+    if (controls) |request| try db_query_search.checkSearchRequestDeadline(request);
     return loaded;
+}
+
+test "db statistics controlled primary hydration preserves ordering duplicates absence and allocation ownership" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("statistics-primary-controls");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, std.mem.span(tmp.path().ptr), .{ .start_index_workers = false, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } });
+    defer db.close();
+    for ([_][]const u8{ "doc:a", "doc:b" }) |id| {
+        const key = try encodeStoreLookupKeyAlloc(&db, alloc, id);
+        defer alloc.free(key);
+        try db.core.store.put(key, "{\"body\":\"alpha\"}");
+    }
+    const keys = [_][]const u8{ "doc:b", "missing", "doc:a", "doc:b" };
+    const expected = try loadStoredSearchDocumentsMany(&db, alloc, &keys, null);
+    defer freeOptionalOwnedBytes(alloc, expected);
+    try std.testing.expect(expected[0] != null and expected[1] == null and expected[2] != null and expected[3] != null);
+    const Signal = struct {
+        checks: usize = 0,
+        fail_at: ?usize = null,
+        fn requested(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            return self.fail_at == self.checks;
+        }
+    };
+    var signal: Signal = .{};
+    const controls: types.SearchRequest = .{ .cancellation = .{ .ptr = &signal, .is_cancelled_fn = Signal.requested } };
+    const actual = try loadStoredSearchDocumentsManyControlled(&db, alloc, &keys, null, controls);
+    defer freeOptionalOwnedBytes(alloc, actual);
+    for (expected, actual) |want, got| {
+        if (want) |bytes| try std.testing.expectEqualStrings(bytes, got.?) else try std.testing.expect(got == null);
+    }
+    const AllocationCase = struct {
+        fn run(a: Allocator, database: *DB, read_keys: []const []const u8, request: types.SearchRequest) !void {
+            const rows = try loadStoredSearchDocumentsManyControlled(database, a, read_keys, null, request);
+            defer freeOptionalOwnedBytes(a, rows);
+            try std.testing.expect(rows[0] != null and rows[1] == null and rows[2] != null and rows[3] != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationCase.run, .{ &db, &keys, controls });
+    for (1..7) |fail_at| {
+        signal = .{ .fail_at = fail_at };
+        try std.testing.expectError(error.Cancelled, loadStoredSearchDocumentsManyControlled(&db, alloc, &keys, null, controls));
+    }
+    try std.testing.expectError(error.Timeout, loadStoredSearchDocumentsManyControlled(&db, alloc, &keys, null, .{ .execution_deadline_ns = 1 }));
 }
 
 fn freeOptionalOwnedBytes(alloc: Allocator, values: []?[]u8) void {
@@ -127029,6 +127110,16 @@ fn loadStoredSearchDocumentManyCallback(
 ) anyerror![]?[]u8 {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     return try loadStoredSearchDocumentsMany(self, alloc, keys, null);
+}
+
+fn loadStoredSearchDocumentManyControlledCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    keys: []const []const u8,
+    controls: types.SearchRequest,
+) anyerror![]?[]u8 {
+    const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    return loadStoredSearchDocumentsManyControlled(self, alloc, keys, null, controls);
 }
 
 fn completeVectorMigrationForTest(db: *DB, job_id: []const u8) !void {

@@ -159,7 +159,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&b.addRunArtifact(text_statistics_controls_tests).step);
     const text_statistics_storage_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "text stats use postings when segment source is omitted", "statistics ownership survives every allocation failure", "statistics frequency result retires", "statistics background labels retire" },
+        .filters = &.{ "text stats use postings when segment source is omitted", "statistics ownership survives every allocation failure", "statistics frequency result retires", "statistics background labels retire", "db statistics controlled primary hydration", "statistics primary hydration adapter" },
     });
     b.step("antfly-text-statistics-storage-test", "Verify exact statistics and retirement after rejected snapshot acquisition")
         .dependOn(&addFilteredTestRunArtifact(b, text_statistics_storage_tests).step);

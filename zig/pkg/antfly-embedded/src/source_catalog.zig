@@ -65,6 +65,7 @@ pub const chunking_mod = @import("chunking/mod.zig");
 pub const chunking_types = @import("chunking/types.zig");
 pub const common_byte_copy = @import("common/byte_copy.zig");
 pub const common_bounded_admission = @import("common/bounded_admission.zig");
+pub const common_read_execution_budget = @import("common/read_execution_budget.zig");
 pub const common_bounded_mutex = @import("common/bounded_mutex.zig");
 pub const common_config = @import("common/config.zig");
 pub const common_credential_safety = @import("common/credential_safety.zig");
