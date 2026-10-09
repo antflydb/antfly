@@ -13546,9 +13546,38 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         const backend = pg.backend();
         const identity = try backend.vtable.authenticate(backend.context, alloc, "pool-reader", "secret");
         defer identity.release(identity.context, alloc);
+        // Mirror the listener's retained request arena: the adapter and
+        // allocator remain alive until asynchronous stream cleanup retires.
+        const FixtureLifetime = struct {
+            references: std.atomic.Value(usize) = .init(1),
+
+            fn retain(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const previous = self.references.fetchAdd(1, .monotonic);
+                std.debug.assert(previous != 0 and previous != std.math.maxInt(usize));
+            }
+
+            fn release(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                // The decrement is the callback's last access to its owner.
+                const previous = self.references.fetchSub(1, .acq_rel);
+                std.debug.assert(previous > 1);
+            }
+
+            fn drain(self: *@This()) void {
+                const io = std.testing.io;
+                const protection = io.swapCancelProtection(.blocked);
+                defer _ = io.swapCancelProtection(protection);
+                while (self.references.load(.acquire) != 1)
+                    io.sleep(.fromMilliseconds(1), .awake) catch unreachable;
+            }
+        };
+        var fixture_lifetime: FixtureLifetime = .{};
+        defer fixture_lifetime.drain();
         var cancel: std.atomic.Value(bool) = .init(false);
         const statement = "SELECT id, name FROM usage_records WHERE id = $1 LIMIT 1";
         const wire_request: wire.Request = .{
+            .retained_lifetime = .{ .context = &fixture_lifetime, .retain_fn = FixtureLifetime.retain, .release_fn = FixtureLifetime.release },
             .statement = statement,
             .parameters = &.{.{ .integer = 9007199254740993 }},
             .parameter_types = &.{.integer},
@@ -13830,24 +13859,31 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         try server.query_admission.update(server.queryAdmissionStats().policy_version, 1, server.cfg.query_waiting, false);
         try @import("sql_pgwire_socket_test.zig").qualify(&server, &storage_manager);
         try qualifyNativeH2Waiting(&server);
-        // Live native streams retain coarse admission until actual close.
-        const stream = (try backend.vtable.open_stream.?(backend.context, alloc, identity, wire_request)).?;
-        defer stream.close(stream.context);
-        try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().in_flight);
-        try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().runnable_slots);
-        try std.testing.expectEqual(@as(usize, 1), server.runnable_scheduler.?.stats().output_blocked);
-        const parked_stats = server.runnableSchedulingStats();
-        try std.testing.expectEqual(@as(u64, 1), parked_stats.operations);
-        try std.testing.expectEqual(@as(u64, 0), parked_stats.runnable_slots);
-        try std.testing.expectEqual(@as(u64, 1), parked_stats.output_blocked);
-        var page = try stream.next(stream.context, alloc, wire_request, 1);
-        defer page.result.deinit();
-        try std.testing.expectEqualStrings("exact", page.result.rows[0][1].string);
-        try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().runnable_slots);
-        try std.testing.expectEqual(@as(usize, 1), server.runnable_scheduler.?.stats().output_blocked);
-        cancel.store(true, .release);
-        try std.testing.expectError(error.QueryCanceled, stream.next(stream.context, alloc, wire_request, 1));
-        try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().in_flight);
+        fixture_lifetime.drain();
+        {
+            // Closing requests cleanup; admission and the request lifetime stay
+            // retained until that cleanup physically retires.
+            const stream = (try backend.vtable.open_stream.?(backend.context, alloc, identity, wire_request)).?;
+            defer stream.close(stream.context);
+            try std.testing.expectEqual(@as(usize, 2), fixture_lifetime.references.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().in_flight);
+            try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), server.runnable_scheduler.?.stats().output_blocked);
+            const parked_stats = server.runnableSchedulingStats();
+            try std.testing.expectEqual(@as(u64, 1), parked_stats.operations);
+            try std.testing.expectEqual(@as(u64, 0), parked_stats.runnable_slots);
+            try std.testing.expectEqual(@as(u64, 1), parked_stats.output_blocked);
+            var page = try stream.next(stream.context, alloc, wire_request, 1);
+            defer page.result.deinit();
+            try std.testing.expectEqualStrings("exact", page.result.rows[0][1].string);
+            try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), server.runnable_scheduler.?.stats().output_blocked);
+            cancel.store(true, .release);
+            try std.testing.expectError(error.QueryCanceled, stream.next(stream.context, alloc, wire_request, 1));
+            try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().in_flight);
+        }
+        fixture_lifetime.drain();
+        try std.testing.expectEqual(@as(usize, 1), fixture_lifetime.references.load(.acquire));
     }
     try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
 
