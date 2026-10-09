@@ -13752,17 +13752,27 @@ test "httpx SQL PostgreSQL conflict assignments and defaults preserve complete n
 }
 
 fn postgresNativeMutationCampaigns(comptime selected: []const []const u8) !void {
-    try postgresNativeMutationCampaignsWithConstraints(selected, false);
+    try postgresNativeMutationCampaignsWithConstraints(selected, false, false);
 }
 
 test "httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages" {
     try postgresNativeMutationCampaignsWithConstraints(&.{
         "sql-1394", "sql-1395", "sql-1398", "sql-1399",
         "sql-1400", "sql-1402", "sql-1406", "sql-1407",
-    }, true);
+    }, true, false);
 }
 
-fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []const u8, comptime unique: bool) !void {
+test "httpx SQL PostgreSQL inferred unique indexes preserve native owners and reject named constraint aliases" {
+    // All statements in this cohort use inference, not constraint names.
+    // PostgreSQL independently verifies index/constraint inference equivalence;
+    // this variant exercises the distinct native index-owned representation.
+    try postgresNativeMutationCampaignsWithConstraints(&.{
+        "sql-1394", "sql-1395", "sql-1398", "sql-1399",
+        "sql-1400", "sql-1402", "sql-1406", "sql-1407",
+    }, true, true);
+}
+
+fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []const u8, comptime unique: bool, comptime index_owned: bool) !void {
     const alloc = std.testing.allocator;
     const parity = @import("sql_parity_reference.zig");
     const Source = @import("sql_parity_sources.zig").Tables(3);
@@ -13805,11 +13815,18 @@ fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []c
             }));
             for (keys, 0..) |key, ordinal| {
                 try std.testing.expect(key.len != 0);
+                const owner_name = try std.fmt.allocPrint(a, "{s}_unique_{d}", .{ name, ordinal });
+                const Change = @import("antfly_local_sources").sql_ast.SchemaChange;
+                const change: Change = if (index_owned) index: {
+                    const orders = try a.alloc(@import("antfly_local_sources").sql_ast.Order, key.len);
+                    for (orders, key) |*order, column| order.* = .{ .field = column };
+                    break :index .{ .create_index = .{ .name = owner_name, .keys = orders, .unique = true } };
+                } else .{ .add_unique = .{ .name = owner_name, .columns = key } };
                 try std.testing.expect(try @import("antfly_local_sources").sql_schema_ddl.apply(a, &owned, .{
                     .kind = .table,
                     .action = .alter_schema,
                     .name = .{ .table = name },
-                    .schema_change = .{ .add_unique = .{ .name = try std.fmt.allocPrint(a, "{s}_unique_{d}", .{ name, ordinal }), .columns = key } },
+                    .schema_change = change,
                 }));
             }
             schema.* = try std.json.Stringify.valueAlloc(a, owned, .{});
@@ -13837,7 +13854,17 @@ fn postgresNativeMutationCampaignsWithConstraints(comptime selected: []const []c
         var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, source.source(), writes.source());
         defer server.deinit();
         var handler = AntflyApiHandler{ .api_server = &server };
-        try parity.runPostgresMutations(alloc, &handler, &tables, &source.records, parsed.value, if (selected.len != 0) selected else campaign.ids);
+        var reference = parsed.value;
+        if (index_owned) {
+            const probes = try a.alloc(parity.PostgresMutationReference.AdmissionProbe, profile.admission_probes.len + 1);
+            @memcpy(probes[0..profile.admission_probes.len], profile.admission_probes);
+            probes[profile.admission_probes.len] = .{
+                .sql = "INSERT INTO usage_records(id,email) VALUES ('index_alias_probe','c@example.test') ON CONFLICT ON CONSTRAINT usage_records_unique_0 DO NOTHING",
+                .sqlstate = "42704",
+            };
+            reference.profile.admission_probes = probes;
+        }
+        try parity.runPostgresMutations(alloc, &handler, &tables, &source.records, reference, if (selected.len != 0) selected else campaign.ids);
         if (unique) {
             // Logical UNIQUE ownership must resolve through native point
             // reads, not table-size-dependent statement capture or scans.

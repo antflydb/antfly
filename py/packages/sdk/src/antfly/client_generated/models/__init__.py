@@ -1139,6 +1139,7 @@ from .relational_row_query_request import RelationalRowQueryRequest
 from .relational_row_row import RelationalRowRow
 from .relational_scalar_expression import RelationalScalarExpression
 from .relational_unique_constraint import RelationalUniqueConstraint
+from .relational_unique_constraint_origin import RelationalUniqueConstraintOrigin
 from .rename_catalog_resource_request import RenameCatalogResourceRequest
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
@@ -2560,6 +2561,7 @@ __all__ = (
     "RelationalRowRow",
     "RelationalScalarExpression",
     "RelationalUniqueConstraint",
+    "RelationalUniqueConstraintOrigin",
     "RenameCatalogResourceRequest",
     "RepairIssueListRequest",
     "RepairRunRequest",

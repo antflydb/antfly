@@ -44,6 +44,26 @@ import (
 
 type relationalHTTPDoer func(*http.Request) (*http.Response, error)
 
+func TestRelationalUniqueOwnershipOriginRoundTrip(t *testing.T) {
+	for _, origin := range []RelationalUniqueConstraintOrigin{RelationalUniqueConstraintOriginConstraint, RelationalUniqueConstraintOriginIndex} {
+		rule := RelationalUniqueConstraint{Name: "email_key", Columns: []string{"email"}, Origin: origin}
+		encoded, err := json.Marshal(rule)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded RelationalUniqueConstraint
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if !decoded.Origin.Valid() || decoded.Origin != origin {
+			t.Fatalf("origin did not round-trip: %s", encoded)
+		}
+	}
+	if RelationalUniqueConstraintOrigin("display-label").Valid() {
+		t.Fatal("invalid ownership kind accepted")
+	}
+}
+
 func TestRelationalExactNumericPublicExpressionContract(t *testing.T) {
 	var expression RelationalScalarExpression
 	if err := json.Unmarshal([]byte(`{"op":"literal","type":"numeric","sql_type":"numeric","value":"9007199254740993.2500"}`), &expression); err != nil {

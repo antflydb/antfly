@@ -1409,6 +1409,22 @@ this cohort. Ambiguous unqualified conflict expressions, temporal profiles,
 partial/expression arbiters and distributed fault activation remain separate
 work; their historical entries have not been reclassified.
 
+Unique-owner provenance is now an OpenAPI-generated `constraint`/`index`
+identity, retained in schema metadata rather than inferred from editable index
+descriptions. Immutable SQL schema views derive only named constraints in a
+linear pass; index-owned keys still participate in native conflict inference.
+Table-bound DROP/VALIDATE CONSTRAINT reject index owners, while index retirement
+removes its paired uniqueness rule even after a description edit. Native cache
+lifetime/allocation-fault tests and independent PostgreSQL contracts cover the
+namespace distinction. Named SET CONSTRAINTS excludes index owners before any
+native authority read, while genuine deferred constraints retain their native
+generation checks. Mounted tests repeat the eight inferred upserts with real
+index-owned uniqueness, unchanged expected postimages and no unbounded source
+reads/capture; the named index alias must reject without a storage change.
+Unqualified PostgreSQL DROP INDEX still needs catalog
+owner resolution; the table-bound schema-builder tests do not claim that syntax
+or the partial/expression historical mutations are complete.
+
 Quantified scalar children now retain correlated ORDER/LIMIT/OFFSET,
 group/aggregate, window and nested-derived boundaries in a typed Apply
 producer. Comparison results are projected once and reduced into separate

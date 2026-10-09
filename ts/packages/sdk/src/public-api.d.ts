@@ -14058,6 +14058,12 @@ export interface components {
             expression?: components["schemas"]["RelationalScalarExpression"];
         };
         /**
+         * @description Durable ownership kind. Index-owned uniqueness participates in ON CONFLICT inference but is not a named SQL constraint. Human-readable index descriptions never determine ownership.
+         * @default constraint
+         * @enum {string}
+         */
+        RelationalUniqueConstraintOrigin: "constraint" | "index";
+        /**
          * @description Enforcement timing for atomic mutations and transaction sessions. Deferred
          *     requires deferrable=true and validates the final transaction state.
          *     NO ACTION permits a valid final-state parent replacement; RESTRICT
@@ -14074,6 +14080,7 @@ export interface components {
          */
         RelationalUniqueConstraint: {
             name: string;
+            origin?: components["schemas"]["RelationalUniqueConstraintOrigin"];
             /** @description SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable. */
             primary?: boolean;
             columns?: string[];

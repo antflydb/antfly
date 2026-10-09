@@ -2876,6 +2876,8 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
     const document_schema = schema.document_schemas[0];
     var primary_count: usize = 0;
     if (schema.unique_constraints) |constraints| for (constraints.value) |constraint| {
+        if ((constraint.origin orelse .constraint) == .index and
+            ((constraint.primary orelse false) or (constraint.deferrable orelse false) or (constraint.timing orelse .immediate) != .immediate)) return error.InvalidSchemaUpdateRequest;
         if ((constraint.columns != null) == (constraint.keys != null)) return error.InvalidSchemaUpdateRequest;
         for (constraint.columns orelse &.{}) |column| if (findDocumentProperty(document_schema.properties, column) == null) return error.InvalidSchemaUpdateRequest;
         if (constraint.primary orelse false) {
@@ -2971,12 +2973,23 @@ fn validateParsedRelationalSchema(schema: TableSchema) !void {
 }
 
 test "relational primary keys cannot defer enforcement" {
+    try verifyImmediateConstraintOwners();
+}
+
+test "relational declarations index owners cannot be primary or deferred" {
+    try verifyImmediateConstraintOwners();
+}
+
+fn verifyImmediateConstraintOwners() !void {
     const alloc = std.testing.allocator;
     const prefix = "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\",\"nullable\":false}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"unique_constraints\":[";
     for ([_][]const u8{
         "{\"name\":\"pk\",\"columns\":[\"id\"],\"primary\":true,\"deferrable\":true,\"timing\":\"deferred\"}",
         "{\"name\":\"pk\",\"columns\":[\"id\"],\"primary\":true,\"deferrable\":true,\"timing\":\"immediate\"}",
         "{\"name\":\"pk\",\"columns\":[],\"primary\":true}",
+        "{\"name\":\"index_pk\",\"origin\":\"index\",\"columns\":[\"id\"],\"primary\":true}",
+        "{\"name\":\"index_deferred\",\"origin\":\"index\",\"columns\":[\"id\"],\"deferrable\":true}",
+        "{\"name\":\"index_timing\",\"origin\":\"index\",\"columns\":[\"id\"],\"timing\":\"deferred\"}",
     }) |constraint| {
         const json = try std.fmt.allocPrint(alloc, "{s}{s}]}}", .{ prefix, constraint });
         defer alloc.free(json);

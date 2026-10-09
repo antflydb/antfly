@@ -44,10 +44,17 @@ pub const Constraint = struct {
     kind: enum { unique, check, foreign_key },
     deferrable: bool = false,
 
+    fn namedConstraint(definition: anytype) bool {
+        if (comptime @hasField(@TypeOf(definition), "origin")) return (definition.origin orelse .constraint) != .index;
+        return true;
+    }
+
     pub fn derive(alloc: std.mem.Allocator, schema: anytype) ![]const Constraint {
         var count: usize = 0;
         inline for (.{ "unique_constraints", "checks", "foreign_keys" }) |field| {
-            if (@field(schema, field)) |values| count = try std.math.add(usize, count, values.value.len);
+            if (@field(schema, field)) |values| for (values.value) |definition| {
+                if (namedConstraint(definition)) count = try std.math.add(usize, count, 1);
+            };
         }
         const output = try alloc.alloc(Constraint, count);
         errdefer alloc.free(output);
@@ -55,6 +62,10 @@ pub const Constraint = struct {
         errdefer for (output[0..initialized]) |value| alloc.free(value.name);
         inline for (.{ "unique_constraints", "checks", "foreign_keys" }, .{ .unique, .check, .foreign_key }) |field, kind| {
             if (@field(schema, field)) |values| for (values.value) |definition| {
+                // Native uniqueness ownership and SQL constraint identity are
+                // distinct. Classify once in this immutable schema view, not
+                // by scanning access indexes or mutable labels per request.
+                if (!namedConstraint(definition)) continue;
                 output[initialized] = .{ .name = try alloc.dupe(u8, definition.name), .kind = kind, .deferrable = if (@hasField(@TypeOf(definition), "deferrable")) definition.deferrable orelse false else false };
                 initialized += 1;
             };

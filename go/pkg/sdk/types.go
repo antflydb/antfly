@@ -74,6 +74,7 @@ type (
 	RelationalExpressionType              = oapi.RelationalExpressionType
 	RelationalCheckConstraint             = oapi.RelationalCheckConstraint
 	RelationalUniqueConstraint            = oapi.RelationalUniqueConstraint
+	RelationalUniqueConstraintOrigin      = oapi.RelationalUniqueConstraintOrigin
 	RelationalForeignKeyConstraint        = oapi.RelationalForeignKeyConstraint
 	RelationalRow                         = oapi.RelationalRow
 	RelationalRowCondition                = oapi.RelationalRowCondition
@@ -662,23 +663,25 @@ func (c CreatedIndex) requireKind(expected IndexType) error {
 }
 
 const (
-	TableStorageModeDocument            = oapi.TableStorageModeDocument
-	TableStorageModeRelational          = oapi.TableStorageModeRelational
-	RelationalIndexKeyDirectionAsc      = oapi.RelationalIndexKeyDirectionAsc
-	RelationalIndexKeyDirectionDesc     = oapi.RelationalIndexKeyDirectionDesc
-	RelationalIndexKeyNullsDefault      = oapi.RelationalIndexKeyNullsDefault
-	RelationalIndexKeyNullsFirst        = oapi.RelationalIndexKeyNullsFirst
-	RelationalIndexKeyNullsLast         = oapi.RelationalIndexKeyNullsLast
-	RelationalComparisonOpEq            = oapi.RelationalComparisonOpEq
-	RelationalComparisonOpNe            = oapi.RelationalComparisonOpNe
-	RelationalComparisonOpGt            = oapi.RelationalComparisonOpGt
-	RelationalComparisonOpGte           = oapi.RelationalComparisonOpGte
-	RelationalComparisonOpLt            = oapi.RelationalComparisonOpLt
-	RelationalComparisonOpLte           = oapi.RelationalComparisonOpLte
-	RelationalComparisonOpIsNull        = oapi.RelationalComparisonOpIsNull
-	RelationalComparisonOpIsNotNull     = oapi.RelationalComparisonOpIsNotNull
-	RelationalComparisonOpIsDistinct    = oapi.RelationalComparisonOpIsDistinct
-	RelationalComparisonOpIsNotDistinct = oapi.RelationalComparisonOpIsNotDistinct
+	TableStorageModeDocument                   = oapi.TableStorageModeDocument
+	RelationalUniqueConstraintOriginConstraint = oapi.RelationalUniqueConstraintOriginConstraint
+	RelationalUniqueConstraintOriginIndex      = oapi.RelationalUniqueConstraintOriginIndex
+	TableStorageModeRelational                 = oapi.TableStorageModeRelational
+	RelationalIndexKeyDirectionAsc             = oapi.RelationalIndexKeyDirectionAsc
+	RelationalIndexKeyDirectionDesc            = oapi.RelationalIndexKeyDirectionDesc
+	RelationalIndexKeyNullsDefault             = oapi.RelationalIndexKeyNullsDefault
+	RelationalIndexKeyNullsFirst               = oapi.RelationalIndexKeyNullsFirst
+	RelationalIndexKeyNullsLast                = oapi.RelationalIndexKeyNullsLast
+	RelationalComparisonOpEq                   = oapi.RelationalComparisonOpEq
+	RelationalComparisonOpNe                   = oapi.RelationalComparisonOpNe
+	RelationalComparisonOpGt                   = oapi.RelationalComparisonOpGt
+	RelationalComparisonOpGte                  = oapi.RelationalComparisonOpGte
+	RelationalComparisonOpLt                   = oapi.RelationalComparisonOpLt
+	RelationalComparisonOpLte                  = oapi.RelationalComparisonOpLte
+	RelationalComparisonOpIsNull               = oapi.RelationalComparisonOpIsNull
+	RelationalComparisonOpIsNotNull            = oapi.RelationalComparisonOpIsNotNull
+	RelationalComparisonOpIsDistinct           = oapi.RelationalComparisonOpIsDistinct
+	RelationalComparisonOpIsNotDistinct        = oapi.RelationalComparisonOpIsNotDistinct
 
 	QueryHitsTotalRelationExact = oapi.QueryHitsTotalRelationExact
 	QueryHitsTotalRelationGte   = oapi.QueryHitsTotalRelationGte

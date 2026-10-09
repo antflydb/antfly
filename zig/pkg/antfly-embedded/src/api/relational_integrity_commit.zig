@@ -1229,9 +1229,14 @@ pub fn resolveConstraintTiming(alloc: Allocator, source: reads.TableReadSource, 
         // Namespace names need enumeration, but native authority reads and
         // compiled tuple plans are required only for matching declarations.
         var matches = false;
+        var named_uniques: std.StringHashMapUnmanaged(void) = .empty;
+        defer named_uniques.deinit(scratch.allocator());
         for (names) |name| {
             if (declaration.unique_constraints) |uniques| for (uniques.value) |unique| {
-                if (std.mem.eql(u8, name, unique.name)) matches = true;
+                if ((unique.origin orelse .constraint) != .index and std.mem.eql(u8, name, unique.name)) {
+                    matches = true;
+                    try named_uniques.put(scratch.allocator(), unique.name, {});
+                }
             };
             if (declaration.foreign_keys) |foreign_keys| for (foreign_keys.value) |foreign| {
                 if (std.mem.eql(u8, name, foreign.name)) matches = true;
@@ -1240,7 +1245,7 @@ pub fn resolveConstraintTiming(alloc: Allocator, source: reads.TableReadSource, 
         if (!matches) continue;
         const table = try builder.load(record.name);
         for (names, 0..) |name, i| {
-            for (table.uniques) |unique| if (std.mem.eql(u8, name, unique.name)) {
+            for (table.uniques) |unique| if (named_uniques.contains(name) and std.mem.eql(u8, name, unique.name)) {
                 if (deferred and !unique.deferrable) return error.ConstraintNotDeferrable;
                 found[i] = true;
                 if (modes.items.len >= 4096) return error.TransactionTooLarge;
@@ -1256,6 +1261,27 @@ pub fn resolveConstraintTiming(alloc: Allocator, source: reads.TableReadSource, 
     }
     for (found) |exists| if (!exists) return error.SqlConstraintNotFound;
     return modes.toOwnedSlice(alloc);
+}
+
+test "distributed txn constraint timing excludes index ownership without native reads" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn lookup(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedNativeRead;
+        }
+    };
+    var fake: Fake = .{};
+    const source: reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = undefined, .query = undefined } };
+    const declaration =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"access_key","origin":"index","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const metadata = [_]TableRecord{.{ .table_id = 1, .name = "rows", .schema_json = declaration }};
+    for ([_]bool{ false, true }) |deferred| {
+        try std.testing.expectError(error.SqlConstraintNotFound, resolveConstraintTiming(std.testing.allocator, source, &metadata, &.{"access_key"}, deferred, .{}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
 }
 
 pub const BackfillRow = struct { key: []const u8, json: []const u8, version: u64, expected_content_digest: ?[32]u8 = null };

@@ -404,6 +404,7 @@ export type {
   RelationalRowQueryRequest,
   RelationalScalarExpression,
   RelationalUniqueConstraint,
+  RelationalUniqueConstraintOrigin,
   RerankerConfig,
   RerankerProfile,
   // Research Agent types

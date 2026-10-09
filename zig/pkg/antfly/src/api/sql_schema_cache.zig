@@ -319,6 +319,38 @@ test "SQL schema cache owns named constraint kinds across eviction and allocatio
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{json});
 }
 
+test "SQL schema cache excludes index owned uniqueness from named constraint identity" {
+    const json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row",
+        \\"unique_constraints":[{"name":"named_key","columns":["id"]},{"name":"access_key","columns":["id"],"origin":"index"}],
+        \\"relational_indexes":[{"name":"access_key","keys":[{"column":"id"}],"description":"operator edited"}],
+        \\"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const Faults = struct {
+        fn run(a: std.mem.Allocator, bytes: []const u8) !void {
+            var cache = Cache.init(a);
+            defer cache.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const table = try cache.resolve(std.testing.io, arena.allocator(), bytes, 1, "rows");
+            try std.testing.expectEqual(@as(usize, 1), table.constraints.len);
+            try std.testing.expectEqualStrings("named_key", table.constraints[0].name);
+            try std.testing.expectEqual(@as(usize, 1), table.indexes.len);
+            try std.testing.expectEqualStrings("access_key", table.indexes[0].name);
+            // Catalog clones must keep both namespaces independent of parser
+            // retirement and cache eviction.
+            for (&cache.slots) |*slot| if (slot.entry) |entry| {
+                cache.destroy(entry);
+                slot.* = .{};
+            };
+            try std.testing.expectEqualStrings("named_key", table.constraints[0].name);
+            try std.testing.expectEqualStrings("access_key", table.indexes[0].name);
+        }
+    };
+    try Faults.run(std.testing.allocator, json);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{json});
+}
+
 test "SQL schema cache document shapes are declared stable unions" {
     var cache = Cache.init(std.testing.allocator);
     defer cache.deinit();

@@ -711,6 +711,7 @@ pub const RelationalRowMutationRequest = types.RelationalRowMutationRequest;
 pub const RelationalRowQueryRequest = types.RelationalRowQueryRequest;
 pub const RelationalScalarExpression = types.RelationalScalarExpression;
 pub const RelationalUniqueConstraint = types.RelationalUniqueConstraint;
+pub const RelationalUniqueConstraintOrigin = types.RelationalUniqueConstraintOrigin;
 pub const RenameCatalogResourceRequest = types.RenameCatalogResourceRequest;
 pub const RepairIssueListRequest = types.RepairIssueListRequest;
 pub const RepairRunRequest = types.RepairRunRequest;

@@ -179,6 +179,8 @@ export type CommittedMutationOutcome = components["schemas"]["CommittedMutationO
 export type CreateTableRequest = components["schemas"]["CreateTableRequest"];
 export type TableSchema = components["schemas"]["TableSchema"];
 export type RelationalUniqueConstraint = components["schemas"]["RelationalUniqueConstraint"];
+export type RelationalUniqueConstraintOrigin =
+  components["schemas"]["RelationalUniqueConstraintOrigin"];
 export type RelationalForeignKeyConstraint =
   components["schemas"]["RelationalForeignKeyConstraint"];
 export type RelationalRow = components["schemas"]["RelationalRow"];

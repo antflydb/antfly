@@ -33377,6 +33377,7 @@ pub const RelationalScalarExpression = struct {
 /// A named, ordered composite unique key. Validation status is maintained by the server. TTL expiry uses the distributed integrity coordinator. Referenced unique keys are nondeferrable.
 pub const RelationalUniqueConstraint = struct {
     name: []const u8,
+    origin: ?RelationalUniqueConstraintOrigin = null,
     /// SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable.
     primary: ?bool = null,
     columns: ?[]const []const u8 = null,
@@ -33393,6 +33394,7 @@ pub const RelationalUniqueConstraint = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
+        .{ "origin", "origin", true },
         .{ "primary", "primary", true },
         .{ "columns", "columns", true },
         .{ "keys", "keys", true },
@@ -33414,6 +33416,10 @@ pub const RelationalUniqueConstraint = struct {
         try jw.beginObject();
         try jw.objectField("name");
         try jw.write(self.name);
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
         if (self.primary) |value| {
             try jw.objectField("primary");
             try jw.write(value);
@@ -33443,6 +33449,32 @@ pub const RelationalUniqueConstraint = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// Durable ownership kind. Index-owned uniqueness participates in ON CONFLICT inference but is not a named SQL constraint. Human-readable index descriptions never determine ownership.
+pub const RelationalUniqueConstraintOrigin = enum {
+    constraint,
+    index,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .constraint => "constraint",
+            .index => "index",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "constraint", .constraint },
+            .{ "index", .index },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 

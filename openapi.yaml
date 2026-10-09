@@ -27977,6 +27977,14 @@ components:
           description: String comparison collation; uses the same rules as ordered indexes.
         expression:
           $ref: '#/components/schemas/RelationalScalarExpression'
+    RelationalUniqueConstraintOrigin:
+      type: string
+      enum:
+        - constraint
+        - index
+      default: constraint
+      description: Durable ownership kind. Index-owned uniqueness participates in ON CONFLICT inference
+        but is not a named SQL constraint. Human-readable index descriptions never determine ownership.
     ForeignKeyTiming:
       type: string
       enum:
@@ -28010,6 +28018,8 @@ components:
           type: string
           minLength: 1
           maxLength: 256
+        origin:
+          $ref: '#/components/schemas/RelationalUniqueConstraintOrigin'
         primary:
           type: boolean
           description: SQL primary-key identity. At most one per relational table; all key columns must

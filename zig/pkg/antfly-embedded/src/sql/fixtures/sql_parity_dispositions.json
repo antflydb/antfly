@@ -62,6 +62,11 @@
       "cwd": ".",
       "timeout_seconds": 120
     },
+    "sql-native-index-owner-boundary": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL inferred unique indexes", "-Dtest-filter=httpx SQL PostgreSQL UNIQUE arbiters", "-Dtest-filter=SQL schema cache"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "sql-mounted-unique-mutations": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages"],
       "cwd": "zig",
@@ -13628,7 +13633,8 @@
       "evidence": [
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL inferred unique indexes preserve native owners and reject named constraint aliases","gate":"sql-native-index-owner-boundary"}
       ]
     },
     {
@@ -13638,7 +13644,8 @@
       "evidence": [
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL inferred unique indexes preserve native owners and reject named constraint aliases","gate":"sql-native-index-owner-boundary"}
       ]
     },
     {
@@ -13658,7 +13665,8 @@
       "evidence": [
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL inferred unique indexes preserve native owners and reject named constraint aliases","gate":"sql-native-index-owner-boundary"}
       ]
     },
     {
@@ -13668,7 +13676,8 @@
       "evidence": [
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL inferred unique indexes preserve native owners and reject named constraint aliases","gate":"sql-native-index-owner-boundary"}
       ]
     },
     {
@@ -13678,7 +13687,8 @@
       "evidence": [
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL inferred unique indexes preserve native owners and reject named constraint aliases","gate":"sql-native-index-owner-boundary"}
       ]
     },
     {
@@ -13693,7 +13703,8 @@
       "evidence": [
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL inferred unique indexes preserve native owners and reject named constraint aliases","gate":"sql-native-index-owner-boundary"}
       ]
     },
     {
@@ -13718,7 +13729,8 @@
       "evidence": [
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL inferred unique indexes preserve native owners and reject named constraint aliases","gate":"sql-native-index-owner-boundary"}
       ]
     },
     {
@@ -13728,7 +13740,8 @@
       "evidence": [
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-mounted-unique-mutations"},
         {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-unique-mutation-reference"},
-        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"}
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL UNIQUE arbiters resolve native logical owners and preserve complete postimages","gate":"sql-postgres-oracle-contracts"},
+        {"path":"zig/pkg/antfly/src/api/httpx_handler.zig","test":"httpx SQL PostgreSQL inferred unique indexes preserve native owners and reject named constraint aliases","gate":"sql-native-index-owner-boundary"}
       ]
     },
     {

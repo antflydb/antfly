@@ -1831,6 +1831,65 @@ class PostgresReferenceTest(unittest.TestCase):
                 self.db.execute("SELECT _id,n FROM named_items").fetchall(),
             )
 
+    def test_unique_indexes_are_inference_arbiters_not_named_constraints(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute(
+                "CREATE TEMP TABLE owner_items (id text PRIMARY KEY, email text, "
+                "tenant_id text, status text, name text)"
+            )
+            self.db.execute(
+                "INSERT INTO owner_items VALUES "
+                "('u1','a@example.test','t1','active','old'),"
+                "('u2','b@example.test','t2','closed','other')"
+            )
+            for keys, predicate, email in (
+                ("email", "", "a@example.test"),
+                ("email", " WHERE status='active'", "a@example.test"),
+                ("lower(email)", "", "A@EXAMPLE.TEST"),
+                ("tenant_id,lower(email)", "", "A@EXAMPLE.TEST"),
+            ):
+                with self.subTest(keys=keys, predicate=predicate):
+                    with self.db.transaction(force_rollback=True):
+                        self.db.execute(
+                            f"CREATE UNIQUE INDEX access_key ON owner_items ({keys}){predicate}"
+                        )
+                        result = self.db.execute(
+                            "INSERT INTO owner_items VALUES ('u2',%s,'t1','active','new') "
+                            f"ON CONFLICT ({keys}){predicate} DO UPDATE "
+                            "SET name=excluded.name RETURNING id,name",
+                            (email,),
+                        ).fetchall()
+                        self.assertEqual([("u1", "new")], result)
+                        self.assertEqual(
+                            [("u1", "new"), ("u2", "other")],
+                            self.db.execute(
+                                "SELECT id,name FROM owner_items ORDER BY id"
+                            ).fetchall(),
+                        )
+                        for sql in (
+                            "INSERT INTO owner_items(id) VALUES('u3') "
+                            "ON CONFLICT ON CONSTRAINT access_key DO NOTHING",
+                            "ALTER TABLE owner_items DROP CONSTRAINT access_key",
+                            "ALTER TABLE owner_items VALIDATE CONSTRAINT access_key",
+                            "SET CONSTRAINTS access_key IMMEDIATE",
+                        ):
+                            with self.subTest(sql=sql):
+                                with self.assertRaises(psycopg.Error) as caught:
+                                    with self.db.transaction():
+                                        self.db.execute(sql)
+                                self.assertEqual("42704", caught.exception.sqlstate)
+                        self.db.execute("DROP INDEX access_key")
+                        self.assertEqual(
+                            [("u1",)],
+                            self.db.execute(
+                                "INSERT INTO owner_items(id) VALUES('u1') "
+                                "ON CONFLICT ON CONSTRAINT owner_items_pkey "
+                                "DO UPDATE SET name='primary' RETURNING id"
+                            ).fetchall(),
+                        )
+
     def test_unique_mutation_profile_keeps_base_seeds_and_original_case_contracts(self):
         import json
         from generate_sql_postgres_reference import mutation_profile, properties
