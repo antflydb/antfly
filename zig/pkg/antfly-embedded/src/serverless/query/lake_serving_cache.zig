@@ -461,10 +461,9 @@ pub const Cache = struct {
         if (claim != null) if (try self.lookup(a, key)) |bytes| return bytes;
         const disk_bytes = if (self.persistent) |*disk| try disk.readAllocFor(a, key, length, context) else null;
         if (disk_bytes) |bytes| {
-            var actual: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+            errdefer a.free(bytes);
+            const actual = try hashImmutableFor(bytes, context);
             if (bytes.len == length and std.mem.eql(u8, &actual, &digest)) {
-                errdefer a.free(bytes);
                 try context.ensureActive();
                 self.recordRead(true, bytes.len);
                 self.store(key, bytes) catch {};
@@ -477,8 +476,7 @@ pub const Cache = struct {
         const bytes = try loader.load(loader.ptr, a);
         errdefer a.free(bytes);
         try context.ensureActive();
-        var actual: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+        const actual = try hashImmutableFor(bytes, context);
         if (bytes.len != length or !std.mem.eql(u8, &actual, &digest)) return error.ArtifactIntegrityMismatch;
         const traffic: ProviderRead = if (loader.provider_read) |read| read(loader.ptr) else .{ .requests = 1, .bytes = bytes.len };
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -488,6 +486,18 @@ pub const Cache = struct {
         if (self.persistent) |*disk| _ = disk.enqueueWrite(key, bytes);
         self.store(key, bytes) catch {};
         return bytes;
+    }
+    fn hashImmutableFor(bytes: []const u8, context: Context) ![32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            try context.ensureActive();
+            const len = @min(@as(usize, 256 * 1024), bytes.len - offset);
+            hash.update(bytes[offset..][0..len]);
+            offset += len;
+        }
+        try context.ensureActive();
+        return hash.finalResult();
     }
     fn pin(self: *Cache, key: []const u8) ?ranges.RangeLease {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -1319,4 +1329,43 @@ test "external lake verified slice admission retains denied ownership and copies
     try std.testing.expectError(error.ArtifactIntegrityMismatch, cache.admitVerifiedBlock(a, @splat(2), "unit", bytes.len + 1, digest, .{}, verified));
     try std.testing.expectEqual(@as(usize, 3), owner.released);
     try std.testing.expectError(error.ArtifactIntegrityMismatch, Cache.VerifiedBytes.authenticate("corrupt", digest));
+}
+
+test "lake SQL immutable artifact hash checkpoints discard an interrupted provider buffer" {
+    const Fixture = struct {
+        checks: usize = 0,
+        loads: usize = 0,
+        fail_at: ?usize,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.fail_at == self.checks) return error.Canceled;
+        }
+        fn load(raw: *anyopaque, a: Allocator) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.loads += 1;
+            const bytes = try a.alloc(u8, 300 * 1024);
+            @memset(bytes, 7);
+            return bytes;
+        }
+    };
+    const a = std.testing.allocator;
+    const payload: [300 * 1024]u8 = @splat(7);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&payload, &digest, .{});
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    var fixture: Fixture = .{ .fail_at = 4 };
+    const context: Context = .{ .checkpoint = .{ .ptr = &fixture, .check = Fixture.check } };
+    const loader: Cache.ImmutableLoader = .{ .ptr = &fixture, .load = Fixture.load };
+    try std.testing.expectError(error.Canceled, cache.readImmutableAlloc(a, @splat(1), "scoped-artifact", payload.len, digest, context, loader));
+    try std.testing.expectEqual(@as(usize, 1), fixture.loads);
+    try std.testing.expectEqual(@as(u64, 0), cache.snapshot().provider_reads);
+    fixture.fail_at = null;
+    fixture.checks = 0;
+    const bytes = try cache.readImmutableAlloc(a, @splat(1), "scoped-artifact", payload.len, digest, context, loader);
+    defer a.free(bytes);
+    try std.testing.expectEqualSlices(u8, &payload, bytes);
+    try std.testing.expect(fixture.checks >= 5);
+    try std.testing.expectEqual(@as(usize, 2), fixture.loads);
 }

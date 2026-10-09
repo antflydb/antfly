@@ -917,7 +917,7 @@ test "artifact reads suspend only provider waits and retire payloads on lost aut
         try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &signal, .requested = Clock.requested } }, .query);
         defer execution.finish();
         var fixture: Fixture = .{ .scheduler = &scheduler, .execution = &execution, .signal = &signal, .caller = &caller, .case = case, .bytes = &payload, .checksum = &checksum };
-        var vtable: ArtifactStore.VTable = .{ .deinit = Fixture.deinit, .put = Fixture.put, .get_alloc = Fixture.get, .get_range_alloc = Fixture.rawRange, .get_range_alloc_with_cancellation = Fixture.range, .stat = Fixture.stat, .delete = Fixture.delete, .get_bounded_alloc_with_cancellation = if (bounded) Fixture.bounded else null };
+        const vtable: ArtifactStore.VTable = .{ .deinit = Fixture.deinit, .put = Fixture.put, .get_alloc = Fixture.get, .get_range_alloc = Fixture.rawRange, .get_range_alloc_with_cancellation = Fixture.range, .stat = Fixture.stat, .delete = Fixture.delete, .get_bounded_alloc_with_cancellation = if (bounded) Fixture.bounded else null };
         var store: ArtifactStore = .{ .allocator = a, .ptr = &fixture, .vtable = &vtable };
         var context: ReadContext = .{ .io = std.testing.io, .cancellation = .fromAtomic(&signal) };
         if (case != .unscheduled) {
