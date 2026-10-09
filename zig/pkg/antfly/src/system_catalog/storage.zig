@@ -578,9 +578,12 @@ pub fn getById(alloc: std.mem.Allocator, txn: anytype, group_id: u64, kind: doma
 
 /// Identify table-binding writes without inspecting unrelated catalog rows.
 /// Canonical key validation belongs to the storage owner, not its consumers.
+pub fn tableRecordPrefixForGroup(buf: []u8, group_id: u64) ![]const u8 {
+    return std.fmt.bufPrint(buf, "\x00\x00__metadata__:system_catalog:{d}:record:table:", .{group_id});
+}
 pub fn tableIdFromRecordKey(key: []const u8, group_id: u64) !?u64 {
     var prefix_buf: [160]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&prefix_buf, "\x00\x00__metadata__:system_catalog:{d}:record:table:", .{group_id});
+    const prefix = try tableRecordPrefixForGroup(&prefix_buf, group_id);
     if (!std.mem.startsWith(u8, key, prefix)) return null;
     const suffix = key[prefix.len..];
     for (suffix) |byte| if (byte < '0' or byte > '9') return error.InvalidCatalogRecord;

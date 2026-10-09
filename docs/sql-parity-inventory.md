@@ -1476,9 +1476,20 @@ malformed markers and adoption downgrade attempts cannot replace local state
 or advance its checkpoint. Valid replacement removes stale local claims,
 preserves other groups and survives restart. Validation is outside the install
 apply lock, releases one table cut at a time and honors snapshot cancellation.
+Standalone checkpoint export verifies adoption/ownership before creating the
+artifact. Import verifies the complete unpublished root after bounded row
+batches and before reporting success to the seed materializer. The materializer
+already discards its installing root on failure; failed imports are not reusable
+fresh targets. Verification streams adopted groups, physical tables, bindings
+and ownership rows with cursors and shares the snapshot table-cut verifier.
+It checks orphan registry groups as well as marker groups, rejects missing,
+forged and injected claims or orphan bindings, and preserves ordinary document
+groups alongside adopted relational groups. A 256-table regression completes
+within 16-KiB verifier scratch; no whole-catalog map or user-row scan is added.
+Valid multi-group/index checkpoints preserve exact ownership across restart.
 FK publication and restore command envelopes use the same admission boundary,
-but pending-generation name reservations, initial adoption/checkpoint
-verification and full distributed publication fault coverage still require
+but pending-generation name reservations, initial adoption/migration and full
+distributed publication fault coverage still require
 activation work. No public unqualified index DDL is enabled.
 Rebuild/verification from authoritative bindings and table definitions, serving
 capability barriers, authorized point resolution, and DROP/REINDEX integration

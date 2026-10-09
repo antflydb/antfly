@@ -569,6 +569,147 @@ test "system catalog relation namespace transaction snapshots verify ownership b
     try std.testing.expectEqual(@as(u64, 5), try recovered.durableAppliedIndex(group));
 }
 
+test "system catalog relation namespace transaction checkpoint export and import reject inconsistent ownership" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    const T = struct {
+        const Variant = enum { valid, missing, forged, extra, marker, orphan_group, orphan_binding };
+        const schema =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"relational_indexes":[{"name":"email_key","keys":[{"column":"email"}]}]}
+        ;
+        fn seed(store: *RaftApplyStore, variant: Variant) !void {
+            {
+                var txn = try store.store.beginWriteTxn();
+                errdefer txn.abort();
+                var buf: [160]u8 = undefined;
+                try txn.put(try RaftApplyStore.relationWriterKeyForGroup(&buf, group), "AFRW01");
+                try txn.put(try RaftApplyStore.relationWriterKeyForGroup(&buf, 43), "AFRW01");
+                try txn.commit();
+            }
+            try store.replaceStandaloneCatalog(group, 0, &.{.{ .table_id = 7, .name = "incoming", .schema_json = schema }}, &.{}, "{}");
+            try store.applyStandaloneCommand(42, .{ .upsert_table = .{ .table_id = 11, .name = "other_group", .schema_json = "{}" } });
+            try store.applyStandaloneCommand(43, .{ .upsert_table = .{ .table_id = 13, .name = "other_adopted_group", .schema_json = "{}" } });
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = group };
+            const key: relation_names.Key = .{ .namespace_id = system_catalog.default_namespace_id, .name = "incoming" };
+            var buf: [160]u8 = undefined;
+            switch (variant) {
+                .valid => {},
+                .missing => try registry.deleteClaim(key),
+                .forged => {
+                    const index_key: relation_names.Key = .{ .namespace_id = key.namespace_id, .name = "email_key" };
+                    var owner = (try registry.getClaim(index_key)).?;
+                    owner.schema_digest[0] ^= 1;
+                    try registry.putClaim(index_key, owner);
+                },
+                .extra => try registry.putClaim(.{ .namespace_id = key.namespace_id, .name = "injected" }, (try registry.getClaim(key)).?),
+                .marker => try txn.put(try RaftApplyStore.relationWriterKeyForGroup(&buf, group), "bad"),
+                .orphan_group => try txn.delete(try RaftApplyStore.relationWriterKeyForGroup(&buf, group)),
+                .orphan_binding => try system_catalog_storage.writeResource(a, &txn, group, .{ .kind = .table, .id = 999, .parent_id = key.namespace_id, .name = "orphan", .storage_name = "absent" }),
+            }
+            try txn.commit();
+        }
+        // Simulate an authenticated artifact whose framing/checksum is valid
+        // but whose producer emitted an inconsistent semantic ownership cut.
+        fn rawArtifact(store: *RaftApplyStore, path: []const u8) !RaftApplyStore.metadata_hot_standby.CheckpointArtifact {
+            const io = store.io_impl.io();
+            var txn = try store.store.beginReadTxn();
+            defer txn.abort();
+            var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
+            defer file.close(io);
+            var writer: RaftApplyStore.metadata_hot_standby.CheckpointWriter = .{ .file = file, .io = io };
+            try writer.write("AFMCHK01");
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var entry = try cursor.first();
+            while (entry) |row| : (entry = try cursor.next()) {
+                try writer.write(&try RaftApplyStore.metadata_hot_standby.checkpointHeader(row.key.len, row.value.len));
+                try writer.write(row.key);
+                try writer.write(row.value);
+            }
+            return writer.finish();
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]T.Variant{ .valid, .missing, .forged, .extra, .marker, .orphan_group, .orphan_binding }) |variant| {
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/checkpoint-{s}", .{ tmp.sub_path, @tagName(variant) });
+        defer a.free(root);
+        const target_root = try std.fmt.allocPrint(a, "{s}-target", .{root});
+        defer a.free(target_root);
+        const path = try std.fmt.allocPrint(a, "{s}.checkpoint", .{root});
+        defer a.free(path);
+        var source = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer source.deinit();
+        try T.seed(&source, variant);
+        const artifact = if (variant == .valid)
+            try source.exportHotStandbyCheckpoint(source.io_impl.io(), path)
+        else blk: {
+            // Rejection must happen before even creating an output artifact.
+            try std.testing.expectError(error.InvalidMetadataHACheckpoint, source.exportHotStandbyCheckpoint(source.io_impl.io(), path));
+            break :blk try T.rawArtifact(&source, path);
+        };
+        {
+            var target = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+            defer target.deinit();
+            if (variant != .valid) {
+                try std.testing.expectError(error.InvalidMetadataHACheckpoint, target.importHotStandbyCheckpoint(target.io_impl.io(), path, artifact.size_bytes));
+                // The seed owner must discard this failed unpublished root;
+                // the fresh-target guard rejects retry into partial contents.
+                try std.testing.expectError(error.MetadataHACheckpointTargetNotEmpty, target.importHotStandbyCheckpoint(target.io_impl.io(), path, artifact.size_bytes));
+                continue;
+            }
+            try target.importHotStandbyCheckpoint(target.io_impl.io(), path, artifact.size_bytes);
+        }
+        var recovered = try RaftApplyStore.init(a, .{ .root_dir = target_root });
+        defer recovered.deinit();
+        var txn = try recovered.store.beginReadTxn();
+        defer txn.abort();
+        try verifyRelationCheckpointTxn(a, &txn);
+        var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = group };
+        try std.testing.expectEqual(@as(u64, 7), (try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "incoming" })).?.table_id);
+        const index_owner = (try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "email_key" })).?;
+        try std.testing.expectEqual(relation_names.Kind.index, index_owner.kind);
+        try std.testing.expectEqual(@as(u32, 1), index_owner.schema_version);
+        var buf: [160]u8 = undefined;
+        _ = try txn.get(try tableKeyForGroup(&buf, 42, 11));
+        registry.group_id = 43;
+        try std.testing.expectEqual(@as(u64, 13), (try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "other_adopted_group" })).?.table_id);
+    }
+}
+
+test "system catalog relation namespace transaction checkpoint verification uses bounded per-table scratch" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/checkpoint-streaming-scratch", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var buf: [160]u8 = undefined;
+        try txn.put(try RaftApplyStore.relationWriterKeyForGroup(&buf, 41), "AFRW01");
+        try txn.commit();
+    }
+    const tables = try a.alloc(metadata.TableRecord, 256);
+    defer a.free(tables);
+    var count: usize = 0;
+    defer for (tables[0..count]) |table| a.free(table.name);
+    for (tables, 0..) |*table, index| {
+        table.* = .{ .table_id = index + 1, .name = try std.fmt.allocPrint(a, "table_{d}", .{index}), .schema_json = "{}" };
+        count += 1;
+    }
+    try store.replaceStandaloneCatalog(41, 0, tables, &.{}, "{}");
+    var txn = try store.store.beginReadTxn();
+    defer txn.abort();
+    var bytes: [16 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&bytes);
+    try verifyRelationCheckpointTxn(bounded.allocator(), &txn);
+}
+
 test "system catalog relation namespace transaction rolls back with schema and persists across restart" {
     const a = std.testing.allocator;
     const names = @import("antfly_local_sources").system_catalog_relation_names;
@@ -7421,6 +7562,7 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         if (try stagingGet(&txn, metadata_hot_standby.outbox_key) != null) return error.MetadataHAOutboxPending;
+        try verifyRelationCheckpointTxn(self.alloc, &txn);
         var file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true });
         defer file.close(io);
         var writer: metadata_hot_standby.CheckpointWriter = .{ .file = file, .io = io };
@@ -7491,6 +7633,11 @@ pub const RaftApplyStore = struct {
         }
         var extra: [1]u8 = undefined;
         if (try file.readPositionalAll(io, &extra, offset) != 0) return error.InvalidMetadataHACheckpoint;
+        {
+            var read = try self.store.beginReadTxn();
+            defer read.abort();
+            try verifyRelationCheckpointTxn(self.alloc, &read);
+        }
         try self.store.sync(true);
     }
 
@@ -14325,8 +14472,9 @@ pub const RaftApplyStore = struct {
     // Writer adoption is separate from serving readiness. Only verified
     // migration/bootstrap may install this marker; it does not advertise
     // unqualified SQL index resolution or bypass a serving capability barrier.
+    const relation_writer_prefix = "\x00\x00__metadata__:sql_relation_writer:v1:";
     fn relationWriterKeyForGroup(buf: []u8, group_id: u64) ![]const u8 {
-        return std.fmt.bufPrint(buf, "\x00\x00__metadata__:sql_relation_writer:v1:{d}", .{group_id});
+        return std.fmt.bufPrint(buf, relation_writer_prefix ++ "{d}", .{group_id});
     }
     fn relationWriterEnabledTxn(txn: *docstore.DocStore.Txn, group_id: u64) !bool {
         var buf: [160]u8 = undefined;
@@ -23621,7 +23769,6 @@ fn validateRelationSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []
         return;
     }
     if (!std.mem.eql(u8, writer.?, "AFRW01")) return error.InvalidMetadataSnapshot;
-    var registry: relation_names.Store(Reader) = .{ .txn = &reader, .alloc = alloc, .group_id = group_id };
     var expected: usize = 0;
     for (rows) |row| {
         if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
@@ -23635,15 +23782,92 @@ fn validateRelationSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []
         const prefix = try tablePrefixForGroup(&buf, group_id);
         if (!std.mem.startsWith(u8, row.key, prefix)) continue;
         const id = (try RaftApplyStore.capturedRelationTableId(row.key, group_id)) orelse return error.InvalidMetadataSnapshot;
-        var table = try RaftApplyStore.relationSnapshot(alloc, &reader, group_id, id, true);
-        defer table.deinit();
-        for (table.claims()) |claim| {
-            const owner = (try registry.getClaim(claim.key)) orelse return error.InvalidMetadataSnapshot;
-            if (!owner.eql(claim.owner)) return error.InvalidMetadataSnapshot;
-        }
-        expected = std.math.add(usize, expected, table.claims().len) catch return error.InvalidMetadataSnapshot;
+        expected = std.math.add(usize, expected, try verifyRelationTableCut(alloc, &reader, group_id, id)) catch return error.InvalidMetadataSnapshot;
     }
     if (expected != received) return error.InvalidMetadataSnapshot;
+}
+
+fn verifyRelationTableCut(alloc: std.mem.Allocator, reader: anytype, group_id: u64, table_id: u64) !usize {
+    var table = try RaftApplyStore.relationSnapshot(alloc, reader, group_id, table_id, true);
+    defer table.deinit();
+    var registry: relation_names.Store(@TypeOf(reader.*)) = .{ .txn = reader, .alloc = alloc, .group_id = group_id };
+    for (table.claims()) |claim| {
+        const owner = (try registry.getClaim(claim.key)) orelse return error.InvalidCatalogRecord;
+        if (!owner.eql(claim.owner)) return error.InvalidCatalogRecord;
+    }
+    return table.claims().len;
+}
+
+/// Offline checkpoint verification. Cursors lend bytes; only one table's
+/// decoded projection/names occupy scratch at once. No whole-catalog map,
+/// independent transaction, repair, or user-data scan is needed.
+fn verifyRelationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64) !void {
+    if (!try RaftApplyStore.relationWriterEnabledTxn(txn, group_id)) return error.InvalidCatalogRecord;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var buf: [160]u8 = undefined;
+    var expected: usize = 0;
+    const tables = try tablePrefixForGroup(&buf, group_id);
+    var entry = try cursor.seekAtOrAfter(tables);
+    while (entry) |row| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, row.key, tables)) break;
+        const id = (try RaftApplyStore.capturedRelationTableId(row.key, group_id)) orelse return error.InvalidCatalogRecord;
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        expected = std.math.add(usize, expected, try verifyRelationTableCut(scratch.allocator(), txn, group_id, id)) catch return error.InvalidCatalogRecord;
+    }
+    const bindings = try system_catalog_storage.tableRecordPrefixForGroup(&buf, group_id);
+    entry = try cursor.seekAtOrAfter(bindings);
+    while (entry) |row| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, row.key, bindings)) break;
+        const id = (try system_catalog_storage.tableIdFromRecordKey(row.key, group_id)) orelse return error.InvalidCatalogRecord;
+        var physical_buf: [160]u8 = undefined;
+        _ = try txn.get(try tableKeyForGroup(&physical_buf, group_id, id));
+    }
+    const claims = try relation_names.Key.prefixForGroup(&buf, group_id);
+    var received: usize = 0;
+    entry = try cursor.seekAtOrAfter(claims);
+    while (entry) |row| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, row.key, claims)) break;
+        _ = (try relation_names.Key.fromStorageKey(row.key, group_id)) orelse return error.InvalidCatalogRecord;
+        _ = try relation_names.Owner.decode(row.value);
+        received += 1;
+    }
+    if (expected != received) return error.InvalidCatalogRecord;
+}
+
+fn verifyRelationCheckpointTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn) !void {
+    verifyRelationCheckpointGroupsTxn(alloc, txn) catch |err| switch (err) {
+        error.InvalidCatalogRecord, error.InvalidCatalogName, error.NotFound, error.CatalogAlreadyExists, error.CatalogCommandTooLarge => return error.InvalidMetadataHACheckpoint,
+        else => return err,
+    };
+}
+
+fn verifyRelationCheckpointGroupsTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn) !void {
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    // Registry keys are grouped by binary group ID. Check each marker once,
+    // including orphan registry groups that no marker scan would discover.
+    const claims = relation_names.Key.allGroupsPrefix();
+    var entry = try cursor.seekAtOrAfter(claims);
+    var previous_group: ?u64 = null;
+    while (entry) |row| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, row.key, claims)) break;
+        const group = (try relation_names.Key.groupFromStorageKey(row.key)) orelse return error.InvalidCatalogRecord;
+        if (previous_group != group) {
+            if (!try RaftApplyStore.relationWriterEnabledTxn(txn, group)) return error.InvalidCatalogRecord;
+            previous_group = group;
+        }
+    }
+    const markers = RaftApplyStore.relation_writer_prefix;
+    entry = try cursor.seekAtOrAfter(markers);
+    while (entry) |row| : (entry = try cursor.next()) {
+        if (!std.mem.startsWith(u8, row.key, markers)) break;
+        const group = std.fmt.parseInt(u64, row.key[markers.len..], 10) catch return error.InvalidCatalogRecord;
+        var buf: [160]u8 = undefined;
+        if (group == 0 or !std.mem.eql(u8, row.key, try RaftApplyStore.relationWriterKeyForGroup(&buf, group))) return error.InvalidCatalogRecord;
+        try verifyRelationGroupTxn(alloc, txn, group);
+    }
 }
 
 fn metadataSnapshotKeyBelongsToGroup(group_id: u64, key: []const u8) bool {

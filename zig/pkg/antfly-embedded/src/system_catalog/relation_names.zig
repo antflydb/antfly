@@ -100,6 +100,16 @@ pub const Key = struct {
         std.mem.writeInt(u64, buf[key_prefix.len..][0..8], group_id, .big);
         return buf[0 .. key_prefix.len + 8];
     }
+    pub fn allGroupsPrefix() []const u8 {
+        return key_prefix;
+    }
+    pub fn groupFromStorageKey(bytes: []const u8) !?u64 {
+        if (!std.mem.startsWith(u8, bytes, key_prefix)) return null;
+        if (bytes.len < key_prefix.len + 8) return error.InvalidCatalogRecord;
+        const group_id = std.mem.readInt(u64, bytes[key_prefix.len..][0..8], .big);
+        _ = try fromStorageKey(bytes, group_id);
+        return group_id;
+    }
     /// Length-delimited UTF-8 preserves quoted SQL names, including dots and
     /// colons. Namespace IDs already identify their parent database uniquely.
     pub fn storageKeyAlloc(self: Key, a: A, group_id: u64) ![]u8 {
@@ -468,6 +478,12 @@ test "catalog relation effect keys decode canonically and reject cross-group rec
     defer a.free(encoded);
     const decoded = (try Key.fromStorageKey(encoded, 41)).?;
     try std.testing.expect(Context.eql(.{}, key, decoded));
+    try std.testing.expectEqual(@as(?u64, 41), try Key.groupFromStorageKey(encoded));
+    var prefix_buf: [160]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, encoded, try Key.prefixForGroup(&prefix_buf, 41)));
+    try std.testing.expectError(error.NoSpaceLeft, Key.prefixForGroup(prefix_buf[0..1], 41));
+    try std.testing.expectError(error.InvalidCatalogRecord, Key.groupFromStorageKey(Key.allGroupsPrefix()));
+    try std.testing.expect((try Key.groupFromStorageKey("unrelated")) == null);
     try std.testing.expectError(error.InvalidCatalogRecord, Key.fromStorageKey(encoded, 42));
     try std.testing.expectError(error.InvalidCatalogRecord, Key.fromStorageKey(encoded[0 .. encoded.len - 1], 41));
     try std.testing.expectError(error.InvalidCatalogRecord, Key.fromStorageKey(key_prefix, 41));
