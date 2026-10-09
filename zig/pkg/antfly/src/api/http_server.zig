@@ -45395,7 +45395,10 @@ test "api http server create index installs exact visible config and defers lagg
             std.testing.allocator.free(snapshot.tables);
         }
 
-        pub fn createIndex(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
+        pub fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
+            // Catalog state outlives the request's HTTP allocation scope.
+            // Match the allocator used by snapshots, projection and deinit.
+            const allocator = std.testing.allocator;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             platform_sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
@@ -45436,7 +45439,8 @@ test "api http server create index installs exact visible config and defers lagg
             self.replaceIndexesJson(std.testing.allocator, next, true);
         }
 
-        pub fn dropIndex(ptr: *anyopaque, allocator: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
+        pub fn dropIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
+            const allocator = std.testing.allocator;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             platform_sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
