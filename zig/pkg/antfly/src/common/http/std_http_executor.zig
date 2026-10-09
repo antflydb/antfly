@@ -416,6 +416,18 @@ pub const StdHttpExecutor = struct {
 
     fn executeResolved(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         const client = &self.resolved_client;
+        const RequestWait = struct {
+            boundary: @import("antfly_local_sources").common_execution_wait.Boundary,
+            fn begin(raw: ?*anyopaque) !void {
+                const self_wait: *@This() = @ptrCast(@alignCast(raw.?));
+                try self_wait.boundary.beginWait();
+            }
+            fn end(raw: ?*anyopaque) !void {
+                const self_wait: *@This() = @ptrCast(@alignCast(raw.?));
+                try self_wait.boundary.endWait();
+            }
+        };
+        var request_wait: RequestWait = .{ .boundary = req.execution_wait orelse undefined };
 
         const extra_count = @as(usize, @intFromBool(req.content_type != null)) +
             @as(usize, @intFromBool(req.authorization != null));
@@ -446,6 +458,7 @@ pub const StdHttpExecutor = struct {
         // header construction above can still prove `not_sent`; once this
         // boundary is crossed, any error must conservatively assume delivery.
         var response = try client.request(method, req.uri, .{
+            .socket_control = if (req.execution_wait != null) .{ .ptr = &request_wait, .wait_begin_fn = RequestWait.begin, .wait_end_fn = RequestWait.end } else null,
             .delivery_observer = if (req.delivery_tracker) |tracker| .{ .context = tracker, .before_send = observeDelivery } else null,
             .headers = header_pairs,
             .max_response_size = req.responseLimit(self.cfg.max_response_bytes),

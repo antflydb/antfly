@@ -304,6 +304,7 @@ pub const ApiHttpClient = struct {
     internal_service: ?internal_service_auth.Config = null,
     /// Borrowed, scoped to one internal query/preflight client.
     prepared_query_routing: ?[]const u8 = null,
+    execution_wait: ?@import("antfly_local_sources").common_execution_wait.Boundary = null,
 
     pub fn init(alloc: std.mem.Allocator, executor: http_common.RequestExecutor) ApiHttpClient {
         return .{
@@ -334,6 +335,7 @@ pub const ApiHttpClient = struct {
     /// requests made through the same client.
     pub fn executeRequest(self: *ApiHttpClient, request: http_common.HttpRequest) !http_common.HttpResponse {
         var forwarded = request;
+        forwarded.execution_wait = request.execution_wait orelse self.execution_wait;
         var headers: std.ArrayListUnmanaged(http_common.RequestHeader) = .empty;
         defer headers.deinit(self.alloc);
         if (self.prepared_query_routing) |value| if (internal_service_auth.requestTargetsInternalApi(request.uri)) {

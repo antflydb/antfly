@@ -126,6 +126,9 @@ pub const HttpRequest = struct {
     body: []const u8 = &.{},
     cancellation: ?*const RequestCancellation = null,
     delivery_tracker: ?*RequestDeliveryTracker = null,
+    /// Borrowed through physical transport joining. Executors may park only
+    /// actual IO waits; authentication, encoding and decoding keep CPU.
+    execution_wait: ?@import("../execution_wait.zig").Boundary = null,
 
     pub fn header(self: HttpRequest, name: []const u8) ?[]const u8 {
         for (self.headers) |entry| {

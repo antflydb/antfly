@@ -15499,6 +15499,30 @@ fn queryRemote(
     return parsed;
 }
 
+/// Stable for the entire synchronous RPC, including physical cancellation
+/// joining. The transport borrows the existing child/root and restores its
+/// actual phase between leaf waits; it never creates fresh query authority.
+const RemoteQueryWait = struct {
+    borrow: ?@import("antfly_runtime_abi").runnable_abi.Borrowed,
+    parked_class: ?@import("antfly_runtime_abi").runnable_abi.Class = null,
+
+    fn boundary(self: *@This()) ?@import("antfly_local_sources").common_execution_wait.Boundary {
+        if (self.borrow == null) return null;
+        return .{ .ptr = self, .begin = begin, .end = end };
+    }
+    fn begin(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.parked_class != null) return error.InvalidRunnableTransition;
+        self.parked_class = try @import("runnable_fanout_owner.zig").parkCoordinator(self.borrow);
+    }
+    fn end(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const phase = self.parked_class orelse return error.InvalidRunnableTransition;
+        try @import("runnable_fanout_owner.zig").resumeCoordinator(self.borrow, phase);
+        self.parked_class = null;
+    }
+};
+
 fn queryResponseRemote(
     executor: http_common.RequestExecutor,
     alloc: std.mem.Allocator,
@@ -15508,6 +15532,8 @@ fn queryResponseRemote(
     req: db_mod.types.SearchRequest,
 ) !query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
+    var request_wait: RemoteQueryWait = .{ .borrow = req.execution_runnable };
+    client.execution_wait = request_wait.boundary();
     const prepared = try @import("prepared_query_routing.zig").encode(alloc, table_name, req);
     defer if (prepared) |value| alloc.free(value);
     client.prepared_query_routing = prepared;
@@ -17361,6 +17387,17 @@ fn consumerTests() type {
                         try std.testing.expect(stats.operations >= 3);
                         try std.testing.expect(stats.runnable_slots <= scheduler.config.slots - scheduler.config.control_slots);
                         try std.testing.expect(stats.resource_blocked >= 1);
+                        const wait = req.execution_wait orelse return error.TestUnexpectedResult;
+                        try wait.beginWait();
+                        const parked = scheduler.stats();
+                        try std.testing.expect(parked.operations >= 3);
+                        try std.testing.expect(parked.resource_blocked >= 2);
+                        var control: native.Execution = .{};
+                        defer control.finish();
+                        try control.start(scheduler, .{ .io = std.testing.io, .retained_bytes = 7 }, .control);
+                        try control.checkpoint();
+                        control.finish();
+                        try wait.endWait();
                     }
                     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, req.body, .{});
                     defer parsed.deinit();

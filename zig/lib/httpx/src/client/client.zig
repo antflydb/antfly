@@ -188,6 +188,10 @@ pub const RequestOptions = struct {
     /// Borrowed transport-neutral cancellation source. It must remain valid
     /// until the request method returns.
     cancellation: ?CancellationToken = null,
+    /// Borrowed by the request until all transport tasks physically join.
+    /// Currently applies to plain HTTP/1 reads and writes. Parsing and body
+    /// decoding retain CPU; shared H2 readers never borrow a stream's grant.
+    socket_control: ?socket_mod.WriteControl = null,
 };
 
 const RequestHeadSerializer = struct {
@@ -1073,6 +1077,7 @@ pub const Client = struct {
         req.max_retries = reqOpts.max_retries;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
         req.delivery_observer = reqOpts.delivery_observer;
+        req.socket_control = reqOpts.socket_control;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -1194,6 +1199,7 @@ pub const Client = struct {
         req.max_retries = reqOpts.max_retries;
         req.attempt_observer = reqOpts.attempt_observer orelse self.config.attempt_observer;
         req.delivery_observer = reqOpts.delivery_observer;
+        req.socket_control = reqOpts.socket_control;
 
         try req.headers.set(HeaderName.USER_AGENT, self.config.user_agent);
 
@@ -2148,6 +2154,15 @@ pub const Client = struct {
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         req.notifySend();
+        if (req.socket_control) |control| {
+            var writer = socket_mod.ControlledWriter{ .socket = socket, .control = control };
+            try writer.writeAll(request_head);
+            try req.writeBody(&writer);
+            var source = ControlledSocketSource{ .socket = socket, .control = control };
+            const result = try self.readResponse(&source, req.method, self.responseSizeLimit(req));
+            if (keep_alive_out) |out| out.* = result.reusable;
+            return result.response;
+        }
         try socket.sendAll(request_head);
         try req.writeBody(socket);
         const result = try self.readResponse(socket, req.method, self.responseSizeLimit(req));
@@ -2169,6 +2184,15 @@ pub const Client = struct {
         const request_head = try serializeRequestHeadAlloc(self.allocator, req);
         defer self.allocator.free(request_head);
         req.notifySend();
+        if (req.socket_control) |control| {
+            var transport_writer = socket_mod.ControlledWriter{ .socket = socket, .control = control };
+            try transport_writer.writeAll(request_head);
+            try req.writeBody(&transport_writer);
+            var source = ControlledSocketSource{ .socket = socket, .control = control };
+            const result = try self.readResponseToWriter(&source, req.method, self.responseSizeLimit(req), writer, progress_cb, progress_ctx);
+            if (keep_alive_out) |out| out.* = result.reusable;
+            return result.response;
+        }
         try socket.sendAll(request_head);
         try req.writeBody(socket);
         const result = try self.readResponseToWriter(
@@ -3273,11 +3297,18 @@ pub const Client = struct {
         };
     }
 
+    const ControlledSocketSource = struct {
+        socket: *Socket,
+        control: socket_mod.WriteControl,
+    };
+
     /// Read bytes from either a Socket or a TlsSession into `buf`.
     fn recvFrom(source: anytype, buf: []u8) !usize {
         const Source = @TypeOf(source);
         if (Source == *Socket) {
             return source.recv(buf);
+        } else if (Source == *ControlledSocketSource) {
+            return source.socket.recvControlled(buf, source.control);
         } else if (Source == *TlsSession) {
             var empty_read_policy = EmptyReadPolicy.init(TlsSessionIoReader.max_empty_reads);
             while (true) {
@@ -3299,6 +3330,9 @@ pub const Client = struct {
         if (Source == *Socket) {
             socket_reader.* = SocketIoReader.init(source, io_buf);
             return &socket_reader.reader_iface;
+        } else if (Source == *ControlledSocketSource) {
+            socket_reader.* = SocketIoReader.initControlled(source.socket, io_buf, source.control);
+            return &socket_reader.reader_iface;
         } else if (Source == *TlsSession) {
             tls_reader.* = TlsSessionIoReader.init(source, io_buf.len, io_buf);
             return &tls_reader.reader_iface;
@@ -3310,6 +3344,14 @@ pub const Client = struct {
     fn readSomeOnce(reader: *Io.Reader, buf: []u8) !usize {
         var iov = [_][]u8{buf};
         return reader.readVec(&iov);
+    }
+
+    fn checkSourceReadError(source: anytype, socket_reader: *const SocketIoReader, tls_reader: *const TlsSessionIoReader) !void {
+        if (@TypeOf(source) == *ControlledSocketSource) {
+            if (socket_reader.last_read_error) |err| return err;
+        } else if (@TypeOf(source) == *TlsSession) {
+            try tls_reader.checkReadError();
+        }
     }
     const ResponseContentCoding = enum {
         gzip,
@@ -3482,7 +3524,7 @@ pub const Client = struct {
 
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkSourceReadError(source, &socket_reader, &tls_reader);
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
@@ -3511,7 +3553,7 @@ pub const Client = struct {
         } else {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkSourceReadError(source, &socket_reader, &tls_reader);
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
@@ -3603,7 +3645,7 @@ pub const Client = struct {
         if (is_redirect) {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkSourceReadError(source, &socket_reader, &tls_reader);
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
@@ -3621,7 +3663,7 @@ pub const Client = struct {
             var encoded_prefix_len: usize = 0;
             while (encoded_prefix_len < encoded_prefix.len) {
                 const n = readSomeOnce(framed_reader, encoded_prefix[encoded_prefix_len..]) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkSourceReadError(source, &socket_reader, &tls_reader);
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
@@ -3643,7 +3685,7 @@ pub const Client = struct {
                 defer encoded.deinit(parser.allocator);
                 while (true) {
                     const n = readSomeOnce(&encoded_reader.reader_iface, &read_buf) catch |err| {
-                        if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                        try checkSourceReadError(source, &socket_reader, &tls_reader);
                         try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                         if (err == error.EndOfStream) break;
                         if (err == error.ReadFailed and close_delimited_body) break;
@@ -3682,7 +3724,7 @@ pub const Client = struct {
 
                 while (true) {
                     const n = decompressor.reader.readSliceShort(&read_buf) catch |err| {
-                        if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                        try checkSourceReadError(source, &socket_reader, &tls_reader);
                         try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                         if (err == error.EndOfStream) break;
                         if (err == error.ReadFailed and close_delimited_body) break;
@@ -3705,7 +3747,7 @@ pub const Client = struct {
         } else {
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkSourceReadError(source, &socket_reader, &tls_reader);
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     if (err == error.ReadFailed and close_delimited_body) break;
@@ -3737,7 +3779,7 @@ pub const Client = struct {
             var discarded: usize = 0;
             while (true) {
                 const n = readSomeOnce(framed_reader, &read_buf) catch |err| {
-                    if (@TypeOf(source) == *TlsSession) try tls_reader.checkReadError();
+                    try checkSourceReadError(source, &socket_reader, &tls_reader);
                     try checkBodyFramingError(parser, &cl_reader, &chunked_reader);
                     if (err == error.EndOfStream) break;
                     return err;
@@ -6578,4 +6620,88 @@ test "outbound admission includes retained headers before transmission" {
     try std.testing.expectEqual(@as(usize, 0), sends.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), client.outbound.snapshot().waiting);
     try std.testing.expectEqual(@as(usize, 0), client.connection_slots.used.load(.acquire));
+}
+
+test "HTTP1 request controls fence header and body input before publication" {
+    const Mode = enum { success, denied_resume, canceled_resume };
+    const Framing = enum { fixed, chunked, close_delimited };
+    const State = struct {
+        mode: Mode,
+        io: Io,
+        header_read: Io.Event = .unset,
+        parked: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: ?*anyopaque) socket_mod.WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.mode == .canceled_resume and self.ends >= 3) return error.Canceled;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked);
+            self.begins += 1;
+            self.parked = true;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked);
+            self.ends += 1;
+            // One request-head write, then one response-header read. Keep
+            // body bytes out of that read so the body adapter must do IO.
+            if (self.ends == 2) self.header_read.set(self.io);
+            if (self.ends >= 3 and self.mode == .denied_resume) return error.DeadlineExceeded;
+            self.parked = false;
+        }
+        fn serve(listener: *socket_mod.TcpListener, state: *@This(), framing: Framing) !void {
+            var accepted = try listener.accept();
+            defer accepted.socket.close();
+            try accepted.socket.setRecvTimeout(2_000);
+            var request: [1024]u8 = undefined;
+            var size: usize = 0;
+            while (std.mem.indexOf(u8, request[0..size], "\r\n\r\n") == null) {
+                const n = try accepted.socket.recv(request[size..]);
+                if (n == 0) return error.UnexpectedEof;
+                size += n;
+            }
+            const head = switch (framing) {
+                .fixed => "HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\n",
+                .chunked => "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                .close_delimited => "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+            };
+            try accepted.socket.sendAll(head);
+            try state.header_read.waitTimeout(state.io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+            try accepted.socket.sendAll(if (framing == .chunked) "7\r\npayload\r\n0\r\n\r\n" else "payload");
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |streaming| for (std.enums.values(Framing)) |framing| for (std.enums.values(Mode)) |mode| {
+        var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var state: State = .{ .mode = mode, .io = io };
+        var server = try io.concurrent(State.serve, .{ &listener, &state, framing });
+        defer server.cancel(io) catch {};
+        const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/", .{listener.getLocalAddress().getPort()});
+        defer alloc.free(url);
+        var client = Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        const options: RequestOptions = .{ .socket_control = .{ .ptr = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = State.end }, .timeout_ms = 2_000 };
+        var output: std.ArrayListUnmanaged(u8) = .empty;
+        defer output.deinit(alloc);
+        const result = if (streaming) client.getToWriter(url, options, arrayListWriter(&output, alloc), null, null) else client.get(url, options);
+        switch (mode) {
+            .success => {
+                var response = try result;
+                defer response.deinit();
+                try std.testing.expectEqualStrings("payload", if (streaming) output.items else response.body.?);
+                try std.testing.expect(!state.parked);
+            },
+            .denied_resume => try std.testing.expectError(error.DeadlineExceeded, result),
+            .canceled_resume => try std.testing.expectError(error.Canceled, result),
+        }
+        if (mode != .success) try std.testing.expectEqual(@as(usize, 0), output.items.len);
+        try server.await(io);
+        try std.testing.expectEqual(state.begins, state.ends);
+        try std.testing.expect(state.ends >= 3);
+    };
 }
