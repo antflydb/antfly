@@ -267,6 +267,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         mutex: Io.Mutex = Io.Mutex.init,
         last_cleanup: i64 = 0,
         changed: Io.Condition = .init,
+        changed_generation: u64 = 0,
         waiters: usize = 0,
         closed: bool = false,
 
@@ -347,6 +348,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                 }
             }
             self.cleanupLocked(milliTimestamp(self.io));
+            self.changed_generation +%= 1;
             self.changed.broadcast(self.io);
         }
 
@@ -354,6 +356,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             self.closed = true;
+            self.changed_generation +%= 1;
             self.changed.broadcast(self.io);
         }
 
@@ -367,11 +370,12 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                 self.mutex.unlock(self.io);
             };
             while (true) {
+                try options.check();
                 if (options.isCancelled()) return error.Cancelled;
                 const current = milliTimestamp(self.io);
                 if (options.deadline_ms) |original| if (current >= original) return error.Timeout;
                 if (queued and current >= deadline) return error.Timeout;
-                return self.getConnection(host, port) catch |err| switch (err) {
+                const connection = self.getConnection(host, port) catch |err| switch (err) {
                     error.PoolExhausted, error.PoolExhaustedForHost => {
                         self.mutex.lockUncancelable(self.io);
                         defer self.mutex.unlock(self.io);
@@ -382,14 +386,14 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                             queued = true;
                         }
                         const wake_ns = @as(i128, @min(deadline, current +| 25)) * std.time.ns_per_ms;
-                        self.changed.waitTimeout(self.io, &self.mutex, .{ .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = @intCast(wake_ns) } } }) catch |wait_err| switch (wait_err) {
-                            error.Timeout => {},
-                            error.Canceled => return error.Canceled,
-                        };
+                        try options.waitCapacity(self.io, &self.mutex, &self.changed, &self.changed_generation, wake_ns);
                         continue;
                     },
                     else => return err,
                 };
+                errdefer self.evictConnection(connection);
+                try options.check();
+                return connection;
             }
         }
 
@@ -477,6 +481,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                 self.mutex.lockUncancelable(self.io);
                 defer self.mutex.unlock(self.io);
                 self.connecting_count -= 1;
+                self.changed_generation +%= 1;
                 self.changed.broadcast(self.io);
                 const count = self.connecting.getPtr(key).?;
                 count.* -= 1;
@@ -544,6 +549,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
             defer self.mutex.unlock(self.io);
             const now = milliTimestamp(self.io);
             entry.release(now);
+            self.changed_generation +%= 1;
             self.changed.broadcast(self.io);
             self.active_count -|= 1;
             // Opportunistic cleanup on release.
@@ -587,6 +593,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
 
             if (entry.in_use) self.active_count -|= 1;
             self.total_count -|= 1;
+            self.changed_generation +%= 1;
             self.changed.broadcast(self.io);
 
             self.destroyEntry(entry);
@@ -838,6 +845,7 @@ const PoolTestContext = struct {
     block: bool = false,
     fail: bool = false,
     calls: std.atomic.Value(usize) = .init(0),
+    cancel_after_create: ?*std.atomic.Value(bool) = null,
 };
 const PoolTestEntry = struct {
     last_used: i64 = 0,
@@ -867,6 +875,7 @@ const PoolTestEntry = struct {
         errdefer alloc.free(owned_host);
         const entry = try alloc.create(@This());
         entry.* = .{ .host = owned_host, .port = port };
+        if (context.cancel_after_create) |signal| signal.store(true, .release);
         return entry;
     }
 };
@@ -939,4 +948,98 @@ test "outbound pool wait preserves original deadline without starting a connecti
     try std.testing.expectError(error.Timeout, pool_inst.getConnectionWait("a", 80, .{ .deadline_ms = milliTimestamp(io) + 10 }, 1, 1000));
     try std.testing.expectEqual(@as(usize, 1), context.calls.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), pool_inst.waiters);
+}
+
+test "outbound pool capacity waits reject reentry before acquiring a released connection" {
+    const Case = enum { success, begin_denied, end_denied, canceled };
+    const State = struct {
+        pool: *TestPool,
+        held: *PoolTestEntry,
+        case: Case,
+        released: bool = false,
+        canceled: bool = false,
+        parked: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: ?*anyopaque) @import("../net/socket.zig").WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.canceled) return error.Canceled;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.pool.mutex.tryLock());
+            self.pool.mutex.unlock(self.pool.io);
+            try std.testing.expectEqual(@as(usize, 1), self.pool.waiters);
+            self.begins += 1;
+            if (self.case == .begin_denied) return error.SchedulerClosed;
+            self.parked = true;
+            self.pool.releaseConnection(self.held);
+            self.released = true;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.pool.mutex.tryLock());
+            self.pool.mutex.unlock(self.pool.io);
+            try std.testing.expect(self.parked);
+            self.parked = false;
+            self.ends += 1;
+            if (self.case == .end_denied) return error.DeadlineExceeded;
+            if (self.case == .canceled) self.canceled = true;
+        }
+    };
+    for (std.enums.values(Case)) |case| {
+        const io = std.testing.io;
+        var context: PoolTestContext = .{ .io = io };
+        var slots: ConnectionSlots = .{ .limit = 1 };
+        var pool_inst = TestPool.initWithConfig(std.testing.allocator, io, .{ .max_connections = 1, .max_per_host = 1 }, &context);
+        defer pool_inst.deinit();
+        pool_inst.bindSlots(&slots);
+        const held = try pool_inst.getConnection("a", 80);
+        var state: State = .{ .pool = &pool_inst, .held = held, .case = case };
+        defer if (!state.released) pool_inst.releaseConnection(held);
+        const result = pool_inst.getConnectionWait("a", 80, .{ .execution_wait = .{ .ptr = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = State.end } }, 1, 1000);
+        switch (case) {
+            .success => {
+                const acquired = try result;
+                try std.testing.expect(acquired == held);
+                pool_inst.releaseConnection(acquired);
+            },
+            .begin_denied => try std.testing.expectError(error.SchedulerClosed, result),
+            .end_denied => try std.testing.expectError(error.DeadlineExceeded, result),
+            .canceled => try std.testing.expectError(error.Canceled, result),
+        }
+        try std.testing.expectEqual(@as(usize, 1), context.calls.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 1), state.begins);
+        try std.testing.expectEqual(@as(usize, if (case == .begin_denied) 0 else 1), state.ends);
+        try std.testing.expect(!state.parked);
+        try std.testing.expectEqual(@as(usize, 0), pool_inst.waiters);
+        if (!state.released) {
+            pool_inst.releaseConnection(held);
+            state.released = true;
+        }
+        pool_inst.retireIdle();
+        try std.testing.expectEqual(@as(usize, 0), slots.used.load(.acquire));
+    }
+}
+
+test "outbound pool acquisition retires a newly created connection after authority rejection" {
+    const Check = struct {
+        fn check(raw: ?*anyopaque) @import("../net/socket.zig").WriteControl.Error!void {
+            const signal: *std.atomic.Value(bool) = @ptrCast(@alignCast(raw.?));
+            if (signal.load(.acquire)) return error.Canceled;
+        }
+    };
+    var signal = std.atomic.Value(bool).init(false);
+    const io = std.testing.io;
+    var context: PoolTestContext = .{ .io = io, .cancel_after_create = &signal };
+    var slots: ConnectionSlots = .{ .limit = 1 };
+    var pool_inst = TestPool.initWithConfig(std.testing.allocator, io, .{ .max_connections = 1 }, &context);
+    defer pool_inst.deinit();
+    pool_inst.bindSlots(&slots);
+    try std.testing.expectError(error.Canceled, pool_inst.getConnectionWait("a", 80, .{ .execution_wait = .{ .ptr = &signal, .check_fn = Check.check } }, 1, 1000));
+    try std.testing.expectEqual(@as(usize, 1), context.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool_inst.totalCount());
+    try std.testing.expectEqual(@as(usize, 0), pool_inst.stats().connecting);
+    try std.testing.expectEqual(@as(usize, 0), pool_inst.waiters);
+    try std.testing.expectEqual(@as(usize, 0), slots.used.load(.acquire));
 }

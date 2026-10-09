@@ -939,6 +939,7 @@ pub const Client = struct {
     h2_mutex: Io.Mutex = Io.Mutex.init,
     h2_opening: std.StringHashMapUnmanaged(void) = .empty,
     h2_changed: Io.Condition = .init,
+    h2_changed_generation: u64 = 0,
     h2_waiting: usize = 0,
     resolved_addresses: std.StringHashMapUnmanaged(Address) = .{},
     resolved_addresses_mutex: Io.Mutex = Io.Mutex.init,
@@ -1987,6 +1988,7 @@ pub const Client = struct {
         return owner.acquire(req.uri.host orelse return error.InvalidUri, req.uri.effectivePort(), .{
             .deadline_ms = deadline_ms,
             .retained_bytes = outboundRetainedBytes(req),
+            .execution_wait = req.socket_control,
             .context = &context,
             .cancelled = Context.cancelled,
         });
@@ -2018,7 +2020,7 @@ pub const Client = struct {
         // Reuses a pooled connection per host when available.
         if (shouldUseHttp2(self.config)) {
             const is_tls = req.uri.isTls();
-            var lease = try self.getOrCreateH2Conn(host, port, is_tls, deadline_ms, interrupt);
+            var lease = try self.getOrCreateH2Conn(host, port, is_tls, deadline_ms, interrupt, req.socket_control);
             defer lease.release();
             const entry = lease.entry;
             var wait_rejected = false;
@@ -2049,7 +2051,7 @@ pub const Client = struct {
         defer if (direct_socket) self.connection_slots.release();
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
-                var tls_conn = try self.tls_pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
+                var tls_conn = try self.tls_pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .execution_wait = req.socket_control, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
                 var ok = false;
                 defer {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
@@ -2073,7 +2075,7 @@ pub const Client = struct {
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
-            var conn = try self.pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
+            var conn = try self.pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .execution_wait = req.socket_control, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
             var ok = false;
             defer {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
@@ -2158,7 +2160,7 @@ pub const Client = struct {
         defer if (direct_socket) self.connection_slots.release();
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
-                var tls_conn = try self.tls_pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
+                var tls_conn = try self.tls_pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .execution_wait = req.socket_control, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
                 var ok = false;
                 defer {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
@@ -2181,7 +2183,7 @@ pub const Client = struct {
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
-            var conn = try self.pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
+            var conn = try self.pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .execution_wait = req.socket_control, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
             var ok = false;
             defer {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
@@ -2404,7 +2406,9 @@ pub const Client = struct {
     /// blocking I/O (DNS, TCP connect, TLS handshake, SETTINGS exchange).
     /// If two fibers race to create the same host:port, the loser discards
     /// its connection and uses the winner's.
-    fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool, deadline_ms: ?i64, interrupt: *RequestInterrupt) !H2Lease {
+    fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool, deadline_ms: ?i64, interrupt: *RequestInterrupt, execution_wait: ?socket_mod.WriteControl) !H2Lease {
+        const wait_options = @import("admission.zig").Options{ .execution_wait = execution_wait };
+        try wait_options.check();
         var key_buf: [280]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_tls) "https" else "http", host, port }) catch return error.InvalidUri;
 
@@ -2418,6 +2422,7 @@ pub const Client = struct {
         // One handshake owner per endpoint. Followers wait within the same
         // operation/deadline envelope instead of opening redundant sockets.
         while (true) {
+            try wait_options.check();
             self.h2_mutex.lockUncancelable(self.io);
             defer self.h2_mutex.unlock(self.io);
             if (self.request_gate.isClosed()) return error.ClientClosed;
@@ -2443,16 +2448,14 @@ pub const Client = struct {
                 self.h2_waiting += 1;
             }
             const wake_ns = @as(i128, @min(wait_deadline, common.milliTimestamp(self.io) +| 25)) * std.time.ns_per_ms;
-            self.h2_changed.waitTimeout(self.io, &self.h2_mutex, .{ .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = @intCast(wake_ns) } } }) catch |err| switch (err) {
-                error.Timeout => {},
-                error.Canceled => return error.Canceled,
-            };
+            try wait_options.waitCapacity(self.io, &self.h2_mutex, &self.h2_changed, &self.h2_changed_generation, wake_ns);
         }
         defer {
             self.h2_mutex.lockUncancelable(self.io);
             defer self.h2_mutex.unlock(self.io);
             const removed = self.h2_opening.fetchRemove(key).?;
             self.allocator.free(removed.key);
+            self.h2_changed_generation +%= 1;
             self.h2_changed.broadcast(self.io);
         }
         self.retireUnusedH2(true);
@@ -2521,6 +2524,8 @@ pub const Client = struct {
             try self.exchangeH2Settings(&entry.h2, &entry.socket, &entry.socket);
         }
 
+        try wait_options.check();
+
         // Spawn background fibers before taking the lock for insertion.
         if (entry.recv_group.concurrent(self.io, h2RecvLoopFiber, .{entry})) {
             entry.recv_running = true;
@@ -2535,6 +2540,8 @@ pub const Client = struct {
             entry.recv_group.await(self.io) catch {};
             entry.socket.close();
         };
+
+        try wait_options.check();
 
         // --- Phase 3: Re-check and insert under lock ---
         // Collect entries to tear down outside the lock (await yields the
@@ -3096,7 +3103,7 @@ pub const Client = struct {
         const host = req.uri.host orelse return error.InvalidUri;
         const is_tls = req.uri.isTls();
         const port = req.uri.effectivePort();
-        var lease = try self.getOrCreateH2Conn(host, port, is_tls, deadline_ms, &interrupt);
+        var lease = try self.getOrCreateH2Conn(host, port, is_tls, deadline_ms, &interrupt, req.socket_control);
         var lease_transferred = false;
         defer if (!lease_transferred) lease.release();
         const entry = lease.entry;
@@ -7156,4 +7163,104 @@ test "H2 cleanup never renews the reserved transport deadline" {
     try io.sleep(.fromMilliseconds(25), .awake);
     for (0..3) |_| try std.testing.expectError(error.Timeout, budget.control().check());
     try std.testing.expectEqual(original, budget.deadline_ns);
+}
+
+test "outbound admission public clients reject capacity resume before transmission" {
+    const Mode = enum { begin_denied, end_denied, canceled };
+    const State = struct {
+        client: *Client,
+        held: *OutboundAdmission.Lease,
+        mode: Mode,
+        canceled: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: ?*anyopaque) socket_mod.WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.canceled) return error.Canceled;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.client.outbound.mutex.tryLock());
+            self.client.outbound.mutex.unlock(self.client.io);
+            try std.testing.expectEqual(@as(usize, 1), self.client.outbound.snapshot().waiting);
+            self.begins += 1;
+            if (self.mode == .begin_denied) return error.SchedulerClosed;
+            self.held.release();
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.client.outbound.mutex.tryLock());
+            self.client.outbound.mutex.unlock(self.client.io);
+            self.ends += 1;
+            if (self.mode == .end_denied) return error.DeadlineExceeded;
+            self.canceled = true;
+        }
+        fn send(raw: *anyopaque) void {
+            _ = @as(*std.atomic.Value(usize), @ptrCast(@alignCast(raw))).fetchAdd(1, .acq_rel);
+        }
+    };
+    for ([_]bool{ false, true }) |streaming| for ([_][]const u8{ "http://127.0.0.1:1/never", "https://127.0.0.1:1/never" }) |url| for (std.enums.values(Mode)) |mode| {
+        const alloc = std.testing.allocator;
+        var client = Client.initWithConfig(alloc, std.testing.io, .{ .outbound = .{ .max_active = 1, .max_waiters = 1 }, .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        var held = try client.outbound.acquire("held", 80, .{});
+        defer held.release();
+        var state: State = .{ .client = &client, .held = &held, .mode = mode };
+        var sends = std.atomic.Value(usize).init(0);
+        const opts: RequestOptions = .{ .timeout_ms = 2000, .socket_control = .{ .ptr = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = State.end }, .delivery_observer = .{ .context = &sends, .before_send = State.send } };
+        var output: std.ArrayListUnmanaged(u8) = .empty;
+        defer output.deinit(alloc);
+        const result = if (streaming) client.getToWriter(url, opts, arrayListWriter(&output, alloc), null, null) else client.get(url, opts);
+        try std.testing.expectError(switch (mode) {
+            .begin_denied => error.SchedulerClosed,
+            .end_denied => error.DeadlineExceeded,
+            .canceled => error.Canceled,
+        }, result);
+        try std.testing.expectEqual(@as(usize, 1), state.begins);
+        try std.testing.expectEqual(@as(usize, if (mode == .begin_denied) 0 else 1), state.ends);
+        try std.testing.expectEqual(@as(usize, 0), sends.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), output.items.len);
+        try std.testing.expectEqual(@as(usize, 0), client.connection_slots.used.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), client.outbound.snapshot().waiting_bytes);
+        held.release();
+        try std.testing.expectEqual(@as(usize, 0), client.outbound.snapshot().active);
+    };
+}
+
+test "H2 opening capacity wait resumes outside connection locks before rejection" {
+    const State = struct {
+        client: *Client,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.client.h2_mutex.tryLock());
+            self.client.h2_mutex.unlock(self.client.io);
+            try std.testing.expectEqual(@as(usize, 1), self.client.h2_waiting);
+            self.begins += 1;
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.client.h2_mutex.tryLock());
+            self.client.h2_mutex.unlock(self.client.io);
+            self.ends += 1;
+            return error.DeadlineExceeded;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var client = Client.initWithConfig(alloc, std.testing.io, .{ .http2_enabled = true, .outbound = .{ .max_waiters = 1 }, .retry_policy = .{ .max_retries = 0 } });
+    defer client.deinit();
+    const key = try alloc.dupe(u8, "http:127.0.0.1:1");
+    try client.h2_opening.put(alloc, key, {});
+    defer {
+        _ = client.h2_opening.remove(key);
+        alloc.free(key);
+    }
+    var state: State = .{ .client = &client };
+    try std.testing.expectError(error.DeadlineExceeded, client.get("http://127.0.0.1:1/never", .{ .timeout_ms = 2000, .socket_control = .{ .ptr = &state, .wait_begin_fn = State.begin, .wait_end_fn = State.end } }));
+    try std.testing.expectEqual(@as(usize, 1), state.begins);
+    try std.testing.expectEqual(@as(usize, 1), state.ends);
+    try std.testing.expectEqual(@as(usize, 0), client.h2_waiting);
+    try std.testing.expectEqual(@as(usize, 0), client.h2_conns.count());
+    try std.testing.expectEqual(@as(usize, 0), client.connection_slots.used.load(.acquire));
 }

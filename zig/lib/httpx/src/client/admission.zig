@@ -2,6 +2,7 @@
 //! Owners must join callers before deinit. Waiting happens before transmission.
 const std = @import("std");
 const Io = std.Io;
+const WriteControl = @import("../net/socket.zig").WriteControl;
 
 pub const Config = struct {
     max_active: u32 = 0,
@@ -13,8 +14,47 @@ pub const Config = struct {
 pub const Options = struct {
     deadline_ms: ?i64 = null,
     retained_bytes: usize = 0,
+    /// Borrowed only for this synchronous acquisition; never retained by a lease.
+    execution_wait: ?WriteControl = null,
     context: ?*const anyopaque = null,
     cancelled: ?*const fn (*const anyopaque) bool = null,
+    pub fn check(self: Options) !void {
+        if (self.execution_wait) |control| try control.check();
+    }
+    /// Caller holds mutex on entry and exit, including errors. Scheduler
+    /// callbacks run without the capacity lock; only the physical condition
+    /// wait borrows CPU. A generation recorded under the capacity lock avoids
+    /// missing a release between scheduler parking and condition registration.
+    /// The original absolute polling deadline is never renewed.
+    pub fn waitCapacity(self: Options, io: Io, mutex: *Io.Mutex, changed: *Io.Condition, generation: *const u64, wake_ns: i128) !void {
+        const Wait = struct {
+            fn run(wait_io: Io, lock: *Io.Mutex, condition: *Io.Condition, deadline_ns: i128) !void {
+                try condition.waitTimeout(wait_io, lock, .{ .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = @intCast(deadline_ns) } } });
+            }
+            fn unlocked(wait_io: Io, lock: *Io.Mutex, condition: *Io.Condition, current_generation: *const u64, observed_generation: u64, deadline_ns: i128) !void {
+                lock.lockUncancelable(wait_io);
+                defer lock.unlock(wait_io);
+                if (current_generation.* != observed_generation) return;
+                run(wait_io, lock, condition, deadline_ns) catch |err| switch (err) {
+                    error.Timeout => {},
+                    else => return err,
+                };
+            }
+        };
+        if (self.execution_wait) |control| {
+            const observed_generation = generation.*;
+            mutex.unlock(io);
+            defer mutex.lockUncancelable(io);
+            const remaining_ns = @max(@as(i128, 0), wake_ns - Io.Clock.awake.now(io).nanoseconds);
+            const poll_ms: u64 = @intCast(@divTrunc(remaining_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms));
+            const ms = (try control.timeout(poll_ms)).?;
+            const bounded_wake = @min(wake_ns, Io.Clock.awake.now(io).nanoseconds + @as(i128, ms) * std.time.ns_per_ms);
+            try control.withWait(Wait.unlocked, .{ io, mutex, changed, generation, observed_generation, bounded_wake });
+        } else Wait.run(io, mutex, changed, wake_ns) catch |err| switch (err) {
+            error.Timeout => {},
+            else => return err,
+        };
+    }
     pub fn isCancelled(self: Options) bool {
         return if (self.context) |ptr| if (self.cancelled) |call| call(ptr) else false else false;
     }
@@ -26,6 +66,7 @@ pub const Admission = struct {
     config: Config,
     mutex: Io.Mutex = .init,
     changed: Io.Condition = .init,
+    changed_generation: u64 = 0,
     endpoints: std.StringHashMapUnmanaged(Endpoint) = .empty,
     active: usize = 0,
     waiting: usize = 0,
@@ -43,6 +84,7 @@ pub const Admission = struct {
             owner.active -= 1;
             owner.endpoints.getPtr(self.key).?.active -= 1;
             owner.dropOwner(self.key);
+            owner.changed_generation +%= 1;
             owner.changed.broadcast(owner.io);
         }
     };
@@ -53,6 +95,7 @@ pub const Admission = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.closed = true;
+        self.changed_generation +%= 1;
         self.changed.broadcast(self.io);
     }
     pub fn deinit(self: *Admission) void {
@@ -73,6 +116,7 @@ pub const Admission = struct {
         }
     }
     pub fn acquire(self: *Admission, host: []const u8, port: u16, options: Options) !Lease {
+        try options.check();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.closed) return error.ClientClosed;
@@ -105,6 +149,7 @@ pub const Admission = struct {
         };
         const deadline = @min(options.deadline_ms orelse std.math.maxInt(i64), now +| self.config.max_wait_ms);
         while (true) {
+            try options.check();
             if (self.closed) return error.ClientClosed;
             if (options.isCancelled()) return error.Cancelled;
             const current = nowMs(self.io);
@@ -124,10 +169,7 @@ pub const Admission = struct {
             }
             // Poll borrowed cancellation; release/close wakes capacity waits immediately.
             const wake_ns = @as(i128, @min(deadline, current +| 25)) * std.time.ns_per_ms;
-            self.changed.waitTimeout(self.io, &self.mutex, .{ .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = @intCast(wake_ns) } } }) catch |err| switch (err) {
-                error.Timeout => {},
-                error.Canceled => return error.Canceled,
-            };
+            try options.waitCapacity(self.io, &self.mutex, &self.changed, &self.changed_generation, wake_ns);
         }
     }
 };
@@ -220,4 +262,108 @@ test "outbound admission bounds queued count bytes cancellation and close" {
         try std.testing.expectEqual(@as(usize, 0), owner.snapshot().waiting_bytes);
         try std.testing.expectEqual(@as(usize, 0), owner.snapshot().waiting);
     }
+}
+
+test "outbound admission capacity waits loan execution without holding the capacity lock" {
+    const Case = enum { success, begin_denied, end_denied, canceled, closed };
+    const State = struct {
+        owner: *Admission,
+        held: *Admission.Lease,
+        case: Case,
+        parked: bool = false,
+        canceled: bool = false,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: ?*anyopaque) WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.canceled) return error.Canceled;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.owner.mutex.tryLock());
+            self.owner.mutex.unlock(self.owner.io);
+            self.begins += 1;
+            try std.testing.expect(!self.parked);
+            try std.testing.expectEqual(@as(usize, 1), self.owner.snapshot().waiting);
+            try std.testing.expectEqual(@as(usize, 7), self.owner.snapshot().waiting_bytes);
+            if (self.case == .begin_denied) return error.SchedulerClosed;
+            self.parked = true;
+            if (self.case == .closed) self.owner.close() else self.held.release();
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.owner.mutex.tryLock());
+            self.owner.mutex.unlock(self.owner.io);
+            try std.testing.expect(self.parked);
+            self.parked = false;
+            self.ends += 1;
+            if (self.case == .end_denied) return error.DeadlineExceeded;
+            if (self.case == .canceled) self.canceled = true;
+        }
+    };
+    for (std.enums.values(Case)) |case| {
+        var owner = Admission.init(std.testing.allocator, std.testing.io, .{ .max_active = 1, .max_per_endpoint = 1, .max_waiters = 1, .max_wait_ms = 1000 });
+        defer owner.deinit();
+        var held = try owner.acquire("a", 80, .{});
+        defer held.release();
+        var state: State = .{ .owner = &owner, .held = &held, .case = case };
+        const result = owner.acquire("a", 80, .{ .retained_bytes = 7, .execution_wait = .{ .ptr = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = State.end } });
+        switch (case) {
+            .success => {
+                var acquired = try result;
+                try std.testing.expectEqual(@as(usize, 1), owner.snapshot().active);
+                acquired.release();
+            },
+            .begin_denied => try std.testing.expectError(error.SchedulerClosed, result),
+            .end_denied => try std.testing.expectError(error.DeadlineExceeded, result),
+            .canceled => try std.testing.expectError(error.Canceled, result),
+            .closed => try std.testing.expectError(error.ClientClosed, result),
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.begins);
+        try std.testing.expectEqual(@as(usize, if (case == .begin_denied) 0 else 1), state.ends);
+        try std.testing.expect(!state.parked);
+        try std.testing.expectEqual(@as(usize, 0), owner.snapshot().waiting);
+        try std.testing.expectEqual(@as(usize, 0), owner.snapshot().waiting_bytes);
+        held.release();
+        try std.testing.expectEqual(@as(usize, 0), owner.snapshot().active);
+        try std.testing.expectEqual(@as(usize, 0), owner.snapshot().endpoints);
+    }
+}
+
+test "outbound admission capacity release during parking cannot miss the wakeup" {
+    const State = struct {
+        io: Io,
+        mutex: *Io.Mutex,
+        changed: *Io.Condition,
+        generation: *u64,
+        ends: usize = 0,
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.mutex.tryLock());
+            defer self.mutex.unlock(self.io);
+            self.generation.* +%= 1;
+            // There are no registered waiters yet. The generation, rather
+            // than a future condition signal, must preserve this release.
+            self.changed.broadcast(self.io);
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.mutex.tryLock());
+            self.mutex.unlock(self.io);
+            self.ends += 1;
+        }
+    };
+    const io = std.testing.io;
+    var mutex: Io.Mutex = .init;
+    var changed: Io.Condition = .init;
+    var generation: u64 = 0;
+    var state: State = .{ .io = io, .mutex = &mutex, .changed = &changed, .generation = &generation };
+    const options: Options = .{ .execution_wait = .{ .ptr = &state, .wait_begin_fn = State.begin, .wait_end_fn = State.end } };
+    const before = Io.Clock.awake.now(io).nanoseconds;
+    mutex.lockUncancelable(io);
+    defer mutex.unlock(io);
+    try options.waitCapacity(io, &mutex, &changed, &generation, before + 5 * std.time.ns_per_s);
+    try std.testing.expect(Io.Clock.awake.now(io).nanoseconds - before < std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 1), state.ends);
+    try std.testing.expectEqual(@as(u64, 1), generation);
 }
