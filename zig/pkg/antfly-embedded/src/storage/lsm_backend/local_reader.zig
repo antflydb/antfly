@@ -129,7 +129,7 @@ pub const Pool = struct {
             return self.slot.arena.allocator();
         }
         pub fn release(self: *Workspace) void {
-            _ = self.slot.arena.reset(.{ .retain_with_limit = retained_bytes_per_workspace });
+            if (!self.slot.arena.reset(.{ .retain_with_limit = retained_bytes_per_workspace })) _ = self.slot.arena.reset(.free_all);
             if (self.slot.budget) |*budget| _ = budget.releaseUnusedCredit();
             platform.sync.lockYielding(&self.pool.mutex);
             self.slot.busy = false;
@@ -469,4 +469,25 @@ test "lsm local decoder admission progress releases workspace before retry" {
     try std.testing.expectEqual(@as(usize, 1), budget.waits);
     try std.testing.expectEqual(@as(usize, 1), pool.active);
     try std.testing.expect(pool.waiters == null);
+}
+
+test "lsm local decoder frees oversized scratch when reset allocation fails" {
+    const allocators = @import("../lite/test_allocator.zig");
+    var backing = allocators.BudgetAllocator{ .backing = std.testing.allocator };
+    var no_resize = allocators.NoResizeAllocator{ .backing = backing.allocator() };
+    var manager = resources.ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    var pool: Pool = .{};
+    defer pool.deinit();
+    var work = pool.acquire(no_resize.allocator(), &manager, std.testing.io, 2 * 1024 * 1024, 4 * 1024 * 1024, 0);
+    _ = try work.allocator().alloc(u8, 1024 * 1024);
+    backing.limit = backing.live;
+    work.release();
+    try std.testing.expectEqual(@as(usize, 0), backing.live);
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+    backing.limit = std.math.maxInt(usize);
+    work = pool.acquire(no_resize.allocator(), &manager, std.testing.io, 256 * 1024, 4 * 1024 * 1024, 0);
+    _ = try work.allocator().alloc(u8, 4096);
+    work.release();
+    try std.testing.expect(pool.slots[0].cap.live <= Pool.retained_bytes_per_workspace + 128);
 }

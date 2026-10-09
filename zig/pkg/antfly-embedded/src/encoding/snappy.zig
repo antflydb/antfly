@@ -78,9 +78,33 @@ pub fn decodeWithAdmission(alloc: Allocator, src: []const u8, control: anytype) 
     var pos: usize = 0;
     const uncompressed_len = try readVarint(src, &pos);
 
-    var dst = try alloc.alloc(u8, uncompressed_len);
+    const dst = try alloc.alloc(u8, uncompressed_len);
     errdefer alloc.free(dst);
 
+    try decodePayload(src, pos, dst, control);
+    return dst;
+}
+
+/// Decode into final caller-owned storage without a second output allocation.
+pub fn decodeInto(src: []const u8, dst: []u8) !void {
+    return decodeIntoWithAdmission(src, dst, null);
+}
+
+pub fn decodeIntoWithAdmission(src: []const u8, dst: []u8, control: anytype) !void {
+    try checkpoint(control);
+    if (src.len == 0) {
+        if (dst.len != 0) return error.CorruptInput;
+        return;
+    }
+    var pos: usize = 0;
+    const uncompressed_len = try readVarint(src, &pos);
+    if (uncompressed_len != dst.len) return error.CorruptInput;
+    try decodePayload(src, pos, dst, control);
+}
+
+fn decodePayload(src: []const u8, start: usize, dst: []u8, control: anytype) !void {
+    var pos = start;
+    const uncompressed_len = dst.len;
     var d: usize = 0; // destination offset
     var checked_destination: usize = 0;
     var tags_since_check: usize = 0;
@@ -161,7 +185,6 @@ pub fn decodeWithAdmission(alloc: Allocator, src: []const u8, control: anytype) 
 
     if (d != uncompressed_len) return error.CorruptInput;
     try checkpoint(control);
-    return dst;
 }
 
 /// Return the decoded length stored in the Snappy block preamble without
