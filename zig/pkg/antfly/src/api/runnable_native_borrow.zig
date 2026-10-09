@@ -350,3 +350,73 @@ test "native execution borrow resumes the current phase without promoting saved 
         try std.testing.expectEqual(@as(u64, 17), owner.stats().retained_bytes);
     }
 }
+
+test "native execution borrow carries production HTTP read capability through a physical child" {
+    const Worker = struct {
+        execution: *native.Execution,
+        file: std.Io.File,
+        ready: std.Io.Event = .unset,
+        go: std.Io.Event = .unset,
+        fn run(self: *@This()) anyerror!u8 {
+            try self.execution.activateChild();
+            defer self.execution.park(.resource_blocked) catch {};
+            try self.execution.park(.resource_blocked);
+            self.ready.set(std.testing.io);
+            self.go.waitUncancelable(std.testing.io);
+            try self.execution.checkLifetime();
+            var bytes: [1]u8 = undefined;
+            try std.testing.expectEqual(@as(usize, 1), try self.file.readPositionalAll(std.testing.io, &bytes, 0));
+            try self.execution.enter(try self.execution.retainedClass());
+            try self.execution.checkpoint();
+            return bytes[0];
+        }
+    };
+    var owner = try native.Scheduler.init(.{ .slots = 2 });
+    var original: native.Execution = .{};
+    try original.start(&owner, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+    defer original.finish();
+    var read: @import("runnable_local_read.zig").Read = .{ .execution = &original, .allocator = std.testing.allocator };
+    var team = try read.team();
+    var bridge = try Bridge.init(&team.borrow, std.testing.allocator);
+    var parent: native.Execution = .{};
+    try bridge.bind(&parent);
+    defer parent.finish();
+    var child: native.Execution = .{};
+    try child.reserveChild(&parent, std.testing.io, @sizeOf(native.Execution) + 31);
+    defer child.finish();
+    const retained = owner.stats().retained_bytes;
+    try std.testing.expectError(error.InvalidRunnableTransition, read.team());
+    try parent.park(.resource_blocked);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "value", .data = &.{42} });
+    const file = try tmp.dir.openFile(std.testing.io, "value", .{});
+    defer file.close(std.testing.io);
+    var worker: Worker = .{ .execution = &child, .file = file };
+    var future = try std.testing.io.concurrent(Worker.run, .{&worker});
+    defer {
+        worker.go.set(std.testing.io);
+        _ = future.cancel(std.testing.io) catch {};
+    }
+    try worker.ready.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } });
+    try team.borrow.checkLifetime();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().runnable_slots);
+    var control: native.Execution = .{};
+    try control.start(&owner, .{ .io = std.testing.io }, .control);
+    try control.checkpoint();
+    control.finish();
+    try std.testing.expectEqual(@as(usize, 2), owner.stats().operations);
+    try std.testing.expectEqual(retained, owner.stats().retained_bytes);
+    worker.go.set(std.testing.io);
+    try std.testing.expectEqual(@as(u8, 42), try future.await(std.testing.io));
+    // Readiness and completed IO cannot retire the child receiver before join.
+    try std.testing.expectEqual(@as(usize, 2), owner.stats().operations);
+    child.finish();
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try parent.enter(try parent.retainedClass());
+    parent.finish();
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), owner.stats().retained_bytes);
+    original.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+}

@@ -14547,6 +14547,10 @@ pub const ApiHttpServer = struct {
         return self.executePublicTableQueryDispatchWithReadinessRetryDeadline(alloc, source, table_name, body, row_filter_json, authenticated_identity, cancellation, response_label, bound_join, catalog_resolver, null);
     }
 
+    fn queryRunnableStatus(status: @import("antfly_runtime_abi").error_abi.Status) !void {
+        if (!status.isOk()) return @import("antfly_runtime_abi").error_abi.errorFromStatus(status);
+    }
+
     fn executePublicTableQueryDispatchWithReadinessRetryDeadline(
         self: *ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -14574,6 +14578,7 @@ pub const ApiHttpServer = struct {
         const request_deadline_ns = if (original_deadline_ns) |deadline| @min(deadline, body_deadline_ns orelse deadline) else body_deadline_ns;
         const retry_deadline_ns = retryDeadlineFromNative(retry_io, request_deadline_ns);
         while (true) {
+            if (resolver.execution_team) |team| try queryRunnableStatus(team.borrow.checkpoint(team.borrow.context));
             try ensureRequestActive(cancellation);
             if (retryDeadlineExpired(retry_deadline_ns, retryMonotonicNs(retry_io))) return error.Timeout;
             return self.executePublicTableQueryDispatchWithIdentity(
@@ -14588,7 +14593,7 @@ pub const ApiHttpServer = struct {
                 response_label,
                 bound_join,
                 resolver,
-                null,
+                resolver.execution_team,
             ) catch |err| switch (err) {
                 error.DocIdentityNamespaceMismatch,
                 error.IdentityReadGenerationChanged,
@@ -14600,7 +14605,9 @@ pub const ApiHttpServer = struct {
                     if (retry_timeout_ns == 0) return err;
                     const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
                     if (sleep_ns == 0) return error.Timeout;
+                    if (resolver.execution_team) |team| try queryRunnableStatus(team.borrow.park(team.borrow.context, @backingInt(@import("antfly_runtime_abi").runnable_abi.Wait.resource)));
                     try sleepNsCancellable(retry_io, sleep_ns, cancellation);
+                    if (resolver.execution_team) |team| try queryRunnableStatus(team.borrow.enter(team.borrow.context, @backingInt(try team.borrow.currentClass())));
                     continue;
                 },
                 error.Timeout => {
@@ -21087,6 +21094,7 @@ pub const ApiHttpServer = struct {
     const CatalogQueryResolver = struct {
         arena: std.mem.Allocator,
         delivery: ?@import("antfly_local_sources").api_query_response.Delivery = null,
+        execution_team: ?*@import("antfly_runtime_abi").runnable_abi.Team = null,
         revision: ?u64 = null,
         tables: std.StringHashMapUnmanaged(?system_catalog.ResolvedTable) = .empty,
         definitions: std.StringHashMapUnmanaged(system_catalog.QueryDefinition) = .empty,
@@ -21929,6 +21937,23 @@ pub const ApiHttpServer = struct {
         return self.handleAdmittedPublicTableQueryWithDelivery(table_name, body, content_type, borrowed_identity, cancellation, null);
     }
 
+    pub fn admitPublicQueryRunnable(self: *ApiHttpServer, execution: *RunnableScheduler.Execution, table_name: []const u8, body: []const u8, cancellation: ?*const http_common.RequestCancellation) !?contextual_operations.OwnedResponse {
+        const body_deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
+        const deadline = originalQueryDeadline(body_deadline, cancellation);
+        execution.start(self.runnableScheduler(), .{
+            .io = self.sharedApiIo() orelse self.embedding_provider_runtime.io,
+            .native_now_ns = platform_time.monotonicNs,
+            .deadline_ns = deadline,
+            .cancellation = if (cancellation) |value| .{ .ptr = value, .requested = struct {
+                fn requested(raw: *const anyopaque) bool {
+                    return @as(*const http_common.RequestCancellation, @ptrCast(@alignCast(raw))).isCancelled();
+                }
+            }.requested } else null,
+            .retained_bytes = @as(u64, body.len) +| table_name.len +| 1024,
+        }, .query) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
+        return null;
+    }
+
     pub fn handleAdmittedPublicTableQueryWithDelivery(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -21938,30 +21963,63 @@ pub const ApiHttpServer = struct {
         cancellation: ?*const http_common.RequestCancellation,
         delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
     ) !contextual_operations.OwnedResponse {
+        var execution: RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        if (!isNdjsonContentType(content_type)) {
+            if (try self.admitPublicQueryRunnable(&execution, table_name, body, cancellation)) |response| return response;
+        }
+        return self.handleAdmittedPublicTableQueryWithRunnable(table_name, body, content_type, borrowed_identity, cancellation, delivery, &execution);
+    }
+
+    pub fn handleAdmittedPublicTableQueryWithRunnable(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        content_type: ?[]const u8,
+        borrowed_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+        delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
+        execution: *RunnableScheduler.Execution,
+    ) !contextual_operations.OwnedResponse {
         if (isNdjsonContentType(content_type)) return self.handlePublicTableMultiQueryWithCancellation(table_name, body, borrowed_identity, cancellation, null, null);
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*owned| owned.deinit(self.alloc);
         const body_deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
-        const deadline = originalQueryDeadline(body_deadline, cancellation);
+        const ingress_deadline = if (execution.entry) |*entry| entry.options.deadline_ns else null;
+        const candidate_deadline = originalQueryDeadline(body_deadline, cancellation);
+        const deadline = if (ingress_deadline) |original| @min(original, candidate_deadline orelse original) else candidate_deadline;
+        var read: @import("runnable_local_read.zig").Read = .{ .execution = execution, .allocator = self.alloc };
+        var team: ?@import("antfly_runtime_abi").runnable_abi.Team = if (execution.entry != null) try read.team() else null;
         var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer catalog_arena.deinit();
         const Bridge = struct {
             server: *ApiHttpServer,
             table_name: []const u8,
             target: @import("antfly_local_sources").api_query_response.Delivery,
+            execution: *RunnableScheduler.Execution,
+            fn parkOutput(self_: *@This()) !void {
+                if (self_.execution.entry != null) try self_.execution.park(.output_blocked);
+            }
+            fn resumeOutput(self_: *@This()) !void {
+                if (self_.execution.entry != null) try self_.execution.enter(try self_.execution.retainedClass());
+            }
             fn start(raw: *anyopaque, length: usize) !void {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
                 try self_.server.reachQueryResultLifecycle("public.table.query", self_.table_name, length);
+                try self_.parkOutput();
                 try self_.target.start_fn(self_.target.ptr, length);
+                try self_.resumeOutput();
             }
             fn write(raw: *anyopaque, bytes: []const u8) !void {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
+                try self_.parkOutput();
                 try self_.target.write_fn(self_.target.ptr, bytes);
+                try self_.resumeOutput();
             }
         };
-        var bridge: ?Bridge = if (delivery) |target| .{ .server = self, .table_name = table_name, .target = target } else null;
-        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .delivery = if (bridge) |*value| .{ .ptr = value, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes, .preparation_bytes = value.target.preparation_bytes, .spill_io = self.embedding_provider_runtime.io, .consume_columns = true } else null };
-        var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
+        var bridge: ?Bridge = if (delivery) |target| .{ .server = self, .table_name = table_name, .target = target, .execution = execution } else null;
+        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .execution_team = if (team) |*value| value else null, .delivery = if (bridge) |*value| .{ .ptr = value, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes, .preparation_bytes = value.target.preparation_bytes, .spill_io = self.embedding_provider_runtime.io, .consume_columns = true } else null };
+        var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none, .execution_team = resolver.execution_team }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
         defer binding.deinit();
         if (bridge) |*value| value.table_name = binding.physical;
         return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null, &resolver, binding.dispatch);
@@ -22156,6 +22214,7 @@ pub const ApiHttpServer = struct {
         err: anyerror,
     ) !contextual_operations.OwnedResponse {
         return switch (err) {
+            error.SchedulerFull, error.SchedulerClosed, error.RunnableWaitTimeout => try self.queryOverloadedResponse(),
             error.ObjectTableJoinUnsupported => try contextual_operations.textAlloc(self.alloc, 400, "object table joins are not supported"),
             error.Forbidden => try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden"),
             error.CatalogGenerationChanged => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
@@ -38645,8 +38704,25 @@ test "api http server serves table query response envelope" {
         }
     };
 
+    const Observer = struct {
+        server: ?*ApiHttpServer = null,
+        calls: usize = 0,
+        fn reach(raw: *anyopaque, _: QueryResultLifecycleEvent) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const stats = self.server.?.runnable_scheduler.?.stats();
+            try std.testing.expectEqual(@as(usize, 1), stats.operations);
+            try std.testing.expectEqual(@as(usize, 1), stats.runnable_slots);
+            try std.testing.expect(stats.retained_bytes >= 1024);
+            self.calls += 1;
+        }
+    };
+    var observer: Observer = .{};
     var source = FakeSource{};
-    var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), table_source.source(), null);
+    var server = ApiHttpServer.init(std.testing.allocator, .{
+        .runnable_policy = .{ .slots = 2 },
+        .query_result_lifecycle_hook = .{ .ptr = &observer, .reach_fn = Observer.reach },
+    }, source.iface(), table_source.source(), null);
+    observer.server = &server;
     defer server.deinit();
     const query_body = try test_contract_helpers.encodeMatchQueryRequest(std.testing.allocator, "body", "hello", &.{}, 5);
     defer std.testing.allocator.free(query_body);
@@ -38658,6 +38734,9 @@ test "api http server serves table query response envelope" {
     });
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqual(@as(usize, 1), observer.calls);
+    try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), server.runnable_scheduler.?.stats().retained_bytes);
     try std.testing.expectEqualStrings("application/json", resp.content_type.?);
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, resp.body, .{});
     defer parsed.deinit();

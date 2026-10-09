@@ -6309,19 +6309,26 @@ pub const AntflyApiHandler = struct {
             return ctx.text("invalid query request");
         };
         defer parsed_table.deinit();
-        var delivery: QueryDelivery = .{ .ctx = ctx };
-        var resp = try self.api_server.handleAdmittedPublicTableQueryWithDelivery(
+        var execution: http_server_mod.RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        if (try self.api_server.admitPublicQueryRunnable(&execution, parsed_table.table_name, body_data, &cancellation)) |value| {
+            var response = value;
+            return respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
+        }
+        var delivery: QueryDelivery = .{ .ctx = ctx, .execution = &execution };
+        var resp = try self.api_server.handleAdmittedPublicTableQueryWithRunnable(
             parsed_table.table_name,
             body_data,
             ctx.header("content-type"),
             authenticated_identity,
             &cancellation,
             delivery.sink(),
+            &execution,
         );
-        if (delivery.writer) |*writer| {
+        if (delivery.writer != null) {
             defer resp.deinit(self.api_server.alloc);
             if (resp.status != 200) return error.QueryDeliveryFailed;
-            try writer.close();
+            try delivery.close();
             return ctx.response.build();
         }
         return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
@@ -7808,7 +7815,13 @@ pub const AntflyApiHandler = struct {
 
     const QueryDelivery = struct {
         ctx: *httpx.Context,
+        execution: ?*http_server_mod.RunnableScheduler.Execution = null,
         writer: ?httpx.Context.StreamWriter = null,
+        fn close(self: *@This()) !void {
+            if (self.execution) |execution| if (execution.entry != null) try execution.park(.output_blocked);
+            try self.writer.?.close();
+            if (self.execution) |execution| if (execution.entry != null) try execution.enter(try execution.retainedClass());
+        }
         fn sink(self: *@This()) ?@import("antfly_local_sources").api_query_response.Delivery {
             if (self.ctx.stream_delegate == null and self.ctx.h1_sock == null and self.ctx.h2 == null) return null;
             return .{ .ptr = self, .start_fn = start, .write_fn = write };
@@ -7849,13 +7862,21 @@ pub const AntflyApiHandler = struct {
         };
         defer ctx.allocator.free(logical);
         var cancellation = requestCancellation(ctx);
-        var delivery: QueryDelivery = .{ .ctx = ctx };
-        var resp = self.api_server.handleAdmittedPublicTableQueryWithDelivery(logical, body_data, ctx.header("content-type"), authenticated_identity, &cancellation, delivery.sink()) catch |err| return err;
-        if (delivery.writer) |*writer| {
+        var execution: http_server_mod.RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        if (!isNdjsonContentType(ctx.header("content-type"))) {
+            if (try self.api_server.admitPublicQueryRunnable(&execution, logical, body_data, &cancellation)) |value| {
+                var response = value;
+                return respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
+            }
+        }
+        var delivery: QueryDelivery = .{ .ctx = ctx, .execution = &execution };
+        var resp = self.api_server.handleAdmittedPublicTableQueryWithRunnable(logical, body_data, ctx.header("content-type"), authenticated_identity, &cancellation, delivery.sink(), &execution) catch |err| return err;
+        if (delivery.writer != null) {
             defer resp.deinit(self.api_server.alloc);
             // A post-commit error closes the stream; never send a second status.
             if (resp.status != 200) return error.QueryDeliveryFailed;
-            try writer.close();
+            try delivery.close();
             return ctx.response.build();
         }
         return respondOwnedContextualResponse(ctx, &resp, self.api_server.alloc);
@@ -17141,9 +17162,16 @@ test "httpx lake query delivery requires a transport and forwards delegated JSON
     defer request.deinit();
     var ctx = httpx.Context.init(a, std.testing.io, &request);
     defer ctx.deinit();
-    var delivery: AntflyApiHandler.QueryDelivery = .{ .ctx = &ctx };
+    var owner = try http_server_mod.RunnableScheduler.Scheduler.init(.{ .slots = 2 });
+    var execution: http_server_mod.RunnableScheduler.Execution = .{};
+    try execution.start(&owner, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+    defer execution.finish();
+    try execution.park(.resource_blocked);
+    try execution.enter(.inference);
+    var delivery: AntflyApiHandler.QueryDelivery = .{ .ctx = &ctx, .execution = &execution };
     try std.testing.expect(delivery.sink() == null);
     const State = struct {
+        owner: *http_server_mod.RunnableScheduler.Scheduler,
         started: bool = false,
         written: bool = false,
         closed: bool = false,
@@ -17162,14 +17190,27 @@ test "httpx lake query delivery requires a transport and forwards delegated JSON
         fn close(raw: ?*anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             try std.testing.expect(self.written);
+            try std.testing.expectEqual(@as(usize, 0), self.owner.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), self.owner.stats().output_blocked);
+            try std.testing.expectEqual(@as(usize, 1), self.owner.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), self.owner.stats().retained_bytes);
+            var control: http_server_mod.RunnableScheduler.Execution = .{};
+            try control.start(self.owner, .{ .io = std.testing.io }, .control);
+            try control.checkpoint();
+            control.finish();
             self.closed = true;
         }
     };
-    var state: State = .{};
+    var state: State = .{ .owner = &owner };
     ctx.stream_delegate = .{ .ptr = &state, .start = State.start, .write = State.write, .close = State.close };
     const sink = delivery.sink().?;
     try sink.start_fn(sink.ptr, 2);
     try sink.write_fn(sink.ptr, "{}");
-    try delivery.writer.?.close();
+    try delivery.close();
     try std.testing.expect(state.closed);
+    try std.testing.expectEqual(http_server_mod.RunnableScheduler.Class.inference, try execution.retainedClass());
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), owner.stats().retained_bytes);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
 }
