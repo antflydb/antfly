@@ -25,6 +25,7 @@ const candidate_prefix = "\x00\x00__metadata_derived__:sql_relation_candidate:v1
 const retirement_prefix = "\x00\x00__metadata__:sql_relation_retirement:v1:";
 const root_prefix = "\x00\x00__metadata__:sql_relation_root:v1:";
 const source_prefix = "\x00\x00__metadata__:sql_relation_source:v1:";
+const live_prefix = "\x00\x00__metadata__:sql_relation_live:v1:";
 pub const max_cursor_bytes = 512;
 pub const max_tables_per_page = 64;
 pub const max_page_bytes = 4 * 1024 * 1024;
@@ -236,8 +237,12 @@ pub fn candidateGenerationPrefix(buf: []u8, generation: Generation) ![]const u8 
     return buf[0 .. candidate_prefix.len + 24];
 }
 pub fn candidateKey(buf: []u8, state: *const State, key: names.Key) ![]const u8 {
+    try state.validate();
+    return candidateGenerationKey(buf, Generation.of(state), key);
+}
+pub fn candidateGenerationKey(buf: []u8, generation: Generation, key: names.Key) ![]const u8 {
     try key.validate();
-    const prefix = try candidatePrefix(buf, state);
+    const prefix = try candidateGenerationPrefix(buf, generation);
     const end = prefix.len + 10 + key.name.len;
     if (buf.len < end) return error.NoSpaceLeft;
     std.mem.writeInt(u64, buf[prefix.len..][0..8], key.namespace_id, .big);
@@ -276,6 +281,223 @@ pub fn retirementKey(buf: []u8, generation: Generation) ![]const u8 {
     std.mem.writeInt(u64, buf[retirement_prefix.len..][0..8], generation.group_id, .big);
     @memcpy(buf[retirement_prefix.len + 8 ..][0..16], &generation.job_id);
     return buf[0 .. retirement_prefix.len + 24];
+}
+
+pub fn liveKey(buf: []u8, group: u64) ![]const u8 {
+    if (group == 0) return error.InvalidCatalogRecord;
+    if (buf.len < live_prefix.len + 8) return error.NoSpaceLeft;
+    @memcpy(buf[0..live_prefix.len], live_prefix);
+    std.mem.writeInt(u64, buf[live_prefix.len..][0..8], group, .big);
+    return buf[0 .. live_prefix.len + 8];
+}
+
+/// Mutable integrity cut of the published generation, separate from its
+/// immutable reconciliation seal. Native publication must independently prove
+/// readiness and fence decoder/writer capabilities before installing this cut.
+pub const LiveRoot = struct {
+    generation: Generation,
+    epoch: Epoch,
+    sequence: u64 = 1,
+    claims: u64,
+    claim_hash: [32]u8,
+    const magic = "AFRL01";
+    pub const encoded_len = magic.len + Generation.encoded_len + 16 + 8 + 8 + 8 + 32;
+
+    pub fn initial(ready: State) !LiveRoot {
+        try ready.validate();
+        if (ready.phase != .ready or ready.failure != .none) return error.InvalidCatalogRecord;
+        const root: LiveRoot = .{ .generation = Generation.of(&ready), .epoch = ready.epoch, .claims = ready.expected.claims, .claim_hash = ready.expected.claim_hash };
+        try root.validate();
+        return root;
+    }
+    fn validate(self: LiveRoot) !void {
+        try self.generation.validate();
+        if (self.sequence == 0 or self.epoch.revision == 0 or std.mem.allEqual(u8, &self.epoch.incarnation, 0) or
+            (self.claims == 0 and !std.mem.allEqual(u8, &self.claim_hash, 0))) return error.InvalidCatalogRecord;
+    }
+    pub fn encode(self: LiveRoot) ![encoded_len]u8 {
+        try self.validate();
+        var out: [encoded_len]u8 = undefined;
+        @memcpy(out[0..magic.len], magic);
+        var offset: usize = magic.len;
+        inline for (.{ try self.generation.encode(), self.epoch.incarnation, self.epoch.revision, self.sequence, self.claims, self.claim_hash }) |value| {
+            const size = @sizeOf(@TypeOf(value));
+            switch (@typeInfo(@TypeOf(value))) {
+                .int => std.mem.writeInt(@TypeOf(value), out[offset..][0..size], value, .big),
+                .array => @memcpy(out[offset..][0..size], &value),
+                else => unreachable,
+            }
+            offset += size;
+        }
+        return out;
+    }
+    pub fn decode(bytes: []const u8) !LiveRoot {
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidCatalogRecord;
+        var offset: usize = magic.len;
+        const generation = try Generation.decode(bytes[offset..][0..Generation.encoded_len]);
+        offset += Generation.encoded_len;
+        var result: LiveRoot = .{ .generation = generation, .epoch = undefined, .sequence = undefined, .claims = undefined, .claim_hash = undefined };
+        inline for (.{ &result.epoch.incarnation, &result.epoch.revision, &result.sequence, &result.claims, &result.claim_hash }) |ptr| {
+            const T = @typeInfo(@TypeOf(ptr)).pointer.child;
+            const size = @sizeOf(T);
+            ptr.* = switch (@typeInfo(T)) {
+                .int => std.mem.readInt(T, bytes[offset..][0..size], .big),
+                .array => bytes[offset..][0..size].*,
+                else => unreachable,
+            };
+            offset += size;
+        }
+        try result.validate();
+        return result;
+    }
+    /// O(affected names), no schema decoding or catalog scan. Full before/after
+    /// entries include both active and reserved owner slots in the digest.
+    pub fn updated(self: LiveRoot, plan: *const names.Plan, epoch: Epoch) !LiveRoot {
+        try self.validate();
+        if (!std.mem.eql(u8, &self.epoch.incarnation, &epoch.incarnation) or epoch.revision < self.epoch.revision) return error.CatalogGenerationChanged;
+        var result = self;
+        var changed = false;
+        var old = plan.before_by_name.iterator();
+        while (old.next()) |entry| {
+            const next = plan.after_by_name.get(entry.key_ptr.*);
+            if (next) |value| if (value.eql(entry.value_ptr.*)) continue;
+            changed = true;
+            const claim = try names.Claim.fromEntry(entry.key_ptr.*, entry.value_ptr.*);
+            result.claims = std.math.sub(u64, result.claims, try claimCount(claim)) catch return error.InvalidCatalogRecord;
+            subtractClaimHash(&result.claim_hash, try claimHash(claim));
+        }
+        var next = plan.after_by_name.iterator();
+        while (next.next()) |entry| {
+            if (plan.before_by_name.get(entry.key_ptr.*)) |prior| if (prior.eql(entry.value_ptr.*)) continue;
+            changed = true;
+            const claim = try names.Claim.fromEntry(entry.key_ptr.*, entry.value_ptr.*);
+            result.claims = std.math.add(u64, result.claims, try claimCount(claim)) catch return error.CatalogGenerationExhausted;
+            addClaimHash(&result.claim_hash, try claimHash(claim));
+        }
+        if (changed and epoch.revision == self.epoch.revision) return error.InvalidCatalogRecord;
+        if (changed or !epoch.eql(self.epoch)) {
+            result.sequence = std.math.add(u64, self.sequence, 1) catch return error.CatalogGenerationExhausted;
+            result.epoch = epoch;
+        }
+        try result.validate();
+        return result;
+    }
+};
+
+/// O(1) root swap, never a bulk copy of candidate names. Caller MUST first
+/// authenticate the complete candidate/source proof and capability/lifecycle
+/// barriers in this same write transaction, and abort on any error here.
+pub fn publishVerifiedRoot(txn: anytype, ready: State, epoch: Epoch, prior: ?LiveRoot) !LiveRoot {
+    const next = try LiveRoot.initial(ready);
+    if (!ready.epoch.eql(epoch) or try readSourceRevision(txn, ready.group_id) != epoch.revision) return error.CatalogGenerationChanged;
+    var buf: [128]u8 = undefined;
+    const job = (try optionalGet(txn, try jobKey(&buf, ready.group_id))) orelse return error.CatalogGenerationChanged;
+    if (!std.mem.eql(u8, job, &(try ready.encode()))) return error.CatalogGenerationChanged;
+    const root = if (try optionalGet(txn, try rootKey(&buf, ready.group_id))) |bytes| try Generation.decode(bytes) else null;
+    const live = if (try optionalGet(txn, try liveKey(&buf, ready.group_id))) |bytes| try LiveRoot.decode(bytes) else null;
+    if (!std.meta.eql(live, prior) or !std.meta.eql(root, if (prior) |value| @as(?Generation, value.generation) else null)) return error.CatalogGenerationChanged;
+    if (prior) |value| {
+        if (value.generation.group_id != ready.group_id) return error.InvalidCatalogRecord;
+        if (!value.epoch.eql(epoch)) return error.CatalogGenerationChanged;
+        if (value.generation.eql(next.generation)) {
+            if (!std.meta.eql(value, next)) return error.CatalogGenerationChanged;
+            return value; // An exact duplicate cannot reset live counters.
+        }
+        if (std.mem.order(u8, &value.generation.job_id, &ready.job_id) != .lt) return error.CatalogGenerationChanged;
+        const retired = (try optionalGet(txn, try retirementKey(&buf, value.generation))) orelse return error.InvalidCatalogRecord;
+        const intent = try Retirement.decode(retired);
+        if (!intent.generation.eql(value.generation) or intent.cursor_len != 0) return error.InvalidCatalogRecord;
+    }
+    // Encode before the first mutation; all point/CAS checks precede writes.
+    const generation = try next.generation.encode();
+    const manifest = try next.encode();
+    try txn.put(try rootKey(&buf, ready.group_id), &generation);
+    try txn.put(try liveKey(&buf, ready.group_id), &manifest);
+    return next;
+}
+
+/// Point reads and prepared-plan mutations over the published generation.
+/// Transaction/root lifetime belongs to the caller; no independent commit,
+/// heap allocation, or per-name root lookup occurs in this adapter.
+pub fn LiveStore(comptime Txn: type) type {
+    return struct {
+        const Self = @This();
+        txn: *Txn,
+        root: LiveRoot,
+        pub fn open(txn: *Txn, group: u64) !?@This() {
+            var buf: [128]u8 = undefined;
+            const generation = if (try optionalGet(txn, try rootKey(&buf, group))) |bytes| try Generation.decode(bytes) else null;
+            const live = if (try optionalGet(txn, try liveKey(&buf, group))) |bytes| try LiveRoot.decode(bytes) else null;
+            if (generation == null and live == null) return null;
+            if (generation == null or live == null or live.?.generation.group_id != group or !generation.?.eql(live.?.generation)) return error.InvalidCatalogRecord;
+            return .{ .txn = txn, .root = live.? };
+        }
+        pub fn getClaim(self: *@This(), key: names.Key) !?names.Owner {
+            return if (try self.getEntry(key)) |entry| entry.active else null;
+        }
+        pub fn getEntry(self: *@This(), key: names.Key) !?names.Entry {
+            var buf: [max_cursor_bytes]u8 = undefined;
+            const bytes = (try optionalGet(self.txn, try candidateGenerationKey(&buf, self.root.generation, key))) orelse return null;
+            return try names.Entry.decode(bytes);
+        }
+        const Writer = struct {
+            base: *Self,
+            pub fn getEntry(self: *@This(), key: names.Key) !?names.Entry {
+                return self.base.getEntry(key);
+            }
+            pub fn putEntry(self: *@This(), key: names.Key, entry: names.Entry) !void {
+                var buf: [max_cursor_bytes]u8 = undefined;
+                try self.base.txn.put(try candidateGenerationKey(&buf, self.base.root.generation, key), &(try entry.encode()));
+            }
+            pub fn deleteEntry(self: *@This(), key: names.Key) !void {
+                var buf: [max_cursor_bytes]u8 = undefined;
+                try self.base.txn.delete(try candidateGenerationKey(&buf, self.base.root.generation, key));
+            }
+        };
+        /// Native raw metadata/source mutations may already be staged. The
+        /// exact root/manifest CAS fences this plan; errors require txn abort.
+        pub fn apply(self: *@This(), plan: *const names.Plan, epoch: Epoch) !void {
+            const current = (try @This().open(self.txn, self.root.generation.group_id)) orelse return error.CatalogGenerationChanged;
+            if (!std.meta.eql(current.root, self.root) or try readSourceRevision(self.txn, self.root.generation.group_id) != epoch.revision) return error.CatalogGenerationChanged;
+            const next = try self.root.updated(plan, epoch);
+            const encoded = try next.encode();
+            var writer: Writer = .{ .base = self };
+            try plan.apply(&writer);
+            if (!std.meta.eql(next, self.root)) {
+                var buf: [128]u8 = undefined;
+                try self.txn.put(try liveKey(&buf, self.root.generation.group_id), &encoded);
+            }
+            self.root = next;
+        }
+    };
+}
+
+/// Streaming physical integrity verification of the mutable root, not proof
+/// of source ownership. Native restore/replay must additionally authenticate
+/// entries against their authoritative table/publication cuts.
+pub fn LiveVerifier(comptime Reader: type) type {
+    return struct {
+        root: LiveRoot,
+        claims: u64 = 0,
+        claim_hash: [32]u8 = @splat(0),
+        pub fn init(reader: *Reader, group: u64, epoch: Epoch) !@This() {
+            const store = (try LiveStore(Reader).open(reader, group)) orelse return error.InvalidCatalogRecord;
+            if (!store.root.epoch.eql(epoch) or try readSourceRevision(reader, group) != epoch.revision) return error.InvalidCatalogRecord;
+            return .{ .root = store.root };
+        }
+        pub fn feed(self: *@This(), key: []const u8, bytes: []const u8) !void {
+            var buf: [max_cursor_bytes]u8 = undefined;
+            const prefix = try candidateGenerationPrefix(&buf, self.root.generation);
+            if (!std.mem.startsWith(u8, key, prefix)) return;
+            const logical = try decodeCandidateGenerationKey(key, self.root.generation);
+            const claim = try names.Claim.fromEntry(logical, try names.Entry.decode(bytes));
+            self.claims = std.math.add(u64, self.claims, try claimCount(claim)) catch return error.InvalidCatalogRecord;
+            addClaimHash(&self.claim_hash, try claimHash(claim));
+        }
+        pub fn finish(self: *const @This()) !void {
+            if (self.claims != self.root.claims or !std.mem.eql(u8, &self.claim_hash, &self.root.claim_hash)) return error.InvalidCatalogRecord;
+        }
+    };
 }
 
 /// Independent of job/GC progress: only authoritative source mutations advance
@@ -1073,6 +1295,195 @@ const test_epoch: Epoch = .{ .incarnation = @splat(1), .revision = 17 };
 const test_owner: names.Owner = .{ .table_id = 7, .schema_version = 3, .schema_digest = @splat(2), .kind = .table };
 const test_claims = [_]names.Claim{.{ .key = .{ .namespace_id = 5, .name = "orders" }, .owner = test_owner }};
 const test_rows = [_]SourceRow{.{ .key = "table:7", .table_id = 7, .claims = &test_claims }};
+
+fn seedLiveRootForTest(txn: *TestTxn, claims: []const names.Claim, job_id: [16]u8, epoch: Epoch) !State {
+    var ready = try State.init(41, job_id, epoch);
+    ready.phase = .ready;
+    if (claims.len != 0) try appendSource(&ready.expected, .{ .key = "table:7", .table_id = 7, .pending_table_id = 8, .claims = claims });
+    var buf: [max_cursor_bytes]u8 = undefined;
+    for (claims) |claim| try txn.put(try candidateKey(&buf, &ready, claim.key), &(try (try claim.entry()).encode()));
+    try txn.put(try jobKey(&buf, 41), &(try ready.encode()));
+    var revision: [8]u8 = undefined;
+    std.mem.writeInt(u64, &revision, epoch.revision, .big);
+    try txn.put(try sourceKey(&buf, 41), &revision);
+    return ready;
+}
+fn verifyLiveRootForTest(txn: *TestTxn, epoch: Epoch) !void {
+    var verifier = try LiveVerifier(TestTxn).init(txn, 41, epoch);
+    var entries = txn.values.iterator();
+    while (entries.next()) |entry| try verifier.feed(entry.key_ptr.*, entry.value_ptr.*);
+    try verifier.finish();
+}
+const CountedLiveTxn = struct {
+    base: *TestTxn,
+    reads: usize = 0,
+    writes: usize = 0,
+    pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+        self.reads += 1;
+        return self.base.get(key);
+    }
+    pub fn put(self: *@This(), key: []const u8, bytes: []const u8) !void {
+        self.writes += 1;
+        try self.base.put(key, bytes);
+    }
+    pub fn delete(self: *@This(), key: []const u8) !void {
+        self.writes += 1;
+        try self.base.delete(key);
+    }
+};
+
+test "relation live root publishes by constant point CAS and rejects noncanonical manifests" {
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    try std.testing.expect((try LiveStore(TestTxn).open(&txn, 41)) == null);
+    const ready = try seedLiveRootForTest(&txn, &test_claims, try nextJobId(null), test_epoch);
+    try std.testing.expect((try LiveStore(TestTxn).open(&txn, 41)) == null);
+    var buf: [128]u8 = undefined;
+    for (0..1000) |index| try txn.put(try std.fmt.bufPrint(&buf, "unrelated-terminal-history:{d}", .{index}), "not a plan");
+    var counted: CountedLiveTxn = .{ .base = &txn };
+    const root = try publishVerifiedRoot(&counted, ready, test_epoch, null);
+    try std.testing.expectEqual(@as(usize, 4), counted.reads);
+    try std.testing.expectEqual(@as(usize, 2), counted.writes);
+    try std.testing.expectEqual(@as(usize, 0), txn.cursor_seeks);
+    try std.testing.expectEqual(@as(usize, 0), txn.cursor_nexts);
+    const encoded = try root.encode();
+    try std.testing.expect(std.meta.eql(root, try LiveRoot.decode(&encoded)));
+    for (0..encoded.len) |len| try std.testing.expectError(error.InvalidCatalogRecord, LiveRoot.decode(encoded[0..len]));
+    var extra: [LiveRoot.encoded_len + 1]u8 = @splat(0);
+    @memcpy(extra[0..encoded.len], &encoded);
+    try std.testing.expectError(error.InvalidCatalogRecord, LiveRoot.decode(&extra));
+    var bad = root;
+    bad.sequence = 0;
+    try std.testing.expectError(error.InvalidCatalogRecord, bad.encode());
+    try std.testing.expect(std.meta.eql(root, try publishVerifiedRoot(&counted, ready, test_epoch, root)));
+    try std.testing.expectEqual(@as(usize, 2), counted.writes);
+    try std.testing.expectError(error.CatalogGenerationChanged, publishVerifiedRoot(&counted, ready, test_epoch, null));
+    var wrong = root;
+    wrong.sequence += 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, publishVerifiedRoot(&counted, ready, test_epoch, wrong));
+    var forged = ready;
+    forged.expected.source_hash[0] ^= 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, publishVerifiedRoot(&counted, forged, test_epoch, root));
+    try std.testing.expectEqual(@as(usize, 2), counted.writes);
+    try verifyLiveRootForTest(&txn, test_epoch);
+    try txn.delete(try liveKey(&buf, 41));
+    try std.testing.expectError(error.InvalidCatalogRecord, LiveStore(TestTxn).open(&txn, 41));
+}
+
+test "relation live root mutations retain pending owners and update exact integrity in affected-name work" {
+    const a = std.testing.allocator;
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    var reserved = try names.TableCut.initSuccessor(a, .{ .namespace_id = 5, .table_id = 7, .name = "orders", .schema_json = "{\"version\":3,\"relational_indexes\":[{\"name\":\"old_idx\"}]}" }, .{ .namespace_id = 5, .table_id = 8, .name = "orders", .schema_json = "{\"version\":4,\"relational_indexes\":[{\"name\":\"new_idx\"}]}", .phase = .reserved, .publication_id = @splat(9) });
+    defer reserved.deinit();
+    var published = try names.TableCut.init(a, .{ .namespace_id = 5, .table_id = 8, .name = "orders", .schema_json = "{\"version\":4,\"relational_indexes\":[{\"name\":\"new_idx\"}]}" });
+    defer published.deinit();
+    const ready = try seedLiveRootForTest(&txn, reserved.claims, try nextJobId(null), test_epoch);
+    _ = try publishVerifiedRoot(&txn, ready, test_epoch, null);
+    var counted: CountedLiveTxn = .{ .base = &txn };
+    var store = (try LiveStore(CountedLiveTxn).open(&counted, 41)).?;
+    var stale = store;
+    try std.testing.expectEqual(@as(u64, 7), (try store.getClaim(.{ .namespace_id = 5, .name = "orders" })).?.table_id);
+    try std.testing.expect((try store.getClaim(.{ .namespace_id = 5, .name = "new_idx" })) == null);
+    try std.testing.expectEqual(@as(u64, 8), (try store.getEntry(.{ .namespace_id = 5, .name = "new_idx" })).?.pending.?.table_id);
+    try verifyLiveRootForTest(&txn, test_epoch);
+    var plan = try names.Plan.init(a, reserved.claims, published.claims);
+    defer plan.deinit();
+    try std.testing.expectError(error.InvalidCatalogRecord, store.root.updated(&plan, test_epoch));
+    var epoch = test_epoch;
+    epoch.revision += 1;
+    try advanceSource(&txn, 41);
+    const reads = counted.reads;
+    const writes = counted.writes;
+    try store.apply(&plan, epoch);
+    try std.testing.expectEqual(@as(usize, 3 + 3), counted.reads - reads);
+    try std.testing.expectEqual(@as(usize, 4), counted.writes - writes);
+    try std.testing.expectEqual(@as(u64, 2), store.root.sequence);
+    try std.testing.expectEqual(@as(u64, 2), store.root.claims);
+    try std.testing.expectEqual(@as(u64, 8), (try store.getClaim(.{ .namespace_id = 5, .name = "orders" })).?.table_id);
+    try std.testing.expect((try store.getEntry(.{ .namespace_id = 5, .name = "old_idx" })) == null);
+    try std.testing.expect((try store.getEntry(.{ .namespace_id = 5, .name = "orders" })).?.pending == null);
+    try verifyLiveRootForTest(&txn, epoch);
+    const before = store.root;
+    const committed_writes = counted.writes;
+    try std.testing.expectError(error.CatalogGenerationChanged, stale.apply(&plan, epoch));
+    try std.testing.expectEqual(committed_writes, counted.writes);
+    var unchanged = try names.Plan.init(a, published.claims, published.claims);
+    defer unchanged.deinit();
+    try store.apply(&unchanged, epoch);
+    try std.testing.expect(std.meta.eql(before, store.root));
+    try std.testing.expectEqual(committed_writes, counted.writes);
+    var exhausted = store.root;
+    exhausted.sequence = std.math.maxInt(u64);
+    var remove = try names.Plan.init(a, published.claims, &.{});
+    defer remove.deinit();
+    var next_epoch = epoch;
+    next_epoch.revision += 1;
+    try std.testing.expectError(error.CatalogGenerationExhausted, exhausted.updated(&remove, next_epoch));
+    try advanceSource(&txn, 41);
+    try store.apply(&remove, next_epoch);
+    try std.testing.expectEqual(@as(u64, 0), store.root.claims);
+    try verifyLiveRootForTest(&txn, next_epoch);
+}
+
+test "relation live root swap fences old writers and keeps old GC root-protected until publication" {
+    const a = std.testing.allocator;
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    const ready = try seedLiveRootForTest(&txn, &test_claims, try nextJobId(null), test_epoch);
+    const old = try publishVerifiedRoot(&txn, ready, test_epoch, null);
+    var store = (try LiveStore(TestTxn).open(&txn, 41)).?;
+    var stale = store;
+    const next_ready = try seedLiveRootForTest(&txn, &test_claims, try nextJobId(&ready), test_epoch);
+    const retirement = Retirement.init(old.generation);
+    var buf: [max_cursor_bytes]u8 = undefined;
+    try txn.put(try retirementKey(&buf, old.generation), &(try retirement.encode()));
+    const old_key = try candidateKey(&buf, &ready, test_claims[0].key);
+    const rows = [_]CandidateRow{.{ .key = old_key, .value = try txn.get(old_key) }};
+    var source: TestCandidates = .{ .rows = &rows };
+    var garbage = try GarbagePage.prepare(a, retirement, &source);
+    defer garbage.deinit();
+    try std.testing.expectError(error.CatalogGenerationChanged, garbage.apply(&txn));
+    const root = try publishVerifiedRoot(&txn, next_ready, test_epoch, old);
+    try std.testing.expect(root.generation.eql(Generation.of(&next_ready)));
+    try std.testing.expect(try garbage.apply(&txn));
+    var unchanged = try names.Plan.init(a, &test_claims, &test_claims);
+    defer unchanged.deinit();
+    try std.testing.expectError(error.CatalogGenerationChanged, stale.apply(&unchanged, test_epoch));
+    try std.testing.expectError(error.NotFound, txn.get(old_key));
+    store = (try LiveStore(TestTxn).open(&txn, 41)).?;
+    try std.testing.expectEqual(test_owner.table_id, (try store.getClaim(test_claims[0].key)).?.table_id);
+    try verifyLiveRootForTest(&txn, test_epoch);
+    // A count-preserving byte forgery still fails the independent root hash.
+    var forged = test_owner;
+    forged.schema_digest[0] ^= 1;
+    try txn.put(try candidateKey(&buf, &next_ready, test_claims[0].key), &(try (names.Entry{ .active = forged }).encode()));
+    try std.testing.expectError(error.InvalidCatalogRecord, verifyLiveRootForTest(&txn, test_epoch));
+}
+
+test "relation live root publication and mutation unwind every allocation failure" {
+    const Fault = struct {
+        fn run(a: A) !void {
+            var txn: TestTxn = .{ .arena = std.heap.ArenaAllocator.init(a) };
+            defer txn.deinit();
+            const ready = try seedLiveRootForTest(&txn, &test_claims, try nextJobId(null), test_epoch);
+            _ = try publishVerifiedRoot(&txn, ready, test_epoch, null);
+            var store = (try LiveStore(TestTxn).open(&txn, 41)).?;
+            const renamed: names.Claim = .{ .key = .{ .namespace_id = 5, .name = "renamed" }, .owner = test_owner };
+            var plan = try names.Plan.init(a, &test_claims, &.{renamed});
+            defer plan.deinit();
+            var epoch = test_epoch;
+            epoch.revision += 1;
+            try advanceSource(&txn, 41);
+            // All error paths discard this transaction. The primitive never
+            // commits a prefix of names separately from its integrity cut.
+            try store.apply(&plan, epoch);
+            try verifyLiveRootForTest(&txn, epoch);
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fault.run, .{});
+}
 
 test "relation reconciliation binary state rejects unknown and noncanonical bytes" {
     const state = try State.init(41, @splat(3), test_epoch);
