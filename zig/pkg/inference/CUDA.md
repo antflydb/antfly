@@ -353,21 +353,21 @@ capacity matrices cover 128/512/2048 tokens at B1/B8 and 128 tokens at B32/B64.
 The 1B matrix also covers 4096/7999 tokens at B1; these synthetic cases are not
 a natural-language holdout.
 
-Initial L4 measurements (30 pairs and 200 tail samples per fixture) are saved
-with raw samples under `testdata/gliner25/family/evidence/`:
+Retained L4 measurements use 30 pairs and 200 tail samples per fixture or
+capacity cell. The three reports and compressed samples are under
+`testdata/gliner25/family/evidence/`:
 
 | Fixture campaign | Fastino reference | Native geometric speedup (95% interval) |
 |---|---|---|
 | Multi, ten extraction cases | FP32 eager | 5.44× (5.41–5.47×) |
-| Multi-Decide, ten classification cases | FlashDeBERTa FP16 | 2.26× (2.24–2.28×) |
-| Decide-1B FP16, ten classification cases | SDPA FP16 | 2.56× (2.55–2.57×) |
+| Multi-Decide FP16, eight capacity cells | FlashDeBERTa FP16, FP16 resident weights | 1.53× (1.52–1.54×) |
+| Decide-1B FP16, ten capacity cells | SDPA FP16, FP16 resident weights | 1.123× (1.120–1.126×) |
 
-These initial Fastino FP16 profiles use FP16 autocast with FP32 resident
-weights. Reports now distinguish `reference_dtype` from
-`reference_weight_dtype`; resident FP16/BF16 weights are separate candidates
-that must independently pass quality checks before performance comparison.
+Reports distinguish `reference_dtype` from `reference_weight_dtype`. Fastino
+FP16 autocast with FP32 resident weights is a different profile from FP16
+resident weights; every profile must pass quality checks before comparison.
 
-Every measured cell passed the 10% regression guard. These are fixture-level
+All Multi extraction cells passed the 10% regression guard. These are fixture-level
 comparisons against the named profiles, not claims against the fastest valid
 profile across the full release matrix. Multi's FlashDeBERTa FP16 candidate
 changed extraction output structure and failed the quality gate.
@@ -379,8 +379,8 @@ at 1.22×, 1.22× and 1.49× Python latency.
 Passing the aggregate speedup does not override those failures. The same
 candidate passes all 18 classification fixtures against the FP32 oracle;
 the earlier Multi extraction candidate passes all ten fixtures after restoring
-exact exponentiation in boundary attention. Earlier partial campaigns and
-rejected candidates are also retained. The final Decide-1B FP16 campaign, after
+exact exponentiation in boundary attention. Passing and rejected quality
+results are summarized in `evidence/summary.json`. The final Decide-1B FP16 campaign, after
 QKV/RoPE fusion and the NFC tokenizer fix, passes all ten capacity cells against
 the quality-checked Fastino SDPA profile with FP16 resident weights. Its
 geometric speedup is 1.123× (1.120–1.126×). At 7,999 tokens/B1, native median
@@ -389,7 +389,7 @@ latency is 1,073 ms versus Fastino's 1,142 ms: 0.940× Python latency
 passes at 1.066× Python latency. Raw paired samples, 200 tail measurements per
 cell, both worker identities and the full report are archived under
 `evidence/l4_decide_1b_capacity_fp16_nfc_vs_fastino_fp16_weights/`.
-Earlier 1B campaigns remain archived with their original failures. These
+Intermediate campaign histories are external run artifacts. These
 loaded-model measurements do not qualify production mixed precision, serving
 latency or every possible Fastino dtype profile. Multi-Decide's three capacity
 regressions and the remaining release checks are follow-up work.
@@ -439,7 +439,7 @@ tokenizer declares NFC, including canonical composition exclusions. BPE now
 applies that normalization before pre-tokenization, protecting added tokens.
 The tokenizer suite passes 101 tests (one skipped), and the rebuilt 1B FP16
 worker matches all 1,600 documents across eight languages, including every
-token ID. The rejected pre-fix capture remains archived.
+token ID. The current replay oracle retains the corrected token IDs.
 Precision is part of both resident and in-flight model identity.
 
 Build optimized workers from `zig/pkg/inference`:
@@ -516,8 +516,8 @@ against MASSIVE's gold intent labels, without rerunning inference or selecting
 examples by outcome. Decide-1B native FP16 and Fastino FP32 both score 643/1,600
 (40.1875%) on the 60-label public test subset. That measures task accuracy;
 the 1,600/1,600 implementation agreement is a separate result. The gold score
-and per-language results are archived under
-`evidence/l4_decide_1b_fp16_nfc_public_gold_intents/`.
+and per-language results are retained in `evidence/summary.json`. The pinned
+classification replay capture and scoring tool can reproduce the gold score.
 
 The revised FP16 Multi-Decide candidate matched 1,599/1,600 documents: Spanish matched
 199/200 and the other seven languages matched 200/200. Multi's FP16 candidate
@@ -527,14 +527,14 @@ Multi's FP32 candidate matched all 1,600 classification documents and 1,599/1,60
 entity documents (Spanish 199/200, all other languages 200/200). The rejected
 Multi-Decide bias-epilogue candidate matched 1,597/1,600 documents, with Arabic
 at 198/200. Revised candidates need fresh measurements before qualification.
-Compressed raw captures and rejection reports are retained in the evidence
-directory.
+Current compressed holdout oracles and their report summaries are retained in
+the evidence directory; rejected candidate results are in `evidence/summary.json`.
 Multi FP32's structured-output campaign exercises 1,673 entity/attribute
 predictions, 576 relations and 867 records. Strict parity fails French at
 198/200 (Spanish 199/200, others 200/200): all three differing documents have
 Fastino spans extending past the original input into its appended period.
-Native preserves its existing source-valid span policy. The archived rejection
-remains the strict comparison. The approved compatibility policy excludes
+Native preserves its existing source-valid span policy. The retained strict
+structured oracle preserves that comparison. The approved compatibility policy excludes
 Fastino entity predictions or relations whose spans include its single
 synthetic terminal period beyond the original text. It does not clip spans,
 ignore valid-coordinate differences, or change native decoding. Re-evaluating
@@ -569,7 +569,7 @@ python scripts/gliner25/check_family_reference_holdout.py \
   --python /path/to/reference/bin/python --model multi_decide \
   --model-dir /models/multi-decide --dtype fp16 --weight-dtype fp16 \
   --attention flashdeberta \
-  --oracle-report testdata/gliner25/family/evidence/l4_multi_decide_fp16_public_classification/report.json \
+  --oracle-report testdata/gliner25/family/evidence/l4_multi_decide_fp16_compact_public_classification/report.json \
   --output /tmp/fastino-multi-decide-public-parity
 ANTFLY_GLINER25_FAMILY_MODEL_DIR=/models/multi-decide \
   zig build test -Dcuda=true -Dmetal=false \
@@ -579,7 +579,8 @@ ANTFLY_GLINER25_FAMILY_MODEL_DIR=/models/multi-decide \
 The opt-in HTTP test uses actual loopback requests at concurrency 1/4/16,
 compares distinct requests with their serial results and checks admission
 cleanup. Multi-Decide FP32 passes all three levels with every lease released
-and no leaks; its report and test log are retained in the evidence directory.
+and no leaks; recorded results and the source log hash are retained in
+`evidence/summary.json`.
 CUDA boundary requests queue before reserving device scratch, so waiting
 requests do not each reserve the same session workspace. A queued client
 disconnect also drains while that lane remains locked, with no device
@@ -594,7 +595,7 @@ variable selects precision for the managed 1B full-context and boundary-window
 tests.
 The model-backed managed window test also passes 2/8/32 windows per document,
 comparing window batch sizes one and four, exact window counts, pre-cancelled
-and interrupted calls, and identical retry responses. Its archived report is
+and interrupted calls, and identical retry responses. Its retained summary is
 correctness evidence; paired window performance is still required.
 
 ## Gemma4 And TurboQuant KV Status

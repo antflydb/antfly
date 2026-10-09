@@ -449,5 +449,11 @@
   },
   "measured_cells_passed": true,
   "peak_worker_rss_bytes": 3646046208,
-  "status": "complete"
+  "status": "complete",
+  "raw_capture": {
+    "path": "raw.jsonl.gz",
+    "encoding": "gzip",
+    "uncompressed_sha256": "f13cb316a3e1bb43f18e86a8c0c707c034dfa7e5b973f1b30eeb4b62047099d3",
+    "uncompressed_size_bytes": 259258
+  }
 }
