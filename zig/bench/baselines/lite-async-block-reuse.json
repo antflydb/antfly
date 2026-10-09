@@ -78,5 +78,97 @@
     ],
     "codec_eligibility": "Borrow warm raw rows or values inside retained none/plain-prefix physical payloads. Temporary Snappy and prefix key storage never becomes a result owner."
   },
-  "scope": "Isolated native Debug production helper fixtures with C result/scratch allocators. Deterministic allocation/admission counts; timing samples are indicative and do not establish end-to-end QPS or a 2 GiB soak."
+  "scope": "Isolated native Debug production helper fixtures with C result/scratch allocators. Deterministic allocation/admission counts; timing samples are indicative and do not establish end-to-end QPS or a 2 GiB soak.",
+  "followup": {
+    "comparison_head": "a933fb09c0b51dbbfaf7cad954e4eb7f2a02278e",
+    "environment": "Same native Debug MemoryStorage/C-allocator scope as original fixtures",
+    "batches": 600,
+    "keys_per_batch": 16,
+    "directory_overlap_runs": 64,
+    "modes": {
+      "1": "legacy synchronous snapshot",
+      "16": "async snapshot with prebuilt topology",
+      "2": "direct directory async snapshot",
+      "3": "snapshot under simulated cache pressure",
+      "4": "copy-only async results",
+      "5": "previous directory selection/sort/topology then async"
+    },
+    "measurements": {
+      "1": {
+        "elapsed_ns": 55437000,
+        "result_allocation_requests": 0,
+        "index_cache_acquisitions": 600,
+        "planning_allocation_requests": 0
+      },
+      "16": {
+        "elapsed_ns": 45041000,
+        "result_allocation_requests": 0,
+        "index_cache_acquisitions": 600,
+        "planning_allocation_requests": 0
+      },
+      "2": {
+        "elapsed_ns": 58449000,
+        "result_allocation_requests": 0,
+        "index_cache_acquisitions": 600,
+        "planning_allocation_requests": 0
+      },
+      "3": {
+        "elapsed_ns": 42578000,
+        "result_allocation_requests": 600,
+        "index_cache_acquisitions": 600,
+        "planning_allocation_requests": 0
+      },
+      "4": {
+        "elapsed_ns": 44917000,
+        "result_allocation_requests": 600,
+        "index_cache_acquisitions": 600,
+        "planning_allocation_requests": 0
+      },
+      "5": {
+        "elapsed_ns": 150586000,
+        "result_allocation_requests": 0,
+        "index_cache_acquisitions": 600,
+        "planning_allocation_requests": 3000
+      }
+    },
+    "owned_results_before": {
+      "allocation_requests": 9600,
+      "elapsed_ns": 45734000
+    },
+    "pressure_selection": {
+      "selected_bytes_per_batch": 16,
+      "before_pinned_payload_cost_bytes": 12683,
+      "after_owned_bytes_per_batch": 16,
+      "after_block_pins": 0
+    },
+    "bounds": {
+      "owned_copy_buffer_bytes": 16384,
+      "values_per_buffer_growth_estimate_max": 64,
+      "direct_directory_l0_runs_max": 64,
+      "additional_tree_summary_bytes_per_node_64_bit": 24,
+      "cursor_path_entries_per_slot": 128,
+      "fallbacks": [
+        "large unordered L0 backlogs",
+        "directories containing non-path or in-memory runs",
+        "sorted-by-run plans",
+        "async-disabled reads"
+      ],
+      "max_packed_value_bytes": 1024
+    },
+    "coverage": [
+      "Warm result lifetime after releasing independent cache handle",
+      "Existing result pin reuse under pressure",
+      "Dense results borrow under pressure within owner caps",
+      "Packed result growth and allocation failure cleanup",
+      "Direct directory ordering matches overlap-and-sort across namespaces and forked roots",
+      "L0 backlog falls back before processing any results",
+      "Mixed-size batches preserve the small buffer and allocate large results at their exact size"
+    ],
+    "limitations": [
+      "Timing samples do not establish end-to-end QPS or 2 GiB soak behavior",
+      "Production arenas may amortize allocator-call savings",
+      "Sorted-by-run and large-L0 directory planning retain the existing path",
+      "Fixed cursor stack storage and 24 bytes per read-order tree node trade against per-batch heap work"
+    ]
+  }
 }

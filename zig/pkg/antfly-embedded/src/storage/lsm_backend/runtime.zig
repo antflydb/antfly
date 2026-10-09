@@ -5582,6 +5582,10 @@ fn readManySortedDirectoryBatch(
     reuse: ?*BatchScratch.ProbeScratch,
     metadata_allocator: Allocator,
 ) !BatchCursorReadResult {
+    if (!sorted_by_run) {
+        @memset(values, null);
+        if (try readManySortedPointFromSourceAsync(backend, mutable, immutable_memtables, &.{}, &.{}, &.{}, allocator, held_values, namespace, keys, values, backend_locked, PointResultLifetime.forBlockPins(held_blocks), held_blocks, directory)) |result| return result;
+    }
     if (reuse) |owner| {
         const planner = try owner.planning(metadata_allocator, runtimeScratchAllocator(allocator), backend.options.resource_manager);
         defer planner.finish();
@@ -5934,6 +5938,7 @@ fn findRunIndexInLevel(runs: []const Run, level: RunLevel, namespace: backend_ty
 
 const PointRunCandidate = struct {
     run_index: usize,
+    directory_run: ?*const Run = null,
 };
 
 const max_stack_point_run_candidates = 16;
@@ -6193,11 +6198,17 @@ const AsyncPointResultPins = struct {
         return out;
     }
 
+    fn contains(self: *const @This(), handle: *const cache_mod.Handle) bool {
+        const identity = @intFromPtr(handle.entry);
+        for (self.identities[0..self.count]) |present| if (present == identity) return true;
+        return false;
+    }
+
     fn retain(self: *@This(), backend: anytype, handle: *const cache_mod.Handle) bool {
         const held = self.held orelse return false;
         if (!handle.isRetained()) return false;
         const identity = @intFromPtr(handle.entry);
-        for (self.identities[0..self.count]) |present| if (present == identity) return true;
+        if (self.contains(handle)) return true;
         if (self.count == max_pins or handle.entry.byte_cost > max_bytes -| self.bytes) return false;
         // Pin metadata is optional: failed growth falls back to an owned value.
         held.ensureUnusedCapacity(backend.allocator, 1) catch return false;
@@ -6206,6 +6217,41 @@ const AsyncPointResultPins = struct {
         self.count += 1;
         self.bytes += handle.entry.byte_cost;
         return true;
+    }
+};
+
+// Final result storage, not temporary scratch. Small values share an owned
+// buffer; oversized values keep their exact-size allocation. Every buffer is
+// registered with the caller before use and survives pool eviction/errors.
+const AsyncPointResultCopies = struct {
+    const max_buffer_bytes = 16 * 1024;
+    const max_packed_value_bytes = 1024;
+    buffer: []u8 = &.{},
+    used: usize = 0,
+    keys: usize,
+
+    fn copy(self: *@This(), allocator: Allocator, held: *std.ArrayListUnmanaged([]u8), value: []const u8) ![]const u8 {
+        if (value.len == 0) return "";
+        // Keep the small buffer across larger results. A mixed-size batch
+        // cannot strand a nearly empty slab for every large value.
+        if (value.len > max_packed_value_bytes) {
+            try held.ensureUnusedCapacity(allocator, 1);
+            const owned = try allocator.dupe(u8, value);
+            held.appendAssumeCapacity(owned);
+            return owned;
+        }
+        if (value.len > self.buffer.len - self.used) {
+            try held.ensureUnusedCapacity(allocator, 1);
+            const capacity = @min(max_buffer_bytes, value.len *| @min(@max(self.keys, 1), 64));
+            const owned = try allocator.alloc(u8, capacity);
+            held.appendAssumeCapacity(owned);
+            self.buffer = owned;
+            self.used = 0;
+        }
+        const result = self.buffer[self.used..][0..value.len];
+        @memcpy(result, value);
+        self.used += value.len;
+        return result;
     }
 };
 
@@ -6236,6 +6282,8 @@ const AsyncPointBlockRead = struct {
     shared_block: ?*BatchAsyncBlock = null,
     result_pins: ?*AsyncPointResultPins = null,
     result_retention: ResultBlockRetention = .unknown,
+    selected_result_bytes: usize = 0,
+    result_copies: ?*AsyncPointResultCopies = null,
 
     fn release(self: *AsyncPointBlockRead) void {
         if (self.shared_block) |block| {
@@ -6450,7 +6498,12 @@ fn prepareAsyncPointBlockRead(
     shared: ?*BatchAsyncBlocks,
 ) !?AsyncPointBlockRead {
     const cache = backend.options.cache orelse return null;
-    const run = &runs[candidate.run_index];
+    var directory_run: Run = undefined;
+    const run = if (candidate.directory_run) |source| blk: {
+        directory_run = source.*;
+        directory_run.shared_read_version = true;
+        break :blk &directory_run;
+    } else &runs[candidate.run_index];
     const path = run.path orelse return null;
     const resident = if (shared) |pool| pool.indexHandle(path, run.id, backend.root_generation) else null;
     var index_handle: ?cache_mod.Handle = if (resident == null) try loadRunTableIndexHandle(backend, run) else null;
@@ -6627,9 +6680,15 @@ fn retainAsyncPointEntry(
         const owner = if (read.shared_block) |shared| &shared.read else read;
         if (owner.result_retention == .unknown) {
             const handle: ?cache_mod.Handle = owner.decoded_handle orelse (if (read.compression == .none or read.compression == .prefix) owner.physical_handle else null);
-            // Decoded handles contain raw rows; physical borrowing is valid
-            // only for codecs whose selected value already lies in the payload.
-            owner.result_retention = if (handle) |h| (if (pins.retain(backend, &h)) .pinned else .copy) else .copy;
+            owner.selected_result_bytes +|= positioned.entry.value.len;
+            if (handle) |h| {
+                // Under pressure, tiny selections copy instead of prolonging a
+                // whole block's lifetime. Reconsider as selection becomes dense.
+                if (!h.isRetained()) {
+                    owner.result_retention = .copy;
+                } else if (pins.contains(&h) or !h.cache.?.resultPinsUnderPressure() or owner.selected_result_bytes >= h.entry.byte_cost / 8)
+                    owner.result_retention = if (pins.retain(backend, &h)) .pinned else .copy;
+            } else owner.result_retention = .copy;
         }
         if (owner.result_retention == .pinned) {
             backend.recordPointRunSurvivorHit();
@@ -6644,7 +6703,7 @@ fn retainAsyncPointEntry(
         try held_values.append(value_allocator, owned.bytes);
         hint.* = .{ .run_index = read.candidate.run_index, .namespace_name = namespace.name, .key = owned.entry.key, .entry_index = positioned.index };
         break :blk owned.entry.value;
-    } else blk: {
+    } else if (read.result_copies) |copies| try copies.copy(value_allocator, held_values, positioned.entry.value) else blk: {
         const owned = try value_allocator.dupe(u8, positioned.entry.value);
         errdefer value_allocator.free(owned);
         try held_values.append(value_allocator, owned);
@@ -6853,6 +6912,7 @@ fn tryReadPointRunCandidatesAsync(
 // Candidate traversal is local to an in-flight slot, not materialized for
 // every key/run pair. Memory is bounded by max_point_async_stack_reads.
 const BatchPointCandidates = struct {
+    directory_cursor: ?@import("run_directory.zig").Directory.ReadPointCursor = null,
     l0_indices: []const usize = &.{},
     next_l0: usize = 0,
     next_level: usize = 0,
@@ -6862,6 +6922,10 @@ const BatchPointCandidates = struct {
     }
 
     fn next(self: *@This(), runs: []const Run, levels: []const RunLevel, namespace: backend_types.Namespace, key: []const u8) ?PointRunCandidate {
+        if (self.directory_cursor) |*cursor| {
+            const handle = cursor.next() orelse return null;
+            return .{ .run_index = 0, .directory_run = handle.run };
+        }
         while (self.next_l0 < self.l0_indices.len) {
             const i = self.l0_indices[self.next_l0];
             self.next_l0 += 1;
@@ -6932,6 +6996,8 @@ fn fillBatchAsyncPointSlot(
     slot: *BatchAsyncPointSlot,
     issued_count: *usize,
     shared: *BatchAsyncBlocks,
+    directory: ?*const @import("run_directory.zig").Directory,
+    copies: *AsyncPointResultCopies,
 ) !bool {
     while (next_key.* < keys.len) {
         const i = next_key.*;
@@ -6946,14 +7012,18 @@ fn fillBatchAsyncPointSlot(
             if (present.tombstone) {
                 result.misses += 1;
             } else {
-                values[i] = try (if (namespace.own_source_point_results) PointResultLifetime.transaction_owned else lifetime).retain(backend, allocator, held_values, held_values.items.len, present.value);
+                values[i] = if (namespace.own_source_point_results or lifetime == .transaction_owned) owned: {
+                    const value = try copies.copy(allocator, held_values, present.value);
+                    recordPointValueCopy(backend);
+                    break :owned value;
+                } else present.value;
                 backend.recordMutableHit();
                 result.hits += 1;
             }
             continue;
         }
         slot.key_index = i;
-        slot.candidates = BatchPointCandidates.init(groups, namespace, key);
+        slot.candidates = if (directory) |source| .{ .directory_cursor = source.readPoint(namespace.name, key) } else BatchPointCandidates.init(groups, namespace, key);
         if (try startBatchAsyncPointSlot(backend, runs, levels, keys, namespace, slot, issued_count, shared)) return true;
         result.misses += 1;
     }
@@ -6978,12 +7048,34 @@ fn readManySortedPointFromSnapshotAsync(
     result_lifetime: PointResultLifetime,
     held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
 ) !?BatchCursorReadResult {
+    return readManySortedPointFromSourceAsync(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_values, namespace, keys, values, backend_locked, result_lifetime, held_blocks, null);
+}
+
+fn readManySortedPointFromSourceAsync(
+    backend: anytype,
+    mutable: anytype,
+    immutable_memtables: []const *const State,
+    runs: []Run,
+    l0_groups: []const RunGroup,
+    levels: []const RunLevel,
+    allocator: Allocator,
+    held_values: *std.ArrayListUnmanaged([]u8),
+    namespace: backend_types.Namespace,
+    keys: []const []const u8,
+    values: []?[]const u8,
+    backend_locked: bool,
+    result_lifetime: PointResultLifetime,
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
+    directory: ?*const @import("run_directory.zig").Directory,
+) !?BatchCursorReadResult {
     if (backend_locked or keys.len < 2 or backend.storage == null or backend.options.cache == null) return null;
     const async_lease = acquirePointAsyncBatchLease(backend);
     defer releasePointAsyncBatchLease(backend, async_lease);
     const configured_limit = async_lease.limit;
     if (configured_limit < 2) return null;
-    for (runs) |run| if (run.path == null or run.state != null) return null;
+    if (directory) |source| {
+        if (!source.supportsAsyncPoints()) return null;
+    } else for (runs) |run| if (run.path == null or run.state != null) return null;
     backend.recordPointGets(keys.len);
 
     const resources = @import("../resource_manager.zig");
@@ -6997,12 +7089,13 @@ fn readManySortedPointFromSnapshotAsync(
     for (slots[0..configured_limit]) |*slot| slot.* = .{};
     defer for (slots[0..configured_limit]) |*slot| if (slot.active) slot.read.release();
     var result_pins = AsyncPointResultPins.init(if (result_lifetime == .snapshot_pinned) held_blocks else null);
+    var result_copies: AsyncPointResultCopies = .{ .keys = keys.len };
     var result: BatchCursorReadResult = .{};
     var issued_count: usize = 0;
     var next_key: usize = 0;
     var active_slots: usize = 0;
     for (slots[0..configured_limit]) |*slot| {
-        if (!try fillBatchAsyncPointSlot(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_values, namespace, keys, values, result_lifetime, &next_key, &result, slot, &issued_count, &shared)) break;
+        if (!try fillBatchAsyncPointSlot(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_values, namespace, keys, values, result_lifetime, &next_key, &result, slot, &issued_count, &shared, directory, &result_copies)) break;
         active_slots += 1;
     }
     var cursor: usize = 0;
@@ -7011,8 +7104,9 @@ fn readManySortedPointFromSnapshotAsync(
         cursor = (cursor + 1) % configured_limit;
         if (!slot.active) continue;
         const key_index = slot.key_index;
-        const deciding_run_index = slot.read.candidate.run_index;
+        const deciding_level = if (slot.read.candidate.directory_run) |run| run.level else runs[slot.read.candidate.run_index].level;
         scratch.resetDenial();
+        slot.read.result_copies = &result_copies;
         slot.read.result_pins = if (result_pins.held != null) &result_pins else null;
         const lookup = consumeAsyncPointRead(backend, &slot.read, null, held_values, allocator, namespace, keys[key_index], &shared) catch |err| return scratch.failure(err);
         slot.read.release();
@@ -7022,7 +7116,7 @@ fn readManySortedPointFromSnapshotAsync(
             .hit => |value| {
                 values[key_index] = value;
                 result.hits += 1;
-                if (runs[deciding_run_index].level == 0) backend.recordL0Hit() else backend.recordLevelHit();
+                if (deciding_level == 0) backend.recordL0Hit() else backend.recordLevelHit();
                 key_decided = true;
             },
             .tombstone => {
@@ -7033,7 +7127,7 @@ fn readManySortedPointFromSnapshotAsync(
         };
         if (!key_decided and try startBatchAsyncPointSlot(backend, runs, levels, keys, namespace, slot, &issued_count, &shared)) continue;
         if (!key_decided) result.misses += 1;
-        if (!try fillBatchAsyncPointSlot(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_values, namespace, keys, values, result_lifetime, &next_key, &result, slot, &issued_count, &shared)) active_slots -= 1;
+        if (!try fillBatchAsyncPointSlot(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_values, namespace, keys, values, result_lifetime, &next_key, &result, slot, &issued_count, &shared, directory, &result_copies)) active_slots -= 1;
     }
     backend.recordPointRunAsyncBatch(issued_count);
     return result;
@@ -9516,7 +9610,10 @@ test "lsm async batch result lifetimes preserve borrowing and unwind owned alloc
                 try std.testing.expectEqual(before, backend.snapshotReadStats().point_value_copies);
             } else {
                 try std.testing.expect(values[0].?.ptr != original.ptr);
-                try std.testing.expectEqual(@as(usize, 3), held.items.len);
+                try std.testing.expectEqual(@as(usize, 1), held.items.len);
+                try std.testing.expect(@intFromPtr(values[0].?.ptr) >= @intFromPtr(held.items[0].ptr));
+                try std.testing.expect(@intFromPtr(values[1].?.ptr) >= @intFromPtr(held.items[0].ptr));
+                try std.testing.expect(@intFromPtr(values[1].?.ptr) + values[1].?.len <= @intFromPtr(held.items[0].ptr) + held.items[0].len);
                 try std.testing.expectEqual(before + 3, backend.snapshotReadStats().point_value_copies);
             }
         }
@@ -11501,7 +11598,7 @@ test "lsm async reuse warm snapshot batches avoid result copies and per-key inde
     var warm_index = try loadRunTableIndexHandle(&backend, @constCast(&run));
     defer warm_index.release();
     var warmed = try loadRunTableBlockHandle(&backend, @constCast(&run), &index, index.blockWindow(0), true);
-    defer warmed.release();
+    warmed.release();
     const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
     var results = Budget{ .backing = std.heap.c_allocator };
     var held: std.ArrayListUnmanaged([]u8) = .empty;
@@ -11520,28 +11617,73 @@ test "lsm async reuse warm snapshot batches avoid result copies and per-key inde
     for (&keys, 0..) |*key, i| key.* = entries[i * 12].key;
     var values: [16]?[]const u8 = @splat(null);
     try std.testing.expectEqual(MultiGetPlan.point, chooseMultiGetPlan(&keys, .snapshot));
-    for ([_]usize{ 1, 16 }) |concurrency| {
+    const Directory = @import("run_directory.zig").Directory;
+    const Fixture = struct {
+        allocator: Allocator,
+        pub fn retainRunSnapshotRef(_: *@This(), run_ptr: *Run) !void {
+            run_ptr.version_ref_pinned = true;
+        }
+        pub fn releaseRunSnapshotRef(_: *@This(), run_ptr: *Run) void {
+            run_ptr.version_ref_pinned = false;
+        }
+    };
+    var fixture: Fixture = .{ .allocator = a };
+    const directory = try Directory.create(a);
+    defer directory.destroy(a);
+    for (0..64) |i| {
+        var source = run;
+        source.id = i + 1;
+        try directory.put(&fixture, source);
+    }
+    var newest = run;
+    newest.id = 64;
+    var newest_index = try loadRunTableIndexHandle(&backend, &newest);
+    newest_index.release();
+    var newest_block = try loadRunTableBlockHandle(&backend, &newest, &index, index.blockWindow(0), true);
+    newest_block.release();
+    var planning = Budget{ .backing = std.heap.c_allocator };
+    var reuse: BatchScratch.ProbeScratch = .{};
+    defer reuse.deinit(a);
+    for ([_]usize{ 1, 16, 2, 3, 4, 5 }) |mode| {
+        const concurrency: usize = if (mode == 1) 1 else 16;
         backend.options.max_concurrent_point_block_reads = concurrency;
+        cache.pressure_target_bytes.store(if (mode == 3) cache.max_bytes else 0, .monotonic);
         const before = results.alloc_calls;
+        const planning_before = planning.alloc_calls;
         const indexes_before = cache.snapshotStats().run_table_index.hits;
         const started = platform_time.monotonicNs();
         for (0..600) |_| {
-            const found = try readManySortedPointFromSnapshot(&backend, &empty, &.{}, &runs, groups, levels, results.allocator(), &pins, &held, .{}, &keys, &values, false);
+            const found = if (mode == 2) try readManySortedDirectoryBatch(&backend, &empty, &.{}, directory, results.allocator(), &pins, &held, .{}, &keys, &values, false, false, &reuse, planning.allocator()) else if (mode == 5) try readManySortedDirectoryCandidates(&backend, &empty, &.{}, directory, planning.allocator(), results.allocator(), &pins, &held, .{}, &keys, &values, false, false) else try readManySortedPointFromSnapshot(&backend, &empty, &.{}, &runs, groups, levels, results.allocator(), if (mode == 4) null else &pins, &held, .{}, &keys, &values, false);
             try std.testing.expectEqual(@as(usize, 16), found.hits);
             for (values) |value| try std.testing.expectEqualStrings("v", value.?);
+            if (mode == 3) {
+                try std.testing.expectEqual(@as(usize, 0), pins.items.len);
+                try std.testing.expectEqual(@as(usize, 16), held.items[0].len);
+            }
             for (held.items) |bytes| results.allocator().free(bytes);
             held.clearRetainingCapacity();
             for (pins.items) |*pin| pin.release();
             pins.clearRetainingCapacity();
         }
-        try std.testing.expectEqual(@as(usize, 0), results.alloc_calls - before);
+        try std.testing.expectEqual(@as(usize, if (mode == 3 or mode == 4) 600 else 0), results.alloc_calls - before);
+        try std.testing.expect(reuse.planner == null);
+        if (mode == 2) try std.testing.expectEqual(@as(usize, 0), planning.alloc_calls - planning_before);
+        if (mode == 5) try std.testing.expect(planning.alloc_calls - planning_before > 0);
         try std.testing.expectEqual(@as(u64, 600), cache.snapshotStats().run_table_index.hits - indexes_before);
-        std.debug.print("\nAsync reuse warm production batches: concurrency={d} batches=600 keys=16 ns={d} result_allocations={d} index_cache_hits={d}\n", .{ concurrency, platform_time.monotonicNs() - started, results.alloc_calls - before, cache.snapshotStats().run_table_index.hits - indexes_before });
+        std.debug.print("\nAsync reuse warm production batches: mode={d} batches=600 keys=16 ns={d} result_allocations={d} index_cache_hits={d} planning_allocations={d}\n", .{ mode, platform_time.monotonicNs() - started, results.alloc_calls - before, cache.snapshotStats().run_table_index.hits - indexes_before, planning.alloc_calls - planning_before });
     }
+    cache.pressure_target_bytes.store(0, .monotonic);
     backend.options.max_concurrent_point_block_reads = 16;
     const found = try readManySortedPointFromSnapshot(&backend, &empty, &.{}, &runs, groups, levels, results.allocator(), &pins, &held, .{}, &keys, &values, false);
     try std.testing.expectEqual(@as(usize, 16), found.hits);
     try std.testing.expectEqual(@as(usize, 1), pins.items.len);
+    // Reuse an already-owned pin under pressure without copying it again.
+    cache.pressure_target_bytes.store(cache.max_bytes, .monotonic);
+    const allocation_calls = results.alloc_calls;
+    _ = try readManySortedPointFromSnapshot(&backend, &empty, &.{}, &runs, groups, levels, results.allocator(), &pins, &held, .{}, &keys, &values, false);
+    try std.testing.expectEqual(allocation_calls, results.alloc_calls);
+    try std.testing.expectEqual(@as(usize, 1), pins.items.len);
+    cache.pressure_target_bytes.store(0, .monotonic);
     cache.invalidatePath(run.path.?);
     for (values) |value| try std.testing.expectEqualStrings("v", value.?);
 }
@@ -11684,17 +11826,61 @@ test "lsm async reuse multi block index borrowing survives replacement and pin c
     var values: [192]?[]const u8 = @splat(null);
     const before = cache.snapshotStats().run_table_index.hits;
     const loads = backend.snapshotReadStats().table_block_loads;
+    cache.pressure_target_bytes.store(cache.max_bytes, .monotonic);
     for (0..2) |_| {
         const found = (try readManySortedPointFromSnapshotAsync(&backend, &empty, &.{}, &runs, groups, levels, result_alloc.allocator(), &held, .{}, &keys, &values, false, .snapshot_pinned, &pins)).?;
         try std.testing.expectEqual(@as(usize, 192), found.hits);
         for (values) |value| try std.testing.expectEqualStrings(&payload, value.?);
         const budget = AsyncPointResultPins.init(&pins);
         try std.testing.expect(budget.bytes <= AsyncPointResultPins.max_bytes);
-        try std.testing.expect(pins.items.len <= AsyncPointResultPins.max_pins);
+        try std.testing.expect(pins.items.len > 0 and pins.items.len <= AsyncPointResultPins.max_pins);
         try std.testing.expect(held.items.len > 0);
     }
     try std.testing.expectEqual(@as(u64, 2), cache.snapshotStats().run_table_index.hits - before);
     try std.testing.expectEqual(@as(u64, @intCast(index.blocks.len)), backend.snapshotReadStats().table_block_loads - loads);
     cache.invalidatePath(run.path.?);
     for (values) |value| try std.testing.expectEqualStrings(&payload, value.?);
+}
+
+test "lsm async reuse packed result buffers survive growth and allocation failure" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var held: std.ArrayListUnmanaged([]u8) = .empty;
+            defer releaseHeldValues(&held, a);
+            var copies: AsyncPointResultCopies = .{ .keys = 2 };
+            const first = try copies.copy(a, &held, "one");
+            const second = try copies.copy(a, &held, "two");
+            try std.testing.expectEqual(@as(usize, 1), held.items.len);
+            const third = try copies.copy(a, &held, "longer result requires another buffer");
+            const large: [20000]u8 = @splat('x');
+            const fourth = try copies.copy(a, &held, &large);
+            try std.testing.expectEqualStrings("one", first);
+            try std.testing.expectEqualStrings("two", second);
+            try std.testing.expectEqualStrings("longer result requires another buffer", third);
+            try std.testing.expectEqualStrings(&large, fourth);
+            try std.testing.expectEqual(@as(usize, 3), held.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "lsm async reuse mixed sizes keep large copies exact and reuse small buffer" {
+    const a = std.testing.allocator;
+    var held: std.ArrayListUnmanaged([]u8) = .empty;
+    defer releaseHeldValues(&held, a);
+    var copies: AsyncPointResultCopies = .{ .keys = 64 };
+    const small: [255]u8 = @splat('s');
+    const large: [16384]u8 = @splat('l');
+    const first = try copies.copy(a, &held, &small);
+    for (0..32) |_| {
+        const value = try copies.copy(a, &held, &large);
+        try std.testing.expectEqualStrings(&large, value);
+        try std.testing.expectEqual(large.len, held.items[held.items.len - 1].len);
+    }
+    const last = try copies.copy(a, &held, &small);
+    try std.testing.expectEqual(@as(usize, 33), held.items.len);
+    try std.testing.expect(last.ptr == first.ptr + small.len);
+    try std.testing.expectEqualStrings(&small, first);
+    try std.testing.expectEqualStrings(&small, last);
+    try std.testing.expect(copies.buffer.len <= AsyncPointResultCopies.max_buffer_bytes);
 }
