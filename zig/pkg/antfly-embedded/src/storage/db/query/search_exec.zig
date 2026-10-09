@@ -253,6 +253,8 @@ pub const SearchTextQueryExecutor = struct {
 
 pub const SearchTextStatsExecutor = struct {
     ctx: ?*anyopaque,
+    /// Synchronous trusted controls shared by the statistics scan, never wire data.
+    controls: types.SearchRequest = .{},
     text_index_entry: *const fn (
         ctx: ?*anyopaque,
         index_name: ?[]const u8,
@@ -2932,7 +2934,7 @@ fn logExactSortBudgetRejection(
     );
 }
 
-fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
+pub fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
     if (req.execution_runnable) |grant| {
         try grant.validate();
         const status = grant.checkpoint(grant.context);
@@ -12550,6 +12552,7 @@ pub fn collectSearchRequestTextStats(
     req: types.SearchRequest,
     executor: SearchTextStatsExecutor,
 ) ![]const distributed_stats_mod.TextFieldStats {
+    try checkSearchRequestDeadline(req);
     var stats_map = std.StringHashMapUnmanaged(SearchRequestTextStatEntry){};
     defer {
         var it = stats_map.iterator();
@@ -12581,6 +12584,7 @@ pub fn collectSearchRequestTextStats(
         }
     } else {
         for (req.full_text_queries) |item| {
+            try checkSearchRequestDeadline(req);
             const text_entry = (try executor.text_index_entry(executor.ctx, item.index_name)) orelse continue;
             {
                 text_entry.lockAnalysisShared();
@@ -12605,12 +12609,15 @@ pub fn collectSearchRequestTextStats(
         }
     }
 
+    try checkSearchRequestDeadline(req);
     if (stats_map.count() == 0) return &.{};
 
     const requests = try text_stats_ownership.requestsFromMap(ExplicitTextStatRequest, alloc, &stats_map);
     defer text_stats_ownership.freeRequests(alloc, requests, requests.len);
 
-    return try collectExplicitTextStats(alloc, requests, executor);
+    var controlled = executor;
+    controlled.controls = req;
+    return try collectExplicitTextStats(alloc, requests, controlled);
 }
 
 pub fn collectExplicitTextStats(
@@ -12618,6 +12625,7 @@ pub fn collectExplicitTextStats(
     requests: []const ExplicitTextStatRequest,
     executor: SearchTextStatsExecutor,
 ) ![]const distributed_stats_mod.TextFieldStats {
+    try checkSearchRequestDeadline(executor.controls);
     if (requests.len == 0) return &.{};
     const out = try alloc.alloc(distributed_stats_mod.TextFieldStats, requests.len);
     var initialized: usize = 0;
@@ -12627,9 +12635,11 @@ pub fn collectExplicitTextStats(
     }
 
     for (requests, 0..) |request, i| {
+        try checkSearchRequestDeadline(executor.controls);
         const text_entry = (try executor.text_index_entry(executor.ctx, request.index_name)) orelse return error.IndexNotFound;
         const snapshot = text_entry.persistent.acquireSnapshot();
         defer snapshot.release();
+        try checkSearchRequestDeadline(executor.controls);
         if (request.resolved_doc_filter) |filter| {
             out[i] = try collectFilteredExplicitTextStats(alloc, snapshot, request, filter, executor);
             initialized += 1;
@@ -12642,6 +12652,7 @@ pub fn collectExplicitTextStats(
             if (term_doc_freqs.len > 0) alloc.free(term_doc_freqs);
         }
         for (request.terms, 0..) |term, term_index| {
+            try checkSearchRequestDeadline(executor.controls);
             term_doc_freqs[term_index] = try text_stats_ownership.termDocFreq(alloc, snapshot, request.field, term);
             initialized_terms += 1;
         }
@@ -12653,6 +12664,7 @@ pub fn collectExplicitTextStats(
         };
         initialized += 1;
     }
+    try checkSearchRequestDeadline(executor.controls);
     return out;
 }
 
@@ -12672,6 +12684,7 @@ fn collectFilteredExplicitTextStats(
         if (term_doc_freqs.len > 0) alloc.free(term_doc_freqs);
     }
     for (request.terms, 0..) |term, term_index| {
+        try checkSearchRequestDeadline(executor.controls);
         term_doc_freqs[term_index] = .{
             .term = try alloc.dupe(u8, term),
             .doc_freq = 0,
@@ -12685,10 +12698,14 @@ fn collectFilteredExplicitTextStats(
     defer freeDocIdArrayList(alloc, &selected_doc_keys);
     var doc_offset: u32 = 0;
     for (snapshot.segments) |*seg| {
-        {
+        try checkSearchRequestDeadline(executor.controls);
+        var batch_start: usize = 0;
+        while (batch_start < seg.reader.doc_count) : (batch_start += 64) {
+            // Yield outside the deletion latch; runnable admission can wait.
+            try checkSearchRequestDeadline(executor.controls);
             seg.shared.lockDeletionShared();
             defer seg.shared.unlockDeletionShared();
-            for (0..seg.reader.doc_count) |local_doc_usize| {
+            for (batch_start..@min(seg.reader.doc_count, batch_start + 64)) |local_doc_usize| {
                 const local_doc: u32 = @intCast(local_doc_usize);
                 if (seg.shared.deleted) |deleted| {
                     if (deleted.contains(local_doc)) continue;
@@ -12710,10 +12727,12 @@ fn collectFilteredExplicitTextStats(
     // primary store, preserving exact projection without a full-index postings
     // scan or restoring the duplicate text-segment copy.
     if (executor.load_many_stored) |load_many| {
+        try checkSearchRequestDeadline(executor.controls);
         const loaded = try load_many(executor.ctx, alloc, selected_doc_keys.items);
         defer freeOptionalOwnedBytes(alloc, loaded);
         if (loaded.len != selected_doc_keys.items.len) return error.InvalidData;
         for (loaded) |maybe_stored| {
+            try checkSearchRequestDeadline(executor.controls);
             const stored = maybe_stored orelse continue;
             var parsed = std.json.parseFromSlice(std.json.Value, alloc, stored, .{}) catch continue;
             defer parsed.deinit();
@@ -12736,12 +12755,15 @@ fn collectFilteredExplicitTextStats(
         // fallback by summing native term frequencies for allowed documents.
         doc_offset = 0;
         for (snapshot.segments) |*seg| {
+            try checkSearchRequestDeadline(executor.controls);
             var allowed_local_docs = roaring.RoaringBitmap.init(alloc);
             defer allowed_local_docs.deinit();
-            {
+            var batch_start: usize = 0;
+            while (batch_start < seg.reader.doc_count) : (batch_start += 64) {
+                try checkSearchRequestDeadline(executor.controls);
                 seg.shared.lockDeletionShared();
                 defer seg.shared.unlockDeletionShared();
-                for (0..seg.reader.doc_count) |local_doc_usize| {
+                for (batch_start..@min(seg.reader.doc_count, batch_start + 64)) |local_doc_usize| {
                     const local_doc: u32 = @intCast(local_doc_usize);
                     if (seg.shared.deleted) |deleted| {
                         if (deleted.contains(local_doc)) continue;
@@ -12758,10 +12780,14 @@ fn collectFilteredExplicitTextStats(
                 var terms = try inv_reader.termIterator();
                 defer terms.deinit();
                 while (try terms.next()) |entry| {
+                    try checkSearchRequestDeadline(executor.controls);
                     var postings = try entry.result.iterator(alloc);
                     defer postings.deinit();
                     postings.decode_positions = false;
+                    var visited: usize = 0;
                     while (try postings.next()) |hit| {
+                        if (visited % 64 == 0) try checkSearchRequestDeadline(executor.controls);
+                        visited += 1;
                         if (!allowed_local_docs.contains(hit.doc_id)) continue;
                         global_total_field_len +|= hit.freq;
                         for (term_doc_freqs) |*item| {
@@ -12774,6 +12800,7 @@ fn collectFilteredExplicitTextStats(
         }
     }
 
+    try checkSearchRequestDeadline(executor.controls);
     return .{
         .field = try alloc.dupe(u8, request.field),
         .global_doc_count = global_doc_count,
@@ -12822,6 +12849,7 @@ pub fn collectExplicitBackgroundTextStats(
 ) ![]const aggregations_mod.DistributedBackgroundTextStats {
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
+    try checkSearchRequestDeadline(executor.controls);
     if (requests.len == 0) return &.{};
     const out = try alloc.alloc(aggregations_mod.DistributedBackgroundTextStats, requests.len);
     var initialized: usize = 0;
@@ -12831,9 +12859,11 @@ pub fn collectExplicitBackgroundTextStats(
     }
 
     for (requests, 0..) |request, i| {
+        try checkSearchRequestDeadline(executor.controls);
         const text_entry = (try executor.text_index_entry(executor.ctx, request.index_name)) orelse return error.IndexNotFound;
         const snapshot = text_entry.persistent.acquireSnapshot();
         defer snapshot.release();
+        try checkSearchRequestDeadline(executor.controls);
         var background_result = try executeBackgroundQuery(alloc, snapshot, request.background_query);
         defer background_result.deinit();
 
@@ -12844,6 +12874,7 @@ pub fn collectExplicitBackgroundTextStats(
             if (term_doc_freqs.len > 0) alloc.free(term_doc_freqs);
         }
         for (request.terms, 0..) |term, term_index| {
+            try checkSearchRequestDeadline(executor.controls);
             term_doc_freqs[term_index] = .{
                 .term = try alloc.dupe(u8, term),
                 .doc_freq = 0,
@@ -12858,6 +12889,7 @@ pub fn collectExplicitBackgroundTextStats(
             if (term_doc_sets.len > 0) alloc.free(term_doc_sets);
         }
         for (request.terms, 0..) |term, term_index| {
+            try checkSearchRequestDeadline(executor.controls);
             term_doc_sets[term_index] = roaring.RoaringBitmap.init(alloc);
             initialized_sets += 1;
             const doc_nums = try snapshot.executeFilter(alloc, .{ .term = .{
@@ -12869,7 +12901,9 @@ pub fn collectExplicitBackgroundTextStats(
         }
 
         var background_doc_count: u32 = 0;
-        for (background_result.hits) |hit| {
+        try checkSearchRequestDeadline(executor.controls);
+        for (background_result.hits, 0..) |hit, hit_index| {
+            if (hit_index % 64 == 0) try checkSearchRequestDeadline(executor.controls);
             if (request.resolved_doc_filter) |filter| {
                 identity_scratch.reset();
                 if (!(try docAllowedByResolvedFilter(identity_scratch.allocator(), snapshot, hit.doc_id, filter))) continue;
@@ -12888,6 +12922,7 @@ pub fn collectExplicitBackgroundTextStats(
         };
         initialized += 1;
     }
+    try checkSearchRequestDeadline(executor.controls);
     return out;
 }
 
@@ -12967,9 +13002,15 @@ test "text stats use postings when segment source is omitted" {
 
     const Harness = struct {
         entry: *index_manager_mod.IndexManager.TextIndex,
+        cancel_on_entry: bool = false,
+        canceled: bool = false,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).canceled;
+        }
 
         fn textIndexEntry(ctx: ?*anyopaque, _: ?[]const u8) anyerror!?*index_manager_mod.IndexManager.TextIndex {
             const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (self.cancel_on_entry) self.canceled = true;
             return self.entry;
         }
     };
@@ -13011,6 +13052,21 @@ test "text stats use postings when segment source is omitted" {
     try std.testing.expectEqual(@as(u64, 2), explicit_stats[0].global_total_field_len);
     try std.testing.expectEqual(@as(u32, 1), explicit_stats[0].term_doc_freqs[0].doc_freq);
     try std.testing.expectEqual(@as(u32, 1), explicit_stats[0].term_doc_freqs[1].doc_freq);
+    harness.cancel_on_entry = true;
+    const cancellation = types.CancellationToken{ .ptr = &harness, .is_cancelled_fn = Harness.requested };
+    try std.testing.expectError(error.Cancelled, collectExplicitTextStats(alloc, &.{.{
+        .index_name = "ft",
+        .field = "body",
+        .terms = &.{"alpha"},
+    }}, .{ .ctx = &harness, .text_index_entry = Harness.textIndexEntry, .controls = .{ .cancellation = cancellation } }));
+    harness.canceled = false;
+    try std.testing.expectError(error.Cancelled, collectExplicitBackgroundTextStats(alloc, &.{.{
+        .aggregation_name = "sig",
+        .index_name = "ft",
+        .field = "body",
+        .terms = &.{"alpha"},
+        .background_query = .{ .match_all = {} },
+    }}, .{ .ctx = &harness, .text_index_entry = Harness.textIndexEntry, .controls = .{ .cancellation = cancellation } }));
 }
 
 fn collectQueryTerms(

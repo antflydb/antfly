@@ -39409,6 +39409,7 @@ pub const DB = struct {
     }
 
     pub fn collectSearchRequestTextStats(self: *DB, alloc: Allocator, req: types.SearchRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        try db_query_search.checkSearchRequestDeadline(req);
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
@@ -39499,12 +39500,23 @@ pub const DB = struct {
     }
 
     pub fn collectExplicitTextStats(self: *DB, alloc: Allocator, requests: []const db_query_search.ExplicitTextStatRequest) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        return self.collectExplicitTextStatsWithControls(alloc, requests, .{});
+    }
+
+    pub fn collectExplicitTextStatsWithControls(
+        self: *DB,
+        alloc: Allocator,
+        requests: []const db_query_search.ExplicitTextStatRequest,
+        controls: types.SearchRequest,
+    ) ![]const @import("../../search/distributed_stats.zig").TextFieldStats {
+        try db_query_search.checkSearchRequestDeadline(controls);
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectExplicitTextStats(alloc, requests, .{
             .ctx = self,
+            .controls = controls,
             .text_index_entry = textIndexEntryCallback,
             .load_many_stored = loadStoredSearchDocumentManyCallback,
         });
@@ -39515,12 +39527,23 @@ pub const DB = struct {
         alloc: Allocator,
         requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
     ) ![]const aggregations_mod.DistributedBackgroundTextStats {
+        return self.collectExplicitBackgroundTextStatsWithControls(alloc, requests, .{});
+    }
+
+    pub fn collectExplicitBackgroundTextStatsWithControls(
+        self: *DB,
+        alloc: Allocator,
+        requests: []const db_query_search.ExplicitBackgroundTextStatRequest,
+        controls: types.SearchRequest,
+    ) ![]const aggregations_mod.DistributedBackgroundTextStats {
+        try db_query_search.checkSearchRequestDeadline(controls);
         var row_policy_lease = try self.local_execution.row_policy_gate.enterUnsupportedSearch();
         defer row_policy_lease.release();
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
         return try db_query_search.collectExplicitBackgroundTextStats(alloc, requests, .{
             .ctx = self,
+            .controls = controls,
             .text_index_entry = textIndexEntryCallback,
         });
     }

@@ -143,6 +143,26 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, antfly_test_mod, true, true);
     antfly_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const text_statistics_controls_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/text_statistics_controls_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    test_imports.configure(b, text_statistics_controls_mod, true, true);
+    const text_statistics_controls_tests = b.addTest(.{
+        .root_module = text_statistics_controls_mod,
+        .filters = &.{"text statistics trusted controls"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-text-statistics-controls-test", "Verify trusted statistics controls retain original authority and deadline")
+        .dependOn(&b.addRunArtifact(text_statistics_controls_tests).step);
+    const text_statistics_storage_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "text stats use postings when segment source is omitted", "statistics ownership survives every allocation failure", "statistics frequency result retires" },
+    });
+    b.step("antfly-text-statistics-storage-test", "Verify exact statistics and retirement after rejected snapshot acquisition")
+        .dependOn(&addFilteredTestRunArtifact(b, text_statistics_storage_tests).step);
     const producer_readiness_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/producer_readiness_test_root.zig"),
         .target = target,

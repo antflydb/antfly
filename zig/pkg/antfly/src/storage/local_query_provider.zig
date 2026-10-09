@@ -268,11 +268,14 @@ fn executeTextStats(
     out_response: *abi.OwnedBytes,
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
-    const response = local_query.executeStorageKernelTextStats(
+    var controls: db_mod.types.SearchRequest = .{};
+    applySearchControls(request, &controls) catch |err| return fail(err, .text_stats, out_failure);
+    const response = local_query.executeStorageKernelTextStatsWithControls(
         std.heap.c_allocator,
         db,
         table_name,
         request.request_json.slice(),
+        controls,
     ) catch |err| return fail(err, .text_stats, out_failure);
     out_response.* = .{ .ptr = response.ptr, .len = @intCast(response.len) };
     return .ok;

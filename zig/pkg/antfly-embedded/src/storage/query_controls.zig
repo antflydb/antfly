@@ -48,3 +48,14 @@ pub fn applyExecutionOptions(req: *types.SearchRequest, options: abi.LocalQueryE
         req.response_table_name = if (options.response_table_name.ptr != null) options.response_table_name.slice() else null;
     }
 }
+
+/// Apply trusted invocation controls without changing the parsed query. A
+/// serialized deadline may tighten the caller's deadline but never extend it.
+/// Authority and cancellation are accepted only from the synchronous caller.
+pub fn applyTrustedControls(req: *types.SearchRequest, controls: types.SearchRequest) void {
+    if (controls.execution_deadline_ns) |deadline| {
+        req.execution_deadline_ns = if (req.execution_deadline_ns) |parsed| @min(parsed, deadline) else deadline;
+    }
+    req.execution_runnable = controls.execution_runnable;
+    req.cancellation = controls.cancellation;
+}
