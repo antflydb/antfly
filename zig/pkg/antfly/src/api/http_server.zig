@@ -58562,6 +58562,22 @@ test "retrieval incoming probe retains original native or borrowed authority thr
             };
         }
         fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn routingSnapshot(raw: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const admin = try snapshot(raw);
+            return .{
+                .metadata_group_id = 1,
+                .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+                .catalog_revision = 1,
+                .change_token = .{
+                    .metadata_group_id = 1,
+                    .metadata_incarnation = "0123456789abcdef0123456789abcdef".*,
+                    .revision = 1,
+                },
+                .tables = admin.tables,
+                .ranges = admin.ranges,
+            };
+        }
+        fn freeRoutingSnapshot(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
         fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
             return null;
         }
@@ -58602,7 +58618,7 @@ test "retrieval incoming probe retains original native or borrowed authority thr
     for (std.enums.values(Case)) |case| for ([_]bool{ false, true }) |borrowed| {
         var fake = Fake{ .case = case };
         const source: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query, .graph_hydrate_group_local = Fake.hydrate } };
-        var server = ApiHttpServer.init(a, .{ .runnable_policy = .{ .slots = 2 } }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, source, null);
+        var server = ApiHttpServer.init(a, .{ .runnable_policy = .{ .slots = 2 } }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot, .routing_snapshot = Fake.routingSnapshot, .linearizable_routing_snapshot = Fake.routingSnapshot, .free_routing_snapshot = Fake.freeRoutingSnapshot } }, source, null);
         defer server.deinit();
         fake.server = &server;
         fake.server_deadline = platform_time.monotonicNs() + std.time.ns_per_s;
