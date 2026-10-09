@@ -188,3 +188,87 @@ fn sqlx_conformance_and_streaming() {
         });
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn sqlx_shares_an_open_database_with_the_document_api() {
+    let directory = std::env::temp_dir().join(format!(
+        "antfly-sqlx-shared-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("db.aflite");
+    std::thread::Builder::new()
+        .stack_size(antfly_embedded::MIN_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let database = std::sync::Arc::new(
+                antfly_embedded::Database::create(
+                    &path,
+                    &antfly_embedded::OpenOptions::new().no_sync(true),
+                )
+                .unwrap(),
+            );
+            database
+                .batch_json(r#"{"inserts":{"doc":{"text":"document api"}}}"#)
+                .unwrap();
+            // A second writer owner on the same file is refused.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                assert!(
+                    AntflyConnectOptions::new(&path)
+                        .no_sync(true)
+                        .connect()
+                        .await
+                        .is_err()
+                );
+                let options = AntflyConnectOptions::new(&path)
+                    .with_database(std::sync::Arc::clone(&database));
+                let pool = sqlx_core::pool::PoolOptions::<Antfly>::new()
+                    .max_connections(2)
+                    .connect_with(options)
+                    .await
+                    .unwrap();
+                pool.execute(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)".into_sql_str(),
+                )
+                .await
+                .unwrap();
+                let mut transaction = pool.begin().await.unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO threads (id, title) VALUES ('t1', 'first')".into_sql_str(),
+                    )
+                    .await
+                    .unwrap();
+                transaction.commit().await.unwrap();
+                // Both APIs see each other's writes on the one owner.
+                let table = database.open_table("threads").unwrap();
+                let scanned = String::from_utf8(table.scan_json("{}").unwrap()).unwrap();
+                assert!(scanned.contains("\"hashes\""), "scan: {scanned}");
+                drop(table);
+                let rows = pool
+                    .fetch_all(query::<Antfly>("SELECT title FROM threads"))
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].get::<String, _>("title"), "first");
+                assert!(database.lookup_json("doc").is_ok());
+                pool.close().await;
+            });
+            // Connections never close a shared handle.
+            database
+                .batch_json(r#"{"inserts":{"after":{"text":"still open"}}}"#)
+                .unwrap();
+            assert!(database.lookup_json("after").is_ok());
+            database.close().unwrap();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

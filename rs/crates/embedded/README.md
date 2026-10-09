@@ -317,6 +317,12 @@ let rows = sqlx::query::<Antfly>("SELECT id,name FROM people")
     .fetch_all(&mut connection).await?;
 ```
 
+libantfly allows one writer owner per file. A process that also uses a
+`Database` for documents, search, or inference shares that handle with
+`AntflyConnectOptions::new(path).with_database(Arc::clone(&database))`;
+opening the file a second time fails with `ANTFLY_BUSY`. Connections never
+close a shared handle.
+
 `AntflyPool`, transactions, nested savepoints, `query`, `query_as`, streaming,
 prepare/describe, and SQLSTATE database errors use native SQL sessions.
 Native work runs on a dedicated worker with the required native stack,

@@ -121,8 +121,12 @@ impl fmt::Debug for Worker {
     }
 }
 static WORKERS: OnceLock<Mutex<HashMap<PathBuf, Weak<Worker>>>> = OnceLock::new();
+static SHARED_WORKERS: OnceLock<Mutex<HashMap<usize, Weak<Worker>>>> = OnceLock::new();
 impl Worker {
     fn open(options: &AntflyConnectOptions) -> Result<Arc<Self>, Error> {
+        if let Some(database) = &options.database {
+            return Self::open_shared(database, options.no_sync);
+        }
         let path = if options.path.is_absolute() {
             options.path.clone()
         } else {
@@ -195,6 +199,35 @@ impl Worker {
         registry.insert(path, Arc::downgrade(&worker));
         Ok(worker)
     }
+    /// One worker per shared handle, so every pooled connection queues on it.
+    fn open_shared(database: &Arc<Database>, no_sync: bool) -> Result<Arc<Self>, Error> {
+        let key = Arc::as_ptr(database) as usize;
+        let mut registry = SHARED_WORKERS
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(protocol)?;
+        if let Some(worker) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(worker);
+        }
+        let (sender, receiver) = mpsc::channel::<Job>();
+        let database = Arc::clone(database);
+        let thread = std::thread::Builder::new()
+            .name("antfly-sqlx".into())
+            .stack_size(MIN_THREAD_STACK_SIZE)
+            .spawn(move || {
+                for job in receiver {
+                    job(&database)
+                }
+            })
+            .map_err(protocol)?;
+        let worker = Arc::new(Worker {
+            sender: Some(sender),
+            thread: Some(thread),
+            no_sync,
+        });
+        registry.insert(key, Arc::downgrade(&worker));
+        Ok(worker)
+    }
     async fn run<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&Database) -> crate::sql::Result<T> + Send + 'static,
@@ -247,16 +280,29 @@ impl Worker {
 pub struct AntflyConnectOptions {
     pub path: PathBuf,
     pub no_sync: bool,
+    /// An already-open handle to run SQL on instead of opening `path`.
+    database: Option<Arc<Database>>,
 }
 impl AntflyConnectOptions {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
             no_sync: false,
+            database: None,
         }
     }
     pub fn no_sync(mut self, value: bool) -> Self {
         self.no_sync = value;
+        self
+    }
+    /// Runs SQL on `database` instead of opening `path` (kept for the URL).
+    ///
+    /// libantfly allows one writer owner per file, so a process that also
+    /// uses the document, search, or inference APIs on a [`Database`] must
+    /// share that handle here rather than open the file a second time.
+    /// Connections never close a shared handle; its owner does.
+    pub fn with_database(mut self, database: Arc<Database>) -> Self {
+        self.database = Some(database);
         self
     }
 }
