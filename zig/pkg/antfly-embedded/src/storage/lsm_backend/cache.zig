@@ -1717,7 +1717,12 @@ pub const Cache = struct {
         }
     }
 
-    fn effectiveMaxBytes(self: *Cache) usize {
+    /// Atomic, advisory signal only; ownership admission remains authoritative.
+    pub fn resultPinsUnderPressure(self: *const Cache) bool {
+        return self.pressure_target_bytes.load(.monotonic) != 0 or self.currentBytes() >= self.effectiveMaxBytes();
+    }
+
+    fn effectiveMaxBytes(self: *const Cache) usize {
         const pressure_target = self.pressure_target_bytes.load(.monotonic);
         if (pressure_target == 0) return self.max_bytes;
         return @min(self.max_bytes, pressure_target);

@@ -388,6 +388,7 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     }
     if (@hasDecl(BackendType, "deinitRunSources")) backend.deinitRunSources();
     if (@hasField(BackendType, "local_reader")) backend.local_reader.deinit();
+    if (@hasField(BackendType, "point_reader")) backend.point_reader.deinit();
     if (@hasField(BackendType, "run_block_cache")) {
         for (backend.run_block_cache.items) |*cached| cached.deinit(backend.allocator);
         backend.run_block_cache.deinit(backend.allocator);

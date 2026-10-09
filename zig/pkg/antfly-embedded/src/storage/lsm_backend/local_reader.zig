@@ -18,6 +18,7 @@ const platform = @import("antfly_platform");
 const resources = @import("../resource_manager.zig");
 const read_admission = @import("../../common/read_admission.zig");
 const bounded_mutex = @import("../../common/bounded_mutex.zig");
+const RecyclingWorkspace = @import("recycling_workspace.zig").RecyclingWorkspace;
 const SharedBytes = @import("shared_bytes.zig").SharedBytes;
 
 /// A fixed number of decoder workspaces and flight records. Workspace storage
@@ -69,7 +70,11 @@ pub const Pool = struct {
     const Slot = struct {
         busy: bool = false,
         initialized: bool = false,
+        bound_manager: ?*resources.ResourceManager = null,
+        bound_backing: std.mem.Allocator = undefined,
         arena: std.heap.ArenaAllocator = undefined,
+        recycled: RecyclingWorkspace = .{},
+        recycled_mode: bool = false,
         budget: ?resources.BudgetedAllocator = null,
         cap: Capped = .{},
     };
@@ -126,10 +131,17 @@ pub const Pool = struct {
         slot: *Slot,
         bytes: usize,
         pub fn allocator(self: *const Workspace) std.mem.Allocator {
-            return self.slot.arena.allocator();
+            return if (self.slot.recycled_mode) self.slot.recycled.allocator() else self.slot.arena.allocator();
         }
+        pub fn reclaimIdle(self: *const Workspace) void {
+            if (self.slot.recycled_mode) self.slot.recycled.trimIdle(0);
+        }
+
         pub fn release(self: *Workspace) void {
-            if (!self.slot.arena.reset(.{ .retain_with_limit = retained_bytes_per_workspace })) _ = self.slot.arena.reset(.free_all);
+            if (self.slot.recycled_mode) {
+                std.debug.assert(self.slot.recycled.live_buffers == 0);
+                self.slot.recycled.trimIdle(retained_bytes_per_workspace);
+            } else if (!self.slot.arena.reset(.{ .retain_with_limit = retained_bytes_per_workspace })) _ = self.slot.arena.reset(.free_all);
             if (self.slot.budget) |*budget| _ = budget.releaseUnusedCredit();
             platform.sync.lockYielding(&self.pool.mutex);
             self.slot.busy = false;
@@ -144,7 +156,7 @@ pub const Pool = struct {
     /// Ordinary operations share the byte ceiling. One operation larger than
     /// the ceiling runs alone, preserving support for legitimate large rows.
     pub fn acquire(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, output_bytes: usize) Workspace {
-        return self.acquireWithAdmission(backing, manager, io, bytes, limit, output_bytes, null) catch unreachable;
+        return self.acquireMode(backing, manager, io, bytes, limit, output_bytes, false, null) catch unreachable;
     }
 
     fn lockWithAdmission(self: *Pool, control: ?read_admission.Port) !void {
@@ -161,6 +173,18 @@ pub const Pool = struct {
     }
 
     pub fn acquireWithAdmission(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, output_bytes: usize, control: ?read_admission.Port) !Workspace {
+        return self.acquireMode(backing, manager, io, bytes, limit, output_bytes, false, control);
+    }
+
+    pub fn acquireRecycled(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize) Workspace {
+        return self.acquireRecycledWithAdmission(backing, manager, io, bytes, limit, null) catch unreachable;
+    }
+
+    pub fn acquireRecycledWithAdmission(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, control: ?read_admission.Port) !Workspace {
+        return self.acquireMode(backing, manager, io, bytes, limit, 0, true, control);
+    }
+
+    fn acquireMode(self: *Pool, backing: std.mem.Allocator, manager: ?*resources.ResourceManager, io: ?std.Io, bytes: usize, limit: usize, output_bytes: usize, recycled_mode: bool, control: ?read_admission.Port) !Workspace {
         while (true) {
             try self.lockWithAdmission(control);
             if (self.active == 0 or bytes <= limit -| self.active_bytes) {
@@ -170,17 +194,31 @@ pub const Pool = struct {
                     self.active_bytes += bytes;
                     self.peak_active_bytes = @max(self.peak_active_bytes, self.active_bytes);
                     if (self.allocator == null) self.allocator = backing;
+                    self.mutex.unlock();
+                    // The busy slot is exclusively owned. Release retained
+                    // credit before rebinding, outside the coordination lock.
+                    if (slot.initialized and (slot.bound_manager != manager or slot.bound_backing.ptr != backing.ptr or slot.bound_backing.vtable != backing.vtable or slot.recycled_mode != recycled_mode)) {
+                        slot.arena.deinit();
+                        slot.recycled.deinit();
+                        if (slot.budget) |*budget| budget.deinit();
+                        slot.budget = null;
+                        slot.cap = .{};
+                        slot.initialized = false;
+                    }
                     if (!slot.initialized) {
+                        slot.bound_manager = manager;
+                        slot.bound_backing = backing;
                         if (manager) |host| {
                             slot.budget = resources.BudgetedAllocator.init(host, .lsm_read_working_set, backing, 1);
                             slot.budget.?.credit_quantum = 4096;
                         }
                         slot.cap.backing = if (slot.budget) |*budget| budget.allocator() else backing;
                         slot.arena = .init(slot.cap.allocator());
+                        slot.recycled = .{ .backing = slot.cap.allocator(), .budget = if (slot.budget) |*budget| budget else null };
+                        slot.recycled_mode = recycled_mode;
                         slot.initialized = true;
                     }
                     slot.cap.limit = @max(slot.cap.live, bytes -| output_bytes);
-                    self.mutex.unlock();
                     return .{ .pool = self, .slot = slot, .bytes = bytes };
                 };
             }
@@ -289,6 +327,7 @@ pub const Pool = struct {
         for (&self.flights) |*flight| std.debug.assert(flight.refs == 0);
         for (&self.slots) |*slot| if (slot.initialized) {
             slot.arena.deinit();
+            slot.recycled.deinit();
             if (slot.budget) |*budget| budget.deinit();
         };
         self.* = .{};

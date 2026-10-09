@@ -301,6 +301,7 @@ pub const WANDScorer = struct {
         const idf = @log(1.0 + (n - df + 0.5) / (df + 0.5));
 
         var iter_owned = iter;
+        errdefer iter_owned.deinit();
         // BM25 scoring doesn't read positions; flip the iterator into the
         // fast path so `next()` skips the per-doc varint walk over positions.
         // Saves real wall time on phrase-aware indexes when the query is
@@ -364,6 +365,28 @@ pub const WANDScorer = struct {
         }
     }
 
+    /// Exact membership can jump over rejected ordinal runs before scoring.
+    /// The collector's lower bound is monotone; absence is represented by 2^32.
+    fn seekCandidate(self: *WANDScorer, collector: anytype, doc: u32) !bool {
+        if (comptime @hasDecl(@typeInfo(@TypeOf(collector)).pointer.child, "nextCandidate")) {
+            const target = collector.nextCandidate(doc);
+            if (target > std.math.maxInt(u32)) {
+                for (self.terms.items) |*term| {
+                    term.current = null;
+                    term.exhausted = true;
+                }
+                return true;
+            }
+            if (target > doc) {
+                for (self.terms.items) |*term| if (!term.exhausted and term.current.?.doc_id < target) {
+                    try self.advancePast(term, @intCast(target));
+                };
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Single-term Block-Max top-k does not need pivot ordering, cumulative
     /// bounds, or the generic multi-term front-interval sweep. Score the
     /// current posting directly and feed the raised threshold into the same
@@ -376,6 +399,7 @@ pub const WANDScorer = struct {
 
         while (!term.exhausted) {
             const hit = term.current orelse break;
+            if (try self.seekCandidate(collector, hit.doc_id)) continue;
             self.pivots_scored += 1;
             self.next_in_score += 1;
             try collector.collect(.{
@@ -438,6 +462,7 @@ pub const WANDScorer = struct {
                 }
             }
             if (min_doc == null) break;
+            if (try self.seekCandidate(collector, min_doc.?)) continue;
 
             // Score this document across all terms that contain it
             var score: f32 = 0;
@@ -495,6 +520,7 @@ pub const WANDScorer = struct {
                 sorted[insert_pos] = moving;
             }
 
+            if (try self.seekCandidate(collector, self.terms.items[sorted[0]].current.?.doc_id)) continue;
             if (try self.skipNonCompetitiveFrontBlock(collector, sorted)) {
                 collector.markLowerBound();
                 continue;
@@ -1240,4 +1266,79 @@ test "block-max scorer proves sparse matches complete below top-k" {
         try std.testing.expectEqual(@as(usize, k), boundary.hits.len);
         try std.testing.expectEqual(if (k == 4) TotalHitsRelation.exact else .gte, boundary.total_relation);
     }
+}
+
+test "WAND membership seeks preserve selective single multi and unbounded scoring" {
+    const a = std.testing.allocator;
+    var builder = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 128 });
+    defer builder.deinit();
+    for (0..8192) |i| try builder.addDocument(@intCast(i), &.{
+        .{ .term = "first", .freq = 1, .norm = 10 },
+        .{ .term = "second", .freq = 2, .norm = 10 },
+    });
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var reader = try inverted.InvertedIndexReader.init(a, bytes);
+    const Collector = struct {
+        base: TopKCollector,
+        calls: usize = 0,
+        pub fn nextCandidate(self: *@This(), first: u32) u64 {
+            self.calls += 1;
+            return if (first <= 7001) 7001 else 4294967296;
+        }
+        pub fn topKLimit(self: *@This()) u32 {
+            return self.base.topKLimit();
+        }
+        pub fn minCompetitiveScore(self: *@This()) f32 {
+            return self.base.minCompetitiveScore();
+        }
+        pub fn worstCompetitiveDocId(self: *@This()) ?u32 {
+            return self.base.worstCompetitiveDocId();
+        }
+        pub fn markLowerBound(self: *@This()) void {
+            self.base.markLowerBound();
+        }
+        pub fn collect(self: *@This(), hit: ScoredHit) !void {
+            if (hit.doc_id != 7001) return error.UnexpectedRejectedScore;
+            try self.base.collect(hit);
+        }
+    };
+    for ([_]usize{ 1, 2 }) |count| for ([_]bool{ false, true }) |bounded| {
+        var scorer = WANDScorer.init(a, 1, 8192, reader.avgDocLen(), .{});
+        defer scorer.deinit();
+        for (([_][]const u8{ "first", "second" })[0..count]) |term| {
+            const lookup = reader.lookup(term) orelse return error.TestUnexpectedResult;
+            try scorer.addTerm(try lookup.iterator(a), lookup.docFreq(), if (bounded) switch (lookup) {
+                .postings => |p| p.block_max,
+                .one_hit => null,
+            } else null, 128, 0);
+        }
+        var collector: Collector = .{ .base = .init(a, 1) };
+        defer collector.base.deinit();
+        try scorer.executeInto(&collector);
+        try std.testing.expectEqual(@as(u32, 1), collector.base.total_count);
+        try std.testing.expectEqual(@as(u32, 7001), collector.base.hits.items[0].doc_id);
+        try std.testing.expect(collector.calls <= 4);
+    };
+}
+
+test "WAND failed term admission releases owned metadata" {
+    const Owner = struct {
+        refs: usize = 1,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.refs -= 1;
+        }
+    };
+    var owner: Owner = .{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var wand = WANDScorer.init(failing.allocator(), 1, 1, 1, .{});
+    defer wand.deinit();
+    const iterator: inverted.PostingsIterator = .{ .alloc = std.testing.allocator, .is_one_hit = true, .metadata_owner = .{ .ptr = &owner, .retain = Owner.retain, .release = Owner.release } };
+    try std.testing.expectError(error.OutOfMemory, wand.addTerm(iterator, 1, null, 1024, 0));
+    try std.testing.expectEqual(@as(usize, 0), owner.refs);
 }

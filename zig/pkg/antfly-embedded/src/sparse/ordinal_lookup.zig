@@ -22,3 +22,18 @@ pub const Lookup = struct {
     one: *const fn (*anyopaque, []const u8) anyerror!?u32,
     block: *const fn (*anyopaque, std.mem.Allocator, []const u8, u32, *const Bitmap, *Bitmap) anyerror!bool,
 };
+
+/// Owned masks in one pinned sparse generation. A null include admits every
+/// ordinal; an empty include admits none. Exclusions never require constructing
+/// the potentially archive-sized complement.
+pub const Selection = struct {
+    /// Unmaterialized constraints remain exact candidate predicates.
+    residual: bool = false,
+    include: ?Bitmap = null,
+    exclude: ?Bitmap = null,
+    pub fn deinit(self: *Selection) void {
+        if (self.include) |*bitmap| bitmap.deinit();
+        if (self.exclude) |*bitmap| bitmap.deinit();
+        self.* = undefined;
+    }
+};
