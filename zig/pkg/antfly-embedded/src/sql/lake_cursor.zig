@@ -565,17 +565,24 @@ const Owner = struct {
             const source = try a.create(serving.ServingSource);
             errdefer a.destroy(source);
             source.* = self.stream.source.*;
-            if (ordered_files) try cloneVersionState(a, source);
-            errdefer if (ordered_files) freeVersionState(a, source);
+            try cloneVersionState(a, source);
+            errdefer freeVersionState(a, source);
             const parent_reader = source.scanner.shared_reader.?;
             const reader = try a.create(@import("../serverless/query/lake_serving_cache.zig").Reader);
             errdefer a.destroy(reader);
             reader.* = .{ .cache = parent_reader.cache, .base = parent_reader.base, .scope = parent_reader.scope, .context = parent_reader.context };
+            // Planning's coordinator attachment ends before these cursors run.
+            // Retain original lifetime evidence in an independent Store, never
+            // the parent's temporary CPU receiver or mutable Store address.
+            if (self.coordinator_context) |original| {
+                reader.bindContext(original);
+                source.scanner.object_reader = reader.base;
+            }
             source.scanner.shared_reader = reader;
             cursor.* = try openPinned(a, self.table, .{ .fields = self.stream.columns, .conditions = self.conditions, .after = self.after, .before = self.before, .primary_key = self.primary_key, .limit = 1024 }, self.context, source);
             const child: *Owner = @ptrCast(@alignCast(cursor.ptr));
             child.partition_source = source;
-            child.partition_versions_owned = ordered_files;
+            child.partition_versions_owned = true;
             child.borrowed_prepared = source.prepared_deletes;
             if (!ordered_files) child.stream.work = self.stream.work;
             child.stream.partition_index = index;
@@ -2048,4 +2055,114 @@ test "lake SQL coordinator can adopt a retained page cursor after an unscheduled
     try std.testing.expect(owner.stream.context.execution == null);
     try execution.checkpoint();
     try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
+}
+
+test "lake SQL split planning owns footer workers and returns cursors without the planning execution" {
+    const Runnable = @import("../common/runnable_scheduler.zig");
+    const Context = @import("../serverless/query/lake_read_context.zig");
+    const Clock = struct {
+        var value: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return value.load(.acquire);
+        }
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+        fn borrowed(_: *anyopaque) !void {
+            return error.BorrowedPlanningReceiver;
+        }
+    };
+    const a = std.testing.allocator;
+    const Case = enum { scoped, registry_full, canceled, expired, ordered };
+    for (std.enums.values(Case)) |case| {
+        var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+        try lake.populate(a, 4, &.{ 1, 2, 3 });
+        defer lake.deinit(a);
+        var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+        defer cache.deinit();
+        var schema = try @import("../serverless/query/lake_schema.zig").icebergSchema(a, "{\"current-schema-id\":7,\"schemas\":[{\"schema-id\":7,\"fields\":[{\"id\":1,\"name\":\"amount\",\"required\":true,\"type\":\"long\"}]}]}", null);
+        defer schema.deinit();
+        lake.source.iceberg_schema = schema;
+        lake.inventory.format = .iceberg;
+        lake.source.inventory = lake.inventory;
+        lake.source.scanner.inventory = lake.inventory;
+        lake.table.external_base_source.?.binding.format = .iceberg;
+        lake.source.lazy_versions = true;
+        lake.source.pinned_files = try a.alloc(bool, lake.inventory.files.len);
+        defer a.free(lake.source.pinned_files);
+        @memset(lake.source.pinned_files, false);
+        var marker: u8 = 0;
+        const original: Context.Context = .{ .io = std.testing.io, .checkpoint = .{ .ptr = &marker, .check = Clock.borrowed } };
+        var store: Context.Store = .{ .base = lake.meter.client(), .context = original };
+        lake.source.scanner.object_reader.client = store.client(a);
+        try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, original);
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_bytes = 64 * 1024 * 1024, .max_operations = if (case == .registry_full) 1 else 128 });
+        var signal: std.atomic.Value(bool) = .init(false);
+        Clock.value.store(0, .release);
+        var planning: Runnable.Execution = .{};
+        try planning.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &signal, .requested = Clock.requested } }, .query);
+        defer planning.finish();
+        lake.meter.execution_owner = &scheduler;
+        lake.meter.expected_parked = if (case == .registry_full or case == .ordered) 1 else 2;
+        if (case == .canceled) lake.meter.cancel_on_read = &signal;
+        if (case == .expired) lake.meter.deadline_on_read = &Clock.value;
+        const parent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 2 }, .{}, &lake.source);
+        defer parent.close(parent.ptr);
+        const owner: *Owner = @ptrCast(@alignCast(parent.ptr));
+        // One planning child at a time still proves physical dispatch with one
+        // ordinary CPU slot, while the result has two disjoint cursor lanes.
+        owner.stream.limits.max_decoded_bytes = 1024 * 1024;
+        const result = if (case == .ordered) parent.splitFor(&planning, a, 2, true) else parent.splitFor(&planning, a, 2, false);
+        if (case == .canceled or case == .expired) {
+            try std.testing.expectError(if (case == .expired) error.DeadlineExceeded else error.Canceled, result);
+            try std.testing.expect(owner.coordinator_context == null);
+            try std.testing.expect(owner.stream.context.execution == null);
+            try std.testing.expect(owner.partition_source.?.scanner.shared_reader.?.context.execution == null);
+            try std.testing.expectEqual(@as(usize, 0), planning.entry.?.children);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+            continue;
+        }
+        const children = (try result).?;
+        defer a.free(children);
+        defer for (children) |child| child.close(child.ptr);
+        try std.testing.expectEqual(@as(usize, 2), children.len);
+        try std.testing.expect(owner.coordinator_context == null);
+        try std.testing.expect(owner.stream.context.execution == null);
+        for (children) |child| {
+            const child_owner: *Owner = @ptrCast(@alignCast(child.ptr));
+            const reader = child_owner.partition_source.?.scanner.shared_reader.?;
+            try std.testing.expect(reader.context.execution == null);
+            try std.testing.expect(reader.request_store.?.context.execution == null);
+            try std.testing.expect(reader.base.client.ptr != owner.partition_source.?.scanner.shared_reader.?.base.client.ptr);
+        }
+        if (case != .ordered) {
+            try std.testing.expectEqual(@as(usize, 4), lake.meter.stats);
+            try std.testing.expectEqual(lake.meter.stats, lake.meter.parked_stats.load(.acquire));
+            try std.testing.expectEqual(lake.meter.stats, lake.meter.control_stats.load(.acquire));
+            try std.testing.expect(lake.meter.parked_reads.load(.acquire) > 0);
+        }
+        try planning.checkpoint();
+        try std.testing.expectEqual(@as(usize, 0), planning.entry.?.children);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        planning.finish();
+        // Returned cursors survive the original execution finish. Their next
+        // call borrows a different root and must not invoke that dead receiver.
+        lake.meter.expected_parked = 1;
+        var next: Runnable.Execution = .{};
+        try next.start(&scheduler, .{ .io = std.testing.io }, .query);
+        defer next.finish();
+        var count: usize = 0;
+        for (children) |child| while (true) {
+            const page = try child.nextFor(&next, a, 2);
+            defer page.deinit();
+            count += page.rows.len;
+            if (page.after == null) break;
+        };
+        try std.testing.expectEqual(@as(usize, 12), count);
+        try next.checkpoint();
+        try std.testing.expectEqual(@as(usize, 0), next.entry.?.children);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        try std.testing.expect(lake.source.scanner.shared_reader.?.request_store == null);
+        for (lake.source.pinned_files) |pinned| try std.testing.expect(!pinned);
+    }
 }

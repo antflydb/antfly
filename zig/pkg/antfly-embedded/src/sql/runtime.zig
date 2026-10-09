@@ -225,7 +225,7 @@ pub const Context = struct {
 
         pub fn partitions(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan, maximum: usize) !?[]catalog.Cursor {
             try self.open(context, table, request);
-            if (self.cursor) |cursor| if (cursor.split_scan) |split| return try split(cursor.ptr, alloc, maximum);
+            if (self.cursor) |cursor| if (cursor.split_scan != null) return try cursor.splitFor(if (context.backend.cpu_scope) |scope| scope.execution else null, alloc, maximum, false);
             return null;
         }
 

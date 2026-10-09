@@ -283,6 +283,21 @@ pub const Cursor = struct {
         if (attached) try execution.?.checkpoint();
         return result;
     }
+    pub fn splitFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, maximum: usize, comptime ordered: bool) !?[]Cursor {
+        const attached = try self.attach(execution);
+        const result = if (ordered) self.split_ordered.?(self.ptr, alloc, maximum) else self.split_scan.?(self.ptr, alloc, maximum);
+        self.detach(attached);
+        if (attached) execution.?.checkpoint() catch |err| {
+            if (result) |cursors| {
+                if (cursors) |owned| {
+                    for (owned) |cursor| cursor.close(cursor.ptr);
+                    alloc.free(owned);
+                }
+            } else |_| {}
+            return err;
+        };
+        return result;
+    }
     pub fn countFor(self: Cursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution) !?u64 {
         const attached = try self.attach(execution);
         const result = self.count_rows.?(self.ptr);

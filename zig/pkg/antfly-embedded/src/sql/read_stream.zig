@@ -453,7 +453,7 @@ const ParallelScan = struct {
     };
     fn start(source: *Stream) !?*ParallelScan {
         const cursor = source.cursor orelse return null;
-        const split = cursor.split_ordered orelse return null;
+        if (cursor.split_ordered == null) return null;
         const scope = source.context.backend.cpu_scope;
         const io = if (scope) |owner| owner.io else source.context.backend.execution_io orelse return null;
         if (scope != null and cursor.bind_execution == null) return null;
@@ -462,7 +462,7 @@ const ParallelScan = struct {
         const a = source.budget.allocator();
         const maximum = if (cursor.ordered_split_bytes == 0) 16 else @min(16, (source.budget.limit -| source.budget.live) / 4 / cursor.ordered_split_bytes);
         if (maximum < 2) return null;
-        const children = (try split(cursor.ptr, a, maximum)) orelse return null;
+        const children = (try cursor.splitFor(if (scope) |owner| owner.execution else null, a, maximum, true)) orelse return null;
         defer a.free(children);
         if (children.len < 2) {
             for (children) |child| child.close(child.ptr);

@@ -333,7 +333,12 @@ pub const Stream = struct {
             // state. The coordinator prepares deletes after a footer survives.
             const scheduler = @import("../../sql/parallel_scheduler.zig");
             var locked: scheduler.LockedAllocator = .{ .backing = self.alloc };
-            const width = @min(maximum, scheduler.global().fanout(self.files.len, self.limits.max_decoded_bytes, 1024 * 1024));
+            const execution = self.context.execution;
+            const width = if (execution != null)
+                @min(@as(usize, 8), @min(maximum, @min(self.files.len, @max(@as(usize, 1), self.limits.max_decoded_bytes / (1024 * 1024)))))
+            else
+                @min(maximum, scheduler.global().fanout(self.files.len, self.limits.max_decoded_bytes, 1024 * 1024));
+            const scope: ?scheduler.ExecutionScope = if (execution) |owner| .{ .execution = owner, .allocator = locked.allocator(), .io = planning_io.?, .wait = self.context.wait.? } else null;
             var offset: usize = 0;
             while (offset < self.files.len) {
                 const count = @min(width, self.files.len - offset);
@@ -344,7 +349,12 @@ pub const Stream = struct {
                 // While tasks run, every request allocation uses the same
                 // lock. Join the entire wave before touching coordinator state.
                 for (jobs[0..count], 0..) |*job, lane| {
-                    tasks[lane] = scheduler.global().submit(planning_io.?, 1024 * 1024, PlanningJob.run, .{job});
+                    if (scope) |owner| {
+                        tasks[lane] = owner.submit(1024 * 1024, locked.allocator(), PlanningJob.runChild, .{job}, PlanningJob.discard) catch |err| {
+                            failures[lane] = err;
+                            break;
+                        };
+                    } else tasks[lane] = scheduler.global().submit(planning_io.?, 1024 * 1024, PlanningJob.run, .{job});
                     if (tasks[lane] == null) PlanningJob.run(job) catch |err| {
                         failures[lane] = err;
                     };
@@ -355,6 +365,7 @@ pub const Stream = struct {
                     };
                 };
                 defer for (jobs[0..count]) |*job| if (job.plan) |*plan| plan.deinit(self.alloc);
+                try self.context.ensureActive();
                 for (failures[0..count]) |failure| if (failure) |err| return err;
                 for (jobs[0..count]) |*job| {
                     self.stats.files_opened += job.stats.files_opened;
@@ -416,9 +427,18 @@ pub const Stream = struct {
         index: usize,
         plan: ?ScanWork.FilePlan = null,
         stats: Stats = .{},
+        fn discard(_: Allocator, _: void) void {}
+        fn runChild(job: *@This(), execution: *@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
+            return job.runFor(execution);
+        }
         fn run(job: *@This()) anyerror!void {
+            return job.runFor(null);
+        }
+        fn runFor(job: *@This(), execution: ?*@import("../../common/runnable_scheduler.zig").Execution) anyerror!void {
             const parent = job.parent;
-            try parent.context.ensureActive();
+            try parent.context.checkLifetime();
+            const context = if (execution) |owner| parent.context.withExecution(owner) else parent.context;
+            try context.ensureActive();
             if (!parent.fileMatches(parent.source.inventory.files[job.index])) {
                 job.stats.files_pruned = 1;
                 return;
@@ -446,9 +466,13 @@ pub const Stream = struct {
                 .context = parent.source.scanner.shared_reader.?.context,
             };
             reader.base.client.allocator = job.alloc;
+            if (execution) |owner| {
+                reader.bindExecution(owner);
+                source.scanner.object_reader = reader.base;
+            }
             source.scanner.shared_reader = &reader;
             source.scanner.object_reader.client.allocator = job.alloc;
-            var worker: Stream = .{ .alloc = job.alloc, .source = &source, .columns = parent.columns, .predicates = parent.predicates, .context = parent.context, .limits = parent.limits, .files = &.{}, .owns_files = false, .schema_contract = parent.schema_contract, .identity_only = parent.identity_only };
+            var worker: Stream = .{ .alloc = job.alloc, .source = &source, .columns = parent.columns, .predicates = parent.predicates, .context = context, .limits = parent.limits, .files = &.{}, .owns_files = false, .schema_contract = parent.schema_contract, .identity_only = parent.identity_only };
             defer worker.deinit();
             try worker.loadFile(job.index);
             job.plan = worker.takeFilePlan();

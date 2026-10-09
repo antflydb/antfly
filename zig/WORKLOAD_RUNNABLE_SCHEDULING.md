@@ -270,3 +270,25 @@ reads are parked, and actual streaming, COUNT and repeated-alias SQL paths.
 This does not yet qualify statement capture/provider opening or split planning
 under the root execution, index/artifact readers, or the broad overload and
 durability/default-sizing gates. Those remain full-design requirements.
+
+
+### Lake split planning (under qualification)
+
+Ordered and associative split calls temporarily attach the coordinator's
+execution. Physical footer discovery uses the exact Store wait. Multi-file
+planners reserve children in that request family, use independent readers and
+version state, join the entire wave before admitting its plans, and retain the
+original cancellation/deadline. Registry exhaustion falls back to the existing
+coordinator without promoting the work to control capacity or a legacy pool.
+
+Returned scan cursors get independent Store wrappers containing their original
+lifetime evidence. They cannot retain the planning call's CPU receiver after the
+coordinator detaches. Denied final authority closes every returned child and its
+owned cursor array before reporting the failure. Native qualification covers
+one ordinary slot, actual footer child dispatch, full-registry fallback,
+cancellation/deadline after payload acquisition, ordered lazy ranges, control
+progress, and scanning after the planning execution finishes.
+
+Statement capture, object-provider initialization, index/artifact readers and
+actual row-group lookahead remain separate ownership qualification requirements,
+as do the full overload, durability and default-sizing proofs.
