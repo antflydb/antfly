@@ -529,7 +529,7 @@ test "SQL scoped streaming retirement notifies before activation failure and pre
 
 test "SQL scoped completion readiness retains child ownership until physical join" {
     const Fixture = struct {
-        fn work(a: A, _: *Runnable.Execution) !*usize {
+        fn work(a: A, _: *Runnable.Execution) anyerror!*usize {
             const value = try a.create(usize);
             value.* = 31;
             return value;
