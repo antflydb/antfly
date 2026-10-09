@@ -37,7 +37,8 @@ class InferenceModelsResponse:
         rerankers (InferenceModelsResponseRerankers): Available reranking models
         embedders (InferenceModelsResponseEmbedders): Available embedding models from models_dir/embedders/
         extractors (InferenceModelsResponseExtractors): Available extractor models (models with 'extraction' capability)
-        deciders (InferenceModelsResponseDeciders): Models declaring the decide task and typed_decisions capability
+        deciders (InferenceModelsResponseDeciders): Models declaring the decide task and either typed_decisions or
+            embedding_similarity capability
         generators (InferenceModelsResponseGenerators): Available generator/LLM models from models_dir/generators/
         rewriters (InferenceModelsResponseRewriters): Available Seq2Seq rewriter models from models_dir/rewriters/
         readers (InferenceModelsResponseReaders): Available reader/OCR models from models_dir/readers/

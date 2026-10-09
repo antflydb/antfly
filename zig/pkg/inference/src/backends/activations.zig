@@ -61,6 +61,130 @@ pub fn gelu(data: []f32) void {
     }
 }
 
+/// Split independent GELU lanes without changing SIMD groups or the scalar
+/// tail. Jobs borrow disjoint slices; every job is drained before return.
+pub fn geluParallelIo(io: std.Io, data: []f32) std.Io.Cancelable!void {
+    const Kernel = struct {
+        fn apply(values: []f32) void {
+            gelu(values);
+        }
+    };
+    return geluParallelWithKernel(Kernel, io, data);
+}
+
+fn geluParallelWithKernel(comptime Kernel: type, io: std.Io, data: []f32) std.Io.Cancelable!void {
+    try io.checkCancel();
+    const vectors = data.len / VEC_LEN;
+    const lanes = @min(vectors, 4);
+    if (lanes < 2) {
+        Kernel.apply(data);
+        try io.checkCancel();
+        return;
+    }
+    const Chunk = struct {
+        values: []f32,
+        fn run(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            Kernel.apply(self.values);
+        }
+    };
+    const pool = @import("inference_linalg").pool;
+    var chunks: [4]Chunk = undefined;
+    var jobs: [4]pool.Job = undefined;
+    for (0..lanes) |lane| {
+        const begin = (vectors * lane / lanes) * VEC_LEN;
+        const end = if (lane + 1 == lanes) data.len else (vectors * (lane + 1) / lanes) * VEC_LEN;
+        chunks[lane] = .{ .values = data[begin..end] };
+        jobs[lane] = .{ .fn_ptr = Chunk.run, .ctx = &chunks[lane] };
+    }
+    try pool.dispatchJobsIo(io, jobs[0..lanes]);
+    try io.checkCancel();
+}
+
+test "embeddinggemma2 CPU parallel GELU preserves SIMD groups tails and independent F64" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 0, 1, 7, 8, 9, 15, 16, 17, 37, 262143, 262144, 262149, 1048581 }) |count| {
+        const seed = try a.alloc(f32, count);
+        defer a.free(seed);
+        for (seed, 0..) |*value, index| {
+            value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 2049)) - 1024)) / 128;
+        }
+        if (count >= 17) {
+            seed[3] = std.math.inf(f32);
+            seed[4] = -std.math.inf(f32);
+            seed[8] = std.math.nan(f32);
+            seed[count - 1] = -0.0;
+        }
+        const serial = try a.dupe(f32, seed);
+        defer a.free(serial);
+        const parallel = try a.dupe(f32, seed);
+        defer a.free(parallel);
+        gelu(serial);
+        try geluParallelIo(std.testing.io, parallel);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(serial), std.mem.sliceAsBytes(parallel));
+        for (seed, parallel, 0..) |value, actual, index| {
+            if (index % 131 != 0 or !std.math.isFinite(value)) continue;
+            const x: f64 = value;
+            const expected = 0.5 * x * (1 + std.math.tanh(@sqrt(2.0 / std.math.pi) * (x + 0.044715 * x * x * x)));
+            try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), actual, 5e-6);
+        }
+    }
+}
+
+test "embeddinggemma2 CPU parallel GELU cancellation drains borrowed chunks and retries" {
+    const Lifecycle = struct {
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        started: std.atomic.Value(usize) = .init(0),
+        finished: std.atomic.Value(usize) = .init(0),
+    };
+    const BlockingKernel = struct {
+        var lifecycle: *Lifecycle = undefined;
+        fn apply(values: []f32) void {
+            if (lifecycle.started.fetchAdd(1, .acq_rel) + 1 == 4) lifecycle.entered.set(lifecycle.io);
+            lifecycle.release.waitUncancelable(lifecycle.io);
+            gelu(values);
+            _ = lifecycle.finished.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Case = struct {
+        fn run(io: std.Io, values: []f32) std.Io.Cancelable!void {
+            return geluParallelWithKernel(BlockingKernel, io, values);
+        }
+        fn release(lifecycle: *Lifecycle) void {
+            std.Io.sleep(lifecycle.io, .fromMilliseconds(20), .awake) catch unreachable;
+            lifecycle.release.set(lifecycle.io);
+        }
+    };
+    var runtime = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(4), .concurrent_limit = .limited(8) });
+    defer runtime.deinit();
+    const io = runtime.io();
+    var lifecycle = Lifecycle{ .io = io };
+    BlockingKernel.lifecycle = &lifecycle;
+    var values: [67]f32 = @splat(0.75);
+    var expected = values;
+    gelu(&expected);
+    var request = try io.concurrent(Case.run, .{ io, &values });
+    var pending = true;
+    defer if (pending) {
+        lifecycle.release.set(io);
+        _ = request.cancel(io) catch {};
+    };
+    lifecycle.entered.waitUncancelable(io);
+    var releaser = try io.concurrent(Case.release, .{&lifecycle});
+    defer releaser.await(io);
+    const result = request.cancel(io);
+    pending = false;
+    try std.testing.expectError(error.Canceled, result);
+    try std.testing.expectEqual(@as(usize, 4), lifecycle.finished.load(.acquire));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&values));
+    @memset(&values, 0.75);
+    try Case.run(io, &values);
+    try std.testing.expectEqual(@as(usize, 8), lifecycle.finished.load(.acquire));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&expected), std.mem.sliceAsBytes(&values));
+}
+
 /// Exact-erf GELU used by Hugging Face configs whose `hidden_act` is `gelu`.
 /// The erf approximation has a maximum absolute error around 1.5e-7 and is
 /// shared semantically with the device implementation.

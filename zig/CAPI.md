@@ -109,7 +109,7 @@ handlers:
 | `antfly_inference_generate_json` | `POST /generate` |
 | `antfly_inference_generate_batch_json` | `POST /generate/batch` |
 | `antfly_inference_rewrite_json` | `POST /rewrite` |
-| `antfly_inference_decide_json` | `POST /decide` |
+| `antfly_inference_decide_json` | `POST /decisions` |
 | `antfly_inference_extract_json` | `POST /extract` |
 | `antfly_inference_read_json` | `POST /read` (OCR) |
 | `antfly_inference_transcribe_json` | `POST /transcribe` |

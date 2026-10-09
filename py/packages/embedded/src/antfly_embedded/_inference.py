@@ -326,7 +326,7 @@ class Inference:
     def decide(self, request: JSONInput, *, raw: bool = False) -> Any:
         """Answer named choice, ordinal score, and Boolean questions.
 
-        Uses the same DecideRequest/DecideResponse JSON as POST /ai/v1/decide.
+        Uses the same DecideRequest/DecideResponse JSON as POST /ai/v1/decisions.
         """
         return self._json_call(self._lib.antfly_inference_decide_json, request, raw=raw)
 

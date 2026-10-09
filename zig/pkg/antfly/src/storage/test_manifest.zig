@@ -370,6 +370,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_lsm_backend_compaction_publication;
     _ = @import("antfly_local_sources").storage_lsm_backend_output_cleanup;
     _ = @import("antfly_local_sources").storage_lsm_backend_ledger_reclamation;
+    _ = @import("antfly_local_sources").storage_lsm_backend_local_reader;
     _ = @import("antfly_local_sources").storage_lsm_backend_memtable_reclamation;
     _ = @import("antfly_local_sources").storage_lsm_backend_compaction_scheduler;
     _ = @import("antfly_local_sources").storage_lsm_backend_mod;
@@ -389,6 +390,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_lsm_backend_state;
     _ = @import("antfly_local_sources").storage_lsm_backend_storage_io;
     _ = @import("antfly_local_sources").storage_lsm_backend_wal;
+    _ = @import("antfly_local_sources").storage_lsm_backend_write_batch_scratch;
     _ = @import("lsm_backend_sim_test.zig");
     _ = @import("lsm_vopr.zig");
     _ = @import("antfly_local_sources").storage_maintenance;

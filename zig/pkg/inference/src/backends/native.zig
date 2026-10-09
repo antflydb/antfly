@@ -22,6 +22,89 @@ pub fn useBlas() bool {
     return build_options.enable_system_blas or openblas.available();
 }
 
+/// Larger tiles amortize system BLAS dispatch on the wide embedding encoder.
+pub const SegmentAttentionGemm = struct {
+    pub const query_block = 128;
+    pub const key_block = 512;
+    pub const sgemmTransBSync = @import("native.zig").sgemmTransBSync;
+    pub const sgemmSync = @import("native.zig").sgemmSync;
+};
+
+/// Qualified wide tiles for EmbeddingGemma2's short sequences and global
+/// 512-dimensional heads. Long sliding layers retain SegmentAttentionGemm.
+pub fn EmbeddingGemma2SegmentAttentionGemm(comptime key_tile: usize) type {
+    return struct {
+        pub const query_block = 512;
+        pub const key_block = key_tile;
+        pub const sgemmTransBSync = @import("native.zig").sgemmTransBSync;
+        pub const sgemmSync = @import("native.zig").sgemmSync;
+    };
+}
+
+test "embeddinggemma2 rotary caching matches scalar positions partial geometry and pair layouts" {
+    const a = std.testing.allocator;
+    const positions = [_]usize{ 0, 1, 1, 512, 512, 0, 17, 8191, 1 };
+    for ([_][2]usize{ .{ 256, 256 }, .{ 512, 256 }, .{ 512, 512 }, .{ 514, 514 } }) |geometry| {
+        const head_dim = geometry[0];
+        const rope_dim = geometry[1];
+        const got = try a.alloc(f32, positions.len * head_dim);
+        defer a.free(got);
+        const want = try a.alloc(f32, got.len);
+        defer a.free(want);
+        for ([_]bool{ false, true }) |pairs| {
+            for (got, 0..) |*x, i| x.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 37)) - 18)) / 19;
+            @memcpy(want, got);
+            linalg.ropeCore(got, &positions, head_dim, rope_dim, 10000, 0.125, pairs);
+            for (positions, 0..) |position, row| for (0..rope_dim / 2) |j| {
+                const frequency = 1.0 / std.math.pow(f32, 10000, @as(f32, @floatFromInt(2 * j)) / @as(f32, @floatFromInt(rope_dim)));
+                const angle = @as(f32, @floatFromInt(position)) * 0.125 * frequency;
+                const left = row * head_dim + if (pairs) 2 * j else j;
+                const right = row * head_dim + if (pairs) 2 * j + 1 else j + head_dim / 2;
+                const x0 = want[left];
+                const x1 = want[right];
+                want[left] = x0 * @cos(angle) - x1 * @sin(angle);
+                want[right] = x0 * @sin(angle) + x1 * @cos(angle);
+            };
+            for (want, got) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-6);
+        }
+    }
+}
+
+test "embeddinggemma2 accelerated segment attention preserves wide heads masks and tile tails" {
+    const a = std.testing.allocator;
+    const queries = 131;
+    const keys = 529;
+    var ranges: [queries * 6]u32 = @splat(0);
+    var qpos: [queries]i32 = undefined;
+    var kpos: [keys]i32 = undefined;
+    for (&kpos, 0..) |*p, i| p.* = @intCast(i % 97);
+    for (&qpos, 0..) |*p, i| {
+        p.* = @intCast(i);
+        if (i > 0) ranges[i * 6 ..][0..6].* = if (i < 33) .{ 0, 100, 150, 180, 0, 0 } else .{ 180, keys, 0, 0, 0, 0 };
+    }
+    var prng = std.Random.DefaultPrng.init(773);
+    const random = prng.random();
+    for ([_]usize{ 256, 512 }) |d| {
+        const q = try a.alloc(f32, queries * d);
+        defer a.free(q);
+        const k = try a.alloc(f32, keys * d);
+        defer a.free(k);
+        const v = try a.alloc(f32, keys * d);
+        defer a.free(v);
+        for (q) |*x| x.* = random.floatNorm(f32);
+        for (k) |*x| x.* = random.floatNorm(f32);
+        for (v) |*x| x.* = random.floatNorm(f32);
+        for ([_]u32{ std.math.maxInt(u32), 12 }) |window| {
+            const want = try linalg.segmentAttentionHost(a, q, k, v, &ranges, &qpos, &kpos, window, queries, keys, 1, d);
+            defer a.free(want);
+            const got = try linalg.segmentAttentionHostWithGemm(SegmentAttentionGemm, a, q, k, v, &ranges, &qpos, &kpos, window, queries, keys, 1, d);
+            defer a.free(got);
+            for (want, got) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 2e-5);
+            for (got[0..d]) |x| try std.testing.expectEqual(@as(f32, 0), x);
+        }
+    }
+}
+
 // Optional system BLAS bindings. CBLAS enum values are stable across vecLib
 // and OpenBLAS; declaring the small surface we use avoids translate-c in
 // optimized builds.

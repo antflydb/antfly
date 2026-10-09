@@ -2034,6 +2034,22 @@
    }
   },
   {
+   "name": "termite_gliner_boundary_ffn_bias_add_layer_norm",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
+   "name": "termite_gliner_boundary_ffn_bias_gelu_exact",
+   "family": "gliner",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_gliner_gru_combine_f32",
    "family": "gliner",
    "generated": false,

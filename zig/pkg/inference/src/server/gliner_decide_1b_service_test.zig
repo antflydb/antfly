@@ -33,7 +33,7 @@ const c_file = @import("../util/c_file.zig");
 const memory = @import("../runtime/tier/memory.zig");
 const perf = @import("gliner_family_perf.zig");
 const extracting = @import("antfly_extracting");
-const decide = @import("../extractors/decide.zig");
+const decide = @import("antfly_decisions").legacy;
 const processor = @import("../pipelines/gliner_boundary_processor.zig");
 const schema_mod = @import("../pipelines/extraction_schema.zig");
 const classification_pipeline = @import("../pipelines/gliner_boundary_pipeline.zig");
@@ -216,10 +216,7 @@ fn linkedModel(a: Allocator, temporary: *std.testing.TmpDir, source: []const u8,
 }
 
 fn requestJson(a: Allocator, captured: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, a, captured, .{ .duplicate_field_behavior = .@"error" });
-    defer parsed.deinit();
-    try parsed.value.object.put(parsed.arena.allocator(), "model", .{ .string = "model" });
-    return std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    return @import("gliner_decision_fixture.zig").requestJson(a, captured, "model");
 }
 
 fn expectResponse(a: Allocator, bytes: []const u8, expected: std.json.Value) !void {
@@ -228,7 +225,7 @@ fn expectResponse(a: Allocator, bytes: []const u8, expected: std.json.Value) !vo
     try std.testing.expectEqualStrings("model", parsed.value.object.get("model").?.string);
     try expectJsonApprox(
         expected.object.get("answers") orelse return error.InvalidFamilyReference,
-        parsed.value.object.get("answers") orelse return error.InvalidFamilyReference,
+        (try @import("gliner_decision_fixture.zig").comparisonValue(parsed.arena.allocator(), parsed.value)).object.get("answers") orelse return error.InvalidFamilyReference,
         5e-4,
     );
 }
@@ -238,7 +235,7 @@ fn dispatch(a: Allocator, node: *Node, raw: []const u8) !httpx.Response {
 }
 
 fn dispatchWithIo(a: Allocator, io: std.Io, node: *Node, raw: []const u8) !httpx.Response {
-    var request = try httpx.Request.init(a, .POST, "/ai/v1/decide");
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/decisions");
     defer request.deinit();
     request.body = raw;
     var context = httpx.Context.init(a, io, &request);
@@ -1354,7 +1351,7 @@ fn productionBenchmark(a: Allocator, io: std.Io, comptime backend: BackendType, 
         defer a.free(request);
         var request_arena = std.heap.ArenaAllocator.init(a);
         defer request_arena.deinit();
-        const typed_request = try decide.parse(request_arena.allocator(), request);
+        const typed_request = (try @import("antfly_decisions").parse(request_arena.allocator(), request)).inner;
         var samples = [4]perf.SampleSet{ .init(), .init(), .init(), .init() };
         const Stage = @import("extraction_metrics.zig").Stage;
         var stage_start: [std.enums.values(Stage).len]u64 = undefined;

@@ -828,7 +828,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             defer result.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ command, catalogs });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ command, catalogs });
     // An immutable extraction directory replaces the per-unit physical guard.
     // Structural validation must recognize that head without accepting a
     // sibling producer's head or unguarded head absence.
@@ -840,7 +840,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
     var head_prepared = try prepare(alloc, selected_command, catalogs);
     defer head_prepared.deinit();
     try std.testing.expectEqualStrings(unit_key, head_prepared.chunk_fence.?.upstream_key.?);
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ selected_command, catalogs });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ selected_command, catalogs });
     const wrong_head = try extraction.headKeyAlloc(alloc, "doc", "other");
     defer alloc.free(wrong_head);
     selected_head.key = wrong_head;
@@ -1138,7 +1138,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             try std.testing.expectEqual(@as(usize, 2), page.units.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, PageAllocationCheck.run, .{metadata_session});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, PageAllocationCheck.run, .{metadata_session});
     const obsolete_id = "\x00obsolete\xff";
     const obsolete_manifest = try chunks.scopedKeyAlloc(alloc, "doc", "chunks", obsolete_id);
     defer alloc.free(obsolete_manifest);
@@ -1178,7 +1178,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             try std.testing.expectEqual(@as(usize, 1), page.units.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, RetirementAllocationCheck.run, .{metadata_session});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, RetirementAllocationCheck.run, .{metadata_session});
     var corrupt_inventory = manifest;
     corrupt_inventory[0] ^= 1;
     try txn.put(obsolete_manifest, &corrupt_inventory);
@@ -1226,7 +1226,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             _ = try page.verifyChildren(a, writer, "doc", "chunks");
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, VerificationAllocationCheck.run, .{ &first_page, &txn });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, VerificationAllocationCheck.run, .{ &first_page, &txn });
     // Borrow the page to isolate the stronger empty-output verification rule.
     // No deinit: first_page still owns these allocations.
     const nonempty_retirement: RetirementPage = .{ .arena = first_page.arena, .proof = first_page.proof, .head_key = first_page.head_key, .head_value = first_page.head_value, .head_position = first_page.head_position, .units = first_page.units, .after = .{ .generation = first_page.after.generation, .after_key = "" }, .visited = first_page.visited, .at_end = first_page.at_end };
@@ -1292,7 +1292,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             try std.testing.expectEqual(@as(usize, 1), selected.missing.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, DispatchAllocationCheck.run, .{ generation_session, dispatch_metadata.after });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, DispatchAllocationCheck.run, .{ generation_session, dispatch_metadata.after });
     const unit_jobs = @import("artifact_unit_jobs.zig");
     var first_admission = try unit_jobs.prepare(alloc, &txn, db.root_incarnation, &dispatch_start, .{});
     defer first_admission.deinit();
@@ -1375,7 +1375,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
                 try (try next_control.command()).validate(a);
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, ControlAllocationCheck.run, .{ &txn, db.root_incarnation, child_requirement, plan.plan() });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, ControlAllocationCheck.run, .{ &txn, db.root_incarnation, child_requirement, plan.plan() });
         var received = try progress.prepareCommand(alloc, &txn, db.root_incarnation, control, plan.plan());
         defer received.deinit();
         try std.testing.expectEqualDeep(first_progress.record, received.record);
@@ -1432,7 +1432,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
                 try std.testing.expect(action == .jobs);
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, ActionAllocationCheck.run, .{ &txn, db.root_incarnation, plan.plan() });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, ActionAllocationCheck.run, .{ &txn, db.root_incarnation, plan.plan() });
         // Invalidate the synthetic prefix before the subsequent integration
         // checks, which continue using actual acceptance evidence only.
         _ = try obligations.mark(alloc, &txn, authority, "doc", null);
@@ -1560,7 +1560,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             defer page.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, ProgressAllocationCheck.run, .{ db.root_incarnation, generation_session });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, ProgressAllocationCheck.run, .{ db.root_incarnation, generation_session });
     var page_count: usize = 0;
     var terminal_command: ?publication.Command = null;
     while (try progress.prepare(alloc, db.root_incarnation, generation_session, .{ .visits = 1 }, null)) |value| {
@@ -1656,7 +1656,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         };
         var parent_request = plan.plan().generated_templates[child_requirement.parent_template.?];
         parent_request.doc_key = "doc";
-        try std.testing.checkAllAllocationFailures(alloc, ExtractionAllocationCheck.run, .{ &reopened, db.root_incarnation, parent_request, plan.plan() });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, ExtractionAllocationCheck.run, .{ &reopened, db.root_incarnation, parent_request, plan.plan() });
     }
     // A new child scope behind the terminal cursor invalidates the old closure
     // through the same physical mutation hook as normal generated writes.
@@ -1831,7 +1831,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
                 try std.testing.expectEqual(@as(usize, 1), page.items.len);
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, WorkAllocationCheck.run, .{ &snapshot, wake_admission.selected });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, WorkAllocationCheck.run, .{ &snapshot, wake_admission.selected });
         const TurnAllocationCheck = struct {
             fn run(a: std.mem.Allocator, reader: @TypeOf(&snapshot), root: u128, selected_scope: unit_jobs.Scope) !void {
                 var turn = try unit_jobs.prepareTurn(a, reader, root, selected_scope, .{ .visits = 1 });
@@ -1839,7 +1839,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
                 try std.testing.expectEqual(@as(usize, 1), turn.page.items.len);
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, TurnAllocationCheck.run, .{ &snapshot, db.root_incarnation, wake_admission.selected });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, TurnAllocationCheck.run, .{ &snapshot, db.root_incarnation, wake_admission.selected });
         var retirement_plan = try db.core.index_manager.acquireWritePlanSnapshot();
         defer retirement_plan.release();
         // Current jobs without accepted results retain their slots, regardless
@@ -1862,7 +1862,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
                 try std.testing.expectEqual(.obsolete, prepared_job_retirement.resolution.kind);
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, JobRetirementAllocationCheck.run, .{ &snapshot, db.root_incarnation, missing_admission.jobs[0].key, retirement_plan.plan() });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, JobRetirementAllocationCheck.run, .{ &snapshot, db.root_incarnation, missing_admission.jobs[0].key, retirement_plan.plan() });
         var obsolete_job = (try job_retirements.prepare(alloc, missing_admission.jobs[0].key)).?;
         defer obsolete_job.deinit();
         try std.testing.expectEqual(.obsolete, obsolete_job.resolution.kind);

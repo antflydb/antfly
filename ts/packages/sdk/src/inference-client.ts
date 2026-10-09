@@ -464,7 +464,7 @@ export class InferenceClient {
 
   /** Answer named typed questions about one state. */
   async decide(request: DecideRequest): Promise<DecideResponse> {
-    const { data, error, response } = await this.client.POST("/ai/v1/decide", {
+    const { data, error, response } = await this.client.POST("/ai/v1/decisions", {
       body: request,
     });
     if (!response.ok) throw inferenceAPIError(response.status, error);

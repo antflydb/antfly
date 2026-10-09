@@ -81,6 +81,7 @@ pub const FriendlyAlias = struct {
 
 pub const bge_m3_pinned_revision = "84790c1a606f60d06c6932e4ecdd174b466d84ac";
 pub const bge_m3_pinned_ref = "BAAI/bge-m3:safetensors@" ++ bge_m3_pinned_revision;
+pub const embeddinggemma2_pinned_ref = "google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b";
 
 pub const friendly_aliases = [_]FriendlyAlias{
     .{ .alias = "bge-m3", .ref = "BAAI/bge-m3" },
@@ -1343,8 +1344,8 @@ fn appendManifestTasks(
         .chunker => try appendUniqueOwnedString(allocator, tasks, "chunk"),
         .reranker => try appendUniqueOwnedString(allocator, tasks, "rerank"),
         .generator => try appendUniqueOwnedString(allocator, tasks, "generate"),
-        .extractor => try appendUniqueOwnedString(allocator, tasks, "extract"),
-        .classifier => try appendUniqueOwnedString(allocator, tasks, "classify"),
+        .extractor => if (!manifest.laya_declared) try appendUniqueOwnedString(allocator, tasks, "extract"),
+        .classifier => if (!manifest.laya_declared) try appendUniqueOwnedString(allocator, tasks, "classify"),
         .rewriter => try appendUniqueOwnedString(allocator, tasks, "rewrite"),
         .reader => try appendUniqueOwnedString(allocator, tasks, "read"),
         .transcriber => try appendUniqueOwnedString(allocator, tasks, "transcribe"),

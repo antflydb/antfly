@@ -1354,7 +1354,7 @@ test "SQL decisions pull streaming batches predicates before offset and projecti
             self.calls += requests.len;
             self.max_batch = @max(self.max_batch, requests.len);
             const values = try a.alloc(Json, requests.len);
-            for (values) |*value| value.* = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"mock\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}", .{});
+            for (values) |*value| value.* = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"mock\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":0.9}],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}", .{});
             return values;
         }
     };
@@ -1388,7 +1388,7 @@ test "SQL decision streams validate nested specifications before opening reads" 
         var backend = fixture.backend();
         backend.decision_provider = mock.provider();
         const parameters: []const Json = if (i == 0) &.{} else &.{.{ .object = .empty }};
-        try std.testing.expectError(error.DecisionLimitExceeded, Stream.open(a, backend, &compiled, parameters, .{}));
+        try std.testing.expectError(error.InvalidDecisionSpecification, Stream.open(a, backend, &compiled, parameters, .{}));
         try std.testing.expectEqual(@as(usize, 0), fixture.opened);
         try std.testing.expectEqual(@as(usize, 0), mock.calls);
     }
