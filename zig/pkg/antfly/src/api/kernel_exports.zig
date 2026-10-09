@@ -1373,7 +1373,7 @@ test "API kernel create keeps SQL lanes owner-produced through saturation and sh
         fn blocked(io: std.Io, gate: *std.Io.Event) void {
             gate.wait(io) catch {};
         }
-        fn probe(io: std.Io) !void {
+        fn probe(io: std.Io) anyerror!void {
             try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, "/antfly-kernel-sql-lane-missing", .{}));
         }
     };
@@ -1426,17 +1426,17 @@ test "API kernel create keeps SQL lanes owner-produced through saturation and sh
     try std.testing.expectEqual(@as(usize, 25), runtime.ptr().laneStats().reserved_workers);
     var foreground_gate: std.Io.Event = .unset;
     var cleanup_gate: std.Io.Event = .unset;
-    var foreground_jobs: std.Io.Group = .{};
+    var foreground_jobs: std.Io.Group = .init;
     var foreground_open = true;
     defer if (foreground_open) {
         foreground_gate.set(std.testing.io);
-        foreground_jobs.wait(foreground);
+        foreground_jobs.await(foreground) catch {};
     };
-    var cleanup_jobs: std.Io.Group = .{};
+    var cleanup_jobs: std.Io.Group = .init;
     var cleanup_open = true;
     defer if (cleanup_open) {
         cleanup_gate.set(std.testing.io);
-        cleanup_jobs.wait(cleanup_io);
+        cleanup_jobs.await(cleanup_io) catch {};
     };
     for (0..state.server.sql_workers.?.capacity) |_| try foreground_jobs.concurrent(foreground, Stub.blocked, .{ foreground, &foreground_gate });
     for (0..state.server.sql_cleanup_workers.?.capacity) |_| try cleanup_jobs.concurrent(cleanup_io, Stub.blocked, .{ cleanup_io, &cleanup_gate });
@@ -1445,10 +1445,10 @@ test "API kernel create keeps SQL lanes owner-produced through saturation and sh
     var control_job = try control.concurrent(Stub.probe, .{control});
     try control_job.await(control);
     foreground_gate.set(std.testing.io);
-    foreground_jobs.wait(foreground);
+    foreground_jobs.await(foreground) catch {};
     foreground_open = false;
     cleanup_gate.set(std.testing.io);
-    cleanup_jobs.wait(cleanup_io);
+    cleanup_jobs.await(cleanup_io) catch {};
     cleanup_open = false;
     destroy(handle.?);
     handle = null;

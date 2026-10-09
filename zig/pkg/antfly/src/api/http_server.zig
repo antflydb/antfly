@@ -21937,10 +21937,8 @@ pub const ApiHttpServer = struct {
         return self.handleAdmittedPublicTableQueryWithDelivery(table_name, body, content_type, borrowed_identity, cancellation, null);
     }
 
-    pub fn admitPublicQueryRunnable(self: *ApiHttpServer, execution: *RunnableScheduler.Execution, table_name: []const u8, body: []const u8, cancellation: ?*const http_common.RequestCancellation) !?contextual_operations.OwnedResponse {
-        const body_deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
-        const deadline = originalQueryDeadline(body_deadline, cancellation);
-        execution.start(self.runnableScheduler(), .{
+    fn startPublicQueryRunnable(self: *ApiHttpServer, execution: *RunnableScheduler.Execution, table_name: []const u8, body: []const u8, cancellation: ?*const http_common.RequestCancellation, deadline: ?u64) !void {
+        try execution.start(self.runnableScheduler(), .{
             .io = self.sharedApiIo() orelse self.embedding_provider_runtime.io,
             .native_now_ns = platform_time.monotonicNs,
             .deadline_ns = deadline,
@@ -21950,7 +21948,14 @@ pub const ApiHttpServer = struct {
                 }
             }.requested } else null,
             .retained_bytes = @as(u64, body.len) +| table_name.len +| 1024,
-        }, .query) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
+        }, .query);
+    }
+
+    pub fn admitPublicQueryRunnable(self: *ApiHttpServer, execution: *RunnableScheduler.Execution, table_name: []const u8, body: []const u8, cancellation: ?*const http_common.RequestCancellation) !?contextual_operations.OwnedResponse {
+        const body_deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return try self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
+        const deadline = originalQueryDeadline(body_deadline, cancellation);
+        self.startPublicQueryRunnable(execution, table_name, body, cancellation, deadline) catch |err|
+            return try self.publicQueryOperationErrorResponse(table_name, body, err);
         return null;
     }
 
@@ -22421,6 +22426,15 @@ pub const ApiHttpServer = struct {
         response_label: ?[]const u8,
         bound_join: ?*const distributed_join.ParsedSupportedJoinRequest,
     ) !contextual_operations.OwnedResponse {
+        // One ingress capsule retains the complete input and original request
+        // authority across every sequential line and its physical child joins.
+        const request_deadline = originalQueryDeadline(null, cancellation);
+        var execution: RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        self.startPublicQueryRunnable(&execution, route_table_name orelse "", body, cancellation, request_deadline) catch |err|
+            return self.publicQueryOperationErrorResponse(route_table_name orelse "", body, err);
+        var read: @import("runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = self.alloc };
+        var team: ?@import("antfly_runtime_abi").runnable_abi.Team = if (execution.entry != null) try read.team() else null;
         var diagnostic_context: query_request_diagnostics.Context = .{};
         const diagnostic_scope = query_request_diagnostics.Scope.init(&diagnostic_context);
         defer diagnostic_scope.deinit();
@@ -22428,7 +22442,7 @@ pub const ApiHttpServer = struct {
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
-        var catalog_resolver = CatalogQueryResolver{ .arena = arena };
+        var catalog_resolver = CatalogQueryResolver{ .arena = arena, .execution_team = if (team) |*value| value else null };
 
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
@@ -22438,6 +22452,7 @@ pub const ApiHttpServer = struct {
 
         var lines = std.mem.splitScalar(u8, body, '\n');
         while (lines.next()) |raw_line| {
+            execution.checkpoint() catch |err| return self.publicQueryOperationErrorResponse(route_table_name orelse "", raw_line, err);
             if (cancellation) |value| {
                 if (value.isCancelled()) {
                     return try self.publicQueryOperationErrorResponse(
@@ -22464,8 +22479,8 @@ pub const ApiHttpServer = struct {
             var line_identity = try cloneCatalogIdentity(self.alloc, authenticated_identity);
             defer if (line_identity) |*identity| identity.deinit(self.alloc);
             const body_deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, line) catch return self.publicQueryOperationErrorResponse(logical_table_name, line, error.InvalidQueryRequest);
-            const deadline = originalQueryDeadline(body_deadline, cancellation);
-            var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, logical_table_name, line, &line_identity, &catalog_resolver) catch |err| return self.publicQueryOperationErrorResponse(logical_table_name, line, err);
+            const deadline = if (request_deadline) |original| @min(original, body_deadline orelse original) else body_deadline;
+            var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none, .execution_team = catalog_resolver.execution_team }, logical_table_name, line, &line_identity, &catalog_resolver) catch |err| return self.publicQueryOperationErrorResponse(logical_table_name, line, err);
             defer binding.deinit();
             const table_name = binding.physical;
 
@@ -43787,6 +43802,7 @@ test "global multi-query rechecks live permission before each table result" {
     };
     const Observer = struct {
         manager: *usermgr.UserManager,
+        server: ?*ApiHttpServer = null,
         event_count: usize = 0,
         revoked: bool = false,
 
@@ -43797,6 +43813,7 @@ test "global multi-query rechecks live permission before each table result" {
         fn reach(ptr: *anyopaque, event: QueryResultLifecycleEvent) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.event_count += 1;
+            try std.testing.expectEqual(@as(usize, 1), self.server.?.runnable_scheduler.?.stats().operations);
             if (!self.revoked and
                 std.mem.eql(u8, event.operation_id, "public.global.multi_query") and
                 std.mem.eql(u8, event.table_name, "docs"))
@@ -43823,10 +43840,12 @@ test "global multi-query rechecks live permission before each table result" {
     var observer = Observer{ .manager = &auth.manager };
     var server = ApiHttpServer.init(alloc, .{
         .auth_enabled = true,
+        .runnable_policy = .{ .slots = 2 },
         .user_manager = &auth.manager,
         .query_result_lifecycle_hook = observer.hook(),
     }, FakeSource.iface(), reads.source(), null);
     defer server.deinit();
+    observer.server = &server;
     const authorization = try encodeBasicAuthorization(alloc, "reader", "secret");
     defer alloc.free(authorization);
     const body =
@@ -43843,6 +43862,7 @@ test "global multi-query rechecks live permission before each table result" {
     try std.testing.expectEqualStrings("{\"error\":\"forbidden\"}", denied.body);
     try std.testing.expectEqual(@as(usize, 1), reads.query_count);
     try std.testing.expectEqual(@as(usize, 1), observer.event_count);
+    try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
 
     var restored = try usermgr.Permission.initOwned(alloc, .table, "tenant_b_docs", .read);
     defer restored.deinit(alloc);
@@ -43947,7 +43967,7 @@ test "api http server maps cancelled NDJSON multi-query to client closed respons
         }
     };
 
-    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), null, null);
+    var server = ApiHttpServer.init(alloc, .{ .runnable_policy = .{ .slots = 2 } }, FakeSource.iface(), null, null);
     defer server.deinit();
     var cancellation = http_common.RequestCancellation{};
     cancellation.cancel();
@@ -43963,6 +43983,19 @@ test "api http server maps cancelled NDJSON multi-query to client closed respons
 
     try std.testing.expectEqual(@as(u16, 499), resp.status);
     try std.testing.expectEqualStrings("client closed request", resp.body);
+    try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
+    const expired: http_common.RequestCancellation = .{ .execution_deadline_ns = platform_time.monotonicNs() -| 1 };
+    var timed_out = try server.handlePublicTableQueryWithContentTypeCancellation(
+        "docs",
+        "{\"query\":{\"match_all\":{}}}\n",
+        "application/x-ndjson",
+        null,
+        &expired,
+    );
+    defer timed_out.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 504), timed_out.status);
+    try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), server.runnable_scheduler.?.stats().retained_bytes);
 }
 
 test "api http server retries transient query EndOfStream before returning 500" {
@@ -57441,6 +57474,8 @@ test "system catalog plain retries and joined graph reads reuse request identity
 test "system catalog NDJSON reuses one query definition without administrative snapshots" {
     const alloc = std.testing.allocator;
     const Fake = struct {
+        server: ?*ApiHttpServer = null,
+        owner_context: ?*anyopaque = null,
         bindings: usize = 0,
         queries: usize = 0,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
@@ -57449,9 +57484,13 @@ test "system catalog NDJSON reuses one query definition without administrative s
         fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
             return error.UnexpectedAdministrativeSnapshot;
         }
-        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, _: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: api_operation.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.bindings += 1;
+            const team = context.execution_team orelse return error.TestMissingReadCapability;
+            try team.borrow.checkLifetime();
+            self.owner_context = team.borrow.context;
+            try std.testing.expectEqual(@as(usize, 1), self.server.?.runnable_scheduler.?.stats().operations);
             try std.testing.expect(input == .resolve_many);
             try std.testing.expect(input.resolve_many.include_query_definitions);
             const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "table:docs", .query_definition = .{ .schema_json = "{}", .read_schema_json = "", .indexes_json = "{}" } }};
@@ -57466,20 +57505,30 @@ test "system catalog NDJSON reuses one query definition without administrative s
         fn query(ptr: *anyopaque, a: std.mem.Allocator, table: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.queries += 1;
+            const stats = self.server.?.runnable_scheduler.?.stats();
+            try std.testing.expectEqual(@as(usize, 1), stats.operations);
+            try std.testing.expectEqual(@as(usize, 1), stats.runnable_slots);
+            try std.testing.expect(stats.retained_bytes >= 1024);
+            try std.testing.expect(self.owner_context != null);
             try std.testing.expectEqualStrings("table:docs", table);
             return .{ .json = try a.dupe(u8, "{\"responses\":[{\"hits\":{\"hits\":[]}}]}") };
         }
     };
     var fake = Fake{};
     const reads: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } };
-    var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .system_catalog = Fake.catalog, .supports_query_definitions = true } }, reads, null);
+    var server = ApiHttpServer.init(alloc, .{ .runnable_policy = .{ .slots = 2, .checkpoint_budget = 1 } }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .system_catalog = Fake.catalog, .supports_query_definitions = true } }, reads, null);
     defer server.deinit();
+    fake.server = &server;
     const line = "{\"table\":\"docs\",\"full_text_search\":{\"match_all\":{}}}\n";
     var response = try server.handlePublicGlobalMultiQuery(z17RepeatString(line, 20), null);
     defer response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), response.status);
     try std.testing.expectEqual(@as(usize, 20), fake.queries);
     try std.testing.expectEqual(@as(usize, 1), fake.bindings);
+    const stats = server.runnable_scheduler.?.stats();
+    try std.testing.expectEqual(@as(usize, 0), stats.operations);
+    try std.testing.expectEqual(@as(u64, 0), stats.retained_bytes);
+    try std.testing.expect(stats.yields >= 20);
 }
 
 test "system catalog table listing never joins stale topology with current bindings" {
@@ -58023,6 +58072,10 @@ test "workload deadline survives NDJSON lines and MCP dispatch" {
 
     const FakeReads = struct {
         expected_deadline_ns: u64,
+        server: ?*ApiHttpServer = null,
+        ndjson: bool = true,
+        query_count: usize = 0,
+        mutable_cancellation: ?*http_common.RequestCancellation = null,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
@@ -58069,20 +58122,33 @@ test "workload deadline survives NDJSON lines and MCP dispatch" {
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
             try std.testing.expectEqual(self.expected_deadline_ns, req.execution_deadline_ns.?);
+            if (self.ndjson) {
+                try std.testing.expectEqual(@as(usize, 1), self.server.?.runnable_scheduler.?.stats().operations);
+            }
+            self.query_count += 1;
+            // A later callback must not renew the ingress budget for the next
+            // line, even if the borrowed transport record changes.
+            if (self.mutable_cancellation) |token| token.execution_deadline_ns = self.expected_deadline_ns + 100 * std.time.ns_per_s;
             return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":[],\"total\":0}]}") };
         }
     };
 
     var reads = FakeReads{ .expected_deadline_ns = outer_deadline_ns };
-    var server = ApiHttpServer.init(alloc, .{}, FakeSource.iface(), reads.source(), null);
+    var server = ApiHttpServer.init(alloc, .{ .runnable_policy = .{ .slots = 2, .checkpoint_budget = 1 } }, FakeSource.iface(), reads.source(), null);
     defer server.deinit();
+    reads.server = &server;
     const body = "{\"query\":{\"match_all\":{}},\"timeout_ms\":999999}";
-    const cancellation: http_common.RequestCancellation = .{ .execution_deadline_ns = outer_deadline_ns };
+    var cancellation: http_common.RequestCancellation = .{ .execution_deadline_ns = outer_deadline_ns };
+    reads.mutable_cancellation = &cancellation;
     const lines = try std.fmt.allocPrint(alloc, "{s}\n{s}", .{ body, body });
     defer alloc.free(lines);
     var multi = try server.handlePublicTableQueryWithContentTypeCancellation("docs", lines, "application/x-ndjson", null, &cancellation);
     defer multi.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), multi.status);
+    try std.testing.expectEqual(@as(usize, 2), reads.query_count);
+    try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
+    reads.ndjson = false;
+    reads.mutable_cancellation = null;
     var mcp_response = try server.executeMcpApplicationOperationWithContext(.{ .query = .{ .table_name = "docs", .body = body } }, null, .{ .deadline_ns = outer_deadline_ns });
     defer mcp_response.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), mcp_response.status);

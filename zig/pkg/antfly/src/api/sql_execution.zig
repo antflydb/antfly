@@ -829,17 +829,17 @@ pub const Adapter = struct {
             const runtime = @import("antfly_runtime_abi");
             fn currentClass(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
                 const adapter: *Adapter = @ptrCast(@alignCast(raw));
-                const execution = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
-                out.* = @intCast(@backingInt(execution.retainedClass() catch |err| return runtime.error_abi.statusFromError(err)));
+                const active_execution = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                out.* = @intCast(@backingInt(active_execution.retainedClass() catch |err| return runtime.error_abi.statusFromError(err)));
                 return .ok;
             }
             fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
                 const adapter: *Adapter = @ptrCast(@alignCast(raw));
-                const execution = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
-                execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+                const active_execution = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                active_execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
                 // Activated cleanup has its own finite fence. Polling the
                 // expired foreground context must not cancel that obligation.
-                if (!execution.entry.?.cleanup_active) adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
+                if (!active_execution.entry.?.cleanup_active) adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
                 return .ok;
             }
             fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {

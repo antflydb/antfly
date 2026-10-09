@@ -117,6 +117,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lake_text_retirement_run.addArg("--require-no-skips");
     b.step("antfly-lake-text-retirement-test", "Verify real packed text IO and physical speculative joins with independent control progress")
         .dependOn(&lake_text_retirement_run.step);
+    const ndjson_read_owner_tests = b.addTest(.{
+        .name = "ndjson-read-owner-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &.{
+            "system catalog NDJSON reuses one query definition without administrative snapshots",
+            "global multi-query rechecks live permission before each table result",
+            "workload deadline survives NDJSON lines and MCP dispatch",
+            "api http server maps cancelled NDJSON multi-query to client closed response",
+        },
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const ndjson_read_owner_run = b.addRunArtifact(ndjson_read_owner_tests);
+    ndjson_read_owner_run.addArg("--require-no-skips");
+    b.step("antfly-ndjson-read-owner-test", "Verify one NDJSON execution owner preserves catalog, permission and original deadline semantics")
+        .dependOn(&ndjson_read_owner_run.step);
     const physical_metadata_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/physical_resource_metadata_test_root.zig"),
         .target = target,
