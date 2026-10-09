@@ -1076,3 +1076,46 @@ test "text statistics trusted controls shared async point pipeline retires stopp
         }
     }
 }
+
+test "text statistics trusted controls native snapshot batch planning retains original authority" {
+    const Budget = struct {
+        execution: *native.Execution,
+        canceled: *std.atomic.Value(bool),
+        stop_at: usize,
+        calls: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls == self.stop_at) self.canceled.store(true, .release);
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const admission = sources.common_read_admission;
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        // Stop during preparation, shared followers, and consumption; later
+        // ordinals also exercise buffers already owned by completed futures.
+        for ([_]usize{ 0, 1, 8, 24, 48, 96 }) |stop_at| {
+            var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+            defer scheduler.close();
+            var canceled = std.atomic.Value(bool).init(false);
+            var parent: native.Execution = .{};
+            defer parent.finish();
+            const deadline = clock.monotonicNs() + 30 * std.time.ns_per_s;
+            try parent.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+            var budget = Budget{ .execution = &parent, .canceled = &canceled, .stop_at = stop_at };
+            var adapter = admission.Adapter(*Budget){ .budget = &budget };
+            const payload = adapter.payload();
+            const result = sources.storage_lsm_backend_runtime.qualifyControlledNativeReadBatch(admission.Port.init(&payload), phase == .inference);
+            if (stop_at != 0 and budget.calls >= stop_at) {
+                try std.testing.expectError(error.Canceled, result);
+            } else try result;
+            try std.testing.expectEqual(phase, parent.entry.?.class);
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+            parent.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        }
+    }
+}

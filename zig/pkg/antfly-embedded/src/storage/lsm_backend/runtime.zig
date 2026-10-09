@@ -2795,14 +2795,16 @@ fn readManySortedPointFromSnapshot(
     keys: []const []const u8,
     values: []?[]const u8,
     backend_locked: bool,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     // Legacy/non-directory readers still charge transient index metadata.
     const resources = @import("../resource_manager.zig");
     var budget: ?resources.BudgetedAllocator = if (backend.options.resource_manager) |manager| resources.BudgetedAllocator.init(manager, .lsm_in_memory_state, runtimeScratchAllocator(allocator), 1) else null;
     defer if (budget) |*admitted| admitted.deinit();
     if (budget) |*admitted| admitted.credit_quantum = 4096;
     const scratch = if (budget) |*admitted| admitted.allocator() else runtimeScratchAllocator(allocator);
-    return readManySortedPointFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch) catch |err| {
+    return readManySortedPointFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch, control) catch |err| {
         if (budget) |*admitted| if (admitted.denied()) return error.ResourceBudgetExceeded;
         return err;
     };
@@ -2823,9 +2825,11 @@ fn readManySortedPointFromSnapshotWithScratch(
     values: []?[]const u8,
     backend_locked: bool,
     scratch: Allocator,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     @memset(values, null);
-    if (try readManySortedPointFromSnapshotAsync(
+    if (try readManySortedPointFromSnapshotAsyncWithAdmission(
         backend,
         mutable,
         immutable_memtables,
@@ -2839,12 +2843,13 @@ fn readManySortedPointFromSnapshotWithScratch(
         values,
         backend_locked,
         PointResultLifetime.forBlockPins(held_blocks),
+        control,
     )) |result| return result;
 
     var local_held_blocks = std.ArrayListUnmanaged(BlockPin).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
-    var batch_indexes = RunBatchIndexHandles{ .allocator = scratch };
+    var batch_indexes = RunBatchIndexHandles{ .allocator = scratch, .control = control };
     defer batch_indexes.deinit();
 
     var result: BatchCursorReadResult = .{};
@@ -2852,6 +2857,7 @@ fn readManySortedPointFromSnapshotWithScratch(
     var read_hint: ?BorrowedReadHint = null;
     backend.recordPointGets(keys.len);
     for (keys, 0..) |key, i| {
+        if (control) |budget| try budget.checkpoint();
         const first_owned = held_values.items.len;
         const value = getFromSnapshotRuns(
             backend,
@@ -2884,6 +2890,7 @@ fn readManySortedPointFromSnapshotWithScratch(
 }
 
 const RunBatchIndexState = struct {
+    control: ?read_admission.Port = null,
     run_index: usize,
     handle: cache_mod.Handle,
     block_index: ?usize = null,
@@ -2918,6 +2925,7 @@ const RunBatchIndexState = struct {
 };
 
 const RunBatchIndexHandles = struct {
+    control: ?read_admission.Port = null,
     allocator: Allocator,
     items: std.ArrayListUnmanaged(RunBatchIndexState) = .empty,
     by_run: std.AutoHashMapUnmanaged(usize, usize) = .empty,
@@ -2934,13 +2942,14 @@ const RunBatchIndexHandles = struct {
     }
 
     fn state(self: *@This(), backend: anytype, run: *Run, run_index: usize) !*RunBatchIndexState {
+        if (self.control) |budget| try budget.checkpoint();
         if (self.by_run.get(run_index)) |i| return &self.items.items[i];
         try self.items.ensureUnusedCapacity(self.allocator, 1);
         try self.by_run.ensureUnusedCapacity(self.allocator, 1);
-        var handle = try loadRunTableIndexHandle(backend, run);
+        var handle = try loadRunTableIndexHandleWithAdmission(backend, run, self.control);
         errdefer handle.release();
         const i = self.items.items.len;
-        self.items.appendAssumeCapacity(.{ .run_index = run_index, .handle = handle });
+        self.items.appendAssumeCapacity(.{ .run_index = run_index, .handle = handle, .control = self.control });
         self.by_run.putAssumeCapacityNoClobber(run_index, i);
         return &self.items.items[i];
     }
@@ -2964,14 +2973,16 @@ fn readManySortedByRunFromSnapshot(
     keys: []const []const u8,
     values: []?[]const u8,
     backend_locked: bool,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     // Legacy/non-directory readers still charge transient index metadata.
     const resources = @import("../resource_manager.zig");
     var budget: ?resources.BudgetedAllocator = if (backend.options.resource_manager) |manager| resources.BudgetedAllocator.init(manager, .lsm_in_memory_state, runtimeScratchAllocator(allocator), 1) else null;
     defer if (budget) |*admitted| admitted.deinit();
     if (budget) |*admitted| admitted.credit_quantum = 4096;
     const scratch = if (budget) |*admitted| admitted.allocator() else runtimeScratchAllocator(allocator);
-    return readManySortedByRunFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch) catch |err| {
+    return readManySortedByRunFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, l0_groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch, control) catch |err| {
         if (budget) |*admitted| if (admitted.denied()) return error.ResourceBudgetExceeded;
         return err;
     };
@@ -2992,13 +3003,15 @@ fn readManySortedByRunFromSnapshotWithScratch(
     values: []?[]const u8,
     backend_locked: bool,
     scratch: Allocator,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     @memset(values, null);
     var local_held_blocks = std.ArrayListUnmanaged(BlockPin).empty;
     defer if (held_blocks == null) releaseHeldBlocks(&local_held_blocks, backend.allocator);
     const block_handles = held_blocks orelse &local_held_blocks;
 
-    var batch_indexes = RunBatchIndexHandles{ .allocator = scratch };
+    var batch_indexes = RunBatchIndexHandles{ .allocator = scratch, .control = control };
     defer batch_indexes.deinit();
 
     var result: BatchCursorReadResult = .{};
@@ -3006,6 +3019,7 @@ fn readManySortedByRunFromSnapshotWithScratch(
     var read_hint: ?BorrowedReadHint = null;
     backend.recordPointGets(keys.len);
     for (keys, 0..) |key, i| {
+        if (control) |budget| try budget.checkpoint();
         const first_owned = held_values.items.len;
         const value = getFromSnapshotRuns(
             backend,
@@ -3671,7 +3685,7 @@ fn readManySortedCurrentWithLayoutLocked(
             _ = lockBackend(BackendType, backend);
         };
         if (builtin.is_test) if (test_current_point_unlocked_hook) |hook| try hook(backend);
-        return readManySortedDirectoryBatch(backend, layout.mutable_snapshot.?.state, layout.immutable_memtables, directory, allocator, held_blocks, held_values, namespace, keys, values, false, false, null, allocator);
+        return readManySortedDirectoryBatch(backend, layout.mutable_snapshot.?.state, layout.immutable_memtables, directory, allocator, held_blocks, held_values, namespace, keys, values, false, false, null, allocator, null);
     }
 
     switch (chooseMultiGetPlan(keys, .stable_probe)) {
@@ -3690,6 +3704,7 @@ fn readManySortedCurrentWithLayoutLocked(
             keys,
             values,
             true,
+            null,
         ),
         .point => return try readManySortedPointFromSnapshot(
             backend,
@@ -3705,6 +3720,7 @@ fn readManySortedCurrentWithLayoutLocked(
             keys,
             values,
             true,
+            null,
         ),
     }
 
@@ -3771,7 +3787,20 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 const p = self.parent;
                 p.backend.recordGetManySorted(keys.len);
                 p.backend.recordGetManySortedLocality(keys);
-                const result = try readManySortedFromReadView(p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, self.allocator, &self.held_blocks, &self.held_values, p.namespace, keys, values, &self.planning_scratch, self.allocator);
+                const result = try readManySortedFromReadView(p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, self.allocator, &self.held_blocks, &self.held_values, p.namespace, keys, values, &self.planning_scratch, self.allocator, null);
+                p.backend.recordGetManySortedResults(result.hits, result.misses);
+            }
+
+            pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+                if (keys.len != values.len) return error.InvalidBatch;
+                @memset(values, null);
+                errdefer @memset(values, null);
+                try control.checkpoint();
+                const p = self.parent;
+                p.backend.recordGetManySorted(keys.len);
+                p.backend.recordGetManySortedLocality(keys);
+                const result = try readManySortedFromReadView(p.backend, p.mutable_snapshot, p.immutable_memtables, p.read_view, self.allocator, &self.held_blocks, &self.held_values, p.namespace, keys, values, &self.planning_scratch, self.allocator, control);
+                try control.checkpoint();
                 p.backend.recordGetManySortedResults(result.hits, result.misses);
             }
 
@@ -3913,7 +3942,20 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
             @memset(values, null);
             self.backend.recordGetManySorted(keys.len);
             self.backend.recordGetManySortedLocality(keys);
-            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys, values, &self.planning_scratch, self.metadata_allocator);
+            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys, values, &self.planning_scratch, self.metadata_allocator, null);
+            self.backend.recordGetManySortedResults(result.hits, result.misses);
+        }
+
+        pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+            if (keys.len != values.len) return error.InvalidBatch;
+            @memset(values, null);
+            errdefer @memset(values, null);
+            try control.checkpoint();
+
+            self.backend.recordGetManySorted(keys.len);
+            self.backend.recordGetManySortedLocality(keys);
+            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys, values, &self.planning_scratch, self.metadata_allocator, control);
+            try control.checkpoint();
             self.backend.recordGetManySortedResults(result.hits, result.misses);
         }
 
@@ -4256,7 +4298,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     recordMultiGetPlan(self.backend, plan);
                     if (self.read_view.?.directory() == null) try self.ensureStablePointViewLoaded();
                     const chunk_result = if (self.read_view.?.directory()) |directory|
-                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, &.{}, directory, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys[offset..end], values[offset..end], plan == .sorted_by_run, false, self.borrowed_batch_scratch orelse &self.batch_scratch, self.metadata_allocator)
+                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, &.{}, directory, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys[offset..end], values[offset..end], plan == .sorted_by_run, false, self.borrowed_batch_scratch orelse &self.batch_scratch, self.metadata_allocator, null)
                     else switch (plan) {
                         .sorted_by_run => try readManySortedByRunFromSnapshot(
                             self.backend,
@@ -4272,6 +4314,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             keys[offset..end],
                             values[offset..end],
                             false,
+                            null,
                         ),
                         .cursor, .point => try readManySortedPointFromSnapshot(
                             self.backend,
@@ -4287,6 +4330,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             keys[offset..end],
                             values[offset..end],
                             false,
+                            null,
                         ),
                     };
                     result.add(chunk_result);
@@ -4356,7 +4400,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     const plan = chooseMultiGetPlan(unresolved_keys, .stable_probe);
                     recordMultiGetPlan(self.backend, plan);
                     const unresolved_result = if (layout.read_view.directory()) |directory|
-                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, layout.immutable_memtables, directory, self.allocator, &self.held_blocks, &self.held_values, source_namespace, unresolved_keys, unresolved_values, plan == .sorted_by_run, false, scratch, self.metadata_allocator)
+                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, layout.immutable_memtables, directory, self.allocator, &self.held_blocks, &self.held_values, source_namespace, unresolved_keys, unresolved_values, plan == .sorted_by_run, false, scratch, self.metadata_allocator, null)
                     else switch (plan) {
                         .sorted_by_run => try readManySortedByRunFromSnapshot(
                             self.backend,
@@ -4372,6 +4416,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             unresolved_keys,
                             unresolved_values,
                             false,
+                            null,
                         ),
                         .cursor, .point => try readManySortedPointFromSnapshot(
                             self.backend,
@@ -4387,6 +4432,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             unresolved_keys,
                             unresolved_values,
                             false,
+                            null,
                         ),
                     };
                     for (unresolved_values, unresolved_indexes) |value, index| values[index] = value;
@@ -5542,7 +5588,7 @@ pub fn NamespaceReadTxn(comptime BackendType: type) type {
             @memset(values, null);
             self.backend.recordGetManySorted(keys.len);
             self.backend.recordGetManySortedLocality(keys);
-            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, namespace, keys, values, &self.planning_scratch, self.metadata_allocator);
+            const result = try readManySortedFromReadView(self.backend, self.mutable_snapshot, self.immutable_memtables, self.read_view, self.allocator, &self.held_blocks, &self.held_values, namespace, keys, values, &self.planning_scratch, self.metadata_allocator, null);
             self.backend.recordGetManySortedResults(result.hits, result.misses);
         }
 
@@ -5724,17 +5770,26 @@ fn readManySortedFromReadView(
     values: []?[]const u8,
     reuse: *BatchScratch.ProbeScratch,
     metadata_allocator: Allocator,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     const plan = chooseMultiGetPlan(keys, .snapshot);
     recordMultiGetPlan(backend, plan);
     if (view.directory() == null) switch (plan) {
-        .point => return readManySortedPointFromSnapshot(backend, mutable, immutable_memtables, view.runs, view.l0_groups, view.levels, allocator, held_blocks, held_values, namespace, keys, values, false),
-        .sorted_by_run => return readManySortedByRunFromSnapshot(backend, mutable, immutable_memtables, view.runs, view.l0_groups, view.levels, allocator, held_blocks, held_values, namespace, keys, values, false),
+        .point => return readManySortedPointFromSnapshot(backend, mutable, immutable_memtables, view.runs, view.l0_groups, view.levels, allocator, held_blocks, held_values, namespace, keys, values, false, control),
+        .sorted_by_run => return readManySortedByRunFromSnapshot(backend, mutable, immutable_memtables, view.runs, view.l0_groups, view.levels, allocator, held_blocks, held_values, namespace, keys, values, false, control),
         .cursor => {},
     };
-    if (plan != .cursor) return readManySortedDirectoryBatch(backend, mutable, immutable_memtables, view.directory().?, allocator, held_blocks, held_values, namespace, keys, values, plan == .sorted_by_run, false, reuse, metadata_allocator);
-    var cursor = try MergeCursor(@TypeOf(backend.*), State).initView(runtimeScratchAllocator(allocator), backend, mutable, immutable_memtables, view, namespace, false);
+    if (plan != .cursor) return readManySortedDirectoryBatch(backend, mutable, immutable_memtables, view.directory().?, allocator, held_blocks, held_values, namespace, keys, values, plan == .sorted_by_run, false, reuse, metadata_allocator, control);
+    const CursorType = MergeCursor(@TypeOf(backend.*), State);
+    const sequence: CursorType.RunSequence = if (view.directory()) |directory| .{ .directory = directory } else .{ .runs = view.runs, .levels = view.levels };
+    var cursor = if (control) |budget|
+        try CursorType.initSequenceControlled(runtimeScratchAllocator(allocator), backend, mutable, immutable_memtables, sequence, if (sequence.directory != null) &.{} else view.l0_groups, namespace, false, budget)
+    else
+        try CursorType.initView(runtimeScratchAllocator(allocator), backend, mutable, immutable_memtables, view, namespace, false);
     defer cursor.close();
+    const guard = if (control) |budget| try cursor.admission.enter(budget) else null;
+    defer if (guard) |scope| scope.deinit();
     return readManySortedFromCursor(backend, allocator, held_blocks, held_values, &cursor, keys, values);
 }
 
@@ -5756,11 +5811,13 @@ fn readManySortedDirectoryBatch(
     backend_locked: bool,
     reuse: ?*BatchScratch.ProbeScratch,
     metadata_allocator: Allocator,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     if (reuse) |owner| {
         const planner = try owner.planning(metadata_allocator, runtimeScratchAllocator(allocator), backend.options.resource_manager);
         defer planner.finish();
-        return readManySortedDirectoryCandidates(backend, mutable, immutable_memtables, directory, planner.arena.allocator(), allocator, held_blocks, held_values, namespace, keys, values, sorted_by_run, backend_locked) catch |err| {
+        return readManySortedDirectoryCandidates(backend, mutable, immutable_memtables, directory, planner.arena.allocator(), allocator, held_blocks, held_values, namespace, keys, values, sorted_by_run, backend_locked, control) catch |err| {
             if (planner.denied()) return error.ResourceBudgetExceeded;
             return err;
         };
@@ -5772,7 +5829,7 @@ fn readManySortedDirectoryBatch(
     };
     defer if (admitted) |*budget| budget.deinit();
     const scratch = if (admitted) |*budget| budget.allocator() else runtimeScratchAllocator(allocator);
-    return readManySortedDirectoryCandidates(backend, mutable, immutable_memtables, directory, scratch, allocator, held_blocks, held_values, namespace, keys, values, sorted_by_run, backend_locked) catch |err| {
+    return readManySortedDirectoryCandidates(backend, mutable, immutable_memtables, directory, scratch, allocator, held_blocks, held_values, namespace, keys, values, sorted_by_run, backend_locked, control) catch |err| {
         if (admitted) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
         return err;
     };
@@ -5792,7 +5849,9 @@ fn readManySortedDirectoryCandidates(
     values: []?[]const u8,
     sorted_by_run: bool,
     backend_locked: bool,
+    control: ?read_admission.Port,
 ) !BatchCursorReadResult {
+    if (control) |budget| try budget.checkpoint();
     const Directory = @import("run_directory.zig").Directory;
     var selected = std.ArrayListUnmanaged(Directory.Handle).empty;
     defer selected.deinit(scratch);
@@ -5800,17 +5859,22 @@ fn readManySortedDirectoryCandidates(
     // rather than revisiting every memtable hit for every overlapping run.
     var unresolved = std.ArrayListUnmanaged([]const u8).empty;
     defer unresolved.deinit(scratch);
-    const planning_keys = try directoryUnresolvedKeys(scratch, mutable, immutable_memtables, namespace, keys, &unresolved);
+    const planning_keys = try directoryUnresolvedKeys(scratch, mutable, immutable_memtables, namespace, keys, &unresolved, control);
     var cursor = directory.sortedPoints(namespace.name, planning_keys);
     while (!cursor.done()) {
-        var budget: usize = 16384;
-        while (cursor.next(&budget)) |handle| try selected.append(scratch, handle);
+        if (control) |authority| try authority.checkpoint();
+        var budget: usize = if (control != null) 64 else 16384;
+        while (cursor.next(&budget)) |handle| {
+            if (control) |authority| try authority.checkpoint();
+            try selected.append(scratch, handle);
+        }
     }
     const handles = selected.items;
     std.mem.sort(Directory.Handle, handles, {}, Directory.readLess);
     const runs = try scratch.alloc(Run, handles.len);
     defer scratch.free(runs);
     for (runs, handles) |*run, handle| {
+        if (control) |authority| try authority.checkpoint();
         run.* = handle.run.*;
         run.shared_read_version = true;
     }
@@ -5818,8 +5882,8 @@ fn readManySortedDirectoryCandidates(
     defer deinitRunGroups(scratch, groups);
     const levels = try buildLowerLevels(scratch, runs);
     defer scratch.free(levels);
-    if (sorted_by_run) return readManySortedByRunFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch);
-    return readManySortedPointFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch);
+    if (sorted_by_run) return readManySortedByRunFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch, control);
+    return readManySortedPointFromSnapshotWithScratch(backend, mutable, immutable_memtables, runs, groups, levels, allocator, held_blocks, held_values, namespace, keys, values, backend_locked, scratch, control);
 }
 
 fn directoryUnresolvedKeys(
@@ -5829,10 +5893,13 @@ fn directoryUnresolvedKeys(
     namespace: backend_types.Namespace,
     keys: []const []const u8,
     unresolved: *std.ArrayListUnmanaged([]const u8),
+    control: ?read_admission.Port,
 ) ![]const []const u8 {
+    if (control) |budget| try budget.checkpoint();
     if (mutable.entryCount() == 0 and immutable_memtables.len == 0) return keys;
     var first_resolved: ?usize = null;
     for (keys, 0..) |key, i| {
+        if (control) |budget| try budget.checkpoint();
         const resolved = found: {
             if (mutable.findIndex(namespace, key) != null) break :found true;
             for (immutable_memtables) |state| if (state.findIndex(namespace, key) != null) break :found true;
@@ -7863,7 +7930,7 @@ fn loadBatchBlock(
     if (state.block_index == null or state.block_index.? != block_index) {
         try state.transferBlock(backend.allocator, held_blocks);
         const window = index.blockWindow(block_index);
-        state.block_handle = try loadRunTableBlockHandle(backend, run, index, window, retain_block);
+        state.block_handle = try loadRunTableBlockHandleWithAdmission(backend, run, index, window, retain_block, state.control);
         state.block_index = block_index;
         state.block_has_values = false;
     }
@@ -7881,6 +7948,7 @@ fn findExactEntryInBatchBlocks(
     namespace: backend_types.Namespace,
     key: []const u8,
 ) !?LocatedTableEntry {
+    if (state.control) |budget| try budget.checkpoint();
     try requireTableBlocks(index);
     const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
     const block = index.blocks[block_index];
@@ -10500,7 +10568,7 @@ test "lsm shared directory classification visits keys once and includes mutable 
     var unresolved: std.ArrayListUnmanaged([]const u8) = .empty;
     defer unresolved.deinit(std.testing.allocator);
     const keys = [_][]const u8{ "hit", "missing", "tombstone" };
-    const planned = try directoryUnresolvedKeys(std.testing.allocator, &mutable, &.{}, .{}, &keys, &unresolved);
+    const planned = try directoryUnresolvedKeys(std.testing.allocator, &mutable, &.{}, .{}, &keys, &unresolved, null);
     try std.testing.expectEqual(@as(usize, 3), mutable.calls);
     try std.testing.expectEqual(@as(usize, 1), planned.len);
     try std.testing.expectEqualStrings("missing", planned[0]);
@@ -11070,11 +11138,11 @@ test "lsm shared directory classification excludes immutable values and tombston
     const keys = [_][]const u8{ "deleted", "missing", "new", "old" };
     var unresolved: std.ArrayListUnmanaged([]const u8) = .empty;
     defer unresolved.deinit(a);
-    const planned = try directoryUnresolvedKeys(a, &empty, &.{ &newest, &older }, .{ .name = "docs" }, &keys, &unresolved);
+    const planned = try directoryUnresolvedKeys(a, &empty, &.{ &newest, &older }, .{ .name = "docs" }, &keys, &unresolved, null);
     try std.testing.expectEqual(@as(usize, 1), planned.len);
     try std.testing.expectEqualStrings("missing", planned[0]);
     unresolved.clearRetainingCapacity();
-    const other = try directoryUnresolvedKeys(a, &empty, &.{ &newest, &older }, .{ .name = "other" }, &keys, &unresolved);
+    const other = try directoryUnresolvedKeys(a, &empty, &.{ &newest, &older }, .{ .name = "other" }, &keys, &unresolved, null);
     try std.testing.expectEqual(@intFromPtr(&keys), @intFromPtr(other.ptr));
 }
 
@@ -11118,7 +11186,7 @@ test "lsm shared immutable classification eliminates overlapping directory selec
     const keys = [_][]const u8{ "deleted", "new", "old" };
     var unresolved: std.ArrayListUnmanaged([]const u8) = .empty;
     defer unresolved.deinit(a);
-    const planned = try directoryUnresolvedKeys(a, &empty, &.{&immutable}, .{ .name = "docs" }, &keys, &unresolved);
+    const planned = try directoryUnresolvedKeys(a, &empty, &.{&immutable}, .{ .name = "docs" }, &keys, &unresolved, null);
     var before = directory.sortedPoints("docs", &keys);
     var before_count: usize = 0;
     while (!before.done()) {
@@ -11763,4 +11831,44 @@ pub fn qualifyControlledAsyncBatch(control: read_admission.Port) !void {
     try std.testing.expectEqual(@as(u64, 1), backend.snapshotReadStats().table_block_loads - before);
     cache.invalidatePrefix("/controlled-async-batch");
     for (values, keys) |value, key| try std.testing.expectEqualStrings(key, value.?);
+}
+
+pub fn qualifyControlledNativeReadBatch(control: read_admission.Port, use_scope: bool) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const B = @import("../lsm_backend.zig").Backend;
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var backend = try B.open(a, "/controlled-native-read-batch", .{ .storage = storage.storage(), .cache = &cache, .flush_threshold = 1, .max_concurrent_point_block_reads = 16 });
+    defer backend.close();
+    var store = try backend.runtimeStore(a, .{ .name = "docs" });
+    defer store.deinit();
+    var key_bytes: [128][64]u8 = undefined;
+    var keys: [128][]const u8 = undefined;
+    var write = try store.beginWrite();
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.bufPrint(&key_bytes[i], "document:long-shared-prefix-for-compression:{d:0>4}", .{i});
+        try write.put(key.*, key.*);
+    }
+    try write.commit();
+    var runs = [_]Run{backend.runs.at(0).*};
+    var handle = try loadRunTableIndexHandle(&backend, &runs[0]);
+    try std.testing.expectEqual(@as(usize, 1), handle.runTableIndex().blocks.len);
+    handle.release();
+    var read = try BoundReadTxn(B).open(&backend, .{ .name = "docs" });
+    defer read.abort();
+    var scope = try read.openReadScope(a);
+    defer scope.close();
+    var values: [128]?[]const u8 = @splat(null);
+    const sparse = [_][]const u8{ keys[0], keys[keys.len - 1] };
+    // Preserve all three existing planner choices: cursor, grouped synchronous
+    // reads, and sparse asynchronous points, including reusable-scope results.
+    for ([_][]const []const u8{ keys[0..16], &keys, &sparse }) |batch| {
+        cache.invalidatePrefix("/controlled-native-read-batch");
+        if (use_scope) try scope.getManySortedWithAdmission(batch, values[0..batch.len], control) else try read.getManySortedWithAdmission(batch, values[0..batch.len], control);
+        cache.invalidatePrefix("/controlled-native-read-batch");
+        for (values[0..batch.len], batch) |value, key| try std.testing.expectEqualStrings(key, value.?);
+    }
 }
