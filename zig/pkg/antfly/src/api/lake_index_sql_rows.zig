@@ -35,6 +35,7 @@ const Owner = struct {
     lease: ?*@import("lake_index_reader_lease.zig").Handle = null,
     reader: ordered.Reader = undefined,
     reader_open: bool = false,
+    public_order: ?@import("lake_index_public_order.zig").Cursor = null,
     predicate_lower: []const u8 = "",
     predicate_upper: ?[]const u8 = null,
     predicate_count: u64 = 0,
@@ -69,6 +70,7 @@ const Owner = struct {
     fn close(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (self.child) |child| child.close(child.ptr);
+        if (self.public_order) |*cursor| cursor.deinit();
         if (self.reader_open) self.reader.deinit();
         if (self.metadata) |owned| owned.release();
         if (self.lease) |lease| lease.deinit();
@@ -419,6 +421,7 @@ const Owner = struct {
 pub const Predicate = struct {
     cursor: catalog.Cursor,
     scan: bool = false,
+    complete_order: bool = false,
     work: u64 = 0,
     pub fn deinit(self: *Predicate) void {
         self.cursor.close(self.cursor.ptr);
@@ -458,6 +461,10 @@ pub const Predicate = struct {
         };
         const owner: *Owner = @ptrCast(@alignCast(self.cursor.ptr));
         try owner.read_context.ensureActive();
+        if (owner.public_order) |*cursor| {
+            if (owner.reader.exhausted) return &.{};
+            return cursor.next(a, count);
+        }
         return owner.reader.next(a, count);
     }
 };
@@ -649,7 +656,11 @@ fn appendStrongBound(a: A, conditions: *std.ArrayList(catalog.Condition), next: 
 /// Ordered identity-only consumption proves deletes, tuple bounds and ordering
 /// from the pinned publication. Membership enforces other required predicates;
 /// this path must never open a Parquet cursor to recheck an index key.
-pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, reverse: bool) !?Predicate {
+pub const SearchOrder = struct {
+    values: []const std.json.Value = &.{},
+    id_descending: bool = false,
+};
+pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, reverse: bool, search_order: SearchOrder) !?Predicate {
     const definitions = table.external_indexes orelse return null;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -660,6 +671,7 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
     var best: ?catalog.Cursor = null;
     errdefer if (best) |cursor| cursor.close(cursor.ptr);
     var best_cost: u64 = std.math.maxInt(u64);
+    var best_complete = false;
     for (indexes) |index| {
         var conditions: std.ArrayList(catalog.Condition) = .empty;
         for (request.conditions) |condition| for (index.keys) |key| {
@@ -679,22 +691,73 @@ pub fn tryOpenOrderedPredicate(a: A, server: *server_api.ApiHttpServer, table: c
             cursor.close(cursor.ptr);
             continue;
         }
+        const complete = preparePublicOrder(a, cursor, index, parsed, candidate, reverse, search_order) catch |err| {
+            cursor.close(cursor.ptr);
+            return err;
+        };
         if (cost < best_cost) {
             if (best) |prior| prior.close(prior.ptr);
             best = cursor;
             best_cost = cost;
+            best_complete = complete;
         } else cursor.close(cursor.ptr);
     }
     if (best) |cursor| {
-        if (reverse) {
+        if (reverse and !best_complete) {
             const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
             const replacement = try @import("../serverless/graph_segment/page_tree.zig").Cursor.initReverse(a, owner.reader.pages.store(), owner.reader.root.page, owner.predicate_lower, owner.predicate_upper);
             owner.reader.cursor.?.deinit();
             owner.reader.cursor = replacement;
         }
-        return .{ .cursor = cursor };
+        return .{ .cursor = cursor, .complete_order = best_complete };
     }
     return null;
+}
+
+fn preparePublicOrder(a: A, cursor: catalog.Cursor, definition: local.storage_relational_index.RelationalIndexDefinition, parsed: anytype, request: catalog.Scan, reverse: bool, search_order: SearchOrder) !bool {
+    const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+    if (owner.reader.root.tie_version != 1) return false;
+    var equal: usize = 0;
+    for (definition.keys) |key| {
+        const constant = for (request.conditions) |condition| {
+            if (condition.op == .eq and condition.value != .null and std.mem.eql(u8, key.column, condition.column)) break true;
+        } else false;
+        if (!constant) break;
+        equal += 1;
+    }
+    // Extra nonconstant index keys would precede the public-ID suffix.
+    if (equal + request.order.len != definition.keys.len) return false;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var boundary: ?[]const u8 = null;
+    var id: ?[]const u8 = null;
+    if (search_order.values.len != 0) {
+        if (search_order.values.len != request.order.len + 1 or search_order.values[search_order.values.len - 1] != .string) return false;
+        id = search_order.values[search_order.values.len - 1].string;
+        const runtime = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
+        defer local.storage_schema.freeSchema(a, runtime);
+        var layout = try local.storage_db_algebraic_relational_row_codec.PhysicalLayout.init(a, runtime);
+        defer layout.deinit();
+        var tuple = try local.storage_db_relational_index_keys.TuplePlan.init(a, runtime, &layout, definition.keys);
+        defer tuple.deinit();
+        const values = try ca.alloc(std.json.Value, definition.keys.len);
+        for (definition.keys, values, 0..) |key, *value, i| {
+            const wire = if (i < equal) for (request.conditions) |condition| {
+                if (condition.op == .eq and std.mem.eql(u8, condition.column, key.column)) break condition.value;
+            } else return false else search_order.values[i - equal];
+            value.* = local.sql_lake_values.comparisonValue(ca, wire, (try owner.table.column(key.column)).type) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return false,
+            };
+        }
+        boundary = try boundKey(ca, tuple, values);
+    }
+    owner.public_order = @import("lake_index_public_order.zig").Cursor.init(a, &owner.reader, owner.predicate_lower, owner.predicate_upper, boundary, id, search_order.id_descending, reverse) catch |err| switch (err) {
+        error.InvalidRelationalIndexBound => return false,
+        else => return err,
+    };
+    return true;
 }
 
 pub fn tryOpenAuto(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !?catalog.Cursor {

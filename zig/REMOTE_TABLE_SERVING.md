@@ -1167,7 +1167,9 @@ budget; stream count has no fixed 4096 cliff. Legacy segments retain their encod
 byte admission. Selective filters seek the block covering the next selected
 ordinal and use the same quantized scorer as broad/unfiltered searches. Contributions retain source/term/chunk addition order.
 Conservative block score bounds include absent terms and both signed endpoints;
-pruning uses strict inequality to retain ties. Prepared bitmap ranks reject
+pruning compares score and native ordinal together to preserve ties. Only
+producer-attested unique streams use score bounds; older repeated postings
+retain conservative accumulation. Prepared bitmap ranks reject
 disjoint ordinal blocks using authenticated trailers without decoding posting
 arrays. Legacy checkpoints, unresolved key predicates, and queries exceeding
 either stream or posting-byte admission retain the bounded spill path: at most
@@ -1229,3 +1231,20 @@ Positive selections reject disjoint segments before opening posting streams,
 avoiding a first-block read from every later segment for a point query. Older
 paged roots without the optional bounds retain the ordinary read path. The
 multi-segment regression admits only the overlapping stream and reads one block.
+
+### Shared directories and public-ID tie seeks
+
+The bounded native text corpus cache owns the physical/native ordinal directory,
+including its typed block and delete-bitmap references. Every query phase borrows
+the same immutable directory under its corpus pin. Decoded ordered-row roots
+likewise cache the snapshot-bound public file digests.
+
+Ordered-row recipe v6 includes a tuple/file count tree. It supports complete
+public-ID tie ordering without duplicating every row into another sort tree or
+rewriting retained rows when snapshot-bound public file digests change. Bounded
+spill grouping constructs the directory; incremental updates adjust changed
+counts with copy-on-write. GC retains these pages while any publication reader
+is active. Complete-key search cursors seek within the boundary file/row and
+stop within large equal-key groups; older or partially ordered indexes retain
+the existing native collector fallback. Public request and cursor formats stay
+the same, and normal publication/rebuild upgrades older index artifacts.

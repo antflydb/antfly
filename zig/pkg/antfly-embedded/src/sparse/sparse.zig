@@ -51,6 +51,63 @@ pub const SparseWrite = struct {
     doc_num: ?u32 = null,
 };
 
+// Keep already canonical batches allocation-free. Coalesce repeated dimensions
+// in input order before either the delta or immutable posting producer sees them.
+fn canonicalWorkingBytes(input: []const SparseWrite) !u64 {
+    var values: u64 = 0;
+    var scratch: u64 = 0;
+    for (input) |write| {
+        if (write.vec.indices.len != write.vec.values.len) return error.InvalidSparseVector;
+        var canonical = true;
+        for (write.vec.indices, 0..) |dimension, i| if (i != 0 and dimension <= write.vec.indices[i - 1]) {
+            canonical = false;
+        };
+        if (canonical) continue;
+        const length: u64 = @intCast(write.vec.indices.len);
+        values = try std.math.add(u64, values, try std.math.mul(u64, length, @sizeOf(u32) + @sizeOf(f32)));
+        scratch = @max(scratch, try std.math.mul(u64, length, @sizeOf(u32) + @sizeOf(f32) + @sizeOf(usize)));
+    }
+    if (values == 0) return 0;
+    return std.math.add(u64, try std.math.add(u64, values, scratch), try std.math.mul(u64, input.len, @sizeOf(SparseWrite)));
+}
+fn canonicalWrites(a: Allocator, backing: Allocator, input: []const SparseWrite) ![]const SparseWrite {
+    var scratch = std.heap.ArenaAllocator.init(backing);
+    defer scratch.deinit();
+    var output: ?[]SparseWrite = null;
+    for (input, 0..) |write, wi| {
+        if (write.vec.indices.len != write.vec.values.len) return error.InvalidSparseVector;
+        var canonical = true;
+        for (write.vec.indices, 0..) |dimension, i| {
+            if (i != 0 and dimension <= write.vec.indices[i - 1]) canonical = false;
+        }
+        if (canonical) continue;
+        if (output == null) output = try a.dupe(SparseWrite, input);
+        const Coordinate = struct { dimension: u32, value: f32, order: usize };
+        _ = scratch.reset(.retain_capacity);
+        const coordinates = try scratch.allocator().alloc(Coordinate, write.vec.indices.len);
+        for (coordinates, write.vec.indices, write.vec.values, 0..) |*coordinate, dimension, value, order| coordinate.* = .{ .dimension = dimension, .value = value, .order = order };
+        std.mem.sort(Coordinate, coordinates, {}, struct {
+            fn less(_: void, x: Coordinate, y: Coordinate) bool {
+                return x.dimension < y.dimension or (x.dimension == y.dimension and x.order < y.order);
+            }
+        }.less);
+        const indices = try a.alloc(u32, coordinates.len);
+        const values = try a.alloc(f32, coordinates.len);
+        var count: usize = 0;
+        for (coordinates) |coordinate| {
+            if (count != 0 and indices[count - 1] == coordinate.dimension) {
+                values[count - 1] = daat.addScore(values[count - 1], coordinate.value) catch return error.InvalidSparseVector;
+            } else {
+                indices[count] = coordinate.dimension;
+                values[count] = coordinate.value;
+                count += 1;
+            }
+        }
+        output.?[wi].vec = .{ .indices = indices[0..count], .values = values[0..count] };
+    }
+    return if (output) |writes| writes else input;
+}
+
 pub const OrdinalDocNumLookup = struct {
     doc_nums: []const u32,
     missing_ordinals: []const u32,
@@ -381,7 +438,7 @@ fn postingRangeMayMatch(range: []const u8, chunk: []const u8, bitmap: ?*const @i
     if (end > range.len) return error.InvalidChunk;
     const tail = range[@intCast(end)..];
     if (tail.len != 0) {
-        if (tail.len != 12 or !std.mem.eql(u8, tail[0..4], "O32B")) return error.InvalidChunk;
+        if (tail.len != 12 or (!std.mem.eql(u8, tail[0..4], "O32B") and !std.mem.eql(u8, tail[0..4], "O32U"))) return error.InvalidChunk;
         const lower = std.mem.readInt(u32, tail[4..8], .little);
         const upper = std.mem.readInt(u32, tail[8..12], .little);
         if (lower > upper) return error.InvalidChunk;
@@ -682,6 +739,10 @@ fn encodeSegmentFromSortedPostings(
         var end = start + 1;
         while (end < postings.len and postings[end].term_id == term_id) : (end += 1) {}
 
+        var unique = true;
+        for (postings[start + 1 .. end], postings[start .. end - 1]) |next, previous| if (next.doc_num <= previous.doc_num) {
+            unique = false;
+        };
         var term_payload = std.ArrayListUnmanaged(u8).empty;
         errdefer term_payload.deinit(alloc);
         var cursor = start;
@@ -702,8 +763,9 @@ fn encodeSegmentFromSortedPostings(
 
             const chunk = try encodeChunk(alloc, doc_nums, weights);
             defer alloc.free(chunk);
-            const range = try encodeChunkOrdinalRange(alloc, min_doc_id.?, max_doc_id.?, doc_nums);
+            const range = try encodeChunkOrdinalRange(alloc, min_doc_id.?, max_doc_id.?, doc_nums, unique);
             defer alloc.free(range);
+            if (!unique) @memcpy(range[range.len - 12 ..][0..4], "O32B");
 
             try appendU32Le(alloc, &term_payload, @intCast(chunk.len));
             try appendU32Le(alloc, &term_payload, @intCast(range.len));
@@ -763,7 +825,7 @@ fn appendCompactionBlock(a: Allocator, builder: *posting_pages.Builder, postings
     }
     const chunk = try encodeChunk(a, doc_nums, weights);
     defer a.free(chunk);
-    const range = try encodeChunkOrdinalRange(a, minimum.?, maximum.?, doc_nums);
+    const range = try encodeChunkOrdinalRange(a, minimum.?, maximum.?, doc_nums, true);
     defer a.free(range);
     var frame: std.ArrayList(u8) = .empty;
     defer frame.deinit(a);
@@ -1051,14 +1113,18 @@ fn encodeChunkRangeMeta(alloc: Allocator, min_doc_id: []const u8, max_doc_id: []
 
 // Readers before ordinal bounds ignore trailing range bytes. Preserve that
 // wire contract: the posting payload and document-ID range prefix stay V1.
-fn encodeChunkOrdinalRange(alloc: Allocator, min_id: []const u8, max_id: []const u8, nums: []const u32) ![]u8 {
+fn encodeChunkOrdinalRange(alloc: Allocator, min_id: []const u8, max_id: []const u8, nums: []const u32, producer_unique: bool) ![]u8 {
     if (nums.len == 0) return error.InvalidChunk;
     const prefix = try encodeChunkRangeMeta(alloc, min_id, max_id);
     defer alloc.free(prefix);
     const result = try alloc.alloc(u8, prefix.len + 12);
     @memcpy(result[0..prefix.len], prefix);
     const tail = result[prefix.len..];
-    @memcpy(tail[0..4], "O32B");
+    var unique = producer_unique;
+    for (nums[1..], nums[0 .. nums.len - 1]) |next, previous| if (next <= previous) {
+        unique = false;
+    };
+    @memcpy(tail[0..4], if (unique) "O32U" else "O32B");
     std.mem.writeInt(u32, tail[4..8], nums[0], .little);
     std.mem.writeInt(u32, tail[8..12], nums[nums.len - 1], .little);
     return result;
@@ -2415,7 +2481,13 @@ pub const SparseIndex = struct {
         return try self.batchWithOptions(writes, deletes, .{});
     }
 
-    pub fn batchWithOptions(self: *SparseIndex, writes: []const SparseWrite, deletes: []const []const u8, options: BatchOptions) !void {
+    pub fn batchWithOptions(self: *SparseIndex, input: []const SparseWrite, deletes: []const []const u8, options: BatchOptions) !void {
+        var normalized = std.heap.ArenaAllocator.init(self.alloc);
+        defer normalized.deinit();
+        const working = try canonicalWorkingBytes(input);
+        var reservation: ?resource_manager_mod.Reservation = if (self.resource_manager != null and working != 0) try self.resource_manager.?.reserve(.sparse_apply_working_set, working) else null;
+        defer if (reservation) |*held| held.release();
+        const writes = try canonicalWrites(normalized.allocator(), self.alloc, input);
         self.write_profile.batch_calls += 1;
         self.write_profile.writes += writes.len;
         self.write_profile.deletes += deletes.len;
@@ -2832,24 +2904,32 @@ pub const SparseIndex = struct {
             for (streams[0..active], 0..) |stream, index| if (stream.doc != null) {
                 try queue.push(alloc, index);
             };
-            var previous: ?u32 = null;
+            var pending: ?BulkPosting = null;
             while (queue.pop()) |index| {
                 const stream = &streams[index];
                 const doc = stream.doc.?;
                 const captured = (try task.sources[stream.query_order].captured(doc, &proof_positions[stream.query_order])) orelse return error.InvalidSparseSegment;
-                if (captured.live and (previous == null or previous.? != doc)) {
-                    if (task.scratch == null) try epochs.put(alloc, doc, .{ .doc_num = doc, .epoch = captured.epoch, .live = true });
-                    try chunk.append(alloc, .{ .term_id = current, .doc_num = doc, .weight = try stream.contribution(), .doc_id = captured.doc_id orelse &.{} });
-                    posting_count += 1;
-                    previous = doc;
-                    if (chunk.items.len >= output_chunk_size) {
-                        try appendCompactionBlock(alloc, &builder, chunk.items);
-                        chunk.clearRetainingCapacity();
+                if (captured.live) {
+                    const contribution = try stream.contribution();
+                    if (pending != null and pending.?.doc_num == doc) {
+                        pending.?.weight = try daat.addScore(pending.?.weight, contribution);
+                    } else {
+                        if (pending) |posting| {
+                            try chunk.append(alloc, posting);
+                            if (chunk.items.len >= output_chunk_size) {
+                                try appendCompactionBlock(alloc, &builder, chunk.items);
+                                chunk.clearRetainingCapacity();
+                            }
+                        }
+                        if (task.scratch == null) try epochs.put(alloc, doc, .{ .doc_num = doc, .epoch = captured.epoch, .live = true });
+                        pending = .{ .term_id = current, .doc_num = doc, .weight = contribution, .doc_id = captured.doc_id orelse &.{} };
+                        posting_count += 1;
                     }
                 }
                 try stream.advance();
                 if (stream.doc != null) try queue.push(alloc, index);
             }
+            if (pending) |posting| try chunk.append(alloc, posting);
             if (chunk.items.len != 0) {
                 try appendCompactionBlock(alloc, &builder, chunk.items);
                 chunk.clearRetainingCapacity();
@@ -4059,7 +4139,7 @@ pub const SparseIndex = struct {
         if (profile) |active_profile| active_profile.chunk_put_ns += elapsedSince(phase_start_ns);
 
         phase_start_ns = nowNs();
-        const meta = try encodeChunkOrdinalRange(alloc, min_doc_id, max_doc_id, doc_nums);
+        const meta = try encodeChunkOrdinalRange(alloc, min_doc_id, max_doc_id, doc_nums, false);
         if (profile) |active_profile| active_profile.range_meta_encode_ns += elapsedSince(phase_start_ns);
         defer alloc.free(meta);
         var meta_ck_buf: [256]u8 = undefined;
@@ -5643,7 +5723,7 @@ fn pruneTermPostings(
         }
         const encoded = try encodeChunk(alloc, out_doc_nums, out_weights);
         errdefer alloc.free(encoded);
-        const encoded_meta = try encodeChunkOrdinalRange(alloc, range.min_doc_id, range.max_doc_id, out_doc_nums);
+        const encoded_meta = try encodeChunkOrdinalRange(alloc, range.min_doc_id, range.max_doc_id, out_doc_nums, false);
         errdefer alloc.free(encoded_meta);
         try kept.append(alloc, .{
             .chunk_bytes = encoded,
@@ -5835,7 +5915,7 @@ fn writeChunkWithRangeMetaToTxn(
     var ck_buf: [256]u8 = undefined;
     try txnPut(dest_txn, dest_dbi, invChunkKey(&ck_buf, term_id, chunk_idx), encoded);
 
-    const meta = try encodeChunkOrdinalRange(alloc, min_doc_id, max_doc_id, doc_nums);
+    const meta = try encodeChunkOrdinalRange(alloc, min_doc_id, max_doc_id, doc_nums, false);
     defer alloc.free(meta);
     var meta_ck_buf: [256]u8 = undefined;
     try txnPut(dest_txn, dest_dbi, invChunkMetaKey(&meta_ck_buf, term_id, chunk_idx), meta);
@@ -6806,7 +6886,7 @@ test "sparse posting block bounds preserve v1 decoding and reject disjoint selec
     defer a.free(bytes);
     try std.testing.expectEqual(@as(u8, 1), bytes[0]);
     try std.testing.expectEqual(@as(usize, 13 + 3 * 5), bytes.len);
-    const extended = try encodeChunkOrdinalRange(a, "first", "last", nums);
+    const extended = try encodeChunkOrdinalRange(a, "first", "last", nums, true);
     defer a.free(extended);
     const legacy = try encodeChunkRangeMeta(a, "first", "last");
     defer a.free(legacy);
@@ -7542,4 +7622,79 @@ test "sparse visibility reuses proven missing intervals and EOF without losing b
     try std.testing.expectError(error.InjectedSeekFailure, reader.get(segmentIncarnationKey(&requested, 42, 9001, false)));
     try std.testing.expectEqualStrings("epoch", try reader.get(&source_key));
     try std.testing.expectEqual(@as(usize, 6), seeks[2]);
+}
+
+test "sparse canonical dimensions agree between bulk delta and reopen" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |bulk| {
+        var pb: [256]u8 = undefined;
+        const path = tmpPath(&pb, if (bulk) "canonical-bulk" else "canonical-delta");
+        defer cleanupTmp(path);
+        var index = try SparseIndex.open(a, path, .{ .chunk_size = 2 });
+        defer index.close();
+        try index.batchWithOptions(&.{
+            .{ .doc_id = "winner", .vec = .{ .indices = &.{ 2, 1, 1 }, .values = &.{ 0, 6, 6 } } },
+            .{ .doc_id = "other", .vec = .{ .indices = &.{1}, .values = &.{10} } },
+        }, &.{}, .{ .prefer_bulk_build = bulk, .assume_new_doc_ids = bulk });
+        const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+        for (0..2) |_| {
+            const result = try index.search(a, &query, 1);
+            defer SparseIndex.freeResults(a, result);
+            try std.testing.expectEqualStrings("winner", result[0].doc_id);
+            try std.testing.expectApproxEqAbs(@as(f32, 12), result[0].score, 0.01);
+            index.close();
+            index = try SparseIndex.open(a, path, .{ .chunk_size = 2 });
+        }
+    }
+}
+
+test "sparse legacy repeated postings survive paged scoring compaction and restart" {
+    const a = std.testing.allocator;
+    for ([_]u32{ 2, 3 }) |chunk_size| {
+        var pb: [256]u8 = undefined;
+        const path = tmpPath(&pb, if (chunk_size == 2) "legacy-repeated-split" else "legacy-repeated-block");
+        defer cleanupTmp(path);
+        var index = try SparseIndex.open(a, path, .{ .chunk_size = chunk_size });
+        defer index.close();
+        const id = index.next_segment_id;
+        const writes = [_]SparseWrite{
+            .{ .doc_id = "zero", .doc_num = 0, .vec = .{ .indices = &.{1}, .values = &.{10} } },
+            .{ .doc_id = "one", .doc_num = 1, .vec = .{ .indices = &.{1}, .values = &.{10} } },
+            .{ .doc_id = "two", .doc_num = 2, .vec = .{ .indices = &.{1}, .values = &.{10} } },
+            .{ .doc_id = "winner", .doc_num = 3, .vec = .{ .indices = &.{1}, .values = &.{6} } },
+            .{ .doc_id = "four", .doc_num = 4, .vec = .{ .indices = &.{1}, .values = &.{6} } },
+        };
+        try index.batchWithOptions(&writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+        try index.batchWithOptions(&.{.{ .doc_id = "unrelated", .doc_num = 5, .vec = .{ .indices = &.{99}, .values = &.{1} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+        const postings = [_]BulkPosting{
+            .{ .term_id = 1, .doc_num = 0, .weight = 10, .doc_id = "zero" },
+            .{ .term_id = 1, .doc_num = 1, .weight = 10, .doc_id = "one" },
+            .{ .term_id = 1, .doc_num = 2, .weight = 10, .doc_id = "two" },
+            .{ .term_id = 1, .doc_num = 3, .weight = 6, .doc_id = "winner" },
+            .{ .term_id = 1, .doc_num = 3, .weight = 6, .doc_id = "winner" },
+            .{ .term_id = 1, .doc_num = 4, .weight = 6, .doc_id = "four" },
+        };
+        const legacy = try encodeSegmentFromSortedPostings(a, &postings, chunk_size);
+        defer a.free(legacy);
+        {
+            var txn = try index.beginWriteTxn();
+            errdefer txn.abort();
+            const root = try posting_pages.publish(a, &txn, id, legacy);
+            defer a.free(root);
+            var key_buf: [16]u8 = undefined;
+            try txn.put(segmentKey(&key_buf, id), root);
+            try txn.commit();
+        }
+        const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+        for (0..3) |phase| {
+            const result = try index.search(a, &query, 1);
+            defer SparseIndex.freeResults(a, result);
+            try std.testing.expectEqualStrings("winner", result[0].doc_id);
+            try std.testing.expectEqual(@as(f32, 12), result[0].score);
+            if (phase == 0) try std.testing.expect(try index.compactSegmentsWithOptions(a, .{ .min_segments = 2 })) else if (phase == 1) {
+                index.close();
+                index = try SparseIndex.open(a, path, .{ .chunk_size = chunk_size });
+            }
+        }
+    }
 }

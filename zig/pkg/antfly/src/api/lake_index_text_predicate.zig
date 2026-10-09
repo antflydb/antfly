@@ -98,9 +98,11 @@ pub const Identities = struct {
             const entry = try result.files.getOrPut(a, try a.dupe(u8, group.file.id));
             if (entry.found_existing) return error.InvalidNativeLakeTextCorpus;
             if (try corpus.physical.validate(group.rows) != offsets[segment] - offsets[start]) return error.InvalidNativeLakeTextCorpus;
-            const encoded_rows = try std.json.Stringify.valueAlloc(a, group.rows, .{});
-            defer a.free(encoded_rows);
-            const physical_rows = try std.json.parseFromSliceLeaky([]const corpus.physical.Block, a, encoded_rows, .{ .allocate = .alloc_always });
+            const physical_rows = try a.dupe(corpus.physical.Block, group.rows);
+            for (physical_rows) |*block| if (block.bitmap) |*ref| {
+                ref.artifact_id = try a.dupe(u8, ref.artifact_id);
+                ref.checksum = try a.dupe(u8, ref.checksum);
+            };
             entry.value_ptr.* = .{ .lower = offsets[start], .upper = offsets[segment], .rows = physical_rows };
         }
         if (segment != snapshot.segments.len) return error.InvalidNativeLakeTextCorpus;

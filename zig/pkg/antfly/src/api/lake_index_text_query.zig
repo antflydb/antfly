@@ -290,8 +290,8 @@ const Execution = struct {
         try self.text_stores_source.put(self.arena, selected.name, stores_source);
         var pin = try self.server.lake_text_corpora.acquire(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation);
         errdefer pin.deinit();
-        const identities = try @import("lake_index_text_predicate.zig").Identities.init(self.arena, root, pin.snapshot);
-        try self.text_identities.put(self.arena, @intFromPtr(pin.snapshot), identities);
+        const identities: *const @import("lake_index_text_predicate.zig").Identities = @ptrCast(@alignCast(pin.provider_metadata orelse return error.InvalidNativeLakeTextCorpus));
+        try self.text_identities.put(self.arena, @intFromPtr(pin.snapshot), identities.*);
         return pin;
     }
     fn attachHighlights(self: *Execution, a: A, req: types.SearchRequest, result: *types.SearchResult) !void {
@@ -519,6 +519,7 @@ const Execution = struct {
         window: std.heap.ArenaAllocator,
         position: usize = 0,
         scanned: u64 = 0,
+        page_size: usize = 256,
         bitmaps: @import("lake_index_text_predicate.zig").LiveRowsCache = .{},
         fn scannedCount(raw: *anyopaque) u64 {
             const self: *Ordered = @ptrCast(@alignCast(raw));
@@ -540,7 +541,7 @@ const Execution = struct {
                 try self.execution.context.ensureActive();
                 if (self.position == self.page.len) {
                     _ = self.window.reset(.retain_capacity);
-                    self.page = try self.predicate.next(self.window.allocator(), 256);
+                    self.page = try self.predicate.next(self.window.allocator(), @min(self.page_size, physical_budget - @as(usize, @intCast(self.scanned - start))));
                     self.position = 0;
                     if (self.page.len == 0) return null;
                 }
@@ -594,12 +595,12 @@ const Execution = struct {
             if (!try sql_rows.compatibleSearchConditions(ca, self.table, &.{condition})) return null;
             try conditions.append(ca, condition);
         }
-        var predicate = (try sql_rows.tryOpenOrderedPredicate(a, self.server, self.table, .{ .fields = &.{}, .conditions = conditions.items, .order = orders, .limit = 256, .row_goal = @as(u64, req.offset) + req.limit }, self.request, self.source, req.search_before.len != 0)) orelse return null;
+        var predicate = (try sql_rows.tryOpenOrderedPredicate(a, self.server, self.table, .{ .fields = &.{}, .conditions = conditions.items, .order = orders, .limit = 256, .row_goal = @as(u64, req.offset) + req.limit }, self.request, self.source, req.search_before.len != 0, .{ .values = if (req.search_before.len != 0) req.search_before else req.search_after, .id_descending = req.order_by[req.order_by.len - 1].desc })) orelse return null;
         errdefer predicate.deinit();
         const owner = try a.create(Ordered);
-        owner.* = .{ .a = a, .execution = self, .predicate = predicate, .plan_arena = arena, .window = .init(a), .identities = identities };
+        owner.* = .{ .a = a, .execution = self, .predicate = predicate, .plan_arena = arena, .window = .init(a), .identities = identities, .page_size = if (predicate.complete_order) @min(256, @as(usize, req.offset) + req.limit + 1) else 256 };
         keep_arena = true;
-        return .{ .ptr = owner, .next = Ordered.next, .scanned_count = Ordered.scannedCount, .close = Ordered.close };
+        return .{ .ptr = owner, .next = Ordered.next, .scanned_count = Ordered.scannedCount, .complete_order = predicate.complete_order, .close = Ordered.close };
     }
     fn searchText(raw: ?*anyopaque, a: A, req: types.SearchRequest, text: types.TextQuery) !types.SearchResult {
         const self = from(raw);

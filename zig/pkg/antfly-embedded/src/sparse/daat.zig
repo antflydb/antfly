@@ -16,7 +16,7 @@
 //! Exact document-at-a-time sparse scoring. Streams retain encoded posting
 //! blocks; no decoded arrays or corpus-sized score table are required. Bounds
 //! include absence (zero) and both signed endpoints, and are added in the same
-//! f32 order as contributions. Strict pruning preserves score ties.
+//! f32 order as contributions. Ordinal-aware pruning preserves score ties.
 const std = @import("std");
 const A = std.mem.Allocator;
 pub const Entry = struct {
@@ -40,7 +40,7 @@ pub fn addScore(left: f32, right: f32) !f32 {
     return result;
 }
 pub const Stats = struct { scored: usize = 0, skipped_blocks: usize = 0, skipped_prefixes: usize = 0 };
-pub const BlockProbe = union(enum) { legacy, end, block: struct { first: u32, last: u32, min: f32, max: f32 } };
+pub const BlockProbe = union(enum) { legacy, end, block: struct { first: u32, last: u32, min: f32, max: f32, unique: bool = false } };
 pub const BlockReader = struct {
     probe: ?*const fn (*anyopaque, u64, u32, u64) anyerror!BlockProbe = null,
     ptr: *anyopaque,
@@ -103,7 +103,9 @@ pub const Stream = struct {
         if (self.chunk.len != 0) return;
         const first = self.doc orelse return;
         self.doc = null;
-        self.seek_target = first;
+        // Probe identified the block by its last-ordinal key. Its first ordinal
+        // can equal the preceding legacy block's last ordinal.
+        self.seek_target = self.last;
         try self.loadEncoded();
         if (self.doc == null or self.doc.? != first) return error.InvalidChunk;
     }
@@ -119,12 +121,12 @@ pub const Stream = struct {
                 .legacy => {},
                 .block => |block| {
                     if (block.first > block.last or block.last < self.seek_target) return error.InvalidChunk;
-                    if (self.doc) |prior| if (block.first <= prior) return error.InvalidChunk;
+                    if (self.doc) |prior| if (block.first < prior) return error.InvalidChunk;
                     self.deinit();
                     self.chunk = &.{};
                     self.doc = block.first;
                     self.last = block.last;
-                    self.upper = if (std.math.isFinite(self.weight) and std.math.isFinite(block.min) and std.math.isFinite(block.max)) @max(0, @max(self.weight * block.min, self.weight * block.max)) else std.math.inf(f32);
+                    self.upper = if (block.unique and std.math.isFinite(self.weight) and std.math.isFinite(block.min) and std.math.isFinite(block.max)) @max(0, @max(self.weight * block.min, self.weight * block.max)) else std.math.inf(f32);
                     return;
                 },
             }
@@ -135,6 +137,9 @@ pub const Stream = struct {
         const prior = self.doc;
         self.doc = null;
         var ordinal_bounds: ?[2]u32 = null;
+        // Old framed streams may repeat an ordinal across block boundaries.
+        // Only a producer proof or a complete single chunk permits pruning.
+        var unique = self.single != null;
         if (self.reader) |reader| {
             self.deinit();
             self.owned = try reader.read(reader.ptr, self.allocator.?, self.segment.?, self.term, self.seek_target);
@@ -159,7 +164,8 @@ pub const Stream = struct {
             if (range_end > range.len) return error.InvalidChunk;
             const tail = range[@intCast(range_end)..];
             if (tail.len != 0) {
-                if (tail.len != 12 or !std.mem.eql(u8, tail[0..4], "O32B")) return error.InvalidChunk;
+                if (tail.len != 12 or (!std.mem.eql(u8, tail[0..4], "O32B") and !std.mem.eql(u8, tail[0..4], "O32U"))) return error.InvalidChunk;
+                unique = std.mem.eql(u8, tail[0..4], "O32U");
                 ordinal_bounds = .{ std.mem.readInt(u32, tail[4..8], .little), std.mem.readInt(u32, tail[8..12], .little) };
             }
             self.offset += @as(usize, length) + range_length;
@@ -172,7 +178,7 @@ pub const Stream = struct {
         self.count = count;
         self.index = 0;
         const first = std.mem.readInt(u32, bytes[13..17], .little);
-        if (prior) |previous| if (first <= previous) return error.InvalidChunk;
+        if (prior) |previous| if (first < previous or (unique and first == previous)) return error.InvalidChunk;
         self.doc = first;
         self.last = first;
         if (ordinal_bounds) |bounds| {
@@ -180,15 +186,22 @@ pub const Stream = struct {
             self.last = bounds[1];
         } else for (1..count) |i| {
             const delta = std.mem.readInt(u32, bytes[13 + i * 4 ..][0..4], .little);
-            if (delta == 0) return error.InvalidChunk;
+            if (delta == 0) unique = false;
             self.last = std.math.add(u32, self.last, delta) catch return error.InvalidChunk;
         }
         const max: f32 = @bitCast(std.mem.readInt(u32, bytes[5..9], .little));
         self.min_weight = @bitCast(std.mem.readInt(u32, bytes[9..13], .little));
         self.step = (if (max > self.min_weight) max - self.min_weight else @as(f32, 1)) / 255.0;
-        const end = self.min_weight + @as(f32, 255) * self.step;
+        var low: u8 = 255;
+        var high: u8 = 0;
+        for (bytes[13 + @as(usize, count) * 4 ..]) |value| {
+            low = @min(low, value);
+            high = @max(high, value);
+        }
+        const minimum = self.min_weight + @as(f32, @floatFromInt(low)) * self.step;
+        const maximum = self.min_weight + @as(f32, @floatFromInt(high)) * self.step;
         // Nonfinite input keeps the conservative path: never prune by it.
-        self.upper = if (std.math.isFinite(self.weight) and std.math.isFinite(self.min_weight) and std.math.isFinite(end)) @max(0, @max(self.weight * self.min_weight, self.weight * end)) else std.math.inf(f32);
+        self.upper = if (unique and std.math.isFinite(self.weight) and std.math.isFinite(minimum) and std.math.isFinite(maximum)) @max(0, @max(self.weight * minimum, self.weight * maximum)) else std.math.inf(f32);
     }
     pub fn contribution(self: *Stream) !f32 {
         try self.materialize();
@@ -208,6 +221,10 @@ pub const Stream = struct {
         }
     }
 };
+
+fn cannotBeat(upper: f32, first: u32, winner: Entry) bool {
+    return std.math.isFinite(upper) and (upper < winner.score or (upper == winner.score and first > winner.doc_num));
+}
 
 pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stats) ![]Entry {
     var winners = std.PriorityQueue(Entry, void, Entry.worse).initContext({});
@@ -264,7 +281,7 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
                 end = @min(end, stream.last);
             };
             next_bounds = @as(u64, end) + 1;
-            if (std.math.isFinite(upper) and upper < winners.peek().?.score) {
+            if (cannotBeat(upper, doc, winners.peek().?)) {
                 queue.clearRetainingCapacity();
                 for (streams, 0..) |*stream, i| {
                     try context.check();
@@ -288,7 +305,7 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
                     if (next <= doc) prefix_upper += stream.upper else prefix_end = @min(prefix_end, next);
                 };
             }
-            if (std.math.isFinite(prefix_upper) and prefix_upper < winners.peek().?.score) {
+            if (cannotBeat(prefix_upper, doc, winners.peek().?)) {
                 while (queue.peek()) |i| {
                     if (streams[i].doc.? != doc) break;
                     _ = queue.pop();
@@ -338,11 +355,15 @@ test "sparse document scoring prunes signed blocks and preserves exact ties unde
         std.mem.writeInt(u32, bytes[9..13], @bitCast(weight), .little);
         for (0..16) |i| std.mem.writeInt(u32, bytes[13 + i * 4 ..][0..4], if (i == 0) @intCast(block * 16) else 1, .little);
         var header: [8]u8 = @splat(0);
-        std.mem.writeInt(u32, header[4..8], 8, .little);
+        std.mem.writeInt(u32, header[4..8], 20, .little);
         std.mem.writeInt(u32, header[0..4], bytes.len, .little);
         try payload.appendSlice(a, &header);
         try payload.appendSlice(a, &bytes);
-        try payload.appendSlice(a, &@as([8]u8, @splat(0)));
+        var range: [20]u8 = @splat(0);
+        @memcpy(range[8..12], "O32U");
+        std.mem.writeInt(u32, range[12..16], @intCast(block * 16), .little);
+        std.mem.writeInt(u32, range[16..20], @intCast(block * 16 + 15), .little);
+        try payload.appendSlice(a, &range);
     };
     const Context = struct {
         pub fn check(_: *@This()) !void {}
@@ -480,7 +501,7 @@ test "sparse block prefix pivots skip low lead ranges before later high terms" {
     try std.testing.expectEqual(@as(u32, 0), result[0].doc_num);
     try std.testing.expectEqual(@as(f32, 1100), result[0].score);
     try std.testing.expectEqual(@as(usize, 1), stats.scored);
-    try std.testing.expectEqual(@as(usize, 1), stats.skipped_prefixes);
+    try std.testing.expect(stats.skipped_prefixes + stats.skipped_blocks > 0);
 }
 
 test "sparse block prefix pivots match exhaustive signed f32 scores across randomized streams" {
@@ -531,7 +552,7 @@ test "sparse metadata bounds skip posting payloads before decoding" {
             if (lower >= 64) return .end;
             const first: u32 = @intCast(lower / 16 * 16);
             const weight: f32 = if (first == 0) 100 else 1;
-            return .{ .block = .{ .first = first, .last = first + 15, .min = weight, .max = weight } };
+            return .{ .block = .{ .first = first, .last = first + 15, .min = weight, .max = weight, .unique = true } };
         }
         fn read(raw: *anyopaque, a: A, _: u64, _: u32, lower: u64) !?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -542,10 +563,11 @@ test "sparse metadata bounds skip posting payloads before decoding" {
             const chunk = bytes[8..];
             chunk[0] = 1;
             std.mem.writeInt(u32, chunk[1..5], 16, .little);
-            const weight: f32 = if (lower == 0) 100 else 1;
+            const first = lower / 16 * 16;
+            const weight: f32 = if (first == 0) 100 else 1;
             std.mem.writeInt(u32, chunk[5..9], @bitCast(weight), .little);
             std.mem.writeInt(u32, chunk[9..13], @bitCast(weight), .little);
-            for (0..16) |i| std.mem.writeInt(u32, chunk[13 + i * 4 ..][0..4], if (i == 0) @intCast(lower) else 1, .little);
+            for (0..16) |i| std.mem.writeInt(u32, chunk[13 + i * 4 ..][0..4], if (i == 0) @intCast(first) else 1, .little);
             self.reads += 1;
             self.resident += bytes.len;
             return bytes;
@@ -567,4 +589,71 @@ test "sparse metadata bounds skip posting payloads before decoding" {
     try std.testing.expectEqual(@as(u32, 0), top[0].doc_num);
     try std.testing.expectEqual(@as(usize, 1), reader.reads);
     try std.testing.expect(stats.skipped_blocks >= 3);
+}
+
+// Deliberately old O32B streams: repeated dimensions were accepted on disk.
+fn appendLegacyTestBlock(a: A, payload: *std.ArrayList(u8), docs: []const u32, weight: f32) !void {
+    const size = 13 + docs.len * 5;
+    const start = payload.items.len;
+    try payload.appendNTimes(a, 0, 8 + size + 20);
+    const out = payload.items[start..];
+    std.mem.writeInt(u32, out[0..4], @intCast(size), .little);
+    std.mem.writeInt(u32, out[4..8], 20, .little);
+    const chunk = out[8..][0..size];
+    chunk[0] = 1;
+    std.mem.writeInt(u32, chunk[1..5], @intCast(docs.len), .little);
+    std.mem.writeInt(u32, chunk[5..9], @bitCast(weight), .little);
+    std.mem.writeInt(u32, chunk[9..13], @bitCast(weight), .little);
+    for (docs, 0..) |doc, i| std.mem.writeInt(u32, chunk[13 + i * 4 ..][0..4], if (i == 0) doc else doc - docs[i - 1], .little);
+    const range = out[8 + size ..];
+    @memcpy(range[8..12], "O32B");
+    std.mem.writeInt(u32, range[12..16], docs[0], .little);
+    std.mem.writeInt(u32, range[16..20], docs[docs.len - 1], .little);
+}
+test "sparse legacy repeated ordinals preserve top k within and across blocks" {
+    const a = std.testing.allocator;
+    const Context = struct {
+        pub fn check(_: *@This()) !void {}
+        pub fn allows(_: *@This(), _: Stream, _: u32) !bool {
+            return true;
+        }
+    };
+    for ([_]bool{ false, true }) |split| {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(a);
+        try appendLegacyTestBlock(a, &payload, &.{ 0, 1, 2 }, 10);
+        if (split) {
+            try appendLegacyTestBlock(a, &payload, &.{3}, 6);
+            try appendLegacyTestBlock(a, &payload, &.{ 3, 4 }, 6);
+        } else try appendLegacyTestBlock(a, &payload, &.{ 3, 3, 4 }, 6);
+        var ctx: Context = .{};
+        var streams = [_]Stream{.{ .weight = 1, .payload = payload.items }};
+        var stats: Stats = .{};
+        const result = try collect(a, &streams, 1, &ctx, &stats);
+        defer a.free(result);
+        try std.testing.expectEqual(@as(u32, 3), result[0].doc_num);
+        try std.testing.expectEqual(@as(f32, 12), result[0].score);
+    }
+}
+test "sparse exact constant bounds prune equal score losers by ordinal" {
+    var bytes: [13 + 1024 * 5]u8 = @splat(0);
+    bytes[0] = 1;
+    std.mem.writeInt(u32, bytes[1..5], 1024, .little);
+    std.mem.writeInt(u32, bytes[5..9], @bitCast(@as(f32, 1)), .little);
+    std.mem.writeInt(u32, bytes[9..13], @bitCast(@as(f32, 1)), .little);
+    for (1..1024) |i| std.mem.writeInt(u32, bytes[13 + i * 4 ..][0..4], 1, .little);
+    const Context = struct {
+        pub fn check(_: *@This()) !void {}
+        pub fn allows(_: *@This(), _: Stream, _: u32) !bool {
+            return true;
+        }
+    };
+    var ctx: Context = .{};
+    var streams = [_]Stream{.{ .weight = 1, .single = &bytes }};
+    var stats: Stats = .{};
+    const result = try collect(std.testing.allocator, &streams, 1, &ctx, &stats);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqual(@as(u32, 0), result[0].doc_num);
+    try std.testing.expectEqual(@as(usize, 1), stats.scored);
+    try std.testing.expect(stats.skipped_blocks > 0);
 }

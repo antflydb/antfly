@@ -120,6 +120,8 @@ pub const PinnedTextSource = struct {
     owner: ?*anyopaque = null,
     release_owner: ?*const fn (*anyopaque) void = null,
     selected_field: ?[]const u8 = null,
+    /// Immutable provider metadata retained by release_owner's lease.
+    provider_metadata: ?*const anyopaque = null,
     pub fn deinit(self: *PinnedTextSource) void {
         self.snapshot.quiesceReadContext();
         self.snapshot.release();
@@ -137,9 +139,10 @@ pub const IndexedTextPredicate = struct {
     exact: bool = true,
 };
 
-/// A provider-proven stream ordered by every requested key except the final
-/// public ID tie breaker. The collector must finish the boundary tie group.
+/// Providers may prove the complete order, including the public-ID tie. Older
+/// producers prove only the primary keys and must finish the boundary tie group.
 pub const OrderedTextCandidates = struct {
+    complete_order: bool = false,
     ptr: *anyopaque,
     scanned_count: ?*const fn (*anyopaque) u64 = null,
     next: *const fn (*anyopaque, usize) anyerror!?u32,
@@ -11411,7 +11414,7 @@ fn sortAndPageTextDocValueCandidatesAlloc(
 
         if (ordered != null and window_len == window_capacity) {
             var primary_order = effective_req;
-            primary_order.order_by = effective_req.order_by[0 .. effective_req.order_by.len - 1];
+            if (!ordered.?.complete_order) primary_order.order_by = effective_req.order_by[0 .. effective_req.order_by.len - 1];
             if (compareDecoratedSortHits(primary_order, decorated, window[0]) == (if (keep_previous_page) std.math.Order.lt else .gt)) {
                 decorated.deinit(alloc);
                 decorated_owned = false;

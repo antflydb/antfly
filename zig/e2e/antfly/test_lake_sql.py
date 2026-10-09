@@ -2787,6 +2787,26 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
             search_before=following_dates["hits"]["hits"][0]["_sort"], remote_snapshot=dates["remote_snapshot"])
         assert [h["_source"]["amount"] for h in prior_dates["hits"]["hits"]] == [0, 1], prior_dates
         assert prior_dates["profile"]["sort"]["ordered_scanned_count"] <= 4, prior_dates
+        # Almost the entire archive shares one timestamp. Complete public-ID
+        # seeks must deliver pages without walking that 100,000-row tie group.
+        tie_filter = {"range": {"event_time": {"gte": "1970-01-01T00:00:00.000000002Z"}}}
+        for id_desc in (False, True):
+            tie_order = [{"field": "event_time"}, {"field": "_id", "desc": id_desc}]
+            first_tie = query(tie_filter, order_by=tie_order, limit=3, profile=True)
+            first_ids = [hit["_id"] for hit in first_tie["hits"]["hits"]]
+            assert len(first_ids) == 3 and first_ids == sorted(first_ids, reverse=id_desc), first_tie
+            assert first_tie["profile"]["sort"]["candidate_source"] == "ordered_lake_index", first_tie
+            assert first_tie["profile"]["sort"]["ordered_scanned_count"] <= 4, first_tie
+            next_tie = query(tie_filter, order_by=tie_order, limit=3, profile=True,
+                search_after=first_tie["hits"]["hits"][-1]["_sort"], remote_snapshot=first_tie["remote_snapshot"])
+            next_ids = [hit["_id"] for hit in next_tie["hits"]["hits"]]
+            assert len(next_ids) == 3 and not set(first_ids) & set(next_ids), next_tie
+            assert first_ids + next_ids == sorted(first_ids + next_ids, reverse=id_desc), next_tie
+            assert next_tie["profile"]["sort"]["ordered_scanned_count"] <= 4, next_tie
+            previous_tie = query(tie_filter, order_by=tie_order, limit=3, profile=True,
+                search_before=next_tie["hits"]["hits"][0]["_sort"], remote_snapshot=next_tie["remote_snapshot"])
+            assert [hit["_id"] for hit in previous_tie["hits"]["hits"]] == first_ids, previous_tie
+            assert previous_tie["profile"]["sort"]["ordered_scanned_count"] <= 4, previous_tie
         native_dates = call("POST", "/tables/indexed_predicates/query", {
             "full_text_search": {"field": "event_time",
                 "start": "1969-12-31T23:59:59.999999999Z",

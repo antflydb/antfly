@@ -82,7 +82,7 @@ fn bindingFor(a: A, source: *local.serverless_query_lake_serving.ServingSource, 
         .parquet => .external_parquet,
         .iceberg => .external_iceberg,
         .lance => return error.UnsupportedExternalLakeIndex,
-    }, .row_ref_kind = .external, .source_id = source.inventory.source_id, .snapshot_id = source.inventory.snapshot_id, .schema_fingerprint = source.inventory.schema_fingerprint, .index_config_hash = try std.fmt.allocPrint(a, "native-ordered-rows-v5:{s}", .{std.fmt.bytesToHex(&fingerprint(tuple, predicate, cover), .lower)}), .column_bindings = try tuple.columnBindings(a) };
+    }, .row_ref_kind = .external, .source_id = source.inventory.source_id, .snapshot_id = source.inventory.snapshot_id, .schema_fingerprint = source.inventory.schema_fingerprint, .index_config_hash = try std.fmt.allocPrint(a, "native-ordered-rows-v6:{s}", .{std.fmt.bytesToHex(&fingerprint(tuple, predicate, cover), .lower)}), .column_bindings = try tuple.columnBindings(a) };
 }
 pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared) ![]const Declared {
     return buildIncremental(a, out, table, source, store, provider, cancellation, reusable, &.{});

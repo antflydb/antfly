@@ -119,6 +119,10 @@ test "external lake incremental native publication appends replaces removes and 
                 var warm = try corpora.acquire(std.testing.io, store, declaration.artifact, root, schema_json, .{ .cache = &read_cache, .scope = @splat(1), .context = .{} }, .{}, .none);
                 defer warm.deinit();
                 try std.testing.expect(warm.snapshot != pooled.snapshot);
+                try std.testing.expect(pooled.provider_metadata != null);
+                try std.testing.expect(warm.provider_metadata == pooled.provider_metadata);
+                const identities: *const @import("lake_index_text_predicate.zig").Identities = @ptrCast(@alignCast(pooled.provider_metadata.?));
+                try std.testing.expectEqual(expected, identities.files.count());
                 for (warm.snapshot.segments, pooled.snapshot.segments) |left, right| try std.testing.expect(left.shared == right.shared);
                 if (std.mem.eql(u8, declaration.name, "all_text")) {
                     var encoded_bytes = declaration.artifact.byte_len;

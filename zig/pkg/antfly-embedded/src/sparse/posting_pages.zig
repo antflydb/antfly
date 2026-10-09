@@ -332,14 +332,28 @@ pub fn putBlock(txn: anytype, id: u64, term: u32, last: u32, block: []const u8) 
     if (block.len < 26) return error.InvalidChunk;
     const chunk = block[8..];
     if (chunk[0] != 1) return error.InvalidChunk;
+    const count = std.mem.readInt(u32, chunk[1..5], .little);
+    const chunk_len = std.mem.readInt(u32, block[0..4], .little);
+    if (count == 0 or 13 + @as(u64, count) * 5 != chunk_len or chunk_len > chunk.len) return error.InvalidChunk;
+    const range = chunk[chunk_len..];
+    if (range.len < 8) return error.InvalidChunk;
+    const range_end = 8 + @as(u64, std.mem.readInt(u32, range[0..4], .little)) + std.mem.readInt(u32, range[4..8], .little);
+    const unique = range_end + 12 == range.len and std.mem.eql(u8, range[@intCast(range_end)..][0..4], "O32U");
     const first = std.mem.readInt(u32, chunk[13..17], .little);
     const max: f32 = @bitCast(std.mem.readInt(u32, chunk[5..9], .little));
     const min: f32 = @bitCast(std.mem.readInt(u32, chunk[9..13], .little));
     const step = (if (max > min) max - min else @as(f32, 1)) / 255.0;
-    var summary: [12]u8 = undefined;
+    var low: u8 = 255;
+    var high: u8 = 0;
+    for (chunk[13 + @as(usize, count) * 4 .. chunk_len]) |value| {
+        low = @min(low, value);
+        high = @max(high, value);
+    }
+    var summary: [13]u8 = undefined;
+    summary[12] = @intFromBool(unique);
     std.mem.writeInt(u32, summary[0..4], first, .little);
-    std.mem.writeInt(u32, summary[4..8], @bitCast(min), .little);
-    std.mem.writeInt(u32, summary[8..12], @bitCast(min + @as(f32, 255) * step), .little);
+    std.mem.writeInt(u32, summary[4..8], @bitCast(min + @as(f32, @floatFromInt(low)) * step), .little);
+    std.mem.writeInt(u32, summary[8..12], @bitCast(min + @as(f32, @floatFromInt(high)) * step), .little);
     var summary_key = key(id, term, last);
     summary_key[0] = summary_tag;
     try txn.put(&summary_key, &summary);
@@ -570,12 +584,13 @@ pub fn Reader(comptime Txn: type) type {
             seek[0] = summary_tag;
             const entry = (try self.summaries.?.seekAtOrAfter(&seek)) orelse return .legacy;
             if (entry.key.len != 17 or !std.mem.eql(u8, entry.key[0..13], seek[0..13])) return .legacy;
-            if (entry.value.len != 12) return error.InvalidSparseSegment;
+            if (entry.value.len != 12 and entry.value.len != 13) return error.InvalidSparseSegment;
             return .{ .block = .{
                 .first = std.mem.readInt(u32, entry.value[0..4], .little),
                 .last = std.mem.readInt(u32, entry.key[13..17], .big),
                 .min = @bitCast(std.mem.readInt(u32, entry.value[4..8], .little)),
                 .max = @bitCast(std.mem.readInt(u32, entry.value[8..12], .little)),
+                .unique = entry.value.len == 13 and entry.value[12] == 1,
             } };
         }
         fn read(raw: *anyopaque, a: A, id: u64, term: u32, lower: u64) !?[]u8 {

@@ -24,6 +24,7 @@ const stores = @import("../serverless/artifacts/store.zig");
 const artifacts = @import("lake_index_aggregate_artifact.zig");
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
+const tie_directory = @import("lake_index_tie_directory.zig");
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const rows = local.storage_rowsource_types;
 pub const metadata_version: u16 = 5;
@@ -36,12 +37,26 @@ pub const Root = struct {
     domain: [32]u8,
     page: ?tree.Ref,
     reverse: ?tree.Ref = null,
+    ties: ?tree.Ref = null,
+    tie_version: u8 = 0,
+    /// Derived once by loadRoot in the bounded decoded-metadata cache.
+    public_digests: []const [32]u8 = &.{},
     predicates: ?tree.Ref = null,
     source: []const u8,
     snapshot: []const u8,
     files: []const []const u8,
     cover: []const []const u8 = &.{},
     file_fingerprints: []const [32]u8 = &.{},
+    pub fn jsonStringify(self: Root, stream: anytype) @TypeOf(stream.*).Error!void {
+        try stream.beginObject();
+        inline for (@typeInfo(Root).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "public_digests")) {
+                try stream.objectField(field);
+                try stream.write(@field(self, field));
+            }
+        }
+        try stream.endObject();
+    }
     pub fn validate(self: Root) !void {
         if (self.version != metadata_version or self.tuple_encoding != tuples.encoding_version or std.mem.allEqual(u8, &self.domain, 0) or std.mem.allEqual(u8, &self.fingerprint, 0) or self.source.len == 0 or self.snapshot.len == 0) return error.InvalidNativeLakeRowIndex;
         if (self.file_fingerprints.len != 0 and self.file_fingerprints.len != self.files.len) return error.InvalidNativeLakeRowIndex;
@@ -49,6 +64,8 @@ pub const Root = struct {
         if (self.page) |page| try page.validate();
         if (self.reverse) |page| try page.validate();
         if (self.predicates) |page| try page.validate();
+        if (self.tie_version > 1 or (self.tie_version == 0 and self.ties != null) or (self.tie_version == 1 and (self.page != null) != (self.ties != null))) return error.InvalidNativeLakeRowIndex;
+        if (self.ties) |page| try page.validate();
         if (self.reverse != null and (self.page == null or self.reverse.?.records != self.page.?.records)) return error.InvalidNativeLakeRowIndex;
         var names: std.StringHashMapUnmanaged(void) = .empty;
         defer names.deinit(std.heap.page_allocator);
@@ -85,6 +102,9 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     defer predicates.deinit();
     var reverse_sort = local.sql_spill.Sort.init(a, sort.manager, &.{.{}}, 512 * 1024);
     defer reverse_sort.deinit();
+    reverse_sort.run_limit = 4;
+    var tie_builder = tie_directory.Builder.init(a, sort.manager);
+    defer tie_builder.deinit();
     const Sorted = struct {
         sort: *local.sql_spill.Sort,
         store: *stores.ArtifactStore,
@@ -189,10 +209,11 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     defer if (merge.cursor) |*cursor| cursor.deinit();
     var page: ?tree.Ref = null;
     var reverse: ?tree.Ref = null;
+    var ties: ?tree.Ref = null;
     // Authenticated subtree counts make the cost estimate proportional to
     // changed files, without walking every old row before choosing a strategy.
     const has_delta = if (delta.previous) |previous| blk: {
-        if (previous.reverse == null or (previous.page != null and previous.predicates == null)) break :blk false;
+        if (previous.tie_version != 1 or previous.reverse == null or (previous.page != null and previous.predicates == null)) break :blk false;
         var removed: u64 = 0;
         for (delta.keep, 0..) |keep_file, slot| {
             if (keep_file) continue;
@@ -208,6 +229,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
         const previous = delta.previous.?;
         page = previous.page;
         reverse = previous.reverse;
+        ties = previous.ties;
         // Walk only the reverse ranges belonging to replaced/removed files.
         // Every cursor stays on the retained prior root while copy-on-write
         // mutations publish a new candidate, never a partially visible index.
@@ -237,6 +259,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                     bytes += key.len;
                 }
                 if (forward_changes.items.len == 0) break;
+                ties = try tie_directory.apply(a, pages.store(), ties, forward_changes.items);
                 page = try applyChanges(a, pages.store(), page, forward_changes.items);
                 reverse = try applyChanges(a, pages.store(), reverse, reverse_changes.items);
             }
@@ -259,6 +282,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                 bytes += key.len * 2 + value.len;
             }
             if (forward_changes.items.len == 0) break;
+            ties = try tie_directory.apply(a, pages.store(), ties, forward_changes.items);
             page = try applyChanges(a, pages.store(), page, forward_changes.items);
             reverse = try applyChanges(a, pages.store(), reverse, reverse_changes.items);
         }
@@ -268,11 +292,13 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
             merge: *Merge,
             reverse_sort: *local.sql_spill.Sort,
             predicates: *predicate_blocks.Builder,
+            ties: *tie_directory.Builder,
             arena: std.heap.ArenaAllocator,
             ordinal: u64 = 0,
             pub fn next(self: *@This()) !?tree.Cursor.Record {
                 const record = try self.merge.next() orelse return null;
                 try self.predicates.add(record.key);
+                try self.ties.add(record.key);
                 _ = self.arena.reset(.retain_capacity);
                 const key = try std.mem.concat(self.arena.allocator(), u8, &.{ record.key[record.key.len - 16 ..], record.key });
                 try self.reverse_sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = key })}, .values = &.{}, .ordinal = self.ordinal });
@@ -280,9 +306,10 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
                 return record;
             }
         };
-        var collect: Collect = .{ .merge = &merge, .reverse_sort = &reverse_sort, .predicates = &predicates, .arena = .init(a) };
+        var collect: Collect = .{ .merge = &merge, .reverse_sort = &reverse_sort, .predicates = &predicates, .ties = &tie_builder, .arena = .init(a) };
         defer collect.arena.deinit();
         page = try tree.buildSorted(a, pages.store(), &collect);
+        ties = try tie_builder.finish(pages.store());
         var reverse_sorted: Sorted = .{ .sort = &reverse_sort, .store = store, .scope = scope, .cancellation = cancellation, .write_bytes = &write_bytes, .scratch = .init(a) };
         defer reverse_sorted.scratch.deinit();
         const ReverseSource = struct {
@@ -299,7 +326,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
     const files = try a.alloc([]const u8, inventory.files.len);
     defer a.free(files);
     for (files, inventory.files) |*file, entry| file.* = entry.file_id;
-    const root: Root = .{ .fingerprint = fingerprint, .domain = scope.domain, .page = page, .reverse = reverse, .predicates = predicate_root, .source = inventory.source_id, .snapshot = inventory.snapshot_id, .files = if (delta.files.len != 0) delta.files else files, .file_fingerprints = delta.fingerprints, .cover = cover };
+    const root: Root = .{ .fingerprint = fingerprint, .domain = scope.domain, .page = page, .reverse = reverse, .ties = ties, .tie_version = 1, .predicates = predicate_root, .source = inventory.source_id, .snapshot = inventory.snapshot_id, .files = if (delta.files.len != 0) delta.files else files, .file_fingerprints = delta.fingerprints, .cover = cover };
     try root.validate();
     const bytes = try std.json.Stringify.valueAlloc(a, root, .{});
     defer a.free(bytes);
@@ -324,8 +351,11 @@ pub fn loadRoot(a: A, store: stores.ArtifactStore, ref: Ref, cancellation: Cance
     if (ref.kind != .ordered_row_index or ref.metadata_version != metadata_version or ref.byte_len > max_root_bytes) return error.InvalidNativeLakeRowIndex;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, cache);
     defer a.free(bytes);
-    const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
+    var root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
     try root.validate();
+    const digests = try a.alloc([32]u8, root.files.len);
+    for (root.files, digests) |file, *digest| digest.* = local.storage_rowsource_identity.fileDigest(root.source, root.snapshot, file);
+    root.public_digests = digests;
     const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeRowIndex;
     if (!std.mem.eql(u8, &scope.domain, &root.domain)) return error.InvalidNativeLakeRowIndex;
     return root;
@@ -420,7 +450,7 @@ pub const Reader = struct {
         }
         return entries.toOwnedSlice(a);
     }
-    fn decode(self: *Reader, record: tree.Cursor.Record) !rows.RowRef {
+    pub fn decode(self: *Reader, record: tree.Cursor.Record) !rows.RowRef {
         if ((record.value.len != 16 and record.value.len != 70) or record.key.len < 16 or !std.mem.eql(u8, record.value[0..16], record.key[record.key.len - 16 ..])) return error.InvalidNativeLakeRowIndex;
         const physical: *const [16]u8 = @ptrCast(record.value.ptr);
         const file = std.mem.readInt(u32, physical[0..4], .big);
@@ -593,4 +623,89 @@ test "external lake ordered update strategy accounts for inserted and removed ro
     try std.testing.expect(!preferCopyOnWrite(100_000, 1, 20_000));
     try std.testing.expect(!preferCopyOnWrite(100_000, 20_000, 0));
     try std.testing.expect(preferCopyOnWrite(2, 2, 2));
+}
+
+test "external lake public ordering seeks complete ties across files and directions" {
+    const public = @import("lake_index_public_order.zig");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("public-ordered-ties");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = .{ .domain = @splat(5), .attempt = @splat(1) };
+    const Check = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Check.check };
+    defer manager.deinit();
+    const files: []const local.serverless_external_source_types.FileEntry = &.{
+        .{ .file_id = @constCast("a"), .object_uri = @constCast("file://a"), .byte_len = 1, .row_count = 10, .row_groups = &.{} },
+        .{ .file_id = @constCast("b"), .object_uri = @constCast("file://b"), .byte_len = 1, .row_count = 10, .row_groups = &.{} },
+        .{ .file_id = @constCast("c"), .object_uri = @constCast("file://c"), .byte_len = 1, .row_count = 10, .row_groups = &.{} },
+    };
+    const inventory: local.serverless_external_source_types.Inventory = .{ .format = .parquet, .source_id = @constCast("lake"), .source_uri = @constCast("file://lake"), .snapshot_id = @constCast("snapshot"), .schema_fingerprint = @constCast("schema"), .files = @constCast(files) };
+    const Expected = struct { key: [4]u8, id: []const u8, ref: rows.RowRef };
+    for ([_]bool{ false, true }) |primary_desc| {
+        var sort = local.sql_spill.Sort.init(a, &manager, &.{.{}}, 64 * 1024);
+        defer sort.deinit();
+        const expected = try ca.alloc(Expected, 30);
+        var position: usize = 0;
+        for (0..2) |primary| for (files, 0..) |file, slot| for (0..5) |row| {
+            var key: [20]u8 = undefined;
+            std.mem.writeInt(u32, key[0..4], @intCast(if (primary_desc) 1 - primary else primary), .big);
+            const ref: rows.RowRef = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .file_id = file.file_id, .row_group_ordinal = @intCast(row % 2), .row_ordinal = primary * 100 + row } };
+            @memcpy(key[4..20], &coordinate(@intCast(slot), ref.external));
+            try sort.add(.{ .keys = &.{local.sql_scalar.Datum.fromJson(.{ .string = &key })}, .values = &.{}, .ordinal = position });
+            expected[position] = .{ .key = key[0..4].*, .ref = ref, .id = try local.storage_rowsource_identity.allocId(ca, ref) };
+            position += 1;
+        };
+        const artifact = try publish(a, ca, &store, &sort, "ordered", @splat(3), inventory, &.{}, .none);
+        const root = try loadRoot(ca, store, artifact, .none, null);
+        try std.testing.expectEqual(@as(u64, 6), root.ties.?.records);
+        var reader: Reader = undefined;
+        try reader.init(a, &store, root, @splat(3), "", null, .none);
+        defer reader.deinit();
+        const Order = struct {
+            descending: bool,
+            fn less(self: @This(), x: Expected, y: Expected) bool {
+                const relation = std.mem.order(u8, &x.key, &y.key);
+                return if (relation != .eq) relation == .lt else std.mem.order(u8, x.id, y.id) == (if (self.descending) std.math.Order.gt else .lt);
+            }
+        };
+        for ([_]bool{ false, true }) |id_desc| {
+            std.mem.sort(Expected, expected, Order{ .descending = id_desc }, Order.less);
+            var all = try public.Cursor.init(a, &reader, "", null, null, null, id_desc, false);
+            defer all.deinit();
+            var rank: usize = 0;
+            while (true) {
+                const page = try all.next(ca, 3);
+                if (page.len == 0) break;
+                for (page) |ref| {
+                    try std.testing.expectEqualStrings(expected[rank].id, try local.storage_rowsource_identity.allocId(ca, ref));
+                    rank += 1;
+                }
+            }
+            try std.testing.expectEqual(expected.len, rank);
+            for ([_]usize{ 0, 7, 14, 15, 29 }) |boundary| for ([_]bool{ false, true }) |before| {
+                var cursor = try public.Cursor.init(a, &reader, "", null, &expected[boundary].key, expected[boundary].id, id_desc, before);
+                defer cursor.deinit();
+                var seen: usize = 0;
+                while (true) {
+                    const page = try cursor.next(ca, 2);
+                    if (page.len == 0) break;
+                    for (page) |ref| {
+                        const ordinal = if (before) boundary - seen - 1 else boundary + seen + 1;
+                        try std.testing.expectEqualStrings(expected[ordinal].id, try local.storage_rowsource_identity.allocId(ca, ref));
+                        seen += 1;
+                    }
+                }
+                try std.testing.expectEqual(if (before) boundary else expected.len - boundary - 1, seen);
+            };
+        }
+    }
 }

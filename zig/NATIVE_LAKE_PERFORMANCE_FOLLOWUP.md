@@ -70,8 +70,8 @@ cancellation joins the worker before releasing its read lease. Speculation keeps
 no result buffers and relies on the independently bounded native read caches.
 
 Document-at-a-time scoring retains one document accumulator and k winners.
-Conservative block bounds include zero and both signed weight endpoints; strict
-score pruning preserves ties. Block-prefix pivots exclude terms whose next
+Conservative block bounds include zero and both signed decoded endpoints;
+score/ordinal pruning preserves the exact winner order. Block-prefix pivots exclude terms whose next
 posting lies beyond the lead range, with a fence at the earliest block end.
 Nonfinite bounds disable pruning. Nonfinite contributions or f32 accumulation
 overflow return `SparseScoreOverflow` before ranking in both streaming and spill
@@ -432,3 +432,49 @@ reduces bytes for dense-gap fixtures; that ratio is not an archive throughput
 claim. Legacy conversion work and source/document directories still have explicit
 admission costs. These changes do not promise constant total memory for arbitrary
 legacy checkpoints or eliminate the need to measure skewed workloads.
+
+### Canonical sparse dimensions and complete public ordering
+
+New sparse writes sort dimensions and coalesce duplicates in original input
+order at the shared index ingestion boundary, before either bulk or delta writes.
+Bulk producers and compaction attest unique ordinals across a term with an
+`O32U` trailer. Older `O32B` and unextended framed streams remain readable and
+accumulate repeated ordinals within and across blocks; without that producer
+proof, score bounds are disabled. Compaction coalesces legacy repeated postings
+before emitting a proved stream. Handoff and rewritten legacy chunks do not
+invent a uniqueness proof from one locally unique chunk.
+
+Posting summaries retain the actual decoded minimum and maximum quantized
+weights and a uniqueness flag. Older 12-byte summaries take the conservative
+path; current 13-byte summaries can prune before payload reads. Equal-score
+blocks/prefixes are skipped only when their first possible ordinal loses to the
+heap boundary. Signed contributions retain canonical f32 addition order.
+
+Each bounded native text corpus owns one immutable physical-to-native identity
+directory, shared by search, planning, and highlights through the corpus lease.
+Directory construction copies typed blocks and bitmap references directly;
+queries no longer serialize and parse the entire directory through JSON. Directory
+allocations count against the existing corpus heap budget and remain pinned
+until the last reader releases that corpus generation.
+
+Ordered-row recipe v6 adds an authenticated tuple/file count directory alongside
+the existing forward, reverse, and predicate trees. A large logical-key tie group
+has one count per participating file. Initial construction groups counts in a
+bounded spill stream; incremental publication adjusts only changed tuple/file
+counts and retains untouched pages. Artifact GC marks the new tree under the
+same reader-safe publication lease as every other native artifact.
+
+When the relational index proves every nonconstant sort field, ordered text
+search uses this directory to visit participating files in public `lake1:` digest
+order and seeks physical rows within each file. The decoded-root cache computes
+snapshot-specific file digests once; changing their permutation requires no row
+reindexing. Public-ID ascending/descending and search-after/search-before use
+the complete tuple and exclusive physical coordinate boundary. The collector can
+stop within a tie group after its bounded winner window. Extra nonconstant keys,
+legacy roots, and incompatible orderings retain the existing complete-tie fallback.
+Per-group and per-file arenas are reset independently; prefetch remains bounded
+by the requested window, 256 references, and the physical probe budget.
+
+Representative cold/warm archive throughput benchmarks remain pending. Kernel
+and pagination counters establish avoided scoring/traversal, not an archive-scale
+latency or throughput claim.
