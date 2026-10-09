@@ -1907,9 +1907,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "lake-api-tests",
         .root_module = api_http_runtime_test_mod,
         .filters = @import("../../../build_support/antfly/test_support.zig").compileFiltersWithAnchors(b, &.{"api module compiles"}, lake_api_filters),
-        // Hosted object-table integration raises the measured macOS peak to
-        // 20.66 GB; retain headroom for this mounted API owner.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 22 else 7) * 1024 * 1024 * 1024,
+        // The native ordering and sparse integration suite peaks at 27.89 GB
+        // in macOS ReleaseFast codegen. Reserve 28 GiB, including headroom,
+        // so the shared scheduler admits only one large API compiler at a time.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 28 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-api-test", "Run mounted API lake and SQL integration tests").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, lake_api_tests, lake_api_filters).step);
