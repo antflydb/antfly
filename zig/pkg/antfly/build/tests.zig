@@ -293,7 +293,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const relation_namespace_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{"system catalog relation namespace transaction"},
+        .filters = &.{ "system catalog relation namespace transaction", "relation mutation ownership" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("system-catalog-relation-store-test", "Verify namespace and schema transaction rollback and restart")

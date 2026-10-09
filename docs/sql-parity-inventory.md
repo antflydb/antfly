@@ -2301,6 +2301,13 @@ post-admission cancellation/deadline failures to outcome-unknown. The final
 context-aware cut passes all 20 tests and 50 build steps, including deadline
 propagation and before/after-admission failure semantics. Public SQL transport
 is not yet wired and no additional original cases are credited.
+Guarded native apply also rechecks independently mutable extension ownership
+inside the replacing transaction. It streams the owning table's indexed members
+and parses changed index metadata once, rather than materializing the full
+catalog. Shared admission preserves semantic JSON equality and propagates OOM;
+the native gate passes all 38 tests and 50 steps, including extension acquisition
+after name admission, replicated deterministic rejection, standalone revision
+preservation and exhaustive allocation faults. This adds no corpus credit.
 The first standalone gate exposed missing storage-owner cleanup symbols in its
 unlinked test composition. Its catalog tests now use a dedicated module linked
 to the production ABI providers, without changing unrelated restore roots or

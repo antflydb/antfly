@@ -340,6 +340,21 @@ test "system catalog relation namespace transaction guarded replacements fence o
     command.compare_and_replace_table.relation_guard = guard;
     // A new source revision on a different table must not serialize this DDL.
     try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "unrelated" } });
+    // Ownership can change after name admission without changing the schema
+    // digest. Both standalone and replicated apply must retain owned state.
+    try store.applyStandaloneCommand(group, .{ .upsert_extension_member = .{ .extension_name = "owner", .scope = .{ .kind = .table, .table_name = table.name }, .object_kind = .table_schema, .object_name = "row", .table_name = table.name } });
+    const owned_revision = try store.standaloneRevision();
+    try std.testing.expectError(error.ExtensionOwnedObject, store.applyStandaloneCommand(group, command));
+    try std.testing.expectEqual(owned_revision, try store.standaloneRevision());
+    {
+        var rejected = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 1, .index = 1, .data = encoded }});
+        defer rejected.deinit();
+        const retained = (try store.getTable(a, group, table.table_id)).?;
+        defer metadata_table_manager.freeTable(a, retained);
+        try std.testing.expectEqualStrings("", retained.description);
+        try std.testing.expectEqual(@as(u64, 1), try store.durableAppliedIndex(group));
+    }
+    try store.applyStandaloneCommand(group, .{ .remove_extension_member = .{ .extension_name = "owner", .object_kind = .table_schema, .object_name = "row" } });
     try store.applyStandaloneCommand(group, command);
     {
         const actual = (try store.getTable(a, group, table.table_id)).?;
@@ -348,15 +363,15 @@ test "system catalog relation namespace transaction guarded replacements fence o
     }
     // Rename changes no schema version and leaves the index owner identical.
     // Only the in-transaction logical binding fence detects this race.
-    try applySystemCatalogTestCommand(&store, 1, .{ .expected_revision = 0, .mutation = .{ .action = .rename, .kind = .table, .name = "physical", .new_name = "logical" } });
+    try applySystemCatalogTestCommand(&store, 2, .{ .expected_revision = 0, .mutation = .{ .action = .rename, .kind = .table, .name = "physical", .new_name = "logical" } });
     command.compare_and_replace_table.expected = replacement;
     command.compare_and_replace_table.replacement.description = "must_not_apply";
     try std.testing.expectError(error.CatalogGenerationChanged, store.applyStandaloneCommand(group, command));
     const stale = try encodeTransitionCommand(a, command);
     defer a.free(stale);
-    var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 1, .index = 2, .data = stale }});
+    var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 1, .index = 3, .data = stale }});
     defer outcome.deinit();
-    try std.testing.expectEqual(@as(u64, 2), try store.durableAppliedIndex(group));
+    try std.testing.expectEqual(@as(u64, 3), try store.durableAppliedIndex(group));
     const actual = (try store.getTable(a, group, table.table_id)).?;
     defer metadata_table_manager.freeTable(a, actual);
     try std.testing.expectEqualStrings("guarded", actual.description);
@@ -11281,7 +11296,7 @@ pub const RaftApplyStore = struct {
         defer if (!committed) txn.abort();
         if (self.hasHotStandbyMirror()) txn.mutation_capture = &capture;
         if (command == .compare_and_replace_table) if (command.compare_and_replace_table.relation_guard) |guard| {
-            try self.validateRelationMutationTxn(&txn, group_id, guard, command.compare_and_replace_table.expected);
+            try self.validateRelationMutationTxn(&txn, group_id, guard, command.compare_and_replace_table.expected, command.compare_and_replace_table.replacement);
         };
         try self.applyTransitionCommandTxn(&txn, group_id, command);
         try advanceStandaloneRevision(&txn);
@@ -20094,8 +20109,8 @@ pub const RaftApplyStore = struct {
                 try self.applyTableUpsertTxn(txn, group_id, record);
             },
             .compare_and_replace_table => |replacement| {
-                if (replacement.relation_guard) |guard| self.validateRelationMutationTxn(txn, group_id, guard, replacement.expected) catch |err| switch (err) {
-                    error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.TableTopologyProtocolUpgradeRequired => return,
+                if (replacement.relation_guard) |guard| self.validateRelationMutationTxn(txn, group_id, guard, replacement.expected, replacement.replacement) catch |err| switch (err) {
+                    error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.TableTopologyProtocolUpgradeRequired, error.ExtensionOwnedObject => return,
                     else => return err,
                 };
                 try self.applyTableCompareAndReplaceTxn(
@@ -22284,6 +22299,7 @@ pub const RaftApplyStore = struct {
         group_id: u64,
         guard: system_catalog.RelationMutationGuard,
         expected: metadata.TableRecord,
+        replacement: metadata.TableRecord,
     ) !void {
         try guard.validate();
         if (guard.owner.table_id != expected.table_id) return error.InvalidCatalogMutation;
@@ -22302,6 +22318,22 @@ pub const RaftApplyStore = struct {
             if (value.value.parent_id != namespace_id or !std.mem.eql(u8, value.value.name, guard.logical_table) or
                 !std.mem.eql(u8, value.value.storage_name, expected.name)) return error.CatalogGenerationChanged;
         } else if (namespace_id != system_catalog.default_namespace_id or !std.mem.eql(u8, expected.name, guard.logical_table)) return error.CatalogGenerationChanged;
+        // Extension ownership is independently mutable. Recheck its exact
+        // table-local index in this write transaction, not a preflight snapshot.
+        var prefix_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
+        const prefix = try extensionTableOwnerIndexPrefixForTable(&prefix_buf, group_id, expected.name);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(prefix);
+        if (row == null or !std.mem.startsWith(u8, row.?.key, prefix)) return;
+        var ownership = try @import("../../extensions/table_ownership.zig").DefinitionMutationGuard.init(self.alloc, expected, replacement);
+        defer ownership.deinit();
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            var member = try decodeExtensionMemberRecord(self.alloc, try txn.get(entry.value));
+            defer member.deinitOwned(self.alloc);
+            if (try ownership.touches(member)) return error.ExtensionOwnedObject;
+        }
     }
 
     fn applyTableCompareAndReplaceTxn(
