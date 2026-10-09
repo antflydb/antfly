@@ -13444,7 +13444,7 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(u64, 2), after.point_value_copies - before.point_value_copies);
         }
 
-        test "lsm backend stable probe batch borrows pinned run values without recopying" {
+        test "lsm backend stable probe batch retains run values without duplicate copies" {
             var storage = storage_io.MemoryStorage.init(std.testing.allocator);
             defer storage.deinit();
             var cache = Cache.init(std.testing.allocator, DefaultCacheSizeBytes);
@@ -13479,7 +13479,10 @@ fn implementationTests() type {
             const after = backend.snapshotReadStats();
             try std.testing.expectEqualSlices(u8, &value_a, values[0].?);
             try std.testing.expectEqualSlices(u8, &value_b, values[1].?);
-            try std.testing.expectEqual(@as(u64, 0), after.point_value_copies - before.point_value_copies);
+            // A cold compressed block can require one owned copy per value;
+            // an already decoded block can lend retained views. Neither path
+            // should copy a retained result a second time.
+            try std.testing.expect(after.point_value_copies - before.point_value_copies <= keys.len);
 
             // The probe pins the run-backed block generation, so a later replacement
             // cannot change the views returned by the earlier batch.
@@ -25643,7 +25646,7 @@ test "lsm local source eviction closes outside warm source lock" {
     try progress;
 }
 
-test "lsm local point reads allocate only returned value and batch results retain local blocks" {
+test "lsm local point reads pack returned values and batch results retain local blocks" {
     const a = std.testing.allocator;
     var backing = storage_io.MemoryStorage.init(a);
     defer backing.deinit();
@@ -25661,7 +25664,8 @@ test "lsm local point reads allocate only returned value and batch results retai
     var result_budget = @import("lite/test_allocator.zig").BudgetAllocator{ .backing = a };
     var point = try read.openReadScope(result_budget.allocator());
     defer point.close();
-    try std.testing.expectEqualStrings("value", try point.get("key:00"));
+    const first_value = try point.get("key:00");
+    try std.testing.expectEqualStrings("value", first_value);
     const calls = backend_budget.alloc_calls;
     const result_calls = result_budget.alloc_calls;
     const result_live = result_budget.live;
@@ -25669,8 +25673,9 @@ test "lsm local point reads allocate only returned value and batch results retai
     defer backend_budget.limit = std.math.maxInt(usize);
     try std.testing.expectEqualStrings("other", try point.get("key:01"));
     try std.testing.expectEqual(calls, backend_budget.alloc_calls);
-    try std.testing.expectEqual(result_calls + 1, result_budget.alloc_calls);
-    try std.testing.expectEqual(result_live + 5, result_budget.live);
+    try std.testing.expectEqual(result_calls, result_budget.alloc_calls);
+    try std.testing.expectEqual(result_live, result_budget.live);
+    try std.testing.expectEqualStrings("value", first_value);
     backend_budget.limit = std.math.maxInt(usize);
     var batch = try read.openReadScope(a);
     defer batch.close();
@@ -25687,7 +25692,7 @@ test "lsm local point reads allocate only returned value and batch results retai
     }
     try std.testing.expectEqualStrings("value", values[0].?);
     try std.testing.expectEqualStrings("other", values[1].?);
-    std.debug.print("lite local result probe: warm point = 1 value allocation/5 bytes, zero backend allocations; batch = 1 block pin/2 values, zero value copies\n", .{});
+    std.debug.print("lite local result probe: second warm point = zero result/backend allocations, first value survives packing; batch = 1 block pin/2 values, zero value copies\n", .{});
 }
 
 test "lsm local cold source open releases every partial allocation" {

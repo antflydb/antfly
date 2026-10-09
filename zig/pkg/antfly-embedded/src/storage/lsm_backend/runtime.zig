@@ -2692,6 +2692,7 @@ const PointResultLifetime = enum {
             const base = @intFromPtr(owned.ptr);
             if (address >= base and address - base <= owned.len and value.len <= owned.len - (address - base)) return value;
         }
+        if (!(builtin.is_test and test_duplicate_owned_point_results)) return copyPointValue(backend, allocator, held, value);
         const owned = try allocator.dupe(u8, value);
         errdefer allocator.free(owned);
         try held.append(allocator, owned);
@@ -2984,10 +2985,7 @@ fn getCurrentPointRetainedLocked(
     if (backend.mutable.findIndex(namespace, key)) |idx| {
         const entry = backend.mutable.entryAt(idx);
         if (entry.tombstone) return error.NotFound;
-        const owned = try allocator.dupe(u8, entry.value);
-        errdefer allocator.free(owned);
-        try held_values.append(allocator, owned);
-        recordPointValueCopy(backend);
+        const owned = try copyPointValue(backend, allocator, held_values, entry.value);
         backend.recordMutableHit();
         return owned;
     }
@@ -2999,10 +2997,7 @@ fn getCurrentPointRetainedLocked(
         if (immutable.findIndex(namespace, key)) |idx| {
             const entry = immutable.entryAt(idx);
             if (entry.tombstone) return error.NotFound;
-            const owned = try allocator.dupe(u8, entry.value);
-            errdefer allocator.free(owned);
-            try held_values.append(allocator, owned);
-            recordPointValueCopy(backend);
+            const owned = try copyPointValue(backend, allocator, held_values, entry.value);
             backend.recordMutableHit();
             return owned;
         }
@@ -3077,7 +3072,6 @@ fn getFromRunPointRetainedLocked(
             }
         }
         const value = try getFromRunWithLocalIndex(backend, run, held_blocks, held_values, value_allocator, namespace, key, true) orelse return null;
-        recordPointValueCopy(backend);
         if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
         return value;
     }
@@ -3086,10 +3080,7 @@ fn getFromRunPointRetainedLocked(
     if (state.findIndex(namespace, key)) |idx| {
         const entry = state.entryAt(idx);
         if (entry.tombstone) return error.NotFound;
-        const owned = try value_allocator.dupe(u8, entry.value);
-        errdefer value_allocator.free(owned);
-        try held_values.append(value_allocator, owned);
-        recordPointValueCopy(backend);
+        const owned = try copyPointValue(backend, value_allocator, held_values, entry.value);
         if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
         return owned;
     }
@@ -3108,11 +3099,9 @@ fn getOwnedDirectoryPoint(
     namespace: backend_types.Namespace,
     key: []const u8,
 ) ![]const u8 {
-    var blocks: std.ArrayListUnmanaged(BlockPin) = .empty;
-    defer releaseHeldBlocks(&blocks, backend.allocator);
     var hint: ?BorrowedReadHint = null;
     const first_owned = held_values.items.len;
-    const value = try getFromDirectoryPointWithLifetime(backend, directory, &.{}, &hint, &blocks, held_values, allocator, namespace, key, .transaction_owned);
+    const value = try getFromDirectoryPointWithLifetime(backend, directory, &.{}, &hint, null, held_values, allocator, namespace, key, .transaction_owned);
     return PointResultLifetime.transaction_owned.retain(backend, allocator, held_values, first_owned, value);
 }
 
@@ -3141,11 +3130,8 @@ fn readManyCurrentSortedPointByRunLocked(
             if (entry.tombstone) {
                 result.misses += 1;
             } else {
-                const owned = try allocator.dupe(u8, entry.value);
-                errdefer allocator.free(owned);
-                try held_values.append(allocator, owned);
+                const owned = try copyPointValue(backend, allocator, held_values, entry.value);
                 values[i] = owned;
-                recordPointValueCopy(backend);
                 result.hits += 1;
                 backend.recordMutableHit();
             }
@@ -3164,11 +3150,8 @@ fn readManyCurrentSortedPointByRunLocked(
                 if (entry.tombstone) {
                     result.misses += 1;
                 } else {
-                    const owned = try allocator.dupe(u8, entry.value);
-                    errdefer allocator.free(owned);
-                    try held_values.append(allocator, owned);
+                    const owned = try copyPointValue(backend, allocator, held_values, entry.value);
                     values[i] = owned;
-                    recordPointValueCopy(backend);
                     result.hits += 1;
                     backend.recordMutableHit();
                 }
@@ -3223,15 +3206,11 @@ fn readManyCurrentSortedPointByRunLocked(
                         values[key_index] = concrete;
                         recordPointValueBorrow(backend);
                     } else {
-                        const owned = try allocator.dupe(u8, concrete);
-                        errdefer allocator.free(owned);
-                        try held_values.append(allocator, owned);
+                        const owned = try copyPointValue(backend, allocator, held_values, concrete);
                         values[key_index] = owned;
-                        recordPointValueCopy(backend);
                     }
                 } else {
                     values[key_index] = concrete;
-                    recordPointValueCopy(backend);
                 }
                 result.hits += 1;
                 if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
@@ -3257,11 +3236,8 @@ fn readManyCurrentSortedPointByRunLocked(
                     if (entry.tombstone) {
                         result.misses += 1;
                     } else {
-                        const owned = try allocator.dupe(u8, entry.value);
-                        errdefer allocator.free(owned);
-                        try held_values.append(allocator, owned);
+                        const owned = try copyPointValue(backend, allocator, held_values, entry.value);
                         values[key_index] = owned;
-                        recordPointValueCopy(backend);
                         result.hits += 1;
                         if (run.level == 0) backend.recordL0Hit() else backend.recordLevelHit();
                     }
@@ -3989,10 +3965,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         }
 
         fn ownValue(self: *@This(), value: []const u8) ![]const u8 {
-            const owned = try self.allocator.dupe(u8, value);
-            errdefer self.allocator.free(owned);
-            try self.held_values.append(self.allocator, owned);
-            return owned;
+            return copyPointValue(self.backend, self.allocator, &self.held_values, value);
         }
 
         fn ensureStablePointViewLoaded(self: *@This()) !void {
@@ -4030,9 +4003,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             defer if (!lease) {
                 self.read_hint = null;
             };
-            var temporary_blocks: std.ArrayListUnmanaged(BlockPin) = .empty;
-            defer releaseHeldBlocks(&temporary_blocks, self.backend.allocator);
-            const blocks = if (lease) &self.held_blocks else &temporary_blocks;
+            const blocks: ?*std.ArrayListUnmanaged(BlockPin) = if (lease) &self.held_blocks else null;
             if (self.stable_point_view) {
                 if (self.read_view.?.version) |version| if (version.directory) |directory| {
                     self.backend.recordPointGet();
@@ -4088,7 +4059,6 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                         recordPointValueBorrow(self.backend);
                         return entry.value;
                     }
-                    recordPointValueCopy(self.backend);
                     return try self.ownValue(entry.value);
                 }
                 break :blk try CurrentReadLayout(BackendType).capturePoint(self.backend, self.allocator);
@@ -4219,7 +4189,6 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             continue;
                         }
                         values[i] = try self.ownValue(entry.value);
-                        recordPointValueCopy(self.backend);
                         self.backend.recordMutableHit();
                         result.hits += 1;
                     }
@@ -5516,7 +5485,7 @@ fn getFromDirectoryPointWithLifetime(
     directory: *const @import("run_directory.zig").Directory,
     immutable_memtables: []const *const State,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *PointResultValues,
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -5562,7 +5531,7 @@ fn getFromDirectoryPointCandidatesWithLifetime(
     backend: anytype,
     directory: *const @import("run_directory.zig").Directory,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *PointResultValues,
     scratch: Allocator,
     value_allocator: Allocator,
@@ -5596,7 +5565,7 @@ fn getFromDirectoryPointCandidatesPlanned(
     backend: anytype,
     directory: *const @import("run_directory.zig").Directory,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *PointResultValues,
     scratch: Allocator,
     value_allocator: Allocator,
@@ -5827,7 +5796,7 @@ fn getFromSnapshotRuns(
     levels: []const RunLevel,
     last_l0_group_index: *?usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *PointResultValues,
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6157,7 +6126,7 @@ fn readPointRunCandidate(
     runs: []Run,
     candidate: PointRunCandidate,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *PointResultValues,
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6192,7 +6161,7 @@ fn getFromPathRunIndicesPrechecked(
     runs: []Run,
     run_indices: []const usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *PointResultValues,
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6225,7 +6194,7 @@ fn getFromPathRunIndicesPrechecked(
                 backend,
                 runs,
                 stack_candidates[0..stack_candidate_len],
-                read_hint,
+                if (held_blocks != null) read_hint else null,
                 held_values,
                 value_allocator,
                 namespace,
@@ -6244,7 +6213,7 @@ fn getFromPathRunIndicesPrechecked(
                 backend,
                 runs,
                 all_candidates.items,
-                read_hint,
+                if (held_blocks != null) read_hint else null,
                 held_values,
                 value_allocator,
                 namespace,
@@ -6272,7 +6241,7 @@ fn readPointRunCandidateWithStats(
     runs: []Run,
     candidate: PointRunCandidate,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *PointResultValues,
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -6358,6 +6327,12 @@ const AsyncPointResultPins = struct {
 // Final result storage, not temporary scratch. Small values share an owned
 // buffer; oversized values keep their exact-size allocation. Every buffer is
 // registered with the caller before use and survives pool eviction/errors.
+fn copyPointValue(backend: anytype, allocator: Allocator, held: *PointResultValues, value: []const u8) ![]const u8 {
+    const copied = try held.copies.copy(allocator, held, value);
+    recordPointValueCopy(backend);
+    return copied;
+}
+
 const AsyncPointResultCopies = struct {
     const max_buffer_bytes = 16 * 1024;
     const max_packed_value_bytes = 1024;
@@ -6850,6 +6825,7 @@ fn retainAsyncPointEntry(
         try held_values.append(value_allocator, owned);
         break :blk owned;
     };
+    recordPointValueCopy(backend);
     backend.recordPointRunSurvivorHit();
     return .{ .hit = value };
 }
@@ -7009,7 +6985,7 @@ fn consumeAsyncPointReadWithScratch(
 fn tryReadDirectoryPointAsync(
     backend: anytype,
     directory: *const @import("run_directory.zig").Directory,
-    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *PointResultValues,
     allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -7086,7 +7062,7 @@ fn tryReadPointRunCandidatesAsync(
     backend: anytype,
     runs: []Run,
     candidates: []const PointRunCandidate,
-    read_hint: *?BorrowedReadHint,
+    read_hint: ?*?BorrowedReadHint,
     held_values: *PointResultValues,
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -7113,6 +7089,7 @@ fn tryReadPointRunCandidatesAsync(
             };
             if (prepared.status == .future) issued_count += 1;
             stack_reads[read_count] = prepared;
+            stack_reads[read_count].result_copies = &held_values.copies;
             read_count += 1;
         }
         backend.recordPointRunAsyncBatch(issued_count);
@@ -7358,7 +7335,7 @@ fn getFromRunIndices(
     runs: []Run,
     run_indices: []const usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *PointResultValues,
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -7601,7 +7578,7 @@ fn getFromRunWithBlockCache(
     run: *Run,
     run_index: usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *PointResultValues,
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -7620,7 +7597,7 @@ fn getFromRunWithBlockCacheBatch(
     run: *Run,
     run_index: usize,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *PointResultValues,
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -7640,7 +7617,7 @@ fn getFromRunWithBlockCacheIndex(
     run_index: usize,
     index: *const lsm_table_file.TableIndex,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *PointResultValues,
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
@@ -7657,11 +7634,20 @@ fn getFromRunWithBlockCacheIndex(
 
     _ = run_index;
     _ = read_hint;
-    const located = try findExactEntryInCachedBlocks(backend, run, index, held_values, value_allocator, namespace, key);
+    const located = try findExactEntryInCachedBlocksWithLifetime(backend, run, index, held_values, value_allocator, namespace, key, PointResultLifetime.forBlockPins(held_blocks));
     var pinned = located orelse return null;
     errdefer if (pinned.handle) |*handle| handle.release();
     if (pinned.handle) |handle| {
-        try held_blocks.append(backend.allocator, .{ .cached = handle });
+        if (held_blocks) |pins| {
+            try pins.append(backend.allocator, .{ .cached = handle });
+        } else {
+            pinned.entry.value = if (pinned.entry.tombstone) "" else try copyPointValue(backend, value_allocator, held_values, pinned.entry.value);
+            pinned.entry.key = key;
+            pinned.entry.namespace_name = namespace.name;
+            var owned_handle = handle;
+            owned_handle.release();
+            pinned.handle = null;
+        }
     }
     return .{
         .entry_index = pinned.entry_index,
@@ -7675,13 +7661,14 @@ fn getFromRunWithBlockCacheBatchState(
     run_index: usize,
     state: *RunBatchIndexState,
     read_hint: *?BorrowedReadHint,
-    held_blocks: *std.ArrayListUnmanaged(BlockPin),
+    held_blocks: ?*std.ArrayListUnmanaged(BlockPin),
     held_values: *PointResultValues,
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
     key: []const u8,
     run_filter_checked: bool,
 ) !?LocatedTableEntry {
+    if (held_blocks == null) return getFromRunWithBlockCacheIndex(backend, run, run_index, state.handle.runTableIndex(), read_hint, null, held_values, value_allocator, namespace, key, run_filter_checked);
     const index = state.handle.runTableIndex();
     if (!run_filter_checked) {
         const present = lsm_table_file.maybeContains(index.borrowFilter(), namespace.name, key);
@@ -7691,9 +7678,7 @@ fn getFromRunWithBlockCacheBatchState(
         }
     }
 
-    _ = run_index;
-    _ = read_hint;
-    const located = try findExactEntryInBatchBlocks(backend, run, index, state, held_blocks, held_values, value_allocator, namespace, key);
+    const located = try findExactEntryInBatchBlocks(backend, run, index, state, held_blocks.?, held_values, value_allocator, namespace, key);
     if (located) |entry| {
         if (!entry.entry.tombstone) state.block_has_values = true;
     }
@@ -7826,6 +7811,7 @@ fn findExactEntryInCachedCompressedPrefixBlock(
     value_allocator: Allocator,
     namespace: backend_types.Namespace,
     key: []const u8,
+    lifetime: PointResultLifetime,
 ) !?LocatedTableEntry {
     const block = index.blocks[block_index];
     const window = index.blockWindow(block_index);
@@ -7845,7 +7831,7 @@ fn findExactEntryInCachedCompressedPrefixBlock(
     defer handle.release();
     var scratch = PointReadScratch.init(backend);
     defer scratch.deinit();
-    const found = (findExactEntryInCachedPrefixWithScratch(handle.runTablePhysicalBlock(), block, window, held_values, value_allocator, scratch.allocator(), namespace, key) catch |err| return scratch.failure(err)) orelse return null;
+    const found = (findExactEntryInCachedPrefixWithScratch(backend, handle.runTablePhysicalBlock(), block, window, held_values, value_allocator, scratch.allocator(), namespace, key, lifetime) catch |err| return scratch.failure(err)) orelse return null;
     if (namespace.retainDataBlocks() and handle.claimPointBlockPromotion(window.len)) {
         defer handle.finishPointBlockPromotion();
         try promoteCachedPointBlock(backend, run.path.?, run.id, backend.root_generation, window, absolute_offset, handle.runTablePhysicalBlock(), null);
@@ -7897,6 +7883,7 @@ fn promoteCachedPointBlock(backend: anytype, path: []const u8, run_id: u64, gene
 }
 
 fn findExactEntryInCachedPrefixWithScratch(
+    backend: anytype,
     payload: []const u8,
     block: lsm_table_file.TableIndex.BlockMeta,
     window: lsm_table_file.EntryDataWindow,
@@ -7905,6 +7892,7 @@ fn findExactEntryInCachedPrefixWithScratch(
     scratch: Allocator,
     namespace: backend_types.Namespace,
     key: []const u8,
+    lifetime: PointResultLifetime,
 ) !?LocatedTableEntry {
     try lsm_table_file.validateBlockPayload(payload, window.checksum);
     const snappy = @import("../../encoding/snappy.zig");
@@ -7917,9 +7905,17 @@ fn findExactEntryInCachedPrefixWithScratch(
     defer reader.deinit(scratch);
     if (reader.entryCount() != block.entry_count) return error.InvalidTableFile;
     const found = try reader.find(scratch, namespace.name, key) orelse return null;
+    if (lifetime == .transaction_owned) {
+        var entry = found.entry;
+        entry.value = if (entry.tombstone) "" else try copyPointValue(backend, value_allocator, held_values, entry.value);
+        entry.key = key;
+        entry.namespace_name = namespace.name;
+        return .{ .entry_index = found.index, .entry = entry };
+    }
     const owned = try copyTableEntry(value_allocator, found.entry);
     errdefer value_allocator.free(owned.bytes);
     try held_values.append(value_allocator, owned.bytes);
+    recordPointValueCopy(backend);
     return .{ .entry_index = found.index, .entry = owned.entry };
 }
 
@@ -7949,6 +7945,19 @@ fn findExactEntryInCachedBlocks(
     namespace: backend_types.Namespace,
     key: []const u8,
 ) !?BlockLocatedEntry {
+    return findExactEntryInCachedBlocksWithLifetime(backend, run, index, held_values, value_allocator, namespace, key, .snapshot_pinned);
+}
+
+fn findExactEntryInCachedBlocksWithLifetime(
+    backend: anytype,
+    run: *Run,
+    index: *const lsm_table_file.TableIndex,
+    held_values: *PointResultValues,
+    value_allocator: Allocator,
+    namespace: backend_types.Namespace,
+    key: []const u8,
+    lifetime: PointResultLifetime,
+) !?BlockLocatedEntry {
     try requireTableBlocks(index);
     const block_index = index.findBlockIndex(namespace.name, key) orelse return null;
     const block = index.blocks[block_index];
@@ -7967,7 +7976,7 @@ fn findExactEntryInCachedBlocks(
     // A checked prefix lookup distinguishes a hit from a definitive miss.
     // Never decode the entire block a second time just to confirm that miss.
     if (window.compression == .prefix or window.compression == .prefix_snappy) {
-        const entry = try findExactEntryInCachedCompressedPrefixBlock(backend, run, index, block_index, held_values, value_allocator, namespace, key) orelse return null;
+        const entry = try findExactEntryInCachedCompressedPrefixBlock(backend, run, index, block_index, held_values, value_allocator, namespace, key, lifetime) orelse return null;
         return .{ .entry_index = entry.entry_index, .entry = entry.entry, .handle = null };
     }
     const handle = try loadRunTableBlockHandle(backend, run, index, window, namespace.retainDataBlocks());
@@ -8688,10 +8697,7 @@ fn getFromRunWithLocalIndex(
         return loaded.entry.value;
     }
 
-    const owned_value = try value_allocator.dupe(u8, loaded.entry.value);
-    errdefer value_allocator.free(owned_value);
-    try held_values.append(value_allocator, owned_value);
-    return owned_value;
+    return try copyPointValue(backend, value_allocator, held_values, loaded.entry.value);
 }
 
 fn runMayContainWithFilter(backend: anytype, run: *Run, namespace: backend_types.Namespace, key: []const u8) !bool {
@@ -12280,87 +12286,175 @@ test "lsm async reuse single directory reads preserve tombstones namespaces and 
 test "lsm async reuse ordinary probes own one copy without retaining blocks" {
     const a = std.testing.allocator;
     const B = @import("../lsm_backend.zig").Backend;
-    var storage = storage_io.MemoryStorage.init(a);
-    defer storage.deinit();
-    var cache = cache_mod.Cache.init(a, 16 * 1024 * 1024);
-    defer cache.deinit();
-    var backend = try B.open(a, "/ordinary-probe-ownership", .{
-        .storage = storage.storage(),
-        .cache = &cache,
-        .flush_threshold = 1,
-        .compact_threshold_runs = 100,
-        .l0_overlap_compact_threshold_runs = 100,
-        .table_block_compression = .none,
-        .max_concurrent_point_block_reads = 16,
-    });
-    defer backend.close();
-    var keys: [192][80]u8 = undefined;
-    for (&keys, 0..) |*key, i| {
-        @memset(key, 'k');
-        key[0] = @intCast(i);
-    }
-    const large: [8192]u8 = @splat('v');
-    for (0..2) |_| {
-        var write = try NamespaceWriteTxn(B).open(&backend);
-        errdefer write.abort();
-        for (&keys) |*key| try write.put(.{}, key, "v");
-        try write.put(.{}, "large", &large);
-        try write.commit();
-        while (try backend.runMaintenanceStep()) {}
-    }
-    try std.testing.expectEqual(@as(usize, 2), run_store.count(&backend));
-    for (0..6) |mode| {
-        if (mode == 3) {
-            backend.options.flush_threshold = 1000;
+    for ([_]lsm_table_file.CompressionPolicy{ .none, .snappy_adaptive }) |compression| {
+        var storage = storage_io.MemoryStorage.init(a);
+        defer storage.deinit();
+        var cache = cache_mod.Cache.init(a, 16 * 1024 * 1024);
+        defer cache.deinit();
+        var backend = try B.open(a, "/ordinary-probe-ownership", .{
+            .storage = storage.storage(),
+            .cache = &cache,
+            .flush_threshold = 1,
+            .compact_threshold_runs = 100,
+            .l0_overlap_compact_threshold_runs = 100,
+            .table_block_compression = compression,
+            .max_concurrent_point_block_reads = 16,
+        });
+        defer backend.close();
+        var keys: [192][80]u8 = undefined;
+        for (&keys, 0..) |*key, i| {
+            @memset(key, 'k');
+            key[0] = @intCast(i);
+        }
+        const large: [8192]u8 = @splat('v');
+        for (0..2) |_| {
             var write = try NamespaceWriteTxn(B).open(&backend);
             errdefer write.abort();
-            try write.put(.{}, "pending", "mutable");
+            for (&keys) |*key| try write.put(.{}, key, "v");
+            try write.put(.{}, "large", &large);
             try write.commit();
+            while (try backend.runMaintenanceStep()) {}
         }
-        if (mode % 3 != 1) for (0..run_store.count(&backend)) |i| {
+        try std.testing.expectEqual(@as(usize, 2), run_store.count(&backend));
+        for (0..6) |mode| {
+            if (mode == 3) {
+                backend.options.flush_threshold = 1000;
+                var write = try NamespaceWriteTxn(B).open(&backend);
+                errdefer write.abort();
+                try write.put(.{}, "pending", "mutable");
+                try write.commit();
+            }
+            if (mode % 3 != 1) for (0..run_store.count(&backend)) |i| {
+                const run = run_store.at(&backend, i);
+                var index = try loadRunTableIndexHandle(&backend, run);
+                defer index.release();
+                for (0..index.runTableIndex().blockCount()) |block_index| {
+                    var block = try loadRunTableBlockHandle(&backend, run, index.runTableIndex(), index.runTableIndex().blockWindow(block_index), true);
+                    block.release();
+                }
+            };
+            cache.pressure_target_bytes.store(if (mode % 3 == 2) cache.max_bytes else 0, .monotonic);
+            var probe = try BoundProbeTxn(B).open(&backend, .{});
+            defer probe.abort();
+            try std.testing.expectEqual(mode < 3, probe.stable_point_view);
+            const before_copies = backend.snapshotReadStats().point_value_copies;
+            const first = try probe.get(&keys[0]);
+            const second = try probe.get(&keys[1]);
+            const third = try probe.get(&keys[2]);
+            const wide = try probe.get("large");
+            try std.testing.expectEqual(@as(u64, 4), backend.snapshotReadStats().point_value_copies - before_copies);
+            try std.testing.expectEqual(@as(usize, 0), probe.held_blocks.items.len);
+            try std.testing.expectEqual(@as(usize, 2), probe.held_values.items.len);
+            try std.testing.expectEqual(@as(usize, 256), probe.held_values.items[0].len);
+            try std.testing.expectEqual(large.len, probe.held_values.items[1].len);
+            for (0..run_store.count(&backend)) |i| cache.invalidatePath(run_store.at(&backend, i).path.?);
+            try std.testing.expectEqual(@as(usize, 0), cache.currentBytes());
+            try std.testing.expectEqualStrings("v", first);
+            try std.testing.expectEqualStrings("v", second);
+            try std.testing.expectEqualStrings("v", third);
+            try std.testing.expectEqualStrings(&large, wide);
+            std.debug.print("\nordinary probe ownership: mode={d} pins=0 owned_bytes=8448 payload_buffers=2 cache_bytes_after_invalidation=0\n", .{mode});
+        }
+        cache.pressure_target_bytes.store(0, .monotonic);
+        // Short leases still opt into block borrowing, independently of ordinary
+        // probes, and remain valid after cache invalidation.
+        for (0..run_store.count(&backend)) |i| {
             const run = run_store.at(&backend, i);
             var index = try loadRunTableIndexHandle(&backend, run);
             defer index.release();
-            for (0..index.runTableIndex().blockCount()) |block_index| {
-                var block = try loadRunTableBlockHandle(&backend, run, index.runTableIndex(), index.runTableIndex().blockWindow(block_index), true);
-                block.release();
-            }
-        };
-        cache.pressure_target_bytes.store(if (mode % 3 == 2) cache.max_bytes else 0, .monotonic);
-        var probe = try BoundProbeTxn(B).open(&backend, .{});
-        defer probe.abort();
-        try std.testing.expectEqual(mode < 3, probe.stable_point_view);
-        const first = try probe.get(&keys[0]);
-        const second = try probe.get(&keys[1]);
-        const third = try probe.get(&keys[2]);
-        const wide = try probe.get("large");
-        try std.testing.expectEqual(@as(usize, 0), probe.held_blocks.items.len);
-        try std.testing.expectEqual(@as(usize, 2), probe.held_values.items.len);
-        try std.testing.expectEqual(@as(usize, 256), probe.held_values.items[0].len);
-        try std.testing.expectEqual(large.len, probe.held_values.items[1].len);
+            var block = try loadRunTableBlockHandle(&backend, run, index.runTableIndex(), index.runTableIndex().blockWindow(0), true);
+            block.release();
+        }
+        var lease = try BoundProbeTxn(B).open(&backend, .{});
+        defer lease.abort();
+        const borrowed = try lease.getLeased(&keys[0]);
+        try std.testing.expect(lease.held_blocks.items.len != 0);
+        try std.testing.expectEqual(@as(usize, 0), lease.leased_values.items.len);
         for (0..run_store.count(&backend)) |i| cache.invalidatePath(run_store.at(&backend, i).path.?);
-        try std.testing.expectEqual(@as(usize, 0), cache.currentBytes());
-        try std.testing.expectEqualStrings("v", first);
-        try std.testing.expectEqualStrings("v", second);
-        try std.testing.expectEqualStrings("v", third);
-        try std.testing.expectEqualStrings(&large, wide);
-        std.debug.print("\nordinary probe ownership: mode={d} pins=0 owned_bytes=8448 payload_buffers=2 cache_bytes_after_invalidation=0\n", .{mode});
+        try std.testing.expectEqualStrings("v", borrowed);
     }
-    cache.pressure_target_bytes.store(0, .monotonic);
-    // Short leases still opt into block borrowing, independently of ordinary
-    // probes, and remain valid after cache invalidation.
-    for (0..run_store.count(&backend)) |i| {
-        const run = run_store.at(&backend, i);
-        var index = try loadRunTableIndexHandle(&backend, run);
-        defer index.release();
-        var block = try loadRunTableBlockHandle(&backend, run, index.runTableIndex(), index.runTableIndex().blockWindow(0), true);
-        block.release();
+}
+
+test "lsm async reuse ordinary fallback packs copies without pin metadata" {
+    const a = std.testing.allocator;
+    const B = @import("../lsm_backend.zig").Backend;
+    const Budget = @import("../lite/test_allocator.zig").BudgetAllocator;
+    for ([_]bool{ false, true }) |with_cache| {
+        for ([_]usize{ 0, 1, 2 }) |run_count| {
+            var storage = storage_io.MemoryStorage.init(a);
+            defer storage.deinit();
+            var cache = cache_mod.Cache.init(a, 16 * 1024 * 1024);
+            defer cache.deinit();
+            var budget = Budget{ .backing = a };
+            var backend = try B.open(budget.allocator(), "/ordinary-allocation-review", .{
+                .storage = storage.storage(),
+                .cache = if (with_cache) &cache else null,
+                .flush_threshold = 1,
+                .compact_threshold_runs = 100,
+                .l0_overlap_compact_threshold_runs = 100,
+                .table_block_compression = .none,
+                .max_concurrent_point_block_reads = 16,
+            });
+            defer backend.close();
+            for (0..run_count) |_| {
+                var write = try NamespaceWriteTxn(B).open(&backend);
+                errdefer write.abort();
+                try write.put(.{}, "key", "v");
+                try write.commit();
+                while (try backend.runMaintenanceStep()) {}
+            }
+            if (run_count == 0) {
+                backend.options.flush_threshold = 1000;
+                var write = try NamespaceWriteTxn(B).open(&backend);
+                errdefer write.abort();
+                try write.put(.{}, "key", "v");
+                try write.commit();
+            }
+            try std.testing.expectEqual(run_count, run_store.count(&backend));
+            if (with_cache) for (0..run_store.count(&backend)) |i| {
+                const run = run_store.at(&backend, i);
+                var index = try loadRunTableIndexHandle(&backend, run);
+                defer index.release();
+                var block = try loadRunTableBlockHandle(&backend, run, index.runTableIndex(), index.runTableIndex().blockWindow(0), true);
+                block.release();
+            };
+            for ([_]bool{ true, false }) |stable| {
+                if (run_count == 0 and stable) continue;
+                if (!stable) {
+                    backend.options.flush_threshold = 1000;
+                    var write = try NamespaceWriteTxn(B).open(&backend);
+                    errdefer write.abort();
+                    try write.put(.{}, "pending", "mutable");
+                    try write.commit();
+                }
+                var probe = try BoundProbeTxn(B).open(&backend, .{});
+                defer probe.abort();
+                try std.testing.expectEqual(stable, probe.stable_point_view);
+                try probe.held_values.ensureTotalCapacity(probe.allocator, 2048);
+                try std.testing.expectEqualStrings("v", try probe.get("key"));
+                const before_calls = budget.alloc_calls;
+                const before_copies = backend.snapshotReadStats().point_value_copies;
+                for (0..1000) |_| try std.testing.expectEqualStrings("v", try probe.get("key"));
+                try std.testing.expectEqual(@as(usize, 0), budget.alloc_calls - before_calls);
+                try std.testing.expectEqual(@as(u64, 1000), backend.snapshotReadStats().point_value_copies - before_copies);
+                try std.testing.expectEqual(@as(usize, 0), probe.held_blocks.items.len);
+                try std.testing.expectEqual(@as(usize, 3), probe.held_values.items.len);
+                std.debug.print("\nordinary fallback: cache={} runs={d} stable={} lookups=1000 allocator_calls={d} reported_copies={d} persistent_pins={d} payload_buffers={d}\n", .{ with_cache, run_count, stable, budget.alloc_calls - before_calls, backend.snapshotReadStats().point_value_copies - before_copies, probe.held_blocks.items.len, probe.held_values.items.len });
+                budget.limit = budget.live + 16;
+                const bounded_result = probe.get("key");
+                budget.limit = std.math.maxInt(usize);
+                try std.testing.expectEqualStrings("v", try bounded_result);
+                try std.testing.expectEqual(@as(usize, 0), budget.alloc_calls - before_calls);
+                try std.testing.expectEqual(@as(u64, 1001), backend.snapshotReadStats().point_value_copies - before_copies);
+                if (run_count == 0) {
+                    const before_batch = backend.snapshotReadStats().point_value_copies;
+                    var values: [2]?[]const u8 = undefined;
+                    try probe.getManySorted(&.{ "key", "pending" }, &values);
+                    try std.testing.expectEqualStrings("v", values[0].?);
+                    try std.testing.expectEqualStrings("mutable", values[1].?);
+                    try std.testing.expectEqual(@as(u64, 2), backend.snapshotReadStats().point_value_copies - before_batch);
+                }
+            }
+        }
     }
-    var lease = try BoundProbeTxn(B).open(&backend, .{});
-    defer lease.abort();
-    const borrowed = try lease.getLeased(&keys[0]);
-    try std.testing.expect(lease.held_blocks.items.len != 0);
-    try std.testing.expectEqual(@as(usize, 0), lease.leased_values.items.len);
-    for (0..run_store.count(&backend)) |i| cache.invalidatePath(run_store.at(&backend, i).path.?);
-    try std.testing.expectEqualStrings("v", borrowed);
 }

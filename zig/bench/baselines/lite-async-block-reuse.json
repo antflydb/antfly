@@ -227,7 +227,8 @@
       "Cold overlapping candidates still issue concurrent reads and cancel superseded reads",
       "Result allocation ownership transfer resets source packing state",
       "Single-run reads retain cache allocator ownership and direct large-value lease adoption"
-    ]
+    ],
+    "measurement_commit": "69ea9adfe1057aa73ee3ff2217070f6581140965"
   },
   "ordinary_probe_ownership_followup": {
     "merged_main_commit": "2964fe531a",
@@ -275,6 +276,40 @@
       "Adopt decoder-owned results and recognize the active packed buffer in constant time, including reuse across lookups; inspect only new allocations for other interior slices.",
       "Reuse one async directory cursor after lookahead by preserving its first two handles in a fixed-size leading window."
     ],
-    "limitations": "Payload buffer counts exclude metadata and storage/cache construction. No standalone speedup is claimed for cursor reuse; timing samples vary and do not establish end-to-end throughput or soak behavior."
+    "limitations": "Payload buffer counts exclude metadata and storage/cache construction. No standalone speedup is claimed for cursor reuse; timing samples vary and do not establish end-to-end throughput or soak behavior.",
+    "measurement_commit": "217995fdbe9d2da3c087cf6e886283410b4607be"
+  },
+  "owned_fallback_policy_followup": {
+    "merged_main_commit": "e8a1bfcabc33a3596b8e7ea3b2040e433c5cd8d1",
+    "comparison_commit": "217995fdbe9d2da3c087cf6e886283410b4607be",
+    "fixture": "Warm MemoryStorage, one or two uncompressed L0 runs, stable and current ordinary probes; 1000 one-byte lookups after a warm-up lookup, result ownership metadata prewarmed. Mutable-only probes covered too.",
+    "before": {
+      "single_run_backend_pin_allocations": 1000,
+      "single_run_owned_payload_buffers": 1001,
+      "current_two_run_reported_copies": 0,
+      "single_run_lookup_with_16_spare_backend_bytes": "OutOfMemory"
+    },
+    "after": {
+      "single_run_backend_pin_allocations": 0,
+      "single_run_owned_payload_buffers": 3,
+      "current_two_run_reported_copies": 1000,
+      "single_run_lookup_with_16_spare_backend_bytes": "success",
+      "persistent_cache_pins": 0
+    },
+    "coverage": [
+      "Stable and current ordinary probes with one or two runs",
+      "Mutable-only ordinary probes",
+      "Compressed and uncompressed warm, cold, pressure and invalidation cases",
+      "Small packing plus exact-size large copies",
+      "Snapshot and short-lease borrowing remains valid",
+      "Allocation-failure and tight-result-budget packing checks"
+    ],
+    "design": [
+      "Null pin ownership expresses transaction-owned results throughout synchronous and planned point loaders; copy into result storage before releasing the cache handle.",
+      "Prefix decoders retain only the selected value for owned callers, preserving checksum and optional promotion checks.",
+      "Use the owner packing cursor for small mutable, immutable, local and cached owned-copy fallbacks; adopt already-owned decoded buffers.",
+      "Count actual async copies at their copy site, and avoid counting adoption again."
+    ],
+    "limitations": "Backend allocation counts exclude the result scratch allocator. Payload buffer counts exclude metadata and storage/cache construction. Small packing trades bounded spare capacity for fewer buffers; these Debug fixtures do not establish end-to-end QPS or 2 GiB soak behavior."
   }
 }
