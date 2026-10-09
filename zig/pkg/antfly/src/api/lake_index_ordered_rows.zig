@@ -350,12 +350,26 @@ pub const Reader = struct {
         return self.initCached(a, store, root, fingerprint, lower, upper, cancellation, null);
     }
     pub fn initCached(self: *Reader, a: A, store: *stores.ArtifactStore, root: Root, fingerprint: [32]u8, lower: []const u8, upper: ?[]const u8, cancellation: Cancellation, cached: ?artifacts.CachedRead) !void {
+        return self.initCachedFor(a, store, root, fingerprint, lower, upper, cancellation, cached, if (cached) |cache| cache.context else .{}, null);
+    }
+    /// Construction may download the root path. Only those synchronous reads
+    /// borrow the opening execution; the retained tree starts with its original
+    /// lifetime context even when construction fails after a physical read.
+    pub fn initCachedFor(self: *Reader, a: A, store: *stores.ArtifactStore, root: Root, fingerprint: [32]u8, lower: []const u8, upper: ?[]const u8, cancellation: Cancellation, cached: ?artifacts.CachedRead, context: local.serverless_query_lake_read_context.Context, execution: ?*local.common_request_admission.runnable_scheduler.Execution) !void {
+        const opening = if (execution) |owner| context.withExecution(owner) else context;
+        try opening.ensureActive();
         try root.validate();
         if (!std.mem.eql(u8, &root.fingerprint, &fingerprint)) return error.ExternalLakeIndexUnavailable;
-        self.* = .{ .root = root, .pages = undefined, .cached = cached, .context = if (cached) |cache| cache.context else .{} };
+        self.* = .{ .root = root, .pages = undefined, .cached = cached, .context = opening };
+        defer self.context = context;
         self.pages = .{ .domain = root.domain, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &self.remaining_reads, .remaining_write_bytes = &self.remaining_writes };
         self.pages.read_cache = .{ .ptr = self, .read = readPage };
         self.cursor = try tree.Cursor.init(a, self.pages.store(), root.page, lower, upper);
+        errdefer {
+            self.cursor.?.deinit();
+            self.cursor = null;
+        }
+        try opening.ensureActive();
     }
     /// Borrow only the execution of this pull. Tree cursors retain their
     /// positions and payloads, while the original publication authority stays
@@ -708,10 +722,10 @@ test "external lake ordered pulls borrow each execution and retain publication a
     for (0..2048) |n| try Make.add(&first, @intCast(n), 0, n);
     const ref = try publish(a, ca, &store, &first, "ordered", @splat(3), inventory, &.{}, .none);
     const root = try loadRoot(ca, store, ref, .none, null);
-    for ([_]bool{ false, true }) |cached| for (std.enums.values(Case)) |case| {
+    for ([_]bool{ false, true }) |cached| for (std.enums.values(Case)) |case| for ([_]bool{ false, true }) |during_open| {
         var scheduler = try Runnable.Scheduler.init(.{ .slots = 2, .max_operations = 16, .max_bytes = 64 * 1024 * 1024 });
         var signal: std.atomic.Value(bool) = .init(false);
-        var fixture: Fixture = .{ .base = store, .scheduler = &scheduler, .signal = &signal, .case = case };
+        var fixture: Fixture = .{ .base = store, .scheduler = &scheduler, .signal = &signal, .case = case, .enabled = during_open };
         var vtable = store.vtable.*;
         vtable.get_bounded_alloc_with_cancellation = Fixture.read;
         var observed = store;
@@ -720,11 +734,41 @@ test "external lake ordered pulls borrow each execution and retain publication a
         var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
         defer cache.deinit();
         const original: local.serverless_query_lake_read_context.Context = .{ .io = std.testing.io, .authority = .{ .ptr = &fixture, .check = Fixture.authority } };
+        Clock.value = 0;
+        var opening_execution: Execution = .{};
+        try opening_execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 10, .cancellation = .{ .ptr = &signal, .requested = Clock.requested } }, .query);
+        defer opening_execution.finish();
         var reader: Reader = undefined;
-        try reader.initCached(a, &observed, root, @splat(3), "", null, .none, if (cached) .{ .cache = &cache, .scope = @splat(7), .context = original } else null);
+        const opened = reader.initCachedFor(a, &observed, root, @splat(3), "", null, .none, if (cached) .{ .cache = &cache, .scope = @splat(7), .context = original } else null, original, &opening_execution);
+        if (during_open and case != .success) {
+            const expected = switch (case) {
+                .canceled => error.Canceled,
+                .expired => error.DeadlineExceeded,
+                .revoked => error.TestPublicationRevoked,
+                .success => unreachable,
+            };
+            try std.testing.expectError(expected, opened);
+            try std.testing.expect(reader.context.execution == null);
+            try std.testing.expect(reader.cursor == null);
+            try std.testing.expect(fixture.calls > 0);
+            try std.testing.expectEqual(fixture.calls, fixture.controls);
+            opening_execution.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            continue;
+        }
+        try opened;
         defer reader.deinit();
-        reader.context = original;
+        try std.testing.expect(reader.context.execution == null);
+        if (reader.cached) |value| try std.testing.expect(value.context.execution == null);
+        if (during_open) {
+            try std.testing.expect(fixture.calls > 0);
+            try std.testing.expectEqual(fixture.calls, fixture.controls);
+        }
+        opening_execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
         fixture.enabled = true;
+        fixture.calls = 0;
+        fixture.controls = 0;
         var seen: usize = 0;
         var calls: usize = 0;
         while (seen < 2048) {

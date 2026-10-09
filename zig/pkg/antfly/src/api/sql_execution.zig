@@ -1374,9 +1374,9 @@ pub const Adapter = struct {
         for (requests, owner.cursors) |request, *cursor| {
             if (request.table.external_base_source != null) {
                 cursor.* = if (request.request.index_range != null)
-                    try @import("lake_index_sql_rows.zig").openPinned(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?)
+                    try @import("lake_index_sql_rows.zig").openPinnedFor(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?, if (self.cpuScope()) |scope| scope.execution else null)
                 else
-                    (try @import("lake_index_sql_rows.zig").tryOpenAuto(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?)) orelse fallback: {
+                    (try @import("lake_index_sql_rows.zig").tryOpenAutoFor(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?, if (self.cpuScope()) |scope| scope.execution else null)) orelse fallback: {
                         var physical_scan = request.request;
                         physical_scan.index_equality = null;
                         break :fallback try @import("lake_sql_cursor.zig").openPinned(alloc, request.table, physical_scan, self.context, owner.sources.get(request.table.id).?);

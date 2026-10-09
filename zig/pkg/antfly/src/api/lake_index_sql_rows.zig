@@ -24,6 +24,7 @@ const ordered = @import("lake_index_ordered_rows.zig");
 const native_rows = @import("lake_index_native_rows.zig");
 const Store = @import("lake_index_store.zig").Store;
 const A = std.mem.Allocator;
+const Execution = local.common_request_admission.runnable_scheduler.Execution;
 const Owner = struct {
     a: A,
     arena: std.heap.ArenaAllocator,
@@ -506,7 +507,7 @@ pub fn tryOpenPredicateWithContext(a: A, server: *server_api.ApiHttpServer, tabl
     for (indexes) |index| {
         const indexed = (try chooseAccess(ca, &.{index}, .{ .fields = &.{}, .conditions = conditions, .limit = 1024 })) orelse continue;
         var work: u64 = 0;
-        const opened = openWithContext(a, server, table, indexed, context, source, .automatic, &work, true, pinned) catch |err| switch (err) {
+        const opened = openWithContext(a, server, table, indexed, context, source, .automatic, &work, true, pinned, null) catch |err| switch (err) {
             error.InvalidBatchRequest => continue,
             else => return err,
         };
@@ -633,12 +634,19 @@ pub fn tryOpenPredicateScan(a: A, table: catalog.Table, conditions: []const cata
 }
 
 pub fn openPinned(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !catalog.Cursor {
-    return (try openWithPolicy(a, server, table, request, context, source, .required, null, false)) orelse error.ExternalLakeIndexUnavailable;
+    return openPinnedFor(a, server, table, request, context, source, null);
+}
+pub fn openPinnedFor(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, execution: ?*Execution) !catalog.Cursor {
+    return (try openWithPolicy(a, server, table, request, context, source, .required, null, false, execution)) orelse error.ExternalLakeIndexUnavailable;
 }
 
 pub fn tryOpenAuto(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource) !?catalog.Cursor {
+    return tryOpenAutoFor(a, server, table, request, context, source, null);
+}
+pub fn tryOpenAutoFor(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, execution: ?*Execution) !?catalog.Cursor {
+    if (execution) |owner| try owner.checkpoint();
     if (request.index_range != null or request.primary_order or request.row_refs != null or request.primary_key != null) return null;
-    if (request.index_equality != null) return openWithPolicy(a, server, table, request, context, source, .automatic, null, false);
+    if (request.index_equality != null) return openWithPolicy(a, server, table, request, context, source, .automatic, null, false, execution);
     const definitions = table.external_indexes orelse return null;
     if (definitions.schema_json.len == 0 or server.source.lakeIndexLifecycleAuthority(context) == null) return null;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -655,7 +663,7 @@ pub fn tryOpenAuto(a: A, server: *server_api.ApiHttpServer, table: catalog.Table
     for (indexes) |index| {
         const indexed = (try chooseAccess(ca, &.{index}, request)) orelse continue;
         var cost: u64 = 0;
-        const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost, false)) orelse continue;
+        const cursor = (try openWithPolicy(a, server, table, indexed, context, source, .automatic, &cost, false, execution)) orelse continue;
         if (cost < best_cost) {
             if (best) |prior| prior.close(prior.ptr);
             best = cursor;
@@ -721,10 +729,10 @@ fn chooseAccess(a: A, indexes: []const local.storage_relational_index.Relational
     return best;
 }
 
-fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool) !?catalog.Cursor {
-    return openWithContext(a, server, table, request, context, source, policy, estimated_cost, identities_only, null);
+fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool, execution: ?*Execution) !?catalog.Cursor {
+    return openWithContext(a, server, table, request, context, source, policy, estimated_cost, identities_only, null, execution);
 }
-fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool, pinned: ?PredicateContext) !?catalog.Cursor {
+fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, source: *local.serverless_query_lake_serving.ServingSource, policy: @import("lake_index_selection.zig").Policy, estimated_cost: ?*u64, identities_only: bool, pinned: ?PredicateContext, execution: ?*Execution) !?catalog.Cursor {
     const index_name = if (request.index_range) |range| range.name else if (request.index_equality) |equality| equality.name else return error.ExternalLakeIndexUnavailable;
     if (request.primary_order or request.row_refs != null) return error.UnsupportedSqlExecution;
     const definitions = table.external_indexes orelse return error.ExternalLakeIndexUnavailable;
@@ -762,7 +770,7 @@ fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table
             return err;
         };
         owner.read_context = owner.lease.?.readContext();
-        selected = (try @import("lake_index_selection.zig").selectCached(ca, table, source, &owner.store, owner.read_context, policy, &server.lake_read_cache)) orelse return null;
+        selected = (try @import("lake_index_selection.zig").selectCached(ca, table, source, &owner.store, if (execution) |active| owner.read_context.withExecution(active) else owner.read_context, policy, &server.lake_read_cache)) orelse return null;
     }
     var parsed = try local.schema_mod.parseValidatedTableSchema(a, definitions.schema_json);
     defer parsed.deinit(a);
@@ -821,8 +829,9 @@ fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table
         if (decl.artifact.kind == .ordered_row_index and std.mem.eql(u8, decl.name, name)) break decl;
     } else return if (policy == .automatic) null else error.ExternalLakeRowIndexNotPublished;
     const cancel: operation.CancellationToken = .{ .ptr = owner, .is_cancelled_fn = Owner.canceled };
-    const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.Root, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, declaration.artifact) else false;
-    owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.Root, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, owner.artifacts, declaration.artifact, cancel, ordered.loadRoot);
+    const opening_context = if (execution) |active| owner.read_context.withExecution(active) else owner.read_context;
+    const resident_metadata = if (identities_only) try @import("lake_index_decoded_metadata.zig").resident(ordered.Root, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = opening_context }, declaration.artifact) else false;
+    owner.metadata = try @import("lake_index_decoded_metadata.zig").acquire(ordered.Root, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = opening_context }, owner.artifacts, declaration.artifact, cancel, ordered.loadRoot);
     const root = owner.metadata.?.value.*;
     if (identities_only and (!std.mem.eql(u8, root.source, source.inventory.source_id) or !std.mem.eql(u8, root.snapshot, source.inventory.snapshot_id))) return error.ExternalLakeSnapshotMismatch;
     const domain = if (pinned) |shared| shared.domain else @import("lake_index_publication.zig").uploadDomainWithNamespace(table.id, owner.store_identity, selected.?.publication().namespace);
@@ -849,9 +858,11 @@ fn openWithContext(a: A, server: *server_api.ApiHttpServer, table: catalog.Table
     if (upper) |end| {
         if (std.mem.order(u8, lower, end) != .lt) empty_range = true;
     }
-    try owner.reader.initCached(a, &owner.artifacts, root, expected, lower, upper, cancel, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context });
+    try owner.reader.initCachedFor(a, &owner.artifacts, root, expected, lower, upper, cancel, .{ .cache = &server.lake_read_cache, .scope = owner.store_identity, .context = owner.read_context }, owner.read_context, execution);
     if (empty_range) owner.reader.exhausted = true;
     owner.reader_open = true;
+    if (execution) |active| try Owner.bindCoordinator(owner, active);
+    defer if (execution != null) Owner.releaseCoordinator(owner);
     owner.covered = root.cover.len != 0;
     for (request.fields) |field| if (!covers(root.cover, field)) {
         owner.covered = false;
