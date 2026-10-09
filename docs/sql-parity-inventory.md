@@ -1613,9 +1613,28 @@ through build, source verification, independent candidate verification and
 retirement GC; stale job preparation rejects before source decoding. Native
 allocation-fault coverage unwinds pinned readers and owned source projections,
 and a real rename rejects both stale preparation and stale page application.
-Leader scheduling, durable page-intent admission and end-to-end coordinator
-retries remain to be wired. Pending-generation reservation sources,
-Raft page commands, GC scheduling,
+Bounded Raft/standalone intents now advance source/candidate pages and retired
+generation GC. Frames carry the exact durable before cut, not leader-supplied
+claims or source JSON. Each replica prepares from its own pinned authority,
+then revalidates source epoch, job, root, applied log position and selected GC
+intent under the apply lock. A moved preparation cut is retried outside that
+lock. Each batch retains at most one source/candidate page and one GC page;
+duplicates and unobserved future cuts do not implicitly chain through the
+batch. Producers must observe committed progress before requesting successors.
+Conflicting/stale proposals are checked before mutation and do not poison
+neighboring metadata entries. Committed entry framing is decoded once outside
+the serialized apply section. Native two-replica traces cover duplicate replay,
+future-cut batching, source changes preceding a page, checkpoint-only changes,
+six-page 65-table reconciliation, mixed standalone/Raft execution, protected
+root admission/revalidation, two-page 65-claim GC and reopen durability.
+Source clocks do not advance with page/GC progress; these commands still do not
+publish roots or enable SQL name resolution.
+The committed-apply outcome registration now releases ownership before
+unlocking. Its deferred cleanup cannot clear the next writer's active outcome;
+a deterministic ownership-handoff regression covers successful and failing
+cleanup paths.
+Leader scheduling, durable failure reporting and end-to-end coordinator
+retries remain to be wired. Pending-generation reservation sources, GC scheduling,
 capability barriers and atomic active-root publication still
 precede writer adoption and SQL point resolution. No original SQL case is
 credited for this protocol component.

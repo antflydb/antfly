@@ -55,7 +55,7 @@ const std = @import("std");
 /// Version 28 maintains immutable ownership counts and publication root sets.
 /// Version 29 admits seekable native text corpora and their durable GC frontier.
 /// Version 31 decodes bounded relation source-adoption and reconciliation-job
-/// controls. Serving/root activation and pending reservation sources remain
+/// controls and independently prepared page advances. Serving/root activation and pending reservation sources remain
 /// separate capabilities, never implied by this decoder floor.
 pub const current_version: u16 = 31;
 pub const relation_reconciliation_version: u16 = 31;

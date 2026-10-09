@@ -13,6 +13,11 @@ pub const max_encoded_bytes = magic.len + 1 + 2 * r.State.encoded_len + 1;
 pub const Command = union(enum(u8)) {
     adopt: protocol.Activation = 1,
     start: struct { next: r.State, prior: ?r.State = null } = 2,
+    /// One bounded step from an already durable cut. Producers must observe
+    /// its committed successor before submitting another step; chained future
+    /// cuts inside the same Raft apply batch are deliberately not admitted.
+    advance: r.State = 3,
+    garbage: r.Retirement = 4,
 
     pub fn encodeAlloc(self: @This(), a: std.mem.Allocator) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
@@ -37,6 +42,11 @@ pub const Command = union(enum(u8)) {
                 try out.append(a, @intFromBool(request.prior != null));
                 if (request.prior) |prior| try out.appendSlice(a, &(try prior.encode()));
             },
+            .advance => |state| {
+                try validateAdvance(state);
+                try out.appendSlice(a, &(try state.encode()));
+            },
+            .garbage => |retirement| try out.appendSlice(a, &(try retirement.encode())),
         }
         return out.toOwnedSlice(a);
     }
@@ -64,11 +74,21 @@ pub const Command = union(enum(u8)) {
                 try validateStart(next, prior);
                 return .{ .start = .{ .next = next, .prior = prior } };
             },
+            3 => {
+                const state = r.State.decode(payload) catch return error.InvalidRelationReconciliationCommand;
+                try validateAdvance(state);
+                return .{ .advance = state };
+            },
+            4 => return .{ .garbage = r.Retirement.decode(payload) catch return error.InvalidRelationReconciliationCommand },
             else => return error.InvalidRelationReconciliationCommand,
         }
     }
 };
 
+fn validateAdvance(state: r.State) !void {
+    _ = try state.encode();
+    if (state.phase == .ready or state.epoch.revision == 0) return error.InvalidRelationReconciliationCommand;
+}
 fn validateActivation(proof: protocol.Activation) !void {
     if (proof.version != protocol.relation_reconciliation_version or proof.member_count == 0 or
         !incarnation.isValid(proof.incarnation) or std.mem.allEqual(u8, &proof.membership_fingerprint, 0)) return error.InvalidRelationReconciliationCommand;
@@ -89,7 +109,7 @@ test "system catalog relation namespace transaction coordinator intents are boun
     const proof: protocol.Activation = .{ .version = protocol.relation_reconciliation_version, .incarnation = "11111111111111111111111111111111".*, .member_count = 1, .membership_fingerprint = @splat(3) };
     const state = try r.State.init(41, try r.nextJobId(null), .{ .incarnation = @splat(1), .revision = 1 });
     const next = try r.State.init(41, try r.nextJobId(&state), state.epoch);
-    for ([_]Command{ .{ .adopt = proof }, .{ .start = .{ .next = state } }, .{ .start = .{ .next = next, .prior = state } } }) |command| {
+    for ([_]Command{ .{ .adopt = proof }, .{ .start = .{ .next = state } }, .{ .start = .{ .next = next, .prior = state } }, .{ .advance = state }, .{ .garbage = r.Retirement.init(r.Generation.of(&state)) } }) |command| {
         const bytes = try command.encodeAlloc(a);
         defer a.free(bytes);
         try std.testing.expect(bytes.len <= max_encoded_bytes);
@@ -104,6 +124,12 @@ test "system catalog relation namespace transaction coordinator intents are boun
     bad.member_count = 0;
     try std.testing.expectError(error.InvalidRelationReconciliationCommand, (Command{ .adopt = bad }).encodeAlloc(a));
     try std.testing.expectError(error.InvalidRelationReconciliationCommand, (Command{ .start = .{ .next = next } }).encodeAlloc(a));
+    var ready = state;
+    ready.phase = .ready;
+    try std.testing.expectError(error.InvalidRelationReconciliationCommand, (Command{ .advance = ready }).encodeAlloc(a));
+    var untracked = state;
+    untracked.epoch.revision = 0;
+    try std.testing.expectError(error.InvalidRelationReconciliationCommand, (Command{ .advance = untracked }).encodeAlloc(a));
     const Fault = struct {
         fn run(alloc: std.mem.Allocator, command: Command) !void {
             const bytes = try command.encodeAlloc(alloc);
@@ -111,5 +137,10 @@ test "system catalog relation namespace transaction coordinator intents are boun
             _ = try Command.decode(bytes);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Fault.run, .{Command{ .start = .{ .next = next, .prior = state } }});
+    // Force growth/shrink through allocation so the backing heap's ability to
+    // resize in place cannot change the numbered allocation-fault schedule.
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fault.run, .{Command{ .start = .{ .next = next, .prior = state } }});
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fault.run, .{Command{ .advance = state }});
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fault.run, .{Command{ .garbage = r.Retirement.init(r.Generation.of(&state)) }});
 }
