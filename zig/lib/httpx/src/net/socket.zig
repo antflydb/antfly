@@ -405,6 +405,8 @@ pub const Socket = struct {
     /// Shuts down reads and writes without releasing the handle. This is used
     /// to wake a blocking connection fiber before its owner performs close.
     pub fn shutdown(self: *Self) void {
+        const protection = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(protection);
         self.io.vtable.netShutdown(self.io.userdata, self.handle, .both) catch {};
     }
 

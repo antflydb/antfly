@@ -932,6 +932,19 @@ pub const H2Connection = struct {
     /// Copies payload data so the original frame can be freed afterward.
     /// HPACK decoding happens here (in the receive loop) to avoid concurrent
     /// decode races on the shared hpack_decode_ctx (RFC 7540 §4.3).
+    /// A closed stream still participates in connection-wide compression and
+    /// flow control. Discard payload ownership while preserving sibling state.
+    fn discardClosedStreamFrame(self: *Self, frame: *const Frame) !void {
+        if (frame.header.frame_type == .headers) {
+            const decoded = try self.decodeFrameHeaders(frame.payload, frame.header.flags);
+            defer self.allocator.free(decoded.headers);
+            for (decoded.headers) |header| header.deinit(self.allocator);
+        } else if (frame.header.frame_type == .data and frame.payload.len > 0) {
+            try self.stream_manager.updateConnectionRecvWindow(-@as(i32, @intCast(frame.payload.len)));
+        }
+        return error.ClosedStream;
+    }
+
     pub fn deliverToMailbox(self: *Self, frame: *const Frame) !void {
         const sid = frame.header.stream_id;
         if (sid == 0) return;
@@ -947,7 +960,7 @@ pub const H2Connection = struct {
             // fully processed and removed are a stream error, not a
             // connection error. Return ClosedStream so the caller can
             // send RST_STREAM(STREAM_CLOSED) without killing the connection.
-            if (sid <= self.stream_manager.max_closed_stream_id) return error.ClosedStream;
+            if (sid <= self.stream_manager.max_closed_stream_id) return self.discardClosedStreamFrame(frame);
 
             // RFC 7540 §5.1.2: Don't create new streams after GOAWAY.
             if (self.goaway_received) return error.ProtocolError;
@@ -958,7 +971,7 @@ pub const H2Connection = struct {
                     self.stream_manager.next_client_stream_id
                 else
                     self.stream_manager.next_server_stream_id;
-                if (sid < last_seen) return error.ClosedStream;
+                if (sid < last_seen) return self.discardClosedStreamFrame(frame);
             }
 
             break :blk try self.stream_manager.getOrCreateStream(sid);
@@ -1204,9 +1217,11 @@ pub const H2Connection = struct {
             self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload }) catch |err| switch (err) {
                 // RFC 7540 §5.1: late frame for a closed stream — send
                 // RST_STREAM(STREAM_CLOSED) but keep the connection alive.
-                // No WINDOW_UPDATE accumulation: deliverToMailbox returned
-                // before accepting the data, so no credit was consumed.
+                // Discarded DATA still consumes connection credit; refund
+                // that credit without reopening the retired stream.
                 error.ClosedStream => {
+                    if (sf.header.frame_type == .data and sf.payload.len > 0)
+                        try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
                     self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
                     return sf.header.stream_id;
                 },
@@ -1214,8 +1229,8 @@ pub const H2Connection = struct {
             };
             // Accumulate WINDOW_UPDATE *after* successful delivery so the
             // credit matches the actual recv window decrement in deliverToMailbox.
-            // This avoids permanent window inflation when delivery fails
-            // (ClosedStream) after accumulateWindowUpdate has already flushed.
+            // ClosedStream has its own refund path after consuming only
+            // connection credit, so a retired stream never gains credit.
             if (sf.header.frame_type == .data and sf.payload.len > 0) {
                 try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
             }
@@ -1276,6 +1291,8 @@ pub const H2Connection = struct {
                 // ensuring the shared hpack_decode_ctx is not accessed concurrently.
                 self.deliverToMailbox(&Frame{ .header = sf.header, .payload = sf.payload }) catch |err| switch (err) {
                     error.ClosedStream => {
+                        if (sf.header.frame_type == .data and sf.payload.len > 0)
+                            try self.accumulateWindowUpdate(writer, sf.header.stream_id, @intCast(sf.payload.len));
                         self.sendRstStream(writer, sf.header.stream_id, .stream_closed) catch {};
                         return sf.header.stream_id;
                     },
@@ -3909,4 +3926,70 @@ test "H2 controlled peer initial window applies to future incoming and locally c
     try std.testing.expectEqual(@as(i32, -3), first.send_window);
     const next = try client.stream_manager.createStream();
     try std.testing.expectEqual(@as(i32, 0), next.send_window);
+}
+
+test "late retired-stream DATA refunds only connection credit" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |locked| {
+        var conn = H2Connection.initServer(alloc, std.testing.io);
+        defer conn.deinit();
+        conn.window_update_threshold = 1;
+        const stream = try conn.stream_manager.getOrCreateStream(1);
+        stream.state = .open;
+        conn.stream_manager.removeStream(1);
+        const initial = conn.stream_manager.connection_recv_window;
+        for (0..8) |_| {
+            var input: std.ArrayListUnmanaged(u8) = .empty;
+            defer input.deinit(alloc);
+            try conn.writeFrame(testWriter(&input, alloc), .data, 0, 1, "abc");
+            var reader: TestReader = .{ .data = input.items };
+            var output: std.ArrayListUnmanaged(u8) = .empty;
+            defer output.deinit(alloc);
+            const writer = testWriter(&output, alloc);
+            const delivered = if (locked) try conn.processOneFrameLocked(&reader, writer) else try conn.processOneFrame(&reader, writer);
+            try std.testing.expectEqual(@as(?u31, 1), delivered);
+            try std.testing.expectEqual(initial, conn.stream_manager.connection_recv_window);
+            try std.testing.expectEqual(@as(u32, 0), conn.pending_conn_window_update);
+            try std.testing.expectEqual(@as(usize, 0), conn.stream_manager.activeStreamCount());
+            var reply_reader: TestReader = .{ .data = output.items };
+            var credit = try conn.readFrame(&reply_reader);
+            defer credit.deinit(alloc);
+            try std.testing.expectEqual(Http2FrameType.window_update, credit.header.frame_type);
+            try std.testing.expectEqual(@as(u31, 0), credit.header.stream_id);
+            try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, credit.payload[0..4], .big));
+            var reset = try conn.readFrame(&reply_reader);
+            defer reset.deinit(alloc);
+            try std.testing.expectEqual(Http2FrameType.rst_stream, reset.header.frame_type);
+            try std.testing.expectEqual(@as(u31, 1), reset.header.stream_id);
+        }
+    }
+}
+
+test "late retired-stream HEADERS preserve shared HPACK state" {
+    const alloc = std.testing.allocator;
+    var sender = H2Connection.initServer(alloc, std.testing.io);
+    defer sender.deinit();
+    var receiver = H2Connection.initClient(alloc, std.testing.io);
+    defer receiver.deinit();
+    const first = try receiver.stream_manager.createStream();
+    first.state = .open;
+    receiver.stream_manager.removeStream(first.id);
+    const second = try receiver.stream_manager.createStream();
+    const headers = [_]hpack.HeaderEntry{ .{ .name = ":status", .value = "200" }, .{ .name = "x-retained-table", .value = "shared-value" } };
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(alloc);
+    const writer = testWriter(&wire, alloc);
+    try sender.sendHeaders(writer, 1, &headers, true);
+    try sender.sendHeaders(writer, second.id, &headers, true);
+    var reader: TestReader = .{ .data = wire.items };
+    var discarded = try receiver.readFrame(&reader);
+    defer discarded.deinit(alloc);
+    try std.testing.expectError(error.ClosedStream, receiver.deliverToMailbox(&discarded));
+    var accepted = try receiver.readFrame(&reader);
+    defer accepted.deinit(alloc);
+    try receiver.deliverToMailbox(&accepted);
+    const decoded = second.request_headers.?;
+    try std.testing.expectEqualStrings("x-retained-table", decoded[1].name);
+    try std.testing.expectEqualStrings("shared-value", decoded[1].value);
+    try std.testing.expect(second.completed);
 }

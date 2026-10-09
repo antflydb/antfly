@@ -189,8 +189,9 @@ pub const RequestOptions = struct {
     /// until the request method returns.
     cancellation: ?CancellationToken = null,
     /// Borrowed by the request until all transport tasks physically join.
-    /// Applies to HTTP/1 socket reads and writes, including TLS. Parsing and body
-    /// decoding retain CPU; shared H2 readers never borrow a stream's grant.
+    /// Applies to HTTP/1 socket reads/writes (including TLS) and buffered H2
+    /// completion waits. Parsing and body decoding retain CPU; shared H2
+    /// readers never borrow a stream's grant.
     socket_control: ?socket_mod.WriteControl = null,
 };
 
@@ -1967,12 +1968,13 @@ pub const Client = struct {
             var lease = try self.getOrCreateH2Conn(host, port, is_tls, deadline_ms, interrupt);
             defer lease.release();
             const entry = lease.entry;
-            const result = self.executeH2OnPooled(entry, req, interrupt) catch |err| {
+            var wait_rejected = false;
+            const result = self.executeH2OnPooled(entry, req, interrupt, &wait_rejected) catch |err| {
                 // Only mark the connection broken for transport/framing errors.
                 // Stream-level errors (MaxConcurrentStreamsExceeded, ContentLengthMismatch,
                 // StreamDataOverflow) don't indicate a bad connection — other streams
                 // may still be healthy.
-                switch (err) {
+                if (!wait_rejected) switch (err) {
                     // A caller cancellation only reset its own stream. The
                     // shared H2 connection remains usable by other requests.
                     error.Cancelled,
@@ -1981,7 +1983,7 @@ pub const Client = struct {
                     error.StreamDataOverflow,
                     => {},
                     else => entry.broken = true,
-                }
+                };
                 return normalizeH2ResponseError(err);
             };
             // Mark broken if peer sent GOAWAY — next request gets a fresh connection.
@@ -2474,9 +2476,10 @@ pub const Client = struct {
         } else |_| {}
 
         errdefer if (entry.recv_running) {
-            entry.socket.close();
+            entry.socket.shutdown();
+            entry.ping_group.cancel(self.io);
             entry.recv_group.await(self.io) catch {};
-            entry.ping_group.await(self.io) catch {};
+            entry.socket.close();
         };
 
         // --- Phase 3: Re-check and insert under lock ---
@@ -2531,9 +2534,10 @@ pub const Client = struct {
     /// Tears down an H2PoolEntry that was never inserted into h2_conns.
     fn destroyH2Entry(self: *Self, entry: *H2PoolEntry) void {
         if (entry.recv_running) {
-            entry.socket.close();
+            entry.socket.shutdown();
+            entry.ping_group.cancel(self.io);
             entry.recv_group.await(self.io) catch {};
-            entry.ping_group.await(self.io) catch {};
+            entry.socket.close();
         } else {
             entry.socket.close();
         }
@@ -2668,7 +2672,7 @@ pub const Client = struct {
             entry.h2.ping_ack_event.waitTimeout(entry.io, timeout) catch {
                 // Timeout or canceled — connection is dead.
                 entry.broken = true;
-                entry.socket.close();
+                entry.socket.shutdown();
                 return;
             };
             // ACK received — connection is alive. Update timestamp.
@@ -2682,7 +2686,7 @@ pub const Client = struct {
     /// In multiplexed mode (recv_running=true), the background receive fiber
     /// pumps frames while this fiber waits on a per-stream event.
     /// In fallback mode, frames are pumped inline via awaitStreamComplete.
-    fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request, interrupt: *RequestInterrupt) !Response {
+    fn executeH2OnPooled(self: *Self, entry: *H2PoolEntry, req: *Request, interrupt: *RequestInterrupt, wait_rejected: *bool) !Response {
         const h2 = &entry.h2;
         const stream = self.createH2ResponseStream(h2, req) catch |err| {
             if (err == error.ConnectionClosed) entry.broken = true;
@@ -2778,7 +2782,16 @@ pub const Client = struct {
             }
 
             // Wait for the receive loop to deliver the response.
-            try stream.completion_event.wait(self.io);
+            if (req.socket_control) |control| {
+                // No connection/mailbox lock crosses weighted reentry. The
+                // receive loop keeps its own transport lifetime and never
+                // stores this request's borrowed callbacks.
+                control.withWait(Io.Event.wait, .{ &stream.completion_event, self.io }) catch |err| {
+                    wait_rejected.* = true;
+                    cleanupH2Stream(entry, stream_id, null, true, self.io, self.allocator);
+                    return err;
+                };
+            } else try stream.completion_event.wait(self.io);
         } else {
             // Fallback mode: pump frames inline (no fiber support).
             if (interrupt.isCancellationRequested()) return error.Cancelled;
@@ -6892,4 +6905,108 @@ test "HTTPS pooled reuse clears the previous request transport controls" {
     try std.testing.expectEqualStrings("payload", next_response.body.?);
     try std.testing.expect(second.ends > 0 and !second.parked);
     try std.testing.expectEqual(first_ends, first.ends);
+}
+
+test "H2 completion waits reject publication and preserve the shared connection" {
+    const Mode = enum { success, begin_failure, end_failure, canceled_resume };
+    const State = struct {
+        mode: Mode,
+        io: Io,
+        started: Io.Event = .unset,
+        finished: Io.Event = .unset,
+        parked: std.atomic.Value(bool) = .init(false),
+        begins: usize = 0,
+        ends: usize = 0,
+        fn check(raw: ?*anyopaque) socket_mod.WriteControl.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.mode == .canceled_resume and self.ends > 0) return error.Canceled;
+        }
+        fn begin(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(!self.parked.load(.acquire));
+            self.begins += 1;
+            if (self.mode == .begin_failure) {
+                self.started.set(self.io);
+                return error.SchedulerClosed;
+            }
+            self.parked.store(true, .release);
+            self.started.set(self.io);
+        }
+        fn end(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expect(self.parked.load(.acquire));
+            self.ends += 1;
+            if (self.mode == .end_failure) return error.DeadlineExceeded;
+            self.parked.store(false, .release);
+        }
+        fn serve(listener: *socket_mod.TcpListener, state: *@This()) !void {
+            const alloc = std.testing.allocator;
+            var accepted = try listener.accept();
+            defer accepted.socket.close();
+            try accepted.socket.setRecvTimeout(3_000);
+            var reader = accepted.socket.reader();
+            var h2 = H2Connection.initServer(alloc, state.io);
+            defer h2.deinit();
+            try h2.readClientPreface(&reader);
+            try h2.sendSettings(&accepted.socket);
+            var requests: usize = 0;
+            while (requests < 2) {
+                var frame = try h2.readFrame(&reader);
+                defer frame.deinit(alloc);
+                switch (frame.header.frame_type) {
+                    .settings => try h2.handleSettings(&frame, &accepted.socket),
+                    .headers => {
+                        const stream_id = frame.header.stream_id;
+                        _ = try h2.stream_manager.getOrCreateStream(stream_id);
+                        if (requests == 0) {
+                            try state.started.waitTimeout(state.io, .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } });
+                            if (state.mode != .begin_failure) try std.testing.expect(state.parked.load(.acquire));
+                        }
+                        try h2.sendHeaders(&accepted.socket, stream_id, &.{ .{ .name = ":status", .value = "200" }, .{ .name = "x-shared", .value = "preserved" } }, false);
+                        try h2.writeData(&accepted.socket, stream_id, "payload", true);
+                        requests += 1;
+                    },
+                    else => {},
+                }
+            }
+            try state.finished.waitTimeout(state.io, .{ .duration = .{ .raw = .fromSeconds(3), .clock = .awake } });
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    for (std.enums.values(Mode)) |mode| {
+        std.debug.print("H2_WAIT mode={s}\n", .{@tagName(mode)});
+        var listener = try socket_mod.TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
+        defer listener.deinit();
+        var state: State = .{ .mode = mode, .io = io };
+        var server = try io.concurrent(State.serve, .{ &listener, &state });
+        defer server.cancel(io) catch {};
+        const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/", .{listener.getLocalAddress().getPort()});
+        defer alloc.free(url);
+        var client = Client.initWithConfig(alloc, io, .{ .http2_enabled = true, .h2_read_idle_timeout_ms = 0, .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        const result = client.get(url, .{ .timeout_ms = 3_000, .socket_control = .{ .ptr = &state, .check_fn = State.check, .wait_begin_fn = State.begin, .wait_end_fn = State.end } });
+        switch (mode) {
+            .success => {
+                var response = try result;
+                defer response.deinit();
+                try std.testing.expectEqualStrings("payload", response.body.?);
+            },
+            .begin_failure => try std.testing.expectError(error.SchedulerClosed, result),
+            .end_failure => try std.testing.expectError(error.DeadlineExceeded, result),
+            .canceled_resume => try std.testing.expectError(error.Canceled, result),
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.begins);
+        try std.testing.expectEqual(@as(usize, if (mode == .begin_failure) 0 else 1), state.ends);
+        const completed_ends = state.ends;
+        // The peer accepts exactly one TCP connection. A sibling request must
+        // still succeed on it after the first stream loses request authority.
+        var sibling = try client.get(url, .{ .timeout_ms = 3_000 });
+        defer sibling.deinit();
+        try std.testing.expectEqualStrings("payload", sibling.body.?);
+        try std.testing.expectEqualStrings("preserved", sibling.headers.get("x-shared").?);
+        try std.testing.expectEqual(completed_ends, state.ends);
+        state.finished.set(io);
+        try server.await(io);
+    }
 }
