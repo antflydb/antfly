@@ -139,6 +139,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{
             "retrieval catalog read owns or borrows one original query execution",
             "retrieval key scans retain original ownership through storage waits and denied reentry",
+            "retrieval incoming probe retains original native or borrowed authority through callback retirement",
             "semantic query planning reuses equivalent embeddings across tables and isolates principals",
             "api http server serves retrieval agent response envelope",
         },

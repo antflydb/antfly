@@ -9611,7 +9611,7 @@ pub const ApiHttpServer = struct {
                     table_name,
                     index_name,
                     keys,
-                    .{ .deadline_ns = runner.deadline_ns, .cancellation = runner.cancellation },
+                    .{ .deadline_ns = runner.deadline_ns, .cancellation = runner.cancellation, .execution_team = runner.execution_team },
                 );
             }
         };
@@ -10471,8 +10471,13 @@ pub const ApiHttpServer = struct {
         keys: []const []const u8,
         request_context: api_operation.RequestContext,
     ) ![]bool {
-        const context = try request_context.platformDeadline();
-        try context.ensureActive();
+        var retained_bytes: u64 = @as(u64, table_name.len) +| index_name.len +| 1024;
+        for (keys) |key| retained_bytes +|= @as(u64, key.len) +| @sizeOf([]const u8);
+        var owner: QueryReadExecution = .{};
+        try owner.start(self, request_context, retained_bytes);
+        defer owner.execution.finish();
+        const context = owner.context;
+        try owner.checkpoint();
         const SourceWorker = struct {
             server: *ApiHttpServer,
             source: table_reads.TableReadSource,
@@ -10561,7 +10566,8 @@ pub const ApiHttpServer = struct {
         var graph_worker = worker.iface();
         graph_worker.execution_deadline_ns = context.deadline_ns;
         graph_worker.cancellation = context.cancellation;
-        return try distributed_graph.probeIncomingEdgesForKeys(
+        graph_worker.runnable = if (context.execution_team) |team| team.borrow else null;
+        const result = try distributed_graph.probeIncomingEdgesForKeys(
             alloc,
             catalog,
             graph_worker,
@@ -10572,6 +10578,9 @@ pub const ApiHttpServer = struct {
             keys,
             .read_index,
         );
+        errdefer alloc.free(result);
+        try owner.checkpoint();
+        return result;
     }
 
     pub fn tableExists(self: *ApiHttpServer, table_name: []const u8) !bool {
@@ -58519,6 +58528,108 @@ test "retrieval key scans retain original ownership through storage waits and de
         const retained = server.runnableScheduler().?.stats();
         try std.testing.expectEqual(@as(usize, if (borrowed) 1 else 0), retained.operations);
         if (borrowed) try std.testing.expectEqual(@as(u64, 23), retained.retained_bytes);
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 0), server.runnableScheduler().?.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), server.runnableScheduler().?.stats().retained_bytes);
+    };
+}
+
+test "retrieval incoming probe retains original native or borrowed authority through callback retirement" {
+    const a = std.testing.allocator;
+    const Case = enum { success, cancel, expire, shutdown };
+    const Fake = struct {
+        server: *ApiHttpServer = undefined,
+        case: Case,
+        canceled: bool = false,
+        calls: usize = 0,
+        server_deadline: u64 = 0,
+        fn requested(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).canceled;
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs", .placement_role = "data", .indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}" }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .table_id = 7, .group_id = 7, .start_key = "", .end_key = null }})[0..]),
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+                .merged_group_statuses = @constCast((&[_]@import("../metadata/reconciler.zig").MergedGroupStatus{.{ .group_id = 7 }})[0..]),
+            };
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return null;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+        fn hydrate(raw: *anyopaque, alloc: std.mem.Allocator, _: u64, _: []const u8, req: distributed_graph.GraphHydrateRequest, _: raft_mod.ReadConsistency) !?distributed_graph.GraphHydrateResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const grant = req.execution_runnable orelse return error.TestMissingProbeCapability;
+            try grant.checkLifetime();
+            try std.testing.expectEqual(@import("antfly_runtime_abi").runnable_abi.Class.query, try grant.currentClass());
+            try std.testing.expectEqual(@as(usize, 1), self.server.runnableScheduler().?.stats().operations);
+            try std.testing.expectEqual(@as(usize, 1), self.server.runnableScheduler().?.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 2), req.keys.len);
+            var result: distributed_graph.GraphHydrateResponse = .{
+                .has_incoming = try alloc.dupe(bool, &.{ true, false }),
+                .incoming_index_identity = req.incoming_index_identity,
+                .incoming_ttl_now_ns = req.incoming_ttl_now_ns,
+                .incoming_scanned_rows = 2,
+            };
+            errdefer result.deinit(alloc);
+            result.has_physical_incoming = try alloc.dupe(bool, result.has_incoming);
+            switch (self.case) {
+                .success => {},
+                .cancel => self.canceled = true,
+                .expire => while (req.cancellation.?.isCancelled() == false and platform_time.monotonicNs() < self.server_deadline) {
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                },
+                .shutdown => self.server.runnableScheduler().?.close(),
+            }
+            return result;
+        }
+    };
+    for (std.enums.values(Case)) |case| for ([_]bool{ false, true }) |borrowed| {
+        var fake = Fake{ .case = case };
+        const source: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query, .graph_hydrate_group_local = Fake.hydrate } };
+        var server = ApiHttpServer.init(a, .{ .runnable_policy = .{ .slots = 2 } }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .free_admin_snapshot = Fake.freeSnapshot } }, source, null);
+        defer server.deinit();
+        fake.server = &server;
+        fake.server_deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+        var context: api_operation.RequestContext = .{ .deadline_ns = fake.server_deadline, .cancellation = .{ .ptr = &fake, .is_cancelled_fn = Fake.requested } };
+        var parent: RunnableScheduler.Execution = .{};
+        defer parent.finish();
+        var read: @import("runnable_local_read.zig").Read = .{ .execution = &parent, .allocator = a };
+        var team: ?@import("antfly_runtime_abi").runnable_abi.Team = null;
+        if (borrowed) {
+            try parent.start(server.runnableScheduler(), .{ .io = std.testing.io, .native_now_ns = platform_time.monotonicNs, .deadline_ns = fake.server_deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &fake, .requested = Fake.requested } }, .query);
+            team = try read.team();
+            context.execution_team = &team.?;
+        }
+        const result = server.probeRetrievalIncomingEdgesWithContext(a, source, "docs", "graph_idx", &.{ "doc:a", "doc:b" }, context);
+        switch (case) {
+            .success => {
+                const mask = try result;
+                defer a.free(mask);
+                try std.testing.expectEqualSlices(bool, &.{ true, false }, mask);
+            },
+            .cancel => try std.testing.expectError(error.Canceled, result),
+            .expire => try std.testing.expectError(error.DeadlineExceeded, result),
+            .shutdown => try std.testing.expectError(error.SchedulerClosed, result),
+        }
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        try std.testing.expectEqual(@as(usize, if (borrowed) 1 else 0), server.runnableScheduler().?.stats().operations);
+        if (borrowed) try std.testing.expectEqual(@as(u64, 23), server.runnableScheduler().?.stats().retained_bytes);
         parent.finish();
         try std.testing.expectEqual(@as(usize, 0), server.runnableScheduler().?.stats().operations);
         try std.testing.expectEqual(@as(u64, 0), server.runnableScheduler().?.stats().retained_bytes);
