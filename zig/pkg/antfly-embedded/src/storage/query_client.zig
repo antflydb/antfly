@@ -59,6 +59,7 @@ pub fn executeControlledJsonAlloc(
     execution_deadline_ns: ?u64,
     cancellation_ctx: ?*anyopaque,
     cancellation_fn: ?abi.CancellationCheckFn,
+    execution_runnable: ?*const anyopaque,
     out_failure: *abi.FailureIdentity,
 ) ![]u8 {
     std.debug.assert(kind != .search);
@@ -71,6 +72,7 @@ pub fn executeControlledJsonAlloc(
         .execution_deadline_ns = execution_deadline_ns orelse 0,
         .cancellation_ctx = cancellation_ctx,
         .cancellation_fn = cancellation_fn,
+        .execution_runnable = execution_runnable,
     }, validationOperation(kind), out_failure);
     return response.json;
 }

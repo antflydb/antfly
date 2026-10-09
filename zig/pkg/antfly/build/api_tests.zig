@@ -271,7 +271,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const graph_fanout_owner_tests = b.addTest(.{
         .name = "graph-fanout-owner-tests",
         .root_module = graph_fanout_owner_root,
-        .filters = &.{"distributed graph fans out per-group expand and hydrate with worker io"},
+        .filters = &.{ "distributed graph fans out per-group expand and hydrate with worker io", "storage local graph controls preserve borrowed authority" },
         .max_rss = 3 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });

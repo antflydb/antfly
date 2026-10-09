@@ -5307,6 +5307,7 @@ pub fn executeStorageOwnerCompiledQueryOperation(
         null,
         null,
         null,
+        null,
         out_failure,
     ) catch |err| {
         if (out_failure.status != .ok) return out_failure.status;
@@ -5476,6 +5477,7 @@ pub fn executeStorageOwnerCompiledGraph(
         if (request.has_execution_deadline != 0) request.execution_deadline_ns else null,
         request.cancellation_ctx,
         request.cancellation_fn,
+        request.execution_runnable,
         out_failure,
     ) catch |err| {
         // A valid nested provider failure retains its local-query origin and

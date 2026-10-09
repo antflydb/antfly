@@ -38,6 +38,12 @@ pub fn execute(
     out_failure.* = .{};
     if (request.version != abi.abi_version)
         return fail(error.InvalidAbiVersion, .validate_request, out_failure);
+    if (request.execution_runnable) |raw| {
+        const grant = @import("antfly_runtime_abi").runnable_abi.Borrowed.read(@ptrCast(@alignCast(raw))) catch |err|
+            return fail(err, .validate_request, out_failure);
+        const status = grant.checkpoint(grant.context);
+        if (!status.isOk()) return fail(@import("antfly_runtime_abi").error_abi.errorFromStatus(status), .validate_request, out_failure);
+    }
     const db: *db_mod.DB = @ptrCast(@alignCast(request.db orelse
         return fail(error.InvalidArgument, .validate_request, out_failure)));
     const table_name = request.table_name.slice();
@@ -89,6 +95,8 @@ fn executeSearch(
             request.execution_deadline_ns;
     }
     owned.req.cancellation = requestCancellationToken(request);
+    owned.req.execution_runnable = requestRunnable(request) catch |err|
+        return fail(err, .validate_request, out_failure);
     @import("antfly_local_sources").api_local_query_contract.checkQueryDeadline(owned.req) catch |err|
         return fail(err, executeOperation(request.dialect), out_failure);
 
@@ -211,7 +219,7 @@ fn executeGraphExpand(
     var parsed = distributed_graph.parseGraphExpandRequest(alloc, request.request_json.slice()) catch |err|
         return fail(err, .parse_graph_expand, out_failure);
     defer parsed.deinit(alloc);
-    applyControls(request, &parsed);
+    applyControls(request, &parsed) catch |err| return fail(err, .validate_request, out_failure);
     var result = local_query.executeStorageKernelGraphExpand(alloc, db, table_name, parsed) catch |err|
         return fail(err, .execute_graph_expand, out_failure);
     defer result.deinit(alloc);
@@ -231,7 +239,7 @@ fn executeGraphHydrate(
     var parsed = distributed_graph.parseGraphHydrateRequest(alloc, request.request_json.slice()) catch |err|
         return fail(err, .parse_graph_hydrate, out_failure);
     defer parsed.deinit(alloc);
-    applyControls(request, &parsed);
+    applyControls(request, &parsed) catch |err| return fail(err, .validate_request, out_failure);
     var result = local_query.executeStorageKernelGraphHydrate(alloc, db, parsed) catch |err|
         return fail(err, .execute_graph_hydrate, out_failure);
     defer result.deinit(alloc);
@@ -251,7 +259,7 @@ fn executeGraphEdges(
     var parsed = distributed_graph.parseGraphEdgesRequest(alloc, request.request_json.slice()) catch |err|
         return fail(err, .parse_graph_edges, out_failure);
     defer parsed.deinit(alloc);
-    applyControls(request, &parsed);
+    applyControls(request, &parsed) catch |err| return fail(err, .validate_request, out_failure);
     var result = local_query.executeStorageKernelGraphEdges(alloc, db, parsed) catch |err|
         return fail(err, .execute_graph_edges, out_failure);
     defer result.deinit(alloc);
@@ -310,13 +318,19 @@ fn executePreflight(
     return .ok;
 }
 
-fn applyControls(request: *const abi.LocalQueryRequest, graph_request: anytype) void {
+fn applyControls(request: *const abi.LocalQueryRequest, graph_request: anytype) !void {
+    graph_request.execution_runnable = try requestRunnable(request);
     graph_request.execution_deadline_ns = if (request.has_execution_deadline != 0)
         request.execution_deadline_ns
     else
         null;
     graph_request.timeout_ms = null;
     graph_request.cancellation = requestCancellationToken(request);
+}
+
+fn requestRunnable(request: *const abi.LocalQueryRequest) !?@import("antfly_runtime_abi").runnable_abi.Borrowed {
+    const raw = request.execution_runnable orelse return null;
+    return try @import("antfly_runtime_abi").runnable_abi.Borrowed.read(@ptrCast(@alignCast(raw)));
 }
 
 fn requestCancellationToken(request: *const abi.LocalQueryRequest) db_mod.types.CancellationToken {
@@ -371,4 +385,67 @@ fn encodeOperation(dialect: abi.LocalQueryDialect) abi.LocalQueryOperation {
 pub fn bufferDestroy(buffer: *abi.OwnedBytes) callconv(.c) void {
     if (buffer.ptr) |ptr| std.heap.c_allocator.free(ptr[0..@intCast(buffer.len)]);
     buffer.* = .{};
+}
+
+test "storage local graph controls preserve borrowed authority and reject malformed grants" {
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const runnable = @import("antfly_runtime_abi").runnable_abi;
+    const clock = @import("antfly_platform").time;
+    var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer scheduler.close();
+    var canceled: std.atomic.Value(bool) = .init(false);
+    const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+    var parent: native.Execution = .{};
+    defer parent.finish();
+    try parent.start(&scheduler, .{
+        .io = std.testing.io,
+        .native_now_ns = clock.monotonicNs,
+        .deadline_ns = deadline,
+        .retained_bytes = 23,
+        .cancellation = .{ .ptr = &canceled, .requested = struct {
+            fn requested(raw: *const anyopaque) bool {
+                return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+            }
+        }.requested },
+    }, .query);
+    var read: @import("../api/runnable_local_read.zig").Read = .{ .execution = &parent, .allocator = std.testing.allocator };
+    const team = try read.team();
+    var request = abi.LocalQueryRequest{
+        .execution_runnable = &team.borrow,
+        .execution_deadline_ns = deadline,
+        .has_execution_deadline = 1,
+    };
+    var parsed: distributed_graph.GraphHydrateRequest = .{ .keys = &.{} };
+    try applyControls(&request, &parsed);
+    try std.testing.expect(parsed.execution_runnable.?.context == team.borrow.context);
+    try std.testing.expectEqual(@as(?u64, deadline), parsed.execution_deadline_ns);
+    const search = local_query_contract.graphHydrateSearchRequest(parsed);
+    try local_query_contract.checkQueryDeadline(search);
+    try std.testing.expectEqual(runnable.Class.query, try search.execution_runnable.?.currentClass());
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+
+    // A local grant survives the ABI control path, never the JSON payload.
+    const encoded = try distributed_graph.encodeGraphHydrateRequest(std.testing.allocator, parsed);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "execution_runnable") == null);
+    var reparsed = try distributed_graph.parseGraphHydrateRequest(std.testing.allocator, encoded);
+    defer reparsed.deinit(std.testing.allocator);
+    try std.testing.expect(reparsed.execution_runnable == null);
+
+    var malformed = team.borrow;
+    malformed.version -= 1;
+    request.execution_runnable = &malformed;
+    try std.testing.expectError(error.UnsupportedVersion, applyControls(&request, &parsed));
+    request.execution_runnable = &team.borrow;
+    try applyControls(&request, &parsed);
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, local_query_contract.checkQueryDeadline(local_query_contract.graphHydrateSearchRequest(parsed)));
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    request.execution_runnable = null;
+    try applyControls(&request, &parsed);
+    try std.testing.expect(parsed.execution_runnable == null);
+    parent.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
 }

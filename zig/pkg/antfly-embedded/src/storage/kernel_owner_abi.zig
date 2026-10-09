@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 82;
+pub const abi_version: u32 = 83;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -287,6 +287,10 @@ pub const LocalQueryRequest = extern struct {
     cancellation_ctx: ?*anyopaque = null,
     cancellation_fn: ?CancellationCheckFn = null,
     execution_deadline_ns: u64 = 0,
+    /// Synchronous invocation-local pointer to runtime_runnable_abi.Borrowed.
+    /// The caller retains its capsule until this call returns. Never encoded
+    /// in request JSON, retained by the provider, or reconstructed from input.
+    execution_runnable: ?*const anyopaque = null,
 };
 
 /// Process-scoped physical-storage owner. The handle owns shared caches and
@@ -1586,6 +1590,10 @@ pub const ControlledJsonOperationRequest = extern struct {
     _reserved1: [7]u8 = @splat(0),
     cancellation_ctx: ?*anyopaque = null,
     cancellation_fn: ?CancellationCheckFn = null,
+    /// Synchronous invocation-local pointer to runtime_runnable_abi.Borrowed.
+    /// The caller retains its capsule until this call returns. Never encoded
+    /// in request JSON, retained by the provider, or reconstructed from input.
+    execution_runnable: ?*const anyopaque = null,
 };
 
 /// Prepare one scoped restore step inside an already leased physical owner.

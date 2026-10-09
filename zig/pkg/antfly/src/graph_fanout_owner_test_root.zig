@@ -6,4 +6,5 @@ pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 pub const local_test_sources = @import("local_test_sources.zig");
 test {
     _ = @import("api/distributed_graph.zig");
+    _ = @import("storage/local_query_provider.zig");
 }

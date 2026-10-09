@@ -849,10 +849,12 @@ pub const Owner = struct {
         execution_deadline_ns: ?u64,
         cancellation_ctx: ?*anyopaque,
         cancellation_fn: ?abi.CancellationCheckFn,
+        execution_runnable: ?*const anyopaque,
     ) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
-        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        var request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        request.execution_runnable = execution_runnable;
         const status = abi.antfly_storage_owner_graph_expand_json(
             self.handle,
             &request,
@@ -870,10 +872,12 @@ pub const Owner = struct {
         execution_deadline_ns: ?u64,
         cancellation_ctx: ?*anyopaque,
         cancellation_fn: ?abi.CancellationCheckFn,
+        execution_runnable: ?*const anyopaque,
     ) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
-        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        var request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        request.execution_runnable = execution_runnable;
         const status = abi.antfly_storage_owner_graph_hydrate_json(
             self.handle,
             &request,
@@ -891,10 +895,12 @@ pub const Owner = struct {
         execution_deadline_ns: ?u64,
         cancellation_ctx: ?*anyopaque,
         cancellation_fn: ?abi.CancellationCheckFn,
+        execution_runnable: ?*const anyopaque,
     ) !Response {
         var response: Response = .{};
         var failure: abi.FailureIdentity = .{};
-        const request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        var request = controlledRequest(table_name, request_json, execution_deadline_ns, cancellation_ctx, cancellation_fn);
+        request.execution_runnable = execution_runnable;
         const status = abi.antfly_storage_owner_graph_edges_json(
             self.handle,
             &request,

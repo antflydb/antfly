@@ -6138,6 +6138,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             controlled.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,
             if (cancellation != null) cancellationTokenRequested else null,
+            if (controlled.execution_runnable) |*borrow| borrow else null,
         );
         defer response.deinit();
         return try distributed_graph.parseGraphExpandResponse(alloc, response.bytes());
@@ -6168,6 +6169,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             controlled.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,
             if (cancellation != null) cancellationTokenRequested else null,
+            if (controlled.execution_runnable) |*borrow| borrow else null,
         );
         defer response.deinit();
         return try distributed_graph.parseGraphHydrateResponse(alloc, response.bytes());
@@ -6198,6 +6200,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             controlled.execution_deadline_ns,
             if (cancellation != null) @ptrCast(&cancellation.?) else null,
             if (cancellation != null) cancellationTokenRequested else null,
+            if (controlled.execution_runnable) |*borrow| borrow else null,
         );
         defer response.deinit();
         return try distributed_graph.parseGraphEdgesResponse(alloc, response.bytes());
