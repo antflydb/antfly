@@ -138,6 +138,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = options.api_http_runtime_test_mod,
         .filters = &.{
             "retrieval catalog read owns or borrows one original query execution",
+            "retrieval key scans retain original ownership through storage waits and denied reentry",
             "semantic query planning reuses equivalent embeddings across tables and isolates principals",
             "api http server serves retrieval agent response envelope",
         },

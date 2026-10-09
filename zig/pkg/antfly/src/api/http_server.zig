@@ -9467,6 +9467,46 @@ pub const ApiHttpServer = struct {
         defer alloc.free(retrieval_resp.body);
     }
 
+    fn executeInternalRetrievalQuery(self: *ApiHttpServer, alloc: std.mem.Allocator, source: table_reads.TableReadSource, input: api_operation.RequestContext, table_name: []const u8, query_json: []const u8) !query_api.QueryResponse {
+        var normalized = try input.platformDeadline();
+        try normalized.ensureActive();
+        const body_deadline = try query_contract.queryExecutionDeadlineNsFromBody(alloc, query_json);
+        normalized.deadline_ns = if (normalized.deadline_ns) |original| @min(original, body_deadline orelse original) else body_deadline;
+        var owner: QueryReadExecution = .{};
+        defer owner.execution.finish();
+        try owner.start(self, normalized, @as(u64, table_name.len) +| query_json.len +| 1024);
+        const context = owner.context;
+        var semantic_resolver = self.semanticStatusResolver(.internal, "");
+        semantic_resolver.query_embedding_deadline_ns = context.deadline_ns;
+        semantic_resolver.query_cancellation = context.cancellation;
+        semantic_resolver.query_runnable = if (context.execution_team) |team| team.borrow else null;
+        var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
+            else => return err,
+        };
+        defer query_req.deinit(alloc);
+        query_req.req.execution_deadline_ns = context.deadline_ns;
+        query_req.req.cancellation = context.cancellation;
+        var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer catalog_arena.deinit();
+        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .execution_team = context.execution_team };
+        self.routeQueryToReadSchemaWithResolver(table_name, &query_req.req, &resolver) catch |err| switch (err) {
+            error.TableNotFound => return err,
+            error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidRetrievalAgentRequest,
+            else => return err,
+        };
+        try owner.checkpoint();
+        var result = (try source.query(
+            alloc,
+            table_name,
+            query_req.req,
+            .read_index,
+        )) orelse return error.TableNotFound;
+        errdefer result.deinit(alloc);
+        try owner.checkpoint();
+        return result;
+    }
+
     /// Execute the internal retrieval worker protocol without manufacturing
     /// an HTTP request. The caller owns `response.body` with `self.alloc`.
     pub fn executeInternalRetrieval(self: *ApiHttpServer, body: []const u8) !retrieval_agent.EncodedResponse {
@@ -9485,6 +9525,7 @@ pub const ApiHttpServer = struct {
             deadline_ns: u64,
             cancellation: CancellationToken,
             source: table_reads.TableReadSource,
+            execution_team: ?*@import("antfly_runtime_abi").runnable_abi.Team,
 
             fn iface(runner: *@This()) retrieval_agent.QueryRunner {
                 return .{
@@ -9529,31 +9570,7 @@ pub const ApiHttpServer = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr_inner));
-                var semantic_resolver = runner.server.semanticStatusResolver(.internal, "");
-                semantic_resolver.query_embedding_deadline_ns = runner.deadline_ns;
-                semantic_resolver.query_cancellation = runner.cancellation;
-                var query_req = query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
-                    error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
-                    else => return err,
-                };
-                defer query_req.deinit(alloc);
-                query_req.req.execution_deadline_ns = if (query_req.req.execution_deadline_ns) |deadline| @min(deadline, runner.deadline_ns) else runner.deadline_ns;
-                query_req.req.cancellation = runner.cancellation;
-                runner.server.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
-                    error.TableNotFound => return err,
-                    error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidRetrievalAgentRequest,
-                    else => return err,
-                };
-                return (runner.source.query(
-                    alloc,
-                    table_name,
-                    query_req.req,
-                    .read_index,
-                ) catch |err| {
-                    if (err == error.DocIdentityNamespaceMismatch) return err;
-                    std.log.err("retrieval query failed table={s} query={s} err={}", .{ table_name, query_json, err });
-                    return err;
-                }) orelse error.TableNotFound;
+                return runner.server.executeInternalRetrievalQuery(alloc, runner.source, .{ .deadline_ns = runner.deadline_ns, .cancellation = runner.cancellation, .execution_team = runner.execution_team }, table_name, query_json);
             }
 
             fn scanKeyPage(
@@ -9575,7 +9592,7 @@ pub const ApiHttpServer = struct {
                     filter_query_json,
                     exclusion_query_json,
                     null,
-                    .{ .deadline_ns = runner.deadline_ns, .cancellation = runner.cancellation },
+                    .{ .deadline_ns = runner.deadline_ns, .cancellation = runner.cancellation, .execution_team = runner.execution_team },
                 );
             }
 
@@ -9639,6 +9656,7 @@ pub const ApiHttpServer = struct {
             .deadline_ns = generation_runner.deadline_ns,
             .cancellation = context.cancellation,
             .source = source,
+            .execution_team = context.execution_team,
         };
         return retrieval_agent.execute(self.alloc, query_runner.iface(), generation_runner.iface(), body);
     }
@@ -9695,7 +9713,7 @@ pub const ApiHttpServer = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const alloc = if (resolver) |cache| cache.arena else arena.allocator();
-        const table = (try self.queryTableDefinition(alloc, resolver, table_name, .{ .deadline_ns = query_req.execution_deadline_ns, .cancellation = query_req.cancellation orelse .none })) orelse return;
+        const table = (try self.queryTableDefinition(alloc, resolver, table_name, .{ .deadline_ns = query_req.execution_deadline_ns, .cancellation = query_req.cancellation orelse .none, .execution_team = if (resolver) |cache| cache.execution_team else null })) orelse return;
         try tables_api.routeQueryRequestToActiveReadIndex(self.alloc, &table, query_req);
         query_req.prepared_read_table_id = table.table_id;
     }
@@ -10374,10 +10392,11 @@ pub const ApiHttpServer = struct {
         authenticated_identity: ?AuthenticatedIdentity,
         request_context: api_operation.RequestContext,
     ) !retrieval_agent.QueryRunner.KeyPage {
-        _ = self;
-        const context = try request_context.platformDeadline();
-        try context.ensureActive();
         if (limit == 0) return error.InvalidRetrievalAgentRequest;
+        var owner: QueryReadExecution = .{};
+        defer owner.execution.finish();
+        try owner.start(self, request_context, @as(u64, table_name.len) +| after_key.len +| (if (filter_query_json) |value| value.len else 0) +| (if (exclusion_query_json) |value| value.len else 0) +| 1024);
+        const context = owner.context;
         const row_filter_json = try resolveEffectiveRowFilterJson(
             alloc,
             authenticated_identity,
@@ -10403,6 +10422,7 @@ pub const ApiHttpServer = struct {
                 .filter_query_json = predicate.json,
                 .execution_deadline_ns = context.deadline_ns,
                 .cancellation = context.cancellation,
+                .execution_wait = owner.waitBoundary(),
             },
             .read_index,
         )) orelse return error.TableNotFound;
@@ -10416,6 +10436,7 @@ pub const ApiHttpServer = struct {
 
         var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
         while (lines.next()) |line| {
+            try owner.checkpoint();
             if (line.len == 0) continue;
             const key = scanLineKey(alloc, line) catch return error.InvalidRetrievalAgentRequest;
             errdefer alloc.free(key);
@@ -14717,6 +14738,72 @@ pub const ApiHttpServer = struct {
     /// Retrieval adapters use the same authorization, catalog binding, and
     /// presentation boundary as ordinary public queries. The binding survives
     /// execution retries and never extends the enclosing request deadline.
+    // Initialize at a stable address and retain until all synchronous reads and
+    // their children return. Borrowed invocations never retire the caller root.
+    const QueryReadExecution = struct {
+        context: api_operation.RequestContext = .{},
+        execution: RunnableScheduler.Execution = .{},
+        read: @import("runnable_local_read.zig").Read = undefined,
+        team: ?@import("antfly_runtime_abi").runnable_abi.Team = null,
+        bridge: ?@import("runnable_native_borrow.zig").Bridge = null,
+        waiting_class: ?RunnableScheduler.Class = null,
+
+        fn start(self: *@This(), server: *ApiHttpServer, input: api_operation.RequestContext, retained_bytes: u64) !void {
+            self.context = try input.platformDeadline();
+            try self.context.ensureActive();
+            errdefer self.execution.finish();
+            if (self.context.execution_team) |team| {
+                self.bridge = try @import("runnable_native_borrow.zig").Bridge.init(&team.borrow, server.alloc);
+                try self.bridge.?.bind(&self.execution);
+                try self.execution.checkpoint();
+            } else {
+                try self.execution.start(server.runnableScheduler(), .{
+                    .io = server.sharedApiIo() orelse server.embedding_provider_runtime.io,
+                    .native_now_ns = platform_time.monotonicNs,
+                    .deadline_ns = self.context.deadline_ns,
+                    .cancellation = .{ .ptr = &self.context.cancellation, .requested = struct {
+                        fn requested(raw: *const anyopaque) bool {
+                            return @as(*const CancellationToken, @ptrCast(@alignCast(raw))).isCancelled();
+                        }
+                    }.requested },
+                    .retained_bytes = retained_bytes,
+                }, .query);
+                if (self.execution.entry != null) {
+                    self.read = .{ .execution = &self.execution, .allocator = server.alloc };
+                    self.team = try self.read.team();
+                    self.context.execution_team = &self.team.?;
+                }
+            }
+        }
+
+        fn checkpoint(self: *@This()) !void {
+            try self.context.ensureActive();
+            try self.execution.checkpoint();
+        }
+
+        fn waitBoundary(self: *@This()) ?@import("antfly_local_sources").common_execution_wait.Boundary {
+            if (self.context.execution_team == null) return null;
+            return .{ .ptr = self, .begin = beginWait, .end = endWait };
+        }
+
+        fn beginWait(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.waiting_class != null) return error.InvalidRunnableTransition;
+            try self.checkpoint();
+            const class = try self.execution.retainedClass();
+            try self.execution.park(.resource_blocked);
+            self.waiting_class = class;
+        }
+
+        fn endWait(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const class = self.waiting_class orelse return error.InvalidRunnableTransition;
+            self.waiting_class = null;
+            try self.execution.enter(class);
+            try self.context.ensureActive();
+        }
+    };
+
     pub fn executeCatalogRetrievalQuery(
         self: *ApiHttpServer,
         alloc: std.mem.Allocator,
@@ -14729,29 +14816,10 @@ pub const ApiHttpServer = struct {
         try normalized.ensureActive();
         const body_deadline = try query_contract.queryExecutionDeadlineNsFromBody(alloc, body);
         normalized.deadline_ns = if (normalized.deadline_ns) |original| @min(original, body_deadline orelse original) else body_deadline;
-        // Each independent agent callback owns its execution. An existing
-        // caller capability is forwarded synchronously without fresh admission.
-        var execution: RunnableScheduler.Execution = .{};
-        defer execution.finish();
-        var read: @import("runnable_local_read.zig").Read = .{ .execution = &execution, .allocator = self.alloc };
-        var team: ?@import("antfly_runtime_abi").runnable_abi.Team = null;
-        if (normalized.execution_team == null) {
-            try execution.start(self.runnableScheduler(), .{
-                .io = self.sharedApiIo() orelse self.embedding_provider_runtime.io,
-                .native_now_ns = platform_time.monotonicNs,
-                .deadline_ns = normalized.deadline_ns,
-                .cancellation = .{ .ptr = &normalized.cancellation, .requested = struct {
-                    fn requested(raw: *const anyopaque) bool {
-                        return @as(*const CancellationToken, @ptrCast(@alignCast(raw))).isCancelled();
-                    }
-                }.requested },
-                .retained_bytes = @as(u64, body.len) +| logical_name.len +| 1024,
-            }, .query);
-            if (execution.entry != null) {
-                team = try read.team();
-                normalized.execution_team = &team.?;
-            }
-        }
+        var owner: QueryReadExecution = .{};
+        defer owner.execution.finish();
+        try owner.start(self, normalized, @as(u64, body.len) +| logical_name.len +| 1024);
+        normalized = owner.context;
         _ = try system_catalog.Target.literal(logical_name);
         const source = self.table_reads orelse return error.TableNotFound;
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
@@ -58289,6 +58357,10 @@ test "retrieval catalog read owns or borrows one original query execution" {
             const team = context.execution_team orelse return error.TestMissingReadCapability;
             try team.borrow.checkLifetime();
             try std.testing.expectEqual(@as(usize, 1), self.server.?.runnable_scheduler.?.stats().operations);
+            if (input == .query_definition) {
+                try std.testing.expectEqualStrings("table:docs", input.query_definition);
+                return std.json.Stringify.valueAlloc(alloc, system_catalog.QueryDefinition{ .table_id = 7, .schema_json = "{}", .read_schema_json = "", .indexes_json = "{}" }, .{});
+            }
             try std.testing.expect(input == .resolve_many);
             const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = 7, .name = "table:docs", .query_definition = .{ .schema_json = "{}", .read_schema_json = "", .indexes_json = "{}" } }};
             return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = 1, .tables = &tables }, .{});
@@ -58334,9 +58406,119 @@ test "retrieval catalog read owns or borrows one original query execution" {
     try std.testing.expectEqual(borrowed_grants, server.runnable_scheduler.?.stats().grants);
     try parent.checkLifetime();
     try std.testing.expectEqual(@as(usize, 1), server.runnable_scheduler.?.stats().operations);
+    var internal_borrowed = try server.executeInternalRetrievalQuery(a, reads, .{ .deadline_ns = deadline, .execution_team = &team }, "table:docs", body);
+    defer internal_borrowed.deinit(a);
+    try parent.checkLifetime();
+    try std.testing.expectEqual(borrowed_grants, server.runnable_scheduler.?.stats().grants);
     parent.finish();
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    var internal_owned = try server.executeInternalRetrievalQuery(a, reads, .{ .deadline_ns = deadline }, "table:docs", body);
+    defer internal_owned.deinit(a);
+    try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
+    try std.testing.expectEqual(@as(usize, 4), fake.calls);
     try std.testing.expectError(error.DeadlineExceeded, server.executeCatalogRetrievalQuery(a, .{ .deadline_ns = platform_time.monotonicNs() -| 1 }, "docs", body, null));
     try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), server.runnable_scheduler.?.stats().retained_bytes);
+}
+
+test "retrieval key scans retain original ownership through storage waits and denied reentry" {
+    const a = std.testing.allocator;
+    const Case = enum { success, cancel, expire, shutdown };
+    const Fake = struct {
+        server: *ApiHttpServer = undefined,
+        case: Case,
+        cancel_requested: bool = false,
+        calls: usize = 0,
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const @This(), @ptrCast(@alignCast(raw))).cancel_requested;
+        }
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return null;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return null;
+        }
+        fn discard(value: table_reads.ScanResponse, alloc: std.mem.Allocator) void {
+            var response = value;
+            response.deinit(alloc);
+        }
+        fn physicalRead(self: *@This(), alloc: std.mem.Allocator, deadline: u64) !table_reads.ScanResponse {
+            const scheduler = self.server.runnableScheduler().?;
+            const parked = scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 0), parked.runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), parked.operations);
+            try std.testing.expect(parked.retained_bytes >= 23);
+            var control: RunnableScheduler.Execution = .{};
+            defer control.finish();
+            try control.start(scheduler, .{ .io = std.testing.io, .native_now_ns = platform_time.monotonicNs, .retained_bytes = 7 }, .control);
+            try control.checkpoint();
+            control.finish();
+            switch (self.case) {
+                .success => {},
+                .cancel => self.cancel_requested = true,
+                .expire => while (platform_time.monotonicNs() < deadline) {
+                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                },
+                .shutdown => scheduler.close(),
+            }
+            const still_retained = scheduler.stats();
+            try std.testing.expectEqual(parked.operations, still_retained.operations);
+            try std.testing.expectEqual(parked.retained_bytes, still_retained.retained_bytes);
+            try std.testing.expectEqual(parked.grants[0], still_retained.grants[0]);
+            return .{ .ndjson = try alloc.dupe(u8, "{\"_id\":\"doc:a\"}\n{\"_id\":\"doc:b\"}\n") };
+        }
+        fn scan(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, opts: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const boundary = opts.execution_wait orelse return error.TestMissingReadCapability;
+            const grants = self.server.runnableScheduler().?.stats().grants[0];
+            const response = boundary.runOwned(physicalRead, .{ self, alloc, opts.execution_deadline_ns.? }, discard, .{alloc}) catch |err| {
+                try std.testing.expectEqual(grants, self.server.runnableScheduler().?.stats().grants[0]);
+                return err;
+            };
+            try std.testing.expectEqual(@as(usize, 1), self.server.runnableScheduler().?.stats().runnable_slots);
+            return response;
+        }
+    };
+    for (std.enums.values(Case)) |case| for ([_]bool{ false, true }) |borrowed| {
+        var fake = Fake{ .case = case };
+        const source: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } };
+        var server = ApiHttpServer.init(a, .{ .runnable_policy = .{ .slots = 2 } }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status } }, source, null);
+        defer server.deinit();
+        fake.server = &server;
+        const deadline = platform_time.monotonicNs() + std.time.ns_per_s;
+        var context: api_operation.RequestContext = .{ .deadline_ns = deadline, .cancellation = .{ .ptr = &fake, .is_cancelled_fn = Fake.canceled } };
+        var parent: RunnableScheduler.Execution = .{};
+        defer parent.finish();
+        var read: @import("runnable_local_read.zig").Read = .{ .execution = &parent, .allocator = a };
+        var team: ?@import("antfly_runtime_abi").runnable_abi.Team = null;
+        if (borrowed) {
+            try parent.start(server.runnableScheduler(), .{ .io = std.testing.io, .native_now_ns = platform_time.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &fake, .requested = Fake.canceled } }, .query);
+            team = try read.team();
+            context.execution_team = &team.?;
+        }
+        const result = server.scanRetrievalKeyPageWithContext(a, source, "docs", "", 3, null, null, null, context);
+        switch (case) {
+            .success => {
+                var page = try result;
+                defer page.deinit(a);
+                try std.testing.expect(page.exhausted);
+                try std.testing.expectEqual(@as(usize, 2), page.keys.len);
+                try std.testing.expectEqualStrings("doc:a", page.keys[0]);
+                try std.testing.expectEqualStrings("doc:b", page.keys[1]);
+            },
+            .cancel => try std.testing.expectError(error.Canceled, result),
+            .expire => try std.testing.expectError(error.DeadlineExceeded, result),
+            .shutdown => try std.testing.expectError(error.SchedulerClosed, result),
+        }
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        const retained = server.runnableScheduler().?.stats();
+        try std.testing.expectEqual(@as(usize, if (borrowed) 1 else 0), retained.operations);
+        if (borrowed) try std.testing.expectEqual(@as(u64, 23), retained.retained_bytes);
+        parent.finish();
+        try std.testing.expectEqual(@as(usize, 0), server.runnableScheduler().?.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), server.runnableScheduler().?.stats().retained_bytes);
+    };
 }
