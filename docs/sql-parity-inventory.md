@@ -1665,8 +1665,27 @@ same-page/cross-page conflicts, duplicate commands with surviving neighbors,
 snapshot downgrade rejection, reopen and successful rebuild after a source fix.
 The opaque storage-owner regression also reads the durable failure through the
 compiled control projection and checks it after reopen.
-Leader scheduling and end-to-end coordinator
-retries remain to be wired. Pending-generation reservation sources, GC scheduling,
+Leader scheduling now shares both in-process and HTTP metadata control/lifecycle
+rounds, including metadata-only nodes. A per-service `std.Io` lane and 250-ms
+cadence admit at most one bounded intent per slice. Tracking adoption remains
+explicit; tracked sources start missing jobs, replace stale source epochs by
+CAS, advance committed cuts and alternate forward work with collectible GC.
+Unchanged failed epochs remain stopped. Pending receipts suppress repeated
+preparation/append until local Raft apply catches up; term changes, coordinator
+restart and ambiguous admission re-observe durable state rather than assuming
+that an intent won. No job apply waiter or separate polling thread is created.
+Capability refresh has a bounded request context, and exact-term/membership
+admission still runs through the ordinary proposal path. Background proposals
+release synchronous-waiter compaction proofs immediately so page churn cannot
+exhaust the bounded receipt tracker. Pure coordinator tests cover cadence/read
+budgets, GC alternation, lane contention, leader loss, overwritten receipts and
+ambiguous outcomes. A real metadata/Raft control-round regression covers
+explicit adoption, initial reconciliation, coordinator restart, source-epoch
+replacement, conflict failure, stopped retries, GC and corrected-source rebuild;
+it also verifies no root publication and zero retained proposal receipts.
+`zig build antfly-relation-coordinator-test` exercises these paths.
+Multi-peer coordinator failover/fault coverage remains to be extended alongside
+serving activation. Pending-generation reservation sources,
 capability barriers and atomic active-root publication still
 precede writer adoption and SQL point resolution. No original SQL case is
 credited for this protocol component.

@@ -32,6 +32,7 @@ const metadata_http_client = @import("http_client.zig");
 const raft_engine = @import("raft_engine");
 const metadata_control_loop = @import("control_loop.zig");
 const metadata_reconcile_lease = @import("reconcile_lease.zig");
+const relation_worker = @import("relation_reconciliation_worker.zig");
 const metadata_reallocation_request = @import("reallocation_request.zig");
 const metadata_runtime_status_protocol = @import("runtime_status_protocol.zig");
 const metadata_reconciler = @import("reconciler.zig");
@@ -4067,6 +4068,51 @@ const local_table_provisioning_refresh_interval_ms: u64 = 30 * std.time.ms_per_s
 const reconcile_lease_probe_interval_ms: u64 = 250;
 const metadata_status_cache_refresh_interval_ms: u64 = 5 * std.time.ms_per_s;
 
+/// Share the serving control cadence, but do not hold a catalog lane or wait
+/// for apply. The worker's own try-lock serializes concurrent HTTP rounds.
+fn runRelationReconciliationRound(service: anytype) !void {
+    const store = service.projectedStore() orelse return;
+    const Host = struct {
+        service: @TypeOf(service),
+        store: @TypeOf(store),
+        pub fn leader(self: *@This()) !?relation_worker.Leader {
+            if (!self.service.runtime_mutex.tryLock()) return error.ResourceTemporarilyUnavailable;
+            defer self.service.unlockRuntime();
+            const host = if (@TypeOf(service.*) == MetadataHttpService) self.service.raft.host.http_host.host else self.service.raft.host.host;
+            const status = host.raftStatus(self.service.metadata_group_id) orelse return null;
+            if (status.soft.role != .leader or status.soft.leader_id != host.cfg.local_node_id) return null;
+            return .{ .term = status.hard.current_term, .applied_index = status.applied_index };
+        }
+        pub fn observe(self: *@This()) !@import("antfly_local_sources").system_catalog_relation_reconciliation.Work {
+            return self.store.relationReconciliationWork(self.service.metadata_group_id);
+        }
+        pub fn propose(self: *@This(), command: @import("relation_reconciliation_command.zig").Command, term: u64) !relation_worker.Receipt {
+            const bytes = try command.encodeAlloc(self.service.alloc);
+            defer self.service.alloc.free(bytes);
+            const request: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| relation_worker.round_interval_ns };
+            const transition: metadata_storage.TransitionCommand = .{ .apply_relation_reconciliation = bytes };
+            try ensureCoordinatedDecoderWithContext(self.service, transition, request);
+            try request.ensureActive();
+            const receipt = try self.service.proposeTransitionCommandWithReceiptInTerm(transition, term);
+            // We only suppress in-flight duplicates, never certify an exact
+            // applied term. Release the shared waiter's compaction proof now;
+            // otherwise every background page would retain a zero-waiter
+            // receipt and eventually exhaust ordinary mutation admission.
+            self.service.lockRuntime();
+            defer self.service.unlockRuntime();
+            const host = if (@TypeOf(service.*) == MetadataHttpService) self.service.raft.host.http_host.host else self.service.raft.host.host;
+            if (host.acquireProposalReceipt(self.service.metadata_group_id, receipt.term, receipt.index))
+                host.releaseProposalReceipt(self.service.metadata_group_id, receipt.term, receipt.index);
+            return .{ .term = receipt.term, .index = receipt.index };
+        }
+    };
+    var host: Host = .{ .service = service, .store = store };
+    _ = service.relation_reconciliation_worker.step(&host, service.metadata_group_id, platform_time.monotonicNs()) catch |err| switch (err) {
+        error.NotLeader, error.TableTopologyProtocolUpgradeRequired, error.DeadlineExceeded, error.Canceled, error.ResourceTemporarilyUnavailable, error.MetadataMutationOutcomeUnknown => return,
+        else => return err,
+    };
+}
+
 const ReconcileLeaseProjectionCache = struct {
     epoch: ?u64 = null,
     record: ?metadata_reconcile_lease.ReconcileLeaseRecord = null,
@@ -5385,6 +5431,7 @@ pub const MetadataService = struct {
     cdc_permit_check_after_ns: std.atomic.Value(u64) = .init(0),
     cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
+    relation_reconciliation_worker: relation_worker.Worker = .{},
     // Coordinate proposal progress across in-process callers just as the HTTP
     // service does: one waiter drives Raft while the others sleep on a
     // generation signal instead of polling independently.
@@ -5905,6 +5952,15 @@ pub const MetadataService = struct {
         self: *MetadataService,
         command: metadata_storage.TransitionCommand,
     ) !MetadataProposalReceipt {
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null);
+    }
+
+    pub fn proposeTransitionCommandWithReceiptInTerm(self: *MetadataService, command: metadata_storage.TransitionCommand, expected_term: u64) !MetadataProposalReceipt {
+        if (expected_term == 0) return error.NotLeader;
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term);
+    }
+
+    fn proposeTransitionCommandWithReceiptInExpectedTerm(self: *MetadataService, command: metadata_storage.TransitionCommand, expected_term: ?u64) !MetadataProposalReceipt {
         const decoder = try prepareCoordinatedDecoderAdmission(self, &.{command});
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
@@ -5915,6 +5971,7 @@ pub const MetadataService = struct {
         try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
         const raft_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse
             return error.NotLeader;
+        if (expected_term) |term| if (raft_status.hard.current_term != term) return error.NotLeader;
         if (raft_status.soft.role != .leader or
             raft_status.soft.leader_id == null or
             raft_status.soft.leader_id.? != raft_status.id)
@@ -6807,6 +6864,7 @@ pub const MetadataService = struct {
             }
         }
         if (!try self.ensureMetadataIncarnation()) return;
+        try runRelationReconciliationRound(self);
         if (!self.observe_local_replica_root) return;
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForRound();
         if ((self.store_status_ticks >= 40 or backfill_markers.len > 0) and shouldRefreshLocalStoreStatus(self, backfill_markers)) {
@@ -6843,6 +6901,7 @@ pub const MetadataService = struct {
             try self.raft.runRaftProgressOnly();
         }
         if (!try self.ensureMetadataIncarnation()) return;
+        try runRelationReconciliationRound(self);
         if (!self.observe_local_replica_root) return;
 
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForLifecycleRound();
@@ -8052,6 +8111,7 @@ pub const MetadataHttpService = struct {
     cdc_permit_check_after_ns: std.atomic.Value(u64) = .init(0),
     cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
+    relation_reconciliation_worker: relation_worker.Worker = .{},
     runtime_mutex: std.Io.Mutex = .init,
     catalog_mutation_mutex: std.Io.RwLock = .init,
     store_report_lanes: [64]std.Io.Mutex = @splat(.init),
@@ -10421,6 +10481,7 @@ pub const MetadataHttpService = struct {
         }
         self.refreshProbeReady();
         if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
+        try runRelationReconciliationRound(self);
         if (!self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
@@ -10524,6 +10585,7 @@ pub const MetadataHttpService = struct {
             return;
         }
         self.refreshProbeReady();
+        try runRelationReconciliationRound(self);
         if (!self.observe_local_replica_root) return;
 
         var local_transition_inputs = try captureLocalTransitionInputs(self);
@@ -18361,6 +18423,108 @@ test "metadata control loop preserves prepared state while renewing its lease" {
     defer svc.freeProjectedSplitTransitions(std.testing.allocator, split_records);
     try std.testing.expectEqual(@as(usize, 1), split_records.len);
     try std.testing.expectEqual(@as(u64, 9201), split_records[0].transition_id);
+}
+
+test "relation reconciliation worker drives real metadata control rounds without serving activation" {
+    const a = std.testing.allocator;
+    const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
+    const control = @import("relation_reconciliation_command.zig");
+    const group: u64 = 1931;
+    const Factory = struct {
+        store: *raft_engine.core.MemoryStorage,
+        fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
+            return .{ .ptr = self, .vtable = &.{ .build_descriptor = build, .free_descriptor = free } };
+        }
+        fn build(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .group = .{
+                .group_id = record.group_id,
+                .local_node_id = record.local_node_id,
+                .raft_config = .{ .id = record.local_node_id, .group_id = record.group_id, .peers = try a.dupe(raft_engine.core.types.NodeId, &.{record.local_node_id}), .election_tick = 5, .heartbeat_tick = 1, .pre_vote = false, .check_quorum = true },
+                .storage = self.store.storage(),
+            }, .bootstrap = if (record.bootstrap_mode == .empty) .empty else .persisted };
+        }
+        fn free(_: *anyopaque, _: std.mem.Allocator, descriptor: *raft_engine.runtime.ReplicaDescriptor) void {
+            a.free(descriptor.group.raft_config.peers);
+        }
+    };
+    const T = struct {
+        fn command(svc: *MetadataService, intent: control.Command) !void {
+            const bytes = try intent.encodeAlloc(a);
+            defer a.free(bytes);
+            const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_relation_reconciliation = bytes });
+            try svc.waitForTransitionApplied(receipt);
+        }
+        fn settle(svc: *MetadataService, failed: bool) !r.Work {
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            for (0..32) |round| {
+                // Simulated cadence avoids sleeps; the pure worker tests
+                // separately assert the production interval/read budgets.
+                svc.relation_reconciliation_worker.next_round_at_ns = 0;
+                if (round == 2) svc.relation_reconciliation_worker = .{};
+                try svc.runRound();
+                const work = try store.relationReconciliationWork(group);
+                if (work.current) |state| if (state.epoch.eql(work.epoch.?) and work.garbage == null and
+                    (if (failed) state.failure != .none else state.phase == .ready)) return work;
+            }
+            return error.ReconciliationDidNotConverge;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/relation-worker", .{tmp.sub_path});
+    defer a.free(root);
+    const catalog = try std.fmt.allocPrint(a, "{s}/replicas.txt", .{root});
+    defer a.free(catalog);
+    var raft_store = raft_engine.core.MemoryStorage.init(a);
+    defer raft_store.deinit();
+    var factory: Factory = .{ .store = &raft_store };
+    var svc = try MetadataService.init(a, .{ .host = .{ .local_node_id = 1, .metadata_group_id = group, .replica_root_dir = root, .replica_catalog_path = catalog } }, .{ .host = .{ .host = .{ .descriptor_factory = factory.iface() } } }, .{ .observe_local_replica_root = false });
+    defer svc.deinit();
+    _ = try svc.ensureMetadataReplica(.{ .group_id = group, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty });
+    try svc.campaignMetadataGroup();
+    try runServiceRounds(&svc, 8);
+    const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    const untracked = try store.relationReconciliationWork(group);
+    try std.testing.expect(untracked.epoch == null and untracked.current == null);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, metadata_topology_protocol.relation_reconciliation_version);
+    const proof: metadata_topology_protocol.Activation = .{ .version = readiness.required_version, .incarnation = readiness.metadata_incarnation.?, .member_count = readiness.protected_member_count, .membership_fingerprint = readiness.protected_membership_fingerprint };
+    const activation = try std.json.Stringify.valueAlloc(a, proof, .{});
+    defer a.free(activation);
+    const activated = try svc.proposeTransitionCommandWithReceipt(.{ .activate_topology_protocol = activation });
+    try svc.waitForTransitionApplied(activated);
+    try std.testing.expectError(error.NotLeader, svc.proposeTransitionCommandWithReceiptInTerm(.{ .upsert_node = .{ .node_id = 99 } }, readiness.term + 1));
+    try T.command(&svc, .{ .adopt = proof });
+    const ready = try T.settle(&svc, false);
+    try std.testing.expectEqual(@as(u64, 0), ready.current.?.expected.rows);
+    try std.testing.expect(ready.root == null);
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"email":{"type":"keyword"}},"additionalProperties":false}}},"relational_indexes":[{"name":"shared_key","keys":[{"column":"email"}]}]}
+    ;
+    for (1..3) |id| {
+        const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_table = .{ .table_id = id, .name = if (id == 1) "one" else "two", .schema_json = schema } });
+        try svc.waitForTransitionApplied(receipt);
+    }
+    const failed = try T.settle(&svc, true);
+    try std.testing.expectEqual(r.FailureReason.name_conflict, failed.current.?.failure);
+    try std.testing.expect(failed.root == null);
+    try std.testing.expect(!std.meta.eql(ready.current.?.job_id, failed.current.?.job_id));
+    const stopped = try failed.current.?.encode();
+    for (0..4) |_| {
+        svc.relation_reconciliation_worker.next_round_at_ns = 0;
+        try svc.runRound();
+        try std.testing.expect(svc.relation_reconciliation_worker.pending == null);
+        try std.testing.expectEqualSlices(u8, &stopped, &(try (try store.relationReconciliationWork(group)).current.?.encode()));
+    }
+    const fixed = try svc.proposeTransitionCommandWithReceipt(.{ .upsert_table = .{ .table_id = 2, .name = "two", .schema_json = "{}" } });
+    try svc.waitForTransitionApplied(fixed);
+    const rebuilt = try T.settle(&svc, false);
+    try std.testing.expectEqual(@as(u64, 2), rebuilt.current.?.expected.rows);
+    try std.testing.expectEqual(r.FailureReason.none, rebuilt.current.?.failure);
+    try std.testing.expect(rebuilt.root == null and rebuilt.garbage == null);
+    svc.lockRuntime();
+    defer svc.unlockRuntime();
+    try std.testing.expectEqual(@as(usize, 0), svc.raft.host.host.runtime_host.groups.getPtr(group).?.tracked_proposal_receipts.count());
 }
 
 test "metadata service projects committed table and range topology" {

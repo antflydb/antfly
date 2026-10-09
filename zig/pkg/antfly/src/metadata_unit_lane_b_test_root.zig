@@ -38,6 +38,7 @@ const replication_backfill = @import("metadata/replication_backfill.zig");
 
 comptime {
     _ = service;
+    _ = @import("metadata/relation_reconciliation_worker.zig");
     _ = catalog_projection_reader;
     _ = admin_read_operations;
     _ = admin_mutation_operations;
