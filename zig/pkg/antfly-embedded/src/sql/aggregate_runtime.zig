@@ -268,7 +268,7 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *ope
         try context.checkpoint();
         var arena = std.heap.ArenaAllocator.init(context.alloc);
         defer arena.deinit();
-        const partials = (try cursor.next(cursor.ptr, arena.allocator(), context.limits.executionRows())) orelse break;
+        const partials = (try cursor.nextFor(if (context.backend.cpu_scope) |scope| scope.execution else null, arena.allocator(), context.limits.executionRows())) orelse break;
         if (partials.len == 0 or partials.len > context.limits.executionRows()) return error.InvalidSqlBackendResponse;
         pages += 1;
         if (pages > context.limits.scan_pages or partials.len > context.limits.scan_rows -| groups) return error.SqlProgramLimitExceeded;

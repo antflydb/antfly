@@ -376,9 +376,24 @@ pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed,
 /// A provider must return null before opening if it cannot prove equivalence;
 /// errors after selection abort execution rather than mixing source snapshots.
 pub const AggregatePartialCursor = struct {
+    /// Pages are borrowed from this cursor or allocated in the caller's page
+    /// arena. Failed authority never publishes them; the caller unwinds its arena.
+    coordinator_execution: ?struct {
+        bind: *const fn (*anyopaque, *@import("../common/runnable_scheduler.zig").Execution) anyerror!void,
+        release: *const fn (*anyopaque) void,
+    } = null,
     ptr: *anyopaque,
     next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!?[]const @import("operators.zig").GroupResult,
     close: *const fn (*anyopaque) void,
+    pub fn nextFor(self: AggregatePartialCursor, execution: ?*@import("../common/runnable_scheduler.zig").Execution, alloc: std.mem.Allocator, maximum: u32) !?[]const @import("operators.zig").GroupResult {
+        const capability = self.coordinator_execution;
+        const attached = execution != null and capability != null;
+        if (attached) try capability.?.bind(self.ptr, execution.?);
+        const result = self.next(self.ptr, alloc, maximum);
+        if (attached) capability.?.release(self.ptr);
+        if (attached) try execution.?.checkpoint();
+        return result;
+    }
 };
 
 pub const Backend = struct {
