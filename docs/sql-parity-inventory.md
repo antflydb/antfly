@@ -2257,6 +2257,10 @@ including the new contract round trip and strict legacy decoding. Inventory
 integrity remains 475 implemented / 136 rejected / 73 superseded / 902 unresolved.
 Standalone qualification is tracked separately; its running build is not
 evidence of a completed standalone gate.
+The first standalone gate exposed missing storage-owner cleanup symbols in its
+unlinked test composition. Its catalog tests now use a dedicated module linked
+to the production ABI providers, without changing unrelated restore roots or
+introducing test cleanup stubs; the linked rerun must complete independently.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,
