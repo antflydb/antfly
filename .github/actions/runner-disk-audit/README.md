@@ -33,3 +33,11 @@ outputs can be sparse. Compare these measurements before increasing storage
 or splitting the unit suite. Do not reuse manifests whose outputs have been
 removed, or remove a phase cache while one
 of its builds, tests, or inventory consumers is still running.
+
+The SDK job runs on the PVC-free standard runtime profile. Its Cargo test and
+package-verification outputs use a private, invocation-owned target directory
+in CI. The SDK phase retires that directory after its consumers finish, on
+success, failure, or cancellation, before Actions archives the Go caches.
+Dependency downloads and the Go caches remain reusable. Local SDK checks keep
+their normal Cargo target directory; cleanup never removes an existing target
+supplied by a caller.
