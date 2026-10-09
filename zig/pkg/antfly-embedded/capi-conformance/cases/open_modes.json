@@ -1,11 +1,11 @@
 {
   "name": "open_modes",
-  "description": "Writer, read-only, and status-only opens; one writer per file; busy timeout; opening a missing file.",
+  "description": "Writer, read-only, and status-only opens; multiple writable connections; busy timeout; opening a missing file.",
   "open": {"create": true, "no_sync": true},
   "steps": [
     {"op": "batch", "timestamp": 1, "writes": [{"key": "doc:mode", "value": {"title": "open modes"}}]},
-    {"op": "open_second", "mode": "writer", "expect": {"error": "ANTFLY_BUSY"}},
-    {"op": "open_second", "mode": "writer", "busy_timeout_ms": 50, "expect": {"error": "ANTFLY_BUSY"}},
+    {"op": "open_second", "mode": "writer"},
+    {"op": "open_second", "mode": "writer", "busy_timeout_ms": 50},
     {"op": "open_second", "mode": "readonly"},
     {"op": "open_second", "path": "missing.aflite", "expect": {"error": "ANTFLY_NOT_FOUND"}},
     {"op": "reopen", "mode": "readonly"},

@@ -28,7 +28,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -36,16 +35,6 @@ import (
 func init() { sql.Register("antfly", sqlDriver{}) }
 
 type sqlDriver struct{}
-type sharedSQLDatabase struct {
-	db     *DB
-	refs   int
-	noSync bool
-}
-
-var sqlDatabases = struct {
-	sync.Mutex
-	entries map[string]*sharedSQLDatabase
-}{entries: make(map[string]*sharedSQLDatabase)}
 
 func (sqlDriver) Open(dsn string) (driver.Conn, error) {
 	u, err := url.Parse(dsn)
@@ -65,7 +54,7 @@ func (sqlDriver) Open(dsn string) (driver.Conn, error) {
 		path = filepath.Join(parent, filepath.Base(path))
 	}
 	for name := range u.Query() {
-		if name != "no_sync" {
+		if name != "no_sync" && name != "busy_timeout_ms" {
 			return nil, fmt.Errorf("antfly: unknown DSN option %q", name)
 		}
 	}
@@ -73,44 +62,37 @@ func (sqlDriver) Open(dsn string) (driver.Conn, error) {
 	if value := u.Query().Get("no_sync"); value != "" && value != "0" && value != "1" {
 		return nil, fmt.Errorf("antfly: no_sync must be 0 or 1")
 	}
-	sqlDatabases.Lock()
-	defer sqlDatabases.Unlock()
-	shared := sqlDatabases.entries[path]
-	if shared == nil {
-		options := OpenOptions{NoSync: noSync}
-		db, err := OpenWithOptions(path, options)
-		if errors.Is(err, NotFound) {
-			db, err = CreateWithOptions(path, options)
+	timeout := 5 * time.Second
+	if value := u.Query().Get("busy_timeout_ms"); value != "" {
+		milliseconds, err := strconv.ParseUint(value, 10, 64)
+		if err != nil || milliseconds > uint64((1<<63-1)/int64(time.Millisecond)) {
+			return nil, fmt.Errorf("antfly: invalid busy_timeout_ms")
 		}
-		// Preserve the native error for inaccessible and corrupt files.
+		timeout = time.Duration(milliseconds) * time.Millisecond
+	}
+	options := OpenOptions{NoSync: noSync, BusyTimeout: timeout}
+	db, err := OpenWithOptions(path, options)
+	if errors.Is(err, NotFound) {
+		db, err = CreateWithOptions(path, options)
 		if err != nil {
-			if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-				db, err = CreateWithOptions(path, options)
+			if _, statErr := os.Stat(path); statErr == nil {
+				db, err = OpenWithOptions(path, options)
 			}
 		}
-		if err != nil {
-			return nil, err
-		}
-		shared = &sharedSQLDatabase{db: db, noSync: noSync}
-		sqlDatabases.entries[path] = shared
-	} else if shared.noSync != noSync {
-		return nil, fmt.Errorf("antfly: database is already open with different no_sync settings")
 	}
-	session, err := shared.db.NewSQLSession()
 	if err != nil {
-		if shared.refs == 0 {
-			shared.db.Close()
-			delete(sqlDatabases.entries, path)
-		}
 		return nil, err
 	}
-	shared.refs++
-	return &sqlConnection{shared: shared, path: path, session: session}, nil
+	session, err := db.NewSQLSession()
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &sqlConnection{db: db, session: session}, nil
 }
 
 type sqlConnection struct {
-	shared      *sharedSQLDatabase
-	path        string
+	db          *DB
 	session     *SQLSession
 	closed      bool
 	poisoned    bool
@@ -138,15 +120,9 @@ func (c *sqlConnection) Close() error {
 	}
 	c.closed = true
 	err := c.session.Close()
-	sqlDatabases.Lock()
-	defer sqlDatabases.Unlock()
-	c.shared.refs--
-	if c.shared.refs == 0 {
-		closeErr := c.shared.db.Close()
-		delete(sqlDatabases.entries, c.path)
-		if err == nil {
-			err = closeErr
-		}
+	closeErr := c.db.Close()
+	if err == nil {
+		err = closeErr
 	}
 	return err
 }
@@ -270,7 +246,7 @@ func (c *sqlConnection) QueryContext(ctx context.Context, query string, args []d
 	_ = json.Unmarshal(body, &request)
 	delete(request, "limit")
 	cursorBody, _ := json.Marshal(request)
-	cursor, err := c.shared.db.OpenSQLCursorJSON(cursorBody)
+	cursor, err := c.db.OpenSQLCursorJSON(cursorBody)
 	if err != nil {
 		var diagnostic *SQLError
 		if !errors.As(err, &diagnostic) || diagnostic.Code != "0A000" {

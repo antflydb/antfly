@@ -6958,6 +6958,13 @@ pub const IndexManager = struct {
         self.deinitWithBackendDisposition(false);
     }
 
+    /// Release an old embedded connection generation without publishing cached
+    /// index state or reclaiming files borrowed by its immutable readers.
+    pub fn deinitImmutableSnapshot(self: *IndexManager) void {
+        self.prepareForCrashRollback();
+        self.deinitWithBackendDisposition(true);
+    }
+
     /// Releases a pre-crash generation without executing backend finalizers.
     /// This is for storage simulators and fault injection after the modeled
     /// device has already rolled back volatile state. Call

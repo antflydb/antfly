@@ -122,6 +122,45 @@ pub const DocumentTurn = struct {
     }
 };
 
+/// Cheap absence check before acquiring a cursor-capable primary snapshot.
+/// A positive result must be rechecked by prepareDocumentTurn in that snapshot.
+pub fn documentMayHaveJobs(txn: anytype, root: u128, document: []const u8) !bool {
+    const authority = (try publication.authority(txn)) orelse return false;
+    if (try DocumentPosition.loadOptional(txn, try documentScope(root, authority, document)) != null) return true;
+    // Point probes do not share a snapshot across gets. If activation changed
+    // the directory namespace while we checked it, require the snapshot path
+    // instead of treating absence in the old namespace as current absence.
+    return !std.meta.eql(@as(?publication.Authority, authority), try publication.authority(txn));
+}
+
+test "ordered artifact inventory absence probe rechecks authority changes" {
+    const Probe = struct {
+        before: [100]u8,
+        after: [100]u8,
+        reads: usize = 0,
+
+        fn encode(epoch: u64) [100]u8 {
+            var raw: [100]u8 = undefined;
+            @memcpy(raw[0..4], "APA1");
+            @memset(raw[4..28], 1);
+            std.mem.writeInt(u64, raw[28..36], epoch, .little);
+            @memset(raw[36..68], 2);
+            std.crypto.hash.Blake3.hash(raw[0..68], raw[68..100], .{});
+            return raw;
+        }
+
+        pub fn get(self: *@This(), key: []const u8) anyerror![]const u8 {
+            if (!std.mem.eql(u8, key, publication.authority_key)) return error.NotFound;
+            self.reads += 1;
+            return if (self.reads == 1) &self.before else &self.after;
+        }
+    };
+    var changed: Probe = .{ .before = Probe.encode(1), .after = Probe.encode(2) };
+    try std.testing.expect(try documentMayHaveJobs(&changed, 1, "doc"));
+    var stable: Probe = .{ .before = Probe.encode(1), .after = Probe.encode(1) };
+    try std.testing.expect(!try documentMayHaveJobs(&stable, 1, "doc"));
+}
+
 pub fn prepareDocumentTurn(txn: anytype, root: u128, document: []const u8) !?DocumentTurn {
     const authority = (try publication.authority(txn)) orelse return null;
     const selected_document = try documentScope(root, authority, document);
@@ -801,6 +840,8 @@ test "ordered artifact inventory document worker fairly resumes nonempty childre
         try writer.put(&key, &directoryValue(key));
     }
     try writer.put(&document, &(DocumentPosition{ .scopes = 2, .generation = @splat(7) }).encode(document));
+    try std.testing.expect(try documentMayHaveJobs(&writer, db.root_incarnation, "doc\x00\xff"));
+    try std.testing.expect(!try documentMayHaveJobs(&writer, db.root_incarnation, "doc"));
     const first_turn = (try prepareDocumentTurn(&writer, db.root_incarnation, "doc\x00\xff")).?;
     try std.testing.expectEqualDeep(first, first_turn.selected.?);
     try first_turn.stage(&writer, db.root_incarnation);

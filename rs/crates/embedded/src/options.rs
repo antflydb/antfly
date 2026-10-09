@@ -107,8 +107,8 @@ pub struct TtlCleanupOptions {
 
 /// Configures [`crate::Database::open`] and [`crate::Database::create`].
 ///
-/// `busy_timeout`, like `sqlite3_busy_timeout`, keeps retrying a writer open
-/// while another process or handle holds the database's writer lock.
+/// `busy_timeout`, like `sqlite3_busy_timeout`, keeps retrying a native operation
+/// while another process holds the database's writer lease.
 /// `None` (or `Some(Duration::ZERO)`) fails immediately with
 /// [`crate::Error::Busy`]. The C ABI takes whole milliseconds, so a
 /// sub-millisecond duration is rounded up.

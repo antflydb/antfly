@@ -150,8 +150,8 @@ typedef struct antfly_open_options {
     uint32_t inference_combined_budget_mb;
     uint32_t inference_kv_budget_mb;
     uint32_t inference_scratch_budget_mb;
-    /* Milliseconds to keep retrying while another writer holds the writer
-     * lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0 fails immediately. */
+    /* Milliseconds to retry a Lite operation while another process holds the
+     * writer lease (ANTFLY_BUSY), like sqlite3_busy_timeout. 0 fails immediately. */
     uint64_t busy_timeout_ms;
     uint64_t reserved[8];
 } antfly_open_options;

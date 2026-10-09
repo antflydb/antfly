@@ -497,6 +497,8 @@ pub const DBCore = struct {
     applied_sequence_checkpoint_path: ?[]u8,
     index_repair_checkpoint: ?IndexRepairCheckpoint,
     store: *docstore_mod.DocStore,
+    /// Retired immutable generations release caches without backend publication.
+    discard_storage_writes: bool = false,
     primary_store_owner: PrimaryStoreOwner,
     change_journal: *change_journal_mod.Journal,
     shard_manager: *shard_mod.ShardManager,
@@ -579,7 +581,9 @@ pub const DBCore = struct {
     }
 
     pub fn deinit(self: *DBCore) void {
-        self.index_manager.deinit();
+        if (self.discard_storage_writes) {
+            self.index_manager.deinitImmutableSnapshot();
+        } else self.index_manager.deinit();
         self.relational_indexes.deinit();
         self.schema_registry.deinit();
         self.alloc.destroy(self.schema_registry);

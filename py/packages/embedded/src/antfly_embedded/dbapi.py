@@ -15,8 +15,8 @@
 
 """PEP 249 interface to embedded Antfly. Positional parameters use :1, :2, …; native $1 syntax is also accepted.
 
-Connections use READ COMMITTED transactions and share one native database
-owner per path. Each connection has its own SQL session. CREATE/DROP TABLE
+Connections use READ COMMITTED transactions and own independent native
+handles and SQL sessions. Writer ownership is scoped to native operations. CREATE/DROP TABLE
 outside an active transaction execute immediately; transactional DDL and
 stronger isolation are rejected by the engine.
 """
@@ -26,7 +26,6 @@ from __future__ import annotations
 import datetime
 import math
 import re
-import threading
 from collections import deque
 from collections.abc import Iterable, Sequence
 from pathlib import Path
@@ -116,36 +115,29 @@ def _parameters(values: Sequence[Any]) -> list[Any]:
     return result
 
 
-_owners: dict[str, tuple[Any, int, bool]] = {}
-_owner_lock = threading.Lock()
-
-
-def connect(path: str | Path, *, autocommit: bool = False, no_sync: bool = False) -> Connection:
+def connect(
+    path: str | Path,
+    *,
+    autocommit: bool = False,
+    no_sync: bool = False,
+    busy_timeout: float | datetime.timedelta = 5.0,
+) -> Connection:
     canonical = str(Path(path).resolve())
-    with _owner_lock:
-        if canonical in _owners:
-            database, refs, existing_no_sync = _owners[canonical]
-            if no_sync != existing_no_sync:
-                raise InterfaceError("database is already open with different no_sync settings")
-        else:
-            options = OpenOptions(no_sync=no_sync)
-            try:
-                database = open_with_options(canonical, options)
-            except errors.NotFoundError:
-                database = create_with_options(canonical, options)
-            except errors.AntflyError:
-                if Path(canonical).exists():
-                    raise
-                database = create_with_options(canonical, options)
-            refs = 0
+    options = OpenOptions(no_sync=no_sync, busy_timeout=busy_timeout)
+    try:
+        database = open_with_options(canonical, options)
+    except errors.NotFoundError:
         try:
-            connection = Connection(database, canonical, autocommit)
-        except Exception:
-            if refs == 0:
-                database.close()
-            raise
-        _owners[canonical] = (database, refs + 1, no_sync)
-        return connection
+            database = create_with_options(canonical, options)
+        except errors.AntflyError:
+            if not Path(canonical).exists():
+                raise
+            database = open_with_options(canonical, options)
+    try:
+        return Connection(database, canonical, autocommit)
+    except Exception:
+        database.close()
+        raise
 
 
 class Connection:
@@ -210,13 +202,7 @@ class Connection:
             self._session.close()
         finally:
             self._closed = True
-            with _owner_lock:
-                database, refs, no_sync = _owners[self._path]
-                if refs == 1:
-                    del _owners[self._path]
-                    database.close()
-                else:
-                    _owners[self._path] = (database, refs - 1, no_sync)
+            self._database.close()
 
     def __enter__(self) -> Connection:
         self._check()

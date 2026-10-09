@@ -70,6 +70,7 @@ pub const EngineSelection = enum {
 };
 
 pub const OpenOptions = struct {
+    externally_locked: bool = false,
     reclamation: docstore.reclamation.Options = .{},
     engine: EngineSelection = .auto,
     read_only: bool = false,
@@ -81,6 +82,7 @@ pub const OpenOptions = struct {
 };
 
 pub const CreateOptions = struct {
+    externally_locked: bool = false,
     reclamation: docstore.reclamation.Options = .{},
     exclusive: bool = false,
     no_sync: bool = false,
@@ -682,6 +684,7 @@ fn openNativeSingleFile(allocator: Allocator, path: []const u8, opts: OpenOption
     };
 
     const initial_store = try docstore.Store.openWithOptions(allocator, path, .{
+        .externally_locked = opts.externally_locked,
         .reclamation = opts.reclamation,
         .read_only = opts.read_only,
         .no_sync = opts.no_sync,
@@ -705,6 +708,7 @@ fn createNativeSingleFile(allocator: Allocator, path: []const u8, opts: CreateOp
     };
 
     const initial_store = try docstore.Store.createWithOptions(allocator, path, .{
+        .externally_locked = opts.externally_locked,
         .reclamation = opts.reclamation,
         .exclusive = opts.exclusive,
         .no_sync = opts.no_sync,

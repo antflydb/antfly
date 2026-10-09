@@ -88,8 +88,8 @@ const (
 
 // OpenOptions configures OpenWithOptions and CreateWithOptions.
 //
-// BusyTimeout, like sqlite3_busy_timeout, keeps retrying a writer open while
-// another process or handle holds the database's writer lock. Zero fails
+// BusyTimeout, like sqlite3_busy_timeout, keeps retrying a native operation while
+// another process holds the database's writer lease. Zero fails
 // immediately with Busy. The C ABI takes whole milliseconds.
 //
 // HostBudgetMB, BackendBudgetMB, CombinedBudgetMB, KVBudgetMB,
@@ -315,7 +315,7 @@ func openWithOptions(path string, opts OpenOptions, create bool) (*DB, error) {
 	cOpts.inference_scratch_budget_mb = C.uint32_t(opts.ScratchBudgetMB)
 	cOpts.inference_process_memory_budget_mb = C.uint32_t(opts.ProcessMemoryBudgetMB)
 	if opts.BusyTimeout > 0 {
-		cOpts.busy_timeout_ms = C.uint64_t((opts.BusyTimeout + time.Millisecond - 1) / time.Millisecond)
+		cOpts.busy_timeout_ms = C.uint64_t((opts.BusyTimeout-1)/time.Millisecond + 1)
 	}
 	if opts.GeneratedEnrichmentReplay {
 		cOpts.flags |= C.ANTFLY_OPEN_FLAG_GENERATED_ENRICHMENT_REPLAY

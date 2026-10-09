@@ -203,16 +203,16 @@ err := inf.GenerateStream(ctx, request, func(chunk []byte) bool {
 
 A `*DB` is safe for concurrent use by multiple goroutines, like `*sql.DB`;
 share one handle rather than opening one per goroutine. `libantfly` runs in
-serialized threading mode (`ThreadingMode() == ThreadingSerialized`): reads
-such as `SearchJSON`, `LookupJSON`, and `ScanJSON` run in parallel with each
-other and with writes, `Batch` and transaction calls on one handle queue
-instead of failing with `Busy`, and schema or index changes wait for in-flight
-calls. `Close` waits for in-flight calls; calls after it return
+serialized threading mode (`ThreadingMode() == ThreadingSerialized`). Lite
+calls queue on a connection and coordinate with other connections to the file.
+Streaming SQL cursors retain their original snapshots while other connections
+publish new commits. Schema or index changes wait for in-flight calls. `Close` waits for in-flight calls; calls after it return
 `InvalidArgument`. See `zig/CAPI.md` "Thread Safety" for the full contract.
 
-Only one writer handle may be open per file at a time, across processes. Set
-`OpenOptions.BusyTimeout` to wait for another writer to close instead of
-failing immediately with `Busy`, like `sqlite3_busy_timeout`.
+Multiple writable Lite connections may remain open, including across processes.
+Native operations queue within a process and take a kernel writer lease across
+processes. `OpenOptions.BusyTimeout` waits for a competing operation rather than
+for another handle to close. Connection lifetimes are independent.
 
 Use `BeginTransaction`, `WriteTransaction`, `ResolveTransaction`,
 `TransactionStatus`, and `CommitVersion` when an embedded application needs the
@@ -249,8 +249,9 @@ _, err = db.Exec("INSERT INTO people (id,name) VALUES ($1,$2)", int64(1), "Ada")
 rows, err := db.Query("SELECT id,name FROM people")
 ```
 
-Pooled connections have independent native SQL sessions and share the file's
-writer. `BeginTx` uses READ COMMITTED; stronger isolation returns an error.
+Pooled connections have independent native handles and SQL sessions. Native
+operations coordinate writer ownership; `busy_timeout_ms` in the DSN defaults
+to 5000. `BeginTx` uses READ COMMITTED; stronger isolation returns an error.
 Rows use native streaming cursors, so queries continue beyond 128 rows. Signed
 64-bit integers remain `int64`; SQL NULL becomes nil. JSON parameters can use
 `json.RawMessage`, JSON results use `[]byte`, and byte parameters represent

@@ -17,14 +17,14 @@
 
 Threading model (see zig/CAPI.md "Thread Safety" and go/pkg/embedded's DB): a
 Database is safe for concurrent use by multiple threads. libantfly runs in
-serialized threading mode: reads run in parallel, writes on one handle queue
+serialized threading mode: Lite calls queue on their connection
 behind each other instead of failing with Busy, and schema/index changes
 wait for in-flight calls. close() waits for in-flight calls on other threads
 to finish; calls made after close() raise InvalidArgumentError, mirroring
 the C ABI's own antfly_db_close contract.
 
 The handle is guarded with a counting condition variable rather than a plain
-lock so that concurrent calls actually run concurrently: ctypes releases the
+lock so that multiple threads may enter the native API: ctypes releases the
 GIL for the duration of a foreign call, and libantfly itself does the real
 serialization/queueing internally.
 """

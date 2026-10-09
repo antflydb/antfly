@@ -50,6 +50,8 @@ SDK_PREFIXES = (
     "zig/pkg/antfly-embedded/capi-conformance/",
 )
 SDK_FILES = {
+    "scripts/ci/disposable_cargo_target.sh",
+    "scripts/ci/test_disposable_cargo_target.py",
     "openapi.yaml",
     "rs/Cargo.toml",
     "rs/Cargo.lock",
