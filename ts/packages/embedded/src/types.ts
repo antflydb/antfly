@@ -67,7 +67,7 @@ export const InferenceMode = {
 export const THREADING_SERIALIZED = 1;
 
 /** The Antfly C ABI version this binding was written against (antfly_abi_version()). */
-export const SUPPORTED_ABI_VERSION = 2;
+export const SUPPORTED_ABI_VERSION = 3;
 
 /** Configures TTL cleanup for a native-profile Lite handle. */
 export interface TTLCleanupOptions {

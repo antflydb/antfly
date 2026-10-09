@@ -33,6 +33,7 @@ import {
   type Uint64Like,
 } from "./marshal.js";
 import { loadNative, type NativeLibrary, storageKind } from "./native.js";
+import { SqlError } from "./sql-types.js";
 import {
   type Capabilities,
   type CheckReport,
@@ -145,7 +146,11 @@ export class Database implements AsyncDisposable {
   #finalizerToken: object = {};
 
   /** @internal use open()/create()/openHosted()/etc. instead of the constructor. */
-  constructor(native: NativeLibrary, handle: unknown) {
+  constructor(
+    native: NativeLibrary,
+    handle: unknown,
+    readonly owner?: Database
+  ) {
     this.#native = native;
     this.#handle = handle;
     finalizationRegistry.register(this, { native, handle }, this.#finalizerToken);
@@ -181,6 +186,53 @@ export class Database implements AsyncDisposable {
     });
   }
 
+  // SQL buffers must be released on failures as well as successful calls.
+  // biome-ignore lint/suspicious/noExplicitAny: native signatures vary
+  #invokeSql(fn: any, ...args: unknown[]): Promise<unknown> {
+    return this.#run(async (handle) => {
+      const out = newBufferOut();
+      const code = await callAsync(fn, handle, ...args, out);
+      const body = takeBuffer(this.#native, out);
+      const value = body.length ? JSON.parse(body.toString("utf8")) : undefined;
+      if (code && value?.error) throw new SqlError(value.error, value.transaction_id);
+      checkCode(code);
+      return value;
+    });
+  }
+  sqlJson(request: JsonInput): Promise<unknown> {
+    return this.#invokeSql(this.#native.dbSqlJson, jsonSlice(request));
+  }
+  createTable(name: string, schema: JsonInput): Promise<void> {
+    return this.#invokeCode(this.#native.dbCreateTableJson, stringSlice(name), jsonSlice(schema));
+  }
+  dropTable(name: string): Promise<void> {
+    return this.#invokeCode(this.#native.dbDropTable, stringSlice(name));
+  }
+  async listTables(): Promise<string[]> {
+    return parseJson(await this.#invokeBuffer(this.#native.dbListTablesJson)) as string[];
+  }
+  async openSqlSession(): Promise<Uint64Like> {
+    return this.#run(async (handle) => {
+      const out: unknown[] = [0];
+      checkCode(await callAsync(this.#native.dbSqlSessionOpen, handle, out));
+      return out[0] as Uint64Like;
+    });
+  }
+  closeSqlSession(id: Uint64Like): Promise<void> {
+    return this.#invokeCode(this.#native.dbSqlSessionClose, id);
+  }
+  async openSqlCursor(request: JsonInput): Promise<Uint64Like> {
+    const out: unknown[] = [0];
+    await this.#invokeSql(this.#native.dbSqlOpenCursorJson, jsonSlice(request), out);
+    return out[0] as Uint64Like;
+  }
+  fetchSqlCursor(id: Uint64Like, rows = 128): Promise<unknown> {
+    return this.#invokeSql(this.#native.dbSqlFetchCursorJson, id, rows);
+  }
+  closeSqlCursor(id: Uint64Like): Promise<void> {
+    return this.#invokeCode(this.#native.dbSqlCloseCursor, id);
+  }
+
   // --- Lifecycle ---
 
   /** Idempotent; waits for in-flight calls before freeing the native handle. Calls made after close() rejects with InvalidArgumentError. */
@@ -208,6 +260,13 @@ export class Database implements AsyncDisposable {
 
   async [Symbol.asyncDispose](): Promise<void> {
     await this.close();
+  }
+
+  /** Open a table-scoped document/schema/index/enrichment handle. */
+  async openTable(name: string): Promise<Database> {
+    const out: unknown[] = [null];
+    await this.#invokeCode(this.#native.dbOpenTable, stringSlice(name), out);
+    return new Database(this.#native, out[0], this);
   }
 
   // --- Status / capabilities / maintenance ---

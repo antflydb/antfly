@@ -200,13 +200,27 @@ def teacher_prompt_ids(tok, record: dict) -> list[int]:
     )
 
 
+def snapshot_cache(cache):
+    """Each layer's keys and values, trimmed to the filled length. mlx-lm 0.32
+    states are the full-capacity buffers plus an offset, and extending a
+    cache writes into its buffers in place; trimmed copies make every fork
+    allocate its own buffer on its first token, so the snapshot stays intact."""
+    saved = []
+    for c in cache:
+        state = c.state
+        keys, values = state[0], state[1]
+        filled = state[2] if len(state) > 2 else keys.shape[2]
+        saved.append((keys[..., :filled, :], values[..., :filled, :]))
+    return saved
+
+
 def fork_cache(cache_mod, saved_state):
-    """A fresh KV cache holding `saved_state`; extending it leaves the saved
-    arrays untouched, so one prefix can branch many continuations."""
+    """A fresh KV cache per layer holding a snapshot from `snapshot_cache`, so
+    one prefix can branch many continuations."""
     fresh = []
-    for k, v in saved_state:
+    for keys, values in saved_state:
         c = cache_mod.KVCache()
-        c.state = (k, v)
+        c.keys, c.values, c.offset = keys, values, keys.shape[2]
         fresh.append(c)
     return fresh
 
@@ -275,7 +289,7 @@ def score_group(
     if prefix:
         cache = cache_mod.make_prompt_cache(model)
         mx.eval(model(mx.array([all_ids[0][:prefix]]), cache=cache))
-        base = [c.state for c in cache]
+        base = snapshot_cache(cache)
     results = []
     for n, (record, ids) in enumerate(zip(group, all_ids)):
         cache = (
@@ -286,7 +300,7 @@ def score_group(
         logits = model(mx.array([ids[prefix:]]), cache=cache)
         mx.eval(logits)
         raw, norm, label_tokens = score_labels(
-            model, tok, mx, cache_mod, [c.state for c in cache], logits[0, -1], record
+            model, tok, mx, cache_mod, snapshot_cache(cache), logits[0, -1], record
         )
         results.append(
             (raw, norm, len(ids) - prefix + label_tokens + (prefix if n == 0 else 0))

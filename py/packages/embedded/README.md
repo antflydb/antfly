@@ -331,3 +331,44 @@ Tests that need `libantfly` skip cleanly when it cannot be found, unless
 `tests/test_conformance.py` runs every case in
 `zig/pkg/antfly-embedded/capi-conformance/cases/*.json` through this public API, the
 same declarative cases the Go and Rust bindings run.
+
+## SQL and multiple tables
+
+The PEP 249 interface provides independent connections, native streaming
+cursors, positional `:1`, `:2`, … parameters (also accepting native `$1` syntax), and SQLSTATE-bearing exceptions:
+
+```python
+from antfly_embedded import dbapi
+
+connection = dbapi.connect("app.aflite")
+cursor = connection.cursor()
+cursor.execute("CREATE TABLE people (id BIGINT PRIMARY KEY, name TEXT)")
+cursor.execute("INSERT INTO people (id,name) VALUES (:1,:2)", (1, "Ada"))
+connection.commit()
+for row in cursor.execute("SELECT id,name FROM people"):
+    print(row)
+connection.close()
+```
+
+Connections share one native file owner and use READ COMMITTED transactions.
+By default, the first data statement starts a transaction; `commit()` and
+`rollback()` finish it. `autocommit=True` executes statements independently.
+DDL outside an active transaction commits immediately. Closing a connection
+discards its staged writes. `fetchmany`, `fetchall`, and iteration read every
+cursor page, including queries longer than 128 rows. Integers preserve all
+signed 64 bits. SQL NULL maps to `None`; JSON maps to Python values.
+
+`Database.create_table`, `list_tables`, `open_table`, and `drop_table` expose
+the same catalog for document workloads. Table handles reuse all existing
+document, schema, index, enrichment, and search methods. Close them before
+dropping a table; database close invalidates them.
+
+Portable `.afb` archives back up the entire database: its table catalog,
+schemas, documents, indexes, enrichments, and constraint records. Call backup
+on the database handle. Restore publishes all tables together into either
+Lite or directory storage; import requires an empty database with no open
+table handles, SQL sessions, or cursors. Table handles cannot export or import
+backups.
+
+See [the native SQL contract](../../../zig/CAPI.md#database-sql) for
+savepoints, supported isolation, and unknown commit outcomes.

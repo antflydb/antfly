@@ -85,6 +85,10 @@ export { Inference } from "./inference.js";
 export type { JsonInput, Uint64Like } from "./marshal.js";
 /** Native stack, in bytes, every libantfly call runs on (ANTFLY_MIN_THREAD_STACK_SIZE). */
 export { NATIVE_STACK_SIZE as MIN_THREAD_STACK_SIZE } from "./native.js";
+export { Connection } from "./sql.js";
+export type { SqlColumn, SqlResult } from "./sql-types.js";
+
+export { SqlError } from "./sql-types.js";
 export type {
   Capabilities,
   CheckReport,

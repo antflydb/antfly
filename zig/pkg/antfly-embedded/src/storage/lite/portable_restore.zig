@@ -115,6 +115,23 @@ pub fn importPortableIntoLiteDb(
     lite_backend: *@import("backend.zig").Handle,
     backup: []const u8,
 ) !void {
+    const Populate = struct {
+        fn run(bytes: []const u8, a: Allocator, prepared: *LiteDb) !void {
+            try populateUnpublishedLiteDb(a, &prepared.db, bytes);
+        }
+    };
+    try importPreparedIntoLiteDb(allocator, db, lite_backend, connection.embeddedRootIdentity(), backup, Populate.run);
+}
+
+/// Publishes a fully populated database generation, including named namespaces.
+pub fn importPreparedIntoLiteDb(
+    allocator: Allocator,
+    db: *db_mod.DB,
+    lite_backend: *@import("backend.zig").Handle,
+    root_identity: db_mod.DocIdentityNamespace,
+    context: anytype,
+    comptime populate: anytype,
+) !void {
     if (!(try db.isPortableImportTargetEmpty(allocator))) return error.LiteImportTargetNotEmpty;
     if (lite_backend.engine != .native_single_file) return error.UnsupportedOperation;
 
@@ -146,17 +163,24 @@ pub fn importPortableIntoLiteDb(
         deleteFileIfExists(io, tmp_path) catch {};
         workspace.deinit();
     }
-    var prepared = try LiteDb.createWithOptions(allocator, tmp_path, true, .{
+    var staged_backend = try @import("backend.zig").Handle.createWithOptions(allocator, tmp_path, .{
+        .exclusive = true,
         .reclamation = workspace.options,
-        .fsync = !lite_backend.native_docstore.?.file.no_sync,
+        .no_sync = lite_backend.native_docstore.?.file.no_sync,
         .writer_lock_marker = portable_generation_lease_magic,
     });
+    var staged_backend_owned = true;
+    errdefer if (staged_backend_owned) staged_backend.deinit();
+    var staged_opts = db_mod.OpenOptions{ .identity_namespace = root_identity, .prefer_existing_identity_namespace = false, .external_derived_checkpoints = false };
+    try staged_backend.configureDbOpenOptions(&staged_opts);
+    var prepared = LiteDb{ .db = try db_mod.DB.open(allocator, tmp_path, staged_opts), .backend = staged_backend, .open_mode = .writer };
+    staged_backend_owned = false;
     var prepared_live = true;
     errdefer if (prepared_live) prepared.close();
-    try populateUnpublishedLiteDb(allocator, &prepared.db, backup);
+    try populate(context, allocator, &prepared);
     var prepared_runtime = try db.preparePortableRuntimeMetadata(
         prepared.db.core.store,
-        connection.embeddedRootIdentity(),
+        prepared.db.core.identity_namespace,
     );
     defer prepared_runtime.deinit();
 

@@ -107,7 +107,19 @@ def test_index_readiness_visible_on_open_and_status_only_handles(aflite_path) ->
                 ),
             }
         )
-        db.batch_json({"inserts": {"node:a": {"name": "a", "embedding": [1, 0, 0, 0]}}})
+        # Replay targets are per index; create an edge so both configured
+        # indexes receive a mutation rather than expecting idle graph replay.
+        db.batch_json(
+            {
+                "inserts": {
+                    "node:a": {
+                        "name": "a",
+                        "embedding": [1, 0, 0, 0],
+                        "_edges": {"graph": {"KNOWS": [{"target": "node:b"}]}},
+                    }
+                }
+            }
+        )
         for stats in (db.stats(), db.status()["stats"]):
             assert stats["indexes_available"] is True
             for name in ("graph", "vec"):

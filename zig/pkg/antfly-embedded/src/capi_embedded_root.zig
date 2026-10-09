@@ -26,6 +26,7 @@ pub const lite = @import("storage/lite/mod.zig");
 pub const paths = @import("graph/paths.zig");
 pub const platform_sync = @import("antfly_platform").sync;
 pub const platform_time = @import("antfly_platform").time;
+pub const database_backup = @import("capi/database_backup.zig");
 pub const portable_backup = @import("storage/portable_backup.zig");
 pub const storage_maintenance = @import("storage/maintenance.zig");
 pub const transactions = @import("storage/transactions.zig");
@@ -58,5 +59,8 @@ pub const capi_dependencies = struct {
     pub const raft_read_gate = @import("storage/read_consistency.zig");
     pub const sql_errors = @import("sql/errors.zig");
     pub const sql_memory_budget = @import("sql/memory_budget.zig");
+    pub const sql_describe = @import("sql/describe.zig");
+    pub const sql_scalar = @import("sql/scalar.zig");
+    pub const sql_read_stream = @import("sql/read_stream.zig");
     pub const sql_runtime = @import("sql/runtime.zig");
 };
