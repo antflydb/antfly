@@ -575,6 +575,89 @@ test "system catalog relation namespace transaction reconciliation binary replay
     }
 }
 
+test "system catalog relation namespace transaction compound entries retain rollback pinned readers and restart" {
+    const a = std.testing.allocator;
+    const Keys = struct {
+        group: u64,
+        pub fn keyAlloc(self: @This(), alloc: std.mem.Allocator, key: relation_names.Key) ![]u8 {
+            return key.storageKeyAlloc(alloc, self.group);
+        }
+    };
+    const Entries = relation_names.EntryStore(docstore.DocStore.Txn, Keys);
+    const Entry = relation_names.Entry;
+    const Plan = relation_names.EntryPlan;
+    const key: relation_names.Key = .{ .namespace_id = 2, .name = "rows" };
+    const old: relation_names.Owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table };
+    const successor: relation_names.Owner = .{ .table_id = 8, .schema_version = 2, .schema_digest = @splat(2), .kind = .table, .phase = .reserved, .publication_id = @splat(3) };
+    const request: Entry.Reservation = .{ .predecessor = old, .successor = successor };
+    const prior: Entry = .{ .active = old };
+    const reserved = try prior.reserve(request);
+    const published = try reserved.publish(request);
+    var reserve = try Plan.init(a, &.{.{ .key = key, .before = prior, .after = reserved }});
+    defer reserve.deinit();
+    var publish = try Plan.init(a, &.{.{ .key = key, .before = reserved, .after = published }});
+    defer publish.deinit();
+    var cancel = try Plan.init(a, &.{.{ .key = key, .before = reserved, .after = try reserved.cancel(request) }});
+    defer cancel.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/compound-entry", .{tmp.sub_path});
+    defer a.free(root);
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var entries: Entries = .{ .txn = &txn, .alloc = a, .keys = .{ .group = 41 } };
+            try entries.putEntry(key, prior);
+            try txn.commit();
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var entries: Entries = .{ .txn = &txn, .alloc = a, .keys = .{ .group = 41 } };
+            try reserve.apply(&entries);
+            try reserve.verifyPublished(&entries);
+        }
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var entries: Entries = .{ .txn = &txn, .alloc = a, .keys = .{ .group = 41 } };
+            try std.testing.expect((try entries.getEntry(key)).?.eql(prior));
+            try reserve.apply(&entries);
+            try txn.commit();
+        }
+        var pinned = try store.store.beginReadTxn();
+        defer pinned.abort();
+        var reader: Entries = .{ .txn = &pinned, .alloc = a, .keys = .{ .group = 41 } };
+        try std.testing.expect((try reader.getEntry(key)).?.eql(reserved));
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var entries: Entries = .{ .txn = &txn, .alloc = a, .keys = .{ .group = 41 } };
+            try publish.apply(&entries);
+            try publish.verifyPublished(&entries);
+            try txn.commit();
+        }
+        try std.testing.expect((try reader.getEntry(key)).?.eql(reserved));
+        {
+            var txn = try store.store.beginWriteTxn();
+            defer txn.abort();
+            var entries: Entries = .{ .txn = &txn, .alloc = a, .keys = .{ .group = 41 } };
+            try std.testing.expectError(error.CatalogGenerationChanged, cancel.apply(&entries));
+            try publish.verifyPublished(&entries);
+        }
+    }
+    var reopened = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer reopened.deinit();
+    var txn = try reopened.store.beginReadTxn();
+    defer txn.abort();
+    var entries: Entries = .{ .txn = &txn, .alloc = a, .keys = .{ .group = 41 } };
+    try publish.verifyPublished(&entries);
+    try std.testing.expect((try entries.getEntry(key)).?.eql(published));
+}
+
 test "system catalog relation namespace transaction source fingerprints borrow schema without metadata copies" {
     const a = std.testing.allocator;
     const group: u64 = 41;

@@ -86,6 +86,112 @@ pub const Owner = struct {
     }
 };
 
+/// A namespace name can remain readable while a restore/FK successor is
+/// reserved. The reservation is never an active lookup result. These cuts
+/// must be published through the caller's metadata transaction, not a second
+/// reservation service or independently committed registry.
+pub const Entry = struct {
+    active: ?Owner = null,
+    pending: ?Owner = null,
+
+    pub const Reservation = struct {
+        predecessor: ?Owner = null,
+        successor: Owner,
+        pub fn validate(self: @This()) !void {
+            if (self.predecessor) |owner| {
+                try owner.validate();
+                if (owner.phase != .active) return error.InvalidCatalogRecord;
+            }
+            try self.successor.validate();
+            if (self.successor.phase != .reserved) return error.InvalidCatalogRecord;
+        }
+    };
+    pub fn validate(self: Entry) !void {
+        if (self.active) |owner| {
+            try owner.validate();
+            if (owner.phase != .active) return error.InvalidCatalogRecord;
+        }
+        if (self.pending) |owner| {
+            try owner.validate();
+            if (owner.phase != .reserved) return error.InvalidCatalogRecord;
+        }
+    }
+    fn same(left: ?Owner, right: ?Owner) bool {
+        return if (left) |l| if (right) |r| l.eql(r) else false else right == null;
+    }
+    pub fn eql(self: Entry, other: Entry) bool {
+        return same(self.active, other.active) and same(self.pending, other.pending);
+    }
+    pub fn empty(self: Entry) bool {
+        return self.active == null and self.pending == null;
+    }
+    pub fn reserve(self: Entry, request: Reservation) !Entry {
+        try self.validate();
+        try request.validate();
+        if (!same(self.active, request.predecessor)) return error.CatalogGenerationChanged;
+        if (self.pending) |owner| {
+            if (!owner.eql(request.successor)) return error.CatalogAlreadyExists;
+            return self; // Exact in-flight retry, not same-name/table inference.
+        }
+        return .{ .active = self.active, .pending = request.successor };
+    }
+    fn checkReservation(self: Entry, request: Reservation) !void {
+        try self.validate();
+        try request.validate();
+        if (!same(self.active, request.predecessor) or !same(self.pending, request.successor))
+            return error.CatalogGenerationChanged;
+    }
+    pub fn publish(self: Entry, request: Reservation) !Entry {
+        try self.checkReservation(request);
+        var owner = request.successor;
+        owner.phase = .active;
+        return .{ .active = owner };
+    }
+    pub fn cancel(self: Entry, request: Reservation) !Entry {
+        try self.checkReservation(request);
+        return .{ .active = self.active };
+    }
+    /// Ordinary DDL cannot overwrite or retire a publication's reservation.
+    /// Even a same-table successor is protected by its exact schema/plan cut.
+    pub fn replaceActive(self: Entry, before: ?Owner, after: ?Owner) !Entry {
+        try self.validate();
+        if (!same(self.active, before)) return error.CatalogGenerationChanged;
+        if (self.pending != null) return error.CatalogAlreadyExists;
+        const next: Entry = .{ .active = after };
+        try next.validate();
+        return next;
+    }
+
+    const magic = "AFRE01";
+    pub const encoded_len = magic.len + 1 + 2 * Owner.encoded_len;
+    pub fn encode(self: Entry) ![encoded_len]u8 {
+        try self.validate();
+        if (self.empty()) return error.InvalidCatalogRecord;
+        var bytes: [encoded_len]u8 = @splat(0);
+        @memcpy(bytes[0..magic.len], magic);
+        bytes[magic.len] = @as(u8, @intFromBool(self.active != null)) | (@as(u8, @intFromBool(self.pending != null)) << 1);
+        const start = magic.len + 1;
+        if (self.active) |owner| @memcpy(bytes[start..][0..Owner.encoded_len], &(try owner.encode()));
+        if (self.pending) |owner| @memcpy(bytes[start + Owner.encoded_len ..][0..Owner.encoded_len], &(try owner.encode()));
+        return bytes;
+    }
+    pub fn decode(bytes: []const u8) !Entry {
+        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidCatalogRecord;
+        const flags = bytes[magic.len];
+        if (flags == 0 or flags > 3) return error.InvalidCatalogRecord;
+        const start = magic.len + 1;
+        const old = bytes[start..][0..Owner.encoded_len];
+        const next = bytes[start + Owner.encoded_len ..][0..Owner.encoded_len];
+        if ((flags & 1 == 0 and !std.mem.allEqual(u8, old, 0)) or (flags & 2 == 0 and !std.mem.allEqual(u8, next, 0))) return error.InvalidCatalogRecord;
+        const entry: Entry = .{
+            .active = if (flags & 1 != 0) try Owner.decode(old) else null,
+            .pending = if (flags & 2 != 0) try Owner.decode(next) else null,
+        };
+        try entry.validate();
+        return entry;
+    }
+};
+
 pub const Key = struct {
     namespace_id: u64,
     name: []const u8,
@@ -240,8 +346,97 @@ const Context = struct {
 };
 const Map = std.HashMapUnmanaged(Key, Owner, Context, 80);
 
+/// Owned CAS over the whole active/reserved cut. Validate every affected name
+/// before the first write. The caller supplies ONE pinned metadata transaction
+/// and must abort it on any error; this planner never commits or retries.
+/// CAS is not publication authority: the producer must validate its immutable
+/// plan, membership capability and lifecycle phase before constructing a cut.
+pub const EntryPlan = struct {
+    pub const Change = struct { key: Key, before: Entry, after: Entry };
+    arena: std.heap.ArenaAllocator,
+    changes: []const Change,
+    pub fn init(a: A, changes: []const Change) !EntryPlan {
+        if (changes.len > max_claims) return error.CatalogCommandTooLarge;
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        var seen: std.HashMapUnmanaged(Key, void, Context, 80) = .empty;
+        try seen.ensureTotalCapacity(owned, @intCast(changes.len));
+        const copy = try owned.alloc(Change, changes.len);
+        for (changes, copy) |change, *next| {
+            try change.key.validate();
+            try change.before.validate();
+            try change.after.validate();
+            const key: Key = .{ .namespace_id = change.key.namespace_id, .name = try owned.dupe(u8, change.key.name) };
+            if (seen.getOrPutAssumeCapacity(key).found_existing) return error.InvalidCatalogRecord;
+            next.* = .{ .key = key, .before = change.before, .after = change.after };
+        }
+        return .{ .arena = arena, .changes = copy };
+    }
+    pub fn deinit(self: *EntryPlan) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+    fn observed(reader: anytype, key: Key) !Entry {
+        const current = (try reader.getEntry(key)) orelse return .{};
+        try current.validate();
+        if (current.empty()) return error.InvalidCatalogRecord;
+        return current;
+    }
+    pub fn validate(self: *const EntryPlan, reader: anytype) !void {
+        for (self.changes) |change| if (!(try observed(reader, change.key)).eql(change.before)) return error.CatalogGenerationChanged;
+    }
+    pub fn apply(self: *const EntryPlan, txn: anytype) !void {
+        try self.validate(txn);
+        for (self.changes) |change| {
+            if (change.before.eql(change.after)) continue;
+            if (change.after.empty()) try txn.deleteEntry(change.key) else try txn.putEntry(change.key, change.after);
+        }
+    }
+    /// Authenticated replay verifies sender effects, never fills missing rows
+    /// or repairs a mismatched generation under a new producer identity.
+    pub fn verifyPublished(self: *const EntryPlan, reader: anytype) !void {
+        for (self.changes) |change| if (!(try observed(reader, change.key)).eql(change.after)) return error.CatalogGenerationChanged;
+    }
+};
+
 /// Point adapter over the metadata owner's existing read/write transaction.
 /// No second transaction or independent namespace commit can be opened here.
+/// Keyspace binds entries to the caller's immutable generation/root. It owns
+/// no transaction and returns an owned physical key from keyAlloc(alloc, key).
+pub fn EntryStore(comptime Txn: type, comptime Keyspace: type) type {
+    return struct {
+        txn: *Txn,
+        alloc: A,
+        keys: Keyspace,
+        pub fn getEntry(self: *@This(), key: Key) !?Entry {
+            try key.validate();
+            const encoded_key = try self.keys.keyAlloc(self.alloc, key);
+            defer self.alloc.free(encoded_key);
+            const bytes = self.txn.get(encoded_key) catch |err| {
+                if (err == error.NotFound) return null;
+                return err;
+            };
+            return try Entry.decode(bytes);
+        }
+        pub fn putEntry(self: *@This(), key: Key, entry: Entry) !void {
+            try key.validate();
+            const encoded = try entry.encode();
+            const encoded_key = try self.keys.keyAlloc(self.alloc, key);
+            defer self.alloc.free(encoded_key);
+            try self.txn.put(encoded_key, &encoded);
+        }
+        pub fn deleteEntry(self: *@This(), key: Key) !void {
+            try key.validate();
+            const encoded_key = try self.keys.keyAlloc(self.alloc, key);
+            defer self.alloc.free(encoded_key);
+            try self.txn.delete(encoded_key);
+        }
+    };
+}
+
+/// Current single-owner registry; activation of compound entries is a separate
+/// capability/source-completeness decision, not a fallback decoder here.
 pub fn Store(comptime Txn: type) type {
     return struct {
         txn: *Txn,
@@ -886,6 +1081,150 @@ test "catalog relation ownership validates the complete cut before any mutation"
     var reader: Reader = .{ .old = old };
     try std.testing.expectError(error.InjectedReadFailure, plan.apply(&reader));
     try std.testing.expectEqual(@as(usize, 2), reader.calls);
+}
+
+test "catalog relation entry reserves successors without exposing them and fences stale publication" {
+    const old = testClaim(2, "rows", 7, 1, .table).owner;
+    var successor = testClaim(2, "rows", 8, 2, .table).owner;
+    successor.phase = .reserved;
+    successor.publication_id = @splat(1);
+    const request: Entry.Reservation = .{ .predecessor = old, .successor = successor };
+    const active: Entry = .{ .active = old };
+    const reserved = try active.reserve(request);
+    try std.testing.expect(reserved.active.?.eql(old));
+    try std.testing.expect(reserved.pending.?.eql(successor));
+    try std.testing.expect(reserved.eql(try reserved.reserve(request)));
+    var competing = request;
+    competing.successor.schema_digest[0] ^= 1;
+    try std.testing.expectError(error.CatalogAlreadyExists, reserved.reserve(competing));
+    try std.testing.expectError(error.CatalogGenerationChanged, reserved.publish(competing));
+    try std.testing.expectError(error.CatalogGenerationChanged, reserved.cancel(competing));
+    try std.testing.expectError(error.CatalogAlreadyExists, reserved.replaceActive(old, null));
+    try std.testing.expect(active.eql(try reserved.cancel(request)));
+    try std.testing.expectError(error.CatalogGenerationChanged, active.publish(request));
+    const published = try reserved.publish(request);
+    try std.testing.expect(published.pending == null);
+    try std.testing.expectEqual(@as(u64, 8), published.active.?.table_id);
+    try std.testing.expectEqual(Phase.active, published.active.?.phase);
+    try std.testing.expectEqualSlices(u8, &successor.publication_id, &published.active.?.publication_id);
+    try std.testing.expectError(error.CatalogGenerationChanged, published.reserve(request));
+    try std.testing.expectError(error.CatalogGenerationChanged, published.cancel(request));
+    var wrong_predecessor = request;
+    wrong_predecessor.predecessor.?.schema_digest[0] ^= 1;
+    try std.testing.expectError(error.CatalogGenerationChanged, active.reserve(wrong_predecessor));
+    const fresh: Entry.Reservation = .{ .successor = successor };
+    const pending_only = try (Entry{}).reserve(fresh);
+    try std.testing.expect(pending_only.active == null);
+    try std.testing.expect((try pending_only.cancel(fresh)).empty());
+    try std.testing.expect((try (Entry{}).replaceActive(null, old)).eql(active));
+}
+
+test "catalog relation entry codec is canonical and rejects incomplete or impossible owner cuts" {
+    const old = testClaim(2, "rows", 7, 1, .table).owner;
+    var successor = old;
+    successor.phase = .reserved;
+    successor.publication_id = @splat(1);
+    for ([_]Entry{ .{ .active = old }, .{ .pending = successor }, .{ .active = old, .pending = successor } }) |entry| {
+        const encoded = try entry.encode();
+        try std.testing.expect(entry.eql(try Entry.decode(&encoded)));
+        for (0..encoded.len) |length| try std.testing.expectError(error.InvalidCatalogRecord, Entry.decode(encoded[0..length]));
+    }
+    try std.testing.expectError(error.InvalidCatalogRecord, (Entry{}).encode());
+    try std.testing.expectError(error.InvalidCatalogRecord, (Entry{ .active = successor }).encode());
+    try std.testing.expectError(error.InvalidCatalogRecord, (Entry{ .pending = old }).encode());
+    var encoded = try (Entry{ .active = old }).encode();
+    encoded[Entry.magic.len + 1 + Owner.encoded_len] = 1;
+    try std.testing.expectError(error.InvalidCatalogRecord, Entry.decode(&encoded));
+    encoded = try (Entry{ .pending = successor }).encode();
+    encoded[Entry.magic.len] = 0xff;
+    try std.testing.expectError(error.InvalidCatalogRecord, Entry.decode(&encoded));
+    encoded = try (Entry{ .pending = successor }).encode();
+    encoded[encoded.len - 1] = @backingInt(Phase.active);
+    try std.testing.expectError(error.InvalidCatalogRecord, Entry.decode(&encoded));
+    successor.publication_id = @splat(0);
+    try std.testing.expectError(error.InvalidCatalogRecord, (Entry{}).reserve(.{ .successor = successor }));
+}
+
+test "catalog relation entry plans validate the complete cut before writes and never repair replay" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        rows: [2]?Entry,
+        reads: usize = 0,
+        writes: usize = 0,
+        fail_read: ?usize = null,
+        fn index(key: Key) usize {
+            return if (std.mem.eql(u8, key.name, "rows")) 0 else 1;
+        }
+        pub fn getEntry(self: *@This(), key: Key) !?Entry {
+            self.reads += 1;
+            if (self.fail_read == self.reads) return error.InjectedReadFailure;
+            return self.rows[index(key)];
+        }
+        pub fn putEntry(self: *@This(), key: Key, entry: Entry) !void {
+            self.writes += 1;
+            self.rows[index(key)] = entry;
+        }
+        pub fn deleteEntry(self: *@This(), key: Key) !void {
+            self.writes += 1;
+            self.rows[index(key)] = null;
+        }
+    };
+    const old = testClaim(2, "rows", 7, 1, .table).owner;
+    var successor = testClaim(2, "rows", 8, 2, .table).owner;
+    successor.phase = .reserved;
+    successor.publication_id = @splat(1);
+    const prior: Entry = .{ .active = old };
+    const reserved = try prior.reserve(.{ .predecessor = old, .successor = successor });
+    const index_reserved = try (Entry{}).reserve(.{ .successor = successor });
+    const changes = [_]EntryPlan.Change{
+        .{ .key = .{ .namespace_id = 2, .name = "rows" }, .before = prior, .after = reserved },
+        .{ .key = .{ .namespace_id = 2, .name = "idx" }, .before = .{}, .after = index_reserved },
+    };
+    var plan = try EntryPlan.init(a, &changes);
+    defer plan.deinit();
+    var store: Fake = .{ .rows = .{ prior, null }, .fail_read = 2 };
+    try std.testing.expectError(error.InjectedReadFailure, plan.apply(&store));
+    try std.testing.expectEqual(@as(usize, 0), store.writes);
+    store.fail_read = null;
+    store.reads = 0;
+    try plan.apply(&store);
+    try std.testing.expectEqual(@as(usize, 2), store.reads);
+    try std.testing.expectEqual(@as(usize, 2), store.writes);
+    try plan.verifyPublished(&store);
+    try std.testing.expectError(error.CatalogGenerationChanged, plan.apply(&store));
+    store.rows[1] = null;
+    try std.testing.expectError(error.CatalogGenerationChanged, plan.verifyPublished(&store));
+    try std.testing.expectEqual(@as(usize, 2), store.writes);
+    store.rows[1] = index_reserved;
+    var cancel = try EntryPlan.init(a, &.{
+        .{ .key = changes[0].key, .before = reserved, .after = prior },
+        .{ .key = changes[1].key, .before = index_reserved, .after = .{} },
+    });
+    defer cancel.deinit();
+    try cancel.apply(&store);
+    try cancel.verifyPublished(&store);
+    try std.testing.expect(store.rows[0].?.eql(prior));
+    try std.testing.expect(store.rows[1] == null);
+}
+
+test "catalog relation entry plan ownership survives input mutation and allocation faults" {
+    const a = std.testing.allocator;
+    var name = [_]u8{ 'r', 'o', 'w', 's' };
+    const before: Entry = .{ .active = testClaim(2, "rows", 7, 1, .table).owner };
+    const changes = [_]EntryPlan.Change{.{ .key = .{ .namespace_id = 2, .name = &name }, .before = before, .after = .{} }};
+    const T = struct {
+        fn prepare(alloc: A, input: []const EntryPlan.Change) !void {
+            var plan = try EntryPlan.init(alloc, input);
+            defer plan.deinit();
+        }
+    };
+    var failing = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(failing.allocator(), T.prepare, .{&changes});
+    var plan = try EntryPlan.init(a, &changes);
+    defer plan.deinit();
+    name[0] = 'x';
+    try std.testing.expectEqualStrings("rows", plan.changes[0].key.name);
+    try std.testing.expectError(error.InvalidCatalogRecord, EntryPlan.init(a, &.{ changes[0], changes[0] }));
 }
 
 test "catalog relation ownership bounds claims and accepts only valid unambiguous names" {

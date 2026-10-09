@@ -1709,6 +1709,24 @@ explicit adoption, initial reconciliation, coordinator restart, source-epoch
 replacement, conflict failure, stopped retries, GC and corrected-source rebuild;
 it also verifies no root publication and zero retained proposal receipts.
 `zig build antfly-relation-coordinator-test` exercises these paths.
+`relation_names.Entry` now models one active owner alongside one reserved
+successor, including a restore successor with a different physical table ID.
+The active cut remains separate and readable; a pending-only name has no active
+owner. Reserve compares the exact predecessor and is idempotent only for the
+same complete pending owner. Publish and cancel compare both cuts; ordinary DDL
+cannot replace an entry with a pending successor. The unpublished `AFRE01`
+codec rejects impossible phases, absent-slot garbage and truncated records.
+An owned, bounded `EntryPlan` validates every affected name before writes and
+verifies replay without synthesizing missing effects. Its adapter borrows the
+caller's metadata transaction and generation-bound keyspace, never opening or
+committing a second transaction. Pure tests cover collision/stale publication,
+canonical bytes, input ownership and allocation failures. A native regression
+checks rollback, committed publication, pinned-reader isolation, stale cancel
+and reopen. These are compound-entry mechanics, not publication authority:
+producers still must validate the immutable plan and capability/lifecycle cut.
+Reconciliation candidates, pending-plan source projections, writer admission
+and active-root serving have not yet switched to this compound representation;
+there is no fallback decoder or newly enabled public lookup.
 Multi-peer coordinator failover/fault coverage remains to be extended alongside
 serving activation. Pending-generation reservation sources,
 capability barriers and atomic active-root publication still
