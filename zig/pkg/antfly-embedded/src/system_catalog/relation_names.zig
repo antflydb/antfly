@@ -397,7 +397,7 @@ const Context = struct {
         return left.namespace_id == right.namespace_id and std.mem.eql(u8, left.name, right.name);
     }
 };
-const Map = std.HashMapUnmanaged(Key, Owner, Context, 80);
+const Map = EntryMap;
 pub const EntryMap = std.HashMapUnmanaged(Key, Entry, Context, 80);
 
 /// Owned CAS over the whole active/reserved cut. Validate every affected name
@@ -551,29 +551,38 @@ pub fn EntryStore(comptime Txn: type, comptime Keyspace: type) type {
     };
 }
 
-/// Current single-owner registry; activation of compound entries is a separate
-/// capability/source-completeness decision, not a fallback decoder here.
+/// Canonical compound registry. Active reads never expose a reserved successor;
+/// mutation admission always compares the complete active/pending cut.
 pub fn Store(comptime Txn: type) type {
     return struct {
         txn: *Txn,
         alloc: A,
         group_id: u64,
         pub fn getClaim(self: *@This(), key: Key) !?Owner {
+            return if (try self.getEntry(key)) |entry| entry.active else null;
+        }
+        pub fn getEntry(self: *@This(), key: Key) !?Entry {
             const bytes = try key.storageKeyAlloc(self.alloc, self.group_id);
             defer self.alloc.free(bytes);
             const value = self.txn.get(bytes) catch |err| {
                 if (err == error.NotFound) return null;
                 return err;
             };
-            return try Owner.decode(value);
+            return try Entry.decode(value);
         }
         pub fn putClaim(self: *@This(), key: Key, owner: Owner) !void {
+            try self.putEntry(key, try (Claim{ .key = key, .owner = owner }).entry());
+        }
+        pub fn putEntry(self: *@This(), key: Key, entry: Entry) !void {
             const bytes = try key.storageKeyAlloc(self.alloc, self.group_id);
             defer self.alloc.free(bytes);
-            const value = try owner.encode();
+            const value = try entry.encode();
             try self.txn.put(bytes, &value);
         }
         pub fn deleteClaim(self: *@This(), key: Key) !void {
+            try self.deleteEntry(key);
+        }
+        pub fn deleteEntry(self: *@This(), key: Key) !void {
             const bytes = try key.storageKeyAlloc(self.alloc, self.group_id);
             defer self.alloc.free(bytes);
             try self.txn.delete(bytes);
@@ -610,14 +619,14 @@ pub const Plan = struct {
         const result = try a.alloc(Claim, claims.len);
         try map.ensureTotalCapacity(a, @intCast(claims.len));
         for (claims, result) |claim, *copy| {
-            if (claim.pending != null or claim.reservation) return error.InvalidCatalogRecord;
+            if (claim.reservation) return error.InvalidCatalogRecord;
             try claim.key.validate();
-            try claim.owner.validate();
+            const entry = try claim.entry();
             const key: Key = .{ .namespace_id = claim.key.namespace_id, .name = try a.dupe(u8, claim.key.name) };
             const found = map.getOrPutAssumeCapacity(key);
             if (found.found_existing) return if (proposed) error.CatalogAlreadyExists else error.InvalidCatalogRecord;
-            found.value_ptr.* = claim.owner;
-            copy.* = .{ .key = key, .owner = claim.owner };
+            found.value_ptr.* = entry;
+            copy.* = try Claim.fromEntry(key, entry);
         }
         return result;
     }
@@ -627,14 +636,14 @@ pub const Plan = struct {
     /// neither the number of unrelated tables nor their schemas is involved.
     pub fn validate(self: *const Plan, reader: anytype) !void {
         for (self.before) |claim| {
-            const current = (try reader.getClaim(claim.key)) orelse return error.CatalogGenerationChanged;
-            if (!current.eql(claim.owner)) return error.CatalogGenerationChanged;
+            const current = (try reader.getEntry(claim.key)) orelse return error.CatalogGenerationChanged;
+            if (!current.eql(try claim.entry())) return error.CatalogGenerationChanged;
         }
         for (self.after) |claim| {
             // Retained names were already generation-fenced in this same
             // pinned transaction. Do not reread every unchanged index owner.
             if (self.before_by_name.contains(claim.key)) continue;
-            if (try reader.getClaim(claim.key)) |_| return error.CatalogAlreadyExists;
+            if (try reader.getEntry(claim.key)) |_| return error.CatalogAlreadyExists;
         }
     }
 
@@ -644,10 +653,11 @@ pub const Plan = struct {
     /// merely because a conflicting claim has the same table ID/name.
     pub fn apply(self: *const Plan, txn: anytype) !void {
         try self.validate(txn);
-        for (self.before) |claim| if (!self.after_by_name.contains(claim.key)) try txn.deleteClaim(claim.key);
+        for (self.before) |claim| if (!self.after_by_name.contains(claim.key)) try txn.deleteEntry(claim.key);
         for (self.after) |claim| {
-            if (self.before_by_name.get(claim.key)) |prior| if (prior.eql(claim.owner)) continue;
-            try txn.putClaim(claim.key, claim.owner);
+            const entry = try claim.entry();
+            if (self.before_by_name.get(claim.key)) |prior| if (prior.eql(entry)) continue;
+            try txn.putEntry(claim.key, entry);
         }
     }
     /// Verify a received final cut without synthesizing missing effects. The
@@ -655,11 +665,11 @@ pub const Plan = struct {
     /// silently repairing replay would hide incompatible producer behavior.
     pub fn verifyPublished(self: *const Plan, reader: anytype) !void {
         for (self.after) |claim| {
-            const current = (try reader.getClaim(claim.key)) orelse return error.CatalogGenerationChanged;
-            if (!current.eql(claim.owner)) return error.CatalogGenerationChanged;
+            const current = (try reader.getEntry(claim.key)) orelse return error.CatalogGenerationChanged;
+            if (!current.eql(try claim.entry())) return error.CatalogGenerationChanged;
         }
         for (self.before) |claim| if (!self.after_by_name.contains(claim.key)) {
-            if (try reader.getClaim(claim.key)) |_| return error.CatalogGenerationChanged;
+            if (try reader.getEntry(claim.key)) |_| return error.CatalogGenerationChanged;
         };
     }
 };
@@ -691,10 +701,19 @@ pub const Publication = struct {
         return plan.after;
     }
     pub fn stage(self: *Publication, table_id: u64, before: []const Claim, after: []const Claim) !void {
-        if (table_id == 0) return error.InvalidCatalogRecord;
+        return self.stageSuccessor(table_id, table_id, before, after);
+    }
+    /// A replacement can retain its exact predecessor under a different
+    /// physical identity. Group the atomic cut by successor, without inferring
+    /// authority from a matching logical name or silently dropping either slot.
+    pub fn stageSuccessor(self: *Publication, predecessor_id: ?u64, table_id: u64, before: []const Claim, after: []const Claim) !void {
+        if (table_id == 0 or predecessor_id == 0) return error.InvalidCatalogRecord;
         if (before.len > max_claims or after.len > max_claims) return error.CatalogCommandTooLarge;
-        for (before) |claim| if (claim.owner.table_id != table_id) return error.InvalidCatalogRecord;
-        for (after) |claim| if (claim.owner.table_id != table_id) return error.InvalidCatalogRecord;
+        for ([_][]const Claim{ before, after }) |cut| for (cut) |claim| {
+            const entry = try claim.entry();
+            if (entry.active) |owner| if (owner.table_id != table_id and owner.table_id != predecessor_id) return error.InvalidCatalogRecord;
+            if (entry.pending) |owner| if (owner.table_id != table_id) return error.InvalidCatalogRecord;
+        };
         const prior = self.changes.getPtr(table_id);
         const before_count = self.before_count - (if (prior) |p| p.before.len else @as(usize, 0));
         const after_count = self.after_count - (if (prior) |p| p.after.len else @as(usize, 0));
@@ -706,7 +725,7 @@ pub const Publication = struct {
             if (p.before.len != next.before.len) return error.CatalogGenerationChanged;
             for (p.before) |claim| {
                 const observed = next.before_by_name.get(claim.key) orelse return error.CatalogGenerationChanged;
-                if (!observed.eql(claim.owner)) return error.CatalogGenerationChanged;
+                if (!observed.eql(try claim.entry())) return error.CatalogGenerationChanged;
             }
             // A failed replacement never destroys the preceding pending cut.
             // Its independent arena also bounds memory across many updates.
@@ -739,19 +758,28 @@ const TestStore = struct {
     calls: usize = 0,
     writes: usize = 0,
     fn getClaim(self: *TestStore, key: Key) !?Owner {
+        return if (try self.getEntry(key)) |entry| entry.active else null;
+    }
+    fn getEntry(self: *TestStore, key: Key) !?Entry {
         self.calls += 1;
-        for (self.rows.items) |claim| if (Context.eql(.{}, key, claim.key)) return claim.owner;
+        for (self.rows.items) |claim| if (Context.eql(.{}, key, claim.key)) return try claim.entry();
         return null;
     }
     fn putClaim(self: *TestStore, key: Key, owner: Owner) !void {
+        try self.putEntry(key, try (Claim{ .key = key, .owner = owner }).entry());
+    }
+    fn putEntry(self: *TestStore, key: Key, entry: Entry) !void {
         self.writes += 1;
         for (self.rows.items) |*claim| if (Context.eql(.{}, key, claim.key)) {
-            claim.owner = owner;
+            claim.* = try Claim.fromEntry(key, entry);
             return;
         };
-        try self.rows.append(std.testing.allocator, .{ .key = key, .owner = owner });
+        try self.rows.append(std.testing.allocator, try Claim.fromEntry(key, entry));
     }
     fn deleteClaim(self: *TestStore, key: Key) !void {
+        try self.deleteEntry(key);
+    }
+    fn deleteEntry(self: *TestStore, key: Key) !void {
         self.writes += 1;
         for (self.rows.items, 0..) |claim, i| if (Context.eql(.{}, key, claim.key)) {
             _ = self.rows.orderedRemove(i);
@@ -760,6 +788,66 @@ const TestStore = struct {
         return error.InvalidCatalogRecord;
     }
 };
+
+test "catalog compound writer publications retain reservations through replacement and reject ordinary theft" {
+    const a = std.testing.allocator;
+    const old: TableCut.Definition = .{ .namespace_id = 2, .table_id = 7, .name = "rows", .schema_json = "{\"version\":1,\"relational_indexes\":[{\"name\":\"shared\"},{\"name\":\"old_idx\"}]}" };
+    const next: TableCut.Definition = .{ .namespace_id = 2, .table_id = 8, .name = "rows", .schema_json = "{\"version\":2,\"relational_indexes\":[{\"name\":\"shared\"},{\"name\":\"new_idx\"}]}", .phase = .reserved, .publication_id = @splat(3) };
+    var before = try TableCut.init(a, old);
+    defer before.deinit();
+    var reserved = try TableCut.initSuccessor(a, old, next);
+    defer reserved.deinit();
+    var active = next;
+    active.phase = .active;
+    var after = try TableCut.init(a, active);
+    defer after.deinit();
+    var store: TestStore = .{};
+    defer store.rows.deinit(a);
+    for (before.claims) |claim| try store.putEntry(claim.key, try claim.entry());
+    var publication = Publication.init(a);
+    defer publication.deinit();
+    try std.testing.expectError(error.InvalidCatalogRecord, publication.stageSuccessor(9, 8, before.claims, reserved.claims));
+    try publication.stageSuccessor(7, 8, before.claims, reserved.claims);
+    var reservation = try publication.compile();
+    defer reservation.deinit();
+    try reservation.apply(&store);
+    const table_key: Key = .{ .namespace_id = 2, .name = "rows" };
+    const new_key: Key = .{ .namespace_id = 2, .name = "new_idx" };
+    try std.testing.expectEqual(@as(u64, 7), (try store.getClaim(table_key)).?.table_id);
+    try std.testing.expect((try store.getClaim(new_key)) == null);
+    try std.testing.expectEqual(@as(u64, 8), (try store.getEntry(new_key)).?.pending.?.table_id);
+    var ordinary = try Plan.init(a, before.claims, before.claims);
+    defer ordinary.deinit();
+    var deletion = try Plan.init(a, before.claims, &.{});
+    defer deletion.deinit();
+    const writes = store.writes;
+    try std.testing.expectError(error.CatalogGenerationChanged, ordinary.apply(&store));
+    try std.testing.expectError(error.CatalogGenerationChanged, deletion.apply(&store));
+    try std.testing.expectEqual(writes, store.writes);
+    var cutover = Publication.init(a);
+    defer cutover.deinit();
+    try cutover.stageSuccessor(7, 8, reserved.claims, after.claims);
+    var publish = try cutover.compile();
+    defer publish.deinit();
+    try publish.apply(&store);
+    try publish.verifyPublished(&store);
+    try std.testing.expectEqual(@as(u64, 8), (try store.getClaim(table_key)).?.table_id);
+    try std.testing.expect((try store.getEntry(.{ .namespace_id = 2, .name = "old_idx" })) == null);
+    try std.testing.expect((try store.getEntry(new_key)).?.pending == null);
+    try std.testing.expectError(error.CatalogGenerationChanged, publish.apply(&store));
+    const Fault = struct {
+        fn run(alloc: A, prior: []const Claim, proposed: []const Claim) !void {
+            var p = Publication.init(alloc);
+            defer p.deinit();
+            try p.stageSuccessor(7, 8, prior, proposed);
+            var plan = try p.compile();
+            defer plan.deinit();
+            try std.testing.expectEqual(@as(u64, 8), plan.after_by_name.get(table_key).?.pending.?.table_id);
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Fault.run, .{ before.claims, reserved.claims });
+}
 
 test "catalog relation received cuts verify without repairing stale or omitted effects" {
     const a = std.testing.allocator;
@@ -1184,7 +1272,7 @@ test "catalog relation ownership owns names and unwinds allocation failures" {
             defer plan.deinit();
             try std.testing.expectEqualStrings("owned_name", plan.before[0].key.name);
             try std.testing.expectEqualStrings("owned_name", plan.after[0].key.name);
-            try std.testing.expectEqual(@as(u32, 2), plan.after_by_name.get(.{ .namespace_id = 2, .name = "owned_name" }).?.schema_version);
+            try std.testing.expectEqual(@as(u32, 2), plan.after_by_name.get(.{ .namespace_id = 2, .name = "owned_name" }).?.active.?.schema_version);
         }
     };
     try Probe.run(std.testing.allocator);
@@ -1270,15 +1358,15 @@ test "catalog relation ownership validates the complete cut before any mutation"
     const Reader = struct {
         old: Claim,
         calls: usize = 0,
-        pub fn getClaim(self: *@This(), key: Key) !?Owner {
+        pub fn getEntry(self: *@This(), key: Key) !?Entry {
             self.calls += 1;
             if (self.calls == 2) return error.InjectedReadFailure;
-            return if (Context.eql(.{}, key, self.old.key)) self.old.owner else null;
+            return if (Context.eql(.{}, key, self.old.key)) try self.old.entry() else null;
         }
-        pub fn putClaim(_: *@This(), _: Key, _: Owner) !void {
+        pub fn putEntry(_: *@This(), _: Key, _: Entry) !void {
             return error.UnexpectedMutation;
         }
-        pub fn deleteClaim(_: *@This(), _: Key) !void {
+        pub fn deleteEntry(_: *@This(), _: Key) !void {
             return error.UnexpectedMutation;
         }
     };

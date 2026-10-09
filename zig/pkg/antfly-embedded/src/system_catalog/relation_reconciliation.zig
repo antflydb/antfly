@@ -1163,7 +1163,11 @@ test "relation reconciliation compound candidates retain active visibility and v
     defer cut.deinit();
     const claims = cut.claims;
     const successor = (try claims[0].entry()).pending.?;
-    try std.testing.expectError(error.InvalidCatalogRecord, names.Plan.init(a, &.{}, claims));
+    var writer = try names.Plan.init(a, &.{}, claims);
+    defer writer.deinit();
+    var partial = claims[0];
+    partial.reservation = true;
+    try std.testing.expectError(error.InvalidCatalogRecord, names.Plan.init(a, &.{}, &.{partial}));
     const rows = [_]SourceRow{.{ .key = "table:7", .table_id = 7, .pending_table_id = 8, .claims = claims }};
     var source: TestSource = .{ .rows = &rows };
     const initial = try State.init(41, try nextJobId(null), test_epoch);
@@ -1174,6 +1178,7 @@ test "relation reconciliation compound candidates retain active visibility and v
     defer build.deinit();
     try build.apply(&txn, test_epoch);
     var reader: CandidateStore(TestTxn) = .{ .txn = &txn, .state = &initial };
+    try writer.verifyPublished(&reader);
     try std.testing.expect((try reader.getClaim(claims[0].key)).?.eql(claims[0].owner));
     try std.testing.expect((try reader.getEntry(claims[0].key)).?.pending.?.eql(successor));
     try std.testing.expect(try reader.getClaim(claims[1].key) == null);

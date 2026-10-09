@@ -1840,6 +1840,26 @@ plus 22 linked tests; inventory, source-catalog, formatting and whitespace
 checks pass. This prepares independent evidence, not a new serving authority:
 the publisher/coordinator still must connect capability and producer-lifecycle
 barriers, writer adoption and atomic root publication. No SQL disposition changes.
+The unpublished writer registry now uses the same canonical compound-entry
+format as reconciliation, without a single-owner fallback decoder. Active reads
+return only the active slot; before/after mutation plans compare complete
+entries, including every pending schema/publication identity, before the first
+write. Retained names still require only one admission point read. Replacement
+publication explicitly binds predecessor and successor physical IDs, supports
+old-only/shared/new-only names, and rejects partial reservation contributions
+where a complete writer cut is required. Replay derives affected IDs from both
+owner slots. Snapshot/checkpoint checks compare complete entries, so an
+unauthorized pending slot cannot hide behind an unchanged valid public owner.
+Pure tests exercise replacement cutover, ordinary update/delete theft, hidden
+pending-only reads, stale publication and exhaustive allocation failures. A
+native regression preserves a compound reservation across restart, rejects
+ordinary rename without advancing revision or changing its physical table,
+and rejects a checkpoint reservation with no authoritative producer plan.
+The native gate passes 170 catalog tests plus 22 linked tests; pure namespace
+and reconciliation tests, inventory, source-catalog, formatting and whitespace
+checks pass. This unifies writer mechanics, not automatic adoption: native
+producer-plan composition, capability/lifecycle barriers and root serving
+remain unfinished. No original SQL parity case receives completion credit.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,

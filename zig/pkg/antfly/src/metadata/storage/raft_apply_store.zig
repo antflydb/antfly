@@ -115,6 +115,60 @@ test "system catalog relation namespace transaction classifies only canonical af
     try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), try system_catalog_storage.tableIdFromRecordKey(prefix ++ "18446744073709551615", 41));
 }
 
+test "system catalog compound writer registry never hides successor reservations from admission or checkpoint validation" {
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/compound-writer-admission", .{tmp.sub_path});
+    defer a.free(root);
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "rows", .schema_json = "{}" };
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            var buf: [160]u8 = undefined;
+            try txn.put(try RaftApplyStore.relationWriterKeyForGroup(&buf, group), "AFRW01");
+            try txn.commit();
+        }
+        try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = group };
+        const key: relation_names.Key = .{ .namespace_id = system_catalog.default_namespace_id, .name = table.name };
+        const prior = (try registry.getEntry(key)).?;
+        var successor = prior.active.?;
+        successor.table_id = 8;
+        successor.phase = .reserved;
+        successor.publication_id = @splat(9);
+        try registry.putEntry(key, try prior.reserve(.{ .predecessor = prior.active, .successor = successor }));
+        // This intentionally lacks a producer plan. Recovery must not accept
+        // the hidden pending slot merely because the public owner still agrees.
+        try std.testing.expectError(error.InvalidMetadataHACheckpoint, verifyRelationCheckpointTxn(a, &txn));
+        try txn.commit();
+    }
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const revision = try store.standaloneRevision();
+    var changed = table;
+    changed.name = "renamed";
+    try std.testing.expectError(error.CatalogGenerationChanged, store.applyStandaloneCommand(group, .{ .upsert_table = changed }));
+    try std.testing.expectEqual(revision, try store.standaloneRevision());
+    var read = try store.store.beginReadTxn();
+    defer read.abort();
+    var registry: relation_names.Store(docstore.DocStore.Txn) = .{ .txn = &read, .alloc = a, .group_id = group };
+    const key: relation_names.Key = .{ .namespace_id = system_catalog.default_namespace_id, .name = table.name };
+    try std.testing.expectEqual(@as(u64, 7), (try registry.getClaim(key)).?.table_id);
+    try std.testing.expectEqual(@as(u64, 8), (try registry.getEntry(key)).?.pending.?.table_id);
+    try std.testing.expect((try registry.getEntry(.{ .namespace_id = system_catalog.default_namespace_id, .name = changed.name })) == null);
+    var buf: [160]u8 = undefined;
+    const actual = try decodeTableRecord(a, try read.get(try tableKeyForGroup(&buf, group, table.table_id)));
+    defer metadata_table_manager.freeTable(a, actual);
+    try std.testing.expectEqualStrings(table.name, actual.name);
+}
+
 test "system catalog relation namespace transaction admits standalone and raft commands atomically" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1567,11 +1621,11 @@ test "system catalog relation namespace transaction snapshots verify ownership b
             defer selected.deinit(a);
             var owner: relation_names.Owner = undefined;
             for (rows) |row| if (try relation_names.Key.fromStorageKey(row.key, group) != null) {
-                owner = try relation_names.Owner.decode(row.value);
+                owner = (try relation_names.Entry.decode(row.value)).active.?;
                 break;
             };
             owner.schema_digest[0] ^= 1;
-            var encoded_owner = try owner.encode();
+            var encoded_owner = try (relation_names.Entry{ .active = owner }).encode();
             const extra_key = try (relation_names.Key{ .namespace_id = system_catalog.default_namespace_id, .name = "injected" }).storageKeyAlloc(a, group);
             defer a.free(extra_key);
             var buf: [160]u8 = undefined;
@@ -2291,13 +2345,13 @@ test "system catalog relation namespace transaction rolls back with schema and p
     const names = @import("antfly_local_sources").system_catalog_relation_names;
     const FaultStore = struct {
         base: *names.Store(docstore.DocStore.Txn),
-        pub fn getClaim(self: *@This(), key: names.Key) !?names.Owner {
-            return self.base.getClaim(key);
+        pub fn getEntry(self: *@This(), key: names.Key) !?names.Entry {
+            return self.base.getEntry(key);
         }
-        pub fn deleteClaim(self: *@This(), key: names.Key) !void {
-            return self.base.deleteClaim(key);
+        pub fn deleteEntry(self: *@This(), key: names.Key) !void {
+            return self.base.deleteEntry(key);
         }
-        pub fn putClaim(_: *@This(), _: names.Key, _: names.Owner) !void {
+        pub fn putEntry(_: *@This(), _: names.Key, _: names.Entry) !void {
             return error.InjectedNamespaceWriteFailure;
         }
     };
@@ -17960,8 +18014,8 @@ pub const RaftApplyStore = struct {
         while (keys.next()) |key| {
             if (try capturedRelationTableId(key.*, group_id)) |id| try addRelationTableId(self.alloc, &ids, id);
             if (include_registry and try relation_names.Key.fromStorageKey(key.*, group_id) != null) {
-                if (journal.originals.get(key.*)) |before| if (before) |bytes| try addRelationTableId(self.alloc, &ids, (try relation_names.Owner.decode(bytes)).table_id);
-                if (try stagingGet(txn, key.*)) |bytes| try addRelationTableId(self.alloc, &ids, (try relation_names.Owner.decode(bytes)).table_id);
+                if (journal.originals.get(key.*)) |before| if (before) |bytes| try addRelationEntryTableIds(self.alloc, &ids, bytes);
+                if (try stagingGet(txn, key.*)) |bytes| try addRelationEntryTableIds(self.alloc, &ids, bytes);
             }
         }
         var publication = relation_names.Publication.init(self.alloc);
@@ -17994,6 +18048,11 @@ pub const RaftApplyStore = struct {
     fn addRelationTableId(a: std.mem.Allocator, ids: *std.AutoHashMapUnmanaged(u64, void), id: u64) !void {
         if (ids.count() >= relation_names.max_claims and !ids.contains(id)) return error.CatalogCommandTooLarge;
         try ids.put(a, id, {});
+    }
+    fn addRelationEntryTableIds(a: std.mem.Allocator, ids: *std.AutoHashMapUnmanaged(u64, void), bytes: []const u8) !void {
+        const entry = try relation_names.Entry.decode(bytes);
+        if (entry.active) |owner| try addRelationTableId(a, ids, owner.table_id);
+        if (entry.pending) |owner| try addRelationTableId(a, ids, owner.table_id);
     }
 
     fn applyTransitionCommandRawTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, command: TransitionCommand) !void {
@@ -27217,7 +27276,7 @@ fn validateRelationSnapshotCut(alloc: std.mem.Allocator, group_id: u64, rows: []
         if (cancelled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
         try reconciliation.feed(row.key, row.value);
         if (try relation_names.Key.fromStorageKey(row.key, group_id) != null) {
-            _ = try relation_names.Owner.decode(row.value);
+            _ = try relation_names.Entry.decode(row.value);
             received += 1;
         }
     }
@@ -27250,8 +27309,8 @@ fn verifyRelationTableCut(alloc: std.mem.Allocator, reader: anytype, group_id: u
     defer table.deinit();
     var registry: relation_names.Store(@TypeOf(reader.*)) = .{ .txn = reader, .alloc = alloc, .group_id = group_id };
     for (table.claims()) |claim| {
-        const owner = (try registry.getClaim(claim.key)) orelse return error.InvalidCatalogRecord;
-        if (!owner.eql(claim.owner)) return error.InvalidCatalogRecord;
+        const entry = (try registry.getEntry(claim.key)) orelse return error.InvalidCatalogRecord;
+        if (!entry.eql(try claim.entry())) return error.InvalidCatalogRecord;
     }
     return table.claims().len;
 }
@@ -27288,7 +27347,7 @@ fn verifyRelationGroupTxn(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn,
     while (entry) |row| : (entry = try cursor.next()) {
         if (!std.mem.startsWith(u8, row.key, claims)) break;
         _ = (try relation_names.Key.fromStorageKey(row.key, group_id)) orelse return error.InvalidCatalogRecord;
-        _ = try relation_names.Owner.decode(row.value);
+        _ = try relation_names.Entry.decode(row.value);
         received += 1;
     }
     if (expected != received) return error.InvalidCatalogRecord;
