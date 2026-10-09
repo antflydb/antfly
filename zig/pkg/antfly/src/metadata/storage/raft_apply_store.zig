@@ -115,7 +115,11 @@ test "system catalog relation namespace transaction rolls back with schema and p
             errdefer txn.abort();
             var registry: names.Store(docstore.DocStore.Txn) = .{ .txn = &txn, .alloc = a, .group_id = 1 };
             try seed.apply(&registry);
+            try std.testing.expect((try registry.getClaim(old.key)).?.eql(old.owner));
             try store.putTableRecordTxn(&txn, 1, table_key, table);
+            const pending_table = try decodeTableRecord(a, try txn.get(table_key));
+            defer metadata_table_manager.freeTable(a, pending_table);
+            try std.testing.expectEqualStrings(old_schema, pending_table.schema_json);
             try txn.commit();
         }
         {
@@ -168,6 +172,116 @@ test "system catalog relation namespace transaction rolls back with schema and p
     const actual = try decodeTableRecord(a, try txn.get(table_key));
     defer metadata_table_manager.freeTable(a, actual);
     try std.testing.expectEqualStrings(new_schema, actual.schema_json);
+}
+
+test "system catalog relation namespace transaction journal retains earlier commands and excludes rejected standby effects" {
+    const a = std.testing.allocator;
+    const Journal = @import("command_journal.zig").Journal;
+    const Capture = @import("antfly_local_sources").storage_txn_mutation_capture.Capture;
+    const first = "\x00\x00__metadata__:journal:first";
+    const created = "\x00\x00__metadata_derived__:journal:created";
+    const deleted = "\x00\x00__metadata__:journal:deleted";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/command-journal", .{tmp.sub_path});
+    defer a.free(root);
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+        defer store.deinit();
+        {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(first, "original");
+            try txn.put(deleted, "retained");
+            try txn.commit();
+        }
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        var parent = Capture.init(a);
+        defer parent.deinit();
+        txn.mutation_capture = &parent;
+        try txn.put(first, "earlier-command");
+        var outcome: CommittedApplyOutcome = .{ .alloc = a };
+        defer outcome.deinit();
+        try outcome.appendProjection(.{ .kind = .table, .metadata_group_id = 1, .table_name = "earlier" });
+        try outcome.appendCommittedKey(.{ .metadata_group_id = 1, .key = first });
+        try outcome.appendTransition(.{ .remove_split = 7 });
+        const checkpoint = outcome.checkpointCommand();
+        {
+            var rejected = Journal.init(a, &txn);
+            defer rejected.deinit();
+            try rejected.attach();
+            try txn.put(first, "rejected");
+            try txn.put(first, "rejected-again");
+            try txn.put(created, "rejected-create");
+            try txn.delete(deleted);
+            try outcome.appendProjection(.{ .kind = .restore_job, .metadata_group_id = 1, .table_name = "rejected", .store_group_ids = &.{ 10, 11 } });
+            try outcome.appendCommittedKey(.{ .metadata_group_id = 1, .key = created });
+            try outcome.appendTransition(.{ .remove_merge = 8 });
+            outcome.recordFailure(error.CatalogAlreadyExists);
+            try std.testing.expectEqualStrings("earlier-command", rejected.originals.get(first).?.?);
+            try std.testing.expectEqual(@as(usize, 3), rejected.originals.count());
+            try std.testing.expectEqual(@as(usize, 1), parent.keys.count());
+            try std.testing.expectError(error.MetadataCommandMutationScope, rejected.capture.touch("outside-metadata"));
+            try rejected.rollback();
+            outcome.rollbackCommand(checkpoint);
+            try std.testing.expectError(error.InvalidMetadataCommandJournal, rejected.attach());
+        }
+        try std.testing.expectEqualStrings("earlier-command", try txn.get(first));
+        try std.testing.expect(outcome.failure == null);
+        try std.testing.expectEqual(@as(usize, 1), outcome.projection_signals.items.len);
+        try std.testing.expectEqualStrings("earlier", outcome.projection_signals.items[0].signal.table_name.?);
+        try std.testing.expectEqual(@as(usize, 1), outcome.committed_keys.items.len);
+        try std.testing.expectEqual(@as(usize, 1), outcome.transition_deltas.items.len);
+        try std.testing.expect(outcome.projection_kinds.contains(.table));
+        try std.testing.expect(!outcome.projection_kinds.contains(.restore_job));
+        try std.testing.expectEqualStrings("retained", try txn.get(deleted));
+        try std.testing.expectError(error.NotFound, txn.get(created));
+        try std.testing.expect(txn.mutation_capture == &parent);
+        try std.testing.expectEqual(@as(usize, 1), parent.keys.count());
+        {
+            var accepted = Journal.init(a, &txn);
+            defer accepted.deinit();
+            try accepted.attach();
+            try txn.put(created, "accepted-create");
+            try accepted.accept();
+            try std.testing.expectError(error.InvalidMetadataCommandJournal, accepted.attach());
+        }
+        try std.testing.expectEqual(@as(usize, 2), parent.keys.count());
+        try std.testing.expect(!parent.keys.contains(deleted));
+        try txn.commit();
+    }
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    var txn = try store.store.beginReadTxn();
+    defer txn.abort();
+    try std.testing.expectEqualStrings("earlier-command", try txn.get(first));
+    try std.testing.expectEqualStrings("accepted-create", try txn.get(created));
+    try std.testing.expectEqualStrings("retained", try txn.get(deleted));
+}
+
+test "system catalog relation namespace transaction journal rejects writes before losing rollback headroom" {
+    const a = std.testing.allocator;
+    const Journal = @import("command_journal.zig").Journal;
+    const first = "\x00\x00__metadata__:journal:first";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/journal-admission", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    var txn = try store.store.beginWriteTxn();
+    defer txn.abort();
+    try txn.put(first, "earlier-command");
+    var storage: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    var journal = Journal.init(fixed.allocator(), &txn);
+    defer journal.deinit();
+    try journal.attach();
+    try std.testing.expectError(error.OutOfMemory, txn.put(first, "must-not-overwrite"));
+    try std.testing.expectEqualStrings("earlier-command", try txn.get(first));
+    try journal.rollback();
+    try std.testing.expect(txn.mutation_capture == null);
 }
 
 const checkpoint_magic = "AMCKPT\x00\x00";
@@ -5614,6 +5728,31 @@ pub const CommittedApplyOutcome = struct {
     transition_deltas: std.ArrayListUnmanaged(CommittedTransitionDelta) = .empty,
     failure: ?anyerror = null,
 
+    const CommandCheckpoint = struct {
+        projections: usize,
+        keys: usize,
+        transitions: usize,
+        kinds: std.EnumSet(ProjectionSignalKind),
+        failure: ?anyerror,
+    };
+    fn checkpointCommand(self: *const CommittedApplyOutcome) CommandCheckpoint {
+        return .{ .projections = self.projection_signals.items.len, .keys = self.committed_keys.items.len, .transitions = self.transition_deltas.items.len, .kinds = self.projection_kinds, .failure = self.failure };
+    }
+    /// Pair with storage-command rollback before committing the enclosing
+    /// Raft batch. Rejected commands must not notify readers or advance live
+    /// topology projections merely because earlier commands are committed.
+    fn rollbackCommand(self: *CommittedApplyOutcome, checkpoint: CommandCheckpoint) void {
+        std.debug.assert(checkpoint.projections <= self.projection_signals.items.len and checkpoint.keys <= self.committed_keys.items.len and checkpoint.transitions <= self.transition_deltas.items.len);
+        for (self.projection_signals.items[checkpoint.projections..]) |*signal| signal.deinit(self.alloc);
+        self.projection_signals.shrinkRetainingCapacity(checkpoint.projections);
+        for (self.committed_keys.items[checkpoint.keys..]) |*signal| signal.deinit(self.alloc);
+        self.committed_keys.shrinkRetainingCapacity(checkpoint.keys);
+        for (self.transition_deltas.items[checkpoint.transitions..]) |*delta| deinitCommittedTransitionDelta(self.alloc, delta);
+        self.transition_deltas.shrinkRetainingCapacity(checkpoint.transitions);
+        self.projection_kinds = checkpoint.kinds;
+        self.failure = checkpoint.failure;
+    }
+
     pub fn deinit(self: *CommittedApplyOutcome) void {
         for (self.projection_signals.items) |*signal| signal.deinit(self.alloc);
         self.projection_signals.deinit(self.alloc);
@@ -9246,9 +9385,9 @@ pub const RaftApplyStore = struct {
         defer publication_arena.deinit();
         var key_buf: [160]u8 = undefined;
         const publication_key = try fk_generation_publication.initialKey(&key_buf, group_id, command.child_table_id);
-        // DocStore's write transaction does not read its pending puts. Pin the
-        // immutable pre-publication plan before applying the transition; the
-        // state machine validates that same revision in this transaction.
+        // Pin the exact admitted plan before applying the transition, which
+        // may replace or retire this publication in the same transaction.
+        // Notifications must describe that original cut, not a later lookup.
         const prior_publication: ?fk_generation_publication.InitialPublication = if (action == .publish_child)
             try std.json.parseFromSliceLeaky(fk_generation_publication.InitialPublication, publication_arena.allocator(), try txn.get(publication_key), .{})
         else

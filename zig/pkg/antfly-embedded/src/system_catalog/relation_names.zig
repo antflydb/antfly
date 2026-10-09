@@ -311,8 +311,8 @@ pub const Plan = struct {
 
 /// One metadata transaction may change a table's schema, binding and
 /// publication phase through separate producers. Keep its original cut
-/// immutable and replace only its proposed cut; transaction.get need not see
-/// pending writes. Compile all tables together before the first registry
+/// immutable and replace only its proposed cut, independently of the store's
+/// read-your-writes behavior. Compile all tables before the first registry
 /// mutation so swaps and cross-table collisions use the final atomic cut.
 pub const Publication = struct {
     alloc: A,

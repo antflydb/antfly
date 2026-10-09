@@ -1406,7 +1406,8 @@ Canonical SQL lowering, allocation faults and a 256-KiB unrelated payload
 under 16-KiB allocator headroom test this extraction boundary.
 The transaction-scoped `Publication` accumulator retains each table's original
 before cut and coalesces schema, binding and phase updates into its final after
-cut. This is necessary because metadata transactions do not read pending puts.
+cut. Current LSM metadata transactions read their pending writes, but that must
+not replace the original before cut or publish intermediate relation names.
 Repeated producers must present the same original ownership fences; a changed
 digest, epoch, phase or publication identity is rejected without losing the
 previous pending cut. Independent arenas reclaim superseded proposals, and
@@ -1427,6 +1428,15 @@ PostgreSQL oracle coverage checks table/index namespace collisions, equal index
 names in distinct schemas, quoted names, and constraint-owned index retirement.
 
 This is the shared publication mechanism, not completed runtime activation.
+Metadata command rollback now has a bounded, first-touch before-image journal
+restricted to metadata keys. It restores earlier commands' pending values,
+including overwrites, creates and deletes, and merges accepted keys into the
+standby effect capture only after acceptance. Matching outcome checkpoints
+discard rejected reader notifications and topology deltas. Tests exercise
+rejection followed by acceptance and restart, allocation failure before a key
+overwrite, capture restoration and strict rejection of user-row keys. This
+journal is not a user-row savepoint, and its automatic per-command admission
+and publication integration remain required before enabling the registry.
 It still must be called by every table/schema writer, FK publication and restore
 path, with namespace binding and claims committed in the same metadata cut.
 Rebuild/verification from authoritative bindings and table definitions, serving
