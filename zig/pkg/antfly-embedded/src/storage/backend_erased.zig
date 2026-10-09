@@ -252,6 +252,7 @@ pub const ReadScope = struct {
     const VTable = struct {
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
+        get_many_sorted_with_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, read_admission.Port) anyerror!void = null,
         close: *const fn (Allocator, *anyopaque) void,
         reset: ?*const fn (*anyopaque) anyerror!void = null,
         get_into: ?*const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 = null,
@@ -283,6 +284,22 @@ pub const ReadScope = struct {
         };
     }
     /// Invalidates scope values and releases pins; keeps bounded reusable scratch.
+    /// Borrows authority only for this call. Results remain owned by the
+    /// existing snapshot/scope; failed calls publish no partial output.
+    pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
+        errdefer @memset(values, null);
+        try control.checkpoint();
+        for (keys, 0..) |key, i| {
+            try control.checkpoint();
+            if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
+        }
+        const get_many = self.vtable.get_many_sorted_with_admission orelse return error.ExecutionWaitUnsupported;
+        try get_many(self.ptr, keys, values, control);
+        try control.checkpoint();
+    }
+
     pub fn reset(self: *@This()) !void {
         const reset_scope = self.vtable.reset orelse return error.ReadScopeResetUnsupported;
         try reset_scope(self.ptr);
@@ -310,6 +327,10 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getManySorted(keys, values);
         }
+        pub fn getManySortedWithAdmission(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.getManySortedWithAdmission(keys, values, control);
+        }
         fn getInto(ptr: *anyopaque, key: []const u8, out: []u8) anyerror![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getInto(key, out);
@@ -329,7 +350,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try alloc.create(State);
     state.* = .{ .handle = handle, .parent = parent };
-    return .{ .allocator = alloc, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    return .{ .allocator = alloc, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .get_many_sorted_with_admission = if (@hasDecl(@TypeOf(handle), "getManySortedWithAdmission")) State.getManySortedWithAdmission else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies
@@ -364,6 +385,7 @@ pub const ReadTxn = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
+        get_many_sorted_with_admission: ?*const fn (*anyopaque, []const []const u8, []?[]const u8, read_admission.Port) anyerror!void = null,
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
         fork_read: ?*const fn (Allocator, *anyopaque) anyerror!ReadTxn = null,
         open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
@@ -391,6 +413,19 @@ pub const ReadTxn = struct {
                 return err;
             };
         }
+    }
+
+    /// Borrows authority only for this call. Results remain owned by the
+    /// existing snapshot/scope; failed calls publish no partial output.
+    pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+        if (keys.len != values.len) return error.InvalidBatch;
+        @memset(values, null);
+        errdefer @memset(values, null);
+        try control.checkpoint();
+
+        const get_many = self.vtable.get_many_sorted_with_admission orelse return error.ExecutionWaitUnsupported;
+        try get_many(self.ptr, keys, values, control);
+        try control.checkpoint();
     }
 
     pub fn openCursor(self: *ReadTxn) !Cursor {
@@ -1373,6 +1408,13 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
             }
         }
 
+        pub fn getManySortedWithAdmission(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) anyerror!void {
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            defer parent.releaseChild();
+            return parent.handle.getManySortedWithAdmission(keys, values, control);
+        }
+
         pub fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
             const parent = unbox(ptr);
             try parent.retainChild();
@@ -1423,6 +1465,7 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
             .abort = vt.abort,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
+            .get_many_sorted_with_admission = if (@hasDecl(Handle, "getManySortedWithAdmission")) vt.getManySortedWithAdmission else null,
             .open_cursor_with_admission = if (@hasDecl(Handle, "openCursorWithAdmission")) vt.openCursorWithAdmission else null,
             .open_cursor = vt.openCursor,
             .fork_read = if (@hasDecl(Handle, "forkBorrowedRead")) vt.forkRead else null,

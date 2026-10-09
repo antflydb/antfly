@@ -1119,3 +1119,61 @@ test "text statistics trusted controls native snapshot batch planning retains or
         }
     }
 }
+
+test "text statistics trusted controls generic batch adapters reject missing authority capability" {
+    const erased = sources.storage_backend_erased;
+    const admission = sources.common_read_admission;
+    const Provider = struct {
+        const Owner = @This();
+        legacy_calls: usize = 0,
+        retired: usize = 0,
+        const Handle = struct {
+            owner: *Owner,
+            pub fn get(self: *@This(), _: []const u8) ![]const u8 {
+                self.owner.legacy_calls += 1;
+                return error.LegacyReadExecuted;
+            }
+            pub fn openCursor(self: *@This()) !erased.Cursor {
+                self.owner.legacy_calls += 1;
+                return error.LegacyReadExecuted;
+            }
+            pub fn abort(self: *@This()) void {
+                self.owner.retired += 1;
+            }
+            pub fn close(self: *@This()) void {
+                self.owner.retired += 1;
+            }
+        };
+    };
+    const Budget = struct {
+        stopped: bool = false,
+        pub fn checkpoint(self: *@This()) !void {
+            if (self.stopped) return error.Canceled;
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var provider = Provider{};
+    var budget = Budget{};
+    var adapter = admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    const port = admission.Port.init(&payload);
+    {
+        var read = try erased.readTxnFrom(std.testing.allocator, Provider.Handle{ .owner = &provider });
+        defer read.abort();
+        var scope = try erased.readScopeFrom(std.testing.allocator, Provider.Handle{ .owner = &provider });
+        defer scope.close();
+        var values = [_]?[]const u8{"stale"};
+        try std.testing.expectError(error.ExecutionWaitUnsupported, read.getManySortedWithAdmission(&.{"key"}, &values, port));
+        try std.testing.expect(values[0] == null);
+        values[0] = "stale";
+        try std.testing.expectError(error.ExecutionWaitUnsupported, scope.getManySortedWithAdmission(&.{"key"}, &values, port));
+        try std.testing.expect(values[0] == null);
+        budget.stopped = true;
+        try std.testing.expectError(error.Canceled, read.getManySortedWithAdmission(&.{"key"}, &values, port));
+        try std.testing.expectError(error.Canceled, scope.getManySortedWithAdmission(&.{"key"}, &values, port));
+        try std.testing.expectEqual(@as(usize, 0), provider.legacy_calls);
+    }
+    try std.testing.expectEqual(@as(usize, 2), provider.retired);
+}

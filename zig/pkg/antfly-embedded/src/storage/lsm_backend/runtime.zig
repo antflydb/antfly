@@ -11857,7 +11857,11 @@ pub fn qualifyControlledNativeReadBatch(control: read_admission.Port, use_scope:
     var handle = try loadRunTableIndexHandle(&backend, &runs[0]);
     try std.testing.expectEqual(@as(usize, 1), handle.runTableIndex().blocks.len);
     handle.release();
-    var read = try BoundReadTxn(B).open(&backend, .{ .name = "docs" });
+    var handle_owner = try BoundReadTxn(B).open(&backend, .{ .name = "docs" });
+    var read = backend_erased.readTxnFrom(a, handle_owner) catch |err| {
+        handle_owner.abort();
+        return err;
+    };
     defer read.abort();
     var scope = try read.openReadScope(a);
     defer scope.close();
@@ -11867,7 +11871,11 @@ pub fn qualifyControlledNativeReadBatch(control: read_admission.Port, use_scope:
     // reads, and sparse asynchronous points, including reusable-scope results.
     for ([_][]const []const u8{ keys[0..16], &keys, &sparse }) |batch| {
         cache.invalidatePrefix("/controlled-native-read-batch");
-        if (use_scope) try scope.getManySortedWithAdmission(batch, values[0..batch.len], control) else try read.getManySortedWithAdmission(batch, values[0..batch.len], control);
+        const result = if (use_scope) scope.getManySortedWithAdmission(batch, values[0..batch.len], control) else read.getManySortedWithAdmission(batch, values[0..batch.len], control);
+        result catch |err| {
+            for (values[0..batch.len]) |value| try std.testing.expect(value == null);
+            return err;
+        };
         cache.invalidatePrefix("/controlled-native-read-batch");
         for (values[0..batch.len], batch) |value, key| try std.testing.expectEqualStrings(key, value.?);
     }
