@@ -3045,7 +3045,13 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
 
 test "SQL document reads reject the relational stateless fallback before transport" {
     var identity: ?http_server.AuthenticatedIdentity = null;
-    var adapter = Adapter{ .server = undefined, .identity = &identity, .context = .{} };
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var server: http_server.ApiHttpServer = undefined;
+    // Backend construction borrows the executor. Catalog and transport remain
+    // poisoned so rejected requests cannot touch those authorities.
+    server.embedding_provider_runtime.io = io_impl.io();
+    var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{} };
     try std.testing.expectError(error.UnsupportedSqlExecution, Adapter.scan(&adapter, std.testing.allocator, .{
         .id = 1,
         .physical_name = "docs",
@@ -3066,7 +3072,13 @@ test "SQL no-op mutations authorize read and write before consulting catalog" {
     var identity: ?http_server.AuthenticatedIdentity = .{ .username = @constCast("writer"), .permissions = &permission };
     // Reaching server/catalog would be invalid: denied read-and-write bindings
     // must fail before metadata access, including contradictory/no-op writes.
-    var adapter = Adapter{ .server = undefined, .identity = &identity, .context = .{} };
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    var server: http_server.ApiHttpServer = undefined;
+    // Backend construction borrows the executor. Catalog and transport remain
+    // poisoned so rejected requests cannot touch those authorities.
+    server.embedding_provider_runtime.io = io_impl.io();
+    var adapter = Adapter{ .server = &server, .identity = &identity, .context = .{} };
     const compiler = @import("antfly_local_sources").sql_compiler;
     const runtime = @import("antfly_local_sources").sql_runtime;
     for ([_][]const u8{ "DELETE FROM docs WHERE _id = NULL", "UPDATE docs SET name = 'x' WHERE _id = 'a' AND _id = 'b'" }) |statement| {

@@ -22,7 +22,8 @@ const stores = @import("../serverless/artifacts/store.zig");
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const Ref = artifacts.ChunkRef;
-const block_bytes = 256 * 1024;
+const block_bytes: usize = 64 * 1024;
+const legacy_block_bytes: usize = 256 * 1024;
 const pack_bytes = 1024 * 1024;
 pub const Piece = struct {
     offset: usize,
@@ -37,13 +38,13 @@ pub const Piece = struct {
 };
 pub const Range = struct { offset: usize, len: usize };
 pub const Directory = struct {
-    version: u16 = 3,
+    version: u16 = 4,
     bytes: usize,
     metadata: []const Piece,
     blocks: []const Piece,
     terms: []const Range,
     pub fn validate(self: Directory) !void {
-        if ((self.version != 1 and self.version != 2 and self.version != 3) or self.bytes == 0 or self.bytes > 32 * 1024 * 1024 or self.metadata.len > 16384 or self.blocks.len > 16384 or self.terms.len > 200000) return error.InvalidNativeLakeTextCorpus;
+        if ((self.version != 1 and self.version != 2 and self.version != 3 and self.version != 4) or self.bytes == 0 or self.bytes > 32 * 1024 * 1024 or self.metadata.len > 16384 or self.blocks.len > 16384 or self.terms.len > 200000) return error.InvalidNativeLakeTextCorpus;
         // The two sorted streams must cover the original segment exactly.
         var position: usize = 0;
         var m: usize = 0;
@@ -51,7 +52,7 @@ pub const Directory = struct {
         while (m < self.metadata.len or b < self.blocks.len) {
             const meta = b == self.blocks.len or (m < self.metadata.len and self.metadata[m].offset < self.blocks[b].offset);
             const piece = if (meta) self.metadata[m] else self.blocks[b];
-            if (piece.offset != position or piece.ref.byte_len == 0 or piece.ref.byte_len > self.bytes - position or (!meta and piece.ref.byte_len > block_bytes)) return error.InvalidNativeLakeTextCorpus;
+            if (piece.offset != position or piece.ref.byte_len == 0 or piece.ref.byte_len > self.bytes - position or (!meta and piece.ref.byte_len > (if (self.version < 4) legacy_block_bytes else block_bytes))) return error.InvalidNativeLakeTextCorpus;
             try stores.validateSha256ArtifactIdentity(piece.ref.artifact_id, piece.ref.checksum);
             if (piece.pack) |pack| {
                 if (self.version < 3 or pack.byte_len == 0 or pack.byte_len > pack_bytes or piece.pack_offset > pack.byte_len or piece.ref.byte_len > pack.byte_len - piece.pack_offset) return error.InvalidNativeLakeTextCorpus;
@@ -90,7 +91,7 @@ pub fn publish(a: A, out: A, store: *stores.ArtifactStore, bytes: []const u8, ca
     defer arena.deinit();
     const ca = arena.allocator();
     // Upload large immutable packs, with independently authenticated bounded
-    // range units. Broad reads need four times fewer GETs than 64 KiB objects,
+    // range units. Broad reads coalesce adjacent units into one pack range GET,
     // while sparse queries never download an entire pack to authenticate it.
     var blocks: std.ArrayList(Piece) = .empty;
     var position: usize = 0;
@@ -133,16 +134,272 @@ pub fn loadDirectory(a: A, read: Read, ref: Ref) !Directory {
     };
     return directory;
 }
+const Decoded = local.serverless_query_lake_decoded_cache;
+const ServingCache = local.serverless_query_lake_serving_cache.Cache;
+const PhysicalResult = struct {
+    const Unit = struct { offset: u64, length: u64, result: anyerror!ServingCache.VerifiedBytes };
+    fn get(self: *const @This(), piece: Piece) !?ServingCache.VerifiedBytes {
+        for (self.units) |unit| if (unit.offset == piece.pack_offset and unit.length == piece.ref.byte_len) {
+            const value = try unit.result;
+            const digest = try stores.sha256DigestFromChecksum(piece.ref.checksum);
+            if (!std.mem.eql(u8, &value.digest, &digest)) return error.ArtifactIntegrityMismatch;
+            return value;
+        };
+        return null;
+    }
+    units: []const Unit,
+    start: u64,
+    end: u64,
+};
+const PhysicalPin = struct {
+    lease: Decoded.Lease,
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lease.release();
+        std.heap.page_allocator.destroy(self);
+    }
+    fn retain(lease: Decoded.Lease, value: ServingCache.VerifiedBytes) !ServingCache.VerifiedLease {
+        const self = try std.heap.page_allocator.create(@This());
+        self.* = .{ .lease = lease.retain() };
+        return .{ .value = value, .owner = .{ .bytes = value.bytes, .owner = .{ .shared = .{ .ptr = self, .release_fn = release } } } };
+    }
+};
+const PhysicalWarm = struct {
+    lease: ServingCache.ImmutableLease,
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lease.deinit();
+        std.heap.page_allocator.destroy(self);
+    }
+    fn retain(self: @This(), digest: [32]u8) !ServingCache.VerifiedLease {
+        var owned = self.lease;
+        errdefer owned.deinit();
+        const holder = try std.heap.page_allocator.create(@This());
+        holder.* = self;
+        const bytes = owned.bytes();
+        return .{ .value = .{ .bytes = bytes, .digest = digest }, .owner = .{ .bytes = bytes, .owner = .{ .shared = .{ .ptr = holder, .release_fn = release } } } };
+    }
+};
+const CoalescedRead = struct {
+    store: stores.ArtifactStore,
+    pack: Ref,
+    start: u64,
+    length: usize,
+    logical_end: usize,
+    cancellation: Cancellation,
+    a: A,
+    bytes: ?[]u8 = null,
+    pieces: []const Piece = &.{},
+    shared: ?Decoded.Lease = null,
+    reused: std.ArrayList(Decoded.Lease) = .empty,
+    fn deinit(self: *@This()) void {
+        if (self.bytes) |bytes| self.a.free(bytes);
+        if (self.shared) |lease| lease.release();
+        for (self.reused.items) |lease| lease.release();
+        self.reused.deinit(self.a);
+    }
+    fn loadPhysical(raw: *anyopaque, item: *Decoded.Item) !void {
+        const loader: *PhysicalLoader = @ptrCast(@alignCast(raw));
+        const self = loader.group;
+        const cache = loader.cached;
+        const a = item.arena.allocator();
+        var units: std.ArrayList(PhysicalResult.Unit) = .empty;
+        const missing = try a.alloc(bool, self.pieces.len);
+        // All joined flights have completed before this loader is registered.
+        // Reuse their immutable units without waiting while owning a flight.
+        try cache.cache.physical.dependMany(item, self.reused.items);
+        for (self.pieces, missing) |piece, *miss| {
+            try self.cancellation.check();
+            const reused = found: {
+                for (self.reused.items) |lease| {
+                    const result: *PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
+                    for (result.units) |unit| if (unit.offset == piece.pack_offset and unit.length == piece.ref.byte_len) {
+                        // Successful slices must match this directory's proof.
+                        if (unit.result) |value| {
+                            if (!std.mem.eql(u8, &value.digest, &(try stores.sha256DigestFromChecksum(piece.ref.checksum)))) return error.ArtifactIntegrityMismatch;
+                        } else |_| {}
+                        try units.append(a, unit);
+                        break :found true;
+                    };
+                }
+                break :found false;
+            };
+            if (reused) {
+                miss.* = false;
+                continue;
+            }
+            miss.* = !(cache.cache.probeImmutableBlock(a, cache.scope, piece.ref.artifact_id, @intCast(piece.ref.byte_len), try stores.sha256DigestFromChecksum(piece.ref.checksum), cache.context) catch |err| {
+                cache.context.ensureActive() catch return error.Canceled;
+                return err;
+            });
+        }
+        var first: usize = 0;
+        while (first < missing.len) {
+            if (!missing[first]) {
+                first += 1;
+                continue;
+            }
+            var end = first + 1;
+            while (end < missing.len and missing[end]) : (end += 1) {}
+            const start = self.pieces[first].pack_offset;
+            const last = self.pieces[end - 1];
+            const length: usize = @intCast(last.pack_offset + last.ref.byte_len - start);
+            const bytes = self.store.getRangeAllocWithCancellationUsingAllocator(a, self.pack.artifact_id, start, length, self.cancellation) catch |err| {
+                try self.cancellation.check();
+                cache.context.ensureActive() catch return error.Canceled;
+                if (err == error.OutOfMemory) return err;
+                for (self.pieces[first..end]) |piece| try units.append(a, .{ .offset = piece.pack_offset, .length = piece.ref.byte_len, .result = err });
+                first = end;
+                continue;
+            };
+            cache.cache.recordPhysicalRead(bytes.len);
+            for (self.pieces[first..end]) |piece| {
+                const offset: usize = @intCast(piece.pack_offset - start);
+                const value: anyerror!ServingCache.VerifiedBytes = if (bytes.len != length) error.ArtifactIntegrityMismatch else ServingCache.VerifiedBytes.authenticate(bytes[offset..][0..@intCast(piece.ref.byte_len)], try stores.sha256DigestFromChecksum(piece.ref.checksum));
+                try units.append(a, .{ .offset = piece.pack_offset, .length = piece.ref.byte_len, .result = value });
+            }
+            first = end;
+        }
+        const result = try a.create(PhysicalResult);
+        result.* = .{ .start = self.start, .end = self.start + self.length, .units = units.items };
+        item.payload = .{ .extension = result };
+    }
+    const PhysicalLoader = struct {
+        group: *CoalescedRead,
+        cached: artifacts.CachedRead,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            self.group.cancellation.check() catch return true;
+            self.cached.context.ensureActive() catch return true;
+            return false;
+        }
+    };
+    fn remainingCoverage(self: *const @This(), domain: [32]u8) Decoded.Cache.Coverage {
+        const end = self.start + self.length;
+        var begin = self.start;
+        while (begin < end) {
+            var covered = begin;
+            for (self.reused.items) |lease| {
+                const result: *const PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
+                if (result.start <= begin) covered = @max(covered, @min(end, result.end));
+            }
+            if (covered != begin) {
+                begin = covered;
+                continue;
+            }
+            var finish = end;
+            for (self.reused.items) |lease| {
+                const result: *const PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
+                if (result.start > begin) finish = @min(finish, result.start);
+            }
+            return .{ .domain = domain, .start = begin, .end = finish, .overlap = true };
+        }
+        // All intervals have been composed. Build our final immutable result
+        // without joining an already consumed partial interval again.
+        return .{ .domain = domain, .start = self.start, .end = end };
+    }
+    fn verifiedLease(self: *@This(), a: A, piece: Piece, cache: artifacts.CachedRead) !ServingCache.VerifiedLease {
+        // One pack-scoped flight, acquired without waiting on other unit
+        // flights. Its owned result contains only verified cold runs.
+        if (self.shared) |lease| {
+            const result: *PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
+            if (try result.get(piece)) |value| return PhysicalPin.retain(lease, value);
+            try self.reused.append(self.a, lease);
+            self.shared = null;
+        }
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("native-lake-physical-pack-flight-v1");
+        hash.update(&cache.scope);
+        hash.update(self.pack.artifact_id);
+        hash.update(self.pack.checksum);
+        const domain = hash.finalResult();
+        var interval: [16]u8 = undefined;
+        std.mem.writeInt(u64, interval[0..8], self.start, .little);
+        std.mem.writeInt(u64, interval[8..16], self.start + self.length, .little);
+        var ranged = std.crypto.hash.sha2.Sha256.init(.{});
+        ranged.update(&domain);
+        ranged.update(&interval);
+        var loader: PhysicalLoader = .{ .group = self, .cached = cache };
+        var flight_context = cache.context;
+        // Publish request-authority failures as cancellation so a live
+        // waiter retries under its own capability instead of inheriting a
+        // leader's expired reader lease. Restore our exact error below.
+        flight_context.checkpoint = null;
+        flight_context.cancellation = .fromCallback(&loader, PhysicalLoader.canceled);
+        while (true) {
+            try self.cancellation.check();
+            const lease = if (cache.context.io != null)
+                cache.cache.physical.acquireCovered(ranged.finalResult(), pack_bytes * 3, flight_context, .{ .ptr = &loader, .load = loadPhysical }, self.remainingCoverage(domain)) catch |err| {
+                    try cache.context.ensureActive();
+                    try self.cancellation.check();
+                    return err;
+                }
+            else inline_load: {
+                const value = try cache.cache.physical.create(pack_bytes * 3);
+                errdefer value.release();
+                try loadPhysical(&loader, value.item);
+                break :inline_load value;
+            };
+            var owns_lease = true;
+            defer if (owns_lease) lease.release();
+            const result: *PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
+            if (result.start > self.start or result.end < self.start + self.length) {
+                try self.reused.append(self.a, lease);
+                owns_lease = false;
+                continue;
+            }
+            if (try result.get(piece)) |value| {
+                self.shared = lease;
+                owns_lease = false;
+                return PhysicalPin.retain(lease, value);
+            }
+            // Residency can change while a flight is planned. Recheck before
+            // falling back to a direct unit read.
+            if (try cache.cache.lookupImmutableBlockLease(a, cache.scope, piece.ref.artifact_id, @intCast(piece.ref.byte_len), try stores.sha256DigestFromChecksum(piece.ref.checksum), cache.context)) |warm| {
+                const owner: PhysicalWarm = .{ .lease = warm };
+                return try owner.retain(try stores.sha256DigestFromChecksum(piece.ref.checksum));
+            }
+            // A concurrent flight may cover a different requested subset,
+            // or this unit became warm while its leader was being planned.
+            // A single-unit direct fallback cannot form a flight cycle.
+            const bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(a, self.pack.artifact_id, piece.pack_offset, @intCast(piece.ref.byte_len), self.cancellation);
+            cache.cache.recordPhysicalRead(bytes.len);
+            errdefer a.free(bytes);
+            const value = try ServingCache.VerifiedBytes.authenticate(bytes, try stores.sha256DigestFromChecksum(piece.ref.checksum));
+            return .{ .value = value, .owner = .{ .bytes = bytes, .owner = .{ .allocation = a } } };
+        }
+    }
+    fn range(self: *@This(), a: A, piece: Piece) ![]u8 {
+        if (self.bytes == null) {
+            self.bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(self.a, self.pack.artifact_id, self.start, self.length, self.cancellation);
+            if (self.bytes.?.len != self.length) return error.ArtifactIntegrityMismatch;
+        }
+        const offset: usize = @intCast(piece.pack_offset - self.start);
+        return a.dupe(u8, self.bytes.?[offset..][0..@intCast(piece.ref.byte_len)]);
+    }
+};
 fn readPieceLease(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
+    return readPieceLeaseCoalesced(a, store, piece, cancellation, cached, null);
+}
+fn readPieceLeaseCoalesced(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead, coalesced: ?*CoalescedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
     if (piece.pack == null) return artifacts.readArtifactLease(a, store, piece.ref, cancellation, cached);
     const Loader = struct {
         store: stores.ArtifactStore,
         piece: Piece,
         cancellation: Cancellation,
+        coalesced: ?*CoalescedRead,
+        cached: ?artifacts.CachedRead,
+        traffic: local.serverless_query_lake_serving_cache.Cache.ProviderRead = .{ .requests = 0, .bytes = 0 },
+        fn providerRead(raw: *anyopaque) local.serverless_query_lake_serving_cache.Cache.ProviderRead {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.traffic;
+        }
         fn load(raw: *anyopaque, alloc: A) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             var source = self.store;
-            const bytes = try source.getRangeAllocWithCancellationUsingAllocator(alloc, self.piece.pack.?.artifact_id, self.piece.pack_offset, @intCast(self.piece.ref.byte_len), self.cancellation);
+            self.traffic = if (self.coalesced) |group| if (group.bytes == null) .{ .requests = 1, .bytes = group.length } else .{ .requests = 0, .bytes = 0 } else .{ .requests = 1, .bytes = self.piece.ref.byte_len };
+            if (self.coalesced != null and self.cached != null) self.traffic = .{ .requests = 0, .bytes = 0 };
+            const bytes = if (self.coalesced) |group| try group.range(alloc, self.piece) else try source.getRangeAllocWithCancellationUsingAllocator(alloc, self.piece.pack.?.artifact_id, self.piece.pack_offset, @intCast(self.piece.ref.byte_len), self.cancellation);
             errdefer alloc.free(bytes);
             if (bytes.len != self.piece.ref.byte_len) return error.ArtifactIntegrityMismatch;
             var digest: [32]u8 = undefined;
@@ -153,8 +410,20 @@ fn readPieceLease(a: A, store: stores.ArtifactStore, piece: Piece, cancellation:
         }
     };
     try cancellation.check();
-    var loader: Loader = .{ .store = store, .piece = piece, .cancellation = cancellation };
-    if (cached) |cache| return cache.cache.readImmutableBlockLease(a, cache.scope, piece.ref.artifact_id, @intCast(piece.ref.byte_len), try stores.sha256DigestFromChecksum(piece.ref.checksum), cache.context, .{ .ptr = &loader, .load = Loader.load });
+    if (cached) |cache| {
+        const length: usize = @intCast(piece.ref.byte_len);
+        const digest = try stores.sha256DigestFromChecksum(piece.ref.checksum);
+        if (try cache.cache.lookupImmutableBlockLease(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context)) |lease| return lease;
+        const verified = if (coalesced) |group| try group.verifiedLease(a, piece, cache) else direct: {
+            var provider = store;
+            const bytes = try provider.getRangeAllocWithCancellationUsingAllocator(a, piece.pack.?.artifact_id, piece.pack_offset, length, cancellation);
+            errdefer a.free(bytes);
+            cache.cache.recordPhysicalRead(bytes.len);
+            break :direct ServingCache.VerifiedLease{ .value = try ServingCache.VerifiedBytes.authenticate(bytes, digest), .owner = .{ .bytes = bytes, .owner = .{ .allocation = a } } };
+        };
+        return cache.cache.admitVerifiedBlock(a, cache.scope, piece.ref.artifact_id, length, digest, cache.context, verified);
+    }
+    var loader: Loader = .{ .store = store, .piece = piece, .cancellation = cancellation, .coalesced = coalesced, .cached = cached };
     return .{ .heap = .{ .alloc = a, .bytes = try Loader.load(&loader, a) } };
 }
 const Owner = struct {
@@ -191,6 +460,7 @@ const Owner = struct {
         io: ?std.Io,
         pending: [4]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null),
         offsets: [4]?u64 = @splat(null),
+        lengths: [4]u64 = @splat(0),
         recent_pages: [4]?u64 = @splat(null),
         recent_cursor: usize = 0,
         cancelled: std.atomic.Value(bool) = .init(false),
@@ -207,20 +477,20 @@ const Owner = struct {
             if (self.capability.cache) |cache| cache.context.ensureActive() catch return true;
             return false;
         }
-        fn warm(self: *@This(), piece: Piece) anyerror!void {
+        fn warm(self: *@This(), pieces: []const Piece) anyerror!void {
             try self.capability.check();
             const token: Cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
             var cached = self.capability.cache;
             if (cached) |*cache| cache.context.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
-            if (cached) |cache| if (piece.pack) |pack| {
-                if (try cache.cache.pinImmutableBlock(std.heap.page_allocator, cache.scope, pack.artifact_id, @intCast(pack.byte_len), try stores.sha256DigestFromChecksum(pack.checksum), cache.context)) |value| {
-                    var lease = value;
-                    lease.deinit();
-                    return;
-                }
-            };
-            var lease = try readPieceLease(std.heap.page_allocator, self.capability.store, piece, token, cached);
-            defer lease.deinit();
+            const first = pieces[0];
+            const last = pieces[pieces.len - 1];
+            var group: ?CoalescedRead = if (first.pack != null) .{ .store = self.capability.store, .pack = first.pack.?, .start = first.pack_offset, .length = last.offset + @as(usize, @intCast(last.ref.byte_len)) - first.offset, .logical_end = last.offset + @as(usize, @intCast(last.ref.byte_len)), .cancellation = token, .a = std.heap.page_allocator, .pieces = pieces } else null;
+            defer if (group) |*value| value.deinit();
+            for (pieces) |piece| {
+                try self.capability.check();
+                var lease = try readPieceLeaseCoalesced(std.heap.page_allocator, self.capability.store, piece, token, cached, if (group) |*value| value else null);
+                lease.deinit();
+            }
         }
         fn drain(self: *@This(), cancel: bool) void {
             if (cancel) self.cancelled.store(true, .release);
@@ -263,24 +533,34 @@ const Owner = struct {
             while (offset < start + length and count < self.pending.len) : (count += 1) {
                 const metadata = containing(self.owner.directory.metadata, @intCast(offset));
                 const block = if (metadata == null) containing(self.owner.directory.blocks, @intCast(offset)) else null;
-                var piece = if (metadata) |i| self.owner.directory.metadata[i] else if (block) |i| self.owner.directory.blocks[i] else return;
-                if (piece.pack) |pack| {
-                    if (offset == piece.offset and piece.pack_offset == 0 and pack.byte_len <= start + length - offset and self.owner.completePack(piece.offset, pack))
-                        piece = .{ .offset = piece.offset, .ref = pack, .pack = pack };
-                }
-                offset = piece.offset + piece.ref.byte_len;
+                const piece = if (metadata) |i| self.owner.directory.metadata[i] else if (block) |i| self.owner.directory.blocks[i] else return;
+                var pieces: []const Piece = if (metadata) |i| self.owner.directory.metadata[i..][0..1] else self.owner.directory.blocks[block.?..][0..1];
+                if (block) |i| if (piece.pack) |pack| {
+                    var end = i + 1;
+                    var finish = piece.offset + piece.ref.byte_len;
+                    while (end < self.owner.directory.blocks.len) : (end += 1) {
+                        const next = self.owner.directory.blocks[end];
+                        if (next.offset != finish or next.offset >= start + length or next.pack == null or !std.mem.eql(u8, next.pack.?.artifact_id, pack.artifact_id) or next.pack_offset != piece.pack_offset + finish - piece.offset) break;
+                        finish += next.ref.byte_len;
+                    }
+                    pieces = self.owner.directory.blocks[i..end];
+                };
+                const last = pieces[pieces.len - 1];
+                offset = last.offset + last.ref.byte_len;
                 // Legacy v1 artifacts can be large; keep speculative bytes bounded.
                 if (piece.ref.byte_len > pack_bytes) continue;
                 // Most native chunks share a page: do not spawn a worker for
                 // every small decoder read of an already consumed page.
                 var duplicate = false;
-                for (self.recent_pages) |page| if (page == piece.offset / block_bytes) {
+                for (self.recent_pages) |page| if (pieces.len == 1 and page == piece.offset / block_bytes) {
                     duplicate = true;
                     break;
                 };
-                for (self.offsets) |prior| if (prior == piece.offset) {
-                    duplicate = true;
-                    break;
+                for (self.offsets, self.lengths) |prior, span| if (prior) |position| {
+                    if (position <= piece.offset and offset <= position + span) {
+                        duplicate = true;
+                        break;
+                    }
                 };
                 if (duplicate) continue;
                 var slot: usize = 0;
@@ -288,16 +568,16 @@ const Owner = struct {
                 // A full speculative queue yields instead of stalling WAND
                 // on an unvisited range. Required reads recycle consumed slots.
                 if (slot == self.pending.len) return;
-                self.pending[slot] = local.sql_parallel_scheduler.global().submitTransient(io, @intCast(piece.ref.byte_len * 2), warm, .{ self, piece }) orelse return;
+                self.pending[slot] = local.sql_parallel_scheduler.global().submitTransient(io, @as(usize, @intCast(offset - piece.offset)) * 2, warm, .{ self, pieces }) orelse return;
                 self.offsets[slot] = piece.offset;
+                self.lengths[slot] = offset - piece.offset;
             }
         }
         fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.cancelled.load(.acquire)) return error.Canceled;
-            // Four independent authenticated units/packs, at most 4 MiB of
-            // source bytes. Required reads share the same singleflight key.
-            if (out.len > block_bytes) prefetch(raw, offset, out.len);
+            // Required broad reads coalesce ranges themselves; speculative
+            // per-page GETs would duplicate that provider request.
             try self.owner.read(self.capability.*, offset, out);
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
@@ -312,13 +592,10 @@ const Owner = struct {
                     self.rememberPage(page);
                 }
             }
-            if (self.capability.context.io) |io| for (&self.pending, &self.offsets) |*slot, *start| {
-                if (start.*) |position| if (position < offset + out.len and position + block_bytes > offset) {
-                    if (slot.*) |*task| task.await(io) catch {};
-                    slot.* = null;
-                    start.* = null;
-                };
-            };
+            // A required cache hit must never join a larger speculative span.
+            // Completed work can be recycled now; live work stays owned by
+            // the query and is canceled/joined by quiesce before capability exit.
+            if (self.capability.context.io) |io| self.reap(io);
             try self.capability.check();
         }
         fn quiesce(raw: *anyopaque) void {
@@ -356,56 +633,71 @@ const Owner = struct {
     fn read(self: *@This(), capability: Read, start: u64, out: []u8) !void {
         try capability.check();
         if (start > self.directory.bytes or out.len > self.directory.bytes - start) return error.InvalidNativeLakeTextCorpus;
+        const io = capability.context.io orelse return self.readSerial(capability, start, out);
+        if (out.len <= pack_bytes) return self.readSerial(capability, start, out);
+        var tasks: [3]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
+        defer for (&tasks) |*task| if (task.*) |*active| {
+            active.await(io) catch {};
+        };
+        var done: usize = 0;
+        while (done < out.len) {
+            for (0..4) |lane| {
+                if (done == out.len) break;
+                const position: usize = @intCast(start + done);
+                const index = containing(self.directory.blocks, position) orelse {
+                    try self.readSerial(capability, start + done, out[done..]);
+                    done = out.len;
+                    break;
+                };
+                const piece = self.directory.blocks[index];
+                const finish: usize = if (piece.pack) |pack| piece.offset + @as(usize, @intCast(pack.byte_len - piece.pack_offset)) else piece.offset + @as(usize, @intCast(piece.ref.byte_len));
+                const take = @min(out.len - done, finish - position);
+                const target = out[done..][0..take];
+                if (lane < tasks.len) {
+                    tasks[lane] = local.sql_parallel_scheduler.global().submit(io, pack_bytes * 3, readSerial, .{ self, capability, start + done, target });
+                    if (tasks[lane] == null) try self.readSerial(capability, start + done, target);
+                } else try self.readSerial(capability, start + done, target);
+                done += take;
+            }
+            var failure: ?anyerror = null;
+            for (&tasks) |*task| if (task.*) |*active| {
+                active.await(io) catch |err| {
+                    failure = failure orelse err;
+                };
+                task.* = null;
+            };
+            if (failure) |err| return err;
+        }
+        try capability.check();
+    }
+    fn readSerial(self: *@This(), capability: Read, start: u64, out: []u8) anyerror!void {
+        try capability.check();
+        if (start > self.directory.bytes or out.len > self.directory.bytes - start) return error.InvalidNativeLakeTextCorpus;
         var offset: usize = @intCast(start);
         var done: usize = 0;
+        var group: ?CoalescedRead = null;
+        defer if (group) |*value| value.deinit();
         while (done < out.len) {
             try capability.check();
             const metadata = containing(self.directory.metadata, offset);
             const block = if (metadata == null) containing(self.directory.blocks, offset) else null;
             const piece = if (metadata) |index| self.directory.metadata[index] else if (block) |index| self.directory.blocks[index] else return error.InvalidNativeLakeTextCorpus;
-            if (piece.pack) |pack| {
-                // Reuse a broad read for later sparse reads without another
-                // allocation or GET. A cold sparse read never fetches a pack.
-                var pack_lease: ?local.serverless_query_lake_serving_cache.Cache.ImmutableLease = if (capability.cache) |cached|
-                    try cached.cache.pinImmutableBlock(self.a, cached.scope, pack.artifact_id, @intCast(pack.byte_len), try stores.sha256DigestFromChecksum(pack.checksum), cached.context)
-                else
-                    null;
-                const complete = offset == piece.offset and piece.pack_offset == 0 and pack.byte_len <= out.len - done and self.completePack(piece.offset, pack);
-                if (pack_lease == null and complete) pack_lease = try readPieceLease(self.a, capability.store, .{ .offset = piece.offset, .ref = pack, .pack = pack }, capability.cancellation, capability.cache);
-                if (pack_lease) |*lease| {
-                    defer lease.deinit();
-                    const data = lease.bytes();
-                    const take = if (complete) @as(usize, @intCast(pack.byte_len)) else @min(out.len - done, @as(usize, @intCast(piece.ref.byte_len)) - (offset - piece.offset));
-                    // The root authenticates both pack and per-unit digests.
-                    // Do not let a broad read bypass a malformed unit proof.
-                    var position = piece.offset;
-                    while (position < offset + take) {
-                        const m = containing(self.directory.metadata, position);
-                        const b = if (m == null) containing(self.directory.blocks, position) else null;
-                        const unit = if (m) |i| self.directory.metadata[i] else if (b) |i| self.directory.blocks[i] else return error.InvalidNativeLakeTextCorpus;
-                        const first: usize = @intCast(unit.pack_offset);
-                        const length: usize = @intCast(unit.ref.byte_len);
-                        if (first > data.len or length > data.len - first) return error.InvalidNativeLakeTextCorpus;
-                        var digest: [32]u8 = undefined;
-                        std.crypto.hash.sha2.Sha256.hash(data[first..][0..length], &digest, .{});
-                        if (!std.mem.eql(u8, &digest, &(try stores.sha256DigestFromChecksum(unit.ref.checksum)))) return error.ArtifactIntegrityMismatch;
-                        try capability.check();
-                        if (b) |i| {
-                            @import("antfly_platform").sync.lockYielding(&self.mutex);
-                            self.loaded[i] = true;
-                            self.mutex.unlock();
-                        }
-                        position += length;
+            if (group == null or offset >= group.?.logical_end) {
+                if (group) |*value| value.deinit();
+                group = null;
+                if (block) |index| if (piece.pack) |pack| {
+                    var length: usize = @intCast(piece.ref.byte_len);
+                    var next = index + 1;
+                    const requested_end = @as(usize, @intCast(start)) + out.len;
+                    while (next < self.directory.blocks.len) : (next += 1) {
+                        const following = self.directory.blocks[next];
+                        if (following.offset != piece.offset + length or following.offset >= requested_end or following.pack == null or !std.mem.eql(u8, following.pack.?.artifact_id, pack.artifact_id) or following.pack_offset != piece.pack_offset + length) break;
+                        length += @intCast(following.ref.byte_len);
                     }
-                    const within: usize = @intCast(piece.pack_offset + offset - piece.offset);
-                    if (within > data.len or take > data.len - within) return error.InvalidNativeLakeTextCorpus;
-                    @memcpy(out[done..][0..take], data[within..][0..take]);
-                    offset += take;
-                    done += take;
-                    continue;
-                }
+                    group = .{ .store = capability.store, .pack = pack, .start = piece.pack_offset, .length = length, .logical_end = piece.offset + length, .cancellation = capability.cancellation, .a = std.heap.page_allocator, .pieces = self.directory.blocks[index..next] };
+                };
             }
-            var lease = try readPieceLease(self.a, capability.store, piece, capability.cancellation, capability.cache);
+            var lease = try readPieceLeaseCoalesced(std.heap.page_allocator, capability.store, piece, capability.cancellation, capability.cache, if (group) |*value| value else null);
             defer lease.deinit();
             const data = lease.bytes();
             try capability.check();
@@ -712,7 +1004,7 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     var source = try Owner.bind(owner, a, &capability);
     var open = true;
     defer if (open) source.close();
-    source.prefetch(0, bytes.len);
+    source.prefetch(0, block_bytes * 4);
     const query: *Owner.Query = @ptrCast(@alignCast(source.ranges.ptr));
     // WAND can skip every hinted page. Completed tasks must not permanently
     // occupy the four slots even when no required read overlaps them.
@@ -721,11 +1013,49 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     };
     source.prefetch(block_bytes * 16, block_bytes);
     query.drain(false);
-    try std.testing.expectEqual(@as(u64, 5), cache.stats.provider_reads);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats.provider_reads);
     var sample: [1]u8 = undefined;
     try source.readInto(block_bytes * 3, &sample);
     try std.testing.expectEqual(@as(u8, 3), sample[0]);
-    try std.testing.expectEqual(@as(u64, 5), cache.stats.provider_reads);
+    try std.testing.expectEqual(@as(u64, 2), cache.stats.provider_reads);
+    // A warm required unit returns while a larger overlapping speculative
+    // task is gated. This catches accidental joining of the whole pack.
+    const Gated = struct {
+        started: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        read_done: std.Io.Event = .unset,
+        fn speculate(self: *@This()) anyerror!void {
+            self.started.set(std.testing.io);
+            try self.release.wait(std.testing.io);
+        }
+        fn required(self: *@This(), input: *local.index.SegmentSource) !void {
+            defer self.read_done.set(std.testing.io);
+            var out: [1]u8 = undefined;
+            try input.readInto(block_bytes * 3, &out);
+            try std.testing.expectEqual(@as(u8, 3), out[0]);
+        }
+    };
+    var gated: Gated = .{};
+    defer gated.release.set(std.testing.io);
+    query.pending[0] = local.sql_parallel_scheduler.global().submitTransient(std.testing.io, pack_bytes, Gated.speculate, .{&gated}) orelse return error.TestUnexpectedResult;
+    query.offsets[0] = 0;
+    query.lengths[0] = pack_bytes;
+    try gated.started.wait(std.testing.io);
+    var required = try std.testing.io.concurrent(Gated.required, .{ &gated, &source });
+    var required_open = true;
+    defer {
+        gated.release.set(std.testing.io);
+        if (required_open) _ = required.cancel(std.testing.io) catch {};
+    }
+    const ready = gated.read_done.waitTimeout(std.testing.io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(250) } });
+    const remained_speculative = query.pending[0] != null;
+    gated.release.set(std.testing.io);
+    const completed = required.await(std.testing.io);
+    required_open = false;
+    try completed;
+    try ready;
+    try std.testing.expect(remained_speculative);
+    query.drain(false);
     // Speculative failures remain invisible until that block is required.
     const Denied = struct {
         fn stat(_: *anyopaque, _: A, _: []const u8) !stores.ArtifactMetadata {
@@ -764,7 +1094,7 @@ test "external lake packed text ranges reduce requests and authenticate sparse r
     store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
     const bytes = try a.alloc(u8, pack_bytes);
     defer a.free(bytes);
-    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / 1024);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / block_bytes);
     const ref = try publish(a, a, &store, bytes, .none);
     defer a.free(ref.artifact_id);
     defer a.free(ref.checksum);
@@ -772,8 +1102,8 @@ test "external lake packed text ranges reduce requests and authenticate sparse r
     var source = data.native;
     defer source.close();
     const owner: *Owner = @ptrCast(@alignCast(source.ranges.ptr));
-    try std.testing.expectEqual(@as(u16, 3), owner.directory.version);
-    try std.testing.expectEqual(@as(usize, 4), owner.directory.blocks.len);
+    try std.testing.expectEqual(@as(u16, 4), owner.directory.version);
+    try std.testing.expectEqual(@as(usize, 16), owner.directory.blocks.len);
     for (owner.directory.blocks) |piece| try std.testing.expectEqualStrings(owner.directory.blocks[0].pack.?.artifact_id, piece.retainedArtifact().artifact_id);
     const Observed = struct {
         var reads: usize = 0;
@@ -805,6 +1135,38 @@ test "external lake packed text ranges reduce requests and authenticate sparse r
     Observed.transferred = 0;
     try owner.read(.{ .store = observed, .cache = null, .context = .{}, .cancellation = .none }, block_bytes + 17, &sample);
     try std.testing.expectEqual(@as(usize, block_bytes), Observed.transferred);
+    // Warm grouped reads must not issue a pack GET, and denied admission
+    // must still serve through the same bounded coalesced provider read.
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    const cached_read: Read = .{ .store = observed, .cache = .{ .cache = &cache, .scope = @splat(2), .context = .{ .io = std.testing.io } }, .context = .{}, .cancellation = .none };
+    Observed.reads = 0;
+    try owner.read(cached_read, 0, output);
+    try std.testing.expectEqual(@as(usize, 1), Observed.reads);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats.provider_reads);
+    try std.testing.expectEqual(@as(u64, pack_bytes), cache.stats.provider_bytes);
+    try owner.read(cached_read, 0, output);
+    try std.testing.expectEqual(@as(usize, 1), Observed.reads);
+    // Fifteen resident units must not be downloaded to fill one missing unit.
+    for (0..2) |mode| {
+        var partial = cached_read;
+        partial.cache.?.scope = @splat(@as(u8, @intCast(4 + mode)));
+        if (mode == 1) partial.cache.?.context.io = null;
+        for (0..15) |i| try owner.read(partial, i * block_bytes, &sample);
+        Observed.reads = 0;
+        Observed.transferred = 0;
+        try owner.read(partial, 0, output);
+        try std.testing.expectEqual(@as(usize, 1), Observed.reads);
+        try std.testing.expectEqual(@as(usize, block_bytes), Observed.transferred);
+        try std.testing.expectEqualSlices(u8, bytes, output);
+    }
+    cache.max_entries = 0;
+    var denied = cached_read;
+    denied.cache.?.scope = @splat(3);
+    Observed.reads = 0;
+    try owner.read(denied, 0, output);
+    try std.testing.expectEqual(@as(usize, 1), Observed.reads);
+    try std.testing.expectEqualSlices(u8, bytes, output);
     Observed.corrupt = true;
     defer Observed.corrupt = false;
     try std.testing.expectError(error.ArtifactIntegrityMismatch, owner.read(.{ .store = observed, .cache = null, .context = .{}, .cancellation = .none }, 0, &sample));
@@ -814,10 +1176,10 @@ test "external lake packed text ranges reduce requests and authenticate sparse r
     const cache_root = try std.fs.path.join(a, &.{ directory.path(), "range-cache" });
     defer a.free(cache_root);
     {
-        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
-        defer cache.deinit();
-        try cache.ensurePersistent(io_impl.io(), cache_root, .{}, .{});
-        const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(4), .context = .{ .io = io_impl.io() } };
+        var restart_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer restart_cache.deinit();
+        try restart_cache.ensurePersistent(io_impl.io(), cache_root, .{}, .{});
+        const cached: artifacts.CachedRead = .{ .cache = &restart_cache, .scope = @splat(4), .context = .{ .io = io_impl.io() } };
         Observed.reads = 0;
         try owner.read(.{ .store = observed, .cache = cached, .context = cached.context, .cancellation = .none }, 0, output);
         try std.testing.expectEqual(@as(usize, 1), Observed.reads);
@@ -825,17 +1187,17 @@ test "external lake packed text ranges reduce requests and authenticate sparse r
         try std.testing.expectEqual(@as(usize, 1), Observed.reads);
     }
     {
-        var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
-        defer cache.deinit();
-        try cache.ensurePersistent(io_impl.io(), cache_root, .{}, .{});
-        const cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(4), .context = .{ .io = io_impl.io() } };
+        var restart_cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+        defer restart_cache.deinit();
+        try restart_cache.ensurePersistent(io_impl.io(), cache_root, .{}, .{});
+        const cached: artifacts.CachedRead = .{ .cache = &restart_cache, .scope = @splat(4), .context = .{ .io = io_impl.io() } };
         Observed.reads = 0;
         Observed.transferred = 0;
         try owner.read(.{ .store = observed, .cache = cached, .context = cached.context, .cancellation = .none }, block_bytes * 2 + 17, &sample);
         try std.testing.expectEqual(bytes[block_bytes * 2 + 17], sample[0]);
         try std.testing.expectEqual(@as(usize, 0), Observed.reads);
         try std.testing.expectEqual(@as(usize, 0), Observed.transferred);
-        try std.testing.expect(cache.snapshot().disk_hits > 0);
+        try std.testing.expect(restart_cache.snapshot().disk_hits > 0);
         try std.testing.expectError(error.DeadlineExceeded, owner.read(.{ .store = observed, .cache = cached, .context = .{ .deadline_ns = 0 }, .cancellation = .none }, 0, &sample));
     }
     var invalid = owner.directory.blocks[0];
@@ -876,4 +1238,268 @@ test "external lake packed readers retain legacy directory compatibility and res
     try cache.readInto(0, &sample);
     try std.testing.expectEqualStrings("legacy", &sample);
     try std.testing.expectEqual(@as(usize, 0), cache.retainedBytes());
+}
+
+test "external lake physical pack flights share different unit leaders without residency and isolate cancellation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("packed-flight-sharing");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(9), 1, io);
+    const bytes = try a.alloc(u8, pack_bytes);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / block_bytes);
+    const ref = try publish(a, a, &store, bytes, .none);
+    defer a.free(ref.artifact_id);
+    defer a.free(ref.checksum);
+    const data = try load(a, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, ref);
+    var source = data.native;
+    defer source.close();
+    const owner: *Owner = @ptrCast(@alignCast(source.ranges.ptr));
+    const Provider = struct {
+        base: stores.ArtifactStore,
+        started: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        corrupt_first: bool = false,
+        fn range(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, len: usize, cancellation: Cancellation) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            self.started.set(std.testing.io);
+            try self.release.wait(std.testing.io);
+            const result = try self.base.getRangeAllocWithCancellationUsingAllocator(alloc, id, offset, len, cancellation);
+            if (self.corrupt_first and offset == 0 and result.len != 0) result[0] ^= 1;
+            return result;
+        }
+    };
+    var provider: Provider = .{ .base = store };
+    var vtable = store.vtable.*;
+    vtable.get_range_alloc_with_cancellation = Provider.range;
+    var observed = store;
+    observed.ptr = &provider;
+    observed.vtable = &vtable;
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    cache.max_entries = 0;
+    var read: Read = .{ .store = observed, .cache = .{ .cache = &cache, .scope = @splat(7), .context = .{ .io = io } }, .context = .{ .io = io }, .cancellation = .none };
+    const output = try a.alloc(u8, bytes.len);
+    defer a.free(output);
+    const other = try a.alloc(u8, bytes.len - block_bytes);
+    defer a.free(other);
+    var leader = try io.concurrent(Owner.read, .{ owner, read, @as(u64, 0), output });
+    var leader_open = true;
+    defer if (leader_open) {
+        provider.release.set(io);
+        leader.cancel(io) catch {};
+    };
+    try provider.started.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+    const Cancel = struct {
+        flag: std.atomic.Value(bool) = .init(false),
+        fn check(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.flag.load(.acquire);
+        }
+    };
+    var cancel: Cancel = .{};
+    read.cache.?.context.cancellation = .fromCallback(&cancel, Cancel.check);
+    var waiter = try io.concurrent(Owner.read, .{ owner, read, @as(u64, block_bytes), other });
+    var waiter_open = true;
+    defer if (waiter_open) {
+        provider.release.set(io);
+        waiter.cancel(io) catch {};
+    };
+    const Wait = struct {
+        fn shared(cache_: *local.serverless_query_lake_serving_cache.Cache) !void {
+            for (0..500) |_| {
+                @import("antfly_platform").sync.lockYielding(&cache_.physical.mutex);
+                var values = cache_.physical.flights.valueIterator();
+                const joined = if (values.next()) |flight| flight.*.refs > 1 else false;
+                cache_.physical.mutex.unlock();
+                if (joined) return;
+                try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+            }
+            return error.TestPhysicalFlightDidNotJoin;
+        }
+    };
+    try Wait.shared(&cache);
+    cancel.flag.store(true, .release);
+    const canceled_result = waiter.await(io);
+    waiter_open = false;
+    try std.testing.expectError(error.Canceled, canceled_result);
+    read.cache.?.context.cancellation = null;
+    var live = try io.concurrent(Owner.read, .{ owner, read, @as(u64, block_bytes), other });
+    var live_open = true;
+    defer if (live_open) {
+        provider.release.set(io);
+        live.cancel(io) catch {};
+    };
+    try Wait.shared(&cache);
+    provider.release.set(io);
+    const leader_result = leader.await(io);
+    leader_open = false;
+    try leader_result;
+    const live_result = live.await(io);
+    live_open = false;
+    try live_result;
+    try std.testing.expectEqualSlices(u8, bytes, output);
+    try std.testing.expectEqualSlices(u8, bytes[block_bytes..], other);
+    try std.testing.expectEqual(@as(usize, 1), provider.calls.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), cache.snapshot().provider_reads);
+    try std.testing.expectEqual(@as(usize, 0), cache.physical.bytes);
+    try std.testing.expectEqual(@as(usize, 0), cache.physical.flights.count());
+    const Expired = struct {
+        flag: std.atomic.Value(bool) = .init(false),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.flag.load(.acquire)) return error.TestReaderLeaseExpired;
+        }
+    };
+    var expired: Expired = .{};
+    provider.started = .unset;
+    provider.release = .unset;
+    read.cache.?.context.checkpoint = .{ .ptr = &expired, .check = Expired.check };
+    leader = try io.concurrent(Owner.read, .{ owner, read, @as(u64, 0), output });
+    leader_open = true;
+    try provider.started.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
+    read.cache.?.context.checkpoint = null;
+    live = try io.concurrent(Owner.read, .{ owner, read, @as(u64, block_bytes), other });
+    live_open = true;
+    try Wait.shared(&cache);
+    expired.flag.store(true, .release);
+    provider.release.set(io);
+    const expired_result = leader.await(io);
+    leader_open = false;
+    try std.testing.expectError(error.TestReaderLeaseExpired, expired_result);
+    const retried_result = live.await(io);
+    live_open = false;
+    try retried_result;
+    try std.testing.expectEqualSlices(u8, bytes[block_bytes..], other);
+    try std.testing.expectEqual(@as(usize, 3), provider.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), cache.physical.flights.count());
+    // A broad leader records corrupt unit zero without poisoning a waiter
+    // that needs only the independently authenticated healthy unit one.
+    provider.started = .unset;
+    provider.release = .unset;
+    provider.corrupt_first = true;
+    leader = try io.concurrent(Owner.read, .{ owner, read, @as(u64, 0), output[0 .. block_bytes * 2] });
+    leader_open = true;
+    try provider.started.wait(io);
+    live = try io.concurrent(Owner.read, .{ owner, read, @as(u64, block_bytes), other[0..1] });
+    live_open = true;
+    try Wait.shared(&cache);
+    provider.release.set(io);
+    const corrupt_result = leader.await(io);
+    leader_open = false;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, corrupt_result);
+    const healthy_result = live.await(io);
+    live_open = false;
+    try healthy_result;
+    try std.testing.expectEqual(@as(u8, 1), other[0]);
+    try std.testing.expectEqual(@as(usize, 4), provider.calls.load(.acquire));
+    // Disjoint requests in one pack must enter the provider concurrently.
+    provider.started = .unset;
+    provider.release = .unset;
+    provider.corrupt_first = false;
+    leader = try io.concurrent(Owner.read, .{ owner, read, @as(u64, 0), output[0..1] });
+    leader_open = true;
+    try provider.started.wait(io);
+    live = try io.concurrent(Owner.read, .{ owner, read, @as(u64, block_bytes), other[0..1] });
+    live_open = true;
+    var overlapped = false;
+    for (0..500) |_| {
+        if (provider.calls.load(.acquire) == 6) {
+            overlapped = true;
+            break;
+        }
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    provider.release.set(io);
+    const first_disjoint = leader.await(io);
+    leader_open = false;
+    try first_disjoint;
+    const second_disjoint = live.await(io);
+    live_open = false;
+    try second_disjoint;
+    try std.testing.expect(overlapped);
+    try std.testing.expectEqual(@as(usize, 0), cache.physical.flights.count());
+    // Partially overlapping requests compose completed verified slices. The
+    // second reader downloads only its unclaimed tail, even with no residency.
+    provider.started = .unset;
+    provider.release = .unset;
+    const before_bytes = cache.snapshot().provider_bytes;
+    leader = try io.concurrent(Owner.read, .{ owner, read, @as(u64, 0), output[0 .. block_bytes * 2] });
+    leader_open = true;
+    try provider.started.wait(io);
+    live = try io.concurrent(Owner.read, .{ owner, read, @as(u64, block_bytes), other[0 .. block_bytes * 2] });
+    live_open = true;
+    try Wait.shared(&cache);
+    provider.release.set(io);
+    const overlap_leader = leader.await(io);
+    leader_open = false;
+    try overlap_leader;
+    const overlap_waiter = live.await(io);
+    live_open = false;
+    try overlap_waiter;
+    try std.testing.expectEqualSlices(u8, bytes[0 .. block_bytes * 2], output[0 .. block_bytes * 2]);
+    try std.testing.expectEqualSlices(u8, bytes[block_bytes .. block_bytes * 3], other[0 .. block_bytes * 2]);
+    try std.testing.expectEqual(@as(u64, block_bytes * 3), cache.snapshot().provider_bytes - before_bytes);
+    try std.testing.expectEqual(@as(usize, 8), provider.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), cache.physical.flights.count());
+}
+
+test "external lake required pack reads overlap and return every scheduler reservation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var directory = try local.common_test_directory.TestDirectory.init("packed-required-parallel");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(10), 1, io);
+    const bytes = try a.alloc(u8, pack_bytes * 4);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / block_bytes);
+    const ref = try publish(a, a, &store, bytes, .none);
+    defer a.free(ref.artifact_id);
+    defer a.free(ref.checksum);
+    const data = try load(a, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, ref);
+    var source = data.native;
+    defer source.close();
+    const owner: *Owner = @ptrCast(@alignCast(source.ranges.ptr));
+    const Provider = struct {
+        base: stores.ArtifactStore,
+        active: std.atomic.Value(usize) = .init(0),
+        peak: std.atomic.Value(usize) = .init(0),
+        fail: bool = false,
+        fn range(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, len: usize, cancellation: Cancellation) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const active = self.active.fetchAdd(1, .acq_rel) + 1;
+            defer _ = self.active.fetchSub(1, .acq_rel);
+            _ = self.peak.fetchMax(active, .monotonic);
+            try std.testing.io.sleep(.fromMilliseconds(15), .awake);
+            if (self.fail) return error.TestRemoteUnavailable;
+            return self.base.getRangeAllocWithCancellationUsingAllocator(alloc, id, offset, len, cancellation);
+        }
+    };
+    var provider: Provider = .{ .base = store };
+    var vtable = store.vtable.*;
+    vtable.get_range_alloc_with_cancellation = Provider.range;
+    var observed = store;
+    observed.ptr = &provider;
+    observed.vtable = &vtable;
+    const output = try a.alloc(u8, bytes.len);
+    defer a.free(output);
+    const read: Read = .{ .store = observed, .cache = null, .context = .{ .io = io }, .cancellation = .none };
+    try owner.read(read, 0, output);
+    try std.testing.expectEqualSlices(u8, bytes, output);
+    try std.testing.expect(provider.peak.load(.acquire) > 1);
+    try std.testing.expect(provider.peak.load(.acquire) <= 4);
+    provider.fail = true;
+    try std.testing.expectError(error.TestRemoteUnavailable, owner.read(read, 0, output));
+    try std.testing.expectEqual(@as(usize, 0), provider.active.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().workers);
+    try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().bytes);
 }

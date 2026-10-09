@@ -571,7 +571,10 @@ pub const SegmentEntry = struct {
     id: u64,
     data: SegmentData,
     reader: segment_mod.SegmentReader,
-    layout_stats: segment_mod.SegmentLayoutStats = .{},
+    // Range-backed readers compute diagnostics only when requested. Counting
+    // dictionary terms at admission would turn a sparse cold query into a
+    // scan of every term block in every segment.
+    layout_stats: ?segment_mod.SegmentLayoutStats = null,
     shared: *SegmentShared,
     // Query-bound native readers borrow the same physical segment pin but own
     // their decoder/navigation state and capability-bound source separately.
@@ -775,14 +778,24 @@ pub const SegmentEntry = struct {
     }
 
     pub fn layoutStats(self: *const SegmentEntry, detailed_inverted: bool) segment_mod.SegmentLayoutStats {
-        if (!detailed_inverted) return self.layout_stats;
+        if (!detailed_inverted) return self.layout_stats orelse self.reader.layoutStats();
         return self.reader.layoutStatsWithInvertedDetails(true);
+    }
+
+    fn admissionLayoutStats(data: SegmentData, reader: *const SegmentReader) ?segment_mod.SegmentLayoutStats {
+        if (data == .native and data.native == .ranges) return null;
+        return reader.layoutStats();
     }
 };
 
 pub const ReplacementSegmentData = struct {
     id: u64,
     data: SegmentData,
+    /// An admitted reader created from `data` with the writer allocator.
+    /// Preparation consumes and clears this reader even if it later fails;
+    /// data ownership still transfers only on publication. This lets remote
+    /// owners admit metadata in bounded parallel jobs before the writer lock.
+    prepared_reader: ?SegmentReader = null,
     /// Optional tombstones to install in the same snapshot publication as
     /// the replacement data. The caller retains ownership; IndexWriter clones
     /// the bitmap into the replacement SegmentShared cell.
@@ -2092,7 +2105,7 @@ pub const IndexWriter = struct {
             .id = seg_id,
             .data = data,
             .reader = reader,
-            .layout_stats = reader.layoutStats(),
+            .layout_stats = SegmentEntry.admissionLayoutStats(data, &reader),
             .shared = shared,
         };
 
@@ -2266,7 +2279,7 @@ pub const IndexWriter = struct {
             .id = seg_id,
             .data = owned.?,
             .reader = reader,
-            .layout_stats = reader.layoutStats(),
+            .layout_stats = SegmentEntry.admissionLayoutStats(owned.?, &reader),
             .shared = shared,
         };
 
@@ -2366,7 +2379,10 @@ pub const IndexWriter = struct {
         }
 
         for (replacements, 0..) |*replacement, i| {
-            replacement_readers[i] = try replacement.data.initReader(self.alloc);
+            replacement_readers[i] = if (replacement.prepared_reader) |reader| blk: {
+                replacement.prepared_reader = null;
+                break :blk reader;
+            } else try replacement.data.initReader(self.alloc);
             if (replacement.data == .owned_view) replacement_readers[i].postings_loader = replacement.data.owned_view.postings_loader;
             replacement_readers_initialized += 1;
         }
@@ -2435,7 +2451,7 @@ pub const IndexWriter = struct {
                 .id = replacement.id,
                 .data = replacement.data,
                 .reader = replacement_readers[i],
-                .layout_stats = replacement_readers[i].layoutStats(),
+                .layout_stats = SegmentEntry.admissionLayoutStats(replacement.data, &replacement_readers[i]),
                 .shared = shared,
             };
             cells_created += 1;
@@ -3924,4 +3940,79 @@ test "external lake scoring parallel lanes join before releasing query authority
     defer scheduler.mutex.unlock();
     try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
     try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+}
+
+test "external lake range segment admission defers dictionary diagnostics across replacements" {
+    const a = std.testing.allocator;
+    var text = inverted.InvertedIndexBuilder.init(a, .{});
+    defer text.deinit();
+    var segment_writer = segment_mod.SegmentWriter.init(a);
+    defer segment_writer.deinit();
+    for (0..16384) |doc| {
+        var term: [32]u8 = undefined;
+        try text.addDocument(@intCast(doc), &.{.{ .term = try std.fmt.bufPrint(&term, "term-{d:0>8}", .{doc}), .freq = 1, .positions = &.{0} }});
+        try segment_writer.addUnstoredDoc();
+    }
+    const section = try text.build();
+    defer a.free(section);
+    try segment_writer.addSection(try segment_writer.addField("body"), .inverted_text, section);
+    const bytes = try segment_writer.build();
+    defer a.free(bytes);
+    var contiguous = try SegmentReader.init(a, bytes);
+    defer contiguous.deinit();
+    const expected = contiguous.layoutStats();
+    const State = struct {
+        bytes: []const u8,
+        reads: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn data(self: *@This()) SegmentData {
+            return .fromNative(.{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close } });
+        }
+    };
+    var state = State{ .bytes = bytes };
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, state.data());
+    var entry = &writer.snapshot().segments[0];
+    // Opening must stay bounded independently of dictionary term/block count.
+    try std.testing.expect(state.reads < 32);
+    const admitted_reads = state.reads;
+    try std.testing.expectEqualDeep(expected, entry.layoutStats(false));
+    try std.testing.expect(state.reads > admitted_reads);
+    state.reads = 0;
+    var replacements = [_]ReplacementSegmentData{.{ .id = 2, .data = state.data() }};
+    try writer.replaceSegmentsManyData(&.{1}, &replacements);
+    entry = &writer.snapshot().segments[0];
+    try std.testing.expectEqual(@as(u64, 2), entry.id);
+    try std.testing.expect(state.reads < 32);
+    try std.testing.expectEqualDeep(expected, entry.layoutStats(false));
+    try std.testing.expectEqual(@as(u64, 16384), entry.layoutStats(false).inverted_term_count);
+    var admitted = [_]ReplacementSegmentData{.{ .id = 3, .data = state.data(), .prepared_reader = try state.data().initReader(a) }};
+    defer if (admitted[0].prepared_reader) |*reader| reader.deinit();
+    const before_adoption = state.reads;
+    try writer.replaceSegmentsManyData(&.{2}, &admitted);
+    try std.testing.expect(admitted[0].prepared_reader == null);
+    try std.testing.expectEqual(before_adoption, state.reads);
+    try std.testing.expectEqual(@as(u64, 3), writer.snapshot().segments[0].id);
+    // Fail after reader transfer but before allocating the replacement snapshot.
+    // Preparation owns reader cleanup; the unpublished data remains ours.
+    var unpublished = [_]ReplacementSegmentData{.{ .id = 4, .data = state.data(), .prepared_reader = try state.data().initReader(a) }};
+    defer unpublished[0].data.deinit(a);
+    defer if (unpublished[0].prepared_reader) |*reader| reader.deinit();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    writer.alloc = failing.allocator();
+    const attempted = writer.prepareSegmentsManyDataWithScratch(a, &.{3}, &unpublished);
+    writer.alloc = a;
+    if (attempted) |value| {
+        var unexpected = value;
+        unexpected.abort();
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+    try std.testing.expect(unpublished[0].prepared_reader == null);
+    try std.testing.expectEqual(@as(u64, 3), writer.snapshot().segments[0].id);
 }

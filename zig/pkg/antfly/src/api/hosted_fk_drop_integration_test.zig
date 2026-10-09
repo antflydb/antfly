@@ -145,9 +145,17 @@ fn awaitParentAcknowledged(alloc: std.mem.Allocator, io: std.Io, reader: @import
     var acknowledged_index: u64 = 0;
     var matching = false;
     while (platform.time.monotonicNs() < deadline) {
-        const lookup = reader.lookupGroupLocal(alloc, parent.group_id, parent.table_name, "parent-row", .{ .relational_topology_json = "{\"mode\":\"generation_publication\"}" }, .read_index) catch |err| {
-            std.debug.print("hosted FK parent ACK lookup failed group_id={} err={s}\n", .{ parent.group_id, @errorName(err) });
-            return err;
+        const lookup = reader.lookupGroupLocal(alloc, parent.group_id, parent.table_name, "parent-row", .{
+            .relational_topology_json = "{\"mode\":\"generation_publication\"}",
+            .execution_deadline_ns = @min(deadline, platform.time.monotonicNs() +| 2 * std.time.ns_per_s),
+        }, .read_index) catch |err| switch (err) {
+            // Publication is durable before a restarted owner necessarily
+            // regains leadership. Keep the exact group and receipt checks.
+            error.NotLeader, error.LeaderUnavailable, error.GroupLeaderUnavailable, error.StorageReadTemporarilyUnavailable, error.StorageKernelOwnerUnavailable, error.Timeout, error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.DeadlineExceeded => {
+                try io.sleep(.fromMilliseconds(20), .awake);
+                continue;
+            },
+            else => return err,
         };
         if (lookup) |value| {
             var response = value;

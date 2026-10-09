@@ -24,6 +24,8 @@ const Allocator = std.mem.Allocator;
 pub const Cache = struct {
     alloc: Allocator,
     decoded: @import("lake_decoded_cache.zig").Cache,
+    /// In-flight physical reads share owned results even when residency is denied.
+    physical: @import("lake_decoded_cache.zig").Cache,
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.StringHashMapUnmanaged(*Entry) = .empty,
     flights: std.StringHashMapUnmanaged(*Flight) = .empty,
@@ -90,6 +92,7 @@ pub const Cache = struct {
             while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
             self.stats.disk_init_failures +|= 1;
             self.mutex.unlock();
+            std.log.scoped(.lake_cache).warn("persistent cache unavailable; serving through RAM/source: {s}", .{@errorName(err)});
             return;
         };
         // Publish exactly once. Readers must acquire ready before touching the
@@ -187,11 +190,14 @@ pub const Cache = struct {
             self.stats.provider_bytes +|= bytes;
         }
     }
+    pub fn recordPhysicalRead(self: *Cache, bytes: usize) void {
+        self.recordRead(false, bytes);
+    }
     pub fn init(alloc: Allocator) Cache {
         return initWithMemoryLimit(alloc, 64 * 1024 * 1024);
     }
     pub fn initWithMemoryLimit(alloc: Allocator, maximum: usize) Cache {
-        return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .max_bytes = maximum };
+        return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .physical = .{ .a = alloc, .max_bytes = 0, .max_entries = 0 }, .max_bytes = maximum };
     }
     pub fn deinit(self: *Cache) void {
         // Readers are quiescent. Join accepted writes before destroying the
@@ -202,6 +208,7 @@ pub const Cache = struct {
         self.mappings.deinit(self.alloc);
         if (self.persistent) |*disk| disk.deinit();
         self.decoded.deinit();
+        self.physical.deinit();
         std.debug.assert(self.flights.count() == 0);
         self.flights.deinit(self.alloc);
         var iter = self.entries.iterator();
@@ -223,7 +230,11 @@ pub const Cache = struct {
     pub const ImmutableLoader = struct {
         ptr: *anyopaque,
         load: *const fn (*anyopaque, Allocator) anyerror![]u8,
+        /// Coalesced loaders may fill several cache units with one provider
+        /// request. Report physical traffic for this load, not logical fills.
+        provider_read: ?*const fn (*anyopaque) ProviderRead = null,
     };
+    pub const ProviderRead = struct { requests: u64, bytes: u64 };
 
     /// The caller proves current authorization and coverage before this call.
     /// Credential/store scope and authenticated identity partition both tiers;
@@ -334,6 +345,83 @@ pub const Cache = struct {
         };
         if (lease == .mapped) return self.admitMapping(key, lease.mapped);
         return lease;
+    }
+    /// Authentication proof for immutable bytes. Producers authenticate once,
+    /// then pair the proof with an owner that keeps that exact slice alive.
+    pub const VerifiedBytes = struct {
+        bytes: []const u8,
+        digest: [32]u8,
+        pub fn authenticate(bytes: []const u8, digest: [32]u8) !@This() {
+            var actual: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+            if (!std.mem.eql(u8, &actual, &digest)) return error.ArtifactIntegrityMismatch;
+            return .{ .bytes = bytes, .digest = digest };
+        }
+    };
+    pub const VerifiedLease = struct { value: VerifiedBytes, owner: ranges.RangeLease };
+    /// Look up authenticated unit residency without starting a unit flight.
+    /// Pack loaders coordinate misses with their own shared physical flight.
+    pub fn lookupImmutableBlockLease(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context) !?ImmutableLease {
+        try context.ensureActive();
+        const key = try immutableKey(a, scope, identity, length, digest);
+        defer a.free(key);
+        if (self.pin(key)) |value| {
+            errdefer value.release();
+            try context.ensureActive();
+            return .{ .shared = value };
+        }
+        if (self.pinMapping(key)) |value| {
+            errdefer value.release();
+            try context.ensureActive();
+            return .{ .mapping = value };
+        }
+        if (self.persistent) |*disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
+            self.recordRead(true, length);
+            var lease = self.admitMapping(key, value);
+            errdefer lease.deinit();
+            try context.ensureActive();
+            return lease;
+        };
+        return null;
+    }
+    /// Consume a verified slice lease. Admission copies a unit once into its
+    /// independently evictable RAM entry; denied admission returns the original
+    /// shared physical slice, without an intermediate allocation or rehash.
+    pub fn admitVerifiedBlock(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context, verified: VerifiedLease) !ImmutableLease {
+        var retained = true;
+        defer if (retained) verified.owner.release();
+        try context.ensureActive();
+        if (verified.value.bytes.ptr != verified.owner.bytes.ptr or verified.value.bytes.len != verified.owner.bytes.len or verified.value.bytes.len != length or !std.mem.eql(u8, &verified.value.digest, &digest)) return error.ArtifactIntegrityMismatch;
+        const key = try immutableKey(a, scope, identity, length, digest);
+        defer a.free(key);
+        if (self.persistent) |*disk| _ = disk.enqueueWrite(key, verified.value.bytes);
+        self.store(key, verified.value.bytes) catch {};
+        if (self.pin(key)) |value| {
+            errdefer value.release();
+            try context.ensureActive();
+            return .{ .shared = value };
+        }
+        try context.ensureActive();
+        retained = false;
+        return .{ .shared = verified.owner };
+    }
+    /// Probe verified residency without joining unit flights or issuing provider I/O.
+    /// Physical read planners must never wait on a unit flight while owning a
+    /// physical flight: another unit leader may already be waiting on them.
+    pub fn probeImmutableBlock(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context) !bool {
+        try context.ensureActive();
+        const key = try immutableKey(a, scope, identity, length, digest);
+        defer a.free(key);
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        const resident = self.entries.contains(key) or self.mappings.contains(key);
+        self.mutex.unlock();
+        if (resident) return true;
+        if (self.persistent) |*disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
+            var lease = self.admitMapping(key, value);
+            lease.deinit();
+            return true;
+        };
+        return false;
     }
     fn pinMapping(self: *Cache, key: []const u8) ?*Mapping {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -452,7 +540,11 @@ pub const Cache = struct {
         var actual: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
         if (bytes.len != length or !std.mem.eql(u8, &actual, &digest)) return error.ArtifactIntegrityMismatch;
-        self.recordRead(false, bytes.len);
+        const traffic: ProviderRead = if (loader.provider_read) |read| read(loader.ptr) else .{ .requests = 1, .bytes = bytes.len };
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        self.stats.provider_reads +|= traffic.requests;
+        self.stats.provider_bytes +|= traffic.bytes;
+        self.mutex.unlock();
         if (self.persistentCache()) |disk| _ = disk.enqueueWrite(key, bytes);
         self.store(key, bytes) catch {};
         return bytes;
@@ -1268,4 +1360,37 @@ test "external lake disk pressure reclaims idle mappings while preserving active
     defer admitted.deinit();
     try std.testing.expect(admitted == .mapping);
     try std.testing.expectEqualStrings("verified block", active.bytes());
+}
+
+test "external lake verified slice admission retains denied ownership and copies resident units once" {
+    const a = std.testing.allocator;
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    const Owner = struct {
+        released: usize = 0,
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.released += 1;
+        }
+    };
+    var owner: Owner = .{};
+    const bytes = "verified unit";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const verified: Cache.VerifiedLease = .{ .value = try Cache.VerifiedBytes.authenticate(bytes, digest), .owner = .{ .bytes = bytes, .owner = .{ .shared = .{ .ptr = &owner, .release_fn = Owner.release } } } };
+    cache.max_entries = 0;
+    var denied = try cache.admitVerifiedBlock(a, @splat(1), "unit", bytes.len, digest, .{}, verified);
+    try std.testing.expect(denied.bytes().ptr == bytes.ptr);
+    try std.testing.expectEqual(@as(usize, 0), owner.released);
+    denied.deinit();
+    try std.testing.expectEqual(@as(usize, 1), owner.released);
+    cache.max_entries = 4096;
+    var admitted = try cache.admitVerifiedBlock(a, @splat(1), "unit", bytes.len, digest, .{}, verified);
+    defer admitted.deinit();
+    try std.testing.expect(admitted.bytes().ptr != bytes.ptr);
+    try std.testing.expectEqualStrings(bytes, admitted.bytes());
+    try std.testing.expectEqual(@as(usize, 2), owner.released);
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, cache.admitVerifiedBlock(a, @splat(2), "unit", bytes.len + 1, digest, .{}, verified));
+    try std.testing.expectEqual(@as(usize, 3), owner.released);
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, Cache.VerifiedBytes.authenticate("corrupt", digest));
 }

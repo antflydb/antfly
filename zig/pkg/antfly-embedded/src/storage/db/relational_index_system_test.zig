@@ -1051,15 +1051,7 @@ test "relational index system mixed schema scan compiles each snapshot layout on
     try std.testing.expect(reader.source_cache_hits >= 510);
     try std.testing.expect(reader.binding_bytes <= 2 * 1024 * 1024);
     std.debug.print("mixed schema LSM scan: rows={d} compilations={d} hits={d} elapsed_us={d}\n", .{ count, reader.source_compilations, reader.source_cache_hits, (time.monotonicNs() - started) / 1000 });
-    // SafeAllocator can sometimes grow an arena in place and sometimes must
-    // move it, depending on earlier fault runs. An exhaustive allocation-index
-    // sweep requires stable allocation counts. Force the allocate/copy path;
-    // every growth allocation is still faulted and leak-checked.
-    var no_resize_vtable = alloc.vtable.*;
-    no_resize_vtable.resize = std.mem.Allocator.noResize;
-    no_resize_vtable.remap = std.mem.Allocator.noRemap;
-    const stable_backing = std.mem.Allocator{ .ptr = alloc.ptr, .vtable = &no_resize_vtable };
-    try std.testing.checkAllAllocationFailures(stable_backing, mixedScanAllocations, .{&db});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, mixedScanAllocations, .{&db});
 }
 
 fn expressionKeyAllocations(test_alloc: std.mem.Allocator) !void {

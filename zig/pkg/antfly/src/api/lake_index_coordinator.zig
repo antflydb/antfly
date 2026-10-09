@@ -290,7 +290,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     try std.testing.expect(try durableDirectoryAvailable(a, &store, recovered.value.published.?, .none));
     // A complete older directory is still a refresh obligation after a
     // reader-format upgrade, even when every source signature is unchanged.
-    recovered.value.published.?.reader_protocol = 28;
+    recovered.value.published.?.reader_protocol = 31;
     const historical = try catalog.encode(a, recovered.value);
     if (mock.owned) |bytes| a.free(bytes);
     mock.owned = historical;

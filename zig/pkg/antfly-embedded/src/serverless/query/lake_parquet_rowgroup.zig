@@ -6792,7 +6792,6 @@ test "lake persistent object range cache retains asynchronous write error reason
     try std.testing.expectEqual(@as(usize, 0), stats.writes_dropped);
     try std.testing.expectEqual(@as(usize, 0), stats.queued_entries);
 }
-
 test "lake persistent object range cache evicts least recently used entries within disk ceilings" {
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();

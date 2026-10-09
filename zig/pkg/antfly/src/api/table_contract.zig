@@ -42,6 +42,8 @@ pub fn classifyCreateTableRequestError(err: anyerror) CreateTableRequestErrorDis
     return switch (err) {
         error.InvalidCreateTableRequest,
         error.InvalidTableStorageSettings,
+        error.ObjectTablePlacementUnsupported,
+        error.RelationalStorageUnavailable,
         error.VectorStoreRequiresLocalSingleShardTable,
         error.ImmutableTableStorageSettings,
         error.VectorStoreRequiresEmptyTable,
@@ -187,6 +189,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         if (num_shards > tables_api.max_table_initial_ranges)
             return error.CreateTableShardCountOutOfRange;
     }
+    try tables_api.validateObjectCreateDefinition(alloc, req);
     return req;
 }
 
@@ -1461,13 +1464,14 @@ test "table contract enforces stable graph source identities and numeric targets
     defer std.testing.allocator.free(config_json);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"target\":42") != null);
 
-    const numeric_source_json = try parseCreateIndexRequest(
-        std.testing.allocator,
-        "document_graph",
-        "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":42,\"target\":\"doc:b\"},\"edge\":{\"edge_id\":\"fact:42\"}}]}",
+    try std.testing.expectError(
+        error.InvalidCreateIndexRequest,
+        parseCreateIndexRequest(
+            std.testing.allocator,
+            "document_graph",
+            "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":42,\"target\":\"doc:b\"},\"edge\":{\"edge_id\":\"fact:42\"}}]}",
+        ),
     );
-    defer std.testing.allocator.free(numeric_source_json);
-    try std.testing.expect(std.mem.indexOf(u8, numeric_source_json, "\"source\":42") != null);
 
     try std.testing.expectError(
         error.InvalidCreateIndexRequest,

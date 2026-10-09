@@ -21,6 +21,7 @@ const scalar = @import("scalar.zig");
 const Datum = scalar.Datum;
 const Row = operators.Row;
 const Allocator = std.mem.Allocator;
+const native_spill_supported = @import("builtin").os.tag != .freestanding;
 pub const none = std.math.maxInt(u64);
 const frame_bytes = 25;
 const snappy = @import("../encoding/snappy.zig");
@@ -134,6 +135,7 @@ pub const Manager = struct {
         try self.checkpoint(self.context);
     }
     fn open(self: *Manager) !void {
+        if (comptime !native_spill_supported) return error.SqlProgramLimitExceeded;
         if (self.dir != null) return;
         try self.check();
         const parent = try std.Io.Dir.openDirAbsolute(self.io, self.root, .{});
@@ -147,6 +149,9 @@ pub const Manager = struct {
         self.parent = parent;
     }
     pub fn create(self: *Manager) !File {
+        // Freestanding builds have no native spill directory. Keep bounded
+        // in-memory SQL available and report its existing limit on overflow.
+        if (comptime !native_spill_supported) return error.SqlProgramLimitExceeded;
         self.lock();
         defer self.mutex.unlock();
         if (self.max_bytes == 0) return error.SqlProgramLimitExceeded;
@@ -180,6 +185,10 @@ pub const Manager = struct {
             self.alloc.destroy(file);
         }
         self.pattern_file = null;
+        if (comptime !native_spill_supported) {
+            std.debug.assert(self.dir == null and self.parent == null);
+            return;
+        }
         if (self.dir) |dir| dir.close(self.io);
         if (self.parent) |parent| {
             parent.deleteTree(self.io, &self.directory_name) catch {};

@@ -372,8 +372,6 @@ fn allocationScenario(alloc: std.mem.Allocator) !void {
 }
 
 test "SQL pull stream unwinds every allocation failure" {
-    // SafeAllocator's remap decisions depend on address layout. Enumerate the
-    // deterministic allocate/copy/free path while retaining leak detection.
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
 }
 

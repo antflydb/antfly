@@ -18,9 +18,11 @@ const maintenance = @import("../maintenance.zig");
 const Allocator = std.mem.Allocator;
 
 /// Test allocator that bounds total live heap usage, and can request cancellation
-/// after allocations have started. Uses a caller-owned I/O runtime in these tests.
+/// after allocations have started. Allocation operations may run concurrently.
+/// Change/read the budget controls and counters only while users are quiescent.
 pub const BudgetAllocator = struct {
     backing: Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
     live: usize = 0,
     peak: usize = 0,
     alloc_calls: usize = 0,
@@ -32,6 +34,10 @@ pub const BudgetAllocator = struct {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
 
+    fn lock(self: *@This()) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
     fn account(self: *@This(), old: usize, new: usize) void {
         self.live = self.live - old + new;
         self.peak = @max(self.peak, self.live);
@@ -39,6 +45,8 @@ pub const BudgetAllocator = struct {
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         if (self.cancel_after == 0) {
             if (self.cancel) |token| token.request();
         } else self.cancel_after -= 1;
@@ -51,6 +59,8 @@ pub const BudgetAllocator = struct {
 
     fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         if (len > (self.limit -| self.live) + buf.len) return false;
         if (!self.backing.rawResize(buf, alignment, len, ra)) return false;
         self.account(buf.len, len);
@@ -59,6 +69,8 @@ pub const BudgetAllocator = struct {
 
     fn remap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
         const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         if (len > (self.limit -| self.live) + buf.len) return null;
         const result = self.backing.rawRemap(buf, alignment, len, ra) orelse return null;
         self.account(buf.len, len);
@@ -67,6 +79,8 @@ pub const BudgetAllocator = struct {
 
     fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const self: *@This() = @ptrCast(@alignCast(ctx));
+        self.lock();
+        defer self.mutex.unlock();
         self.backing.rawFree(buf, alignment, ra);
         self.account(buf.len, 0);
     }

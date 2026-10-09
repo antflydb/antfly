@@ -722,6 +722,10 @@ pub const Detail = enum(c_int) {
     unsupported_iceberg_schema_evolution,
     unsupported_iceberg_delete_file,
     invalid_sql_spill,
+    // Append only: existing runtime detail identities remain stable.
+    metric_not_ready,
+    metric_stale,
+    invalid_generated_tool_arguments,
     sql_feature_not_supported,
 };
 
@@ -1073,6 +1077,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.HAReadWaitForApply => status(.retryable, .ha_read_wait_for_apply),
         error.HAReadWaitForMetadata => status(.retryable, .ha_read_wait_for_metadata),
         error.DistributedQueryUnavailable => status(.retryable, .distributed_query_unavailable),
+        error.MetricNotReady => status(.retryable, .metric_not_ready),
+        error.MetricStale => status(.retryable, .metric_stale),
         error.StorageReadTemporarilyUnavailable => status(.retryable, .storage_read_temporarily_unavailable),
         error.PersistentDescriptorAdmissionExhausted => status(.retryable, .persistent_descriptor_admission_exhausted),
         error.ResourceRequestTooLarge => status(.invalid_argument, .resource_request_too_large),
@@ -1219,6 +1225,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.UnsupportedGeneratorProvider => status(.unsupported, .unsupported_generator_provider),
         error.GenerateRequestFailed => status(.unavailable, .generate_request_failed),
         error.GenerationCapacityUnavailable => status(.retryable, .generation_capacity_unavailable),
+        error.InvalidGeneratedToolArguments => status(.retryable, .invalid_generated_tool_arguments),
         error.RateLimit => status(.retryable, .generation_rate_limit),
         error.InvalidRateLimitPolicy => status(.invalid_argument, .invalid_rate_limit_policy),
         error.ConflictingRateLimitPolicy => status(.conflict, .conflicting_rate_limit_policy),
@@ -1452,6 +1459,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_iceberg_schema_evolution => "UnsupportedIcebergSchemaEvolution",
         .unsupported_iceberg_delete_file => "UnsupportedIcebergDeleteFile",
         .invalid_sql_spill => "InvalidSqlSpill",
+        .metric_not_ready => "MetricNotReady",
+        .metric_stale => "MetricStale",
 
         .generation_publication_changed => "GenerationPublicationChanged",
         .initial_child_provision_already_committed => "InitialChildProvisionAlreadyCommitted",
@@ -2066,6 +2075,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .unsupported_generator_provider => "UnsupportedGeneratorProvider",
         .generate_request_failed => "GenerateRequestFailed",
         .generation_capacity_unavailable => "GenerationCapacityUnavailable",
+        .invalid_generated_tool_arguments => "InvalidGeneratedToolArguments",
         .generation_rate_limit => "RateLimit",
         .invalid_rate_limit_policy => "InvalidRateLimitPolicy",
         .conflicting_rate_limit_policy => "ConflictingRateLimitPolicy",
@@ -2110,7 +2120,7 @@ test "stable status preserves deterministic raft rejection and malformed respons
 }
 
 test "stable status preserves public boundary semantics" {
-    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable }) |err| {
+    for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable, error.MetricNotReady, error.MetricStale }) |err| {
         const readiness = statusFromError(err);
         try std.testing.expectEqual(@backingInt(Code.retryable), readiness.code);
         try std.testing.expectEqual(err, errorFromStatus(readiness));
@@ -2250,6 +2260,9 @@ test "generation capacity retains retryability across the runtime boundary" {
     const result = statusFromError(error.GenerationCapacityUnavailable);
     try std.testing.expectEqual(@backingInt(Code.retryable), result.code);
     try std.testing.expectEqual(error.GenerationCapacityUnavailable, errorFromStatus(result));
+    const malformed = statusFromError(error.InvalidGeneratedToolArguments);
+    try std.testing.expectEqual(@backingInt(Code.retryable), malformed.code);
+    try std.testing.expectEqual(error.InvalidGeneratedToolArguments, errorFromStatus(malformed));
 }
 
 test "system catalog errors retain their stable runtime boundary classification" {

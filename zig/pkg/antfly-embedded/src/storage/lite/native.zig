@@ -2460,7 +2460,13 @@ pub const VacuumImage = struct {
     report: VacuumReport,
 
     pub fn deinit(self: *VacuumImage) void {
-        deleteFilePath(self.prepared.runtimeIo(), self.prepared.path) catch {};
+        {
+            const io = self.prepared.runtimeIo();
+            const previous = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(previous);
+            deleteFilePath(io, self.prepared.path) catch {};
+        }
+        // Restore protection before close can release an owned I/O runtime.
         self.prepared.close();
         self.* = undefined;
     }
@@ -2502,6 +2508,8 @@ pub const NativeFile = struct {
     vacuum_target_indexed: bool = false,
     ledger: ?*allocator_v4.State = null,
     minimum_reader_sequence: ?u64 = null,
+    reader_frontier: ?*const std.atomic.Value(u64) = null,
+    publication_observer: ?struct { context: *anyopaque, notify: *const fn (*anyopaque, CheckpointSlot, bool) void } = null,
     secondary_page_cache: ?*PageCache = null,
     retirement_work_pages: usize = 128,
     allocator_cancel_token: ?*const maintenance.CancelToken = null,
@@ -2533,6 +2541,10 @@ pub const NativeFile = struct {
     free_pages_verified: bool = false,
     // Structural scaling assertions count page operations, independent of
     // filesystem speed and cache warmth. No counters exist in production.
+    // Exact backing-file page reads, after shared and cursor-local caches.
+    // These count read operations/bytes, not storage-device cache misses.
+    test_backing_read_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_backing_read_bytes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_value_read_bytes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_value_read_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_cancel_on_read: if (builtin.is_test) ?*maintenance.CancelToken else void = if (builtin.is_test) null else {},
@@ -3088,7 +3100,7 @@ pub const NativeFile = struct {
     }
     fn reuseFrontier(self: *NativeFile) u64 {
         const frontier = self.metadataReuseFrontier();
-        return @min(frontier, self.minimum_reader_sequence orelse frontier);
+        return @min(@min(frontier, self.minimum_reader_sequence orelse frontier), if (self.reader_frontier) |readers| readers.load(.acquire) else frontier);
     }
 
     /// Work is bounded by retired graph objects, including value subtrees. A
@@ -3338,7 +3350,7 @@ pub const NativeFile = struct {
         const item = state.heap.peek() orelse return false;
         // Advancing a fallback slot makes progress only if a reader or a
         // deferred durability barrier is not the remaining visibility fence.
-        return item.epoch <= self.reuseFrontier() or (self.minimum_reader_sequence == null and self.durable_header == null);
+        return item.epoch <= self.reuseFrontier() or (self.minimum_reader_sequence == null and (if (self.reader_frontier) |readers| readers.load(.acquire) == std.math.maxInt(u64) else true) and self.durable_header == null);
     }
 
     fn budgetedCheckpointDue(self: *NativeFile, state: *allocator_v4.State) bool {
@@ -3585,7 +3597,7 @@ pub const NativeFile = struct {
         const page = try allocator.alloc(u8, page_size);
         errdefer allocator.free(page);
 
-        try readExactAt(self.file, self.runtimeIo(), page, page_id * @as(u64, self.header.page_size));
+        try self.readBackingPages(page, page_id * @as(u64, self.header.page_size));
         // Free-map pages are rewritten every commit and read once, so caching
         // them buys nothing; skipping them also keeps free-map validation
         // reading disk truth before any pages are handed out for reuse.
@@ -3593,6 +3605,14 @@ pub const NativeFile = struct {
             self.page_cache.put(self.allocator, page_id, page);
         }
         return page;
+    }
+
+    fn readBackingPages(self: *NativeFile, out: []u8, offset: u64) !void {
+        if (builtin.is_test) {
+            _ = self.test_backing_read_calls.fetchAdd(1, .monotonic);
+            _ = self.test_backing_read_bytes.fetchAdd(out.len, .monotonic);
+        }
+        try readExactAt(self.file, self.runtimeIo(), out, offset);
     }
 
     /// Bounded scratch reads for point lookups avoid allocating decoded keys
@@ -3609,7 +3629,7 @@ pub const NativeFile = struct {
         const page = scratch[0..self.header.page_size];
         const use_cache = self.page_cache_enabled.load(.monotonic) and self.page_cache_bypass.load(.monotonic) == 0;
         if (use_cache and self.page_cache.copyInto(page_id, page)) return page;
-        try readExactAt(self.file, self.runtimeIo(), page, page_id * @as(u64, self.header.page_size));
+        try self.readBackingPages(page, page_id * @as(u64, self.header.page_size));
         if (use_cache and self.admitPageToCache(page)) self.page_cache.put(self.allocator, page_id, page);
         return page;
     }
@@ -4353,6 +4373,7 @@ pub const NativeFile = struct {
         var cursor = try ValueChunkCursor.initAtCheckpoint(self, value.root, value.length, checkpoint);
         defer cursor.deinit();
         cursor.skip = @intCast(offset);
+        cursor.read_end = @intCast(offset + length);
         var remaining: usize = @intCast(length);
         var crc = Crc32.init();
         while (remaining != 0) {
@@ -4362,6 +4383,53 @@ pub const NativeFile = struct {
             remaining -= take;
         }
         return crc.final();
+    }
+
+    /// One forward traversal for cache fills, checksumming, and range delivery.
+    pub fn visitIndexValue(self: *NativeFile, value: IndexValue, offset: u64, length: u64, checkpoint: CheckpointSlot, context: *anyopaque, visit: *const fn (*anyopaque, u64, []const u8) anyerror!void) !void {
+        if (offset > value.length or length > value.length - offset) return error.EndOfStream;
+        if (length == 0) return;
+        if (value.root == 0) return visit(context, 0, value.inline_bytes[@intCast(offset)..][0..@intCast(length)]);
+        var cursor = try ValueChunkCursor.initAtCheckpoint(self, value.root, value.length, checkpoint);
+        defer cursor.deinit();
+        cursor.skip = @intCast(offset);
+        cursor.read_end = @intCast(offset + length);
+        var position: u64 = 0;
+        while (position < length) {
+            const chunk = (try cursor.next(null)) orelse return error.InvalidNativeValueChain;
+            const take: usize = @intCast(@min(chunk.len, length - position));
+            try visit(context, position, chunk[0..take]);
+            position += take;
+        }
+    }
+
+    /// Authenticate and deliver a logical subrange in one forward traversal.
+    /// Output is private scratch until the expected CRC has been checked.
+    pub fn readAuthenticatedIndexValue(self: *NativeFile, value: IndexValue, offset: u64, length: u64, within: usize, out: []u8, expected: ?u32, checkpoint: CheckpointSlot) !void {
+        if (offset > value.length or length > value.length - offset or within > length or out.len > length - within) return error.EndOfStream;
+        if (expected == null) return self.readIndexValueInto(value, offset + within, out, checkpoint);
+        if (value.root == 0) {
+            const bytes = value.inline_bytes[@intCast(offset)..][0..@intCast(length)];
+            if (Crc32.hash(bytes) != expected.?) return error.CrcMismatch;
+            @memcpy(out, bytes[within..][0..out.len]);
+            return;
+        }
+        var cursor = try ValueChunkCursor.initAtCheckpoint(self, value.root, value.length, checkpoint);
+        defer cursor.deinit();
+        cursor.skip = @intCast(offset);
+        cursor.read_end = @intCast(offset + length);
+        var position: u64 = 0;
+        var crc = Crc32.init();
+        while (position < length) {
+            const chunk = (try cursor.next(null)) orelse return error.InvalidNativeValueChain;
+            const take: usize = @intCast(@min(chunk.len, length - position));
+            crc.update(chunk[0..take]);
+            const begin = @max(position, within);
+            const end = @min(position + take, @as(u64, within) + out.len);
+            if (begin < end) @memcpy(out[@intCast(begin - within)..][0..@intCast(end - begin)], chunk[@intCast(begin - position)..][0..@intCast(end - begin)]);
+            position += take;
+        }
+        if (crc.final() != expected.?) return error.CrcMismatch;
     }
 
     /// Export a pinned artifact with bounded scratch and one forward page
@@ -5614,7 +5682,7 @@ pub const NativeFile = struct {
                 _ = file.test_value_read_calls.fetchAdd(1, .monotonic);
                 _ = file.test_value_read_bytes.fetchAdd(count * size, .monotonic);
             }
-            try readExactAt(file.file, file.runtimeIo(), self.bytes[0 .. count * size], page * size);
+            try file.readBackingPages(self.bytes[0 .. count * size], page * size);
             self.first = page;
             self.count = count;
             return self.requested(file, 0);
@@ -5648,10 +5716,18 @@ pub const NativeFile = struct {
         const Frame = struct { node: ExtentNode, position: usize = 0 };
         file: *NativeFile,
         checkpoint: CheckpointSlot,
+        // Four levels cover ordinary artifact trees without allocator traffic.
+        // The format permits at most 63 levels; deeper trees use one exact,
+        // bounded overflow allocation, reused for the entire traversal.
         frames: std.ArrayListUnmanaged(Frame) = .empty,
+        inline_frames: [4]Frame = undefined,
+        frame_count: usize = 0,
+        max_depth: usize = 0,
         pending: ?ExtentRef,
         chain_page: u64,
         remaining: usize,
+        value_length: usize = 0,
+        read_end: ?usize = null,
         skip: usize = 0,
         reader: ValuePageReader = .{},
 
@@ -5666,10 +5742,11 @@ pub const NativeFile = struct {
 
         fn initWithCacheIntent(file: *NativeFile, root: u64, len: usize, checkpoint: CheckpointSlot, cache_payload: bool) !ValueChunkCursor {
             if (len == 0) return error.InvalidNativeValueChain;
-            var cursor = ValueChunkCursor{ .file = file, .checkpoint = checkpoint, .pending = null, .chain_page = root, .remaining = len, .reader = .{ .cache_payload = cache_payload } };
+            var cursor = ValueChunkCursor{ .file = file, .checkpoint = checkpoint, .pending = null, .chain_page = root, .remaining = len, .value_length = len, .reader = .{ .cache_payload = cache_payload } };
             const raw = try cursor.reader.read(file, checkpoint, root, 1);
             if (raw[4] == @backingInt(PageKind.value_extent)) {
                 const node = try decodeExtentNode(try decodePagePayload(raw, .value_extent), len);
+                cursor.max_depth = node.height;
                 cursor.pending = .{ .page = root, .len = len, .height = node.height };
                 cursor.chain_page = 0;
             } else {
@@ -5683,6 +5760,34 @@ pub const NativeFile = struct {
             return cursor;
         }
 
+        fn readAheadRemaining(self: *const ValueChunkCursor) usize {
+            const position = self.value_length - self.remaining;
+            return @min(self.remaining, (self.read_end orelse self.value_length) -| position);
+        }
+
+        fn frameSlice(self: *ValueChunkCursor) []Frame {
+            return if (self.frames.capacity != 0) self.frames.items else self.inline_frames[0..self.frame_count];
+        }
+
+        fn pushFrame(self: *ValueChunkCursor, node: ExtentNode) !void {
+            if (self.frame_count >= self.max_depth) return error.InvalidNativeValueChain;
+            if (self.frames.capacity == 0 and self.frame_count < self.inline_frames.len) {
+                self.inline_frames[self.frame_count] = .{ .node = node };
+            } else {
+                if (self.frames.capacity == 0) {
+                    try self.frames.ensureTotalCapacityPrecise(self.file.allocator, self.max_depth);
+                    self.frames.appendSliceAssumeCapacity(self.inline_frames[0..self.frame_count]);
+                }
+                self.frames.appendAssumeCapacity(.{ .node = node });
+            }
+            self.frame_count += 1;
+        }
+
+        fn popFrame(self: *ValueChunkCursor) void {
+            self.frame_count -= 1;
+            if (self.frames.capacity != 0) self.frames.items.len = self.frame_count;
+        }
+
         pub fn deinit(self: *ValueChunkCursor) void {
             self.frames.deinit(self.file.allocator);
         }
@@ -5693,7 +5798,7 @@ pub const NativeFile = struct {
             while (true) {
                 if (cancel) |token| try token.check();
                 if (self.chain_page != 0) {
-                    const raw = try self.reader.readChain(self.file, self.checkpoint, self.chain_page, self.remaining);
+                    const raw = try self.reader.readChain(self.file, self.checkpoint, self.chain_page, self.readAheadRemaining());
                     const value = try decodeValuePage(try decodePagePayload(raw, .value));
                     if (value.chunk.len == 0 or value.chunk.len > self.remaining) return error.InvalidNativeValueChain;
                     self.remaining -= value.chunk.len;
@@ -5705,10 +5810,10 @@ pub const NativeFile = struct {
                     return value.chunk[skipped..];
                 }
                 const ref = self.pending orelse blk: {
-                    while (self.frames.items.len > 0) {
-                        const frame = &self.frames.items[self.frames.items.len - 1];
+                    while (self.frame_count > 0) {
+                        const frame = &self.frameSlice()[self.frame_count - 1];
                         if (frame.position == frame.node.count) {
-                            _ = self.frames.pop();
+                            self.popFrame();
                             continue;
                         }
                         const child = frame.node.children[frame.position];
@@ -5725,15 +5830,15 @@ pub const NativeFile = struct {
                     self.remaining -= ref.len;
                     continue;
                 }
-                const ahead = if (ref.height == 0 and self.frames.items.len != 0) blk: {
-                    const frame = &self.frames.items[self.frames.items.len - 1];
-                    break :blk extentLeafReadAhead(frame.node.children[0..frame.node.count], frame.position - 1, self.remaining);
+                const ahead = if (ref.height == 0 and self.frame_count != 0) blk: {
+                    const frame = &self.frameSlice()[self.frame_count - 1];
+                    break :blk extentLeafReadAhead(frame.node.children[0..frame.node.count], frame.position - 1, self.readAheadRemaining());
                 } else 1;
                 const raw = try self.reader.read(self.file, self.checkpoint, ref.page, ahead);
                 if (ref.height != 0) {
                     const node = try decodeExtentNode(try decodePagePayload(raw, .value_extent), ref.len);
                     if (node.height != ref.height) return error.InvalidNativeValueChain;
-                    try self.frames.append(self.file.allocator, .{ .node = node });
+                    try self.pushFrame(node);
                     continue;
                 }
                 const value = try decodeValuePage(try decodePagePayload(raw, .value));
@@ -7658,6 +7763,7 @@ pub const NativeFile = struct {
         }
         if (changed) next.commit_sequence = previous.checkpoints[previous.active_checkpoint].commit_sequence + 1;
         if (!durable and !self.no_sync) {
+            defer self.notifyPublication();
             // Keep the last durable checkpoint slots intact until an explicit
             // durability barrier. Readers on this handle see the new roots;
             // reopening after a crash sees the previous complete checkpoint.
@@ -7678,6 +7784,7 @@ pub const NativeFile = struct {
             self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
             return;
         }
+        defer self.notifyPublication();
         if (self.durable_header) |durable| {
             self.header = durable;
             self.durable_header = null;
@@ -7704,6 +7811,10 @@ pub const NativeFile = struct {
             state.released_data_pages = 0;
             state.retired_inline_bytes = 0;
         }
+    }
+
+    fn notifyPublication(self: *NativeFile) void {
+        if (self.publication_observer) |observer| observer.notify(observer.context, self.activeCheckpoint(), self.checkpoint_publication_uncertain);
     }
 
     fn syncIfRequired(self: *NativeFile) !void {
@@ -10390,6 +10501,44 @@ test "lite native stable snapshot holds output writer lock before staging" {
     try std.testing.expectError(error.WouldBlock, copyStableSnapshot(allocator, source_path, snapshot_path, false));
     try std.testing.expect(!pathExists(std.testing.io, snapshot_path));
     try std.testing.expect(!pathExists(std.testing.io, tmp_path));
+}
+
+test "lite vacuum image cleanup removes prepared file despite pending cancellation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vacuum-cleanup.aflite", .{tmp.sub_path});
+    defer alloc.free(path);
+    var pool = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(4) });
+    defer pool.deinit();
+    const io = pool.io();
+    var file = try NativeFile.createWithIo(alloc, io, path, .{ .no_sync = true });
+    defer file.close();
+    try file.putDocument("doc", "retained");
+    var image = try file.prepareVacuum(null);
+    var image_owned = true;
+    defer if (image_owned) image.deinit();
+    const prepared_path = try alloc.dupe(u8, image.prepared.path);
+    defer alloc.free(prepared_path);
+    const State = struct {
+        started: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        fn run(i: std.Io, self: *@This(), prepared: *VacuumImage) void {
+            self.started.set(i);
+            // Re-arm the gate's cancellation before exercising cleanup.
+            self.release.wait(i) catch i.recancel();
+            prepared.deinit();
+        }
+    };
+    var state: State = .{};
+    var child = try io.concurrent(State.run, .{ io, &state, &image });
+    image_owned = false; // The child owns cleanup after successful dispatch.
+    state.started.waitUncancelable(io);
+    child.cancel(io);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, prepared_path, .{}));
+    const value = (try file.getDocumentAlloc(alloc, "doc")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("retained", value);
 }
 
 test "lite native vacuum rewrites live catalog and document records" {
@@ -15503,4 +15652,78 @@ test "lite cold artifact export keeps payload pages out of native cache" {
     }
     try std.testing.expect(payload_count > 0);
     std.debug.print("LITE_COLD_EXPORT bytes={d} exported_payload_cache_pages=0\n", .{bytes.len});
+}
+
+test "lite native value cursor uses inline frames and bounded deep overflow" {
+    const a = std.testing.allocator;
+    var file: NativeFile = undefined;
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 0 };
+    file.allocator = budget.allocator();
+    var cursor = NativeFile.ValueChunkCursor{ .file = &file, .checkpoint = undefined, .pending = null, .chain_page = 0, .remaining = 0, .max_depth = 63 };
+    defer cursor.deinit();
+    const node = NativeFile.ExtentNode{ .height = 1, .count = 0 };
+    for (0..4) |_| try cursor.pushFrame(node);
+    try std.testing.expectEqual(@as(usize, 0), budget.alloc_calls);
+    try std.testing.expectError(error.OutOfMemory, cursor.pushFrame(node));
+    try std.testing.expectEqual(@as(usize, 4), cursor.frame_count);
+    budget.limit = 128 * 1024;
+    for (4..63) |_| try cursor.pushFrame(node);
+    try std.testing.expectEqual(@as(usize, 1), budget.alloc_calls);
+    try std.testing.expectEqual(@as(usize, 63), cursor.frames.capacity);
+    try std.testing.expectError(error.InvalidNativeValueChain, cursor.pushFrame(node));
+    for (0..63) |_| cursor.popFrame();
+    for (0..63) |_| try cursor.pushFrame(node);
+    try std.testing.expectEqual(@as(usize, 1), budget.alloc_calls);
+    std.debug.print("LITE_CURSOR_FRAMES inline_levels=4 inline_heap=0 max_levels=63 overflow_bytes={d} allocations={d}\n", .{ budget.peak, budget.alloc_calls });
+}
+
+test "lite native immutable value traversal needs no heap scratch for ordinary extents" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cursor-scratch.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    defer file.close();
+    const payload = try a.alloc(u8, 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 19);
+    try file.putIndexCatalogRecord("/artifact", payload);
+    file.page_cache_enabled.store(false, .monotonic);
+    const checkpoint = file.activeCheckpoint();
+    var value = try file.openIndexValue(a, "/artifact", checkpoint);
+    defer value.deinit(a);
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 0 };
+    file.allocator = budget.allocator();
+    defer file.allocator = a;
+    const Visitor = struct {
+        length: usize = 0,
+        crc: Crc32 = Crc32.init(),
+        fn consume(raw: *anyopaque, offset: u64, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.length, offset);
+            self.length += bytes.len;
+            self.crc.update(bytes);
+        }
+    };
+    for (0..8) |_| {
+        var visitor = Visitor{};
+        try file.visitIndexValue(value, 0, payload.len, checkpoint, &visitor, Visitor.consume);
+        try std.testing.expectEqual(payload.len, visitor.length);
+        try std.testing.expectEqual(Crc32.hash(payload), visitor.crc.final());
+        var out: [8]u8 = undefined;
+        try file.readAuthenticatedIndexValue(value, 0, payload.len, 123, &out, Crc32.hash(payload), checkpoint);
+        try std.testing.expectEqualSlices(u8, payload[123..131], &out);
+        const before = file.test_backing_read_bytes.load(.monotonic);
+        var limited = Visitor{};
+        try file.visitIndexValue(value, 123, 65536, checkpoint, &limited, Visitor.consume);
+        try std.testing.expectEqual(@as(usize, 65536), limited.length);
+        try std.testing.expectEqual(Crc32.hash(payload[123..][0..65536]), limited.crc.final());
+        const bytes_read = file.test_backing_read_bytes.load(.monotonic) - before;
+        // Account for overlapping leaves and two navigation levels, without
+        // allowing speculative batches to run beyond this logical range.
+        try std.testing.expect(bytes_read <= 65536 + 4 * file.header.page_size);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.alloc_calls);
+    std.debug.print("LITE_CURSOR_TRAVERSAL bytes=1048576 traversals=24 heap_allocations={d}\n", .{budget.alloc_calls});
 }

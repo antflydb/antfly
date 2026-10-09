@@ -45,7 +45,7 @@ unit-test: ## Run the existing repository unit gate across libraries, Antfly, an
 	for ((i=0; i<$${#build_args[@]}; i++)); do \
 		if [ "$${build_args[i]}" = --cache-dir ]; then unit_cache_dir="$${build_args[i+1]:-}"; fi; \
 	done; \
-	if [ "$${CI:-}" = true ] && [ "$$(uname -s)" = Linux ] && [ "$${unit_cache_dir##*/}" = zig-local ]; then \
+	if [ "$${CI:-}" = true ] && { [ "$$(uname -s)" = Linux ] || [ "$$(uname -s)" = Darwin ]; } && [ "$${unit_cache_dir##*/}" = zig-local ]; then \
 		unit_cache_dir="$$(python3 tools/prune_completed_test_cache.py --validate-phase "$$unit_cache_dir")" || exit $$?; \
 		unit_cache_flags=-Dunit-test-cache-release=true; \
 	fi; \

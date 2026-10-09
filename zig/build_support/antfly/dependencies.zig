@@ -986,6 +986,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     });
     inference_worker_wire_mod.addImport("antfly_inference_bridge", inference_bridge_mod);
     inference_worker_wire_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
+    inference_worker_wire_mod.addImport("antfly_platform", platform_mod);
     inference_worker_wire_mod.addImport("httpx", httpx_mod);
     inference_worker_wire_mod.addImport("antfly_inference_worker_rpc", inference_worker_rpc_mod);
     inference_worker_wire_mod.addImport("antfly_inference_work", inference_work_mod);

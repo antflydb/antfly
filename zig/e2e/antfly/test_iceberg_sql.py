@@ -270,3 +270,172 @@ def test_real_iceberg_snapshots_schema_ids_partitions_deletes_and_restart(tmp_pa
         failed = False
     finally:
         server.stop(test_failed=failed)
+
+
+@pytest.mark.parametrize("source_format", ["parquet", "iceberg"])
+def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
+    tmp_path, source_format
+):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    count = 10003
+    rows = pa.table(
+        {
+            "body": ["common"] * count,
+            "category": ["story"] * 2 + ["comment"] * (count - 2),
+            "amount": range(count),
+            "label": ["other"] * (count - 3) + ["kept"] * 3,
+        }
+    )
+    root = tmp_path / source_format
+    if source_format == "iceberg":
+        pytest.importorskip("fastavro")
+        pytest.importorskip("pyiceberg")
+        from pyiceberg.catalog.sql import SqlCatalog
+        from pyiceberg.schema import Schema
+        from pyiceberg.types import LongType, NestedField, StringType
+
+        catalog = SqlCatalog(
+            "sort_pages",
+            uri=f"sqlite:///{tmp_path}/catalog.db",
+            warehouse=(tmp_path / "warehouse").as_uri(),
+        )
+        catalog.create_namespace("sort_pages")
+        table = catalog.create_table(
+            "sort_pages.items",
+            schema=Schema(
+                NestedField(1, "body", StringType(), required=False),
+                NestedField(2, "category", StringType(), required=False),
+                NestedField(3, "amount", LongType(), required=False),
+                NestedField(4, "label", StringType(), required=False),
+            ),
+        )
+        table.append(rows)
+        _export_table(table, root)
+    else:
+        objects = root / "buckets" / "antfly" / "objects"
+        objects.mkdir(parents=True)
+        parquet = tmp_path / "items.parquet"
+        pq.write_table(rows, parquet, row_group_size=4096, compression="snappy")
+        payload = parquet.read_bytes()
+        (objects / "part.parquet").write_bytes(
+            b"AFOBJ001"
+            + struct.pack("<QI", len(payload), 0)
+            + hashlib.sha256(payload).hexdigest().encode()
+            + payload
+        )
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    failed = True
+    try:
+
+        def call(method, path, body=None):
+            response = requests.request(
+                method,
+                server.api_url + path,
+                json=body,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+            assert response.ok, response.text + "\n" + server.debug_logs()
+            value = response.json()
+            return value["responses"][0] if "responses" in value else value
+
+        call(
+            "POST",
+            "/tables/sort_pages",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "sort-pages",
+                        "format": source_format,
+                        "uri": root.as_uri(),
+                    },
+                    "relational_indexes": [
+                        {"name": "category_idx", "keys": [{"column": "category"}]},
+                        {"name": "amount_idx", "keys": [{"column": "amount"}]},
+                    ],
+                },
+                "indexes": {"body_text": {"type": "full_text", "field": "body"}},
+            },
+        )
+        deadline = time.monotonic() + 300
+        while True:
+            resource = call("GET", "/tables/sort_pages/indexes/body_text")
+            if resource["status"]["readiness"]["queryable"]:
+                break
+            assert time.monotonic() < deadline, str(resource) + server.debug_logs()
+            time.sleep(0.1)
+        category = {"term": {"path": "/category", "value": "comment"}}
+        predicates = [
+            {
+                "bool": {
+                    "filter": [
+                        category,
+                        {"range": {"path": "/amount", "gte": count - 3}},
+                    ]
+                }
+            },
+            {"conjuncts": [category, {"prefix": {"path": "/label", "value": "ke"}}]},
+        ]
+        expected = set(range(count - 3, count))
+        for restart in (False, True):
+            if restart:
+                server.restart()
+            for predicate in predicates:
+                request = {
+                    "full_text_search": {"term": "common", "field": "body"},
+                    "fields": ["amount"],
+                    "filter_query": predicate,
+                    "limit": 10,
+                }
+                baseline = call("POST", "/tables/sort_pages/query", request)
+                assert {
+                    h["_source"]["amount"] for h in baseline["hits"]["hits"]
+                } == expected
+                for sort in ("_score", "_id"):
+                    ordered = dict(
+                        request, order_by=[{"field": sort, "desc": sort != "_id"}]
+                    )
+                    reference = call("POST", "/tables/sort_pages/query", ordered)
+                    assert reference["hits"]["total"] == {
+                        "value": 3,
+                        "relation": "exact",
+                    }
+                    hits = reference["hits"]["hits"]
+                    assert {h["_source"]["amount"] for h in hits} == expected
+                    first = call(
+                        "POST", "/tables/sort_pages/query", dict(ordered, limit=1)
+                    )
+                    assert first["hits"]["hits"] == hits[:1]
+                    continuation = dict(
+                        ordered,
+                        limit=1,
+                        remote_snapshot=first["remote_snapshot"],
+                    )
+                    # A cursor with no explicit order_by has implicit ID order.
+                    if sort == "_id":
+                        continuation.pop("order_by")
+                    after = call(
+                        "POST",
+                        "/tables/sort_pages/query",
+                        dict(
+                            continuation, search_after=first["hits"]["hits"][0]["_sort"]
+                        ),
+                    )
+                    assert after["hits"]["hits"] == hits[1:2]
+                    before = call(
+                        "POST",
+                        "/tables/sort_pages/query",
+                        dict(
+                            continuation,
+                            search_before=after["hits"]["hits"][0]["_sort"],
+                        ),
+                    )
+                    assert before["hits"]["hits"] == hits[:1]
+        failed = False
+    finally:
+        server.stop(test_failed=failed)

@@ -97,6 +97,9 @@ pub const Operation = struct {
     /// Explicit per-operation ceilings, independent of a borrowed client's
     /// ambient policy. Populated from x-antfly-client-request-policy.
     client_request_policy: ?ClientRequestPolicy = null,
+    /// Transport may stream ordinary JSON without changing its typed schema.
+    /// Populated from x-antfly-response-streaming.
+    response_streaming: bool = false,
 };
 
 pub const ClientRequestPolicy = struct {

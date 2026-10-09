@@ -330,6 +330,35 @@ pub const ObjectStore = struct {
         return try dupeWithCancellationAlloc(alloc, result.body, cancellation);
     }
 
+    fn getBoundedAllocWithCancellation(
+        self: *ObjectStore,
+        alloc: std.mem.Allocator,
+        artifact_id: []const u8,
+        expected_len: usize,
+        cancellation: CancellationToken,
+    ) ![]u8 {
+        try cancellation.check();
+        const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
+        defer self.alloc.free(key);
+        var client = self.client;
+        client.allocator = alloc;
+        // Fetch the complete body: a prefix Range GET cannot prove object length.
+        // The content-addressed identity is authenticated by the caller's hash.
+        var result = client.getObject(self.bucket, key, .{
+            .skip_metadata_probe = true,
+            .max_response_bytes = @max(expected_len, 1),
+            .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
+        }) catch |err| {
+            if (err == error.ResponseTooLarge) return error.ArtifactIntegrityMismatch;
+            return normalizeCancellationError(err, cancellation);
+        };
+        defer result.deinit(alloc);
+        try cancellation.check();
+        const body = result.body;
+        result.body = &.{};
+        return body;
+    }
+
     pub fn getRangeAlloc(self: *ObjectStore, alloc: std.mem.Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
         return try self.getRangeAllocWithCancellation(alloc, artifact_id, offset, len, .none);
     }
@@ -668,6 +697,7 @@ pub const ObjectStore = struct {
         .reclaim_retired_scoped_inventory = erasedReclaimRetiredScopedInventory,
         .get_alloc = erasedGetAlloc,
         .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
+        .get_bounded_alloc_with_cancellation = erasedGetBoundedAllocWithCancellation,
         .get_range_alloc = erasedGetRangeAlloc,
         .get_range_alloc_with_cancellation = erasedGetRangeAllocWithCancellation,
         .get_verified_range_alloc_with_cancellation = erasedGetVerifiedRangeAllocWithCancellation,
@@ -720,6 +750,11 @@ pub const ObjectStore = struct {
     fn erasedGetAllocWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, cancellation: CancellationToken) ![]u8 {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return try self.getAllocWithCancellation(alloc, artifact_id, cancellation);
+    }
+
+    fn erasedGetBoundedAllocWithCancellation(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, expected_len: usize, cancellation: CancellationToken) ![]u8 {
+        const self: *ObjectStore = @ptrCast(@alignCast(ptr));
+        return self.getBoundedAllocWithCancellation(alloc, artifact_id, expected_len, cancellation);
     }
 
     fn erasedGetRangeAlloc(ptr: *anyopaque, alloc: std.mem.Allocator, artifact_id: []const u8, offset: u64, len: usize) ![]u8 {
@@ -924,7 +959,8 @@ test "objectstore-backed artifact readers preserve bucket provisioning authority
     var memory = objectstore.MemoryClient.init(alloc);
     defer memory.deinit();
     try std.testing.expectError(error.ArtifactBucketNotFound, ObjectStore.initWithClientOptions(alloc, memory.client(), "missing-bucket", "tenant/a", .{}));
-    try std.testing.expect(!(try memory.client().bucketExists("missing-bucket")));
+    var memory_client = memory.client();
+    try std.testing.expect(!(try memory_client.bucketExists("missing-bucket")));
     var impl = try ObjectStore.initWithClientOptions(alloc, memory.client(), "artifact-bucket", "tenant/a", .{ .ensure_bucket = true });
     defer impl.deinit();
     var reader = try ObjectStore.initWithClientOptions(alloc, memory.client(), "artifact-bucket", "tenant/a", .{ .read_only = true });
@@ -983,9 +1019,11 @@ test "serverless objectstore-backed artifacts preserve distinct client and resul
     try std.testing.expectEqual(@as(u64, "allocator-safe".len), stat.byte_len);
     try store.verifyContentWithCancellationUsingAllocator(result_alloc, meta.artifact_id, meta.byte_len, meta.checksum, .none);
 
-    var query_buffer: [1024]u8 = undefined;
-    var query_fba = std.heap.FixedBufferAllocator.init(&query_buffer);
-    const query_alloc = query_fba.allocator();
+    // A fixed buffer only reclaims its tail, so its cursor cannot prove that
+    // metadata freed before a retained body was released is leak-free.
+    var query_budget = @import("antfly_local_sources").storage_test_allocator.BoundedAllocator.init(result_alloc, 1024);
+    defer std.debug.assert(query_budget.deinit() == 0);
+    const query_alloc = query_budget.allocator();
     const verified = try store.getVerifiedAllocWithCancellationUsingAllocator(
         query_alloc,
         meta.artifact_id,
@@ -993,9 +1031,9 @@ test "serverless objectstore-backed artifacts preserve distinct client and resul
         meta.checksum,
         .none,
     );
-    try std.testing.expect(query_fba.ownsSlice(verified));
+    try std.testing.expectEqual(verified.len, query_budget.live);
     query_alloc.free(verified);
-    try std.testing.expectEqual(@as(usize, 0), query_fba.end_index);
+    try std.testing.expectEqual(@as(usize, 0), query_budget.live);
 
     const key = try keyForChecksumAlloc(result_alloc, "tenant/a", meta.checksum);
     defer result_alloc.free(key);
@@ -1178,4 +1216,35 @@ fn cleanupTmp(path: [*:0]const u8) void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
+}
+
+test "external lake complete artifact reads avoid metadata probes and reject tampering" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var impl = try ObjectStore.initWithClient(alloc, memory.client(), "bucket", "cold");
+    var store = impl.artifactStore();
+    defer store.deinit();
+    var metadata = try store.put("verified");
+    defer metadata.deinit(alloc);
+    memory.resetOperationCount();
+    const body = try store.getVerifiedAllocWithCancellation(metadata.artifact_id, metadata.byte_len, metadata.checksum, .none);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("verified", body);
+    try std.testing.expectEqual(@as(u64, 1), memory.operationCount());
+    const key = try keyForArtifactIdAlloc(alloc, impl.prefix, metadata.artifact_id);
+    defer alloc.free(key);
+    var client = memory.client();
+    for ([_][]const u8{ "verified-extra", "short", "modified" }) |corrupt| {
+        var put = try client.putObject("bucket", key, corrupt, .{});
+        put.deinit(alloc);
+        try std.testing.expectError(error.ArtifactIntegrityMismatch, store.getVerifiedAllocWithCancellation(metadata.artifact_id, metadata.byte_len, metadata.checksum, .none));
+    }
+    var empty = try store.put("");
+    defer empty.deinit(alloc);
+    const empty_body = try store.getVerifiedAllocWithCancellation(empty.artifact_id, 0, empty.checksum, .none);
+    defer alloc.free(empty_body);
+    try std.testing.expectEqual(@as(usize, 0), empty_body.len);
+    try store.delete(empty.artifact_id);
+    try std.testing.expectError(error.FileNotFound, store.getVerifiedAllocWithCancellation(empty.artifact_id, 0, empty.checksum, .none));
 }

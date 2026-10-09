@@ -446,7 +446,11 @@ pub const TuplePlan = struct {
                 const shape = NumericKeys.parsePrefix(bytes[pos..], key.descending, .{ .bytes = @import("relational_index_limits.zig").max_stored_key_bytes -| pos }, &budget) catch |err| return if (err == error.InvalidSqlNumericKey) error.InvalidRelationalIndexKey else err;
                 pos += shape.consumed;
             } else {
-                const width: usize = if (key.column_type == .boolean) 1 else if (key.column_type == .datetime) 16 else 8;
+                const width: usize = switch (key.column_type) {
+                    .boolean => 1,
+                    .datetime => 16,
+                    else => 8,
+                };
                 if (width > bytes.len - pos) return error.InvalidRelationalIndexKey;
                 pos += width;
             }

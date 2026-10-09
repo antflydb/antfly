@@ -285,6 +285,7 @@ const mappings = [_]Mapping{
     .{ .status = .index_rebuilding, .err = error.IndexRebuilding },
     .{ .status = .incomplete_published_snapshot, .err = error.IncompletePublishedSnapshot },
     .{ .status = .distributed_query_unavailable, .err = error.DistributedQueryUnavailable },
+    .{ .status = .invalid_generated_tool_arguments, .err = error.InvalidGeneratedToolArguments },
     .{ .status = .storage_read_temporarily_unavailable, .err = error.StorageReadTemporarilyUnavailable },
     .{ .status = .identity_read_generation_changed, .err = error.IdentityReadGenerationChanged },
     .{ .status = .timeout, .err = error.Timeout },
@@ -734,6 +735,12 @@ const mappings = [_]Mapping{
     .{ .status = .row_policy_unsupported, .err = error.RowPolicyUnsupported },
     .{ .status = .raft_batch_write_outcome_unknown, .err = error.RaftBatchWriteOutcomeUnknown },
     .{ .status = .unsupported_raft_batch_protocol_version, .err = error.UnsupportedRaftBatchProtocolVersion },
+    .{ .status = .enrichment_retry_in_progress, .err = error.EnrichmentRetryInProgress },
+    .{ .status = .enrichment_wait_canceled, .err = error.EnrichmentWaitCanceled },
+    .{ .status = .enrichment_wait_timeout, .err = error.EnrichmentWaitTimeout },
+    .{ .status = .enrichment_worker_failed, .err = error.EnrichmentWorkerFailed },
+    .{ .status = .commit_visibility_not_satisfied, .err = error.CommitVisibilityNotSatisfied },
+    .{ .status = .commit_propagation_incomplete, .err = error.CommitPropagationIncomplete },
 };
 
 pub fn statusFromError(err: anyerror) abi.Status {
@@ -1005,5 +1012,22 @@ test "index readiness survives the local query and storage owner boundary" {
             return error.ExpectedReadinessFailure;
         };
         try std.testing.expectEqual(expected, transported);
+    }
+}
+
+test "committed visibility outcomes survive the storage owner boundary" {
+    for ([_]anyerror{
+        error.EnrichmentRetryInProgress,
+        error.EnrichmentWaitCanceled,
+        error.EnrichmentWaitTimeout,
+        error.EnrichmentWorkerFailed,
+        error.CommitVisibilityNotSatisfied,
+        error.CommitPropagationIncomplete,
+    }) |err| {
+        const failure = failureFromError(err, .storage_owner, abi.abi_version, 1);
+        try std.testing.expect(failure.status != .internal);
+        try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
+        try std.testing.expectError(err, statusToError(failure.status));
+        try std.testing.expectEqualStrings(@errorName(err), failure.errorName());
     }
 }
