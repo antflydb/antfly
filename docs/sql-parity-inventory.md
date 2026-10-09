@@ -2140,8 +2140,30 @@ legacy/indexed fold time of 32.46/0.478 ms for one-table distinct rows,
 0.171/0.139 ms for 32 hot rows. The distinct one-table indexed path allocated
 1.21 MB versus 0.54 MB cumulatively per fold; temporary hash storage is released
 before return. These are CPU/allocation microbenchmarks, not end-to-end SQL or
-storage throughput. Native session-integration validation remains in progress.
+storage throughput. Native session integration passes 51/51 build steps,
+including its new request-buffer allocation-fault test and 12 C-ABI SQL tests.
 No original parity disposition is changed by this infrastructure improvement.
+Native relation publication now has a separate v32 command carrying the ready
+cut, exact predecessor generation and membership-bound activation, never a
+sender-authored publication proof. Replica preparation authenticates source and
+candidate pages before the apply lock; pending evidence keeps the existing
+per-group Raft continuation unacknowledged. A publishing transaction rechecks
+the original applied position, job, source epoch and root, then swaps root/live
+manifest and adopts all native writers atomically. Raft checkpoint advancement
+is explicitly separated from the initially fenced proof position; earlier
+commands in the same batch can make publication a deterministic stale no-op.
+Published groups retain the v32 producer floor and reject activation downgrade.
+The command codec checks canonical ready states, epoch/incarnation binding,
+strict predecessor ordering, truncation and allocation faults. Native tests
+exercise 70-table multi-page receiver preparation, pre-v32 rejection, a stale
+batched source, first publication, duplicate commands, mutable live writes,
+root replacement, membership mismatch and reopen. Native publication passes
+47/47 build steps, 175 catalog tests and 22 linked tests. The expanded mixed-v31/
+v32 proposal and stale-admission checks pass with all 15 coordinator tests
+(50/50 build steps); inventory, formatting and whitespace checks also pass.
+Automatic coordinator publication remains deliberately
+unwired until independently prepared standby generation adoption is integrated;
+public SQL namespace resolution and its parity cases also remain unfinished.
 The owned table-cut projector can now combine an exact predecessor definition
 with a plan-fenced successor definition in expected linear time. It retains
 old-only active names, both owners for shared names and pending-only new names,

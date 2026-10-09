@@ -1427,6 +1427,140 @@ test "system catalog relation namespace transaction source epoch fences schema c
     try verifyReconciliationGroupTxn(&txn, group);
 }
 
+test "system catalog relation namespace transaction publication verifies replicas fences batched sources and adopts live writers atomically" {
+    const a = std.testing.allocator;
+    const r = relation_reconciliation;
+    const group: u64 = 41;
+    const identity = "01010101010101010101010101010101".*;
+    const adopted: topology_protocol.Activation = .{ .version = topology_protocol.relation_reconciliation_version, .incarnation = identity, .member_count = 3, .membership_fingerprint = @splat(7) };
+    var activated = adopted;
+    activated.version = topology_protocol.relation_publication_version;
+    const T = struct {
+        fn control(store: *RaftApplyStore, command: relation_control.Command) !void {
+            const bytes = try command.encodeAlloc(a);
+            defer a.free(bytes);
+            try store.applyStandaloneCommand(group, .{ .apply_relation_reconciliation = bytes });
+        }
+        fn activate(store: *RaftApplyStore, activation: topology_protocol.Activation) !void {
+            const bytes = try std.json.Stringify.valueAlloc(a, activation, .{});
+            defer a.free(bytes);
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = bytes });
+        }
+        fn wire(command: relation_control.Command) ![]u8 {
+            const bytes = try command.encodeAlloc(a);
+            defer a.free(bytes);
+            return encodeTransitionCommand(a, .{ .apply_relation_reconciliation = bytes });
+        }
+        fn epoch(store: *RaftApplyStore) !r.Epoch {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            return RaftApplyStore.relationSourceEpochTxn(&read, group);
+        }
+        fn retry(store: *RaftApplyStore, entries: []const raft_engine.core.Entry, baseline: u64) !usize {
+            for (0..32) |attempt| {
+                var outcome = MetadataReplayTest.apply(store, group, entries) catch |err| {
+                    if (err != error.CatalogPublicationProofPending) return err;
+                    try std.testing.expectEqual(baseline, try store.durableAppliedIndex(group));
+                    continue;
+                };
+                outcome.deinit();
+                return attempt;
+            }
+            return error.TestExpectedBoundedProgress;
+        }
+        fn live(store: *RaftApplyStore) !r.LiveRoot {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            return (try r.LiveStore(docstore.DocStore.Txn).open(&read, group)).?.root;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/verified-root", .{tmp.sub_path});
+    defer a.free(path);
+    var retained: r.LiveRoot = undefined;
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = identity });
+        for (1..71) |id| {
+            var name: [32]u8 = undefined;
+            try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = id, .name = try std.fmt.bufPrint(&name, "t{d:0>4}", .{id}), .schema_json = "{}" } });
+        }
+        try T.activate(&store, adopted);
+        try T.control(&store, .{ .adopt = adopted });
+        const first = try reconcileRestoreNamesForTest(&store, a, try r.State.init(group, try r.nextJobId(null), try T.epoch(&store)));
+        const first_wire = try T.wire(.{ .publish = .{ .state = first, .activation = activated } });
+        defer a.free(first_wire);
+        _ = try T.retry(&store, &.{.{ .term = 1, .index = 1, .data = first_wire }}, 0);
+        try std.testing.expect((try store.relationReconciliationWork(group)).root == null);
+        try T.activate(&store, activated);
+        // Earlier producer commands in a batch invalidate its prepared proof,
+        // even though publication runs after the new watermark was written.
+        const rename = try encodeTransitionCommand(a, .{ .upsert_table = .{ .table_id = 1, .name = "renamed", .schema_json = "{}" } });
+        defer a.free(rename);
+        try std.testing.expect(try T.retry(&store, &.{ .{ .term = 1, .index = 2, .data = rename }, .{ .term = 1, .index = 3, .data = first_wire } }, 1) >= 2);
+        try std.testing.expect((try store.relationReconciliationWork(group)).root == null);
+        {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect(!try RaftApplyStore.relationWriterEnabledTxn(&read, group));
+        }
+        const next = try r.State.init(group, try r.nextJobId(&first), try T.epoch(&store));
+        try T.control(&store, .{ .start = .{ .next = next, .prior = first } });
+        const second = try reconcileRestoreNamesForTest(&store, a, next);
+        const second_wire = try T.wire(.{ .publish = .{ .state = second, .activation = activated } });
+        defer a.free(second_wire);
+        try std.testing.expect(try T.retry(&store, &.{.{ .term = 1, .index = 4, .data = second_wire }}, 3) >= 2);
+        const live = try T.live(&store);
+        try std.testing.expect(live.generation.eql(r.Generation.of(&second)));
+        try std.testing.expectEqual(@as(u64, 70), live.claims);
+        {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            try std.testing.expect(try RaftApplyStore.relationWriterEnabledTxn(&read, group));
+            var registry = try RaftApplyStore.RelationRegistry(docstore.DocStore.Txn).init(a, &read, group);
+            try std.testing.expectEqual(@as(u64, 1), (try registry.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = "renamed" })).?.table_id);
+        }
+        _ = try T.retry(&store, &.{.{ .term = 1, .index = 5, .data = second_wire }}, 4);
+        try std.testing.expect(std.meta.eql(live, try T.live(&store)));
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "after", .schema_json = "{}" } });
+        const after = try T.live(&store);
+        try std.testing.expectEqual(live.sequence + 1, after.sequence);
+        try std.testing.expectEqual(live.claims, after.claims);
+        try T.activate(&store, adopted);
+        try std.testing.expect((try store.topologyActivation(group)).?.satisfies(activated));
+        // Rebuild/swap is O(1) at commit and preserves old-generation retirement.
+        const third_start = try r.State.init(group, try r.nextJobId(&second), try T.epoch(&store));
+        try T.control(&store, .{ .start = .{ .next = third_start, .prior = second } });
+        const third = try reconcileRestoreNamesForTest(&store, a, third_start);
+        var published = false;
+        for (0..32) |_| {
+            T.control(&store, .{ .publish = .{ .state = third, .prior = after.generation, .activation = activated } }) catch |err| {
+                if (err != error.CatalogPublicationProofPending) return err;
+                try std.testing.expect(std.meta.eql(after, try T.live(&store)));
+                continue;
+            };
+            published = true;
+            break;
+        }
+        try std.testing.expect(published);
+        retained = try T.live(&store);
+        try std.testing.expect(retained.generation.eql(r.Generation.of(&third)));
+        try std.testing.expectEqual(@as(u64, 1), retained.sequence);
+        var wrong = activated;
+        wrong.membership_fingerprint[0] ^= 1;
+        try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, T.control(&store, .{ .publish = .{ .state = third, .prior = after.generation, .activation = wrong } }));
+        try std.testing.expect(std.meta.eql(retained, try T.live(&store)));
+        try verifyRelationRecoveryForTest(&store, a, group);
+    }
+    var reopened = try RaftApplyStore.init(a, .{ .root_dir = path });
+    defer reopened.deinit();
+    try std.testing.expect(std.meta.eql(retained, try T.live(&reopened)));
+    try std.testing.expectEqual(@as(u64, 5), try reopened.durableAppliedIndex(group));
+    try verifyRelationRecoveryForTest(&reopened, a, group);
+}
+
 test "system catalog relation namespace transaction coordinator controls fence capability epoch and stale Raft proposals" {
     const a = std.testing.allocator;
     const r = relation_reconciliation;
@@ -9684,6 +9818,8 @@ pub const RaftApplyStore = struct {
     active_relation_page: ?*const relation_reconciliation.Page = null,
     active_relation_failure: ?*const relation_reconciliation.FailurePlan = null,
     active_relation_garbage: ?*const relation_reconciliation.GarbagePage = null,
+    active_relation_publication: ?*const RelationPublicationProof = null,
+    active_relation_initial_index: ?u64 = null,
     verified_catalog_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
     read_only: bool = false,
     hot_standby_gate: ?@import("antfly_local_sources").storage_db_replication_contract.WriteGate = null,
@@ -10473,6 +10609,7 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn applyStandaloneCommand(self: *RaftApplyStore, group_id: u64, command: TransitionCommand) !void {
+        var publication: ?RelationPublicationProof = null;
         var page: ?relation_reconciliation.Page = null;
         var failure: ?relation_reconciliation.FailurePlan = null;
         defer if (page) |*value| value.deinit();
@@ -10480,6 +10617,10 @@ pub const RaftApplyStore = struct {
         defer if (garbage) |*value| value.deinit();
         if (command == .apply_relation_reconciliation) {
             const intent = try relation_control.Command.decode(command.apply_relation_reconciliation);
+            if (intent == .publish) {
+                if (intent.publish.state.group_id != group_id) return error.InvalidRelationReconciliationCommand;
+                publication = try self.prepareRequestedRelationPublication(intent.publish);
+            }
             if (intent == .advance) {
                 if (intent.advance.group_id != group_id) return error.InvalidRelationReconciliationCommand;
                 page = self.prepareRelationReconciliationPage(self.alloc, intent.advance) catch |err| blk: {
@@ -10505,6 +10646,9 @@ pub const RaftApplyStore = struct {
         std.debug.assert(self.active_relation_garbage == null);
         self.active_relation_garbage = if (garbage) |*value| value else null;
         defer self.active_relation_garbage = null;
+        std.debug.assert(self.active_relation_publication == null);
+        self.active_relation_publication = if (publication) |*value| value else null;
+        defer self.active_relation_publication = null;
         try self.flushHotStandbyOutboxLocked();
         try self.lockHotStandbyTransition();
         var transition_locked = true;
@@ -16711,7 +16855,7 @@ pub const RaftApplyStore = struct {
         const mask = switch (tag) {
             .apply_relation_reconciliation => metadataSnapshotProjectionBit(.relation_source) | metadataSnapshotProjectionBit(.relation_reconciliation) |
                 metadataSnapshotProjectionBit(.relation_retirements) | metadataSnapshotProjectionBit(.relation_candidates) | metadataSnapshotProjectionBit(.relation_root) | metadataSnapshotProjectionBit(.relation_live) |
-                metadataSnapshotProjectionBit(.topology_activation) | metadataSnapshotProjectionBit(.metadata_incarnation),
+                metadataSnapshotProjectionBit(.relation_writer) | metadataSnapshotProjectionBit(.topology_activation) | metadataSnapshotProjectionBit(.metadata_incarnation),
             .apply_restore_staging => metadataSnapshotProjectionBit(.system_catalog) | metadataSnapshotProjectionBit(.restore_staging) | metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.range) | metadataSnapshotProjectionBit(.table_transition_fence) | metadataSnapshotProjectionBit(.catalog_revision),
             .publish_secret_collection => metadataSnapshotProjectionBit(.secret_collection),
@@ -17265,6 +17409,11 @@ pub const RaftApplyStore = struct {
             std.debug.assert(self.active_relation_garbage == null);
             self.active_relation_garbage = if (prepared.garbage) |*page| page else null;
             defer self.active_relation_garbage = null;
+            std.debug.assert(self.active_relation_publication == null and self.active_relation_initial_index == null);
+            self.active_relation_publication = if (prepared.publication) |*proof| proof else null;
+            self.active_relation_initial_index = applied_index;
+            defer self.active_relation_publication = null;
+            defer self.active_relation_initial_index = null;
             try self.projectEntriesTxn(&txn, group_id, decoded, applied_index);
         }
         if (outcome.failure) |err| return err;
@@ -17428,7 +17577,7 @@ pub const RaftApplyStore = struct {
         if (activation_bytes.len > 1024) return error.InvalidCatalogRecord;
         var activation = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, activation_bytes, .{});
         defer activation.deinit();
-        if (activation.value.version < topology_protocol.relation_reconciliation_version) return error.TableTopologyProtocolUpgradeRequired;
+        if (activation.value.version < command.requiredDecoderVersion()) return error.TableTopologyProtocolUpgradeRequired;
         if (activation.value.version > topology_protocol.current_version or activation.value.member_count == 0 or std.mem.allEqual(u8, &activation.value.membership_fingerprint, 0)) return error.InvalidCatalogRecord;
         const identity_bytes = (try stagingGet(txn, try metadataIncarnationKeyForGroup(&buf, group_id))) orelse return error.TableTopologyProtocolUpgradeRequired;
         const identity = (try decodeMetadataIncarnationRecord(identity_bytes)).incarnation;
@@ -17475,6 +17624,23 @@ pub const RaftApplyStore = struct {
                 _ = try page.apply(txn);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = try relation_reconciliation.retirementKey(&buf, expected.generation) });
             },
+            .publish => |request| {
+                if (request.state.group_id != group_id) return error.InvalidRelationReconciliationCommand;
+                if (!activation.value.satisfies(request.activation)) return error.TableTopologyProtocolUpgradeRequired;
+                const proof = self.active_relation_publication orelse return error.CatalogGenerationChanged;
+                if (!std.meta.eql(proof.state, request.state) or !std.meta.eql(proof.root, request.prior)) return error.CatalogGenerationChanged;
+                // Raft wrote the new checkpoint before projection. Its initial
+                // applied position was fenced before taking the write txn;
+                // comparing against the new watermark would reject every cut.
+                const initial = self.active_relation_initial_index orelse try durableAppliedIndexTxn(txn, group_id);
+                if (initial != proof.applied_index or !try proof.matchesSourceTxn(txn)) return error.CatalogGenerationChanged;
+                const prior = if (try stagingGet(txn, try relation_reconciliation.liveKey(&buf, group_id))) |live_bytes| try relation_reconciliation.LiveRoot.decode(live_bytes) else null;
+                _ = try relation_reconciliation.publishVerifiedRoot(txn, request.state, try relationSourceEpochTxn(txn, group_id), prior);
+                try txn.put(try relationWriterKeyForGroup(&buf, group_id), "AFRW01");
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = try relation_reconciliation.rootKey(&buf, group_id) });
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = try relation_reconciliation.liveKey(&buf, group_id) });
+                self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = try relationWriterKeyForGroup(&buf, group_id) });
+            },
         }
     }
     const PreparedRelationBatch = struct {
@@ -17489,6 +17655,8 @@ pub const RaftApplyStore = struct {
         garbage: ?relation_reconciliation.GarbagePage = null,
         garbage_intent: ?relation_reconciliation.Retirement = null,
         garbage_observed: ?relation_reconciliation.Retirement = null,
+        publication: ?RelationPublicationProof = null,
+        publication_attempted: bool = false,
         fn deinit(self: *@This()) void {
             if (self.page) |*page| page.deinit();
             if (self.garbage) |*page| page.deinit();
@@ -17543,6 +17711,16 @@ pub const RaftApplyStore = struct {
             var decoded = (try decodeTransitionCommand(self.alloc, entry.data)).?;
             defer decoded.deinit(self.alloc);
             const intent = try relation_control.Command.decode(decoded.apply_relation_reconciliation);
+            if (intent == .publish) {
+                const request = intent.publish;
+                if (request.state.group_id != group) return error.InvalidRelationReconciliationCommand;
+                if (!result.engaged) result = try PreparedRelationBatch.capture(&read, group);
+                if (!result.publication_attempted) {
+                    result.publication_attempted = true;
+                    result.publication = try self.prepareRequestedRelationPublication(request);
+                }
+                continue;
+            }
             if (intent == .garbage) {
                 const expected = intent.garbage;
                 if (expected.generation.group_id != group) return error.InvalidRelationReconciliationCommand;
@@ -17607,6 +17785,10 @@ pub const RaftApplyStore = struct {
         fn matchesTxn(self: *const @This(), txn: *docstore.DocStore.Txn) !bool {
             const group = self.state.group_id;
             if (try durableAppliedIndexTxn(txn, group) != self.applied_index) return false;
+            return self.matchesSourceTxn(txn);
+        }
+        fn matchesSourceTxn(self: *const @This(), txn: *docstore.DocStore.Txn) !bool {
+            const group = self.state.group_id;
             if (!(try relationSourceEpochTxn(txn, group)).eql(self.state.epoch)) return false;
             var buf: [128]u8 = undefined;
             const job = (try stagingGet(txn, try relation_reconciliation.jobKey(&buf, group))) orelse return false;
@@ -17620,6 +17802,24 @@ pub const RaftApplyStore = struct {
     // Replica-local evidence survives leadership changes, but never a changed
     // applied position, source epoch, ready seal or root identity.
     pub const RelationPublicationPool = relation_worker.PublicationProofPool(RelationPublicationScan, RelationPublicationProof, 8, 2);
+
+    fn prepareRequestedRelationPublication(self: *RaftApplyStore, request: relation_control.Publication) !?RelationPublicationProof {
+        var read = try self.store.beginReadTxn();
+        defer read.abort();
+        const observed = try PreparedRelationBatch.capture(&read, request.state.group_id);
+        if (!std.meta.eql(observed.job, @as(?relation_reconciliation.State, request.state)) or observed.epoch == null or
+            !observed.epoch.?.eql(request.state.epoch) or !std.meta.eql(observed.root, request.prior)) return null;
+        var buf: [160]u8 = undefined;
+        const raw = (try stagingGet(&read, try topologyActivationKeyForGroup(&buf, request.state.group_id))) orelse return null;
+        if (raw.len > 1024) return error.InvalidCatalogRecord;
+        var activation = try std.json.parseFromSlice(topology_protocol.Activation, self.alloc, raw, .{});
+        defer activation.deinit();
+        if (!activation.value.satisfies(request.activation)) return null;
+        return self.requireRelationPublicationProof(request.state, platform_time.monotonicNs()) catch |err| switch (err) {
+            error.CatalogGenerationChanged => null,
+            else => return err,
+        };
+    }
 
     /// Advance at most one bounded source/candidate page, outside apply_mutex.
     /// null is pending evidence, not publication authority. Final apply must
@@ -19020,6 +19220,7 @@ pub const RaftApplyStore = struct {
                 const incarnation_bytes = try txn.get(try metadataIncarnationKeyForGroup(&key_buf, group_id));
                 if (!std.meta.eql((try decodeMetadataIncarnationRecord(incarnation_bytes)).incarnation, activation.incarnation)) return;
                 if (try relation_reconciliation.readSourceRevision(txn, group_id) != 0 and activation.version < topology_protocol.relation_reconciliation_version) return;
+                if (try stagingGet(txn, try relation_reconciliation.liveKey(&key_buf, group_id)) != null and activation.version < topology_protocol.relation_publication_version) return;
                 try txn.put(try topologyActivationKeyForGroup(&key_buf, group_id), bytes);
             },
             .apply_relation_reconciliation => |bytes| try self.applyRelationControlTxn(txn, group_id, bytes),

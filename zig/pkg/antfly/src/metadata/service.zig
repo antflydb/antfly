@@ -3258,7 +3258,10 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
-    if (command == .apply_relation_reconciliation) return metadata_topology_protocol.relation_reconciliation_version;
+    if (command == .apply_relation_reconciliation) {
+        const intent = @import("relation_reconciliation_command.zig").Command.decode(command.apply_relation_reconciliation) catch return metadata_topology_protocol.current_version;
+        return intent.requiredDecoderVersion();
+    }
     const object_engine = switch (command) {
         .upsert_table => |table| table.storage.engine == .object,
         .compare_and_replace_table => |cas| cas.expected.storage.engine == .object or cas.replacement.storage.engine == .object,
@@ -3375,7 +3378,12 @@ fn relationSourceDecoderFloor(service: anytype) !u16 {
     if (comptime @hasDecl(@TypeOf(service.*), "projectedStore")) {
         if (service.projectedStore()) |store| {
             if (comptime @hasDecl(@TypeOf(store.*), "relationSourceTrackingActive")) {
-                if (try store.relationSourceTrackingActive(service.metadata_group_id)) return metadata_topology_protocol.relation_reconciliation_version;
+                if (try store.relationSourceTrackingActive(service.metadata_group_id)) {
+                    if (comptime @hasDecl(@TypeOf(store.*), "relationReconciliationWork")) {
+                        if ((try store.relationReconciliationWork(service.metadata_group_id)).root != null) return metadata_topology_protocol.relation_publication_version;
+                    }
+                    return metadata_topology_protocol.relation_reconciliation_version;
+                }
             }
         }
     }
@@ -13002,8 +13010,17 @@ test "relational topology admission rejects lifecycle proposals before encoding 
         source: Source = .{},
         const Source = struct {
             tracked: bool = false,
+            published: bool = false,
             pub fn relationSourceTrackingActive(self: *@This(), _: u64) !bool {
                 return self.tracked;
+            }
+            pub fn relationReconciliationWork(self: *@This(), group: u64) !@import("antfly_local_sources").system_catalog_relation_reconciliation.Work {
+                const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
+                var identity: [16]u8 = undefined;
+                _ = try std.fmt.hexToBytes(&identity, "0123456789abcdef0123456789abcdef");
+                var state = try r.State.init(group, try r.nextJobId(null), .{ .incarnation = identity, .revision = 1 });
+                state.phase = .ready;
+                return .{ .epoch = if (self.tracked) state.epoch else null, .current = if (self.published) state else null, .root = if (self.published) r.Generation.of(&state) else null };
             }
         };
         pub fn projectedStore(self: *@This()) ?*Source {
@@ -13195,6 +13212,32 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try ensureCoordinatedDecoderWithContext(&source_peers, legacy, .{});
     try source_peers.propose(&.{legacy});
     try std.testing.expectEqual(@as(usize, 2), source_peers.appended);
+    const before_publication = try prepareCoordinatedDecoderAdmission(&source_peers, &.{legacy});
+    source_peers.source.published = true;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, validateRelationSourceDecoderFloor(&source_peers, before_publication));
+    source_peers.cache.cached = null;
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&source_peers, legacy, .{}));
+    source_peers.member_versions = &.{ 32, 32, 32 };
+    try ensureCoordinatedDecoderWithContext(&source_peers, legacy, .{});
+    try source_peers.propose(&.{legacy});
+    try std.testing.expectEqual(@as(usize, 3), source_peers.appended);
+    const r = @import("antfly_local_sources").system_catalog_relation_reconciliation;
+    const readiness = try Fake.proof(metadata_topology_protocol.relation_publication_version);
+    var epoch_identity: [16]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&epoch_identity, &readiness.metadata_incarnation.?);
+    var ready = try r.State.init(42, try r.nextJobId(null), .{ .incarnation = epoch_identity, .revision = 1 });
+    ready.phase = .ready;
+    const publish_bytes = try (@import("relation_reconciliation_command.zig").Command{ .publish = .{ .state = ready, .activation = .{ .version = readiness.required_version, .incarnation = readiness.metadata_incarnation.?, .member_count = readiness.protected_member_count, .membership_fingerprint = readiness.protected_membership_fingerprint } } }).encodeAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(publish_bytes);
+    const publication: metadata_storage.TransitionCommand = .{ .apply_relation_reconciliation = publish_bytes };
+    var publication_peers: Fake = .{ .member_versions = &.{ 32, 31, 32 } };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, ensureCoordinatedDecoderWithContext(&publication_peers, publication, .{}));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, publication_peers.propose(&.{publication}));
+    try std.testing.expectEqual(@as(usize, 0), publication_peers.appended);
+    publication_peers.member_versions = &.{ 32, 32, 32 };
+    try ensureCoordinatedDecoderWithContext(&publication_peers, publication, .{});
+    try publication_peers.propose(&.{publication});
+    try std.testing.expectEqual(@as(usize, 1), publication_peers.appended);
 }
 
 test "relational topology admission requires metadata decoder capability beyond framed status" {
