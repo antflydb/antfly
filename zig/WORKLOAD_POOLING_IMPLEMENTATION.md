@@ -2041,10 +2041,20 @@ the shared mutex even when the unused owned mutex is held. The focused HA
 admission suite passes 15 selected checks (12 default-runner and 3 local-runner).
 
 These fixes require independent archive/API/DB verification. The live cumulative
-snapshot also failed its provisioned-owner text-statistics assertion (expected
-four documents, observed three); the existing physical binary reproduces it.
-The fixture now prints the exact statistics on that failure without relaxing
-the assertion. Its indexing/synchronization cause remains unresolved. The live
-and queued validation snapshots retain their original source and HEAD. Full
-runtime resource, performance, cleanup/fairness and automatic-default gates
-remain open; Linux validation remains unavailable after Docker recovery failed.
+snapshot also failed its provisioned-owner runtime-status document-count
+assertion (expected four, observed three). Debugger inspection places the failure
+at the later runtime-status assertion, after the text-statistics assertion has
+passed. The earlier attribution to text statistics was incorrect. The same
+binary passes under debugger timing at the runtime-status assertion.
+
+The fixture accepts both single-document and range artifact reprocessing before
+sampling runtime status. The production reprocessing path explicitly skips the
+postcommit visibility wait; its success proves acceptance, not complete derived
+index publication. The fixture now uses the existing full-index synchronization
+barrier after reprocessing before demanding the exact serving count. The count
+assertion remains four, and public reprocessing retains its acceptance semantics.
+This correction still requires physical compiled-owner validation; debugger
+timing alone does not qualify it. Live and queued snapshots retain their original
+source and HEAD. Full runtime resource, performance, cleanup/fairness and
+automatic-default gates remain open; Linux validation remains unavailable after
+Docker recovery failed.

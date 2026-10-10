@@ -1335,9 +1335,6 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     switch (text_stats) {
         .fields => |fields| {
             try std.testing.expectEqual(@as(usize, 1), fields.fields.len);
-            if (fields.fields[0].global_doc_count != 4) {
-                std.debug.print("compiled owner text statistics after bulk finish and full-index synchronization: {s}\n", .{text_stats_response.json});
-            }
             try std.testing.expectEqual(@as(u32, 4), fields.fields[0].global_doc_count);
             try std.testing.expectEqual(@as(u32, 1), fields.fields[0].term_doc_freqs[0].doc_freq);
         },
@@ -1618,10 +1615,18 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqual(@as(u64, 7001), lease_capture.last_group_id);
     try std.testing.expect(owner_source.cacheStats().hit_count > initial_cache_stats.hit_count);
 
+    // Public artifact reprocessing accepts the rewrite without waiting for
+    // derived visibility. The exact serving count below requires that later
+    // generation to finish, including the range reprocess above.
+    try owner_source.waitForCurrentSyncGroupLocal(7001, "articles", .full_index);
+
     var statuses = (try write_source.source().localRuntimeStatuses(alloc, "articles")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);
     try std.testing.expectEqual(@as(u64, 7001), statuses.items[0].group_id);
+    if (statuses.items[0].stats.doc_count != 4) {
+        std.debug.print("compiled owner status after reprocessing visibility: docs={d} source_docs={d} freshness={t}\n", .{ statuses.items[0].stats.doc_count, statuses.items[0].stats.source_doc_count, statuses.items[0].metadata.freshness });
+    }
     try std.testing.expectEqual(@as(u64, 4), statuses.items[0].stats.doc_count);
     try std.testing.expectEqual(.live_writer_publish, statuses.items[0].metadata.source);
     try std.testing.expectEqual(.fresh, statuses.items[0].metadata.freshness);
