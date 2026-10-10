@@ -40,13 +40,41 @@
     "output_batch_max_rows": 4096,
     "single_column_measured_peak_bytes": 4065504,
     "single_column_allocator_budget_bytes": 5592404,
-    "regional_rerun_status": "building_optimized_binary"
+    "regional_rerun_status": "failed_before_queries",
+    "binary_sha256": "3ec9dae11634327ad77cbd37ab8e76ca6608943fb9445026a247750ad7949e2e",
+    "target": "x86_64-linux-musl",
+    "optimization": "fast"
   },
   "budget": {
     "approved_ceiling_usd": 150,
     "prior_work_reserved_usd": 25,
     "first_attempt_reserved_usd": 20,
-    "second_attempt_reserved_usd": 0,
+    "second_attempt_reserved_usd": 20,
     "note": "Reservations are conservative allowances, not measured cloud billing."
+  },
+  "rerun": {
+    "revision": "235f9f16c7b5e6bc857ba74b6a87e72f67ad307c",
+    "resources": {
+      "cpu": 8,
+      "memory_gib": 48,
+      "disk_gib": 10
+    },
+    "status": "failed_before_queries",
+    "stage": "index_build",
+    "error": "SqlProgramLimitExceeded",
+    "table_registration_ms": 41870.0,
+    "elapsed_since_build_start_seconds": 195.33,
+    "build_peak_rss_bytes": 182185984,
+    "latencies": null,
+    "pod_deleted": true,
+    "derived_objects_deleted": 78,
+    "derived_bytes_deleted": 144166
+  },
+  "next_blocker": {
+    "shape": "Archive-wide replay capture inherits a 1 GiB SQL spill limit before native index construction.",
+    "diagnosis": "Static build-path diagnosis consistent with SqlProgramLimitExceeded; the runtime failure does not identify the exact limit site.",
+    "replay_path": "zig/pkg/antfly/src/api/lake_index_build_replay.zig",
+    "spill_path": "zig/pkg/antfly-embedded/src/sql/spill.zig",
+    "required_work": "Bound replay lifetime to file/cohort windows, release each completed window, and checkpoint resumable publication; requalify construction and queries."
   }
 }

@@ -629,7 +629,7 @@ archive qualification. The configuration targets the pinned 47,717,307-row
 export; an expired or changed source requires a newly reviewed inventory/config.
 The temporary bucket is unsuitable for the public service's durable storage.
 
-### October 10 full-archive baseline
+### October 10 full-archive results
 
 [archive-results-20261010.json](archive-results-20261010.json) records the pinned
 47,717,307-row raw export and the merged-main Linux `fast` attempt. Registration
@@ -644,5 +644,16 @@ materialization limits remain in force. A 12-column, 145,186-row regression
 covers cached/uncached reads and correct references across 4,096-row batches;
 one column's measured allocation peak was 4,065,504 bytes within its combined
 5,592,404-byte payload/structure allowance. The 132 focused Parquet and 31 lake
-SQL tests passed. The optimized cloud rerun must complete before archive latency
-can be claimed.
+SQL tests passed.
+
+The fixed optimized rerun passed the original decoder failure but stopped during
+construction with `SqlProgramLimitExceeded` after 195.3 seconds, with 174 MiB
+peak RSS. Registration took 41.9 seconds. Static inspection points to the
+archive-wide replay capture inheriting SQL’s 1 GiB spill limit; the runtime
+error does not identify the exact limit site. The second pod and 78 derived
+objects were deleted. No search latency was measured in either attempt.
+
+The next engine step is bounded file/cohort replay with release and resumable
+publication, followed by another qualification run. Both configured attempts
+are consumed; the ledger retains $65 in conservative allowances, including
+prior work. Reconcile charges and review a new run plan before further attempts.

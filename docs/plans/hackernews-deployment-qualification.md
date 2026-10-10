@@ -71,6 +71,30 @@ bucket's eight-day lifecycle removes them. Source data belongs to the earlier
 qualification and must not be deleted by this runner. No long-lived deployment
 may depend on this expiring bucket.
 
+## October 10 measured blockers
+
+The [recorded results](../../examples/hackernews/archive-results-20261010.json)
+contain two attempts over the same raw archive. Merged main rejected a large
+Parquet page with `ParquetRowGroupTooLarge`. The decoder fix eliminates redundant
+per-column row-reference arrays while retaining the existing materialization
+bounds; 132 Parquet and 31 lake SQL tests pass.
+
+The fixed rerun advanced past that failure and stopped with
+`SqlProgramLimitExceeded` after 195.3 seconds, using 174 MiB peak RSS. Static
+inspection points to archive-wide build replay inheriting the SQL spill
+manager’s 1 GiB limit; the error does not identify the exact limit site. Neither
+attempt reached SQL count or search benchmarks. Both pods and their uniquely
+scoped derived artifacts were deleted, preserving source objects.
+
+Replace whole-archive replay with bounded file/cohort windows shared across
+index consumers. Release a window after its consumers finish, persist completed
+contributions for resumable construction, and publish only after complete
+coverage and source/lease validation. Bound local disk independently of archive
+size and expose progress and the exhausted resource in failures. Raising the
+spill limit alone does not establish archive scalability. Repeat construction
+and the query matrix after this work; the two configured run allowances have
+been consumed.
+
 ## Current/history correctness gate
 
 Exercise the existing saved logical `hackernews` source with an explicit,
