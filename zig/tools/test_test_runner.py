@@ -46,6 +46,16 @@ class TestRunnerSelection(unittest.TestCase):
             'test "progress body" { try std.testing.io.sleep(.fromSeconds(2), .awake); }\n'
             'test "error logging" { std.log.err("visible error", .{}); }\n'
             'test "environment unavailable" { return error.SkipZigTest; }\n'
+            'test "debug allocator policy" { '
+            "const actual = std.debug.getDebugInfoAllocator(); "
+            "try std.testing.expectEqual(std.heap.c_allocator.ptr, actual.ptr); "
+            "try std.testing.expectEqual(std.heap.c_allocator.vtable, actual.vtable); "
+            "var frames: [8]usize = undefined; "
+            "for (0..2000) |_| { "
+            "const trace = std.debug.captureCurrentStackTrace(.{}, &frames); "
+            "try std.testing.expect(trace.return_addresses.len != 0); } }\n"
+            'test "diagnostic assertion failure" { try std.testing.expect(false); }\n'
+            'test "diagnostic memory leak" { _ = try std.testing.allocator.alloc(u8, 8); }\n'
         )
         cls.binary = root / "tests"
         subprocess.run(
@@ -82,6 +92,29 @@ class TestRunnerSelection(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+
+    def test_debug_allocator_reclaims_without_disabling_diagnostics(self):
+        result = subprocess.run(
+            [str(self.binary), "--test-filter", "debug allocator policy"],
+            text=True,
+            capture_output=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("1 passed", result.stderr)
+        for name, diagnostic in (
+            ("diagnostic assertion failure", "FAIL"),
+            ("diagnostic memory leak", "1 leaked"),
+        ):
+            result = subprocess.run(
+                [str(self.binary), "--test-filter", name],
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn(diagnostic, result.stderr)
+            self.assertIn("selection.zig", result.stderr)
 
     def test_required_execution_rejects_skips_but_inventory_still_lists(self):
         for required, owner, expected in (

@@ -69,8 +69,13 @@ pub const Plan = struct {
     }
 
     pub fn evaluateValue(self: *const Plan, alloc: Allocator, scratch: *std.ArrayList(u8), value: tuples.Value) !Truth {
+        return self.evaluateValueWithContext(alloc, scratch, value, null);
+    }
+
+    pub fn evaluateValueWithContext(self: *const Plan, alloc: Allocator, scratch: *std.ArrayList(u8), value: tuples.Value, context: ?*@import("../../sql/numeric_value.zig").Context) !Truth {
         scratch.clearRetainingCapacity();
-        const is_null = try self.tuple.appendValues(alloc, scratch, &.{value});
+        const is_null = try self.tuple.appendValuesWithContext(alloc, scratch, &.{value}, context);
+        if (context) |work| try work.charge(@min(scratch.items.len, self.operand.len));
         return self.compare(scratch.items, is_null);
     }
 

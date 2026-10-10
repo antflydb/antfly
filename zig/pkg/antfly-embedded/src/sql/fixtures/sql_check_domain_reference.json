@@ -1,0 +1,13 @@
+{
+  "reference": "PostgreSQL 18 wide CHECK assignments",
+  "blob_bytes": 614400,
+  "text_bytes": 1048577,
+  "entries": [
+    {"blob": "same", "text": "wide", "accepted": true},
+    {"blob": "other", "text": "wide", "accepted": false},
+    {"blob": "same", "text": "empty", "accepted": false},
+    {"blob": "null", "text": "wide", "accepted": true},
+    {"blob": "same", "text": "null", "accepted": true},
+    {"blob": "null", "text": "null", "accepted": true}
+  ]
+}

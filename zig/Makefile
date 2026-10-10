@@ -75,9 +75,16 @@ inference-e2e-models: ## Prefetch the curated inference E2E model set with `antf
 
 .PHONY: generate generated-check tls-compat-check openapi-generate openapi-check mcp-schema-fragments-generate mcp-schema-fragments-check snowball-generate snowball-check sql-grammar-generate sql-grammar-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
 
-generate: openapi-generate snowball-generate sql-grammar-generate cabi-header-generate ## Regenerate checked-in generated sources.
+generate: openapi-generate snowball-generate sql-grammar-generate cabi-header-generate source-catalog-generate ## Regenerate checked-in generated sources.
 
-generated-check: tls-compat-check openapi-check snowball-check sql-grammar-check cabi-header-check ## Check all checked-in generated sources are current.
+generated-check: tls-compat-check openapi-check snowball-check sql-grammar-check cabi-header-check source-catalog-check ## Check all checked-in generated sources are current.
+
+.PHONY: source-catalog-generate source-catalog-check
+source-catalog-generate:
+	$(SCRIPTS_PY) tools/check_storage_compilation.py --write-control-catalog
+
+source-catalog-check:
+	$(SCRIPTS_PY) tools/check_storage_compilation.py --check-control-catalog
 
 tls-compat-check: ## Verify the checked-in Zig TLS compatibility patch has not drifted.
 	@sh lib/httpx/src/tls/check_client_compat.sh

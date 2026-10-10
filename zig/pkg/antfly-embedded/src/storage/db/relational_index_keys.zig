@@ -40,7 +40,29 @@ pub const Value = union(enum) {
     datetime: i128,
     integer: i64,
     number: f64,
+    /// Borrowed canonical NUMERIC row bytes; display scale is not identity.
+    numeric: []const u8,
 };
+
+const NumericKeys = @import("../../common/sql_numeric_key_layout.zig");
+const NumericContext = @import("../../sql/numeric_value.zig").Context;
+const NumericBudget = struct {
+    remaining: u64 = @import("relational_index_limits.zig").max_stored_key_bytes,
+    shared: ?*NumericContext = null,
+    pub fn charge(self: *@This(), count: u64) !void {
+        if (count > self.remaining) return self.limit();
+        if (self.shared) |context| try context.charge(count);
+        self.remaining -= count;
+    }
+    pub fn limit(_: *@This()) anyerror {
+        return error.RelationalIndexKeyTooLarge;
+    }
+};
+
+fn numericSource(bytes: []const u8, budget: *NumericBudget) !NumericKeys.Source {
+    const view = try @import("../../common/sql_numeric_layout.zig").View.openWithBudget(bytes, .{ .bytes = @import("relational_index_limits.zig").max_stored_key_bytes }, budget);
+    return NumericKeys.Source.fromCanonicalRow(view);
+}
 
 const BoundKey = struct {
     ordinal: u32,
@@ -146,21 +168,12 @@ pub const TuplePlan = struct {
                 return error.RelationalIndexColumnNotFound else 0;
             const column_type = if (expression) |compiled| compiled.plan.result_kind else table_schema.relational_columns[ordinal].column_type;
             switch (column_type) {
-                .string, .blob, .boolean, .datetime, .integer, .number => {},
-                .json, .geopoint, .geoshape, .dense_vector => return error.UnsupportedRelationalIndexColumn,
+                .string, .blob, .boolean, .datetime, .integer, .number, .numeric => {},
+                .json, .geopoint, .geoshape, .dense_vector, .sql_array => return error.UnsupportedRelationalIndexColumn,
             }
             var fold_ascii = false;
             if (definition.collation) |collation| {
-                if (column_type != .string) return error.UnsupportedRelationalIndexCollation;
-                if (std.ascii.eqlIgnoreCase(collation, "C") or
-                    std.ascii.eqlIgnoreCase(collation, "POSIX") or
-                    std.ascii.eqlIgnoreCase(collation, "binary"))
-                {} else if (std.ascii.eqlIgnoreCase(collation, "ci") or
-                    std.ascii.eqlIgnoreCase(collation, "case_insensitive") or
-                    std.ascii.eqlIgnoreCase(collation, "antfly.case_insensitive"))
-                {
-                    fold_ascii = true;
-                } else return error.UnsupportedRelationalIndexCollation;
+                fold_ascii = try expressions.foldAsciiCollation(column_type, collation);
             }
             key.* = .{
                 .ordinal = @intCast(ordinal),
@@ -192,6 +205,16 @@ pub const TuplePlan = struct {
             if (key.expression) |expression| hasher.update(&expression.fingerprint);
             hasher.update(&.{ @backingInt(key.column_type), @intFromBool(key.descending), @intFromBool(key.nulls_first), @intFromBool(key.fold_ascii) });
         }
+        const has_sql_types = for (keys) |key| {
+            if (key.expression == null and table_schema.relational_columns[key.ordinal].sql_element_type != null) break true;
+        } else false;
+        if (has_sql_types) {
+            hasher.update("antfly:ordered-tuple:sql-types:v1\x00");
+            for (keys) |key| {
+                const kind = if (key.expression == null) table_schema.relational_columns[key.ordinal].sql_element_type else null;
+                hasher.update(&.{if (kind) |value| @backingInt(value) + 1 else 0});
+            }
+        }
         var fingerprint: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
         hasher.final(&fingerprint);
         return .{ .alloc = alloc, .layout = layout, .columns = table_schema.relational_columns, .keys = keys, .fingerprint = fingerprint };
@@ -214,6 +237,7 @@ pub const TuplePlan = struct {
             return std.mem.eql(u8, &expression.fingerprint, &rhs.fingerprint);
         }
         if (right.expression != null) return false;
+        if (self.columns[left.ordinal].sql_element_type != other.columns[right.ordinal].sql_element_type) return false;
         return std.mem.eql(u8, self.columns[left.ordinal].name, other.columns[right.ordinal].name);
     }
 
@@ -248,7 +272,8 @@ pub const TuplePlan = struct {
             const name = self.columns[original.ordinal].name;
             const ordinal = layout.ordinalForName(source.relational_columns, name) orelse
                 return error.RelationalIndexColumnNotFound;
-            if (source.relational_columns[ordinal].column_type != original.column_type)
+            if (source.relational_columns[ordinal].column_type != original.column_type or
+                source.relational_columns[ordinal].sql_element_type != self.columns[original.ordinal].sql_element_type)
                 return error.RelationalIndexColumnTypeMismatch;
             key.ordinal = @intCast(ordinal);
             initialized += 1;
@@ -268,13 +293,19 @@ pub const TuplePlan = struct {
     /// physical bytes. This also supplies the equality representation for
     /// composite constraint claims and FK probes.
     pub fn appendValues(self: TuplePlan, alloc: Allocator, out: *std.ArrayList(u8), values: []const Value) !bool {
+        return self.appendValuesWithContext(alloc, out, values, null);
+    }
+
+    /// Preserve per-key size limits while charging aggregate work to the row.
+    /// Failure leaves the caller's previously encoded prefix unchanged.
+    pub fn appendValuesWithContext(self: TuplePlan, alloc: Allocator, out: *std.ArrayList(u8), values: []const Value, context: ?*NumericContext) !bool {
         if (values.len > self.keys.len) return error.InvalidRelationalIndexBound;
         const start = out.items.len;
         errdefer out.shrinkRetainingCapacity(start);
         var has_null = false;
         for (values, self.keys[0..values.len]) |value, key| {
             if (value == .null) has_null = true;
-            try appendValue(alloc, out, start, key, value);
+            try appendValueWithContext(alloc, out, start, key, value, context);
         }
         return has_null;
     }
@@ -303,7 +334,7 @@ pub const TuplePlan = struct {
         const inputs = try alloc.alloc(?usize, self.columns.len);
         errdefer alloc.free(inputs);
         @memset(inputs, null);
-        const values = try alloc.alloc(Value, self.columns.len);
+        const values = try alloc.alloc(expressions.Value, self.columns.len);
         errdefer alloc.free(values);
         @memset(values, .null);
         const needed = try alloc.alloc(bool, self.columns.len);
@@ -345,7 +376,7 @@ pub const TuplePlan = struct {
             if (key.expression) |expression| {
                 // The tuple's layout/column-pointer fence above certifies the
                 // expression compiler's ordinals, including cold projections.
-                const value = try expression.plan.evaluateBoundRowWithBudget(scratch.allocator(), row, &expression_budget);
+                const value = (try expression.plan.evaluateBoundRowWithBudget(scratch.allocator(), row, &expression_budget)).scalar(Value) catch return error.UnsupportedRelationalIndexColumn;
                 // Borrowed column/literal results allocate nothing in the
                 // evaluator but still expand the physical key. Charge that
                 // output before appending, including worst-case escaping.
@@ -379,6 +410,7 @@ pub const TuplePlan = struct {
                 .datetime => .{ .datetime = value.u64_val },
                 .integer => .{ .integer = value.i64_val },
                 .number => .{ .number = value.f64_val },
+                .numeric => .{ .numeric = value.bytes_val },
                 else => unreachable,
             });
         }
@@ -409,6 +441,10 @@ pub const TuplePlan = struct {
                     if (escaped == marker) break;
                     if (escaped != ~marker) return error.InvalidRelationalIndexKey;
                 }
+            } else if (key.column_type == .numeric) {
+                var budget: NumericBudget = .{};
+                const shape = NumericKeys.parsePrefix(bytes[pos..], key.descending, .{ .bytes = @import("relational_index_limits.zig").max_stored_key_bytes -| pos }, &budget) catch |err| return if (err == error.InvalidSqlNumericKey) error.InvalidRelationalIndexKey else err;
+                pos += shape.consumed;
             } else {
                 const width: usize = switch (key.column_type) {
                     .boolean => 1,
@@ -428,7 +464,7 @@ pub const BatchKeys = struct {
     plan: TuplePlan,
     batch: @import("../rowsource/types.zig").ColumnBatch,
     inputs: []?usize,
-    values: []Value,
+    values: []expressions.Value,
     scratch: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *BatchKeys) void {
@@ -445,17 +481,29 @@ pub const BatchKeys = struct {
         // Only bound dependencies are decoded; unrelated wide columns stay in
         // their physical vectors. NULL slots are checked before dictionary IDs.
         for (self.inputs, self.plan.columns, self.values) |input, column, *value| {
-            value.* = if (input) |index| try vectorValue(self.batch.columns[index], column.column_type, row) else .null;
+            value.* = if (input) |index| blk: {
+                const vector = self.batch.columns[index];
+                // Array dependencies are logical operands, not ordered keys.
+                // The pinned schema owns element identity; payloads borrow the
+                // retained batch. NULLs must precede dictionary addressing.
+                if (vector.nulls.isNull(row)) break :blk .null;
+                if (column.column_type == .sql_array) break :blk .{ .sql_array = .{
+                    .element_type = column.sql_element_type orelse return error.RelationalIndexColumnTypeMismatch,
+                    .bytes = try vector.bytesAt(row),
+                } };
+                break :blk expressions.Value.fromScalar(try vectorValue(vector, column.column_type, row));
+            } else .null;
         }
         var budget: usize = expressions.max_allocated_bytes;
         var has_null = false;
         for (self.plan.keys) |key| {
             const value = if (key.expression) |expression|
-                try expression.plan.evaluateWithBudget(self.scratch.allocator(), self.values, &budget)
+                (try expression.plan.evaluateWithBudget(self.scratch.allocator(), self.values, &budget)).scalar(Value) catch return error.UnsupportedRelationalIndexColumn
             else
-                self.values[key.ordinal];
+                self.values[key.ordinal].scalar(Value) catch return error.UnsupportedRelationalIndexColumn;
             const bytes: usize = switch (value) {
                 .string, .blob => |s| s.len *| 2 +| 3,
+                .numeric => |s| s.len +| 1,
                 .null => 1,
                 .datetime => 17,
                 .boolean => 2,
@@ -475,6 +523,7 @@ fn vectorValue(vector: @import("../rowsource/types.zig").ColumnVector, kind: sch
     return switch (kind) {
         .string => .{ .string = try vector.bytesAt(row) },
         .blob => .{ .blob = try vector.bytesAt(row) },
+        .numeric => .{ .numeric = try vector.bytesAt(row) },
         .integer => .{ .integer = try vector.integerAt(row) },
         .datetime => blk: {
             const value = try vector.integerAt(row);
@@ -494,17 +543,30 @@ fn vectorValue(vector: @import("../rowsource/types.zig").ColumnVector, kind: sch
 }
 
 fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, key: BoundKey, value: Value) !void {
+    return appendValueWithContext(alloc, out, tuple_start, key, value, null);
+}
+
+fn appendValueWithContext(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, key: BoundKey, value: Value, context: ?*NumericContext) !void {
+    if (context) |work| try work.charge(1);
+    var numeric_budget: NumericBudget = .{ .shared = context };
+    var numeric_source: ?NumericKeys.Source = null;
     const encoded_size: usize = switch (value) {
+        .numeric => |bytes| blk: {
+            numeric_source = try numericSource(bytes, &numeric_budget);
+            break :blk 1 + numeric_source.?.encodedSize();
+        },
         .null => 1,
         .boolean => 2,
         .string, .blob => |bytes| blk: {
             try @import("relational_index_limits.zig").admit(bytes.len);
+            if (context) |work| try work.charge(bytes.len);
             break :blk 3 + bytes.len + std.mem.count(u8, bytes, "\x00");
         },
         .datetime => 17,
         else => 9,
     };
     try @import("relational_index_limits.zig").admit(out.items.len - tuple_start +| encoded_size);
+    if (value != .numeric) if (context) |work| try work.charge(encoded_size);
     if (value == .null) {
         try out.append(alloc, if (key.nulls_first) @as(u8, 0) else 0xff);
         return;
@@ -512,6 +574,16 @@ fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, ke
     switch (value) {
         .null => unreachable,
         inline else => |_, tag| if (key.column_type != @field(schema.RelationalColumnType, @tagName(tag))) return error.InvalidRelationalIndexBound,
+    }
+    if (numeric_source) |source| {
+        try out.ensureUnusedCapacity(alloc, encoded_size);
+        const start = out.items.len;
+        out.items.len += encoded_size;
+        errdefer out.shrinkRetainingCapacity(start);
+        out.items[start] = 0x80;
+        var writer: std.Io.Writer = .fixed(out.items[start + 1 ..]);
+        try source.write(&writer, key.descending, &numeric_budget);
+        return;
     }
     try out.append(alloc, 0x80);
     var scalar: [16]u8 = undefined;
@@ -539,7 +611,7 @@ fn appendValue(alloc: Allocator, out: *std.ArrayList(u8), tuple_start: usize, ke
             std.mem.writeInt(u64, scalar[0..8], ordered, .big);
             break :blk scalar[0..8];
         },
-        .null => unreachable,
+        .null, .numeric => unreachable,
     };
     if (key.column_type == .string or key.column_type == .blob) {
         try appendVariableScalar(alloc, out, bytes, key.descending, key.fold_ascii);
@@ -900,6 +972,71 @@ test "relational tuple wide row allocation benchmark and append rollback" {
     try std.testing.expectEqualStrings("existing-prefix", output.items);
 }
 
+test "relational index system SQL tuples bind precise direct and expression domains across cold sources" {
+    const alloc = std.testing.allocator;
+    const old: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer, .sql_element_type = .int16 }} };
+    const current: schema.TableSchema = .{ .version = 2, .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer, .sql_element_type = .int32 }} };
+    var old_layout = try rows.PhysicalLayout.init(alloc, old);
+    defer old_layout.deinit();
+    var current_layout = try rows.PhysicalLayout.init(alloc, current);
+    defer current_layout.deinit();
+    for ([_]indexes.RelationalIndexKey{
+        .{ .column = "n" },
+        .{ .expression_json = "{\"op\":\"column\",\"column\":\"n\"}", .result_type = .integer },
+    }) |definition| {
+        var before = try TuplePlan.init(alloc, old, &old_layout, &.{definition});
+        defer before.deinit();
+        var after = try TuplePlan.init(alloc, current, &current_layout, &.{definition});
+        defer after.deinit();
+        try std.testing.expect(!std.mem.eql(u8, &before.fingerprint, &after.fingerprint));
+        try std.testing.expect(!before.sameEqualityKey(0, after, 0));
+        try std.testing.expectError(error.RelationalIndexColumnTypeMismatch, after.projectSource(alloc, old, &old_layout));
+        var same = try after.projectSource(alloc, current, &current_layout);
+        defer same.deinit();
+        try std.testing.expectEqualSlices(u8, &same.fingerprint, &after.fingerprint);
+        const cells = [_]rows.Cell{.{ .ordinal = 0, .path = "n", .value_type = .i64_val, .value = .{ .i64_val = 7 } }};
+        var old_tuple = try testTupleAlloc(alloc, before, old, &cells);
+        defer old_tuple.deinit(alloc);
+        var new_tuple = try testTupleAlloc(alloc, after, current, &cells);
+        defer new_tuple.deinit(alloc);
+        try std.testing.expectEqualSlices(u8, old_tuple.bytes, new_tuple.bytes);
+    }
+}
+
+test "relational index system array dependent scalar keys share cold dictionary and pinned row bytes" {
+    const a = std.testing.allocator;
+    const sources = @import("../rowsource/types.zig");
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .requires_array_expressions = true, .relational_columns = &.{
+        .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .int64 },
+    } };
+    var layout = try rows.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try TuplePlan.init(a, table, &layout, &.{.{ .expression_json = "{\"op\":\"is_null\",\"args\":[{\"op\":\"column\",\"column\":\"a\"}]}", .result_type = .boolean }});
+    defer plan.deinit();
+    try std.testing.expectError(error.UnsupportedRelationalIndexColumn, TuplePlan.init(a, table, &layout, &.{.{ .column = "a" }}));
+    const empty: []const u8 = &.{ 1, 0, 0, 0, 0, 0, 0, 0 };
+    const batch: sources.ColumnBatch = .{
+        .snapshot = .{ .table_id = "arrays", .snapshot_id = "one" },
+        .row_refs = &.{ .{ .relational_key = "one" }, .{ .relational_key = "two" } },
+        .columns = &.{.{ .name = "a", .nulls = .{ .bytes = &.{ 0, 1 } }, .values = .{ .dictionary_bytes = .{
+            .values = &.{empty},
+            .indices = &.{ 0, std.math.maxInt(u32) },
+        } } }},
+    };
+    var bound = try plan.bindBatch(a, batch);
+    defer bound.deinit();
+    var actual: std.ArrayList(u8) = .empty;
+    defer actual.deinit(a);
+    for (0..2) |i| {
+        actual.clearRetainingCapacity();
+        try std.testing.expect(!try bound.append(a, &actual, i));
+        const cells = [_]rows.Cell{.{ .ordinal = 0, .path = "a", .value_type = .bytes_val, .sql_array_element_type = .int64, .is_null = i == 1, .value = .{ .bytes_val = empty } }};
+        var expected = try testTupleAlloc(a, plan, table, &cells);
+        defer expected.deinit(a);
+        try std.testing.expectEqualSlices(u8, expected.bytes, actual.items);
+    }
+}
+
 test "relational tuple definition identity tracks semantics instead of epoch placement" {
     const alloc = std.testing.allocator;
     const columns = [_]schema.RelationalColumn{
@@ -943,11 +1080,114 @@ test "external lake relational index signed datetime bounds preserve epoch order
         defer encoded.deinit(a);
         _ = try plan.appendValues(a, &encoded, &.{.{ .datetime = ns }});
         try std.testing.expectEqual(@as(usize, 17), encoded.items.len);
+        try encoded.appendSlice(a, "document suffix");
+        try std.testing.expectEqual(@as(usize, 17), try plan.prefixLen(encoded.items));
+        encoded.shrinkRetainingCapacity(17);
         if (previous) |key| {
             try std.testing.expectEqual(std.math.Order.lt, std.mem.order(u8, key, encoded.items));
             a.free(key);
             previous = null;
         }
         previous = try a.dupe(u8, encoded.items);
+    }
+}
+
+test "relational index system shared tuple admission preserves prefixes on late quota and cancellation" {
+    const a = std.testing.allocator;
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "tenant", .path = "tenant", .column_type = .integer },
+        .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric },
+    } };
+    var layout = try rows.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var plan = try TuplePlan.init(a, table, &layout, &.{ .{ .column = "tenant" }, .{ .column = "n" } });
+    defer plan.deinit();
+    const number = try @import("../../sql/numeric_storage.zig").encodeJsonAlloc(a, .{ .string = "12345.6789" });
+    defer a.free(number);
+    const values = [_]Value{ .{ .integer = 7 }, .{ .numeric = number } };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try out.appendSlice(a, "keep");
+    var context: NumericContext = .{ .alloc = a };
+    try std.testing.expect(!try plan.appendValuesWithContext(a, &out, &values, &context));
+    const work = 8 * 1024 * 1024 - context.remaining;
+    try std.testing.expect(work > 1);
+    out.shrinkRetainingCapacity(4);
+    context = .{ .alloc = a, .remaining = work - 1 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, plan.appendValuesWithContext(a, &out, &values, &context));
+    try std.testing.expectEqualStrings("keep", out.items);
+    context.remaining = 8 * 1024 * 1024;
+    try std.testing.expectError(error.SqlProgramLimitExceeded, plan.appendValuesWithContext(a, &out, &values, &context));
+    const Cancel = struct {
+        fn poll(_: ?*anyopaque) anyerror!void {
+            return error.Canceled;
+        }
+    };
+    context = .{ .alloc = a, .checkpoint = Cancel.poll };
+    try std.testing.expectError(error.Canceled, plan.appendValuesWithContext(a, &out, &values, &context));
+    try std.testing.expectEqualStrings("keep", out.items);
+    context.checkpoint = null;
+    try std.testing.expectError(error.Canceled, plan.appendValuesWithContext(a, &out, &values, &context));
+}
+
+test "relational index system NUMERIC composite tuples match PostgreSQL ranks and borrow canonical coefficients" {
+    const a = std.testing.allocator;
+    const fixture = try std.json.parseFromSlice(struct {
+        entries: []const struct { input: []const u8, rank: usize },
+    }, a, @embedFile("../../sql/fixtures/sql_exact_numeric_key_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 235), fixture.value.entries.len);
+    const table: schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "tenant", .path = "tenant", .column_type = .integer },
+        .{ .name = "n", .path = "n", .column_type = .numeric, .sql_element_type = .numeric, .allows_null = true },
+    } };
+    var layout = try rows.PhysicalLayout.init(a, table);
+    defer layout.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    for ([_]bool{ false, true }) |descending| {
+        var plan = try TuplePlan.init(a, table, &layout, &.{ .{ .column = "tenant" }, .{ .column = "n", .direction = if (descending) .desc else .asc } });
+        defer plan.deinit();
+        const keys = try scratch.alloc([]const u8, fixture.value.entries.len);
+        for (fixture.value.entries, keys) |entry, *key| {
+            const wire = try @import("../../sql/numeric_storage.zig").encodeJsonAlloc(scratch, .{ .string = entry.input });
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(a);
+            try out.ensureTotalCapacity(a, 2 * wire.len + 64);
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            try std.testing.expect(!try plan.appendValues(failing.allocator(), &out, &.{ .{ .integer = 7 }, .{ .numeric = wire } }));
+            try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+            const tuple_len = out.items.len;
+            var from_row = try testTupleAlloc(a, plan, table, &.{
+                .{ .ordinal = 0, .path = "tenant", .value_type = .i64_val, .value = .{ .i64_val = 7 } },
+                .{ .ordinal = 1, .path = "n", .value_type = .bytes_val, .is_numeric = true, .value = .{ .bytes_val = wire } },
+            });
+            defer from_row.deinit(a);
+            try std.testing.expectEqualSlices(u8, out.items, from_row.bytes);
+            try out.appendSlice(a, "row suffix");
+            try std.testing.expectEqual(tuple_len, try plan.prefixLen(out.items));
+            key.* = try scratch.dupe(u8, out.items[0..tuple_len]);
+            out.clearRetainingCapacity();
+            var shared: NumericContext = .{ .alloc = failing.allocator() };
+            try std.testing.expect(!try plan.appendValuesWithContext(failing.allocator(), &out, &.{ .{ .integer = 7 }, .{ .numeric = wire } }, &shared));
+            try std.testing.expectEqualSlices(u8, key.*, out.items);
+            try std.testing.expect(shared.remaining < 8 * 1024 * 1024);
+            try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+        }
+        for (fixture.value.entries, keys) |left, left_key| for (fixture.value.entries, keys) |right, right_key| {
+            const expected = if (descending) std.math.order(right.rank, left.rank) else std.math.order(left.rank, right.rank);
+            try std.testing.expectEqual(expected, std.mem.order(u8, left_key, right_key));
+        };
+        var null_key: std.ArrayList(u8) = .empty;
+        defer null_key.deinit(a);
+        try std.testing.expect(try plan.appendValues(a, &null_key, &.{ .{ .integer = 7 }, .null }));
+        try std.testing.expectEqual(null_key.items.len, try plan.prefixLen(null_key.items));
+        for (keys) |key| try std.testing.expectEqual(descending, std.mem.lessThan(u8, null_key.items, key));
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try out.appendSlice(a, "keep");
+        try std.testing.expectError(error.InvalidSqlBinaryRepresentation, plan.appendValues(a, &out, &.{ .{ .integer = 7 }, .{ .numeric = &.{ 0, 1, 0, 0, 0, 0, 0, 0, 0x27, 0x10 } } }));
+        try std.testing.expectEqualStrings("keep", out.items);
     }
 }

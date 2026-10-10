@@ -31,6 +31,7 @@ const Entry = struct {
     external_base_source: ?@import("antfly_local_sources").serverless_external_source_schema_binding.OwnedExternalTableBinding = null,
     columns: []const catalog.Column = &.{},
     indexes: []const catalog.Index = &.{},
+    constraints: []const catalog.Constraint = &.{},
     refs: usize = 0,
     used: u64 = 0,
 };
@@ -84,7 +85,12 @@ pub const Cache = struct {
             for (index.columns, names) |name, *copy| copy.* = try alloc.dupe(u8, name);
             out.* = .{ .name = try alloc.dupe(u8, index.name), .columns = names };
         }
-        return .{ .external_base_source = if (entry.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.version, .storage_mode = entry.storage_mode, .columns = columns, .indexes = indexes };
+        const constraints = try alloc.alloc(catalog.Constraint, entry.constraints.len);
+        for (entry.constraints, constraints) |constraint, *out| {
+            out.* = constraint;
+            out.name = try alloc.dupe(u8, constraint.name);
+        }
+        return .{ .external_base_source = if (entry.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.version, .storage_mode = entry.storage_mode, .columns = columns, .indexes = indexes, .constraints = constraints };
     }
     fn acquire(self: *Cache, io: std.Io, json: []const u8) !*Entry {
         var digest: [32]u8 = undefined;
@@ -161,6 +167,7 @@ fn derive(entry: *Entry, json: []const u8) !void {
     const alloc = scratch.allocator();
     const owned = entry.arena.allocator();
     const parsed = try schema.parseValidatedTableSchema(alloc, json);
+    entry.constraints = try catalog.Constraint.derive(owned, parsed);
     if (parsed.storage_mode == .document) {
         entry.storage_mode = .document;
         entry.version = parsed.version;
@@ -186,13 +193,17 @@ fn derive(entry: *Entry, json: []const u8) !void {
         .path = try owned.dupe(u8, column.path),
         .nullable = !column.required or column.allows_null,
         .generated = generated.contains(column.name),
+        .element_type = column.sql_element_type,
+        .numeric_modifier = column.numeric_modifier,
         .type = @import("antfly_local_sources").sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
             .string => .string,
             .integer => .integer,
             .number => .number,
+            .numeric => .number,
             .boolean => .boolean,
             .datetime => .datetime,
             .json => .json,
+            .sql_array => .array,
             else => return error.UnsupportedSqlExecution,
         }),
     };
@@ -278,6 +289,68 @@ test "SQL schema cache pins direct total index candidates with the layout" {
     try std.testing.expectEqualStrings("tenant", table.indexes[1].columns[1]);
 }
 
+test "SQL schema cache owns named constraint kinds across eviction and allocation faults" {
+    const json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"selected_key","columns":["id"]},{"name":"later_key","columns":["id"],"deferrable":true}],"relational_indexes":[{"name":"access_only","keys":[{"column":"id"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const Faults = struct {
+        fn run(a: std.mem.Allocator, bytes: []const u8) !void {
+            var cache = Cache.init(a);
+            defer cache.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const table = try cache.resolve(std.testing.io, arena.allocator(), bytes, 1, "rows");
+            try std.testing.expectEqual(@as(usize, 2), table.constraints.len);
+            try std.testing.expectEqualStrings("selected_key", table.constraints[0].name);
+            try std.testing.expectEqual(.unique, table.constraints[0].kind);
+            try std.testing.expect(!table.constraints[0].deferrable);
+            try std.testing.expect(table.constraints[1].deferrable);
+            // Release every cache-owned schema; request descriptors must own
+            // their names, not borrow the temporary parser or cached arena.
+            for (&cache.slots) |*slot| if (slot.entry) |entry| {
+                cache.destroy(entry);
+                slot.* = .{};
+            };
+            try std.testing.expectEqualStrings("selected_key", table.constraints[0].name);
+            try std.testing.expectEqualStrings("later_key", table.constraints[1].name);
+        }
+    };
+    try Faults.run(std.testing.allocator, json);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{json});
+}
+
+test "SQL schema cache excludes index owned uniqueness from named constraint identity" {
+    const json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row",
+        \\"unique_constraints":[{"name":"named_key","columns":["id"]},{"name":"access_key","columns":["id"],"origin":"index"}],
+        \\"relational_indexes":[{"name":"access_key","keys":[{"column":"id"}],"description":"operator edited"}],
+        \\"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const Faults = struct {
+        fn run(a: std.mem.Allocator, bytes: []const u8) !void {
+            var cache = Cache.init(a);
+            defer cache.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const table = try cache.resolve(std.testing.io, arena.allocator(), bytes, 1, "rows");
+            try std.testing.expectEqual(@as(usize, 1), table.constraints.len);
+            try std.testing.expectEqualStrings("named_key", table.constraints[0].name);
+            try std.testing.expectEqual(@as(usize, 1), table.indexes.len);
+            try std.testing.expectEqualStrings("access_key", table.indexes[0].name);
+            // Catalog clones must keep both namespaces independent of parser
+            // retirement and cache eviction.
+            for (&cache.slots) |*slot| if (slot.entry) |entry| {
+                cache.destroy(entry);
+                slot.* = .{};
+            };
+            try std.testing.expectEqualStrings("named_key", table.constraints[0].name);
+            try std.testing.expectEqualStrings("access_key", table.indexes[0].name);
+        }
+    };
+    try Faults.run(std.testing.allocator, json);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{json});
+}
+
 test "SQL schema cache document shapes are declared stable unions" {
     var cache = Cache.init(std.testing.allocator);
     defer cache.deinit();
@@ -308,4 +381,34 @@ test "SQL schema cache preserves logical UUID over physical keywords" {
     , 7, "items");
     try std.testing.expectEqual(@import("antfly_local_sources").sql_ast.ColumnType.uuid, (try table.column("u")).type);
     try std.testing.expectEqual(@import("antfly_local_sources").sql_ast.ColumnType.string, (try table.column("label")).type);
+}
+
+test "SQL schema cache preserves every declared scalar builtin width through DDL" {
+    const alloc = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var create = try sources.sql_compiler.compile(a, "CREATE TABLE widths (t text, s smallint, i integer, b bigint, r real, d double precision, flag boolean, u uuid, j jsonb)", .{});
+    defer create.deinit();
+    const schema_json = try sources.sql_ddl_runtime.createSchemaAlloc(a, create.statement.create_table);
+    const table = try cache.resolve(std.testing.io, a, schema_json, 7, "widths");
+    const expected = [_]struct { name: []const u8, kind: sources.sql_array_value.ElementType, oid: u32 }{
+        .{ .name = "t", .kind = .text, .oid = 25 },
+        .{ .name = "s", .kind = .int16, .oid = 21 },
+        .{ .name = "i", .kind = .int32, .oid = 23 },
+        .{ .name = "b", .kind = .int64, .oid = 20 },
+        .{ .name = "r", .kind = .float32, .oid = 700 },
+        .{ .name = "d", .kind = .float64, .oid = 701 },
+        .{ .name = "flag", .kind = .boolean, .oid = 16 },
+        .{ .name = "u", .kind = .uuid, .oid = 2950 },
+        .{ .name = "j", .kind = .jsonb, .oid = 3802 },
+    };
+    for (expected) |entry| {
+        const column = try table.column(entry.name);
+        try std.testing.expectEqual(entry.kind, column.element_type.?);
+        try std.testing.expectEqual(entry.oid, column.element_type.?.oid());
+    }
 }

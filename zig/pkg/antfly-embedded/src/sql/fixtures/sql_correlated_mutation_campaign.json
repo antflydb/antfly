@@ -1,0 +1,13 @@
+{
+  "format": 1,
+  "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
+  "description": "Exact original non-key correlated and tuple membership mutations. Matching, mismatching, duplicate and SQL NULL witnesses must affect complete persisted-state assertions; source SQL is never rewritten.",
+  "entries": [
+    {"id": "sql-0600"},
+    {"id": "sql-0601"},
+    {"id": "sql-0602"},
+    {"id": "sql-0610"},
+    {"id": "sql-0611"},
+    {"id": "sql-0612"}
+  ]
+}

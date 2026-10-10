@@ -1,5 +1,8 @@
 import type {
   AntflyClient,
+  SQLArrayElementType,
+  SQLArrayValue,
+  SQLColumn,
   SQLConnectionOpenRequest,
   SQLConnectionResponse,
   SQLPreparedExecutionRequest,
@@ -34,6 +37,25 @@ void closeConnection;
 declare const prepared: SQLPreparedResponse;
 const exactOwner: string = prepared.owner_node_id;
 void exactOwner;
+
+const elementType: SQLArrayElementType = "int64";
+const arrayColumn: SQLColumn = { name: "items", type: "array", element_type: elementType };
+const exactArray: SQLArrayValue = {
+  dimensions: [{ length: 3, lower_bound: -2 }],
+  values: ["-9223372036854775808", "9223372036854775807", null],
+  sql_nulls: [false, false, true],
+};
+const jsonNulls: SQLArrayValue = {
+  dimensions: [{ length: 2, lower_bound: 1 }],
+  values: [null, null],
+  sql_nulls: [false, true],
+};
+void arrayColumn;
+void exactArray;
+void jsonNulls;
+// @ts-expect-error array descriptors use a supported PostgreSQL element type.
+const unsupportedElement: SQLArrayElementType = "decimal";
+void unsupportedElement;
 
 // Stored SQL and namespace are immutable authority of the resource.
 // @ts-expect-error execution cannot replace the stored statement.

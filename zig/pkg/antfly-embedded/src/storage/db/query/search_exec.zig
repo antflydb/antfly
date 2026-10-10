@@ -120,6 +120,9 @@ pub const PinnedTextSource = struct {
     owner: ?*anyopaque = null,
     release_owner: ?*const fn (*anyopaque) void = null,
     selected_field: ?[]const u8 = null,
+    /// Authenticated source fields present in every stored sidecar document.
+    /// Empty means no coverage proof; native document IDs alone are not one.
+    stored_projection_fields: []const []const u8 = &.{},
     /// Immutable provider metadata retained by release_owner's lease.
     provider_metadata: ?*const anyopaque = null,
     pub fn deinit(self: *PinnedTextSource) void {

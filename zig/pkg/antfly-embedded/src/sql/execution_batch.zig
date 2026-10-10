@@ -165,12 +165,17 @@ pub const Batch = union(enum) {
             .mapped => |v| blk: {
                 if (v.ordinals[column] == std.math.maxInt(usize)) break :blk .{};
                 const value = try v.source.cell(a, v.selection[index], v.ordinals[column]);
+                if (value.numeric != null) {
+                    if (v.kinds[column] != .number) return error.SqlTypeMismatch;
+                    break :blk value;
+                }
+                if (value.array != null) break :blk value;
                 break :blk .{ .value = try @import("describe.zig").coerceAlloc(a, value.value, v.kinds[column]), .sql_null = value.sql_null, .patterns = value.patterns };
             },
             .columns => |v| blk: {
                 const definition = v.definitions[column];
                 const value = try v.page.cell(a, index, definition.name);
-                break :blk .{ .value = try @import("describe.zig").coerceAlloc(a, value.value, definition.type), .sql_null = value.sql_null, .patterns = value.patterns };
+                break :blk try @import("describe.zig").coerceDatum(a, value, definition.type, definition.element_type);
             },
         };
     }
@@ -210,6 +215,20 @@ fn selectedDictionaryScenario(a: A) !void {
     defer a.free(reordered.dictionary.indices);
     for (0..mapped.len()) |row| try std.testing.expectEqualDeep(try mapped.cell(a, row, 0), try reordered.cell(a, row, 0));
 }
+test "SQL NUMERIC batch mappings borrow exact cells without placeholder coercion" {
+    var context: @import("numeric_value.zig").Context = .{ .alloc = std.testing.allocator };
+    var number = try @import("numeric_value.zig").parse(&context, "9007199254740993.1200");
+    defer number.deinit();
+    const source: Batch = .{ .rows = &.{ &.{scalar.Datum.typedNumeric(&number.value)}, &.{.{}} } };
+    var mapping: Batch = .{ .mapped = .{ .source = &source, .ordinals = &.{0}, .kinds = &.{.number}, .selection = &.{ 0, 1 } } };
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    const cell_ = try mapping.cell(none.allocator(), 0, 0);
+    try std.testing.expect(cell_.numeric == &number.value and !cell_.sql_null);
+    try std.testing.expect((try mapping.cell(none.allocator(), 1, 0)).sql_null);
+    mapping.mapped.kinds = &.{.string};
+    try std.testing.expectError(error.SqlTypeMismatch, mapping.cell(none.allocator(), 0, 0));
+}
+
 test "SQL dictionary traits preserve selected coercion and mapping through allocation failures" {
     try selectedDictionaryScenario(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, selectedDictionaryScenario, .{});

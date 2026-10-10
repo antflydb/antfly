@@ -340,6 +340,10 @@ pub const Session = struct {
     }
 
     fn describe(self: *Session, alloc: std.mem.Allocator, statement: []const u8, types: []const backend.Type) !backend.Description {
+        return self.describeTyped(alloc, statement, types, &.{});
+    }
+
+    fn describeTyped(self: *Session, alloc: std.mem.Allocator, statement: []const u8, types: []const backend.Type, descriptors: []const backend.Parameter) !backend.Description {
         if (try commands.settingCommand(alloc, statement)) |setting| {
             if (types.len != 0) return error.InvalidParameter;
             return .{ .columns = switch (setting) {
@@ -355,14 +359,28 @@ pub const Session = struct {
         self.cancel_requested.store(false, .release);
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
-        const req = self.request(statement, &.{}, types);
+        var req = self.request(statement, &.{}, types);
+        req.parameter_descriptors = descriptors;
         try req.check();
         const result = try self.source.vtable.describe(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req);
         if (result.columns.len > self.limits.columns or result.parameter_types.len > self.limits.parameters) return error.ProgramLimitExceeded;
+        if (result.parameter_descriptors.len != 0) {
+            if (result.parameter_descriptors.len != result.parameter_types.len) return error.InvalidParameter;
+            for (result.parameter_descriptors, result.parameter_types) |descriptor, kind| {
+                const inferred = try values.parameterFromOid(try values.parameterOid(descriptor));
+                if (inferred.kind == null) {
+                    if (kind != .unknown) return error.InvalidParameter;
+                } else if (!std.mem.eql(u8, @tagName(inferred.kind.?), @tagName(kind))) return error.InvalidParameter;
+            }
+        }
         return result;
     }
 
     fn execute(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
+        return self.executeTyped(alloc, statement, parameters, types, &.{}, binding_guard, setting_epoch);
+    }
+
+    fn executeTyped(self: *Session, alloc: std.mem.Allocator, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, binding_guard: ?[]const u8, setting_epoch: ?u64) !backend.Result {
         if (try commands.settingCommand(alloc, statement)) |setting| {
             if (parameters.len != 0 or types.len != 0) return error.InvalidParameter;
             return switch (setting) {
@@ -379,6 +397,7 @@ pub const Session = struct {
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
         var req = self.request(statement, parameters, types);
+        req.parameter_descriptors = descriptors;
         req.binding_guard = binding_guard;
         req.setting_epoch = setting_epoch;
         try req.check();
@@ -695,16 +714,18 @@ pub const Session = struct {
                 const a = arena.allocator();
                 const declared = try a.alloc(u32, count);
                 const types = try a.alloc(backend.Type, count);
-                for (declared, types) |*oid, *kind| {
+                const descriptors = try a.alloc(backend.Parameter, count);
+                for (declared, types, descriptors) |*oid, *kind, *descriptor| {
                     oid.* = try cursor.int(u32);
                     kind.* = try values.fromOid(oid.*);
+                    descriptor.* = try values.parameterFromOid(oid.*);
                 }
                 try cursor.finish();
-                const description = try self.describe(a, statement, types);
+                const description = try self.describeTyped(a, statement, types, descriptors);
                 if (count > description.parameter_types.len) return error.InvalidParameter;
                 const oids = try a.alloc(u32, description.parameter_types.len);
                 for (oids, description.parameter_types, 0..) |*oid, kind, index| {
-                    oid.* = if (index < declared.len and declared[index] != 0) declared[index] else values.oid(kind);
+                    oid.* = if (index < declared.len and declared[index] != 0) declared[index] else if (description.parameter_descriptors.len == oids.len) try values.parameterOid(description.parameter_descriptors[index]) else try values.oid(kind);
                 }
                 const owned_statement = try a.dupe(u8, statement);
                 const owned_name = try self.alloc.dupe(u8, name);
@@ -759,6 +780,7 @@ pub const Session = struct {
                 const description = backend.Description{
                     .columns = try cloneColumns(a, statement.description.columns),
                     .parameter_types = types,
+                    .parameter_descriptors = try a.dupe(backend.Parameter, statement.description.parameter_descriptors),
                     .binding_guard = if (statement.description.binding_guard) |guard| try a.dupe(u8, guard) else null,
                     .setting_epoch = statement.description.setting_epoch,
                 };
@@ -816,6 +838,7 @@ pub const Session = struct {
                         self.executing.store(true, .release);
                         defer self.executing.store(false, .release);
                         var req = self.request(portal.statement, portal.parameters, portal.types);
+                        req.parameter_descriptors = portal.description.parameter_descriptors;
                         req.binding_guard = portal.description.binding_guard;
                         req.setting_epoch = portal.description.setting_epoch;
                         portal.stream = try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req);
@@ -827,7 +850,7 @@ pub const Session = struct {
                     return;
                 }
                 if (portal.result == null) {
-                    portal.result = try self.execute(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.binding_guard, portal.description.setting_epoch);
+                    portal.result = try self.executeTyped(portal.arena.allocator(), portal.statement, portal.parameters, portal.types, portal.description.parameter_descriptors, portal.description.binding_guard, portal.description.setting_epoch);
                     const result = portal.result.?;
                     if (!columnsEqual(portal.description.columns, result.columns)) return error.ResultShapeChanged;
                 }
@@ -883,10 +906,10 @@ pub const Session = struct {
                 var arena = std.heap.ArenaAllocator.init(self.alloc);
                 errdefer arena.deinit();
                 const a = arena.allocator();
-                const description = try self.describe(a, prepare.statement, prepare.types);
+                const description = try self.describeTyped(a, prepare.statement, prepare.types, prepare.descriptors);
                 if (prepare.types.len > description.parameter_types.len) return error.InvalidParameter;
                 const oids = try a.alloc(u32, description.parameter_types.len);
-                for (oids, description.parameter_types) |*oid, kind| oid.* = values.oid(kind);
+                for (oids, description.parameter_types, 0..) |*oid, kind, index| oid.* = if (description.parameter_descriptors.len == oids.len) try values.parameterOid(description.parameter_descriptors[index]) else try values.oid(kind);
                 const sql = try a.dupe(u8, prepare.statement);
                 const name = try self.alloc.dupe(u8, prepare.name);
                 errdefer self.alloc.free(name);
@@ -921,12 +944,13 @@ pub const Session = struct {
                 self.cancel_requested.store(false, .release);
                 self.executing.store(true, .release);
                 defer self.executing.store(false, .release);
-                const req = self.request(prepared.statement, &.{}, prepared.description.parameter_types);
+                var req = self.request(prepared.statement, &.{}, prepared.description.parameter_types);
+                req.parameter_descriptors = prepared.description.parameter_descriptors;
                 try req.check();
                 const parameters = try evaluator(self.source.context, alloc, self.identity orelse return error.AuthenticationFailed, req, execute_command.expressions);
                 if (parameters.len != prepared.description.parameter_types.len) return error.InvalidParameter;
-                if (try self.simpleStreamParameters(prepared.statement, parameters, prepared.description.parameter_types, prepared.description.binding_guard, prepared.description.setting_epoch)) return true;
-                var result = try self.execute(alloc, prepared.statement, parameters, prepared.description.parameter_types, prepared.description.binding_guard, prepared.description.setting_epoch);
+                if (try self.simpleStreamParameters(prepared.statement, parameters, prepared.description.parameter_types, prepared.description.parameter_descriptors, prepared.description.binding_guard, prepared.description.setting_epoch)) return true;
+                var result = try self.executeTyped(alloc, prepared.statement, parameters, prepared.description.parameter_types, prepared.description.parameter_descriptors, prepared.description.binding_guard, prepared.description.setting_epoch);
                 defer result.deinit();
                 if (result.columns.len > 0) try self.rowDescription(result.columns, &.{});
                 if (result.sql_nulls) |flags| if (flags.len != result.rows.len) return error.InvalidResult;
@@ -1292,6 +1316,7 @@ pub const Session = struct {
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
         var req = self.request(portal.statement, portal.parameters, portal.types);
+        req.parameter_descriptors = portal.description.parameter_descriptors;
         req.binding_guard = portal.description.binding_guard;
         req.setting_epoch = portal.description.setting_epoch;
         var remaining: usize = if (requested == 0) std.math.maxInt(usize) else @intCast(requested);
@@ -1326,10 +1351,10 @@ pub const Session = struct {
     }
 
     fn simpleStream(self: *Session, statement: []const u8) !bool {
-        return self.simpleStreamParameters(statement, &.{}, &.{}, null, null);
+        return self.simpleStreamParameters(statement, &.{}, &.{}, &.{}, null, null);
     }
 
-    fn simpleStreamParameters(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, binding_guard: ?[]const u8, setting_epoch: ?u64) !bool {
+    fn simpleStreamParameters(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type, descriptors: []const backend.Parameter, binding_guard: ?[]const u8, setting_epoch: ?u64) !bool {
         var settings_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer settings_arena.deinit();
         if (try commands.settingCommand(settings_arena.allocator(), statement) != null) return false;
@@ -1338,6 +1363,7 @@ pub const Session = struct {
         self.executing.store(true, .release);
         defer self.executing.store(false, .release);
         var req = self.request(statement, parameters, types);
+        req.parameter_descriptors = descriptors;
         req.binding_guard = binding_guard;
         req.setting_epoch = setting_epoch;
         const stream = (try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req)) orelse return false;
@@ -1347,7 +1373,7 @@ pub const Session = struct {
             .parameters = parameters,
             .types = types,
             .formats = &.{},
-            .description = .{ .columns = stream.columns, .parameter_types = types, .binding_guard = binding_guard, .setting_epoch = setting_epoch },
+            .description = .{ .columns = stream.columns, .parameter_types = types, .parameter_descriptors = descriptors, .binding_guard = binding_guard, .setting_epoch = setting_epoch },
             .stream = stream,
             .stream_opened = true,
         };
@@ -1439,9 +1465,9 @@ pub const Session = struct {
             try bytes.writer.writeByte(0);
             try bytes.writer.writeInt(u32, 0, .big);
             try bytes.writer.writeInt(u16, 0, .big);
-            try bytes.writer.writeInt(u32, values.oid(column.type), .big);
-            try bytes.writer.writeInt(i16, values.typeSize(column.type), .big);
-            try bytes.writer.writeInt(i32, -1, .big);
+            try bytes.writer.writeInt(u32, try values.columnOid(column), .big);
+            try bytes.writer.writeInt(i16, values.columnTypeSize(column), .big);
+            try bytes.writer.writeInt(i32, try values.columnModifier(column), .big);
             try bytes.writer.writeInt(u16, formatAt(formats, index), .big);
         }
         try self.message('T', bytes.written());
@@ -1460,6 +1486,10 @@ pub const Session = struct {
         if (null_flags) |flags| if (flags.len != row.len) return error.InvalidResult;
         try bytes.writer.writeInt(u16, @intCast(row.len), .big);
         for (row, columns, 0..) |value, column, index| {
+            const payload_limit = self.limits.frame_bytes -| 4;
+            const remaining_headers = (row.len - index) * 4;
+            if (bytes.written().len > payload_limit or remaining_headers > payload_limit - bytes.written().len) return error.ProgramLimitExceeded;
+            const cell_limit = payload_limit - bytes.written().len - remaining_headers;
             const sql_null = if (null_flags) |flags| flags[index] else value == .null;
             if (sql_null) {
                 if (value != .null) return error.InvalidResult;
@@ -1468,7 +1498,7 @@ pub const Session = struct {
             }
             const position = bytes.written().len;
             try bytes.writer.writeInt(i32, 0, .big);
-            try values.encodeInto(self.alloc, &bytes.writer, column.type, formatAt(formats, index), value);
+            try values.encodeColumnInto(self.alloc, &bytes.writer, column, formatAt(formats, index), value, cell_limit);
             const length = bytes.written().len - position - 4;
             if (length > self.limits.frame_bytes -| 4 or length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
             std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
@@ -1551,8 +1581,38 @@ fn cloneColumns(alloc: std.mem.Allocator, columns: []const backend.Column) ![]co
 }
 fn columnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
     if (a.len != b.len) return false;
-    for (a, b) |left, right| if (left.type != right.type or !std.mem.eql(u8, left.name, right.name)) return false;
+    for (a, b) |left, right| if (left.type != right.type or left.element_type != right.element_type or !@import("antfly_local_sources").sql_scalar.NumericModifier.eql(left.numeric_modifier, right.numeric_modifier) or !std.mem.eql(u8, left.name, right.name)) return false;
     return true;
+}
+
+test "pgwire result shape fences array element identity across prepared and cursor pages" {
+    const int4 = [_]backend.Column{.{ .name = "items", .type = .array, .element_type = .int32 }};
+    const int8 = [_]backend.Column{.{ .name = "items", .type = .array, .element_type = .int64 }};
+    const missing = [_]backend.Column{.{ .name = "items", .type = .array }};
+    const json = [_]backend.Column{.{ .name = "items", .type = .json }};
+    try std.testing.expect(columnsEqual(&int4, &int4));
+    try std.testing.expect(!columnsEqual(&int4, &int8));
+    try std.testing.expect(!columnsEqual(&int4, &missing));
+    try std.testing.expect(!columnsEqual(&int4, &json));
+}
+
+test "pgwire NUMERIC result identity fences precision scale and unconstrained results" {
+    const scalar = [_]backend.Column{.{ .name = "n", .type = .number, .element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } }};
+    var changed = scalar;
+    changed[0].numeric_modifier.?.scale = 1;
+    try std.testing.expect(columnsEqual(&scalar, &scalar));
+    try std.testing.expect(!columnsEqual(&scalar, &changed));
+    changed[0].numeric_modifier = null;
+    try std.testing.expect(!columnsEqual(&scalar, &changed));
+}
+
+test "pgwire typed parameter failures retain actionable PostgreSQL SQLSTATEs" {
+    try std.testing.expectEqualStrings("22P02", sqlstate(error.SqlInvalidTextRepresentation));
+    try std.testing.expectEqualStrings("22P03", sqlstate(error.InvalidSqlBinaryRepresentation));
+    try std.testing.expectEqualStrings("42804", sqlstate(error.SqlBinaryTypeMismatch));
+    try std.testing.expectEqualStrings("22003", sqlstate(error.SqlNumericOutOfRange));
+    try std.testing.expectEqualStrings("22021", sqlstate(error.SqlInvalidTextEncoding));
+    try std.testing.expectEqualStrings("42P08", sqlstate(error.ConflictingSqlParameterTypes));
 }
 
 fn sqlstate(err: anyerror) []const u8 {
@@ -1564,6 +1624,13 @@ fn sqlstate(err: anyerror) []const u8 {
         error.UniqueConstraintViolation => "23505",
         error.ForeignKeyParentMissing, error.ForeignKeyReferenced => "23503",
         error.InvalidParameter => "22P02",
+        error.SqlInvalidTextRepresentation, error.InvalidSqlArrayShape => "22P02",
+        error.InvalidSqlBinaryRepresentation, error.SqlBinaryTypeMismatch => @import("antfly_local_sources").sql_errors.describe(err).code,
+        error.SqlNumericOutOfRange => "22003",
+        error.SqlInvalidTextEncoding => "22021",
+        error.SqlArraySubscriptError => "2202E",
+        error.ConflictingSqlParameterTypes => "42P08",
+        error.UnknownSqlParameterType => "42P18",
         error.InvalidStatementName => "26000",
         error.InvalidPortalName => "34000",
         error.InvalidCursorName => "34000",
@@ -1578,6 +1645,8 @@ fn sqlstate(err: anyerror) []const u8 {
         error.CursorMustBeInTransaction, error.NoActiveSqlTransaction => "25P01",
         error.CursorNotScrollable => "55000",
         error.InvalidSqlParameters, error.InvalidSqlParameter, error.InvalidSqlNumber, error.SqlTypeMismatch, error.InvalidSqlLimit, error.InvalidSettingValue => "22023",
+        error.SqlSubstringError => "22011",
+        error.InvalidSqlCharacterCode => "54000",
         error.SqlNotNullViolation => "23502",
         error.SqlProgramLimitExceeded, error.SqlResultTooLarge, error.SqlLimitExceeded, error.SettingLimitExceeded => "54000",
         error.UnknownSetting => "42704",

@@ -1,0 +1,4908 @@
+{
+  "format": 2,
+  "reference": "PostgreSQL exact SQL",
+  "profile": "guarded-document-field-mutations",
+  "seeds": [
+    {
+      "key": "doc:a",
+      "value": {
+        "title": "Launch",
+        "status": "draft",
+        "category": "release",
+        "amount": 12,
+        "enabled": true,
+        "note": "keep-a",
+        "metadata": {
+          "source": "api",
+          "billing": {
+            "plan": "pro"
+          },
+          "flags": [
+            "rated"
+          ]
+        }
+      }
+    },
+    {
+      "key": "doc:b",
+      "value": {
+        "title": "Other",
+        "status": "ready",
+        "category": "other",
+        "amount": 20,
+        "enabled": false,
+        "note": "keep-b",
+        "metadata": {
+          "source": "internal",
+          "billing": {
+            "plan": "free"
+          },
+          "flags": []
+        }
+      }
+    },
+    {
+      "key": "doc:c",
+      "value": {
+        "title": "Untouched",
+        "status": "closed",
+        "category": "other",
+        "amount": 4,
+        "enabled": false,
+        "note": "keep-c",
+        "metadata": {
+          "source": "manual",
+          "flags": []
+        }
+      }
+    }
+  ],
+  "entries": [
+    {
+      "id": "sql-0886",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0887",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 2,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0888",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0890",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0893",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 3,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": []
+    },
+    {
+      "id": "sql-0947",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0948",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0949",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0950",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 3,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Joined",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Joined",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0951",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 3,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0952",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0953",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0954",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0955",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0981",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0986",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-0995",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1000",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1008",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "flags": [
+                "rated"
+              ],
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              }
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "flags": [],
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              }
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "flags": [],
+              "source": "manual"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1013",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 3,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "flags": [
+                "rated"
+              ],
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              }
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Joined",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "flags": [],
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              }
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Joined",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "flags": [],
+              "source": "manual"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1029",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "flags": [
+                "rated"
+              ],
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              }
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "flags": [],
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              }
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "flags": [],
+              "source": "manual"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1054",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1055",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1056",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1057",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1059",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1060",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1061",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1062",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "status",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "status",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1063",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-index-name": "status_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:status_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "status",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-index-name": "status_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:status_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "status",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1064",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Joined",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1070",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "doc:a",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1076",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1077",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 2,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Launch",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1081",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "archived_at": {
+                  "type": "numeric",
+                  "nullable": true
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "archived_at": {
+                  "type": "numeric",
+                  "nullable": true
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            },
+            "archived_at": null
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1084",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1085",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 2,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Launch",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1086",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 2,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Launch",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1087",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "enabled": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "enabled": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1089",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1090",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1092",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1093",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 3,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": []
+    },
+    {
+      "id": "sql-1094",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1095",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1096",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1098",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1099",
+      "columns": [],
+      "rows": [],
+      "sql_nulls": [],
+      "column_oids": [],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "sql-1100",
+      "columns": [
+        "_id",
+        "title"
+      ],
+      "rows": [
+        [
+          "doc:a",
+          "Launch"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 1,
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "native_schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      },
+      "final": [
+        {
+          "key": "doc:a",
+          "value": {
+            "title": "Launch",
+            "status": "draft",
+            "category": "release",
+            "amount": 12,
+            "enabled": true,
+            "note": "keep-a",
+            "metadata": {
+              "source": "api",
+              "billing": {
+                "plan": "pro"
+              },
+              "flags": [
+                "rated"
+              ]
+            }
+          }
+        },
+        {
+          "key": "doc:b",
+          "value": {
+            "title": "Other",
+            "status": "ready",
+            "category": "other",
+            "amount": 20,
+            "enabled": false,
+            "note": "keep-b",
+            "metadata": {
+              "source": "internal",
+              "billing": {
+                "plan": "free"
+              },
+              "flags": []
+            }
+          }
+        },
+        {
+          "key": "doc:c",
+          "value": {
+            "title": "Untouched",
+            "status": "closed",
+            "category": "other",
+            "amount": 4,
+            "enabled": false,
+            "note": "keep-c",
+            "metadata": {
+              "source": "manual",
+              "flags": []
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "server_version": 180006
+}

@@ -2903,7 +2903,9 @@ def test_native_remote_indexed_metadata_predicates_above_id_list_limit(tmp_path)
                 "POST",
                 "/tables/indexed_predicates/query",
                 {
-                    "embeddings": {"sparse_native": {"indices": [1], "values": [weight]}},
+                    "embeddings": {
+                        "sparse_native": {"indices": [1], "values": [weight]}
+                    },
                     "indexes": ["sparse_native"],
                     "fields": ["amount"],
                     "limit": 3,

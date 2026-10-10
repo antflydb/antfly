@@ -242,6 +242,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "data runtime records and backs off HA standby replication round failures",
         "data runtime HA replication HTTP budget covers base64 apply envelope",
         "data runtime HA apply window remains bounded for control-plane liveness",
+        "data runtime publication proof yields without transport failure backoff",
         "data runtime disk usage scanner reads borrowed filesystem for sharding evidence",
         "data runtime HA apply window does not report caught up with pending or deferred WAL",
         "data server keeps upstream replication availability failures nonfatal",

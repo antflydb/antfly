@@ -26,6 +26,9 @@ const Mock = struct {
     fail_auth: bool = false,
     fail_execute: bool = false,
     json_null_results: bool = false,
+    array_results: bool = false,
+    array_parameters: bool = false,
+    result_override: ?backend.Result = null,
     result_cells: bool = false,
     ddl_pending: bool = false,
     ddl_unknown: bool = false,
@@ -172,14 +175,21 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         self.describes += 1;
         try request.check();
+        if (self.array_parameters) {
+            if (request.parameter_descriptors.len != 0 and request.parameter_descriptors[0].kind != null) try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, .int64), request.parameter_descriptors[0].element_type);
+            return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = &.{.array}, .parameter_descriptors = &.{.{ .kind = .array, .element_type = .int64 }} };
+        }
+        if (self.result_override) |result| return .{ .columns = result.columns };
         if (self.cursor_revoked) return error.Forbidden;
         if (self.ddl_pending or self.ddl_unknown) return .{ .columns = &.{} };
         if (self.expected_result_tag != null) return .{ .columns = &.{}, .binding_guard = "immutable-catalog-binding" };
         if (self.json_null_results) return .{ .columns = &.{.{ .name = "j", .type = .json }} };
+        if (self.array_results) return .{ .columns = &.{.{ .name = "a", .type = .array, .element_type = .jsonb }} };
         return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .parameter_types = if (std.mem.indexOf(u8, request.statement, "$1") != null) (if (std.mem.indexOf(u8, request.statement, "usage_records") != null) &.{.string} else &.{.integer}) else &.{}, .binding_guard = "immutable-catalog-binding", .setting_epoch = self.describe_setting_epoch };
     }
     fn execute(raw: *anyopaque, alloc: std.mem.Allocator, _: backend.Identity, request: backend.Request) !backend.Result {
         const self: *Mock = @ptrCast(@alignCast(raw));
+        if (self.result_override) |result| return result;
         self.observed_setting = if (request.setting_overlay.len == 0) null else request.setting_overlay[0].value.integer;
         self.observed_setting_epoch = request.setting_epoch;
         self.executions += 1;
@@ -216,6 +226,16 @@ const Mock = struct {
         try request.check();
         if (self.ddl_unknown) return .{ .command_tag = "DDL PENDING", .ddl_receipt_json = "{\"state\":\"admission_unknown\",\"restore_job_id\":\"job-1\"}" };
         if (self.ddl_pending) return .{ .command_tag = "DDL PENDING", .mutation_outcome = .committed_pending, .ddl_receipt_json = "{\"table_id\":\"17\",\"schema_version\":8,\"state\":\"pending\"}" };
+        if (self.array_results) {
+            const sources = @import("antfly_local_sources");
+            var value = try sources.sql_array_text.decode(alloc, .jsonb, "[0:2]={\"null\",NULL,\"{\\\"x\\\":[1,2]}\"}", .{});
+            defer value.deinit();
+            const rows = try alloc.alloc([]const std.json.Value, 3);
+            rows[0] = try alloc.dupe(std.json.Value, &.{try sources.sql_array_wire.toJsonLeaky(alloc, value.value, .{})});
+            rows[1] = try alloc.dupe(std.json.Value, &.{try sources.sql_array_wire.toJsonLeaky(alloc, .{ .element_type = .jsonb, .dimensions = &.{}, .elements = &.{} }, .{})});
+            rows[2] = try alloc.dupe(std.json.Value, &.{.null});
+            return .{ .columns = &.{.{ .name = "a", .type = .array, .element_type = .jsonb }}, .rows = rows, .sql_nulls = &.{ &.{false}, &.{false}, &.{true} }, .command_tag = "SELECT 3" };
+        }
         if (self.json_null_results) return .{
             .columns = &.{.{ .name = "j", .type = .json }},
             .rows = if (self.result_cells) &.{} else &.{ &.{.null}, &.{.null} },
@@ -233,7 +253,17 @@ const Mock = struct {
             self.saw_distinct_owner_namespace = true;
         };
         if (request.parameters.len > 0) {
-            if (self.expected_text_parameter) |expected| {
+            if (self.array_parameters) {
+                try std.testing.expectEqual(@as(usize, 1), request.parameter_descriptors.len);
+                try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, .int64), request.parameter_descriptors[0].element_type);
+                if (request.parameters[0] != .null) {
+                    var decoded = try @import("antfly_local_sources").sql_array_wire.decode(alloc, .int64, request.parameters[0], .{});
+                    defer decoded.deinit();
+                    try std.testing.expectEqual(@as(i32, -1), decoded.value.dimensions[0].lower);
+                    try std.testing.expectEqual(@as(i64, 9007199254740993), decoded.value.elements[0].value.integer);
+                    try std.testing.expect(decoded.value.elements[1].sql_null);
+                }
+            } else if (self.expected_text_parameter) |expected| {
                 try std.testing.expectEqualStrings(expected, request.parameters[0].string);
                 self.saw_text_parameter = true;
             } else self.seen_parameter = request.parameters[0].integer;
@@ -348,6 +378,207 @@ fn tags(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
         _ = try cursor.take(len - 4);
     }
     return out.toOwnedSlice(alloc);
+}
+
+test "pgwire Parse Bind Execute retain inferred and declared array parameter identity" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    for ([_]u32{ 0, 1016 }) |declared| for ([_]u16{ 0, 1 }) |format| for ([_]bool{ false, true }) |is_null| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        var parse_payload: std.Io.Writer.Allocating = .init(a);
+        defer parse_payload.deinit();
+        try parse_payload.writer.writeAll("q\x00SELECT cardinality($1::bigint[])\x00");
+        try parse_payload.writer.writeInt(u16, 1, .big);
+        try parse_payload.writer.writeInt(u32, declared, .big);
+        try frame(&input.writer, 'P', parse_payload.written());
+        try frame(&input.writer, 'D', "Sq\x00");
+        var source = try sources.sql_array_text.decode(a, .int64, "[-1:0]={9007199254740993,NULL}", .{});
+        defer source.deinit();
+        var encoded: std.Io.Writer.Allocating = .init(a);
+        defer encoded.deinit();
+        if (format == 0) try sources.sql_array_text.encode(source.value, &encoded.writer, .{}) else try sources.sql_array_binary.encode(source.value, &encoded.writer, .{});
+        var bind_payload: std.Io.Writer.Allocating = .init(a);
+        defer bind_payload.deinit();
+        try bind_payload.writer.writeAll("p\x00q\x00");
+        try bind_payload.writer.writeInt(u16, 1, .big);
+        try bind_payload.writer.writeInt(u16, format, .big);
+        try bind_payload.writer.writeInt(u16, 1, .big);
+        try bind_payload.writer.writeInt(i32, if (is_null) -1 else @intCast(encoded.written().len), .big);
+        if (!is_null) try bind_payload.writer.writeAll(encoded.written());
+        try bind_payload.writer.writeInt(u16, 0, .big);
+        try frame(&input.writer, 'B', bind_payload.written());
+        // Close the prepared owner before execution: the portal owns metadata.
+        try frame(&input.writer, 'C', "Sq\x00");
+        try execute(&input.writer, "p", 0);
+        try frame(&input.writer, 'S', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .array_parameters = true };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        var messages: protocol.Cursor = .{ .bytes = output.written() };
+        var descriptions: usize = 0;
+        while (messages.offset < messages.bytes.len) {
+            const tag = try messages.int(u8);
+            const length = try messages.int(u32);
+            var payload: protocol.Cursor = .{ .bytes = try messages.take(length - 4) };
+            if (tag == 'E') return error.UnexpectedArrayParameterError;
+            if (tag == 't') {
+                descriptions += 1;
+                try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+                try std.testing.expectEqual(@as(u32, 1016), try payload.int(u32));
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), descriptions);
+        try std.testing.expectEqual(@as(usize, 1), mock.executions);
+    };
+}
+
+test "pgwire array row descriptions and data frames preserve binary text empty and NULL values" {
+    const sources = @import("antfly_local_sources");
+    const a = std.testing.allocator;
+    for ([_]bool{ true, false }) |simple| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (simple) try frame(&input.writer, 'Q', "SELECT a\x00") else {
+            try parse(&input.writer, "q", "SELECT a", false);
+            try bind(&input.writer, "p", "q", null);
+            try frame(&input.writer, 'D', "Pp\x00");
+            try execute(&input.writer, "p", 0);
+            try frame(&input.writer, 'S', "");
+        }
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .array_results = true };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        var messages: protocol.Cursor = .{ .bytes = output.written() };
+        var descriptions: usize = 0;
+        var rows: usize = 0;
+        while (messages.offset < messages.bytes.len) {
+            const tag = try messages.int(u8);
+            const length = try messages.int(u32);
+            var payload: protocol.Cursor = .{ .bytes = try messages.take(length - 4) };
+            switch (tag) {
+                'E' => return error.UnexpectedArrayProtocolError,
+                'T' => {
+                    descriptions += 1;
+                    try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+                    try std.testing.expectEqualStrings("a", try payload.string());
+                    _ = try payload.take(6);
+                    try std.testing.expectEqual(@as(u32, 3807), try payload.int(u32));
+                    try std.testing.expectEqual(@as(i16, -1), try payload.int(i16));
+                    try std.testing.expectEqual(@as(i32, -1), try payload.int(i32));
+                    try std.testing.expectEqual(@as(u16, if (simple) 0 else 1), try payload.int(u16));
+                },
+                'D' => {
+                    try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+                    const bytes = try payload.int(i32);
+                    if (rows == 2) {
+                        try std.testing.expectEqual(@as(i32, -1), bytes);
+                    } else {
+                        try std.testing.expect(bytes >= 0);
+                        const wire = try payload.take(@intCast(bytes));
+                        var decoded = if (simple) try sources.sql_array_text.decode(a, .jsonb, wire, .{}) else try sources.sql_array_binary.decode(a, .jsonb, wire, .{});
+                        defer decoded.deinit();
+                        if (rows == 0) {
+                            try std.testing.expectEqual(@as(i32, 0), decoded.value.dimensions[0].lower);
+                            try std.testing.expectEqual(@as(usize, 3), decoded.value.elements.len);
+                            try std.testing.expect(decoded.value.elements[0].value == .null and !decoded.value.elements[0].sql_null);
+                            try std.testing.expect(decoded.value.elements[1].sql_null);
+                            try std.testing.expect(decoded.value.elements[2].value == .object);
+                        } else try std.testing.expectEqual(@as(usize, 0), decoded.value.elements.len);
+                    }
+                    try std.testing.expectEqual(payload.bytes.len, payload.offset);
+                    rows += 1;
+                },
+                else => {},
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), descriptions);
+        try std.testing.expectEqual(@as(usize, 3), rows);
+    }
+}
+
+test "pgwire NUMERIC row descriptions preserve scalar array and negative scale modifiers" {
+    const a = std.testing.allocator;
+    const columns = [_]backend.Column{
+        .{ .name = "n", .type = .number, .element_type = .numeric, .numeric_modifier = .{ .precision = 4, .scale = 2 } },
+        .{ .name = "items", .type = .array, .element_type = .numeric, .numeric_modifier = .{ .precision = 2, .scale = -3 } },
+    };
+    for ([_]bool{ true, false }) |simple| {
+        var input: std.Io.Writer.Allocating = .init(a);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (simple) try frame(&input.writer, 'Q', "SELECT n, items\x00") else {
+            try parse(&input.writer, "q", "SELECT n, items", false);
+            try bind(&input.writer, "p", "q", null);
+            try frame(&input.writer, 'D', "Pp\x00");
+            try execute(&input.writer, "p", 0);
+            try frame(&input.writer, 'S', "");
+        }
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{ .result_override = .{ .columns = &columns, .rows = &.{&.{ .null, .null }}, .sql_nulls = &.{&.{ true, true }}, .command_tag = "SELECT 1" } };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        var messages: protocol.Cursor = .{ .bytes = output.written() };
+        var descriptions: usize = 0;
+        while (messages.offset < messages.bytes.len) {
+            const tag = try messages.int(u8);
+            const length = try messages.int(u32);
+            var payload: protocol.Cursor = .{ .bytes = try messages.take(length - 4) };
+            if (tag == 'E') return error.UnexpectedNumericProtocolError;
+            if (tag != 'T') continue;
+            descriptions += 1;
+            try std.testing.expectEqual(@as(u16, 2), try payload.int(u16));
+            for (columns, [_]u32{ 1700, 1231 }, [_]i32{ 262150, 133121 }) |column, oid, modifier| {
+                try std.testing.expectEqualStrings(column.name, try payload.string());
+                _ = try payload.take(6);
+                try std.testing.expectEqual(oid, try payload.int(u32));
+                try std.testing.expectEqual(@as(i16, -1), try payload.int(i16));
+                try std.testing.expectEqual(modifier, try payload.int(i32));
+                _ = try payload.int(u16);
+            }
+            try std.testing.expectEqual(payload.bytes.len, payload.offset);
+        }
+        try std.testing.expectEqual(@as(usize, 1), descriptions);
+    }
+    try std.testing.expectError(error.InvalidResult, @import("values.zig").columnModifier(.{ .name = "bad", .type = .string, .numeric_modifier = .{ .precision = 4, .scale = 2 } }));
+}
+
+test "pgwire frame admission reserves later headers and rejects wide rows before publication" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var owner: std.heap.ArenaAllocator = .init(a);
+    defer owner.deinit();
+    var cells: [40]sources.sql_array_value.Element = @splat(.{ .value = .{ .integer = 1 }, .sql_null = false });
+    const envelope = try sources.sql_array_wire.toJsonLeaky(owner.allocator(), .{ .element_type = .int32, .dimensions = &.{.{ .length = cells.len }}, .elements = &cells }, .{});
+    const columns = [_]backend.Column{ .{ .name = "a", .type = .array, .element_type = .int32 }, .{ .name = "b", .type = .array, .element_type = .int32 } };
+    var input: std.Io.Writer.Allocating = .init(a);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "SELECT a,b\x00");
+    try frame(&input.writer, 'X', "");
+    // Each 81-byte array fits individually; their combined row exceeds the
+    // 124-byte payload allowance, after column-count and length headers.
+    var mock: Mock = .{ .result_override = .{ .columns = &columns, .rows = &.{&.{ envelope, envelope }}, .sql_nulls = &.{&.{ false, false }}, .command_tag = "SELECT 1" } };
+    var output = try run(&mock, input.written(), .{ .frame_bytes = 128 });
+    defer output.deinit();
+    var frames: protocol.Cursor = .{ .bytes = output.written() };
+    var rejected = false;
+    while (frames.offset < frames.bytes.len) {
+        const tag = try frames.int(u8);
+        const length = try frames.int(u32);
+        const payload = try frames.take(length - 4);
+        try std.testing.expect(length <= 128);
+        try std.testing.expect(tag != 'D');
+        if (tag == 'E') {
+            try std.testing.expect(std.mem.indexOf(u8, payload, "C54000\x00") != null);
+            rejected = true;
+        }
+    }
+    try std.testing.expect(rejected);
 }
 
 test "pgwire retained materialized views preserve exact binary integers and JSON nulls" {

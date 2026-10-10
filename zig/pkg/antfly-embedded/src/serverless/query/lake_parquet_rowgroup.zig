@@ -275,6 +275,12 @@ pub const PersistentObjectRangeCacheStats = struct {
     writes_coalesced: usize = 0,
     writes_dropped: usize = 0,
     dropped_bytes: usize = 0,
+    drops_policy: usize = 0,
+    drops_queue: usize = 0,
+    drops_memory: usize = 0,
+    drops_capacity: usize = 0,
+    drops_allocation: usize = 0,
+    drops_closing: usize = 0,
     queued_bytes: usize = 0,
     queued_entries: usize = 0,
 };
@@ -284,6 +290,8 @@ pub const PersistentObjectRangeCacheEnqueueResult = enum {
     coalesced,
     dropped,
 };
+
+const CacheDropReason = enum { policy, queue, memory, capacity, allocation, closing };
 
 pub const PersistentObjectRangeCacheResources = struct {
     /// Called without the disk-cache mutex when eviction is blocked by pins.
@@ -745,27 +753,27 @@ const PersistentObjectRangeCacheState = struct {
         bytes: []const u8,
     ) PersistentObjectRangeCacheEnqueueResult {
         const disk_bytes = persistentObjectRangeEncodedLen(cache_key.len, bytes.len) orelse
-            return self.recordDropped(bytes.len);
+            return self.recordDropped(bytes.len, .policy);
         if (cache_key.len > self.policy.max_cache_key_bytes or disk_bytes > self.policy.max_total_bytes) {
-            return self.recordDropped(bytes.len);
+            return self.recordDropped(bytes.len, .policy);
         }
         const memory_bytes = std.math.add(usize, cache_key.len, bytes.len) catch
-            return self.recordDropped(bytes.len);
+            return self.recordDropped(bytes.len, .policy);
         var memory_reservation: ?resource_manager_mod.Reservation = if (self.resource_manager) |manager|
             manager.reserve(.lake_range_cache_queue, @intCast(memory_bytes)) catch
-                return self.recordDropped(bytes.len)
+                return self.recordDropped(bytes.len, .memory)
         else
             null;
 
         const owned_key = self.alloc.dupe(u8, cache_key) catch {
             releaseMemoryReservation(&memory_reservation);
-            return self.recordDropped(bytes.len);
+            return self.recordDropped(bytes.len, .allocation);
         };
 
         const io = self.io;
         self.mutex.lockUncancelable(io);
         if (self.closing) {
-            _ = self.recordDroppedLocked(bytes.len);
+            _ = self.recordDroppedLocked(bytes.len, .closing);
             self.mutex.unlock(io);
             self.alloc.free(owned_key);
             releaseMemoryReservation(&memory_reservation);
@@ -782,7 +790,7 @@ const PersistentObjectRangeCacheState = struct {
             memory_bytes > self.policy.max_write_queue_bytes or
             self.pending_bytes > self.policy.max_write_queue_bytes - memory_bytes)
         {
-            _ = self.recordDroppedLocked(bytes.len);
+            _ = self.recordDroppedLocked(bytes.len, .queue);
             self.mutex.unlock(io);
             self.alloc.free(owned_key);
             releaseMemoryReservation(&memory_reservation);
@@ -790,7 +798,7 @@ const PersistentObjectRangeCacheState = struct {
         }
 
         self.pending.put(self.alloc, owned_key, {}) catch {
-            _ = self.recordDroppedLocked(bytes.len);
+            _ = self.recordDroppedLocked(bytes.len, .allocation);
             self.mutex.unlock(io);
             self.alloc.free(owned_key);
             releaseMemoryReservation(&memory_reservation);
@@ -810,7 +818,7 @@ const PersistentObjectRangeCacheState = struct {
             _ = self.pending.remove(owned_key);
             decrementSaturating(&self.pending_bytes, memory_bytes);
             decrementSaturating(&self.pending_count, 1);
-            _ = self.recordDroppedLocked(bytes.len);
+            _ = self.recordDroppedLocked(bytes.len, .allocation);
             self.condition.broadcast(io);
             self.mutex.unlock(io);
             self.alloc.free(owned_key);
@@ -843,23 +851,26 @@ const PersistentObjectRangeCacheState = struct {
         _ = self.pending.remove(owned_key);
         decrementSaturating(&self.pending_bytes, memory_bytes);
         decrementSaturating(&self.pending_count, 1);
-        _ = self.recordDroppedLocked(payload_bytes);
+        _ = self.recordDroppedLocked(payload_bytes, .allocation);
         self.condition.broadcast(io);
         self.mutex.unlock(io);
         self.alloc.free(owned_key);
         releaseMemoryReservation(memory_reservation);
     }
 
-    fn recordDropped(self: *PersistentObjectRangeCacheState, byte_len: usize) PersistentObjectRangeCacheEnqueueResult {
+    fn recordDropped(self: *PersistentObjectRangeCacheState, byte_len: usize, reason: CacheDropReason) PersistentObjectRangeCacheEnqueueResult {
         const io = self.io;
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        return self.recordDroppedLocked(byte_len);
+        return self.recordDroppedLocked(byte_len, reason);
     }
 
-    fn recordDroppedLocked(self: *PersistentObjectRangeCacheState, byte_len: usize) PersistentObjectRangeCacheEnqueueResult {
+    fn recordDroppedLocked(self: *PersistentObjectRangeCacheState, byte_len: usize, reason: CacheDropReason) PersistentObjectRangeCacheEnqueueResult {
         self.stats.writes_dropped += 1;
         self.stats.dropped_bytes +|= byte_len;
+        switch (reason) {
+            inline else => |tag| @field(self.stats, "drops_" ++ @tagName(tag)) +|= 1,
+        }
         return .dropped;
     }
 
@@ -1136,8 +1147,7 @@ fn persistentObjectRangeWorkerMain(state: *PersistentObjectRangeCacheState) void
         if (outcome) |result| switch (result) {
             .written, .already_present => state.stats.writes_completed += 1,
             .capacity_unavailable => {
-                state.stats.writes_dropped += 1;
-                state.stats.dropped_bytes +|= task.bytes.len;
+                _ = state.recordDroppedLocked(task.bytes.len, .capacity);
             },
         } else {
             state.stats.write_errors += 1;
@@ -6710,6 +6720,8 @@ test "lake persistent object range cache bounds write-behind admission" {
     const stats = persistent.statsSnapshot();
     try std.testing.expectEqual(@as(usize, 1), stats.writes_dropped);
     try std.testing.expectEqual(@as(usize, 7), stats.dropped_bytes);
+    try std.testing.expectEqual(@as(usize, 1), stats.drops_queue);
+    try std.testing.expectEqual(@as(usize, 0), stats.drops_policy);
     try std.testing.expectEqual(@as(usize, 0), stats.queued_entries);
     try std.testing.expect((try persistent.readAlloc(alloc, "long", 1)) == null);
     try std.testing.expectEqual(@as(usize, 1), persistent.statsSnapshot().read_misses);
@@ -6756,6 +6768,31 @@ test "lake persistent cache admits native-clock capacity with an offset Io awake
     try std.testing.expectEqual(@as(usize, 1), restarted.statsSnapshot().read_hits);
 }
 
+test "lake persistent object range cache retains asynchronous write error reasons" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/writes", .{tmp.sub_path});
+    defer a.free(root);
+    const moved = try std.fmt.allocPrint(a, "{s}-moved", .{root});
+    defer a.free(moved);
+    var disk = try PersistentObjectRangeCache.init(io, root);
+    defer disk.deinit();
+    // Move only this test's private cache directory. The worker still owns
+    // its lock but the configured write destination no longer exists.
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), root, std.Io.Dir.cwd(), moved, io);
+    try std.testing.expectEqual(PersistentObjectRangeCacheEnqueueResult.enqueued, disk.enqueueWrite("key", "data"));
+    disk.flush();
+    const stats = disk.statsSnapshot();
+    try std.testing.expectEqual(@as(usize, 1), stats.write_errors);
+    try std.testing.expectEqualStrings("FileNotFound", stats.last_write_error.?);
+    try std.testing.expectEqual(@as(usize, 0), stats.writes_dropped);
+    try std.testing.expectEqual(@as(usize, 0), stats.queued_entries);
+}
 test "lake persistent object range cache evicts least recently used entries within disk ceilings" {
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
