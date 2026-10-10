@@ -2336,6 +2336,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
+    const participant_fanout_control_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/participant_fanout_control_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configureConsumer(b, participant_fanout_control_root);
+    participant_fanout_control_root.addImport("antfly_source_root", participant_fanout_control_root);
+    participant_fanout_control_root.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const participant_fanout_control_tests = b.addTest(.{
+        .name = "participant-fanout-control-tests",
+        .root_module = participant_fanout_control_root,
+        .filters = &.{"distributed txn independently scheduled"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-participant-fanout-control-test", "Verify independent participant scopes, CPU-free physical joins and original completion authority")
+        .dependOn(&b.addRunArtifact(participant_fanout_control_tests).step);
     const local_commit_control_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_local_commit_control_test_root.zig"),
         .target = target,

@@ -267,7 +267,7 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         if (e.parent != null) return error.InvalidRunnableTransition;
-        try self.submitLocked(e, now, false);
+        try self.submitLocked(e, now, false, false);
     }
 
     /// Reserve a child before publishing its task. Each child uses the same
@@ -275,6 +275,16 @@ pub const Scheduler = struct {
     /// park/yield state. Its IO must be an independently owned worker lane;
     /// every deadline, clock and cancellation borrow comes from the parent.
     pub fn submitChild(self: *Scheduler, parent: *Entry, child: *Entry, io: std.Io) !void {
+        return self.submitChildMode(parent, child, io, false);
+    }
+
+    /// Reserve registry ownership without publishing CPU demand. An unused
+    /// packet cannot hold capacity needed by another physical worker or root.
+    fn reserveChild(self: *Scheduler, parent: *Entry, child: *Entry, io: std.Io) !void {
+        return self.submitChildMode(parent, child, io, true);
+    }
+
+    fn submitChildMode(self: *Scheduler, parent: *Entry, child: *Entry, io: std.Io, initially_blocked: bool) !void {
         try self.checkAuthority(parent);
         const now = parent.options.now();
         self.lock();
@@ -295,13 +305,13 @@ pub const Scheduler = struct {
         // child. The parent and its original clock live through every join.
         child.completion_options = if (parent.completion_active) child.options else null;
         child.completion_active = parent.completion_active;
-        try self.submitLocked(child, now, parent.completion_active);
+        try self.submitLocked(child, now, parent.completion_active, initially_blocked);
         child.parent = parent;
         parent.children += 1;
         self.metrics.child_operations += 1;
     }
 
-    fn submitLocked(self: *Scheduler, e: *Entry, now: u64, completion_child: bool) !void {
+    fn submitLocked(self: *Scheduler, e: *Entry, now: u64, completion_child: bool, initially_blocked: bool) !void {
         if (e.state != .fresh or e.scheduler != null) return error.InvalidRunnableTransition;
         const capacity = self.capacityFor(e, e.class);
         // Only the validated child factory can extend an already accepted
@@ -348,9 +358,14 @@ pub const Scheduler = struct {
         self.entries = e;
         self.sequence +|= 1;
         e.sequence = self.sequence;
-        self.enqueue(e, now);
-        self.dispatch();
-        e.waited = e.state == .queued;
+        if (initially_blocked) {
+            e.state = .resource_blocked;
+            self.metrics.resource_blocked += 1;
+        } else {
+            self.enqueue(e, now);
+            self.dispatch();
+            e.waited = e.state == .queued;
+        }
     }
 
     fn checkAuthority(self: *Scheduler, e: *const Entry) !void {
@@ -935,7 +950,7 @@ pub const Execution = struct {
         const owner = try schedulerFor(parent_entry, true);
         self.entry = .{ .options = parent_entry.options, .class = parent_entry.class, .bytes = retained_bytes };
         errdefer self.finish();
-        try owner.submitChild(parent_entry, &self.entry.?, io);
+        try owner.reserveChild(parent_entry, &self.entry.?, io);
         self.child_pending = true;
     }
 
@@ -956,6 +971,7 @@ pub const Execution = struct {
         }
         self.child_pending = false;
         const owner = try schedulerFor(e, false);
+        try owner.unblock(e);
         try owner.waitRetained(e);
         self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
@@ -2925,4 +2941,35 @@ test "runnable scheduler completion child preserves implicit parent clock on ind
         try std_test.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
         try std_test.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     }
+}
+
+test "runnable scheduler reserved child packets hold no CPU demand before physical activation" {
+    var scheduler = try Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer scheduler.close();
+    var parent: Execution = .{};
+    defer parent.finish();
+    try parent.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 256 }, .write);
+    var unused: Execution = .{};
+    defer unused.finish();
+    var active: Execution = .{};
+    defer active.finish();
+    try unused.reserveChild(&parent, std.testing.io, @sizeOf(Execution));
+    try active.reserveChild(&parent, std.testing.io, @sizeOf(Execution));
+    const bytes = scheduler.stats().retained_bytes;
+    try std.testing.expectEqual(@as(usize, 3), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().queued);
+    try std.testing.expectEqual(State.resource_blocked, scheduler.state(&unused.entry.?));
+    try parent.park(.resource_blocked);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try active.activateChild();
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(State.resource_blocked, scheduler.state(&unused.entry.?));
+    try active.park(.resource_blocked);
+    try parent.enter(.write);
+    try std.testing.expectEqual(bytes, scheduler.stats().retained_bytes);
+    active.finish();
+    unused.finish();
+    try std.testing.expectEqual(@as(usize, 0), parent.entry.?.children);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 256), scheduler.stats().retained_bytes);
 }

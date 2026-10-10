@@ -1530,3 +1530,41 @@ separate qualifications. The participant coordinator has not yet adopted this
 window; per-call hosted/local worker binding, remote wait/budget propagation and
 all four BEGIN/prepare/commit/abort phases still need that production wiring.
 Automatic defaults and the resource/performance matrix remain unqualified.
+
+The distributed transaction coordinator now adopts independently scheduled
+participant windows for capable local/hosted workers with active finite
+completion authority. It shrinks to one coordinator CPU slot, allocates a
+bounded packet array and reserves every packet before the first coordinator
+BEGIN. Registry reservation initially leaves children resource-blocked rather
+than eligible for CPU: an unused packet cannot consume the only ordinary slot.
+Each physical worker activates its own packet. BEGIN, prepare, committed
+follower resolution and abort follower resolution park the coordinator, destroy
+worker arenas, physically join, then resume the original coordinator class.
+
+Packets retain their original receiver, completion clock and operation/byte
+charges across windows and phases. They may reactivate only after their owning
+window joins; no new coordination allocation or child admission follows the
+durable decision. Failed resumption retains the original cause, rejects further
+coordinator callbacks and reports committed propagation debt. Denied initial
+child reservation retires partial ownership and finishes the reserved team
+before any participant contact.
+
+Local BEGIN/prepare forward each call's independent borrow through the compiled
+admission boundary without mutating shared worker context. Hosted calls use a
+stack-local view and remote wait boundary; committed resolution translates the
+remaining original completion budget conservatively and retains the supplied
+post-commit cancellation token. Local resolution carries the original lifetime
+through its cancellation boundary, but its complete durable service-wait graph
+still needs runnable control transport. Coordinator status/acknowledgement and
+ambiguous-decision recovery also need complete scoped wait coverage.
+
+Native qualification passes 156 selected tests: 147 coordinator/window,
+scheduler/service-lock, compiled write-contract and text checks, plus 9 existing
+child-owner/native-borrow regressions. Coverage includes an actual coordinator
+invocation, admission denial before any RPC, all four phase helpers, repeated
+physical packet reuse, unused-packet single-slot progress, original completion
+expiry, failed resumption and protected health progress. Hosted RPC routing and
+physical durable storage waits are not qualified by the mock coordinator tests.
+Pinned Nix/glibc Linux and cumulative physical integration are separate gates.
+The full resource/overload/performance matrix and automatic defaults remain
+unqualified.

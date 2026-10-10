@@ -12,6 +12,7 @@ pub const Window = struct {
     team: *abi.Team,
     owners: []fanout.Owner,
     phase: ?abi.Class = null,
+    retire_children: bool = true,
     state: enum { reserved, parked, joined, retired } = .reserved,
 
     pub fn reserve(team: *abi.Team, owners: []fanout.Owner, io: std.Io, retained_bytes_per_child: u64) !Window {
@@ -29,6 +30,19 @@ pub const Window = struct {
         return .{ .team = team, .owners = owners };
     }
 
+    /// Attach a phase to pre-reserved invocation-owned packets. No registry
+    /// admission or coordination allocation follows the durable decision.
+    pub fn reuse(team: *abi.Team, owners: []fanout.Owner) !Window {
+        if (team.state != .active or team.borrow.cpu_slots != 1 or owners.len == 0) return error.InvalidRunnableTransition;
+        try team.borrow.checkLifetime();
+        if (try team.borrow.currentClass() == .control) return error.InvalidRunnableDemand;
+        for (owners) |*owner| {
+            if (owner.child == null or owner.running or !owner.can_activate) return error.InvalidRunnableTransition;
+            try owner.child.?.borrow.checkLifetime();
+        }
+        return .{ .team = team, .owners = owners, .retire_children = false };
+    }
+
     pub fn park(self: *Window) !void {
         if (self.state != .reserved) return error.InvalidRunnableTransition;
         self.phase = try fanout.parkCoordinator(self.team.borrow);
@@ -42,6 +56,7 @@ pub const Window = struct {
         // separately; joining cannot abandon a mandatory completion consumer.
         group.await(io) catch {};
         self.state = .joined;
+        for (self.owners) |*owner| owner.joined();
         try fanout.resumeCoordinator(self.team.borrow, self.phase);
     }
 
@@ -50,7 +65,7 @@ pub const Window = struct {
     pub fn retire(self: *Window) void {
         if (self.state == .retired) return;
         std.debug.assert(self.state == .reserved or self.state == .joined);
-        for (self.owners) |*owner| owner.retire();
+        if (self.retire_children) for (self.owners) |*owner| owner.retire();
         self.state = .retired;
     }
 };
@@ -288,4 +303,68 @@ test "SQL protected commit team independent participant children cannot consume 
     try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
     try health.checkpoint();
     try std.testing.expectEqual(@as(usize, 4), scheduler.stats().runnable_slots);
+}
+
+test "SQL write team reusable participant packets reject activation before join and retain original charges" {
+    const runtime = @import("antfly_runtime_abi");
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const allocation = @import("antfly_request_allocation_budget");
+    const writes = @import("runnable_write_team.zig");
+    const Worker = struct {
+        owner: *fanout.Owner,
+        err: ?anyerror = null,
+        fn run(self: *@This()) void {
+            _ = self.owner.activate() catch |err| {
+                self.err = err;
+                return;
+            };
+            self.owner.park();
+        }
+    };
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer scheduler.close();
+    var memory: allocation.Shared = .{ .child = std.testing.allocator, .limit = 64 * 1024 };
+    var root: native.Execution = .{};
+    defer root.finish();
+    try root.start(&scheduler, .{ .io = io, .retained_bytes = 256 }, .write);
+    var bridge = try writes.Completion.init(&root, memory.allocator());
+    var team = try bridge.team();
+    try team.borrow.reserveCompletion(&.{ .io = &io_borrow, .deadline_ns = @as(u64, @intCast(std.Io.Clock.awake.now(io).nanoseconds)) + 5 * std.time.ns_per_s });
+    try team.borrow.activateCompletion();
+    try team.reserveIndependent();
+    defer team.finish();
+    var owners: [1]fanout.Owner = @splat(.{});
+    try owners[0].reserve(team.borrow, io, 31);
+    defer owners[0].retire();
+    const original_context = owners[0].child.?.borrow.context;
+    const original_bytes = scheduler.stats().retained_bytes;
+    const original_allocated = memory.used.load(.acquire);
+    for (0..3) |_| {
+        var window = try Window.reuse(&team, &owners);
+        defer window.retire();
+        try window.park();
+        var worker: Worker = .{ .owner = &owners[0] };
+        var group: std.Io.Group = .init;
+        group.async(io, Worker.run, .{&worker});
+        group.await(io) catch {};
+        // Physical completion alone does not grant another worker the packet;
+        // the owning window must explicitly join and finish its handoff.
+        try std.testing.expect(worker.err == null);
+        try std.testing.expectError(error.InvalidRunnableTransition, owners[0].activate());
+        try std.testing.expectError(error.InvalidRunnableTransition, Window.reuse(&team, &owners));
+        try window.join(&group, io);
+        window.retire();
+        try std.testing.expectEqual(original_context, owners[0].child.?.borrow.context);
+        try std.testing.expectEqual(original_bytes, scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(original_allocated, memory.used.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 2), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    }
+    owners[0].retire();
+    try std.testing.expectEqual(@as(usize, 0), root.entry.?.children);
+    try std.testing.expectEqual(@as(usize, 0), memory.used.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 256), scheduler.stats().retained_bytes);
 }

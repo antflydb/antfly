@@ -10,6 +10,8 @@ pub const Owner = struct {
     io: std.Io = undefined,
     child: ?abi.Child = null,
     running: bool = false,
+    started: bool = false,
+    can_activate: bool = false,
 
     pub fn reserve(self: *Owner, parent: ?abi.Borrowed, io: std.Io, retained_bytes: u64) !void {
         if (self.child != null) return error.InvalidRunnableTransition;
@@ -21,12 +23,21 @@ pub const Owner = struct {
         self.child = child;
         errdefer self.retire();
         try self.child.?.validate();
+        self.can_activate = true;
     }
 
     pub fn activate(self: *Owner) !?abi.Borrowed {
         if (self.running) return error.InvalidRunnableTransition;
         const child = if (self.child) |*value| value else return null;
-        try child.activate();
+        if (!self.can_activate) return error.InvalidRunnableTransition;
+        self.can_activate = false;
+        if (self.started) {
+            const phase = try child.borrow.currentClass();
+            try checked(child.borrow.enter(child.borrow.context, @backingInt(phase)));
+        } else {
+            try child.activate();
+            self.started = true;
+        }
         self.running = true;
         return child.borrow;
     }
@@ -39,10 +50,19 @@ pub const Owner = struct {
         _ = borrow.park(borrow.context, @backingInt(abi.Wait.resource));
     }
 
+    /// A reusable packet may move to another physical worker only after the
+    /// coordinator has joined the previous task and destroyed its results.
+    pub fn joined(self: *Owner) void {
+        std.debug.assert(!self.running and self.child != null);
+        self.can_activate = true;
+    }
+
     pub fn retire(self: *Owner) void {
         if (self.child) |*child| child.deinit();
         self.child = null;
         self.running = false;
+        self.started = false;
+        self.can_activate = false;
     }
 };
 
