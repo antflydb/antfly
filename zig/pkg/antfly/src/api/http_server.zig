@@ -16966,6 +16966,10 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn handleSchemaRewrite(self: *ApiHttpServer, before: metadata_table_manager.TableRecord, proposed: []const u8, idempotency_key: ?[]const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext, default_columns: []const []const u8) !contextual_operations.OwnedResponse {
+        return self.handleSchemaRewriteWithConstraintNameGuard(before, proposed, idempotency_key, identity, context, default_columns, null);
+    }
+
+    pub fn handleSchemaRewriteWithConstraintNameGuard(self: *ApiHttpServer, before: metadata_table_manager.TableRecord, proposed: []const u8, idempotency_key: ?[]const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext, default_columns: []const []const u8, guard: ?system_catalog.RelationMutationGuard) !contextual_operations.OwnedResponse {
         try ensureTableOperationActive(context);
         if (self.cfg.auth_enabled and identity == null) return contextualJsonErrorResponse(self.alloc, 403, "schema rewrite requires table administrator authorization");
         var snapshot = (try self.source.adminSnapshot()) orelse return contextualRetryableJsonErrorResponse(self.alloc, 503, "schema rewrite metadata is unavailable");
@@ -17040,7 +17044,7 @@ pub const ApiHttpServer = struct {
             }
         };
         var observer: Observer = .{ .server = self, .context = context };
-        const plan = try admission.buildWithPolicies(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, .{ .default_columns = default_columns });
+        const plan = try admission.buildWithPoliciesAndConstraintNameGuard(alloc, plan_id, cohort, snapshot.ranges, before.name, proposed, &observer, .{ .default_columns = default_columns }, guard);
         start.rewrite_plan_json = try std.json.Stringify.valueAlloc(alloc, plan, .{});
         try ensureTableOperationActive(context);
         const accepted = self.restore_job_store.startRecoverable(self.alloc, start) catch |err| return restoreJobStartErrorResponse(self.alloc, err);

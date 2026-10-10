@@ -537,6 +537,12 @@ pub const RaftApplyStore = struct {
         try context.ensureActive();
         return bytes;
     }
+    pub fn checkConstraintNamesWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: @import("antfly_local_sources").system_catalog_domain.ConstraintNameCheck, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
+        const normalized = try context.platformDeadline();
+        const ready = try self.catalogProjection(bool, alloc, group_id, .{ .constraint_name_check = .{ .request = request, .deadline_ns = normalized.deadline_ns } });
+        try context.ensureActive();
+        if (!ready) return error.InvalidCatalogRecord;
+    }
     pub fn preflightFkGenerationNameAdmission(self: *RaftApplyStore, group_id: u64, plan: fk_generation_publication.Plan) !void {
         if (plan.constraint_name_guard == null) return;
         const ready = try self.catalogProjection(bool, self.alloc, group_id, .{ .fk_generation_name_admission = plan });

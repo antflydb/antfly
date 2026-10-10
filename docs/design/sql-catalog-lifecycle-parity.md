@@ -690,3 +690,28 @@ qualification and the corrected native HTTP campaign remain pending; no public
 activation or original-case disposition is claimed. Primary-key rewrite plan
 integration, distributed race/fault qualification and capability activation
 remain unfinished.
+
+### Primary-key rewrite admission (implementation in progress)
+
+The shared restore staging plan now retains the optional generated-name guard
+for the one rewritten primary-key owner. Validation binds it to the predecessor
+schema digest/version and selected primary-key rule; serialization omits an
+absent guard. Both the frozen plan digest and pre-pin rewrite intent include
+the guard, so source preparation cannot change the admitted predicate.
+
+SQL performs a compact read-only name check before admitting a rewrite job.
+The metadata owner loads its own predecessor instead of accepting a caller's
+copy. Reservation repeats the predicate in the store transaction before the
+first owner, range, name or job write. The existing restore reservation owns
+the name afterward; no separate naming registry or restore subsystem is added.
+
+The dedicated `antfly-rewrite-generated-name-admission-test` gate covers guard
+serialization/recovery, intent binding and invalid predecessor/selected-rule
+bindings. The focused ReleaseFast gate passes one test with no leaks; Debug
+and integrated qualification are pending. Native lower-capability nonreservation,
+concurrent name acquisition, cancellation/recovery and failover qualification
+remain required before capability 34 can be advertised. This checkpoint does
+not change any original SQL case disposition or enable public generated names.
+
+The follow-up is PR #1061 (after merged #1048). Main was merged again at
+`0102c506d1`, containing upstream `121699433e`; in-progress edits were preserved.

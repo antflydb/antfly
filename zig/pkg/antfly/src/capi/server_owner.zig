@@ -1948,6 +1948,10 @@ pub fn metadataApplyStoreProjection(
                     const value = handle.store.prepareConstraintNamesJsonWithContext(a, group_id, input.request, .{ .deadline_ns = input.deadline_ns }) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);
                 },
+                .constraint_name_check => |input| {
+                    handle.store.checkConstraintNamesWithContext(a, group_id, input.request, .{ .deadline_ns = input.deadline_ns }) catch |err| break :blk storageOwnerStatusFromError(err);
+                    break :blk metadataProjectionJson(alloc, out_json, true);
+                },
                 .fk_initial_child_decision => |input| {
                     const value = handle.store.fkInitialChildDecisionJson(a, group_id, input) catch |err| break :blk storageOwnerStatusFromError(err);
                     break :blk metadataProjectionJson(alloc, out_json, value);

@@ -14493,6 +14493,29 @@ pub const RaftApplyStore = struct {
         return system_catalog_storage.readMeta(alloc, &txn, group_id);
     }
 
+    pub fn checkConstraintNamesWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ConstraintNameCheck, context: @import("antfly_local_sources").api_operation.RequestContext) !void {
+        try context.ensureActive();
+        try request.guard.validate();
+        if (request.guard.constraint_name_admission == null) return error.InvalidCatalogMutation;
+        if (request.schema_json.len > 16 * 1024 * 1024) return error.ProgramLimitExceeded;
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [160]u8 = undefined;
+        const raw = txn.get(try tableKeyForGroup(&key_buf, group_id, request.guard.owner.table_id)) catch |err| switch (err) {
+            error.NotFound => return error.CatalogGenerationChanged,
+            else => return err,
+        };
+        const before = try decodeTableRecord(alloc, raw);
+        defer metadata_table_manager.freeTable(alloc, before);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(before.schema_json, &digest, .{});
+        if (!std.mem.eql(u8, &digest, &request.guard.owner.schema_digest)) return error.CatalogGenerationChanged;
+        var after = before;
+        after.schema_json = request.schema_json;
+        try self.validateRelationMutationTxn(&txn, group_id, request.guard, before, after);
+        try context.ensureActive();
+    }
+
     pub fn prepareConstraintNamesJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ConstraintNamePreparation, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
         if (topology_protocol.current_version < topology_protocol.constraint_occupancy_version) return error.TableTopologyProtocolUpgradeRequired;
@@ -22075,6 +22098,14 @@ pub const RaftApplyStore = struct {
                 if (err == error.InvalidRestoreStaging) return;
                 return err;
             };
+            if (try plan.constraintNameTarget()) |target| {
+                // This is before the first name, owner, range or job write.
+                // The admitted plan subsequently owns the name reservation.
+                self.validateRelationMutationTxn(txn, group_id, plan.constraint_name_guard.?, target.replace.?.table, target.table) catch |err| switch (err) {
+                    error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady, error.TableTopologyProtocolUpgradeRequired, error.ExtensionOwnedObject => return,
+                    else => return err,
+                };
+            }
             {
                 var prefix_buf: [256]u8 = undefined;
                 const prefix = try restore_staging.activePrefix(&prefix_buf, group_id);

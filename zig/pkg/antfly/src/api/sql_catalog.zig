@@ -252,9 +252,9 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     }
     if (ddl.schema_change) |change| switch (change) {
         .add_column => |column| if (!column.nullable or column.default_expression != null or column.generated_expression != null)
-            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_expression != null) &.{column.name} else &.{}),
+            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_expression != null) &.{column.name} else &.{}, null),
         .add_unique => |constraint| if (constraint.primary)
-            return if (guard.constraint_name_admission != null) error.TableTopologyProtocolUpgradeRequired else rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}),
+            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}, if (guard.constraint_name_admission != null) guard else null),
         else => {},
     };
     const retirement = try requiresRetirement(a, definition.schema_json, schema);
@@ -291,7 +291,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     return .{};
 }
 
-fn rewriteSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, physical: []const u8, table_id: u64, version: u32, schema: []const u8, default_columns: []const []const u8) !catalog.DdlOutcome {
+fn rewriteSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, physical: []const u8, table_id: u64, version: u32, schema: []const u8, default_columns: []const []const u8, guard: ?domain.RelationMutationGuard) !catalog.DdlOutcome {
     // Rewrite jobs and their staging plan must be committed by the metadata
     // owner. A data node's local restore history cannot admit this operation.
     if (server.restore_job_store.replicated == null) return error.SqlSchemaRewriteRequiresMetadataOwner;
@@ -300,6 +300,17 @@ fn rewriteSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authen
     const table = tables.findTableByName(&snapshot, physical) orelse return error.TableNotFound;
     if (table.table_id != table_id or try tables.schemaVersion(table.schema_json) != version) return error.SchemaVersionChanged;
     const target_version = std.math.add(u32, version, 1) catch return error.SqlLimitExceeded;
+    if (guard) |value| {
+        // Send the selected schema, not the dependency cohort. Metadata loads
+        // its own predecessor. This read cannot admit a restore job.
+        var private = context;
+        private.setting_admin = true;
+        const checked = try server.source.systemCatalog(alloc, private, .{ .constraint_name_check = .{ .guard = value, .schema_json = schema } });
+        defer alloc.free(checked);
+        var ready = try std.json.parseFromSlice(bool, alloc, checked, .{});
+        defer ready.deinit();
+        if (!ready.value) return error.InvalidSqlBackendResponse;
+    }
     var receipt = try newReceipt(alloc, target, table_id, target_version);
     errdefer {
         alloc.free(receipt.database);
@@ -321,7 +332,7 @@ fn rewriteSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authen
     receipt.restore_job_id = try std.fmt.allocPrint(alloc, "{d}", .{job_id});
     // Shared native restore machinery reserves the entire dependency cohort,
     // transforms into unpublished storage, validates, and publishes atomically.
-    var response = server.handleSchemaRewrite(table.*, schema, receipt.idempotency_key, identity, context, default_columns) catch |err| return rewriteCallFailure(receipt, err);
+    var response = server.handleSchemaRewriteWithConstraintNameGuard(table.*, schema, receipt.idempotency_key, identity, context, default_columns, guard) catch |err| return rewriteCallFailure(receipt, err);
     defer response.deinit(server.alloc);
     return rewriteResponse(alloc, response.status, response.body, receipt);
 }

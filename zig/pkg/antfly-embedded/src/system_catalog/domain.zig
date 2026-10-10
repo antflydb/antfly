@@ -1019,6 +1019,13 @@ pub const ConstraintNamePrepared = struct {
     admission: @import("constraint_names.zig").Admission,
 };
 
+/// Read-only validation of an already selected name. Metadata loads the
+/// predecessor itself; callers cannot substitute its physical definition.
+pub const ConstraintNameCheck = struct {
+    guard: RelationMutationGuard,
+    schema_json: []const u8,
+};
+
 pub const ResolveMany = struct {
     targets: []const Target = &.{},
     /// Internal reverse lookup for dependency authorization and schema output.

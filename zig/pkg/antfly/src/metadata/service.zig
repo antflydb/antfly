@@ -3422,6 +3422,10 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         return metadata_topology_protocol.constraint_occupancy_version;
     if (command == .apply_fk_generation_publication and carriesConstraintNameAdmission(command.apply_fk_generation_publication))
         return metadata_topology_protocol.constraint_occupancy_version;
+    if (command == .create_restore_job_with_staging and carriesConstraintNameAdmission(command.create_restore_job_with_staging.plan_json))
+        return metadata_topology_protocol.constraint_occupancy_version;
+    if (command == .apply_restore_staging and carriesConstraintNameAdmission(command.apply_restore_staging))
+        return metadata_topology_protocol.constraint_occupancy_version;
     if (command == .compare_and_replace_table) if (command.compare_and_replace_table.relation_guard) |guard|
         return if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {

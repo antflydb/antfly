@@ -24,13 +24,14 @@ pub fn requiresOccupancy(bytes: []const u8, max_bytes: usize) bool {
     const Shape = struct {
         version: u32 = 1,
         constraint_name_admission: ?Marker = null,
+        constraint_name_guard: ?Guard = null,
         plan: ?struct { constraint_name_admission: ?Marker = null, constraint_name_guard: ?Guard = null } = null,
     };
     var buffer: [4096]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&buffer);
     const shape = std.json.parseFromSliceLeaky(Shape, fixed.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return true;
     // Malformed, exhausted and future frames cannot use legacy admission.
-    return shape.version != 1 or shape.constraint_name_admission != null or
+    return shape.version != 1 or shape.constraint_name_admission != null or shape.constraint_name_guard != null or
         (if (shape.plan) |plan| plan.constraint_name_admission != null or plan.constraint_name_guard != null else false);
 }
 
@@ -48,6 +49,7 @@ test "naming wire projection skips large escaped schemas and detects nested and 
     try std.testing.expect(requiresOccupancy(named, limit));
     try std.testing.expect(requiresOccupancy("{\"plan\":{\"constraint_name_guard\":{\"constraint_name_admission\":{\"namespace_id\":2}}}}", limit));
     try std.testing.expect(requiresOccupancy("{\"plan\":{\"constraint_name_guard\":{}}}", limit));
+    try std.testing.expect(requiresOccupancy("{\"constraint_name_guard\":{\"constraint_name_admission\":{\"namespace_id\":2}}}", limit));
     try std.testing.expect(!requiresOccupancy("{\"plan\":{\"constraint_name_guard\":null}}", limit));
     try std.testing.expect(requiresOccupancy("{\"constraint_name_admission\":{\"namespace_id\":2}}", limit));
     try std.testing.expect(!requiresOccupancy("{\"version\":1,\"constraint_name_admission\":null}", limit));

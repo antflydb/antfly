@@ -2574,6 +2574,12 @@ const LocalStandaloneMetadata = struct {
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
                 return store.prepareConstraintNamesJsonWithContext(alloc, group_ids.main_metadata_group_id, .{ .addition = request }, context);
             },
+            .constraint_name_check => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                try store.checkConstraintNamesWithContext(alloc, group_ids.main_metadata_group_id, request, context);
+                return std.json.Stringify.valueAlloc(alloc, true, .{});
+            },
             .fk_initial_child_decision => |request| {
                 if (!context.fk_generation_publication_authority or !self.localFkPublicationSupported()) return error.UnsupportedOperation;
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;

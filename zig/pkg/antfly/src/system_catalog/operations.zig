@@ -537,6 +537,14 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.prepareConstraintNamesJsonWithContext(alloc, svc.metadata_group_id, .{ .addition = request }, context);
         },
+        .constraint_name_check => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.constraint_occupancy_version);
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            try store.checkConstraintNamesWithContext(alloc, svc.metadata_group_id, request, context);
+            break :blk std.json.Stringify.valueAlloc(alloc, true, .{});
+        },
         .fk_initial_child_decision => |request| blk: {
             if (!context.fk_generation_publication_authority) return error.Forbidden;
             try svc.ensureLinearizableReadWithContext(context);

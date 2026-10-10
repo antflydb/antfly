@@ -1150,7 +1150,7 @@ pub const MetadataHttpClient = struct {
         };
         var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
         defer response.deinit(self.alloc);
-        if ((input == .fk_initial_create_prepare or input == .constraint_name_prepare) and response.status != 200) {
+        if ((input == .fk_initial_create_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
             if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
         }
         if (response.status != 200) return switch (response.status) {

@@ -312,6 +312,7 @@ pub const CatalogProjectionRequest = union(enum) {
     fk_generation_name_admission: @import("../fk_generation_publication.zig").Plan,
     fk_initial_create_prepare_with_deadline: struct { request: @import("../fk_generation_publication.zig").InitialCreatePrepareRequest, deadline_ns: ?u64 = null },
     constraint_name_prepare: struct { request: system_catalog.ConstraintNamePreparation, deadline_ns: ?u64 = null },
+    constraint_name_check: struct { request: system_catalog.ConstraintNameCheck, deadline_ns: ?u64 = null },
     fk_initial_child_decision: @import("../fk_generation_publication.zig").InitialChildDecisionRequest,
     fk_initial_create_status: u64,
     fk_generation_table_locked: u64,

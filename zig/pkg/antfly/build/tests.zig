@@ -305,6 +305,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-fk-generated-name-admission-test", "Verify FK generated-name plan digests, recovery and atomic lower-capability nonadmission")
         .dependOn(&addFilteredTestRunArtifact(b, fk_name_admission_tests).step);
+    const rewrite_name_admission_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata_rewrite_name_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, rewrite_name_admission_mod, true, true);
+    const rewrite_name_admission_tests = b.addTest(.{
+        .root_module = rewrite_name_admission_mod,
+        .filters = &.{"relational integrity restore staging rewrite intent binds original schema source pin and immutable target"},
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-rewrite-generated-name-admission-test", "Verify primary-key rewrite naming guard recovery and frozen intent binding")
+        .dependOn(&addFilteredTestRunArtifact(b, rewrite_name_admission_tests).step);
     const relation_command_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/metadata/relation_reconciliation_command.zig"),
         .target = target,
