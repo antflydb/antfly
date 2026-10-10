@@ -1152,6 +1152,7 @@ pub const MetadataHttpClient = struct {
         defer response.deinit(self.alloc);
         if ((input == .fk_initial_create_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
             if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
+            if (response.status == 405 and std.mem.eql(u8, response.body, "ExtensionOwnedObject")) return error.ExtensionOwnedObject;
         }
         if (response.status != 200) return switch (response.status) {
             400 => if ((input == .fk_generation_publication_status or input == .fk_generation_publication_decision or
@@ -4674,6 +4675,16 @@ test "system catalog hidden FK prepare preserves definite naming diagnostics" {
     executor.status = 409;
     executor.body = "SqlIndexAlreadyExists";
     try std.testing.expectError(error.SqlIndexAlreadyExists, client.readSystemCatalog("http://metadata.invalid", addition, 25, null));
+    const check: @import("../system_catalog/server_call.zig").Call = .{ .constraint_name_check = .{ .guard = addition.constraint_name_prepare.guard, .schema_json = "{}" } };
+    try std.testing.expectError(error.SqlIndexAlreadyExists, client.readSystemCatalog("http://metadata.invalid", check, 25, null));
+    executor.status = 405;
+    executor.body = "ExtensionOwnedObject";
+    for ([_]@import("../system_catalog/server_call.zig").Call{ call, addition, check }) |request| {
+        try std.testing.expectError(error.ExtensionOwnedObject, client.readSystemCatalog("http://metadata.invalid", request, 25, null));
+    }
+    try std.testing.expectError(error.RemoteUnavailable, client.readSystemCatalog("http://metadata.invalid", .snapshot, 25, null));
+    executor.body = "other service rejected this method";
+    try std.testing.expectError(error.RemoteUnavailable, client.readSystemCatalog("http://metadata.invalid", check, 25, null));
 }
 
 test "system catalog initial FK retirement page requires a store-bound transport" {

@@ -707,11 +707,26 @@ the name afterward; no separate naming registry or restore subsystem is added.
 
 The dedicated `antfly-rewrite-generated-name-admission-test` gate covers guard
 serialization/recovery, intent binding and invalid predecessor/selected-rule
-bindings. The focused ReleaseFast gate passes one test with no leaks; Debug
-and integrated qualification are pending. Native lower-capability nonreservation,
-concurrent name acquisition, cancellation/recovery and failover qualification
+bindings. The initial plan-only gate passed in Debug and ReleaseFast. The
+expanded Debug and ReleaseFast gates each pass two tests with no leaks, including native
+lower-capability rejection of both direct staging and compound job admission.
+It verifies no staging/job/replacement owner or active reservation, unchanged
+source reconciliation state and predecessor, then successfully admits the same
+rewrite without the new naming predicate as a positive control.
+
+The focused coordinator Debug and ReleaseFast gates each pass two tests: single and batch
+proposal admission reject naming-enabled restore bytes before append, even for
+a malformed non-null marker; private name checks preserve exact naming and
+extension-ownership diagnostics without treating unrelated failures as definite
+rejections. The fixed-memory wire marker test passes in Debug and ReleaseFast.
+Integrated qualification is pending. Concurrent name
+acquisition, cancellation/recovery and failover qualification
 remain required before capability 34 can be advertised. This checkpoint does
 not change any original SQL case disposition or enable public generated names.
+
+The PostgreSQL 18 catalog-lifecycle oracle also passes all 13 tests at this
+checkpoint. The inventory verifier still reports 478 implemented, 136 rejected,
+73 superseded and 899 unresolved original cases.
 
 The follow-up is PR #1061 (after merged #1048). Main was merged again at
 `0102c506d1`, containing upstream `121699433e`; in-progress edits were preserved.

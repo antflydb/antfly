@@ -8475,6 +8475,14 @@ test "metadata raft apply store compound rewrite admission atomically reserves e
 }
 
 fn testRewriteDraft(cancel: bool, compound: bool) !void {
+    return testRewriteDraftWithNames(cancel, compound, false);
+}
+
+test "metadata raft apply store generated primary rewrite cannot reserve names or jobs below capability" {
+    try testRewriteDraftWithNames(false, true, true);
+}
+
+fn testRewriteDraftWithNames(cancel: bool, compound: bool, named: bool) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8482,7 +8490,14 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
     defer alloc.free(root);
     const group = group_ids.main_metadata_group_id;
     const id = try restore_staging.idForAttempt(7, 1);
-    const schema_json = "{\"version\":1,\"storage_mode\":\"document\"}";
+    const schema_json = if (named)
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"x":{"type":"integer"}},"additionalProperties":false}}}}
+    else
+        "{\"version\":1,\"storage_mode\":\"document\"}";
+    const target_schema = if (named)
+        \\{"version":2,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"rows_pkey","columns":["x"],"primary":true,"timing":"immediate"}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"x":{"type":"integer","nullable":false}},"required":["x"],"additionalProperties":false}}}}
+    else
+        schema_json;
     const source: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
         .fence = .{ .role = .rewrite_source, .transition_id = 7, .attempt = 1, .owner_group_id = 301, .peer_group_id = 401, .namespace = .{ .table_id = 9, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(4) },
         .receiver_namespace = .{ .table_id = 10, .shard_id = 401, .range_id = 401 },
@@ -8493,11 +8508,11 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
     const original_range: metadata.RangeRecord = .{ .table_id = 9, .group_id = 301, .range_id = 301, .start_key = "" };
     var targets = [_]restore_staging.Target{.{
         .source_table_id = 9,
-        .table = .{ .table_id = 10, .name = "rows", .schema_json = schema_json },
+        .table = .{ .table_id = 10, .name = "rows", .schema_json = target_schema },
         .ranges = &.{.{ .table_id = 10, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" }},
         .replace = .{ .table = original, .ranges = &.{original_range}, .fences = &.{source.fence} },
         .rewrite_sources = &.{source},
-        .rewrite = .{ .preserve_document = true, .source_schemas = &.{schema_json}, .target_schema = schema_json, .program_digest = @splat(6) },
+        .rewrite = .{ .preserve_document = !named, .source_schemas = &.{schema_json}, .target_schema = target_schema, .program_digest = @splat(6) },
         .generation_handoffs = &.{.{ .source_group_id = 301, .target_group_id = 401, .source_namespace = source.fence.namespace, .admissions = &.{}, .admissions_digest = try @import("antfly_local_sources").storage_portable_backup.sourceGenerationAdmissionSummaryDigest(source.fence.namespace, &.{}), .retired_digest = @splat(8), .retired_count = 0 }},
     }};
     var draft: restore_staging.Plan = .{ .id = id, .cohort_digest = @splat(7), .targets = &targets, .preparing_sources = true };
@@ -8522,6 +8537,55 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
         }
         const user_key = restore_job_logical_prefix ++ "0000000000000007";
         const user_value = "{\"job_id\":7,\"attempt_id\":1,\"staging_attempt_id\":1,\"source_kind\":\"schema_rewrite\",\"phase\":\"queued\"}";
+        if (named) {
+            const work = try store.relationReconciliationWork(group);
+            var schema_digest: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(schema_json, &schema_digest, .{});
+            draft.constraint_name_guard = .{
+                .target = .{ .name = "rows" },
+                .logical_table = "rows",
+                .owner = .{ .table_id = 9, .schema_version = 1, .schema_digest = schema_digest, .kind = .table },
+                .incarnation = work.epoch.?.incarnation,
+                .constraint_name_admission = .{ .namespace_id = system_catalog.default_namespace_id, .names = &.{.{ .name = "rows_pkey", .kind = .primary }} },
+            };
+            try draft.validate(alloc);
+            try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.checkConstraintNamesWithContext(alloc, group, .{ .guard = draft.constraint_name_guard.?, .schema_json = target_schema }, .{}));
+            const plan_json = try std.json.Stringify.valueAlloc(alloc, draft, .{});
+            defer alloc.free(plan_json);
+            const reserve_json = try std.json.Stringify.valueAlloc(alloc, restore_staging.Command{ .id = id, .action = .reserve, .plan = draft }, .{});
+            defer alloc.free(reserve_json);
+            try store.applyStandaloneCommand(group, .{ .apply_restore_staging = reserve_json });
+            try store.applyStandaloneCommand(group, .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = plan_json } });
+            try std.testing.expect(std.meta.eql(work, try store.relationReconciliationWork(group)));
+            {
+                var read = try store.store.beginReadTxn();
+                defer read.abort();
+                var key_buf: [256]u8 = undefined;
+                try std.testing.expectError(error.NotFound, read.get(try restore_staging.jobKey(&key_buf, group, id)));
+                try std.testing.expectError(error.NotFound, read.get(try restoreJobKeyForGroup(&key_buf, group, user_key)));
+                try std.testing.expectError(error.NotFound, read.get(try tableKeyForGroup(&key_buf, group, 10)));
+                const unchanged = try decodeTableRecord(alloc, try read.get(try tableKeyForGroup(&key_buf, group, 9)));
+                defer metadata_table_manager.freeTable(alloc, unchanged);
+                try std.testing.expectEqualDeep(original, unchanged);
+                var cursor = try read.openCursor();
+                defer cursor.close();
+                const prefix = try restore_staging.activePrefix(&key_buf, group);
+                if (try cursor.seekAtOrAfter(prefix)) |row| try std.testing.expect(!std.mem.startsWith(u8, row.key, prefix));
+            }
+            // The exact same topology and schema can be admitted without the
+            // new predicate. This proves the negative result above was not
+            // caused by an invalid rewrite fixture or missing source facts.
+            draft.constraint_name_guard = null;
+            const legacy_json = try std.json.Stringify.valueAlloc(alloc, draft, .{});
+            defer alloc.free(legacy_json);
+            try store.applyStandaloneCommand(group, .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = legacy_json } });
+            var accepted = try store.store.beginReadTxn();
+            defer accepted.abort();
+            var key_buf: [256]u8 = undefined;
+            _ = try accepted.get(try restore_staging.jobKey(&key_buf, group, id));
+            try std.testing.expectEqualStrings(user_value, try accepted.get(try restoreJobKeyForGroup(&key_buf, group, user_key)));
+            return;
+        }
         if (compound) {
             const plan_json = try std.json.Stringify.valueAlloc(alloc, draft, .{});
             defer alloc.free(plan_json);

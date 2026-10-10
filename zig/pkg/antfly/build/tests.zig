@@ -313,7 +313,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, rewrite_name_admission_mod, true, true);
     const rewrite_name_admission_tests = b.addTest(.{
         .root_module = rewrite_name_admission_mod,
-        .filters = &.{"relational integrity restore staging rewrite intent binds original schema source pin and immutable target"},
+        .filters = &.{ "relational integrity restore staging rewrite intent binds original schema source pin and immutable target", "metadata raft apply store generated primary rewrite cannot reserve names or jobs below capability" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-rewrite-generated-name-admission-test", "Verify primary-key rewrite naming guard recovery and frozen intent binding")
@@ -343,6 +343,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-relation-coordinator-test", "Verify relation control and tracked-writer decoder admission")
         .dependOn(&addFilteredTestRunArtifact(b, relation_coordinator_tests).step);
+    const naming_coordinator_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[1],
+        .filters = &.{ "relational topology admission rejects lifecycle proposals before encoding on mixed metadata versions", "system catalog hidden FK prepare preserves definite naming diagnostics" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-generated-name-coordinator-test", "Verify naming decoder barriers and definite read-only preparation diagnostics")
+        .dependOn(&addFilteredTestRunArtifact(b, naming_coordinator_tests).step);
     const system_catalog_store_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
         .filters = &.{ "metadata raft apply store", "metadata replay", "system catalog", "row-policy publication", "metadata.table storage extension", "relational integrity restore staging", "FK generation publication", "policy definition command serializes", "standalone metadata" },

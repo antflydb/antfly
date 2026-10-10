@@ -13454,7 +13454,9 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     const naming_catalog: metadata_storage.TransitionCommand = .{ .apply_system_catalog = "{\"version\":2,\"constraint_name_admission\":{\"namespace_id\":2,\"names\":[]}}" };
     const naming_fk: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{\"plan\":{\"constraint_name_admission\":{\"namespace_id\":2,\"names\":[]}}}" };
     const naming_generation: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{\"plan\":{\"constraint_name_guard\":{\"constraint_name_admission\":{\"namespace_id\":2,\"names\":[]}}}}" };
-    for ([_]metadata_storage.TransitionCommand{ naming_catalog, naming_fk, naming_generation }) |named| {
+    const naming_rewrite: metadata_storage.TransitionCommand = .{ .create_restore_job_with_staging = .{ .key = "1", .value = "{}", .plan_json = "{\"constraint_name_guard\":{}}" } };
+    const naming_restore: metadata_storage.TransitionCommand = .{ .apply_restore_staging = "{\"plan\":{\"constraint_name_guard\":{}}}" };
+    for ([_]metadata_storage.TransitionCommand{ naming_catalog, naming_fk, naming_generation, naming_rewrite, naming_restore }) |named| {
         try std.testing.expectEqual(naming_version, transitionRequiredCoordinatedDecoderVersion(named));
         try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{named}));
         try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{ legacy, named }));

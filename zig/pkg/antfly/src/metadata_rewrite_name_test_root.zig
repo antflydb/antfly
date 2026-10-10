@@ -3,6 +3,7 @@
 
 test {
     _ = @import("metadata/restore_staging.zig");
+    _ = @import("metadata/storage/raft_apply_store.zig");
 }
 
 pub const antfly_sources = @import("source_owner_physical.zig");
