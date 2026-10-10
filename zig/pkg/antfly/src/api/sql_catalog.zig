@@ -433,7 +433,7 @@ fn chooseGeneratedNames(server: *server_mod.ApiHttpServer, context: operation.Re
     var working = std.heap.ArenaAllocator.init(scratch);
     defer working.deinit();
     const temporary_schema = working.allocator();
-    var schema = try std.json.parseFromSliceLeaky(std.json.Value, temporary_schema, schema_json, .{ .allocate = .alloc_always });
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, temporary_schema, schema_json, .{ .allocate = .alloc_always, .parse_numbers = false });
     var used: std.StringHashMapUnmanaged(void) = .empty;
     try used.put(temporary_schema, target.table, {});
     for ([_][]const u8{ "unique_constraints", "foreign_keys", "checks", "relational_indexes" }) |key| {
@@ -455,7 +455,7 @@ fn chooseGeneratedNames(server: *server_mod.ApiHttpServer, context: operation.Re
             if (ordinal != 0 and used.contains(candidate)) continue;
             if (std.mem.eql(u8, candidate, target.table)) continue;
             const relations = [_]domain.RelationTarget{.{ .database = target.database, .namespace = target.namespace, .name = candidate }};
-            const lookup: domain.ResolveMany = .{ .relations = &relations, .expected_relation_epoch = epoch };
+            const lookup: domain.ResolveMany = .{ .relations = &relations, .name_allocation = true, .expected_relation_epoch = epoch };
             const bytes = try server.source.systemCatalog(temporary, context, .{ .resolve_many = lookup });
             const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, temporary, bytes, .{ .allocate = .alloc_always });
             try resolved.validateRelations(lookup);
@@ -488,17 +488,38 @@ fn suffixedConstraintName(alloc: std.mem.Allocator, base: []const u8, ordinal: u
 /// IF NOT EXISTS applies to the requested table, never to an index-name
 /// conflict. A taken automatically selected name can be retried safely only
 /// after the authority has rejected the create before durable admission.
-fn createConflict(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, names: []const []const u8, conditional: bool, err: anyerror) !catalog.DdlOutcome {
+fn createConflict(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, names: []const []const u8, conditional: bool, err: anyerror, scratch: std.mem.Allocator) !catalog.DdlOutcome {
     if (err != error.CatalogAlreadyExists and err != error.TableAlreadyExists) return err;
-    const relations = try alloc.alloc(domain.RelationTarget, names.len);
-    for (relations, names) |*relation, name| relation.* = .{ .database = target.database, .namespace = target.namespace, .name = name };
-    const lookup: domain.ResolveMany = .{ .targets = &.{target}, .relations = relations };
+    const lookup: domain.ResolveMany = .{ .targets = &.{target} };
     const bytes = try server.source.systemCatalog(alloc, context, .{ .resolve_many = lookup });
     const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
     try resolved.validateRelations(lookup);
     if (resolved.tables.len != 1) return error.InvalidCatalogRecord;
     if (resolved.tables[0] != null) return if (conditional) .{} else err;
-    for (resolved.relations) |relation| if (relation != null) return error.CatalogGenerationChanged;
+    // The authority's table-exists result needs no relation publication or
+    // name batch. Only a rejected create of an absent table needs that read.
+    var epoch: ?@import("antfly_local_sources").system_catalog_relation_reconciliation.Epoch = null;
+    var occupied = false;
+    var offset: usize = 0;
+    while (offset < names.len) {
+        try context.ensureActive();
+        var batch_arena = std.heap.ArenaAllocator.init(scratch);
+        defer batch_arena.deinit();
+        const a = batch_arena.allocator();
+        const count = @min(@as(usize, 256), names.len - offset);
+        const relations = try a.alloc(domain.RelationTarget, count);
+        for (relations, names[offset..][0..count]) |*relation, name| relation.* = .{ .database = target.database, .namespace = target.namespace, .name = name };
+        const batch: domain.ResolveMany = .{ .relations = relations, .name_allocation = true, .expected_relation_epoch = epoch };
+        const reply = try server.source.systemCatalog(a, context, .{ .resolve_many = batch });
+        const cut = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, reply, .{ .allocate = .alloc_always });
+        try cut.validateRelations(batch);
+        epoch = cut.relation_epoch;
+        for (cut.relations) |relation| if (relation != null) {
+            occupied = true;
+        };
+        offset += count;
+    }
+    if (occupied) return error.CatalogGenerationChanged;
     return err;
 }
 
@@ -578,7 +599,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
             if (create.tablespace) |tablespace| parsed.tablespace_name = try allocators.scratch.dupe(u8, tablespace);
             if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema)) {
                 const plan = @import("fk_initial_create_plan_builder.zig").buildWithScratch(server, a, allocators.scratch, context, identity, target, parsed) catch |err| switch (err) {
-                    error.CatalogAlreadyExists, error.TableAlreadyExists => return createConflict(server, context, a, target, generated_names, create.if_not_exists, err),
+                    error.CatalogAlreadyExists, error.TableAlreadyExists => return createConflict(server, context, a, target, generated_names, create.if_not_exists, err, allocators.scratch),
                     else => return err,
                 };
                 var receipt = try newReceipt(alloc, target, plan.child.table_id, 0);
@@ -591,7 +612,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
                 }
                 const hex = std.fmt.bytesToHex(plan.id, .lower);
                 receipt.fk_generation_publication_id = try alloc.dupe(u8, &hex);
-                const accepted = server.submitFkInitialCreatePlan(allocators.scratch, context, plan) catch |err| return createConflict(server, context, a, target, generated_names, create.if_not_exists, err);
+                const accepted = server.submitFkInitialCreatePlan(allocators.scratch, context, plan) catch |err| return createConflict(server, context, a, target, generated_names, create.if_not_exists, err, allocators.scratch);
                 receipt.state = if (accepted.state == .admission_unknown) .admission_unknown else .pending;
                 receipt.diagnostic = if (accepted.state == .admission_unknown)
                     "Initial FK table admission is unresolved. Retain the publication ID, refresh table status, and do not replay CREATE."
@@ -628,7 +649,7 @@ pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?serve
         // Conditional DDL observes the authority's atomic outcome; there is no
         // existence preflight and no retry of an ambiguous durable submission.
         switch (input) {
-            .create_table => |create| if (err == error.CatalogAlreadyExists or err == error.TableAlreadyExists) return createConflict(server, context, a, target, generated_names, create.if_not_exists, err),
+            .create_table => |create| if (err == error.CatalogAlreadyExists or err == error.TableAlreadyExists) return createConflict(server, context, a, target, generated_names, create.if_not_exists, err, allocators.scratch),
             .drop_table => |drop| if (drop.if_exists and (err == error.CatalogNotFound or err == error.TableNotFound)) return .{},
             .catalog_ddl => |ddl| if (ddl.conditional and ((ddl.action == .create and err == error.CatalogAlreadyExists) or (ddl.action == .drop and err == error.CatalogNotFound))) return .{},
             .policy_ddl => unreachable,
@@ -1257,21 +1278,26 @@ test "SQL catalog automatic constraint names observe namespace collisions and ad
             try std.testing.expect(call == .resolve_many);
             const lookup = call.resolve_many;
             self.reads += 1;
-            var relations: [1]?domain.ResolvedRelation = .{null};
+            const relations = try alloc.alloc(?domain.ResolvedRelation, lookup.relations.len);
+            defer alloc.free(relations);
+            @memset(relations, null);
             const table: domain.ResolvedTable = .{ .table_id = 17, .name = "table:17" };
             if (lookup.relations.len != 0) {
-                try std.testing.expectEqual(@as(usize, 1), lookup.relations.len);
+                try std.testing.expect(lookup.relations.len <= 256);
+                try std.testing.expect(lookup.name_allocation);
                 try std.testing.expectEqualStrings("tenant", lookup.relations[0].namespace);
-                const name = lookup.relations[0].name;
-                if (self.claimed or std.mem.eql(u8, name, "foo_pkey") or std.mem.eql(u8, name, "foo_pkey1"))
-                    relations[0] = .{ .table = table, .logical_table = "holder", .owner = .{ .table_id = 17, .schema_version = 1, .schema_digest = @splat(1), .kind = .index } };
+                for (lookup.relations, relations) |relation, *slot| {
+                    const name = relation.name;
+                    if (self.claimed or std.mem.eql(u8, name, "foo_pkey") or std.mem.eql(u8, name, "foo_pkey1"))
+                        slot.* = .{ .table = table, .logical_table = "holder", .owner = .{ .table_id = 17, .schema_version = 1, .schema_digest = @splat(1), .kind = .index } };
+                }
             }
             const targets = [_]?domain.ResolvedTable{if (self.target_exists) table else null};
             return std.json.Stringify.valueAlloc(alloc, domain.ResolvedMany{
                 .revision = 9,
                 .tables = targets[0..lookup.targets.len],
                 .relations = relations[0..lookup.relations.len],
-                .relation_epoch = if (self.unattested) null else .{ .revision = if (self.churn and self.reads > 1) 10 else 9, .incarnation = @splat(1) },
+                .relation_epoch = if (self.unattested) null else .{ .revision = if (self.churn and ((lookup.targets.len == 0 and lookup.expected_relation_epoch != null))) 10 else 9, .incarnation = @splat(1) },
             }, .{});
         }
     };
@@ -1300,14 +1326,33 @@ test "SQL catalog automatic constraint names observe namespace collisions and ad
     try std.testing.expectError(error.TableTopologyUpgradeRequired, chooseGeneratedNames(&server, .{}, a, alloc, target, schema, &.{"foo_pkey"}));
     source.unattested = false;
     source.claimed = true;
-    try std.testing.expectError(error.CatalogGenerationChanged, createConflict(&server, .{}, a, target, selected.names, true, error.CatalogAlreadyExists));
+    try std.testing.expectError(error.CatalogGenerationChanged, createConflict(&server, .{}, a, target, selected.names, true, error.CatalogAlreadyExists, alloc));
     source.target_exists = true;
-    _ = try createConflict(&server, .{}, a, target, selected.names, true, error.CatalogAlreadyExists);
-    try std.testing.expectError(error.CatalogAlreadyExists, createConflict(&server, .{}, a, target, selected.names, false, error.CatalogAlreadyExists));
+    _ = try createConflict(&server, .{}, a, target, selected.names, true, error.CatalogAlreadyExists, alloc);
+    try std.testing.expectError(error.CatalogAlreadyExists, createConflict(&server, .{}, a, target, selected.names, false, error.CatalogAlreadyExists, alloc));
     source.target_exists = false;
     source.claimed = false;
-    try std.testing.expectError(error.CatalogAlreadyExists, createConflict(&server, .{}, a, target, &.{}, true, error.CatalogAlreadyExists));
-    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, createConflict(&server, .{}, a, target, selected.names, true, error.MetadataMutationOutcomeUnknown));
+    try std.testing.expectError(error.CatalogAlreadyExists, createConflict(&server, .{}, a, target, &.{}, true, error.CatalogAlreadyExists, alloc));
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, createConflict(&server, .{}, a, target, selected.names, true, error.MetadataMutationOutcomeUnknown, alloc));
+    // An existing table short-circuits before any relation batch, even at
+    // the largest supported schema width. An absent table uses bounded batches
+    // whose answers must all belong to the same epoch.
+    const many_names = try a.alloc([]const u8, 513);
+    @memset(many_names, "available_key");
+    source.target_exists = true;
+    source.reads = 0;
+    _ = try createConflict(&server, .{}, a, target, many_names, true, error.CatalogAlreadyExists, alloc);
+    try std.testing.expectEqual(@as(usize, 1), source.reads);
+    source.target_exists = false;
+    source.reads = 0;
+    try std.testing.expectError(error.CatalogAlreadyExists, createConflict(&server, .{}, a, target, many_names, true, error.CatalogAlreadyExists, alloc));
+    try std.testing.expectEqual(@as(usize, 4), source.reads);
+    source.claimed = true;
+    source.reads = 0;
+    try std.testing.expectError(error.CatalogGenerationChanged, createConflict(&server, .{}, a, target, many_names, true, error.CatalogAlreadyExists, alloc));
+    source.churn = true;
+    source.reads = 0;
+    try std.testing.expectError(error.CatalogGenerationChanged, createConflict(&server, .{}, a, target, many_names, true, error.CatalogAlreadyExists, alloc));
     const long_name = try suffixedConstraintName(a, "éééééééééééééééééééééééééééé_pkey", 123);
     try std.testing.expect(long_name.len <= 63);
     try std.testing.expect(std.unicode.utf8ValidateSlice(long_name));

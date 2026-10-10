@@ -2247,6 +2247,62 @@ const LocalStandaloneMetadata = struct {
         return table.*;
     }
 
+    fn standaloneRelationPublicationSupported(self: *const LocalStandaloneMetadata) bool {
+        // Binding an HA mirror enables lifecycle work, including per-table
+        // HA without a whole-instance catalog pointer. Neither that mirror
+        // nor its write gate permits standalone capability activation.
+        return self.coordinated_lifecycle_allowed and self.hot_standby_catalog_server == null and
+            self.hot_standby_gate == null and self.hot_standby_mirror == null;
+    }
+
+    /// HA's durable catalog projection is refreshed under this mutation lane.
+    /// Name selection needs that coherent source cut, not a published index
+    /// registry. Return an explicitly names-only attestation so this read can
+    /// never be consumed as authority for guarded index/schema mutation.
+    fn resolveAllocationNamesLocked(self: *LocalStandaloneMetadata, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, request: system_catalog.ResolveMany) ![]u8 {
+        if (!request.name_allocation or request.include_query_definitions or request.targets.len != 0 or request.storage_names.len != 0) return error.InvalidCatalogMutation;
+        if (request.relations.len > 256) return error.CatalogCommandTooLarge;
+        var incarnation: [16]u8 = undefined;
+        const identity = self.metadata_incarnation orelse return error.InvalidMetadataIncarnation;
+        _ = std.fmt.hexToBytes(&incarnation, &identity) catch return error.InvalidMetadataIncarnation;
+        const epoch: @import("antfly_local_sources").system_catalog_relation_reconciliation.Epoch = .{
+            .incarnation = incarnation,
+            .revision = self.durable_revision,
+        };
+        if (epoch.revision == 0) return error.CatalogPublicationProofPending;
+        if (request.expected_relation_epoch) |expected| if (!epoch.eql(expected)) return error.CatalogGenerationChanged;
+        const revision = self.systemCatalogState().revision;
+        if (request.expected_revision) |expected| if (expected != revision) return error.CatalogGenerationChanged;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const relations = try a.alloc(?system_catalog.ResolvedRelation, request.relations.len);
+        @memset(relations, null);
+        const empty: system_catalog.StateIndex = .{};
+        const index = if (self.system_catalog_state) |*state| &state.index else &empty;
+        const names = @import("antfly_local_sources").system_catalog_relation_names;
+        for (request.relations, relations) |target, *slot| {
+            try target.validate();
+            const namespace = index.namespaceFor(target.database, target.namespace) catch continue;
+            var tables = self.manager.tables.valueIterator();
+            while (tables.next()) |table| {
+                try context.ensureActive();
+                const binding = index.storage_names.get(table.name);
+                const namespace_id = if (binding) |value| value.parent_id else system_catalog.default_namespace_id;
+                if (namespace_id != namespace.id) continue;
+                const logical_name = if (binding) |value| value.name else table.name;
+                var cut = try names.TableCut.init(alloc, .{ .namespace_id = namespace_id, .table_id = table.table_id, .name = logical_name, .schema_json = table.schema_json });
+                defer cut.deinit();
+                for (cut.claims) |claim| if (std.mem.eql(u8, claim.key.name, target.name)) {
+                    if (slot.* != null) return error.InvalidCatalogRecord;
+                    slot.* = .{ .table = system_catalog.ResolvedTable.fromTable(table.*), .logical_table = logical_name, .owner = claim.owner };
+                };
+            }
+        }
+        try context.ensureActive();
+        return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = revision, .tables = &.{}, .relations = relations, .relation_epoch = epoch, .relation_names_only = true }, .{});
+    }
+
     fn exportCatalog(ptr: *anyopaque, alloc: std.mem.Allocator) ![]u8 {
         return systemCatalog(ptr, alloc, .{}, .export_snapshot);
     }
@@ -2852,6 +2908,8 @@ const LocalStandaloneMetadata = struct {
                 return std.json.Stringify.valueAlloc(alloc, identity, .{});
             },
             .resolve_many => |request| {
+                if (request.name_allocation and !self.standaloneRelationPublicationSupported())
+                    return self.resolveAllocationNamesLocked(alloc, context, request);
                 if (request.relations.len != 0 or request.expected_relation_epoch != null) {
                     const store = self.lifecycle_store orelse return error.CatalogPublicationProofPending;
                     const resolved = try store.resolveSystemCatalogIdentities(alloc, group_ids.main_metadata_group_id, request);
@@ -3466,10 +3524,10 @@ const LocalStandaloneMetadata = struct {
     fn reconcileRelations(self: *LocalStandaloneMetadata) !void {
         // HA has a separate writer/replica authority contract. A standalone
         // coordinator cannot activate a single-owner capability for it.
-        if (!self.coordinated_lifecycle_allowed or self.hot_standby_catalog_server != null) return;
         const store = self.lifecycle_store orelse return;
         if (!self.mutex.tryLock()) return;
         defer self.mutex.unlock();
+        if (!self.standaloneRelationPublicationSupported()) return;
         const before = try store.standaloneRevision();
         const applied = self.relation_reconciliation.step(store, self.alloc, group_ids.main_metadata_group_id, self.metadata_incarnation orelse return error.InvalidMetadataIncarnation, self.local_node_id, platform_time.monotonicNs()) catch |err| switch (err) {
             error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.ResourceTemporarilyUnavailable, error.WriterLocked, error.LsmRootWriterAlreadyOpen, error.OutOfMemory, error.MetadataMutationOutcomeUnknown => false,
@@ -14917,4 +14975,65 @@ test "system catalog standalone relation coordinator publishes changed schemas a
             alloc.free(reply);
         }
     }
+}
+
+test "system catalog standalone relation coordinator names-only cuts do not require publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    const domain = @import("antfly_local_sources").system_catalog_domain;
+    const store = metadata.lifecycle_store.?;
+    const group = group_ids.main_metadata_group_id;
+    const table: antfly.metadata.TableRecord = .{
+        .table_id = 7,
+        .name = "holder",
+        .schema_json = "{\"version\":1,\"unique_constraints\":[{\"name\":\"automatic_pkey\",\"columns\":[\"id\"]}],\"relational_indexes\":[{\"name\":\"automatic_pkey1\",\"keys\":[{\"column\":\"id\"}]}]}",
+    };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    try metadata.reloadLifecycleProjectionLocked();
+    const targets = [_]domain.RelationTarget{
+        .{ .name = "holder" }, .{ .name = "automatic_pkey" }, .{ .name = "automatic_pkey1" }, .{ .name = "automatic_pkey2" },
+    };
+    const request: domain.ResolveMany = .{ .relations = &targets, .name_allocation = true };
+    try std.testing.expectError(error.CatalogPublicationProofPending, store.resolveSystemCatalogIdentities(alloc, group, request));
+    metadata.coordinated_lifecycle_allowed = false;
+    const bytes = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .resolve_many = request });
+    defer alloc.free(bytes);
+    var parsed = try std.json.parseFromSlice(domain.ResolvedMany, alloc, bytes, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    const cut = parsed.value;
+    try cut.validateRelations(request);
+    try std.testing.expect(cut.relation_names_only);
+    for (cut.relations[0..3]) |relation| try std.testing.expect(relation != null);
+    try std.testing.expect(cut.relations[3] == null);
+    try std.testing.expectError(error.CatalogPublicationProofPending, cut.validateRelations(.{ .relations = &targets }));
+    // Runtime HA mirror binding re-enables lifecycle work without setting the
+    // whole-instance catalog pointer. A live gate still excludes standalone
+    // activation, and name selection remains available through that source.
+    const Gate = struct {
+        fn check(_: *const anyopaque) anyerror!void {
+            return error.HAPrimaryFenced;
+        }
+    };
+    var sentinel: u8 = 0;
+    metadata.coordinated_lifecycle_allowed = true;
+    metadata.hot_standby_gate = .{ .borrowed = .{ .ptr = &sentinel, .check_fn = Gate.check } };
+    const before = try store.standaloneRevision();
+    try metadata.reconcileRelations();
+    try std.testing.expectEqual(before, try store.standaloneRevision());
+    const gated = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .resolve_many = request });
+    defer alloc.free(gated);
+    var gated_cut = try std.json.parseFromSlice(domain.ResolvedMany, alloc, gated, .{ .allocate = .alloc_always });
+    defer gated_cut.deinit();
+    try gated_cut.value.validateRelations(request);
+    try std.testing.expect(gated_cut.value.relation_names_only);
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "second" } });
+    try metadata.reloadLifecycleProjectionLocked();
+    try std.testing.expectError(error.CatalogGenerationChanged, metadata.resolveAllocationNamesLocked(alloc, .{}, .{ .relations = &targets, .name_allocation = true, .expected_relation_epoch = cut.relation_epoch }));
 }
