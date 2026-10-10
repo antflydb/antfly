@@ -120,7 +120,11 @@ Policies are node-local and reset to configuration after restart.
 ## Reproducible pressure comparison
 
 `run_matrix.py` runs origin/main (when supplied), candidate fail-fast, and candidate
-fixed waiting in independent temporary stores. Candidate fail-fast uses the same
+fixed waiting in independent temporary stores. Manifests with a runnable policy
+also compare candidate runnable scheduling directly against candidate fail-fast,
+candidate fixed waiting and origin/main. The same-binary comparisons validate
+both complete manifest policies before normalizing only the declared scheduler
+and waiting differences; memory and admission capacity remain equal. Candidate fail-fast uses the same
 startup heaps and configuration as fixed waiting, with only query waiting disabled. `load_clients.py` records every
 offered/submitted/completed/successful/failed/generator-dropped request, zero
 retries, successful and all-response p95/p99, resource peaks, control latency and

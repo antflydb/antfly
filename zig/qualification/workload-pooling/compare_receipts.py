@@ -21,6 +21,7 @@ def compare(baseline, candidate):
             failures.append(label + " binary identity missing")
     if baseline.get("binary_sha256") == candidate.get("binary_sha256"):
         runnable_comparison = candidate.get("policy") == "runnable"
+        failfast_comparison = runnable_comparison and baseline.get("policy") == "failfast"
         configurations = []
         for receipt in (baseline, candidate):
             config = copy.deepcopy(receipt.get("configuration"))
@@ -29,9 +30,9 @@ def compare(baseline, candidate):
                 continue
             config.get("pgwire", {}).pop("bind_port", None)
             if runnable_comparison:
-                if receipt.get("policy") not in ("fixed", "runnable"):
+                if receipt.get("policy") not in ("fixed", "failfast", "runnable"):
                     failures.append(
-                        "runnable comparison requires fixed and runnable policies"
+                        "runnable comparison requires fixed, failfast or runnable policies"
                     )
                     continue
                 expected = configuration_for_policy(
@@ -47,13 +48,21 @@ def compare(baseline, candidate):
                         "runnable comparison configuration does not match manifest policy"
                     )
                 config.get("admission", {}).pop("runnable", None)
+                if failfast_comparison:
+                    # Both complete policies were checked against the manifest
+                    # before normalizing their intentional waiting difference.
+                    config.get("admission", {}).get("query", {}).pop("waiting", None)
             else:
                 config.get("admission", {}).get("query", {}).pop("waiting", None)
             configurations.append(config)
         if len(configurations) == 2 and configurations[0] != configurations[1]:
             failures.append(
                 "same-binary comparison differs beyond "
-                + ("runnable scheduling" if runnable_comparison else "query waiting")
+                + (
+                    "runnable scheduling and query waiting"
+                    if failfast_comparison
+                    else "runnable scheduling" if runnable_comparison else "query waiting"
+                )
             )
     limits = candidate["manifest"]["comparison_thresholds"]
     baseline_phases = {p["name"]: p for p in baseline.get("phases", [])}

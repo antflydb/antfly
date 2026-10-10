@@ -2455,3 +2455,19 @@ still requires independently owned children, bounded CPU stages and physical
 retirement before removing its existing fallback. Whole-request allocation
 coverage, runtime envelopes, throughput/fairness measurements and defaults
 also remain incomplete.
+
+### Direct fail-fast versus runnable qualification
+
+The rotated pressure matrix previously launched candidate fail-fast but omitted
+its direct comparison with candidate runnable scheduling. Runnable manifests now
+require that comparison in every repetition, in addition to fixed waiting and
+origin/main. The comparer checks both complete manifest policies before ignoring
+only their declared scheduler and waiting differences. Changed queue settings,
+request memory or admission capacity fail comparison. Existing successful
+throughput, low-load latency, manifest identity, resource and shutdown gates remain
+unchanged. No previous pressure receipt gains qualification from this change.
+
+Harness checks cover all five comparison pairs across four rotated repetitions
+and reject policy changes on either side. Real Linux pressure runs, whole-node
+resource envelopes and per-class fairness remain required; these unit checks
+are not performance evidence and do not qualify default enablement.

@@ -80,7 +80,7 @@ def main():
                 if "candidate-runnable" in outputs:
                     comparisons.extend(
                         (name, "candidate-runnable")
-                        for name in ("candidate-fixed", "origin-main")
+                        for name in ("candidate-fixed", "candidate-failfast", "origin-main")
                         if name in outputs
                     )
                 for name, candidate_name in comparisons:

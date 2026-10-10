@@ -318,14 +318,27 @@ class RunnableQualificationTests(unittest.TestCase):
             comparisons = [
                 call for call in calls if call[1].endswith("compare_receipts.py")
             ]
-            self.assertEqual(16, len(comparisons))
+            self.assertEqual(20, len(comparisons))
             self.assertEqual(
-                8,
+                12,
                 sum(
                     "candidate-runnable" in call[call.index("--candidate") + 1]
                     for call in comparisons
                 ),
             )
+            for repetition in range(1, 5):
+                prefix = "profile-r%02d-" % repetition
+                pairs = {
+                    (
+                        pathlib.Path(call[call.index("--baseline") + 1]).stem,
+                        pathlib.Path(call[call.index("--candidate") + 1]).stem,
+                    )
+                    for call in comparisons
+                }
+                self.assertIn(
+                    (prefix + "candidate-failfast", prefix + "candidate-runnable"),
+                    pairs,
+                )
 
     def test_variant_preserves_admission_and_memory_configuration(self):
         from run_local import configuration_for_policy
@@ -464,6 +477,32 @@ class RunnableQualificationTests(unittest.TestCase):
             changed = copy.deepcopy(candidate)
             changed["configuration"]["admission"][field] = value
             self.assertFalse(compare(baseline, changed)["passed"])
+
+    def test_failfast_runnable_comparison_verifies_both_complete_policies(self):
+        from run_local import configuration_for_policy
+
+        baseline, candidate = QualificationTests().receipt(), QualificationTests().receipt()
+        manifest = dict(candidate["manifest"], **self.manifest())
+        for receipt, policy in ((baseline, "failfast"), (candidate, "runnable")):
+            receipt["policy"] = policy
+            receipt["manifest"] = manifest
+            receipt["configuration"] = configuration_for_policy(manifest, policy)
+            receipt["configuration"]["pgwire"] = {
+                "enabled": True, "bind_port": 5432, "max_connections": 32,
+            }
+        self.assertTrue(compare(baseline, candidate)["passed"])
+        for index, original in enumerate((baseline, candidate)):
+            for change in ("waiting", "memory", "capacity"):
+                changed = copy.deepcopy(original)
+                admission = changed["configuration"]["admission"]
+                if change == "waiting":
+                    admission["query"]["waiting"] = {"max_wait_ms": 999}
+                elif change == "memory":
+                    admission["max_request_memory_bytes"] = 1
+                else:
+                    admission["query"]["max_concurrent_requests"] = 99
+                pair = (changed, candidate) if index == 0 else (baseline, changed)
+                self.assertFalse(compare(*pair)["passed"], (index, change))
 
 
 class ConcurrencySweepTests(unittest.TestCase):
