@@ -2396,6 +2396,7 @@ pub const ResourceManager = struct {
         }
         self.commitMemoryLocked(next);
         self.memory.external_bytes += bytes;
+        self.pressure_change.advance();
         return .reserved;
     }
 
@@ -2415,7 +2416,7 @@ pub const ResourceManager = struct {
         }
         self.memory.external_bytes -= bytes;
         self.memory.used_bytes -= bytes;
-        self.notifyPressureChange();
+        self.pressure_change.advance();
         return .released;
     }
 
@@ -2745,6 +2746,18 @@ pub const ResourceManager = struct {
         return self.reserveOnce(slice, bytes);
     }
 
+    /// No reclaim callbacks. Ledger/parent contention spends only the original
+    /// scope; every failed attempt leaves capacity and ownership unchanged.
+    pub fn reserveWithoutReclaimWithAdmission(self: *ResourceManager, slice: Slice, bytes: u64, control: read_admission.Port) !Reservation {
+        while (true) {
+            return self.reserveOnceControlled(slice, bytes, control) catch |err| {
+                if (err != error.ParentMemoryBusy) return err;
+                try control.waitForProgress();
+                continue;
+            };
+        }
+    }
+
     /// Atomically owns a required secondary credit and as much of the requested
     /// primary credit as currently fits. The full request gets the normal cache
     /// reclamation opportunity before the partial fallback is considered.
@@ -2845,9 +2858,14 @@ pub const ResourceManager = struct {
     }
 
     fn reserveOnce(self: *ResourceManager, slice: Slice, bytes: u64) !Reservation {
+        return self.reserveOnceControlled(slice, bytes, null);
+    }
+
+    fn reserveOnceControlled(self: *ResourceManager, slice: Slice, bytes: u64, control: ?read_admission.Port) !Reservation {
+        if (control) |budget| try budget.checkpoint();
         if (bytes == 0) return .{ .manager = self, .identity = 0, .slice = slice, .bytes = 0 };
 
-        lockAtomic(&self.mutex);
+        if (control) |budget| try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, budget) else lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
         const idx = sliceIndex(slice);
@@ -2862,7 +2880,7 @@ pub const ResourceManager = struct {
         }
         const next_memory = try self.checkMemoryLocked(bytes);
         const identity = try self.registerReservationIdentityLocked(slice, bytes);
-        self.reserveParentLocked(bytes) catch |err| {
+        (if (control != null) self.reserveParentWithoutWaiting(bytes) else self.reserveParentLocked(bytes)) catch |err| {
             _ = self.reservation_identities.remove(identity);
             return err;
         };
@@ -2872,7 +2890,7 @@ pub const ResourceManager = struct {
             state.soft_limit_events += 1;
         }
         self.commitMemoryLocked(next_memory);
-        self.notifyPressureChange();
+        if (control != null) self.pressure_change.advance() else self.notifyPressureChange();
         return .{ .manager = self, .identity = identity, .slice = slice, .bytes = bytes };
     }
 
@@ -3104,6 +3122,34 @@ pub const ResourceManager = struct {
         return true;
     }
 
+    /// The physical owner has retired. A busy ledger/parent keeps this exact
+    /// reservation charged in its independent cleanup owner; no waiting,
+    /// reclamation, scope callback or legacy parent callback occurs here.
+    pub fn tryReleaseReservation(self: *ResourceManager, reservation: *Reservation) MemoryParent.ReleaseResult {
+        if (reservation.manager != self) return .mismatch;
+        if (reservation.released) return .released;
+        if (reservation.identity == 0 and reservation.bytes == 0) {
+            reservation.released = true;
+            return .released;
+        }
+        if (!self.mutex.tryLock()) return .busy;
+        defer self.mutex.unlock();
+        const owned = self.reservation_identities.get(reservation.identity) orelse return .mismatch;
+        const state = &self.slices[sliceIndex(owned.slice)];
+        if (owned.slice != reservation.slice or owned.bytes != reservation.bytes or owned.bytes > state.used_bytes or owned.bytes > self.memory.used_bytes) return .mismatch;
+        if (owned.bytes != 0) self.releaseParentWithoutWaiting(owned.bytes) catch |err| return switch (err) {
+            error.ParentMemoryBusy => .busy,
+            error.ExecutionWaitUnsupported => .unsupported,
+            else => .mismatch,
+        };
+        state.used_bytes -= owned.bytes;
+        self.memory.used_bytes -= owned.bytes;
+        _ = self.reservation_identities.remove(reservation.identity);
+        reservation.released = true;
+        self.pressure_change.advance();
+        return .released;
+    }
+
     fn shrinkReservation(self: *ResourceManager, reservation: *Reservation, bytes: u64) bool {
         if (bytes == 0 or reservation.bytes == 0) return true;
         lockAtomic(&self.mutex);
@@ -3300,14 +3346,29 @@ pub const ResourceManager = struct {
         if (!enforce_limits and self.memory.budget.hard_limit_bytes > 0 and memory_next > self.memory.budget.hard_limit_bytes)
             self.memory.hard_limit_rejections +|= 1;
         if (next == 0) _ = self.observer_identities.remove(key);
-        self.notifyPressureChange();
+        if (bounded_parent) self.pressure_change.advance() else self.notifyPressureChange();
     }
 
     /// Move construction credit into an observed retained owner atomically.
     /// Destination growth includes metadata; only its excess over transferred
     /// credit adds host usage. No reclamation callback runs under this lock.
     pub fn adoptReservationUsage(self: *ResourceManager, reservation: *Reservation, destination: Slice, current: *u64, added: u64) !void {
-        lockAtomic(&self.mutex);
+        return self.adoptReservationUsageOnce(reservation, destination, current, added, null);
+    }
+
+    pub fn adoptReservationUsageWithAdmission(self: *ResourceManager, reservation: *Reservation, destination: Slice, current: *u64, added: u64, control: read_admission.Port) !void {
+        while (true) {
+            self.adoptReservationUsageOnce(reservation, destination, current, added, control) catch |err| {
+                if (err != error.ParentMemoryBusy) return err;
+                try control.waitForProgress();
+                continue;
+            };
+            return;
+        }
+    }
+
+    fn adoptReservationUsageOnce(self: *ResourceManager, reservation: *Reservation, destination: Slice, current: *u64, added: u64, control: ?read_admission.Port) !void {
+        if (control) |budget| try @import("../common/bounded_mutex.zig").lockAtomic(&self.mutex, budget) else lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         if (reservation.manager != self or reservation.released) return error.ResourceAccountingMismatch;
         const source_owned = try self.reservationIdentityLocked(reservation);
@@ -3342,7 +3403,9 @@ pub const ResourceManager = struct {
         // Construction already charged the parent for credit. Only metadata
         // growth needs new capacity; admit it before publishing either owner.
         // Failure leaves the reservation and observer unchanged.
-        if (added > credit) try self.reserveParentLocked(added - credit);
+        if (added > credit) {
+            if (control != null) try self.reserveParentWithoutWaiting(added - credit) else try self.reserveParentLocked(added - credit);
+        }
         source.used_bytes -= credit;
         target.used_bytes = target_next;
         target.peak_bytes = @max(target.peak_bytes, target_next);
@@ -7075,6 +7138,50 @@ pub fn qualifyParentConstructionCredit() !void {
             try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.accounting_errors);
         }
     }
+}
+
+pub fn qualifyNoLiveReservations(manager: *const ResourceManager) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    try std.testing.expectEqual(@as(u32, 0), manager.reservation_identities.count());
+}
+
+pub fn qualifyControlledCreditNotifications(control: read_admission.Port) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    var root = ResourceManager.init(.{ .identity_allocator = a });
+    defer root.deinit(a);
+    var middle = ResourceManager.init(.{ .identity_allocator = a });
+    defer middle.deinit(a);
+    var child = ResourceManager.init(.{ .identity_allocator = a });
+    defer child.deinit(a);
+    try middle.installMemoryParent(root.memoryParentPort());
+    try child.installMemoryParent(middle.memoryParentPort());
+    const Legacy = struct {
+        fn notify(_: *anyopaque) callconv(.c) void {
+            @panic("controlled credit invoked a legacy parent notification");
+        }
+    };
+    const middle_notify = middle.memory_parent.?.notify_fn;
+    const child_notify = child.memory_parent.?.notify_fn;
+    defer {
+        if (middle.memory_parent) |*parent| parent.notify_fn = middle_notify;
+        if (child.memory_parent) |*parent| parent.notify_fn = child_notify;
+    }
+    if (middle.memory_parent) |*parent| parent.notify_fn = Legacy.notify;
+    if (child.memory_parent) |*parent| parent.notify_fn = Legacy.notify;
+    const before = root.pressure_change.snapshot();
+    var credit = try child.reserveWithoutReclaimWithAdmission(.lsm_read_working_set, 128, control);
+    defer credit.release();
+    var retained: u64 = 0;
+    try child.adoptReservationUsageWithAdmission(&credit, .lsm_block_table_cache, &retained, 136, control);
+    try std.testing.expectEqual(@as(u64, 136), root.snapshot().memory.used_bytes);
+    try std.testing.expect(root.pressure_change.snapshot() != before);
+    try std.testing.expectEqual(ResourceManager.MemoryParent.ReleaseResult.released, child.tryReleaseReservation(&credit));
+    try child.adjustUsageWithAdmission(.lsm_block_table_cache, &retained, 0, control);
+    try std.testing.expectEqual(@as(u64, 0), root.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), middle.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.used_bytes);
+    try qualifyNoLiveReservations(&child);
 }
 
 test "resource manager construction credit preserves hierarchical parent capacity" {

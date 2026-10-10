@@ -7168,11 +7168,12 @@ fn retainAsyncPointEntry(
 // promotion lease or cancel the owner's physical handle.
 fn retainAsyncDecodedPointEntry(backend: anytype, read: *AsyncPointBlockRead, read_hint: ?*?BorrowedReadHint, held_values: *PointResultValues, value_allocator: Allocator, namespace: backend_types.Namespace, positioned: lsm_table_file.BorrowedDecoded.PositionedEntry, decoded: DecodedPointBlock) !AsyncPointLookupResult {
     const result = try retainAsyncPointEntry(backend, read, read_hint, held_values, value_allocator, namespace, positioned);
+    if (read.control) |budget| try budget.checkpoint();
     const owner = if (read.shared_block) |shared_owner| &shared_owner.read else read;
-    if (namespace.retainDataBlocks()) if (owner.physical_handle) |*handle| if (handle.claimPointBlockPromotion(read.logical_len)) {
+    if (namespace.retainDataBlocks()) if (owner.physical_handle) |*handle| if (try handle.claimPointBlockPromotionWithAdmission(read.logical_len, read.control)) {
         defer handle.finishPointBlockPromotion();
         const index = try read.index();
-        try promoteCachedPointBlock(backend, read.path, read.run_id, read.generation, index.blockWindow(read.block_index), read.absolute_offset, handle.runTablePhysicalBlock(), decoded);
+        try promoteCachedPointBlockWithAdmission(backend, read.path, read.run_id, read.generation, index.blockWindow(read.block_index), read.absolute_offset, handle.runTablePhysicalBlock(), decoded, read.control);
     };
     return result;
 }
@@ -8274,41 +8275,85 @@ fn findExactEntryInCachedCompressedPrefixBlock(
 const DecodedPointBlock = union(enum) { prefix_records: []const u8, raw_rows: []const u8 };
 
 fn promoteCachedPointBlock(backend: anytype, path: []const u8, run_id: u64, generation: u64, window: lsm_table_file.EntryDataWindow, offset: u64, payload: []const u8, prepared: ?DecodedPointBlock) !void {
+    return promoteCachedPointBlockWithAdmission(backend, path, run_id, generation, window, offset, payload, prepared, null);
+}
+
+fn promoteCachedPointBlockWithAdmission(backend: anytype, path: []const u8, run_id: u64, generation: u64, window: lsm_table_file.EntryDataWindow, offset: u64, payload: []const u8, prepared: ?DecodedPointBlock, control: ?read_admission.Port) !void {
     const cache = backend.options.cache orelse return;
-    var claim = (cache.tryBeginLoadClaim(path, run_id, generation, .run_table_block, offset, window.physicalLen(), null) catch return) orelse return;
+    if (control) |budget| {
+        try budget.checkpoint();
+        // A managed read cannot publish promotion into an uncharged cache.
+        // This optional optimization leaves its already-owned result intact.
+        if (backend.options.resource_manager != null and cache.resource_manager == null) return;
+    }
+    var claim = (cache.tryBeginLoadClaim(path, run_id, generation, .run_table_block, offset, window.physicalLen(), control) catch |err| {
+        if (control == null) return;
+        switch (err) {
+            error.OutOfMemory, error.ResourceBudgetExceeded, error.ResourceTemporarilyUnavailable => return,
+            else => return err,
+        }
+    }) orelse return;
     defer claim.transferToCache();
-    if (cache.retainRunTableBlock(path, run_id, generation, offset, window.physicalLen())) |retained| {
+    const winner_handle = if (control) |budget| try cache.retainRunTableBlockWithAdmission(path, run_id, generation, offset, window.physicalLen(), budget) else cache.retainRunTableBlock(path, run_id, generation, offset, window.physicalLen());
+    if (winner_handle) |retained| {
         var winner = retained;
-        winner.release();
+        winner.releaseWithAdmission(control);
         return;
     }
     const resources = @import("../resource_manager.zig");
-    var output_credit: ?resources.Reservation = if (backend.options.resource_manager) |manager|
-        manager.reserveWithoutReclaim(.lsm_read_working_set, window.len) catch |err| switch (err) {
+    // Unprepared prefix-Snappy decoding owns a temporary prefix buffer as well
+    // as the final rows. Admit both before allocation and keep their credit in
+    // the claim until buffers retire or cache retention adopts it.
+    const scratch_bytes = if (prepared == null and window.compression == .prefix_snappy) try @import("../../encoding/snappy.zig").decodedLen(payload) else 0;
+    const construction_bytes = std.math.add(u64, window.len, scratch_bytes) catch return error.ResourceBudgetExceeded;
+    // Decoded rows belong to the shared cache. Charge its manager even when
+    // the requesting backend has a different working-set accounting owner.
+    const promotion_manager = cache.resource_manager orelse backend.options.resource_manager;
+    const output_credit: ?*resources.Reservation = if (promotion_manager) |manager|
+        claim.reserveConstructionCredit(manager, construction_bytes, control) catch |err| switch (err) {
             error.ResourceBudgetExceeded => return,
             else => return err,
         }
     else
         null;
-    defer if (output_credit) |*credit| credit.release();
-    var scratch = PointReadScratch.init(backend);
-    defer scratch.deinit();
+    const scratch = runtimeScratchAllocator(backend.allocator);
     const decoded = (if (prepared) |ready| blk: {
-        try lsm_table_file.validateBlockPayload(payload, window.checksum);
+        try lsm_table_file.validateBlockPayloadWithAdmission(payload, window.checksum, control);
         break :blk switch (ready) {
-            .prefix_records => |records| lsm_table_file.expandValidatedPrefixRecordsAlloc(cache.valueAllocator(), records, window.len),
+            .prefix_records => |records| lsm_table_file.expandValidatedPrefixRecordsAllocWithAdmission(cache.valueAllocator(), records, window.len, control),
             .raw_rows => |rows| copy: {
                 if (rows.len != window.len) return error.InvalidTableFile;
-                break :copy cache.valueAllocator().dupe(u8, rows);
+                break :copy copyPointPromotionRows(cache.valueAllocator(), rows, control);
             },
         };
-    } else lsm_table_file.decodeBlockPayloadWithScratchAlloc(cache.valueAllocator(), scratch.allocator(), window.compression, payload, window.len, window.checksum)) catch |err| switch (err) {
+    } else lsm_table_file.decodeBlockPayloadWithScratchAllocWithAdmission(cache.valueAllocator(), scratch, window.compression, payload, window.len, window.checksum, control)) catch |err| switch (err) {
         error.OutOfMemory => return,
         else => return err,
     };
     // put consumes decoded on every exit, including allocation failure.
-    var promoted = cache.putRunTableBlockWithCredit(path, run_id, generation, offset, window.physicalLen(), decoded, if (output_credit) |*credit| credit else null) catch return;
-    promoted.release();
+    var promoted = (if (control) |budget| cache.putRunTableBlockWithCreditAdmission(path, run_id, generation, offset, window.physicalLen(), decoded, output_credit, budget) else cache.putRunTableBlockWithCredit(path, run_id, generation, offset, window.physicalLen(), decoded, output_credit)) catch |err| {
+        if (control == null) return;
+        switch (err) {
+            error.OutOfMemory, error.ResourceBudgetExceeded => return,
+            else => return err,
+        }
+    };
+    promoted.releaseWithAdmission(control);
+}
+
+fn copyPointPromotionRows(allocator: Allocator, rows: []const u8, control: ?read_admission.Port) ![]u8 {
+    if (control) |budget| try budget.checkpoint();
+    const owned = try allocator.alloc(u8, rows.len);
+    errdefer allocator.free(owned);
+    var cursor: usize = 0;
+    while (cursor < rows.len) {
+        if (control) |budget| try budget.checkpoint();
+        const end = cursor + @min(rows.len - cursor, 64 * 1024);
+        @memcpy(owned[cursor..end], rows[cursor..end]);
+        cursor = end;
+    }
+    if (control) |budget| try budget.checkpoint();
+    return owned;
 }
 
 fn findExactEntryInCachedPrefixWithScratch(
@@ -13639,4 +13684,71 @@ pub fn qualifyControlledLargeSnappyBatch(control: read_admission.Port) !void {
     try std.testing.expectEqual(@as(usize, 1), result.misses);
     try std.testing.expectEqualSlices(u8, &bytes, values[0].?);
     try std.testing.expect(values[1] == null);
+}
+
+pub fn qualifyControlledPointPromotion(control: read_admission.Port, fixture: usize) !void {
+    if (!builtin.is_test) @compileError("test fixture only");
+    const a = std.testing.allocator;
+    const resources = @import("../resource_manager.zig");
+    var parent = resources.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 2 * 1024 * 1024 } });
+    defer parent.deinit(a);
+    var child = resources.ResourceManager.init(.{ .identity_allocator = a });
+    defer child.deinit(a);
+    try child.installMemoryParent(parent.memoryParentPort());
+    var peer = resources.ResourceManager.init(.{ .identity_allocator = a });
+    defer peer.deinit(a);
+    try peer.installMemoryParent(parent.memoryParentPort());
+    defer {
+        std.debug.assert(parent.snapshot().memory.used_bytes == 0);
+        std.debug.assert(child.snapshot().memory.used_bytes == 0);
+        std.debug.assert(parent.snapshot().memory.accounting_errors == 0);
+        std.debug.assert(child.snapshot().memory.accounting_errors == 0);
+    }
+    var cache = cache_mod.Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    if (fixture != 4) cache.attachResourceManager(&child);
+    const Backend = struct {
+        allocator: Allocator,
+        options: struct { cache: ?*cache_mod.Cache, resource_manager: ?*resources.ResourceManager },
+    };
+    var backend = Backend{ .allocator = a, .options = .{ .cache = &cache, .resource_manager = if (fixture == 5) &peer else &child } };
+    var entries: [192]lsm_table_file.Entry = undefined;
+    var keys: [192][80]u8 = undefined;
+    for (&entries, 0..) |*entry, i| entry.* = .{ .namespace_name = "docs", .key = try std.fmt.bufPrint(&keys[i], "long-shared-document-key-prefix-for-compression:{d:0>4}", .{i}), .value = "a selected document's exact value" };
+    var filter = try lsm_table_file.buildFilterAlloc(a, &entries, lsm_table_file.default_filter_config);
+    defer filter.deinit(a);
+    const encoded = try lsm_table_file.encodeWithFilterAllocOptions(a, &entries, filter, .{ .block_compression = if (fixture == 3) .none else .snappy_adaptive });
+    defer a.free(encoded);
+    var index = try lsm_table_file.decodeIndexAlloc(a, encoded);
+    defer index.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), index.blocks.len);
+    const window = index.blockWindow(0);
+    if (fixture != 3) try std.testing.expectEqual(lsm_table_file.BlockCompression.prefix_snappy, window.compression);
+    const offset = index.entry_data_start + window.physicalRelativeOffset();
+    const payload = encoded[offset..][0..window.physicalLen()];
+    const expected = try lsm_table_file.decodeBlockPayloadAlloc(a, window.compression, payload, window.len, window.checksum);
+    defer a.free(expected);
+    const prefix = if (fixture == 1) try @import("../../encoding/snappy.zig").decode(a, payload) else null;
+    defer if (prefix) |owned| a.free(owned);
+    const prepared: ?DecodedPointBlock = switch (fixture) {
+        0 => null,
+        1 => .{ .prefix_records = prefix.? },
+        else => .{ .raw_rows = expected },
+    };
+    const path = "/controlled-point-promotion";
+    try promoteCachedPointBlockWithAdmission(&backend, path, 1, 1, window, offset, payload, prepared, control);
+    if (fixture == 4) {
+        try std.testing.expect(cache.retainRunTableBlock(path, 1, 1, offset, window.physicalLen()) == null);
+        try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+        return;
+    }
+    var retained = cache.retainRunTableBlock(path, 1, 1, offset, window.physicalLen()) orelse return error.TestUnexpectedResult;
+    defer retained.release();
+    try std.testing.expectEqualSlices(u8, expected, retained.runTableBlock());
+    try cache.drainLoadCleanupWithAdmission(control);
+    try std.testing.expectEqual(@as(u64, 0), child.sliceStats(.lsm_read_working_set).used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), peer.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(child.snapshot().memory.used_bytes, parent.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(child.snapshot().memory.peak_bytes, parent.snapshot().memory.peak_bytes);
+    try std.testing.expect(parent.snapshot().memory.peak_bytes < @as(u64, window.len) * 2);
 }

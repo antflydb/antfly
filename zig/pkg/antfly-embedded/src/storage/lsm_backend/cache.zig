@@ -228,6 +228,7 @@ pub const Cache = struct {
         identity: u64 = 0,
         accounted_bytes: u64 = 0,
         retirement_debt: u64 = 0,
+        construction_credit: ?resource_manager_mod.Reservation = null,
     };
     const transient_cleanup_slots: usize = 32;
     const TransientCleanup = struct {
@@ -599,6 +600,10 @@ pub const Cache = struct {
     /// cache retention when both owners use the same ResourceManager.
     pub fn putRunTableBlockWithCredit(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, block: []u8, credit: ?*resource_manager_mod.Reservation) !Handle {
         return self.putWithBlockCredit(path, run_id, generation, .{ .run_table_block = block }, estimateTableBlockCost(path, block), block_offset, block_len, false, credit);
+    }
+
+    pub fn putRunTableBlockWithCreditAdmission(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, block: []u8, credit: ?*resource_manager_mod.Reservation, control: read_admission.Port) !Handle {
+        return self.putWithBlockReservedCredit(path, run_id, generation, .{ .run_table_block = block }, estimateTableBlockCost(path, block), block_offset, block_len, false, control, false, credit);
     }
 
     pub fn putTransientRunTableBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, block: []u8) !Handle {
@@ -1004,7 +1009,7 @@ pub const Cache = struct {
     fn admitLoadKeyBytes(self: *Cache, slot: *LoadCleanup, bytes: usize, control: ?read_admission.Port) !void {
         if (control) |budget| try @import("../../common/bounded_mutex.zig").lockAtomic(&self.load_key_accounting_mutex, budget) else _ = lockAtomic(&self.load_key_accounting_mutex);
         defer self.load_key_accounting_mutex.unlock();
-        std.debug.assert(slot.accounted_bytes == 0 and slot.retirement_debt == 0 and slot.key == null);
+        std.debug.assert(slot.accounted_bytes == 0 and slot.retirement_debt == 0 and slot.key == null and slot.construction_credit == null);
         const manager = self.resource_manager orelse return;
         if (control) |budget|
             try manager.adjustUsageWithAdmission(.lsm_block_table_cache, &slot.accounted_bytes, @intCast(bytes), budget)
@@ -1037,6 +1042,7 @@ pub const Cache = struct {
         defer self.load_key_accounting_mutex.unlock();
         for (&shard.load_cleanup) |*slot| {
             if (slot.state.load(.acquire) != .pending) continue;
+            if (tryFinishLoadCredit(slot) != .released) continue;
             const retirement = LoadKeyRetirement{ .cache = self, .shard = shard, .slot = slot };
             if (self.resource_manager) |manager| {
                 if (slot.accounted_bytes > slot.retirement_debt) {
@@ -1058,6 +1064,8 @@ pub const Cache = struct {
         for (&shard.load_cleanup) |*slot| {
             std.debug.assert(slot.state.load(.acquire) != .reserved);
             if (slot.state.load(.acquire) != .pending) continue;
+            if (slot.construction_credit) |*credit| credit.release();
+            slot.construction_credit = null;
             (LoadKeyRetirement{ .cache = self, .shard = shard, .slot = slot }).retire();
             if (self.resource_manager) |manager| manager.observeUsage(.lsm_block_table_cache, &slot.accounted_bytes, 0);
             slot.retirement_debt = 0;
@@ -1082,6 +1090,15 @@ pub const Cache = struct {
                     defer self.load_key_accounting_mutex.unlock();
                     for (&shard.load_cleanup) |*slot| {
                         if (slot.state.load(.acquire) != .pending) continue;
+                        switch (tryFinishLoadCredit(slot)) {
+                            .released => {},
+                            .busy => {
+                                physical_pending = true;
+                                continue;
+                            },
+                            .unsupported => return error.ExecutionWaitUnsupported,
+                            .mismatch => return error.ResourceAccountingMismatch,
+                        }
                         if (slot.key != null) {
                             physical_pending = true;
                             continue;
@@ -1109,6 +1126,15 @@ pub const Cache = struct {
                 try control.waitForProgress();
             }
         }
+    }
+
+    fn tryFinishLoadCredit(slot: *LoadCleanup) resource_manager_mod.ResourceManager.MemoryParent.ReleaseResult {
+        if (slot.construction_credit) |*credit| {
+            const result = credit.manager.tryReleaseReservation(credit);
+            if (result != .released) return result;
+            slot.construction_credit = null;
+        }
+        return .released;
     }
 
     fn nextLoadIdentity(self: *Cache) !u64 {
@@ -1381,8 +1407,11 @@ pub const Cache = struct {
         // Admit the complete estimate before allocating entry/path metadata.
         // Retention stays optional; managed admitted transients still require
         // their physical bytes to fit the node memory envelope.
-        const retention_admitted = !force_transient and byte_cost <= self.effectiveMaxBytes() and (prepaid or (if (credit) |construction| self.admitResourceGrowthWithCredit(byte_cost, construction) else if (control) |budget| try self.admitResourceGrowthWithAdmission(byte_cost, budget) else self.admitResourceGrowth(byte_cost)));
+        const retention_admitted = !force_transient and byte_cost <= self.effectiveMaxBytes() and (prepaid or (if (credit) |construction| (if (control) |budget| try self.admitResourceGrowthWithCreditAdmission(byte_cost, construction, budget) else self.admitResourceGrowthWithCredit(byte_cost, construction)) else if (control) |budget| try self.admitResourceGrowthWithAdmission(byte_cost, budget) else self.admitResourceGrowth(byte_cost)));
         reservation_active = prepaid or retention_admitted;
+        // Optional promotion already owns construction credit. Rejecting
+        // retention consumes the buffer; never charge it again as a transient.
+        if (!retention_admitted and control != null and credit != null) return error.ResourceBudgetExceeded;
         if (!retention_admitted) {
             if (control) |budget| transient_cleanup = try self.reserveTransientCleanup(key, budget);
         }
@@ -2030,6 +2059,18 @@ pub const Cache = struct {
         return true;
     }
 
+    fn admitResourceGrowthWithCreditAdmission(self: *Cache, bytes: usize, credit: *resource_manager_mod.Reservation, control: read_admission.Port) !bool {
+        try @import("../../common/bounded_mutex.zig").lockAtomic(&self.resource_accounting_mutex, control);
+        defer self.resource_accounting_mutex.unlock();
+        const manager = self.resource_manager orelse return error.ResourceAccountingMismatch;
+        if (manager != credit.manager) return error.ResourceAccountingMismatch;
+        manager.adoptReservationUsageWithAdmission(credit, .lsm_block_table_cache, &self.resource_accounted_bytes, bytes, control) catch |err| return switch (err) {
+            error.ResourceBudgetExceeded, error.OutOfMemory => false,
+            else => err,
+        };
+        return true;
+    }
+
     fn releaseResourceBytes(self: *Cache, bytes: usize) void {
         if (bytes == 0) return;
         const locked = lockAtomic(&self.resource_accounting_mutex);
@@ -2364,6 +2405,130 @@ pub fn qualifyOptionalLoadClaimAllocation() !void {
     }
 }
 
+pub fn qualifyPromotionCreditContention(control: read_admission.Port, stage: usize) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    var parent = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+    defer parent.deinit(a);
+    var child = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+    defer child.deinit(a);
+    try child.installMemoryParent(parent.memoryParentPort());
+    defer {
+        std.debug.assert(parent.snapshot().memory.used_bytes == 0);
+        std.debug.assert(child.snapshot().memory.used_bytes == 0);
+        resource_manager_mod.qualifyNoLiveReservations(&child) catch unreachable;
+    }
+    var cache = Cache.init(a, 4096);
+    defer cache.deinit();
+    cache.attachResourceManager(&child);
+    const Probe = struct {
+        control: read_admission.Port,
+        child: *resource_manager_mod.ResourceManager,
+        cache: *Cache,
+        shard: *Cache.Shard,
+        held: ?*std.atomic.Mutex = null,
+        waits: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.control.checkpoint();
+        }
+        pub fn waitForProgress(self: *@This()) !void {
+            try std.testing.expect(self.shard.pending_sync.tryLock());
+            self.shard.pending_sync.unlock();
+            if (self.held != &self.child.mutex) {
+                try std.testing.expect(self.child.mutex.tryLock());
+                self.child.mutex.unlock();
+            }
+            self.waits += 1;
+            try self.control.waitForProgress();
+            self.unlock();
+        }
+        fn unlock(self: *@This()) void {
+            if (self.held) |mutex| mutex.unlock();
+            self.held = null;
+        }
+        fn hold(self: *@This(), mutex: *std.atomic.Mutex) void {
+            std.debug.assert(mutex.tryLock());
+            self.held = mutex;
+        }
+    };
+    const path = "promotion-credit-contention";
+    var probe = Probe{ .control = control, .child = &child, .cache = &cache, .shard = cache.shardForKey(makeKey(path, 1, 1, .run_table_block, 8, 128)) };
+    defer probe.unlock();
+    var adapter = read_admission.Adapter(*Probe){ .budget = &probe };
+    const payload = adapter.payload();
+    const port = read_admission.Port.init(&payload);
+    var claim = (try cache.tryBeginLoadClaim(path, 1, 1, .run_table_block, 8, 128, port)) orelse return error.TestUnexpectedResult;
+    defer claim.transferToCache();
+    if (stage == 0) probe.hold(&child.mutex);
+    if (stage == 1) probe.hold(&parent.mutex);
+    const credit = try claim.reserveConstructionCredit(&child, 128, port);
+    if (stage == 2) probe.hold(&cache.resource_accounting_mutex);
+    if (stage == 3) probe.hold(&child.mutex);
+    if (stage == 4) probe.hold(&parent.mutex);
+    var promoted = try cache.putRunTableBlockWithCreditAdmission(path, 1, 1, 8, 128, try a.dupe(u8, &@as([128]u8, @splat('x'))), credit, port);
+    defer promoted.releaseWithAdmission(port);
+    try std.testing.expectEqual(@as(usize, 1), probe.waits);
+    try std.testing.expectEqual(@as(u64, 0), credit.bytes);
+    try std.testing.expectEqual(child.snapshot().memory.used_bytes, parent.snapshot().memory.used_bytes);
+}
+
+pub fn qualifyPromotionCreditCleanup(control: read_admission.Port, deny_retention: bool) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    var parent = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+    defer parent.deinit(a);
+    var child = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+    defer child.deinit(a);
+    try child.installMemoryParent(parent.memoryParentPort());
+    var cache = Cache.init(a, if (deny_retention) 64 else 4096);
+    defer cache.deinit();
+    cache.attachResourceManager(&child);
+    const path = "promotion-credit-cleanup";
+    var claim = (try cache.tryBeginLoadClaim(path, 1, 1, .run_table_block, 8, 128, control)) orelse return error.TestUnexpectedResult;
+    defer claim.transferToCache();
+    const credit = try claim.reserveConstructionCredit(&child, 128, control);
+    if (deny_retention) {
+        try std.testing.expectError(error.ResourceBudgetExceeded, cache.putRunTableBlockWithCreditAdmission(path, 1, 1, 8, 128, try a.dupe(u8, &@as([128]u8, @splat('x'))), credit, control));
+        try std.testing.expectEqual(@as(u64, 128), credit.bytes);
+        try std.testing.expectEqual(@as(u64, 128 + path.len * 2), parent.snapshot().memory.peak_bytes);
+        try std.testing.expectEqual(@as(usize, 0), cache.charged_transient_entries.load(.acquire));
+    }
+    const slot = claim.cleanup;
+    const shard = cache.shardForKey(claim.key.?);
+    shard.pending_sync.lock();
+    std.debug.assert(child.mutex.tryLock());
+    std.debug.assert(parent.mutex.tryLock());
+    claim.transferToCache();
+    parent.mutex.unlock();
+    child.mutex.unlock();
+    // A busy parent leaves the reservation fully charged in cache storage.
+    std.debug.assert(parent.mutex.tryLock());
+    cache.drainLoadCleanupLocked(shard);
+    parent.mutex.unlock();
+    shard.pending_sync.unlock();
+    try std.testing.expect(slot.construction_credit != null);
+    try std.testing.expectEqual(@as(u64, 128), slot.construction_credit.?.bytes);
+    try cache.drainLoadCleanupWithAdmission(control);
+    try std.testing.expect(slot.construction_credit == null);
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), child.snapshot().memory.used_bytes);
+    try resource_manager_mod.qualifyNoLiveReservations(&child);
+}
+
+pub fn qualifyControlledPromotionElection(control: read_admission.Port) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    var cache = Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var physical = try cache.putRunTablePhysicalBlock("promotion-election", 1, 1, 8, 128, try a.dupe(u8, &@as([128]u8, @splat('x'))));
+    defer physical.releaseWithAdmission(control);
+    physical.entry.point_promotion_hits.store(0, .monotonic);
+    try std.testing.expect(try physical.claimPointBlockPromotionWithAdmission(128, control));
+    defer physical.finishPointBlockPromotion();
+    try std.testing.expect(!(try physical.claimPointBlockPromotionWithAdmission(128, control)));
+    try control.checkpoint();
+}
+
 /// Owns exactly one loader registration and its independent cleanup key.
 /// The cache/allocator must outlive this token and all physical loader work.
 /// Retire or transfer the token before destroying its owning completion task.
@@ -2372,6 +2537,15 @@ pub const LoadClaim = struct {
     key: ?Cache.Key,
     identity: u64,
     cleanup: *Cache.LoadCleanup,
+
+    /// The manager outlives the cache-owned cleanup slot. Commit the credit
+    /// directly to that slot before decoding; no borrowed scope is retained.
+    pub fn reserveConstructionCredit(self: *LoadClaim, manager: *resource_manager_mod.ResourceManager, bytes: u64, control: ?read_admission.Port) !*resource_manager_mod.Reservation {
+        if (self.key == null or self.cleanup.construction_credit != null) return error.InvalidArgument;
+        self.cleanup.construction_credit = if (control) |budget| try manager.reserveWithoutReclaimWithAdmission(.lsm_read_working_set, bytes, budget) else try manager.reserveWithoutReclaim(.lsm_read_working_set, bytes);
+        if (self.cleanup.construction_credit) |*credit| return credit;
+        unreachable;
+    }
 
     pub fn isFinished(self: *const LoadClaim) bool {
         return self.key == null;
@@ -2601,12 +2775,18 @@ pub const Handle = struct {
     /// Elect one promoter without allocating a separate hot-block directory.
     /// Transient/policy-bypassed blocks and oversized expansions stay direct.
     pub fn claimPointBlockPromotion(self: *const Handle, decoded_bytes: usize) bool {
+        return self.claimPointBlockPromotionWithAdmission(decoded_bytes, null) catch unreachable;
+    }
+
+    pub fn claimPointBlockPromotionWithAdmission(self: *const Handle, decoded_bytes: usize, control: ?read_admission.Port) !bool {
+        if (control) |budget| try budget.checkpoint();
         const cache = self.cache orelse return false;
         if (self.kind != .run_table_physical_block or decoded_bytes > 64 * 1024 or
             decoded_bytes +| self.entry.path.len > cache.effectiveMaxBytes() / 16) return false;
         const promoting = std.math.maxInt(u16);
         var remaining = self.entry.point_promotion_hits.load(.monotonic);
         while (remaining != promoting) {
+            if (control) |budget| try budget.checkpoint();
             const next = if (remaining == 0) promoting else remaining - 1;
             if (self.entry.point_promotion_hits.cmpxchgWeak(remaining, next, .monotonic, .monotonic)) |observed| {
                 remaining = observed;

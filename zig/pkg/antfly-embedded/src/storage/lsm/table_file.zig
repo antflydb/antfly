@@ -2401,7 +2401,11 @@ fn commonPrefixLen(lhs: []const u8, rhs: []const u8) usize {
 /// Expand previously checksum-validated prefix records into immutable raw rows.
 /// The caller owns admission and the compressed source's integrity check.
 pub fn expandValidatedPrefixRecordsAlloc(allocator: std.mem.Allocator, records: []const u8, expected_len: usize) ![]u8 {
-    return decodePrefixCompressedBlockAlloc(allocator, allocator, records, expected_len);
+    return expandValidatedPrefixRecordsAllocWithAdmission(allocator, records, expected_len, null);
+}
+
+pub fn expandValidatedPrefixRecordsAllocWithAdmission(allocator: std.mem.Allocator, records: []const u8, expected_len: usize, control: ?read_admission.Port) ![]u8 {
+    return decodePrefixCompressedBlockAllocWithAdmission(allocator, allocator, records, expected_len, control);
 }
 
 pub fn decodeBlockPayloadAlloc(
