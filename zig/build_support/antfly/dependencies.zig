@@ -336,7 +336,10 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // transitive tests require different owner roots. Select the SQL and
     // row-policy contract namespaces at compile time, while allowing explicit
     // caller filters.
-    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "common.sql_array_layout", "system_catalog.policies" }) });
+    // SQL declaration lowering must agree with the distributed integrity
+    // planner, which lives outside sql/. Keep that cross-layer regression in
+    // this gate rather than leaving it silently outside the selected corpus.
+    const sql_tests = b.addTest(.{ .root_module = sql_test_mod, .filters = selectTestFilters(b, &.{ "sql.", "common.sql_array_layout", "system_catalog.policies", "SQL UNIQUE null clauses share distributed claims and conflict arbiters", "schema deserialization cleans initialized mappings on allocation failure" }) });
     // Use the same exact-filter runner as extracted SQL owners. Besides
     // consistent failure/leak attribution, this keeps compile-only anonymous
     // reachability anchors out of runtime selection.

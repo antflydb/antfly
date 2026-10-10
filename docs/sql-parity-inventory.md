@@ -1442,6 +1442,12 @@ from current SQL extraction is not repaired by naming this inventory check a ful
 
 ## Concrete remaining reviews
 
+The post-#1048 follow-up sequence and acceptance requirements are tracked in
+[SQL catalog lifecycle and original-case qualification](design/sql-catalog-lifecycle-parity.md).
+It starts with current-engine catalog/index lifecycle evidence, then reuses
+faithful owner fixtures across query and mutation activation. The pools in that
+plan are unresolved reviews, not automatically missing implementations.
+
 ### Namespace relation ownership publication boundary
 
 `system_catalog/relation_names.zig` now provides an owned, bounded before/after

@@ -487,6 +487,45 @@ test "SQL constraints bind typed expressions and preserve composite FK actions" 
     try std.testing.expectEqualStrings("and", schema.object.get("checks").?.array.items[0].object.get("expression").?.object.get("op").?.string);
 }
 
+fn uniqueNullSchema(alloc: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var created = try @import("compiler.zig").compile(alloc, "CREATE TABLE items (tenant BIGINT NOT NULL, email TEXT UNIQUE NULLS NOT DISTINCT, status TEXT)", .{});
+    defer created.deinit();
+    const bytes = try createSchemaAlloc(alloc, created.statement.create_table);
+    defer alloc.free(bytes);
+    var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+    for ([_][]const u8{
+        "ALTER TABLE items ADD CONSTRAINT tenant_email UNIQUE NULLS NOT DISTINCT (tenant, email) DEFERRABLE INITIALLY DEFERRED",
+        "CREATE UNIQUE INDEX folded_email ON items (lower(email)) NULLS NOT DISTINCT WHERE status='active'",
+        "CREATE UNIQUE INDEX ordinary_email ON items (email) NULLS DISTINCT",
+    }) |sql| {
+        var compiled = try @import("compiler.zig").compile(alloc, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expect(try @import("schema_ddl.zig").apply(a, &schema, compiled.statement.catalog_ddl));
+    }
+    const encoded = try std.json.Stringify.valueAlloc(a, schema, .{});
+    var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, encoded);
+    defer parsed.deinit(alloc);
+    const definitions = try parsed.relationalUniqueDefinitions(a);
+    try std.testing.expectEqual(@as(usize, 4), definitions.len);
+    for (definitions[0..3]) |definition| try std.testing.expect(definition.nulls_not_distinct);
+    try std.testing.expect(!definitions[3].nulls_not_distinct);
+    try std.testing.expect(definitions[1].deferrable);
+    try std.testing.expectEqual(.deferred, definitions[1].timing);
+    try std.testing.expectEqual(@as(usize, 1), definitions[2].keys.len);
+    try std.testing.expectEqual(@as(usize, 1), definitions[2].where.len);
+    const wire = schema.object.get("unique_constraints").?.array.items;
+    try std.testing.expectEqualStrings("index", wire[2].object.get("origin").?.string);
+    try std.testing.expectEqualStrings("index", wire[3].object.get("origin").?.string);
+}
+
+test "SQL UNIQUE null semantics survive public schema lowering and allocation failure" {
+    try uniqueNullSchema(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, uniqueNullSchema, .{});
+}
+
 test "SQL CREATE TABLE combines inline primary keys and named composite declarations" {
     const alloc = std.testing.allocator;
     var compiled = try @import("compiler.zig").compile(alloc, "CREATE TABLE items (id BIGINT PRIMARY KEY, parent BIGINT REFERENCES parents (id), name TEXT CONSTRAINT unique_name UNIQUE, CONSTRAINT positive CHECK (id > 0), UNIQUE (id, name))", .{});

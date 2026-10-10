@@ -2311,7 +2311,7 @@ test "SQL typed array spill codec preserves complete cells and rejects every tru
             bytes.items[10] = kind;
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "SQL typed array row and column spill preserve dimensions and NULL provenance" {

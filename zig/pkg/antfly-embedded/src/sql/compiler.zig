@@ -1873,7 +1873,8 @@ const Parser = struct {
                     definition.nullable = false;
                     try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_primary_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}), .primary = true } }));
                 } else if (self.keyword(.unique)) {
-                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_unique_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}) } }));
+                    const nulls_not_distinct = try self.uniqueNulls();
+                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_unique_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}), .nulls_not_distinct = nulls_not_distinct } }));
                 } else if (self.keyword(.constraint)) {
                     const constraint_name = try self.identifier();
                     try constraints.append(self.alloc, try self.inlineConstraint(constraint_name, column));
@@ -2095,9 +2096,12 @@ const Parser = struct {
             }
             try self.expect(.rparen);
         }
+        const nulls_not_distinct = try self.uniqueNulls();
+        if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.nulls) or self.tokens[self.pos].isKeyword(.include)))
+            return self.fail(error.InvalidSqlSyntax, "duplicate or misplaced index NULLS/INCLUDE clause");
         const partial_predicate = if (self.keyword(.where)) try self.scalar(0, 0) else null;
         if (partial_predicate) |expression| try self.checkScalarDepth(expression, 0);
-        return .{ .kind = .index, .action = .create, .name = .{ .table = index_name }, .index_table = table_name, .conditional = conditional, .concurrently = concurrently, .schema_change = .{ .create_index = .{ .name = index_name, .keys = try keys.toOwnedSlice(self.alloc), .include_columns = try included.toOwnedSlice(self.alloc), .unique = unique, .predicate = partial_predicate } } };
+        return .{ .kind = .index, .action = .create, .name = .{ .table = index_name }, .index_table = table_name, .conditional = conditional, .concurrently = concurrently, .schema_change = .{ .create_index = .{ .name = index_name, .keys = try keys.toOwnedSlice(self.alloc), .include_columns = try included.toOwnedSlice(self.alloc), .unique = unique, .predicate = partial_predicate, .nulls_not_distinct = nulls_not_distinct } } };
     }
 
     fn schemaDefault(self: *Parser) Error!*const ast.Scalar {
@@ -2192,6 +2196,13 @@ const Parser = struct {
         return self.constraintDefinition(constraint_name);
     }
 
+    fn uniqueNulls(self: *Parser) Error!bool {
+        if (!self.keyword(.nulls)) return false;
+        const not_distinct = self.keyword(.not);
+        try self.expectKeyword(.distinct);
+        return not_distinct;
+    }
+
     fn uniqueTiming(self: *Parser, change: ast.SchemaChange) Error!ast.SchemaChange {
         var result = change;
         var timing_seen = false;
@@ -2212,6 +2223,7 @@ const Parser = struct {
             } else break;
         }
         if (std.mem.eql(u8, result.add_unique.timing, "deferred") and !result.add_unique.deferrable) return self.fail(error.InvalidSqlSyntax, "INITIALLY DEFERRED requires DEFERRABLE");
+        if (self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.nulls)) return self.fail(error.InvalidSqlSyntax, "constraint NULLS clause must follow UNIQUE");
         return result;
     }
 
@@ -2221,7 +2233,10 @@ const Parser = struct {
             try self.expectKeyword(.key);
             return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = columns, .primary = true } });
         }
-        if (self.keyword(.unique)) return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = columns } });
+        if (self.keyword(.unique)) {
+            const nulls_not_distinct = try self.uniqueNulls();
+            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = columns, .nulls_not_distinct = nulls_not_distinct } });
+        }
         if (self.peek(.identifier) and self.tokens[self.pos].isKeyword(.check)) return self.constraintDefinition(constraint_name);
         return self.foreignKeyDefinition(constraint_name, columns);
     }
@@ -2231,7 +2246,10 @@ const Parser = struct {
             try self.expectKeyword(.key);
             return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlColumnList(), .primary = true } });
         }
-        if (self.keyword(.unique)) return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlColumnList() } });
+        if (self.keyword(.unique)) {
+            const nulls_not_distinct = try self.uniqueNulls();
+            return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = try self.ddlColumnList(), .nulls_not_distinct = nulls_not_distinct } });
+        }
         if (self.keyword(.check)) {
             try self.expect(.lparen);
             const expression = try self.scalar(0, 0);
@@ -2574,6 +2592,72 @@ test "policy DDL parses draft definitions and never accepts publication commands
     try std.testing.expectEqual(.disable, disabled.statement.policy_ddl.action);
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE POLICY bad ON accounts FOR INSERT USING (true)", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE POLICY bad ON accounts FOR SELECT WITH CHECK (true)", .{}));
+}
+
+test "compiler UNIQUE null semantics retain PostgreSQL clause ordering" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { sql: []const u8, not_distinct: bool }{
+        .{ .sql = "CREATE UNIQUE INDEX email_key ON items (email) NULLS NOT DISTINCT", .not_distinct = true },
+        .{ .sql = "CREATE UNIQUE INDEX email_key ON items (email) NULLS DISTINCT", .not_distinct = false },
+        .{ .sql = "CREATE UNIQUE INDEX email_key ON items (lower(email)) INCLUDE (id) NULLS NOT DISTINCT WHERE email IS NULL", .not_distinct = true },
+        .{ .sql = "CREATE INDEX email_lookup ON items (email) NULLS NOT DISTINCT", .not_distinct = true },
+    }) |case| {
+        var compiled = try compile(alloc, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(case.not_distinct, compiled.statement.catalog_ddl.schema_change.?.create_index.nulls_not_distinct);
+    }
+    for ([_]struct { sql: []const u8, not_distinct: bool }{
+        .{ .sql = "CREATE TABLE items (email TEXT UNIQUE NULLS NOT DISTINCT)", .not_distinct = true },
+        .{ .sql = "CREATE TABLE items (email TEXT CONSTRAINT email_key UNIQUE NULLS NOT DISTINCT DEFERRABLE INITIALLY DEFERRED)", .not_distinct = true },
+        .{ .sql = "CREATE TABLE items (email TEXT, UNIQUE NULLS DISTINCT (email))", .not_distinct = false },
+        .{ .sql = "CREATE TABLE items (email TEXT, CONSTRAINT email_key UNIQUE NULLS NOT DISTINCT (email))", .not_distinct = true },
+    }) |case| {
+        var compiled = try compile(alloc, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectEqual(case.not_distinct, compiled.statement.create_table.constraints[0].add_unique.nulls_not_distinct);
+    }
+    var altered = try compile(alloc, "ALTER TABLE items ADD CONSTRAINT email_key UNIQUE NULLS NOT DISTINCT (email) DEFERRABLE INITIALLY DEFERRED", .{});
+    defer altered.deinit();
+    const constraint = altered.statement.catalog_ddl.schema_change.?.add_unique;
+    try std.testing.expect(constraint.nulls_not_distinct and constraint.deferrable);
+    try std.testing.expectEqualStrings("deferred", constraint.timing);
+    for ([_][]const u8{
+        "CREATE UNIQUE INDEX bad ON items (email) NULLS NOT",
+        "CREATE UNIQUE INDEX bad ON items (email) NULLS FIRST",
+        "CREATE UNIQUE INDEX bad ON items (email) NULLS DISTINCT NULLS DISTINCT",
+        "CREATE UNIQUE INDEX bad ON items (email) NULLS NOT DISTINCT INCLUDE (id)",
+        "CREATE TABLE items (email TEXT PRIMARY KEY NULLS NOT DISTINCT)",
+        "ALTER TABLE items ADD CONSTRAINT bad UNIQUE (email) NULLS NOT DISTINCT",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(alloc, sql, .{}));
+}
+
+test "compiler original uniqueness null clauses retain unchanged source contracts" {
+    const alloc = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, @embedFile("fixtures/sql_parity_inventory.json"), .{});
+    defer parsed.deinit();
+    var covered: usize = 0;
+    for (parsed.value.object.get("entries").?.array.items) |entry| {
+        const id = entry.object.get("id").?.string;
+        const not_distinct = std.mem.eql(u8, id, "sql-0692");
+        const constraint = std.mem.eql(u8, id, "sql-0731");
+        if (!not_distinct and !constraint and !std.mem.eql(u8, id, "sql-0706")) continue;
+        var compiled = try compile(alloc, entry.object.get("sql").?.string, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        if (constraint) {
+            try std.testing.expect(!ddl.schema_change.?.add_unique.nulls_not_distinct);
+            try std.testing.expect(!ddl.schema_change.?.add_unique.deferrable);
+            try std.testing.expectEqualStrings("immediate", ddl.schema_change.?.add_unique.timing);
+            try std.testing.expectEqualStrings("usage_records", ddl.name.table);
+        } else {
+            try std.testing.expectEqual(not_distinct, ddl.schema_change.?.create_index.nulls_not_distinct);
+            try std.testing.expect(ddl.schema_change.?.create_index.unique);
+            try std.testing.expectEqualStrings("usage_records", ddl.index_table.?.table);
+        }
+        covered += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), covered);
+    // Compiler evidence is not mounted activation or original-case credit.
 }
 
 test "compiler index DDL retains namespace ownership and distributed statement contracts" {

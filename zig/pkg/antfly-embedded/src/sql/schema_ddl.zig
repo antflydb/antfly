@@ -86,7 +86,12 @@ fn indexOwnershipNamespaces(allocator: std.mem.Allocator) !void {
             const before = try std.json.Stringify.valueAlloc(a, schema, .{});
             var compiled = try compiler.compile(a, try std.fmt.allocPrint(a, "ALTER TABLE items {s} CONSTRAINT {s}", .{ action, name }), .{});
             defer compiled.deinit();
-            try std.testing.expectError(error.SqlConstraintNotFound, apply(a, &schema, compiled.statement.catalog_ddl));
+            if (apply(a, &schema, compiled.statement.catalog_ddl)) |_| return error.TestUnexpectedError else |err| {
+                // The allocation-fault sweep must observe injected OOM, not
+                // misclassify it as a failed semantic rejection assertion.
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expect(err == error.SqlConstraintNotFound);
+            }
             try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, schema, .{}));
         }
     }
@@ -210,7 +215,7 @@ pub fn applyCandidate(alloc: std.mem.Allocator, schema: *Value, ddl: ast.Catalog
             if (constraint.primary) try requirePrimaryColumns(alloc, schema, constraint.columns);
             const constraints = try list(schema, alloc, "unique_constraints");
             if (named(constraints.items, constraint.name, "name") != null) return error.SqlConstraintAlreadyExists;
-            try constraints.append(try value(alloc, .{ .name = constraint.name, .columns = constraint.columns, .primary = constraint.primary, .deferrable = constraint.deferrable, .timing = constraint.timing }));
+            try constraints.append(try value(alloc, .{ .name = constraint.name, .columns = constraint.columns, .primary = constraint.primary, .deferrable = constraint.deferrable, .timing = constraint.timing, .nulls_not_distinct = constraint.nulls_not_distinct }));
         },
         .add_check => |constraint| {
             if (constraintExists(schema.*, constraint.name)) return error.SqlConstraintAlreadyExists;
@@ -253,9 +258,9 @@ pub fn applyCandidate(alloc: std.mem.Allocator, schema: *Value, ddl: ast.Catalog
                     if (key.expression != null) break true;
                 } else false;
                 try constraints.append(if (has_expression)
-                    try value(alloc, .{ .name = index.name, .origin = "index", .keys = keys.items, .where = predicates })
+                    try value(alloc, .{ .name = index.name, .origin = "index", .keys = keys.items, .where = predicates, .nulls_not_distinct = index.nulls_not_distinct })
                 else
-                    try value(alloc, .{ .name = index.name, .origin = "index", .columns = columns.items, .where = predicates }));
+                    try value(alloc, .{ .name = index.name, .origin = "index", .columns = columns.items, .where = predicates, .nulls_not_distinct = index.nulls_not_distinct }));
             }
         },
         .drop_index => |index_name| {

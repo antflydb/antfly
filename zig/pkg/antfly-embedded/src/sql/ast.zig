@@ -316,7 +316,7 @@ pub const CatalogDdl = struct {
 pub const SchemaChange = union(enum) {
     drop_constraint: []const u8,
     validate_constraint: []const u8,
-    add_unique: struct { name: []const u8, columns: []const []const u8, primary: bool = false, deferrable: bool = false, timing: []const u8 = "immediate" },
+    add_unique: struct { name: []const u8, columns: []const []const u8, primary: bool = false, deferrable: bool = false, timing: []const u8 = "immediate", nulls_not_distinct: bool = false },
     add_check: struct { name: []const u8, expression: *const Scalar },
     add_foreign_key: struct {
         name: []const u8,
@@ -329,7 +329,7 @@ pub const SchemaChange = union(enum) {
         deferrable: bool = false,
         timing: []const u8 = "immediate",
     },
-    create_index: struct { name: []const u8, keys: []const Order, include_columns: []const []const u8 = &.{}, unique: bool = false, predicate: ?*const Scalar = null },
+    create_index: struct { name: []const u8, keys: []const Order, include_columns: []const []const u8 = &.{}, unique: bool = false, predicate: ?*const Scalar = null, nulls_not_distinct: bool = false },
     drop_index: []const u8,
     add_column: Column,
     drop_column: []const u8,

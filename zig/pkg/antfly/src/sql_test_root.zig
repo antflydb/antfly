@@ -18,6 +18,9 @@ test {
     _ = @import("sql/subquery_shape_test.zig");
     _ = @import("sql/joined_mutation_test.zig");
     _ = @import("antfly_local_sources").system_catalog_policies;
+    // Keep SQL schema lowering and native uniqueness/conflict admission in
+    // one qualification gate; the build selects the cross-layer contract.
+    _ = @import("antfly_local_sources").api_relational_integrity;
 }
 
 /// Server fixtures retain this compilation root's source and type identity.

@@ -376,7 +376,13 @@ fn executeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authent
         candidates[i * stride] = .{ .database = target.database, .namespace = scope, .name = name.table };
         if (creating) candidates[i * stride + 1] = .{ .database = target.database, .namespace = scope, .name = ddl.name.table };
     }
-    if (namespaces == 0) return if (creating) error.TableNotFound else error.SqlIndexNotFound;
+    // An empty lookup path proves absence without contacting the catalog.
+    // IF EXISTS has the same no-op contract as a completed missing lookup;
+    // explicitly qualified names still bypass the path above.
+    if (namespaces == 0) {
+        if (!creating and ddl.conditional) return .{};
+        return if (creating) error.TableNotFound else error.SqlIndexNotFound;
+    }
     const lookup: domain.ResolveMany = .{ .relations = candidates[0 .. namespaces * stride], .include_query_definitions = true };
     const bytes = try server.source.systemCatalog(a, context, .{ .resolve_many = lookup });
     const resolved = try std.json.parseFromSliceLeaky(domain.ResolvedMany, a, bytes, .{ .allocate = .alloc_always });
@@ -782,6 +788,29 @@ test "SQL index DDL drops the exact qualified owner without a catalog snapshot" 
     _ = try executeWithPath(&server, null, .{}, "default", "public", alloc, path_input, &path);
     try std.testing.expectError(error.Forbidden, executeWithPath(&server, denied, .{}, "default", "public", alloc, path_input, &path));
     try std.testing.expectEqual(@as(usize, 6), source.writes);
+    // An empty connection path must not fall back to the request namespace,
+    // and a conditional missing drop must not require catalog availability.
+    const empty_path: SearchPath = .{};
+    const empty_reads = source.reads;
+    const empty_writes = source.writes;
+    try std.testing.expectError(error.SqlIndexNotFound, executeWithPath(&server, null, .{}, "default", "public", alloc, path_input, &empty_path));
+    var missing = try @import("antfly_local_sources").sql_compiler.compile(alloc, "DROP INDEX IF EXISTS items_id", .{});
+    defer missing.deinit();
+    const missing_input: catalog.Ddl = .{ .catalog_ddl = missing.statement.catalog_ddl };
+    const outcome = try executeWithPath(&server, null, .{}, "default", "public", alloc, missing_input, &empty_path);
+    try std.testing.expect(outcome.receipt == null);
+    try std.testing.expectEqual(empty_reads, source.reads);
+    try std.testing.expectEqual(empty_writes, source.writes);
+    var creating = try @import("antfly_local_sources").sql_compiler.compile(alloc, "CREATE INDEX items_id ON items (id)", .{});
+    defer creating.deinit();
+    try std.testing.expectError(error.TableNotFound, executeWithPath(&server, null, .{}, "default", "public", alloc, .{ .catalog_ddl = creating.statement.catalog_ddl }, &empty_path));
+    try std.testing.expectEqual(empty_reads, source.reads);
+    try std.testing.expectEqual(empty_writes, source.writes);
+    source.path_lookup = false;
+    source.shadow_index = false;
+    _ = try executeWithPath(&server, null, .{}, "default", "public", alloc, input, &empty_path);
+    try std.testing.expectEqual(empty_reads + 1, source.reads);
+    try std.testing.expectEqual(empty_writes + 1, source.writes);
 }
 
 test "SQL catalog ALTER submits native schema CAS without client generations" {
