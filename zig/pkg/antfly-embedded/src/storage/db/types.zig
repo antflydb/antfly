@@ -1942,6 +1942,8 @@ pub const SearchRequest = struct {
     native_key_predicate: ?struct {
         ptr: *anyopaque,
         allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+        /// Changes only when exact query-owned constraints become materialized.
+        constraint_revision: ?*const fn (*anyopaque) u64 = null,
         select_constraints: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?SparseOrdinalSelection = null,
         select_ordinals: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
     } = null,

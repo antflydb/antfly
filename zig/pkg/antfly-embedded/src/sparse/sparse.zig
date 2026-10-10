@@ -218,12 +218,53 @@ pub const OrdinalLookup = @import("ordinal_lookup.zig").Lookup;
 pub const KeyPredicate = struct {
     ptr: *anyopaque,
     allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+    /// Changes only when exact query-owned constraints become materialized.
+    constraint_revision: ?*const fn (*anyopaque) u64 = null,
     /// Resolve exact include/exclude masks without expanding a complement.
     select_constraints: ?*const fn (*anyopaque, Allocator, OrdinalLookup) anyerror!?@import("ordinal_lookup.zig").Selection = null,
     /// Resolve an exact positive physical selection against this read transaction.
     /// Null retains the key predicate path (for example exclusion-only queries).
     select_ordinals: ?*const fn (*anyopaque, Allocator, OrdinalLookup) anyerror!?@import("../encoding/roaring.zig").RoaringBitmap = null,
 };
+
+/// Query-owned masks are always resolved against the same pinned read txn.
+/// A revision changes only on an adaptive provider's one-way completion; this
+/// avoids rebuilding masks per candidate while making the current DAAT seekable.
+const AdaptiveOrdinalConstraints = struct {
+    a: Allocator,
+    predicate: ?KeyPredicate,
+    lookup: OrdinalLookup,
+    revision: u64 = 0,
+    include: ?@import("../encoding/roaring.zig").RoaringBitmap = null,
+    exclude: ?@import("../encoding/roaring.zig").RoaringBitmap = null,
+    resolved: bool = false,
+    fn deinit(self: *@This()) void {
+        if (self.include) |*bitmap| bitmap.deinit();
+        if (self.exclude) |*bitmap| bitmap.deinit();
+    }
+    fn load(self: *@This()) !void {
+        const predicate = self.predicate orelse return;
+        const masks = if (predicate.select_constraints) |select| try select(predicate.ptr, self.a, self.lookup) else null;
+        var selected = masks orelse blk: {
+            const include = if (predicate.select_ordinals) |select| try select(predicate.ptr, self.a, self.lookup) else null;
+            break :blk @import("ordinal_lookup.zig").Selection{ .include = include, .residual = include == null };
+        };
+        errdefer selected.deinit();
+        if (selected.include) |*bitmap| try bitmap.prepareRead();
+        if (selected.exclude) |*bitmap| try bitmap.prepareRead();
+        self.deinit();
+        self.include = selected.include;
+        self.exclude = selected.exclude;
+        self.resolved = !selected.residual;
+        self.revision = if (predicate.constraint_revision) |get| get(predicate.ptr) else 0;
+    }
+    fn refresh(self: *@This()) !void {
+        const predicate = self.predicate orelse return;
+        const get = predicate.constraint_revision orelse return;
+        if (get(predicate.ptr) != self.revision) try self.load();
+    }
+};
+
 pub const SearchConstraints = struct {
     score_spill: ?@import("../spill_sort.zig").Options = null,
     max_score_docs: usize = 65536,
@@ -4710,29 +4751,19 @@ pub const SparseIndex = struct {
             }
         };
         var lookup: Lookup = .{ .index = self, .txn = &txn, .cancellation = constraints.cancellation };
-        const masks = if (constraints.key_predicate) |predicate|
-            if (predicate.select_constraints) |select| try select(predicate.ptr, alloc, .{ .ptr = &lookup, .one = Lookup.lookup, .block = Lookup.block }) else null
-        else
-            null;
-        var ordinal_exclude = if (masks) |selected| selected.exclude else null;
-        defer if (ordinal_exclude) |*bitmap| bitmap.deinit();
-        var ordinal_filter = if (masks) |selected| selected.include else if (constraints.key_predicate) |predicate|
-            if (predicate.select_ordinals) |select| try select(predicate.ptr, alloc, .{ .ptr = &lookup, .one = Lookup.lookup, .block = Lookup.block }) else null
-        else
-            null;
-        defer if (ordinal_filter) |*bitmap| bitmap.deinit();
-        if (ordinal_exclude) |*bitmap| try bitmap.prepareRead();
-        const predicate_resolved = if (masks) |selection| !selection.residual else ordinal_filter != null;
-        if (constraints.key_predicate == null and ordinal_filter == null and (filter_doc_nums.count() != 0 or direct_filter_doc_nums.count() != 0)) {
-            ordinal_filter = @import("../encoding/roaring.zig").RoaringBitmap.init(alloc);
+        var ordinal_state: AdaptiveOrdinalConstraints = .{ .a = alloc, .predicate = constraints.key_predicate, .lookup = .{ .ptr = &lookup, .one = Lookup.lookup, .block = Lookup.block } };
+        defer ordinal_state.deinit();
+        try ordinal_state.load();
+        if (constraints.key_predicate == null and ordinal_state.include == null and (filter_doc_nums.count() != 0 or direct_filter_doc_nums.count() != 0)) {
+            ordinal_state.include = @import("../encoding/roaring.zig").RoaringBitmap.init(alloc);
             const first = if (filter_doc_nums.count() != 0) &filter_doc_nums else &direct_filter_doc_nums;
             var it = first.keyIterator();
             while (it.next()) |num| {
                 if (filter_doc_nums.count() != 0 and direct_filter_doc_nums.count() != 0 and !direct_filter_doc_nums.contains(num.*)) continue;
-                try ordinal_filter.?.add(num.*);
+                try ordinal_state.include.?.add(num.*);
             }
         }
-        if (ordinal_filter) |*bitmap| {
+        if (ordinal_state.include) |*bitmap| {
             try bitmap.prepareRead();
             if (bitmap.isEmpty()) return try alloc.alloc(SearchResult, 0);
         }
@@ -4777,37 +4808,37 @@ pub const SparseIndex = struct {
             source: ScoreSource,
             cancellation: ?CancellationToken,
             key_predicate: ?KeyPredicate,
-            ordinal_filter: ?*const @import("../encoding/roaring.zig").RoaringBitmap,
-            ordinal_exclude: ?*const @import("../encoding/roaring.zig").RoaringBitmap,
+            ordinals: *AdaptiveOrdinalConstraints,
             index: *SparseIndex,
             decisions: *Decisions,
 
             pub fn check(ctx: *@This()) !void {
                 try checkSearchCancellation(ctx.cancellation);
             }
-            pub fn nextCandidate(ctx: *@This(), first: u32) u64 {
+            pub fn nextCandidate(ctx: *@This(), first: u32) !u64 {
+                try ctx.ordinals.refresh();
                 const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
                 var includes: [1]*const Bitmap = undefined;
                 var excludes: [1]*const Bitmap = undefined;
                 var ni: usize = 0;
                 var ne: usize = 0;
-                if (ctx.ordinal_filter) |bitmap| {
+                if (ctx.ordinals.include) |*bitmap| {
                     includes[0] = bitmap;
                     ni = 1;
                 }
-                if (ctx.ordinal_exclude) |bitmap| {
+                if (ctx.ordinals.exclude) |*bitmap| {
                     excludes[0] = bitmap;
                     ne = 1;
                 }
                 return Bitmap.candidateLowerBound(first, 0x1_0000_0000, includes[0..ni], excludes[0..ne]);
             }
             pub fn mayMatch(ctx: *@This(), first: u32, last: u32) bool {
-                if (ctx.ordinal_filter) |bitmap| if (bitmap.rangeCardinality(first, @as(u64, last) + 1) == 0) return false;
-                if (ctx.ordinal_exclude) |bitmap| if (bitmap.rangeCardinality(first, @as(u64, last) + 1) == @as(u64, last) + 1 - first) return false;
+                if (ctx.ordinals.include) |*bitmap| if (bitmap.rangeCardinality(first, @as(u64, last) + 1) == 0) return false;
+                if (ctx.ordinals.exclude) |*bitmap| if (bitmap.rangeCardinality(first, @as(u64, last) + 1) == @as(u64, last) + 1 - first) return false;
                 return true;
             }
             fn allowsKey(ctx: *@This(), doc_num: u32) !bool {
-                if (ctx.key_predicate) |predicate| {
+                if (!ctx.ordinals.resolved) if (ctx.key_predicate) |predicate| {
                     if (ctx.decisions.values.get(doc_num)) |allowed| return allowed;
                     if (ctx.index.docNumDeleted(ctx.visibility, doc_num)) return false;
                     var owned: ?[]u8 = null;
@@ -4832,12 +4863,12 @@ pub const SparseIndex = struct {
                     const allowed = try predicate.allows(predicate.ptr, id);
                     ctx.decisions.values.put(doc_num, allowed);
                     return allowed;
-                }
+                };
                 return true;
             }
             pub fn allows(ctx: *@This(), stream: daat.Stream, doc_num: u32) !bool {
-                if (ctx.ordinal_filter) |bitmap| if (!bitmap.contains(doc_num)) return false;
-                if (ctx.ordinal_exclude) |bitmap| if (bitmap.contains(doc_num)) return false;
+                if (ctx.ordinals.include) |*bitmap| if (!bitmap.contains(doc_num)) return false;
+                if (ctx.ordinals.exclude) |*bitmap| if (bitmap.contains(doc_num)) return false;
                 if (ctx.filter_doc_nums.count() > 0 and !ctx.filter_doc_nums.contains(doc_num)) return false;
                 if (ctx.direct_filter_doc_nums.count() > 0 and !ctx.direct_filter_doc_nums.contains(doc_num)) return false;
                 if (ctx.exclude_doc_nums.contains(doc_num) or ctx.direct_exclude_doc_nums.contains(doc_num)) return false;
@@ -4847,14 +4878,16 @@ pub const SparseIndex = struct {
             }
             fn shouldDecode(ctx: *@This(), bytes: []const u8, range: []const u8) !bool {
                 try checkSearchCancellation(ctx.cancellation);
-                return postingRangeMayMatch(range, bytes, ctx.ordinal_filter);
+                try ctx.ordinals.refresh();
+                return postingRangeMayMatch(range, bytes, if (ctx.ordinals.include) |*bitmap| bitmap else null);
             }
             fn visit(ctx: *@This(), decoded: DecodedChunk) !void {
                 const collect_start_ns = if (ctx.profile != null) nowNs() else 0;
                 for (decoded.doc_nums, 0..) |doc_num, di| {
+                    try ctx.ordinals.refresh();
                     if (di % 256 == 0) try checkSearchCancellation(ctx.cancellation);
-                    if (ctx.ordinal_filter) |bitmap| if (!bitmap.contains(doc_num)) continue;
-                    if (ctx.ordinal_exclude) |bitmap| if (bitmap.contains(doc_num)) continue;
+                    if (ctx.ordinals.include) |*bitmap| if (!bitmap.contains(doc_num)) continue;
+                    if (ctx.ordinals.exclude) |*bitmap| if (bitmap.contains(doc_num)) continue;
                     if (ctx.filter_doc_nums.count() > 0 and !ctx.filter_doc_nums.contains(doc_num)) continue;
                     if (ctx.direct_filter_doc_nums.count() > 0 and !ctx.direct_filter_doc_nums.contains(doc_num)) continue;
                     if (ctx.exclude_doc_nums.contains(doc_num)) continue;
@@ -4879,7 +4912,7 @@ pub const SparseIndex = struct {
         var fast_entries: ?[]ScoreEntry = null;
         defer if (fast_entries) |values| alloc.free(values);
         if (decisions.complete) {
-            if (try collectPostingStreams(alloc, &txn, query_vec, constraints.cancellation, 64 * 1024 * 1024, &page_reader, if (ordinal_filter) |*bitmap| bitmap else null)) |input| {
+            if (try collectPostingStreams(alloc, &txn, query_vec, constraints.cancellation, 64 * 1024 * 1024, &page_reader, if (ordinal_state.include) |*bitmap| bitmap else null)) |input| {
                 defer {
                     for (input) |*stream| stream.deinit();
                     alloc.free(input);
@@ -4898,9 +4931,8 @@ pub const SparseIndex = struct {
                     .profile = null,
                     .source = .segment,
                     .cancellation = constraints.cancellation,
-                    .key_predicate = if (!predicate_resolved) constraints.key_predicate else null,
-                    .ordinal_filter = if (ordinal_filter) |*bitmap| bitmap else null,
-                    .ordinal_exclude = if (ordinal_exclude) |*bitmap| bitmap else null,
+                    .key_predicate = if (!ordinal_state.resolved) constraints.key_predicate else null,
+                    .ordinals = &ordinal_state,
                     .index = self,
                     .decisions = &decisions,
                 };
@@ -4943,9 +4975,8 @@ pub const SparseIndex = struct {
                         .profile = if (profile_enabled) &profile else null,
                         .source = .segment,
                         .cancellation = constraints.cancellation,
-                        .key_predicate = if (!predicate_resolved) constraints.key_predicate else null,
-                        .ordinal_filter = if (ordinal_filter) |*bitmap| bitmap else null,
-                        .ordinal_exclude = if (ordinal_exclude) |*bitmap| bitmap else null,
+                        .key_predicate = if (!ordinal_state.resolved) constraints.key_predicate else null,
+                        .ordinals = &ordinal_state,
                         .index = self,
                         .decisions = &decisions,
                     };
@@ -4974,7 +5005,7 @@ pub const SparseIndex = struct {
                     const ck = invChunkKey(&ck_buf, term_id, @intCast(ci));
                     const chunk_data = txn.get(ck) catch continue;
 
-                    if (!try chunkMayMatch(chunk_data, if (ordinal_filter) |*bitmap| bitmap else null)) continue;
+                    if (!try chunkMayMatch(chunk_data, if (ordinal_state.include) |*bitmap| bitmap else null)) continue;
                     const delta_start_ns = if (profile_enabled) nowNs() else 0;
                     const decoded = try decodeChunk(alloc, chunk_data);
                     defer alloc.free(decoded.doc_nums);
@@ -4994,9 +5025,8 @@ pub const SparseIndex = struct {
                         .profile = if (profile_enabled) &profile else null,
                         .source = .delta,
                         .cancellation = constraints.cancellation,
-                        .key_predicate = if (!predicate_resolved) constraints.key_predicate else null,
-                        .ordinal_filter = if (ordinal_filter) |*bitmap| bitmap else null,
-                        .ordinal_exclude = if (ordinal_exclude) |*bitmap| bitmap else null,
+                        .key_predicate = if (!ordinal_state.resolved) constraints.key_predicate else null,
+                        .ordinals = &ordinal_state,
                         .index = self,
                         .decisions = &decisions,
                     };
@@ -7265,7 +7295,7 @@ test "sparse paged archive admission depends on live blocks rather than segment 
         pub fn allows(_: *@This(), _: daat.Stream, _: u32) !bool {
             return true;
         }
-        pub fn nextCandidate(_: *@This(), first: u32) u64 {
+        pub fn nextCandidate(_: *@This(), first: u32) !u64 {
             return if (first <= 2047) 2047 else @as(u64, std.math.maxInt(u32)) + 1;
         }
     };
@@ -8020,4 +8050,53 @@ test "sparse predicate decisions remain bounded and exact through collisions" {
         if (i >= 256) try std.testing.expect(cache.get(doc - 256) == null);
     }
     try std.testing.expect(@sizeOf(PredicateDecisionCache) <= 4096);
+}
+
+test "sparse adaptive ordinal constraints seek on upfront and mid query completion" {
+    const a = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "adaptive-seeks");
+    defer cleanupTmp(path);
+    var idx = try SparseIndex.open(a, path, .{ .chunk_size = 32 });
+    defer idx.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const writes = try ca.alloc(SparseWrite, 10000);
+    for (writes, 0..) |*write, i| write.* = .{ .doc_id = try std.fmt.allocPrint(ca, "doc-{d}", .{i}), .vec = .{ .indices = &.{1}, .values = &.{1} } };
+    try idx.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    const Predicate = struct {
+        calls: usize = 0,
+        selections: usize = 0,
+        complete: bool = false,
+        fn revision(raw: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return @intFromBool(self.complete);
+        }
+        fn allows(raw: *anyopaque, key: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 3) self.complete = true;
+            return std.mem.eql(u8, key, "doc-9999");
+        }
+        fn select(raw: *anyopaque, alloc: Allocator, lookup: OrdinalLookup) !?@import("ordinal_lookup.zig").Selection {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.selections += 1;
+            if (!self.complete) return .{ .residual = true };
+            var selected: @import("ordinal_lookup.zig").Selection = .{ .include = .init(alloc) };
+            errdefer selected.deinit();
+            try selected.include.?.add((try lookup.one(lookup.ptr, "doc-9999")).?);
+            return selected;
+        }
+    };
+    for ([_]bool{ false, true }) |upfront| {
+        var predicate: Predicate = .{ .complete = upfront };
+        const query: SparseVector = .{ .indices = &.{1}, .values = &.{-1} };
+        const hits = try idx.searchConstrained(a, &query, 10, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_constraints = Predicate.select, .constraint_revision = Predicate.revision } });
+        defer SparseIndex.freeResults(a, hits);
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("doc-9999", hits[0].doc_id);
+        try std.testing.expectEqual(@as(usize, if (upfront) 0 else 3), predicate.calls);
+        try std.testing.expectEqual(@as(usize, if (upfront) 1 else 2), predicate.selections);
+    }
 }

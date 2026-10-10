@@ -678,20 +678,33 @@ keeping the existing source, publication, authorization and runtime pins alive.
 
 Cheap exact selections still materialize immediately. A broader predicate can
 start with reverse-row-index probes of candidates actually reached by ranking.
-Direct probes require an authenticated reverse tree and proof that tuple bounds
+Direct probes require authenticated reverse trees and proof that tuple bounds
 enforce **every** condition (`rangeEnforcesConditions`); an indexed superset is
-insufficient. OR/residual shapes retain the existing full predicate planner.
+insufficient. A whole-predicate index or a conjunction of independent exact
+column indexes provides that proof. Independent predicates short circuit in
+increasing estimated-cardinality order. OR/residual shapes retain the existing
+full predicate planner.
 
 Each point probe costs 64 relative work units, consistent with the text producer.
-Accumulated point work cannot exceed the cheaper full index-walk/column-scan
+A composed conjunction reserves 64 units per child before evaluating a candidate.
+Accumulated point work cannot exceed the cheaper combined index-walk/column-scan
 estimate. Exhausting this budget, or the reader's independent authenticated
 page-read budget, switches once to the full planner's compressed physical set.
 Subsequent hybrid consumers reuse that set. Include/exclude state is independent.
 Cancellation and lease/deadline checks run even when membership is fully cached.
 
+Selections with at most 4,096 candidates in their cheapest exact index materialize
+upfront, independently of cold metadata setup cost. For composed predicates,
+materialization drives the smallest physical selection and chooses bounded point
+probes or a compressed index intersection for each remaining column. An exhausted
+point-read budget falls back to the independent tuple walk without admitting
+partial output.
+
 Sparse planning converts only inexpensive completed physical sets to ordinal
-masks. An incomplete or broad provider remains an exact candidate predicate
-inside scoring, before heap admission. Dense ranking uses its existing exact
+masks. A query-local completion revision refreshes those masks in the same pinned
+native transaction before the next DAAT seek or fallback chunk. Thus completion
+helps the current search immediately. An incomplete or broad provider remains an
+exact candidate predicate inside scoring, before heap admission. Dense ranking uses its existing exact
 eligibility callback and retains its existing ANN approximation contract.
 Physical coordinates remain distinct from native ordinals across generations.
 
@@ -746,47 +759,82 @@ per-segment monotone seekable nodes. Term, analyzed match, match-all/match-none,
 and bitmap leaves compose with must, should/minimum-should-match, must-not,
 pure optional clauses and nested boosts. Each clause retains its current hit;
 ranking retains a bounded heap and existing 64-candidate predicate batches.
-Per-field document frequencies and average lengths are cached once per query,
-not recomputed across every segment. Segment iterator arenas reset between
-segments after owned iterators/readers close.
+Unique terms are collected before segment execution and document frequencies
+are loaded in one batch per field through the shared snapshot statistics cache
+and scheduler. Each segment opens one scoped reader per field, shared by its term
+iterators. Reader contexts, iterator buffers and node arrays use the reusable
+segment arena, rather than retaining every segment's scratch in the outer request
+arena. Iterators close before readers, and the arena resets between segments.
 
 Existing same-field fast paths remain first. Nested simple nodes preserve their
 established lowering and f32 arithmetic order, including legacy BM25 normalization,
-boost placement and grouped optional contributions. Mixed-field bounds are not
-reused across subtrees. The new tree visits matching documents to retain exact
-counts and does not claim competitive subtree pruning it has not proved.
+boost placement and grouped optional contributions. An N-of-M posting-head pivot
+skips candidates that cannot meet minimum-should-match, including optional clauses
+under a required conjunction. Common OR/AND cases avoid per-candidate sorting.
+
+Conservative subtree bounds compose each term's own field statistics and posting
+block metadata in scorer arithmetic order. Bounds are cached until their earliest
+block boundary. Rejected ranges advance metadata cursors without decoding posting
+payloads; a competitive seek loads its target block. Negative-boost or unsupported
+bounds disable competitive pruning. Strict score/document-ID comparisons preserve
+cutoff ties. A pruned search reports a truthful lower-bound hit count (`gte`), like
+the existing native WAND paths; an unpruned search retains exact counts.
 
 Phrase/position and other unsupported leaves, distributed statistics,
 aggregations and search-after retain the authoritative existing paths. Public
 sort/cursor orchestration remains unchanged. Future streaming position leaves
-must verify positions before admission; conservative subtree bounds could add
-further pruning, but neither is required for the delivered term/match tree.
+must verify positions before admission. Position/phrase streaming remains future
+work outside this term/match tree.
 
-Seeded randomized differential coverage compares 100 nested shapes across two
+Seeded randomized differential coverage compares 1,000 nested shapes across two
 segments with mixed fields, duplicate clauses, zero/negative boosts, optional
 clauses, minimum-should-match, deletes, bitmap filters and offsets. Candidate
-producer includes/exclusions are compared separately with the all-hit reference.
-Scores, counts, relations and document IDs must match exactly, without a floating
-point tolerance. Phrase fallback eligibility is checked explicitly. Exhaustive
-allocation-failure injection covers iterator, statistics, producer-batch, heap
+producer includes/exclusions are compared separately with the all-hit reference
+for the first 100 shapes. The remaining 900 compare bounded ranking with a full
+unpruned tree, preserving the same lowering and f32 arithmetic policy.
+Scores and document IDs must match exactly, without a floating point tolerance.
+Unpruned counts remain exact; pruned counts must be valid lower bounds. Phrase
+fallback eligibility is checked explicitly. Exhaustive allocation-failure injection covers iterator, statistics, producer-batch, heap
 and stored-result cleanup for a nested mixed-field tree.
 
 ### Qualification
 
 The implementation was qualified after merging main using Zig 0.17.0:
 
-- Debug: 64 sparse tests, 386 bounded native reader tests (one ReleaseFast-only
-  benchmark skipped), 19 focused filtered text/scorer tests (one benchmark skipped),
+- Debug: 65 sparse tests, 388 bounded native reader tests (one additional
+  ReleaseFast-only benchmark skipped), 21 focused filtered text/scorer tests
+  (one additional benchmark skipped),
   and four filtered reader tests; no failures or leaks.
-- ReleaseFast: 20 focused text/scorer tests, including the heap benchmark, and
+- ReleaseFast: 22 focused text/scorer tests, including the heap benchmark, and
   four filtered reader tests; no failures or leaks.
 - Production Debug `antfly` build passed.
 - The existing real Parquet/Iceberg `e2e-full` fixture now publishes text, sparse
   and dense indexes, exercises rare/common sparse candidates with broad predicates,
   exclusion-only queries, dense/hybrid filters, and retains text sort/cursor
-  assertions before and after restart: both formats passed (22.61 seconds total).
-  The separate quantized sparse-score E2E regression also passed (1.97 seconds).
+  assertions before and after restart: both formats passed (20.10 seconds total).
+  The separate quantized sparse-score E2E regression passed (1.92 seconds).
 
 Representative 50-million-row cold/warm throughput and peak process memory
 remain unmeasured. The heap microbenchmark and bounded state guarantees do not
 substitute for that archive-scale qualification.
+
+### Follow-up review regressions and qualification
+
+The follow-up fixes the two review findings: cold/warm selective metadata predicates
+retain upfront sparse ordinal seeks, and native segment scratch stays bounded
+when the caller uses an arena. It also implements the three remaining opportunities:
+minimum-should-match/subtree pruning, shared field readers with batched statistics,
+and adaptive conjunction membership across independent metadata indexes.
+
+Work-count regressions verify that a late rare posting jumps over a 2,000-row common
+clause, including under required clauses; metadata-only block navigation leaves the
+posting decoder on its original block; and sparse membership completion after three
+candidate probes refreshes the current 10,000-row search exactly once and seeks to
+the final row. An upfront exact mask uses no reverse-key predicate callbacks. Native
+arena retention at 1/8/32 segments must stay within three times the one-segment
+capacity, and two same-field terms must share one reader. Existing exhaustive
+allocation-failure and signed-score differential checks remain enabled.
+
+The real Parquet/Iceberg E2E fixture additionally exercises cold/warm selective
+conjunctions, rare/common candidates across independent metadata indexes, transition
+to a selective intersection, and composed exclusions, before and after restart.

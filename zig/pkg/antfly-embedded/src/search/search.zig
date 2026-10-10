@@ -2596,7 +2596,6 @@ const StreamingBoolNode = struct {
     segment: *const index_mod.SegmentEntry,
     steps: usize = 0,
     group_optional: bool = false,
-    reader: ?inverted.ScopedInvertedIndexReader = null,
     term: ?FastTermState = null,
     scorer: inverted.BM25TermScorer = undefined,
     legacy_norm: bool = false,
@@ -2609,18 +2608,107 @@ const StreamingBoolNode = struct {
     should: []const *StreamingBoolNode = &.{},
     must_not: []const *StreamingBoolNode = &.{},
     minimum: u32 = 0,
+    pivots: []u32 = &.{},
     baseline: ?f32 = null,
     boost: f32 = 1,
     current: ?Hit = null,
     exhausted: bool = false,
+
+    fn check(self: *@This()) !void {
+        if (self.steps % 256 == 0) if (self.segment.query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check_context| try check_context(source.ranges.ptr);
+        self.steps +%= 1;
+    }
+
+    const Bound = struct { upper: f32, last: u32 };
+    /// A ceiling valid through the earliest child block boundary. Unsupported
+    /// signed subtrees disable pruning rather than borrowing another field's
+    /// statistics. Addition follows the scorer's clause/group order.
+    fn bound(self: *@This(), first: u32) anyerror!Bound {
+        try self.check();
+        var result: Bound = .{ .upper = std.math.inf(f32), .last = self.count - 1 };
+        if (self.boost < 0) return result;
+        switch (self.kind) {
+            .none => result.upper = 0,
+            .all => result.upper = 1,
+            .bitmap => result.upper = self.boost,
+            .term => {
+                const state = &self.term.?;
+                if (state.idf < 0 or self.config.k1 < 0 or !std.math.isFinite(self.config.k1) or self.config.b < 0 or self.config.b > 1 or !std.math.isFinite(self.config.b) or !(self.average > 0)) return result;
+                const posting = state.current orelse {
+                    result.upper = 0;
+                    return result;
+                };
+                if (posting.doc_id > first) return .{ .upper = 0, .last = posting.doc_id - 1 };
+                const blocks = state.block_max orelse return result;
+                var cursor = state.block_cursor orelse state.iter.currentBlockCursor() orelse return result;
+                // Walk authenticated block metadata without decoding rejected
+                // posting payloads. A later seek loads only the competitive block.
+                while (cursor.max_doc < first) {
+                    try self.check();
+                    if (!try state.iter.advanceBlockCursor(&cursor)) {
+                        result.upper = 0;
+                        return result;
+                    }
+                }
+                state.block_cursor = cursor;
+                if (cursor.min_doc > first) return .{ .upper = 0, .last = cursor.min_doc - 1 };
+                result.last = @min(result.last, cursor.max_doc);
+                result.upper = state.iter.blockCursorImpactWithIdf(blocks, cursor, self.average, state.idf, self.config) * self.boost;
+            },
+            .boolean => {
+                result.upper = self.baseline orelse 0;
+                for (self.must) |child| {
+                    const value = try child.bound(first);
+                    result.upper += value.upper;
+                    result.last = @min(result.last, value.last);
+                }
+                var optional: f32 = 0;
+                for (self.should) |child| {
+                    const value = try child.bound(first);
+                    if (self.group_optional) optional += @max(0, value.upper) else result.upper += @max(0, value.upper);
+                    result.last = @min(result.last, value.last);
+                }
+                if (self.group_optional) result.upper += optional;
+                result.upper *= self.boost;
+            },
+        }
+        // Cover legacy/precomputed BM25 and final multiplication rounding.
+        if (std.math.isFinite(result.upper) and result.upper > 0) result.upper = std.math.nextAfter(f32, result.upper * 1.000001, std.math.inf(f32));
+        return result;
+    }
+
+    fn shouldCandidate(self: *@This(), first: u32) anyerror!?u32 {
+        var target = first;
+        while (true) {
+            var live: usize = 0;
+            for (self.should) |child| if (try child.seek(target)) |hit| {
+                self.pivots[live] = hit.doc;
+                live += 1;
+            };
+            const required = @max(self.minimum, 1);
+            if (live < required) return null;
+            var minimum = self.pivots[0];
+            var maximum = minimum;
+            for (self.pivots[1..live]) |doc| {
+                minimum = @min(minimum, doc);
+                maximum = @max(maximum, doc);
+            }
+            // Common OR/AND cases need no per-document sort.
+            const pivot = if (required == 1) minimum else if (required == live) maximum else blk: {
+                std.mem.sort(u32, self.pivots[0..live], {}, std.sort.asc(u32));
+                break :blk self.pivots[required - 1];
+            };
+            if (minimum == pivot) return pivot;
+            target = pivot;
+        }
+    }
 
     fn seek(self: *@This(), first: u32) anyerror!?Hit {
         if (self.exhausted) return null;
         if (self.current) |hit| if (hit.doc >= first) return hit;
         var target = first;
         while (target < self.count) {
-            if (self.steps % 256 == 0) if (self.segment.query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
-            self.steps +%= 1;
+            try self.check();
             const hit: ?Hit = switch (self.kind) {
                 .none => null,
                 .all => .{ .doc = target, .score = 1 },
@@ -2633,6 +2721,7 @@ const StreamingBoolNode = struct {
                 .term => blk: {
                     const state = &self.term.?;
                     try state.advanceTo(target);
+                    state.block_cursor = null;
                     const posting = state.current orelse break :blk null;
                     const score = if (self.legacy_norm) inverted.bm25ScoreWithIdf(posting.freq, posting.norm, self.average, state.idf, self.config) else self.scorer.score(posting.freq, posting.norm);
                     break :blk .{ .doc = posting.doc_id, .score = score * self.boost };
@@ -2650,12 +2739,16 @@ const StreamingBoolNode = struct {
                                 }
                             }
                         }
-                    } else if (self.baseline == null) {
-                        var next: ?u32 = null;
-                        for (self.should) |child| if (try child.seek(target)) |child_hit| {
-                            next = @min(next orelse child_hit.doc, child_hit.doc);
-                        };
-                        target = next orelse break :blk null;
+                    }
+                    if (self.minimum > 0 or (self.must.len == 0 and self.baseline == null)) {
+                        // N-of-M heads supply a lower bound for both optional
+                        // and required conjunctions, before scoring any union.
+                        const next = (try self.shouldCandidate(target)) orelse break :blk null;
+                        if (next > target and self.must.len != 0) {
+                            target = next;
+                            continue;
+                        }
+                        target = next;
                     }
                     var score: f32 = self.baseline orelse 0;
                     for (self.must) |child| score += child.current.?.score;
@@ -2698,21 +2791,51 @@ const StreamingBoolStats = struct {
     snap: *const index_mod.IndexSnapshot,
     count: u32,
     fields: std.StringHashMapUnmanaged(Field) = .empty,
-    fn get(self: *@This(), field: []const u8, term: []const u8) !struct { frequency: u32, average: f32 } {
+    fn add(self: *@This(), field: []const u8, term: []const u8) !void {
         const entry = try self.fields.getOrPut(self.a, field);
         if (!entry.found_existing) entry.value_ptr.* = .{ .average = self.snap.textAvgDocLen(field) };
-        const frequency = entry.value_ptr.frequencies.get(term) orelse blk: {
-            const value = try self.snap.termDocFreq(self.a, field, term);
-            try entry.value_ptr.frequencies.put(self.a, try self.a.dupe(u8, term), value);
-            break :blk value;
-        };
-        return .{ .frequency = frequency, .average = entry.value_ptr.average };
+        const value = try entry.value_ptr.frequencies.getOrPut(self.a, term);
+        if (!value.found_existing) {
+            value.key_ptr.* = try self.a.dupe(u8, term);
+            value.value_ptr.* = 0;
+        }
+    }
+    fn collect(self: *@This(), query: SearchQuery) anyerror!void {
+        switch (query) {
+            .term => |t| try self.add(t.field, t.term),
+            .match => |m| {
+                const analyzer = m.analyzer orelse &analysis_mod.default_analyzer;
+                const tokens = try analyzer.analyze(self.a, m.text);
+                defer analysis_mod.Analyzer.freeTokens(self.a, tokens);
+                for (tokens) |token| try self.add(m.field, token.term);
+            },
+            .bool_query => |b| for ([_][]const SearchQuery{ b.must, b.should, b.must_not }) |children| {
+                for (children) |child| try self.collect(child);
+            },
+            else => {},
+        }
+    }
+    fn load(self: *@This()) !void {
+        var fields = self.fields.iterator();
+        while (fields.next()) |field| {
+            const frequencies = &field.value_ptr.frequencies;
+            const names = try self.a.alloc([]const u8, frequencies.count());
+            const values = try self.a.alloc(u32, names.len);
+            var terms = frequencies.keyIterator();
+            var i: usize = 0;
+            while (terms.next()) |term| : (i += 1) names[i] = term.*;
+            try self.snap.termDocFreqs(self.a, field.key_ptr.*, names, values);
+            for (names, values) |name, value| frequencies.getPtr(name).?.* = value;
+        }
+    }
+    fn get(self: *@This(), field: []const u8, term: []const u8) !struct { frequency: u32, average: f32 } {
+        const value = self.fields.get(field) orelse return error.InvalidArgument;
+        return .{ .frequency = value.frequencies.get(term) orelse return error.InvalidArgument, .average = value.average };
     }
 };
 
 const StreamingBoolBuilder = struct {
     a: Allocator,
-    alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
     segment: *const index_mod.SegmentEntry,
     offset: u32,
@@ -2721,11 +2844,28 @@ const StreamingBoolBuilder = struct {
     constrained: bool,
     bitmap_constraints: bool,
     nodes: std.ArrayListUnmanaged(*StreamingBoolNode) = .empty,
+    readers: std.StringHashMapUnmanaged(?*inverted.ScopedInvertedIndexReader) = .empty,
     fn deinit(self: *@This()) void {
         for (self.nodes.items) |node| {
             if (node.term) |*term| term.deinit();
-            if (node.reader) |*reader| reader.deinit();
         }
+        var readers = self.readers.valueIterator();
+        while (readers.next()) |reader| if (reader.*) |value| value.deinit();
+    }
+    fn fieldReader(self: *@This(), field: []const u8) !?*inverted.ScopedInvertedIndexReader {
+        const entry = try self.readers.getOrPut(self.a, field);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = null;
+            const reader = (try self.segment.reader.invertedIndexScoped(self.a, field)) orelse return null;
+            const value = self.a.create(inverted.ScopedInvertedIndexReader) catch |err| {
+                var owned = reader;
+                owned.deinit();
+                return err;
+            };
+            value.* = reader;
+            entry.value_ptr.* = value;
+        }
+        return entry.value_ptr.*;
     }
     fn allocateNode(self: *@This()) !*StreamingBoolNode {
         const value = try self.a.create(StreamingBoolNode);
@@ -2775,6 +2915,7 @@ const StreamingBoolBuilder = struct {
         value.must = try self.simpleTerms(must.items, !wand);
         value.should = try self.simpleTerms(should.items, !wand);
         value.must_not = try self.simpleTerms(prohibited.items, !wand);
+        value.pivots = try self.a.alloc(u32, value.should.len);
         return value;
     }
     fn build(self: *@This(), query: SearchQuery) anyerror!*StreamingBoolNode {
@@ -2796,11 +2937,17 @@ const StreamingBoolBuilder = struct {
                 const stats = try self.stats.get(tq.field, tq.term);
                 const frequency = stats.frequency;
                 if (frequency == 0) return value;
-                value.reader = (try self.segment.reader.invertedIndexScoped(self.alloc, tq.field)) orelse return value;
-                const lookup = (try value.reader.?.lookup(tq.term)) orelse return value;
-                var iterator = try lookup.iterator(self.alloc);
+                const reader = (try self.fieldReader(tq.field)) orelse return value;
+                const lookup = (try reader.lookup(tq.term)) orelse return value;
+                var iterator = try lookup.iterator(self.a);
                 iterator.decode_positions = false;
-                value.term = .{ .iter = iterator, .doc_freq = frequency, .idf = inverted.bm25Idf(self.stats.count, frequency), .boost = tq.boost, .block_max = null, .chunk_size = 0 };
+                value.term = .{ .iter = iterator, .doc_freq = frequency, .idf = inverted.bm25Idf(self.stats.count, frequency), .boost = tq.boost, .block_max = switch (lookup) {
+                    .postings => |postings| postings.block_max,
+                    .one_hit => null,
+                }, .chunk_size = switch (lookup) {
+                    .postings => |postings| postings.scoringChunkSize(),
+                    .one_hit => 0,
+                } };
                 try value.term.?.next();
                 value.average = stats.average;
                 value.config = self.config;
@@ -2836,6 +2983,7 @@ const StreamingBoolBuilder = struct {
             },
             else => unreachable,
         }
+        if (value.kind == .boolean) value.pivots = try self.a.alloc(u32, value.should.len);
         return value;
     }
 };
@@ -2865,13 +3013,15 @@ fn executeStreamingTextBool(alloc: Allocator, snap: *const index_mod.IndexSnapsh
     var stats_arena = std.heap.ArenaAllocator.init(alloc);
     defer stats_arena.deinit();
     var stats: StreamingBoolStats = .{ .a = stats_arena.allocator(), .snap = snap, .count = snap.scoringDocCount() };
+    try stats.collect(.{ .bool_query = bq });
+    try stats.load();
     var offset: u32 = 0;
     for (snap.segments) |*segment| {
         try collector.beginSegment(offset, segment.reader.doc_count);
         segment.beginAccess();
         defer segment.endAccess();
         _ = arena.reset(.retain_capacity);
-        var builder: StreamingBoolBuilder = .{ .a = arena.allocator(), .alloc = alloc, .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .stats = &stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .bitmap_constraints = request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null };
+        var builder: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .stats = &stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .bitmap_constraints = request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null };
         defer builder.deinit();
         const root = try builder.build(.{ .bool_query = bq });
         if (request.diagnostics) |diagnostics| {
@@ -2885,10 +3035,23 @@ fn executeStreamingTextBool(alloc: Allocator, snap: *const index_mod.IndexSnapsh
         defer segment.shared.unlockDeletionShared();
         var gate: BitmapGate = .init(request.filter_doc_bitmap, offset, segment.reader.doc_count);
         var first: u32 = 0;
+        var ceiling_cache: ?StreamingBoolNode.Bound = null;
         while (first < segment.reader.doc_count) {
             const allowed = collector.nextAllowed(&gate, offset + first);
             if (allowed >= gate.end) break;
-            const hit = (try root.seek(@intCast(allowed - offset))) orelse break;
+            const target: u32 = @intCast(allowed - offset);
+            if (collector.worstCompetitiveDocId()) |worst| {
+                const ceiling = if (ceiling_cache) |cached| if (target <= cached.last) cached else try root.bound(target) else try root.bound(target);
+                ceiling_cache = ceiling;
+                const threshold = collector.minCompetitiveScore();
+                if (std.math.isFinite(ceiling.upper) and (ceiling.upper < threshold or (ceiling.upper == threshold and allowed > worst))) {
+                    collector.pruned = true;
+                    if (request.diagnostics) |diagnostics| diagnostics.boolean_chunks_skipped += 1;
+                    first = ceiling.last + 1;
+                    continue;
+                }
+            }
+            const hit = (try root.seek(target)) orelse break;
             if (!isSegmentDocDeleted(segment, hit.doc)) try collector.collect(offset + hit.doc, hit.score);
             first = hit.doc + 1;
         }
@@ -2898,7 +3061,7 @@ fn executeStreamingTextBool(alloc: Allocator, snap: *const index_mod.IndexSnapsh
     const hits = try collector.finish();
     defer alloc.free(hits);
     if (request.diagnostics) |diagnostics| diagnostics.boolean_candidates_scored += collector.total_count;
-    return try buildResult(alloc, snap, hits, collector.total_count, .exact, request);
+    return try buildResult(alloc, snap, hits, collector.total_count, if (collector.pruned) .gte else .exact, request);
 }
 
 fn executeBool(
@@ -6648,18 +6811,39 @@ test "streaming boolean nested mixed fields match all hit reference" {
     while (selected_iterator.next()) |id| try selected_ids.append(a, id);
     var prng = std.Random.DefaultPrng.init(0x1046_1051);
     const random = prng.random();
-    for (0..100) |iteration| {
+    for (0..1000) |iteration| {
         const must = [_]SearchQuery{ leaves[random.uintLessThan(usize, leaves.len)], leaves[random.uintLessThan(usize, leaves.len)] };
         const should = [_]SearchQuery{ leaves[random.uintLessThan(usize, leaves.len)], leaves[random.uintLessThan(usize, leaves.len)], leaves[random.uintLessThan(usize, leaves.len)] };
         const prohibited = [_]SearchQuery{leaves[random.uintLessThan(usize, leaves.len)]};
         const bq: BoolQuery = .{ .must = must[0..random.uintLessThan(usize, 3)], .should = &should, .must_not = prohibited[0 .. iteration % 2], .min_should = random.uintLessThan(u32, 5), .pure_should_optional = iteration % 4 == 0, .boost = if (iteration % 3 == 0) -1 else if (iteration % 3 == 1) 0 else 1.25 };
         const request: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 7, .offset = @intCast(iteration % 3), .include_stored = false, .filter_doc_bitmap = if (iteration % 2 == 0) &filter else null };
+        if (iteration >= 100) {
+            // A full-window tree is an unpruned oracle with exactly the same
+            // established lowering/f32 grouping. Exercise bounds across more
+            // shapes without conflating preexisting same-field lowering policies.
+            var full_request = request;
+            full_request.k = writer.snapshot().scoringDocCount();
+            full_request.offset = 0;
+            var full = (try executeStreamingTextBool(a, writer.snapshot(), bq, full_request, .{})).?;
+            defer full.deinit();
+            var bounded = (try executeStreamingTextBool(a, writer.snapshot(), bq, request, .{})).?;
+            defer bounded.deinit();
+            try std.testing.expectEqual(TotalHitsRelation.exact, full.total_hits_relation);
+            if (bounded.total_hits_relation == .exact) try std.testing.expectEqual(full.total_hits, bounded.total_hits) else try std.testing.expect(bounded.total_hits <= full.total_hits);
+            const lower = @min(request.offset, full.hits.len);
+            const upper = @min(lower + request.k, full.hits.len);
+            try std.testing.expectEqual(upper - lower, bounded.hits.len);
+            for (full.hits[lower..upper], bounded.hits) |expected, actual| {
+                try std.testing.expectEqual(expected.doc_id, actual.doc_id);
+                try std.testing.expectEqual(expected.score, actual.score);
+            }
+            continue;
+        }
         var reference = try executeBoolAllHit(a, writer.snapshot(), bq, request);
         defer reference.deinit();
         var result = (try executeStreamingTextBool(a, writer.snapshot(), bq, request, .{})).?;
         defer result.deinit();
-        try std.testing.expectEqual(reference.total_hits, result.total_hits);
-        try std.testing.expectEqual(reference.total_hits_relation, result.total_hits_relation);
+        if (result.total_hits_relation == .exact) try std.testing.expectEqual(reference.total_hits, result.total_hits) else try std.testing.expect(result.total_hits <= reference.total_hits);
         try std.testing.expectEqual(reference.hits.len, result.hits.len);
         for (reference.hits, result.hits) |expected, actual| {
             try std.testing.expectEqual(expected.doc_id, actual.doc_id);
@@ -6680,8 +6864,7 @@ test "streaming boolean nested mixed fields match all hit reference" {
             constrained.exclude_doc_nums = &.{};
             var actual = (try executeStreamingTextBool(a, writer.snapshot(), bq, constrained, if (exclude) .{ .exclude = producer } else .{ .include = producer })).?;
             defer actual.deinit();
-            try std.testing.expectEqual(expected.total_hits, actual.total_hits);
-            try std.testing.expectEqual(expected.total_hits_relation, actual.total_hits_relation);
+            if (actual.total_hits_relation == .exact) try std.testing.expectEqual(expected.total_hits, actual.total_hits) else try std.testing.expect(actual.total_hits <= expected.total_hits);
             try std.testing.expectEqual(expected.hits.len, actual.hits.len);
             for (expected.hits, actual.hits) |left, right| {
                 try std.testing.expectEqual(left.doc_id, right.doc_id);
@@ -6699,4 +6882,120 @@ test "streaming boolean nested mixed fields match all hit reference" {
     };
     try std.testing.checkAllAllocationFailures(a, FailureCheck.run, .{writer.snapshot()});
     try std.testing.expect(!canStreamBool(.{ .phrase = .{ .field = "body", .text = "common x" } }, 0));
+}
+
+test "streaming boolean native segment scratch and shared readers remain bounded" {
+    const a = std.testing.allocator;
+    var inverted_builder = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 64 });
+    defer inverted_builder.deinit();
+    var segment_builder = segment_mod.SegmentWriter.init(a);
+    defer segment_builder.deinit();
+    for (0..1000) |i| {
+        var id: [32]u8 = undefined;
+        try segment_builder.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        try inverted_builder.addDocument(@intCast(i), &.{ .{ .term = "alpha", .freq = 2, .norm = 40 }, .{ .term = "beta", .freq = 3, .norm = 40 } });
+    }
+    const inverted_bytes = try inverted_builder.build();
+    defer a.free(inverted_bytes);
+    try segment_builder.addSection(try segment_builder.addField("title"), .inverted_text, inverted_bytes);
+    const bytes = try segment_builder.build();
+    defer a.free(bytes);
+    var first_capacity: usize = 0;
+    for ([_]usize{ 1, 8, 32 }) |segments| {
+        var writer = try index_mod.IndexWriter.init(a);
+        defer writer.deinit();
+        for (0..segments) |i| try writer.addSegmentWithIdData(i + 1, .fromNative(.{ .contiguous = bytes }));
+        var request_arena = std.heap.ArenaAllocator.init(a);
+        defer request_arena.deinit();
+        const bq: BoolQuery = .{ .must = &.{ .{ .term = .{ .field = "title", .term = "alpha" } }, .{ .bool_query = .{ .should = &.{ .{ .term = .{ .field = "title", .term = "beta" } }, .{ .term = .{ .field = "absent", .term = "missing" } } } } } } };
+        var result = (try executeStreamingTextBool(request_arena.allocator(), writer.snapshot(), bq, .{ .query = .{ .bool_query = bq }, .k = 10, .include_stored = false }, .{})).?;
+        defer result.deinit();
+        const capacity = request_arena.queryCapacity();
+        if (segments == 1) first_capacity = capacity;
+        try std.testing.expect(capacity <= first_capacity * 3);
+        try std.testing.expectEqual(@as(usize, 10), result.hits.len);
+        // Two terms in one field share a single native reader.
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        var stats: StreamingBoolStats = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .count = writer.snapshot().scoringDocCount() };
+        try stats.collect(.{ .bool_query = bq });
+        try stats.load();
+        var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+        defer builder.deinit();
+        _ = try builder.build(.{ .bool_query = bq });
+        try std.testing.expectEqual(@as(u32, 1), builder.readers.count());
+    }
+}
+
+test "streaming boolean minimum should pivot and mixed field block bounds" {
+    const a = std.testing.allocator;
+    var title = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 16 });
+    defer title.deinit();
+    var body = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 16 });
+    defer body.deinit();
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for (0..2000) |i| {
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        const frequency: u32 = if (i < 16) 100 else 1;
+        try title.addDocument(@intCast(i), &.{.{ .term = "common", .freq = frequency, .norm = 40 }});
+        if (i == 1999) try body.addDocument(@intCast(i), &.{.{ .term = "rare", .freq = 1, .norm = 40 }});
+        try body.addDocument(@intCast(i), &.{.{ .term = "ranked", .freq = frequency, .norm = 40 }});
+    }
+    const title_bytes = try title.build();
+    defer a.free(title_bytes);
+    const body_bytes = try body.build();
+    defer a.free(body_bytes);
+    try segment.addSection(try segment.addField("title"), .inverted_text, title_bytes);
+    try segment.addSection(try segment.addField("body"), .inverted_text, body_bytes);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const pivot: BoolQuery = .{ .should = &.{ .{ .term = .{ .field = "title", .term = "common" } }, .{ .term = .{ .field = "body", .term = "rare" } } }, .min_should = 2 };
+    var stats: StreamingBoolStats = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .count = writer.snapshot().scoringDocCount() };
+    try stats.collect(.{ .bool_query = pivot });
+    try stats.load();
+    var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+    defer builder.deinit();
+    const root = try builder.build(.{ .bool_query = pivot });
+    try std.testing.expectEqual(@as(u32, 1999), (try root.seek(0)).?.doc);
+    try std.testing.expect(root.should[0].steps <= 2);
+    try std.testing.expect(root.should[1].steps <= 2);
+    const ranked: BoolQuery = .{ .must = &.{ .{ .term = .{ .field = "title", .term = "common" } }, .{ .term = .{ .field = "body", .term = "ranked" } } } };
+    try stats.collect(.{ .bool_query = ranked });
+    try stats.load();
+    var ranked_builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+    defer ranked_builder.deinit();
+    const ranked_root = try ranked_builder.build(.{ .bool_query = ranked });
+    const first_score = (try ranked_root.seek(0)).?.score;
+    const original_block = ranked_root.must[0].term.?.iter.currentBlockCursor().?.ordinal;
+    const ceiling = try ranked_root.bound(1536);
+    try std.testing.expect(ceiling.upper < first_score);
+    try std.testing.expect(ranked_root.must[0].term.?.block_cursor.?.ordinal > original_block);
+    try std.testing.expectEqual(original_block, ranked_root.must[0].term.?.iter.currentBlockCursor().?.ordinal);
+    // Required clauses also jump to the optional N-of-M candidate, rather
+    // than walking a dense must clause one document at a time.
+    const required: BoolQuery = .{ .must = pivot.should[0..1], .should = pivot.should, .min_should = 2 };
+    const required_root = try builder.build(.{ .bool_query = required });
+    try std.testing.expectEqual(@as(u32, 1999), (try required_root.seek(0)).?.doc);
+    try std.testing.expect(required_root.must[0].steps <= 2);
+    var diagnostics: SearchDiagnostics = .{};
+    const request: SearchRequest = .{ .query = .{ .bool_query = ranked }, .k = 3, .include_stored = false, .diagnostics = &diagnostics };
+    var expected = try executeBoolAllHit(a, writer.snapshot(), ranked, request);
+    defer expected.deinit();
+    var actual = (try executeStreamingTextBool(a, writer.snapshot(), ranked, request, .{})).?;
+    defer actual.deinit();
+    try std.testing.expect(diagnostics.boolean_chunks_skipped > 0);
+    try std.testing.expectEqual(TotalHitsRelation.gte, actual.total_hits_relation);
+    try std.testing.expect(actual.total_hits < expected.total_hits);
+    try std.testing.expectEqual(expected.hits.len, actual.hits.len);
+    for (expected.hits, actual.hits) |left, right| {
+        try std.testing.expectEqual(left.doc_id, right.doc_id);
+        try std.testing.expectEqual(left.score, right.score);
+    }
 }

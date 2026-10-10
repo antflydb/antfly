@@ -427,6 +427,50 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
             assert [
                 (h["_source"]["amount"], h["_score"]) for h in rare["hits"]["hits"]
             ] == [(count - 1, 1)]
+            # Cold/warm exact ID selections must retain sparse seeks even
+            # when loading the index metadata costs more than one point probe.
+            for _ in range(2):
+                point = call(
+                    "POST",
+                    "/tables/sort_pages/query",
+                    dict(
+                        sparse_base,
+                        filter_query={
+                            "conjuncts": [
+                                category,
+                                {"term": {"path": "/amount", "value": count - 1}},
+                            ]
+                        },
+                    ),
+                )
+                assert [
+                    (h["_source"]["amount"], h["_score"]) for h in point["hits"]["hits"]
+                ] == [(count - 1, 1)]
+            # Two independent indexes enforce the entire conjunction through
+            # shared candidate membership, for rare and common sparse postings.
+            multi = {
+                "conjuncts": [
+                    category,
+                    {"range": {"path": "/amount", "gte": count // 2}},
+                ]
+            }
+            for dimension in (97, 1):
+                combined = call(
+                    "POST",
+                    "/tables/sort_pages/query",
+                    dict(
+                        sparse_base,
+                        embeddings={
+                            "sparse_native": {"indices": [dimension], "values": [1]}
+                        },
+                        filter_query=multi,
+                    ),
+                )
+                assert len(combined["hits"]["hits"]) == (1 if dimension == 97 else 10)
+                assert all(
+                    h["_source"]["amount"] >= count // 2 and h["_score"] == 1
+                    for h in combined["hits"]["hits"]
+                )
             common = call(
                 "POST",
                 "/tables/sort_pages/query",
@@ -439,6 +483,34 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
             assert all(
                 h["_source"]["amount"] >= count // 2 and h["_score"] == 1
                 for h in common["hits"]["hits"]
+            )
+            transitioned = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    sparse_base,
+                    filter_query={
+                        "conjuncts": [
+                            category,
+                            {"range": {"path": "/amount", "lte": 4096}},
+                        ]
+                    },
+                ),
+            )
+            assert len(transitioned["hits"]["hits"]) == 10
+            assert all(
+                2 <= h["_source"]["amount"] <= 4096
+                for h in transitioned["hits"]["hits"]
+            )
+            multi_excluded = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(sparse_base, exclusion_query=multi),
+            )
+            assert len(multi_excluded["hits"]["hits"]) == 10
+            assert all(
+                h["_source"]["amount"] < count // 2
+                for h in multi_excluded["hits"]["hits"]
             )
             excluded = call(
                 "POST",

@@ -242,10 +242,10 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
         try context.check();
         if (comptime @hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "nextCandidate")) {
             if (stream.reader != null) {
-                try stream.seek(context.nextCandidate(0));
+                try stream.seek(try context.nextCandidate(0));
             } else {
                 try stream.advance();
-                if (stream.doc) |doc| try stream.seek(context.nextCandidate(doc));
+                if (stream.doc) |doc| try stream.seek(try context.nextCandidate(doc));
             }
         } else try stream.advance();
         if (stream.doc != null) try queue.push(a, i);
@@ -257,7 +257,7 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
         try context.check();
         const doc = streams[first].doc.?;
         if (comptime @hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "nextCandidate")) {
-            const candidate = context.nextCandidate(doc);
+            const candidate = try context.nextCandidate(doc);
             if (candidate > doc) {
                 _ = queue.pop();
                 try streams[first].seek(candidate);

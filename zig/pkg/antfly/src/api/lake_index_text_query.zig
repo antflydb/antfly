@@ -181,7 +181,7 @@ const Execution = struct {
     fn vectorRequest(self: *Execution, req: types.SearchRequest) types.SearchRequest {
         var result = req;
         if (self.vector_include != null or self.vector_exclude != null or self.vector_include_provider != null or self.vector_exclude_provider != null) {
-            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey, .select_constraints = selectSparseConstraints };
+            result.native_key_predicate = .{ .ptr = self, .allows = allowsVectorKey, .select_constraints = selectSparseConstraints, .constraint_revision = sparseConstraintRevision };
             result.filter_query_json = "";
             result.exclusion_query_json = "";
         }
@@ -196,6 +196,10 @@ const Execution = struct {
         if (self.vector_exclude) |*set| return set;
         if (self.vector_exclude_provider) |*provider| if (provider.complete) |*set| return set;
         return null;
+    }
+    fn sparseConstraintRevision(raw: *anyopaque) u64 {
+        const self: *Execution = @ptrCast(@alignCast(raw));
+        return @as(u64, @intFromBool(self.includeSet() != null)) | (@as(u64, @intFromBool(self.excludeSet() != null)) << 1);
     }
     fn selectSparseConstraints(raw: *anyopaque, a: A, lookup: types.SparseOrdinalLookup) !?types.SparseOrdinalSelection {
         const self: *Execution = @ptrCast(@alignCast(raw));
