@@ -228,6 +228,7 @@ pub const Collector = struct {
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(self.table, self.identity, self.namespace);
         const group = try @import("lake_index_native_text.zig").loadFileManifest(a, self.store, ref, domain, self.cancellation(), null);
+        for (group.summaries) |summary| try self.markPages(a, domain, summary, false);
         for (group.rows) |block| {
             if (block.bitmap) |bitmap| _ = try self.mark(bitmap);
         }
@@ -278,6 +279,8 @@ pub const Collector = struct {
                 if (ref.metadata_version >= 1 and ref.metadata_version <= @import("lake_index_native_text.zig").metadata_version) {
                     try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
                     const root = try self.retainedNativeRoot(a, @import("lake_index_native_text.zig"), ref);
+                    try self.markPages(a, root.domain, root.term_statistics, false);
+                    for (root.file_groups) |group| for (group.summaries) |summary| try self.markPages(a, root.domain, summary, false);
                     for (root.manifests) |manifest| {
                         if (self.progress) |progress| try progress.enqueue(.{ .text_manifest = .{ .ref = manifest, .seekable = root.seekable } }) else try self.markTextManifest(a, manifest, root.seekable);
                     }
@@ -424,17 +427,46 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     var hole_upload = try store.put(hole_bytes);
     defer hole_upload.deinit(a);
     const text = @import("lake_index_native_text.zig");
+    const tree = @import("../serverless/graph_segment/page_tree.zig");
+    const page_store = @import("../serverless/graph_segment/page_store.zig");
+    const StatisticsSource = struct {
+        value: []const u8,
+        done: bool = false,
+        pub fn next(self: *@This()) !?tree.Cursor.Record {
+            if (self.done) return null;
+            self.done = true;
+            return .{ .key = "authenticated-text-statistics", .value = self.value };
+        }
+    };
+    var stats_reads: u64 = 1024 * 1024;
+    var stats_writes: u64 = 1024 * 1024;
+    var stats_pages: page_store.PageStore = .{ .domain = domain, .attempt = scope.attempt, .artifacts = &store, .remaining_read_bytes = &stats_reads, .remaining_write_bytes = &stats_writes };
+    var global_source: StatisticsSource = .{ .value = "global frequencies" };
+    const global_statistics = (try tree.buildSorted(a, stats_pages.store(), &global_source)).?;
+    var summary_source: StatisticsSource = .{ .value = "segment pruning summaries" };
+    const segment_statistics = (try tree.buildSorted(a, stats_pages.store(), &summary_source)).?;
+    var old_source: StatisticsSource = .{ .value = "old reader only statistics" };
+    const old_statistics = (try tree.buildSorted(a, stats_pages.store(), &old_source)).?;
     const manifest_bytes = try std.json.Stringify.valueAlloc(ca, text.FileGroup{
         .file = .{ .id = "part", .digest = @splat(7) },
         .segments = &.{.{ .artifact_id = text_segment.artifact_id, .checksum = text_segment.checksum, .byte_len = text_segment.byte_len }},
+        .summaries = &.{segment_statistics},
         .rows = &.{.{ .group = 0, .high = 0, .base = 0, .count = 2, .lower = 0, .bitmap = .{ .artifact_id = hole_upload.artifact_id, .checksum = hole_upload.checksum, .byte_len = hole_upload.byte_len } }},
     }, .{});
     var text_manifest = try store.put(manifest_bytes);
     defer text_manifest.deinit(a);
-    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
+    const text_root_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .statistics_version = 1, .term_statistics = global_statistics, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
     var text_upload = try store.put(text_root_bytes);
     defer text_upload.deinit(a);
     const text_ref: local.serverless_manifest_artifact_ref.ArtifactRef = .{ .name = "text", .kind = .text_segment, .metadata_version = @import("lake_index_native_text.zig").metadata_version, .artifact_id = text_upload.artifact_id, .checksum = text_upload.checksum, .byte_len = text_upload.byte_len };
+    const old_text_bytes = try std.json.Stringify.valueAlloc(ca, text.Root{ .domain = domain, .binding = text_binding, .config_json = "{}", .statistics_version = 1, .term_statistics = old_statistics, .manifests = &.{.{ .artifact_id = text_manifest.artifact_id, .checksum = text_manifest.checksum, .byte_len = text_manifest.byte_len }} }, .{});
+    var old_text_upload = try store.put(old_text_bytes);
+    defer old_text_upload.deinit(a);
+    var old_text_ref = text_ref;
+    old_text_ref.name = "old_text";
+    old_text_ref.artifact_id = old_text_upload.artifact_id;
+    old_text_ref.checksum = old_text_upload.checksum;
+    old_text_ref.byte_len = old_text_upload.byte_len;
     var sparse_binding = binding;
     sparse_binding.sidecar_kind = .sparse;
     var sparse_child = try store.put("authenticated native sparse file block");
@@ -450,7 +482,7 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     var contribution_index: @import("lake_index_contributions.zig").Index = undefined;
     try contribution_index.init(a, store, null, .none);
     defer contribution_index.deinit();
-    const directory_one = try @import("lake_index_directory.zig").publishIndexed(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = "old_sum", .binding = binding, .artifact = old_root }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, &.{.{ .file = @splat(1), .recipe = recipe.fingerprint(), .name = "sum", .artifact = root }}, &contribution_index, .none);
+    const directory_one = try @import("lake_index_directory.zig").publishIndexed(ca, &store, &.{ .{ .name = "sum", .binding = binding, .artifact = root }, .{ .name = "old_sum", .binding = binding, .artifact = old_root }, .{ .name = "old_text", .binding = text_binding, .artifact = old_text_ref }, .{ .name = row_root.name, .binding = row_binding, .artifact = row_root }, .{ .name = "text", .binding = text_binding, .artifact = text_ref }, .{ .name = "sparse", .binding = sparse_binding, .artifact = sparse_ref } }, &.{.{ .file = @splat(1), .recipe = recipe.fingerprint(), .name = "sum", .artifact = root }}, &contribution_index, .none);
     var orphan = try store.put("abandoned build artifact");
     defer orphan.deinit(a);
     var second_orphan = try store.put("another abandoned build artifact");
@@ -528,10 +560,18 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     try std.testing.expectEqual(@as(usize, 2), deleted);
     const retained_old = try store.getAlloc(old_root.artifact_id);
     defer a.free(retained_old);
+    const retained_old_statistics = try store.getAlloc(&try page_store.PageStore.identity(domain, old_statistics));
+    defer a.free(retained_old_statistics);
     harness.state = try harness.state.release(ca, @splat(9));
     var second: Collector = .{ .a = a, .table = 4, .authority = authority, .store = store, .identity = identity, .context = .{}, .options = .{ .dry_run = false }, .token = @splat(8) };
     try std.testing.expect((try second.run()).deleted >= 2);
     try std.testing.expectEqual(@as(usize, 1), harness.state.publications.len);
+    for ([_]tree.Ref{ global_statistics, segment_statistics }) |ref| {
+        const retained_statistics = try store.getAlloc(&try page_store.PageStore.identity(domain, ref));
+        defer a.free(retained_statistics);
+        try std.testing.expectEqual(ref.bytes, retained_statistics.len);
+    }
+    try std.testing.expectError(error.FileNotFound, store.getAlloc(&try page_store.PageStore.identity(domain, old_statistics)));
     const retained_holes = try store.getAlloc(hole_upload.artifact_id);
     defer a.free(retained_holes);
     try std.testing.expectEqualSlices(u8, hole_bytes, retained_holes);

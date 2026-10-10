@@ -191,7 +191,7 @@ test "external lake coverage proofs bind immutable plans publications and fresh 
         }
     };
     var dummy: u8 = 0;
-    const published = try publication.build(a, &artifact_store, table, &source, store.identity, .{}, .none, .{ .ptr = &dummy, .now_ms = Clock.now });
+    const published = try publication.build(a, &artifact_store, table, &source, store.identity, .{ .io = std.testing.io }, .none, .{ .ptr = &dummy, .now_ms = Clock.now });
     defer a.free(published);
     var parsed = try catalog.parse(a, published);
     defer parsed.deinit();
