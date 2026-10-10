@@ -260,3 +260,34 @@ test "mutation root lease explicit nested admission preserves rejection and roll
     healthy.release();
     try std.testing.expectEqual(@as(usize, 1), root.borrowers.load(.acquire));
 }
+
+test "mutation root lease retires resolver and nested batch before C1 capture" {
+    const admission = @import("storage/db/mutation_admission.zig");
+    var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer scheduler.close();
+    var original: native.Execution = .{};
+    defer original.finish();
+    try original.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .write);
+    var barrier: Barrier = .{};
+    var resolver: ?Barrier.SharedLease = barrier.acquireShared();
+    var batch: ?Barrier.SharedLease = barrier.acquireShared();
+    const retirement: admission.MutationRetirement = .{ .current = &batch, .enclosing = &resolver };
+    defer retirement.retire();
+    try std.testing.expect(batch.?.nested);
+    try std.testing.expect(barrier.tryAcquireExclusive() == null);
+    retirement.retire();
+    retirement.retire();
+    try std.testing.expect(batch == null and resolver == null);
+    try original.park(.resource_blocked);
+    var capture_owner: native.Execution = .{};
+    defer capture_owner.finish();
+    try capture_owner.start(&scheduler, .{ .io = std.testing.io }, .control);
+    var capture = barrier.tryAcquireExclusive() orelse return error.ResolverReaderSurvivedBatch;
+    capture.release();
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+    capture_owner.finish();
+    try original.enter(.write);
+    var cleanup = barrier.acquireShared();
+    cleanup.release();
+}

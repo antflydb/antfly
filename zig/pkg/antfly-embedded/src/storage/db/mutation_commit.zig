@@ -1063,7 +1063,13 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         },
                     );
                     unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
-                    if (!opts.bypass_replication_write_gate) try self.flushTransactionReplicationOutbox(resolution.txn_id);
+                    const retirement: @import("mutation_admission.zig").MutationRetirement = .{
+                        .current = &replication_mutation,
+                        .enclosing = opts.enclosing_mutation_retirement,
+                    };
+                    if (!opts.bypass_replication_write_gate) {
+                        try flushTransactionReplicationOutboxWithRetirement(self, resolution.txn_id, retirement);
+                    } else retirement.retire();
                     try self.waitForResolvedTransactionSync(req.sync_level, outcome.replay_sequence);
                     return;
                 }
@@ -2944,7 +2950,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     sync_targets.target_identities,
                     sync_targets.target_scope_known,
                 );
-            releaseReplicationMutationShared(&replication_mutation);
+            (@import("mutation_admission.zig").MutationRetirement{
+                .current = &replication_mutation,
+                .enclosing = opts.enclosing_mutation_retirement,
+            }).retire();
             if (builtin.is_test and opts.restore_staging != null and D.test_fail_restore_projection_apply.*) {
                 D.test_fail_restore_projection_apply.* = false;
                 return error.InjectedRestoreProjectionApplyFailure;
@@ -2966,6 +2975,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     // satisfied durability and the final authority recheck. Keep
                     // the cleanup atomic with other local DB mutations without
                     // retaining the apply lock across the remote wait above.
+                    var cleanup_mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, null);
+                    defer releaseReplicationMutationShared(&cleanup_mutation);
+                    try self.enforceReplicationWriteGate();
                     lockApply(self);
                     defer self.core.unlockApply();
                     if (opts.transaction_resolution) |resolution| {
@@ -3368,13 +3380,24 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn flushTransactionReplicationOutbox(self: anytype, txn_id: transactions_mod.TxnId) !void {
+            var mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, null);
+            defer releaseReplicationMutationShared(&mutation);
+            try flushTransactionReplicationOutboxWithRetirement(self, txn_id, .{ .current = &mutation });
+        }
+
+        fn flushTransactionReplicationOutboxWithRetirement(
+            self: anytype,
+            txn_id: transactions_mod.TxnId,
+            retirement: @import("mutation_admission.zig").MutationRetirement,
+        ) !void {
             var outbox = try self.core.loadTransactionReplicationOutbox(self.alloc, txn_id);
             defer outbox.deinit(self.alloc);
-            if (outbox.batch_payload == null and outbox.replay_payload == null) return;
-
-            // An outbox entry is a durable synchronous-replication obligation. Do
-            // not silently discard it if a restart temporarily removes or
-            // downgrades the corresponding mirror configuration.
+            if (outbox.batch_payload == null and outbox.replay_payload == null) {
+                retirement.retire();
+                return;
+            }
+            // Durable obligations survive unavailable publishers and uncertain
+            // replies. Append every local tail before surrendering capture protection.
             if (outbox.batch_payload != null) {
                 const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
                 if (!replicationMirrorSyncEnabled(mirror)) return error.ReplicationPublisherUnavailable;
@@ -3387,18 +3410,36 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var ctx = self.batchContext();
             if (outbox.batch_payload != null) try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_batch_mirror);
             if (outbox.replay_payload != null) try preflightReplicationMirrorSyncCommitContext(&ctx, ctx.replication_async_effect_mirror);
+            const projected = replicationCommitContext(&ctx);
+            var tails = ReplicationDeferredCommitGates.begin(projected.transition_mutex);
+            defer tails.releaseTransition();
+            const batch_gate = if (outbox.batch_payload) |payload|
+                try appendReplicationEncodedBatchMutationCommitLockedContext(&ctx, payload)
+            else
+                null;
+            const replay_gate = if (outbox.replay_payload) |payload|
+                try appendReplicationReplayPayloadCommitLockedContext(&ctx, payload)
+            else
+                null;
+            tails.releaseTransition();
+            retirement.retire();
 
-            if (outbox.batch_payload) |payload| {
-                try self.mirrorReplicationEncodedBatchMutationCommit(payload);
+            // Preserve per-outbox acknowledgement: an acknowledged batch may be
+            // cleared even when the replay reply is lost. Each completion rechecks
+            // authority, then cleanup takes fresh local capture/apply protection.
+            const gates = [_]?ReplicationDeferredCommitGate{ batch_gate, replay_gate };
+            const present = [_]bool{ outbox.batch_payload != null, outbox.replay_payload != null };
+            for (gates, present, 0..) |gate, has_payload, i| {
+                if (!has_payload) continue;
+                var completion: ReplicationDeferredCommitGates = .{ .transition_mutex = projected.transition_mutex };
+                completion.append(gate);
+                try completion.waitForDurabilityAndAuthority(ctx.replication_write_gate);
+                var cleanup_mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, null);
+                defer releaseReplicationMutationShared(&cleanup_mutation);
+                try self.enforceReplicationWriteGate();
                 try self.lockApplyForPortableRuntime();
                 defer self.core.unlockApply();
-                try self.core.clearTransactionReplicationOutbox(txn_id, .batch);
-            }
-            if (outbox.replay_payload) |payload| {
-                try self.mirrorReplicationReplayPayloadCommit(payload);
-                try self.lockApplyForPortableRuntime();
-                defer self.core.unlockApply();
-                try self.core.clearTransactionReplicationOutbox(txn_id, .replay);
+                try self.core.clearTransactionReplicationOutbox(txn_id, if (i == 0) .batch else .replay);
             }
         }
 
@@ -3746,7 +3787,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         return err;
                     };
                     self.core.unlockApply();
-                    try self.flushTransactionReplicationOutbox(txn_id);
+                    try flushTransactionReplicationOutboxWithRetirement(self, txn_id, .{ .current = &replication_mutation });
                     try self.waitForResolvedTransactionSyncWithCancellation(sync_level, outcome.replay_sequence, visibility_cancellation);
                     return;
                 }
@@ -3772,6 +3813,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }, null, .{
                     .visibility_cancellation = visibility_cancellation,
                     .admission_controls = retained,
+                    .enclosing_mutation_retirement = &replication_mutation,
                     .bypass_replication_write_gate = bypass_replication_write_gate,
                     .ordered_apply_receipt = ordered_receipt,
                     .durable_rows = &durable_rows,

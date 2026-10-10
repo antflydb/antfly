@@ -981,6 +981,9 @@ pub const RelationalPriorMembership = struct {
 };
 
 pub const BatchExecutionOptions = struct {
+    /// Resolver-owned reader, borrowed until the batch orders its local tails.
+    /// The batch retires its nested reader first and nulls this slot before waits.
+    enclosing_mutation_retirement: ?*?MutationBarrier.SharedLease = null,
     /// Borrowed at a stable address; all nested work joins before root release.
     mutation_root: ?*MutationBarrier.RootSharedLease = null,
     /// Borrowed only during pre-decision snapshot/apply acquisition. This

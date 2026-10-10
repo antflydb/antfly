@@ -2094,7 +2094,7 @@ test "storage.hot_standby pending acknowledgement preserves batch and replay tai
     try std.testing.expectEqualStrings("{\"title\":\"pending-tail\"}", local.json);
 }
 
-test "db transaction HA retry drains durable mirror outbox" {
+test "storage.hot_standby transaction HA retry drains durable mirror outbox without blocking capture" {
     const alloc = std.testing.allocator;
     var db_path_tmp = try TestDirectory.init("db");
     defer db_path_tmp.cleanup();
@@ -2118,20 +2118,28 @@ test "db transaction HA retry drains durable mirror outbox" {
     }, .{});
     defer primary.close();
     try primary.createSlot("standby-a", 0);
+    var mutation_barrier: MutationBarrier = .{};
     const AckOnRetry = struct {
+        barrier: *MutationBarrier,
         calls: usize = 0,
         fn wait(ctx: *anyopaque, active_primary_ctx: *anyopaque, target_lsn: u64, _: hot_standby_primary_mod.SyncPolicy) !void {
             const active_primary: *hot_standby_primary_mod.Primary = @ptrCast(@alignCast(active_primary_ctx));
             const self: *@This() = @ptrCast(@alignCast(ctx));
+            // Exercise the real DB resolver on both initial commit and the
+            // no-intents retry after an uncertain remote reply.
+            var capture = self.barrier.tryAcquireExclusive() orelse
+                return error.TransactionResolutionBlockedCapture;
+            capture.release();
             self.calls += 1;
             if (self.calls == 1) return error.InjectedMirrorWaitFailure;
             try active_primary.standbyStatusUpdate("standby-a", 1, target_lsn, target_lsn);
         }
     };
-    var ack = AckOnRetry{};
+    var ack = AckOnRetry{ .barrier = &mutation_barrier };
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
+            .mutation_barrier = &mutation_barrier,
             .sync_policy = .{
                 .mode = .remote_write,
                 .standby_names = &standby_names,
@@ -2152,6 +2160,9 @@ test "db transaction HA retry drains durable mirror outbox" {
     try std.testing.expectError(error.InjectedMirrorWaitFailure, db.commitTransaction(txn_id, 20_001));
     try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
+    var pending = try db.core.loadTransactionReplicationOutbox(alloc, txn_id);
+    defer pending.deinit(alloc);
+    try std.testing.expect(pending.batch_payload != null);
 
     const configured_mirror = db.local_execution.replication_async_batch_mirror;
     db.local_execution.replication_async_batch_mirror = null;
@@ -2163,6 +2174,10 @@ test "db transaction HA retry drains durable mirror outbox" {
     try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
     try db.commitTransaction(txn_id, 20_001);
     try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
+    try std.testing.expectEqual(@as(usize, 2), ack.calls);
+    var remaining = try db.core.loadTransactionReplicationOutbox(alloc, txn_id);
+    defer remaining.deinit(alloc);
+    try std.testing.expect(remaining.batch_payload == null and remaining.replay_payload == null);
 }
 
 test "storage.hot_standby db primary progress sync wait survives primary restart before ack" {

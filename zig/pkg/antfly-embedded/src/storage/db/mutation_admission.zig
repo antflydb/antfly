@@ -5,6 +5,24 @@
 //! Mandatory decision/resolution paths retain their separate completion owner.
 const lock = @import("apply_rw_lock.zig");
 
+/// Retire nested mutation readers in acquisition order reversed, after the
+/// local commit and replication tails are ordered. Mandatory retirement must
+/// not consult cancellation or acquire a new execution owner.
+pub const MutationRetirement = struct {
+    current: *?@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.SharedLease,
+    enclosing: ?*?@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.SharedLease = null,
+
+    pub fn retire(self: @This()) void {
+        release(self.current);
+        if (self.enclosing) |outer| release(outer);
+    }
+
+    fn release(slot: *?@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.SharedLease) void {
+        if (slot.*) |*lease| lease.release();
+        slot.* = null;
+    }
+};
+
 pub fn lockApply(owner: anytype, controls: ?lock.ApplyRwLock.Acquisition) !void {
     if (controls) |original| {
         try owner.enforcePortableRuntimeGate();

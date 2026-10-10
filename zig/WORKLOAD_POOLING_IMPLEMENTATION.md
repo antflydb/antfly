@@ -2585,3 +2585,29 @@ validators terminate, after which superseded worktrees can be removed. The
 previous local PR branch tip is preserved in
 `refs/archive/workload-scheduling-before-consolidation` for reconciliation before
 publication; this local consolidation does not update the remote PR.
+
+
+### Transaction resolution retires enclosing mutation readers
+
+The resolver passes a stable nullable lease slot to its prepared batch. After
+primary commit and the corresponding replication tails are locally ordered, the
+batch retires its nested reader and then the resolver reader before remote
+acknowledgement, derived visibility, and resident graph cleanup. Optimistic
+precommit failures retain the enclosing reader. Retirement is idempotent and
+cannot be canceled or acquire another execution owner.
+
+Both no-intents retry paths use the same handoff. Outstanding transaction
+outboxes append all local tails under transition/capture protection, then release
+that protection before remote completion. Each outbox is acknowledged and cleared
+separately, preserving uncertain-delivery debt and partial completion. Persistent
+cleanup reacquires a mutation reader before the apply lock and rechecks authority.
+
+The focused mutation-root consumer has five checks, including nested resolver/
+batch retirement with C1/H1 capture and the original operation/bytes retained.
+The actual HA transaction retry fixture now requires physical capture during the
+initial lost reply and the no-intents retry, and checks durable debt before and
+after acknowledgement. That fixture remains unqualified until the cumulative
+hot-standby gate runs. This is direct resolver/batch retirement, not complete
+operation-root migration or CPU lending throughout every enclosing service
+holder. Full integration, broader ownership migration, resource/performance
+qualification, and enabling defaults remain required.
