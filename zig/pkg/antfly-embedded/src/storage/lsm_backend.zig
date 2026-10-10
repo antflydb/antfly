@@ -1446,15 +1446,48 @@ pub const Backend = struct {
     const CachedRunBlock = struct {
         run_id: u64,
         path: []u8,
+        path_owner: ?*SharedBytes = null,
         block_offset: u64,
         block_len: u32,
         payload: *SharedBytes,
         last_access: u64,
 
         pub fn deinit(self: *CachedRunBlock, allocator: Allocator) void {
-            allocator.free(self.path);
+            if (self.path_owner) |owner| owner.release() else allocator.free(self.path);
             self.payload.release();
             self.* = undefined;
+        }
+    };
+
+    /// Stable owner for the cache entry slab; entries transfer to a replacement
+    /// slab before this record becomes ready. Its destructor never reads entries.
+    const LocalCacheEntries = struct {
+        allocator: Allocator,
+        entries: []CachedRunBlock,
+        reservation: ?resource_manager_mod.Reservation = null,
+        retirement: resource_manager_mod.PayloadRetirement = .{},
+
+        fn create(allocator: Allocator, manager: *resource_manager_mod.ResourceManager, existing: ?[]CachedRunBlock, control: read_admission.Port) !*LocalCacheEntries {
+            const count = if (existing) |entries| entries.len else max_local_cached_run_blocks;
+            var construction = try manager.reserveConstructionWithAdmission(.lsm_block_table_cache, @sizeOf(LocalCacheEntries) + count * @sizeOf(CachedRunBlock), control);
+            defer construction.retire();
+            const self = try allocator.create(LocalCacheEntries);
+            errdefer allocator.destroy(self);
+            const entries = existing orelse try allocator.alloc(CachedRunBlock, count);
+            errdefer if (existing == null) allocator.free(entries);
+            self.* = .{ .allocator = allocator, .entries = entries };
+            try manager.registerPayloadRetirementWithAdmission(&self.retirement, &self.reservation, &construction, self, destroy, control);
+            // Ownership transfer has no fallible checkpoint after registration.
+            return self;
+        }
+        fn destroy(raw: *anyopaque) void {
+            const self: *LocalCacheEntries = @ptrCast(@alignCast(raw));
+            const allocator = self.allocator;
+            allocator.free(self.entries);
+            allocator.destroy(self);
+        }
+        fn release(self: *LocalCacheEntries) void {
+            self.retirement.publish();
         }
     };
 
@@ -1672,6 +1705,7 @@ pub const Backend = struct {
     run_state_cache: std.ArrayListUnmanaged(CachedRunState) = .empty,
     run_index_cache: std.ArrayListUnmanaged(CachedRunIndex) = .empty,
     run_block_cache: std.ArrayListUnmanaged(CachedRunBlock) = .empty,
+    run_block_cache_owner: ?*LocalCacheEntries = null,
     local_reader: LocalReader = .{},
     // Independent slots keep shared point batches from blocking local decoders.
     point_reader: LocalReader = .{},
@@ -7305,6 +7339,50 @@ pub const Backend = struct {
         return std.mem.eql(u8, left, right);
     }
 
+    fn prepareLocalCacheEntries(self: *Backend, control: ?read_admission.Port) !bool {
+        const manager = self.options.resource_manager;
+        if (control == null or manager == null) {
+            // A managed slab has room for the fixed cache ceiling. Never ask
+            // ArrayList to resize a buffer owned by an intrusive retirement node.
+            if (self.run_block_cache_owner != null) return true;
+            self.run_block_cache.ensureUnusedCapacity(self.allocator, 1) catch return false;
+            return true;
+        }
+        const budget = control.?;
+        if (self.run_block_cache_owner == null and self.run_block_cache.capacity != 0) {
+            // Adopt a legacy slab before replacement can free it. The exact
+            // retained capacity, including slack, is charged before publication.
+            const owned = try LocalCacheEntries.create(self.allocator, manager.?, self.run_block_cache.allocatedSlice(), budget);
+            self.run_block_cache_owner = owned;
+        }
+        if (self.run_block_cache_owner != null and self.run_block_cache.capacity >= max_local_cached_run_blocks) return true;
+        const replacement = try LocalCacheEntries.create(self.allocator, manager.?, null, budget);
+        var published = false;
+        defer if (!published) replacement.release();
+        for (self.run_block_cache.items, 0..) |entry, i| {
+            try budget.checkpoint();
+            replacement.entries[i] = entry;
+        }
+        try budget.checkpoint();
+        const previous = self.run_block_cache_owner;
+        const length = self.run_block_cache.items.len;
+        self.run_block_cache = .empty;
+        self.run_block_cache.items = replacement.entries[0..length];
+        self.run_block_cache.capacity = replacement.entries.len;
+        self.run_block_cache_owner = replacement;
+        published = true;
+        if (previous) |owned| owned.release();
+        return true;
+    }
+
+    pub fn deinitRunBlockCache(self: *Backend) void {
+        for (self.run_block_cache.items) |*cached| cached.deinit(self.allocator);
+        if (self.run_block_cache_owner) |owned| owned.release() else self.run_block_cache.deinit(self.allocator);
+        self.run_block_cache_owner = null;
+        self.run_block_cache = .empty;
+        self.run_block_cache_bytes = 0;
+    }
+
     fn cacheRunBlockLeaseControlled(self: *Backend, path: []const u8, run_id: u64, offset: u64, len: u32, payload: *SharedBytes, control: ?@import("../common/read_admission.zig").Port) !bool {
         if (control) |budget| try budget.checkpoint();
         if (!self.localBlockCacheEligible(payload.bytes.len) or self.closing.load(.acquire) or payload.cache_admitted) return false;
@@ -7340,9 +7418,20 @@ pub const Backend = struct {
             if (required > available +| reclaimable) return false;
         }
         if (control) |budget| try budget.checkpoint();
+        var path_construction: ?resource_manager_mod.ConstructionCredit = null;
+        if (control) |budget| if (self.options.resource_manager) |manager| {
+            path_construction = manager.reserveConstructionWithAdmission(.lsm_block_table_cache, @sizeOf(SharedBytes) + path.len, budget) catch |err| {
+                if (err == error.ResourceBudgetExceeded or err == error.ResourceTemporarilyUnavailable) return false;
+                return err;
+            };
+        };
+        defer if (path_construction) |*credit| credit.retire();
         const cached_path = self.allocator.alloc(u8, path.len) catch return false;
+        var path_owner: ?*SharedBytes = null;
         var admitted = false;
-        defer if (!admitted) self.allocator.free(cached_path);
+        defer if (!admitted) {
+            if (path_owner) |owned| owned.release() else self.allocator.free(cached_path);
+        };
         if (control) |budget| {
             var copied: usize = 0;
             while (copied < path.len) {
@@ -7353,7 +7442,15 @@ pub const Backend = struct {
             }
             try budget.checkpoint();
         } else @memcpy(cached_path, path);
-        self.run_block_cache.ensureUnusedCapacity(self.allocator, 1) catch return false;
+        if (path_construction) |*credit| {
+            const owner = SharedBytes.create(self.allocator, cached_path) catch return false;
+            path_owner = owner;
+            try owner.registerRetirementWithAdmission(credit, control.?);
+        }
+        if (!(self.prepareLocalCacheEntries(control) catch |err| {
+            if (err == error.OutOfMemory or err == error.ResourceBudgetExceeded or err == error.ResourceTemporarilyUnavailable) return false;
+            return err;
+        })) return false;
         if (control) |budget| try budget.checkpoint();
         if (self.options.resource_manager) |manager| {
             const bytes = payload.bytes.len + @sizeOf(SharedBytes);
@@ -7387,7 +7484,7 @@ pub const Backend = struct {
             if (control) |budget| _ = try self.evictOldestLocalBlockWithAdmission(budget) else _ = self.evictOldestLocalBlock();
         }
         if (control) |budget| try budget.checkpoint();
-        self.run_block_cache.appendAssumeCapacity(.{ .run_id = run_id, .path = cached_path, .block_offset = offset, .block_len = len, .payload = payload, .last_access = self.nextLocalCacheAccess() });
+        self.run_block_cache.appendAssumeCapacity(.{ .run_id = run_id, .path = cached_path, .path_owner = path_owner, .block_offset = offset, .block_len = len, .payload = payload, .last_access = self.nextLocalCacheAccess() });
         _ = payload.retain();
         payload.cache_admitted = true;
         payload.result_pins_allowed = true;
@@ -27464,15 +27561,18 @@ pub fn qualifyControlledLocalCache(control: @import("../common/read_admission.zi
     const resources = @import("resource_manager.zig");
     const a = std.testing.allocator;
     const cost = @sizeOf(SharedBytes) + 8;
-    var parent = resources.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = 2 * cost } });
+    const metadata = @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock) + @sizeOf(SharedBytes) + (if (fixture == 1) @as(usize, 192 * 1024) else 4);
+    const parent_limit = 2 * cost + metadata;
+    var parent = resources.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = parent_limit } });
     defer parent.deinit(a);
     var options: resources.Options = .{ .identity_allocator = a };
-    options.budgets[@backingInt(resources.Slice.lsm_block_table_cache)].hard_limit_bytes = if (fixture == 3) 1 else if (fixture == 2) cost else 2 * cost;
+    options.budgets[@backingInt(resources.Slice.lsm_block_table_cache)].hard_limit_bytes = if (fixture == 3) 1 else if (fixture == 2) cost + metadata else parent_limit;
     var manager = resources.ResourceManager.init(options);
     defer manager.deinit(a);
     try manager.installMemoryParent(parent.memoryParentPort());
     var backend = Backend.init(a, .{ .resource_manager = &manager, .local_block_cache_bytes = 8, .local_block_cache_max_block_bytes = 4096 });
     defer backend.close();
+    if (fixture == 2) try std.testing.expect(try backend.prepareLocalCacheEntries(control));
     if (fixture == 2 or fixture == 4) {
         const old = blk: {
             const bytes = try a.dupe(u8, "oldbytes");
@@ -27499,7 +27599,7 @@ pub fn qualifyControlledLocalCache(control: @import("../common/read_admission.zi
     const path = wide orelse "/new";
     std.debug.assert(backend.mu.tryLock());
     defer backend.mu.unlock();
-    var failures = std.testing.FailingAllocator.init(a, .{ .fail_index = if (fixture == 5) 1 else 0 });
+    var failures = std.testing.FailingAllocator.init(a, .{ .fail_index = if (fixture >= 5) fixture - 4 else 0 });
     const admitted = blk: {
         if (fixture >= 4) backend.allocator = failures.allocator();
         defer backend.allocator = a;
@@ -27537,7 +27637,7 @@ pub fn qualifyControlledLocalCache(control: @import("../common/read_admission.zi
         if (fixture == 4) try std.testing.expectEqualStrings("oldbytes", backend.run_block_cache.items[0].payload.bytes);
         try std.testing.expectEqual(resources.Slice.lsm_read_working_set, value.reservation.?.slice);
     }
-    try std.testing.expect(parent.snapshot().memory.peak_bytes <= 2 * cost);
+    try std.testing.expect(parent.snapshot().memory.peak_bytes <= parent_limit);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
 }
 
@@ -27550,12 +27650,13 @@ pub fn qualifyControlledLocalCacheContention(control: @import("../common/read_ad
     var parent = resources.ResourceManager.init(.{ .identity_allocator = a });
     defer parent.deinit(a);
     var options: resources.Options = .{ .identity_allocator = a };
-    options.budgets[@backingInt(resources.Slice.lsm_block_table_cache)].hard_limit_bytes = cost;
+    options.budgets[@backingInt(resources.Slice.lsm_block_table_cache)].hard_limit_bytes = cost + @sizeOf(SharedBytes) + 4 + @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock);
     var manager = resources.ResourceManager.init(options);
     defer manager.deinit(a);
     try manager.installMemoryParent(parent.memoryParentPort());
     var backend = Backend.init(a, .{ .resource_manager = &manager, .local_block_cache_bytes = 8, .local_block_cache_max_block_bytes = 4096 });
     defer backend.close();
+    try std.testing.expect(try backend.prepareLocalCacheEntries(control));
     if (stage >= 3) {
         const old = blk: {
             const bytes = try a.dupe(u8, "oldbytes");
@@ -27653,4 +27754,60 @@ pub fn qualifyMakeManagedCleanupPayload(manager: *@import("resource_manager.zig"
     errdefer value.release();
     try value.registerRetirementWithAdmission(&credit, control);
     return value;
+}
+
+pub fn qualifyControlledLocalCacheMetadata(control: read_admission.Port, deny: bool) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    const path = "/physically-charged-cache-path";
+    const payload_cost = @sizeOf(SharedBytes) + 8;
+    const path_cost = @sizeOf(SharedBytes) + path.len;
+    const slab_cost = @sizeOf(Backend.LocalCacheEntries) + max_local_cached_run_blocks * @sizeOf(Backend.CachedRunBlock);
+    var parent = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a, .memory_budget = .{ .hard_limit_bytes = if (deny) payload_cost else payload_cost + path_cost + slab_cost } });
+    defer parent.deinit(a);
+    var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var backend = Backend.init(a, .{ .resource_manager = &manager });
+    defer backend.close();
+    var credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, payload_cost, control);
+    defer credit.retire();
+    const value = blk: {
+        const bytes = try a.dupe(u8, "retained");
+        errdefer a.free(bytes);
+        break :blk try SharedBytes.create(a, bytes);
+    };
+    var value_owned = true;
+    defer if (value_owned) value.release();
+    try value.registerRetirementWithAdmission(&credit, control);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    if (deny) backend.allocator = failing.allocator();
+    const admitted = backend.cacheRunBlockLeaseWithAdmission(path, 1, 0, 8, value, control);
+    backend.allocator = a;
+    try std.testing.expectEqual(!deny, try admitted);
+    if (deny) {
+        // Parent denial happens before any path or slab allocation attempt.
+        try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), backend.run_block_cache.items.len);
+        try std.testing.expectEqual(@as(u64, payload_cost), manager.snapshot().memory.used_bytes);
+        return;
+    }
+    const charged = payload_cost + path_cost + slab_cost;
+    try std.testing.expectEqual(@as(u64, charged), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, charged), parent.snapshot().memory.used_bytes);
+    value_owned = false;
+    value.release();
+    std.debug.assert(parent.mutex.tryLock());
+    defer parent.mutex.unlock();
+    std.debug.assert(manager.mutex.tryLock());
+    defer manager.mutex.unlock();
+    std.debug.assert(manager.payload_retirement_mutex.tryLock());
+    defer manager.payload_retirement_mutex.unlock();
+    backend.deinitRunBlockCache();
+    // Dropping cache ownership runs no destructor, ledger callback or lock wait.
+    try std.testing.expectEqual(@as(u64, charged), manager.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, charged), parent.memory.used_bytes);
+    try std.testing.expectEqual(@as(usize, 3), manager.payload_retirement_ready.load(.acquire));
+    try std.testing.expect(backend.run_block_cache_owner == null);
 }

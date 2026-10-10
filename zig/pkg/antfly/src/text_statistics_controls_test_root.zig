@@ -1962,7 +1962,7 @@ test "text statistics trusted controls local cache publication replacement and d
         }
     };
     for ([_]native.Class{ .query, .inference }) |phase| {
-        for (0..6) |fixture| {
+        for (0..8) |fixture| {
             var completion_checkpoint: usize = 0;
             for ([_]usize{ 0, 1, 2, 4, 8, 32, 128, 512, 2048, std.math.maxInt(usize) }) |requested_stop| {
                 const stop_at = if (requested_stop == std.math.maxInt(usize)) completion_checkpoint else requested_stop;
@@ -2290,6 +2290,15 @@ test "text statistics trusted controls manager cleanup shutdown joins stalled ph
     producer.finish();
     physical.node.publish();
     try Gate.waitFor(&gate.entered);
+    // The physical owner is claimed, so its uninterruptible allocator callback
+    // must not retain the shared registry needed by unrelated read producers.
+    try std.testing.expect(manager.payload_retirement_mutex.tryLock());
+    manager.payload_retirement_mutex.unlock();
+    var foreground: native.Execution = .{};
+    defer foreground.finish();
+    try foreground.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 23 }, .query);
+    try foreground.checkpoint();
+    foreground.finish();
     try std.testing.expectEqual(@as(u64, charged), manager.snapshot().memory.used_bytes);
     var joining = try lane.io().concurrent(Gate.joinWorker, .{ &gate, worker });
     defer {
@@ -2313,4 +2322,34 @@ test "text statistics trusted controls manager cleanup shutdown joins stalled ph
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "text statistics trusted controls cache metadata is charged before allocation and retired without ledger waits" {
+    const Budget = struct {
+        execution: *native.Execution,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        for ([_]bool{ false, true }) |deny| {
+            var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+            defer scheduler.close();
+            var execution: native.Execution = .{};
+            defer execution.finish();
+            try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = clock.monotonicNs() + 60 * std.time.ns_per_s, .retained_bytes = 23 }, phase);
+            var budget = Budget{ .execution = &execution };
+            const admission = sources.common_read_admission;
+            var adapter = admission.Adapter(*Budget){ .budget = &budget };
+            const payload = adapter.payload();
+            try sources.storage_lsm_backend.qualifyControlledLocalCacheMetadata(admission.Port.init(&payload), deny);
+            try std.testing.expectEqual(phase, try execution.retainedClass());
+            execution.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        }
+    }
 }

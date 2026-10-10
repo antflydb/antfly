@@ -2881,10 +2881,11 @@ pub const ResourceManager = struct {
     /// buffers. Physical destruction precedes accounting release, and a busy
     /// parent leaves credit in fixed manager metadata after destruction.
     pub fn drainPayloadRetirementWithAdmission(self: *ResourceManager, control: read_admission.Port) !usize {
-        try @import("../common/bounded_mutex.zig").lockAtomic(&self.payload_retirement_mutex, control);
-        defer self.payload_retirement_mutex.unlock();
         var retired: usize = 0;
         for (0..64) |_| {
+            try @import("../common/bounded_mutex.zig").lockAtomic(&self.payload_retirement_mutex, control);
+            var registry_held = true;
+            defer if (registry_held) self.payload_retirement_mutex.unlock();
             try control.checkpoint();
             const node = self.payload_retirement_cursor orelse break;
             self.payload_retirement_cursor = node.next orelse self.payload_retirement_head;
@@ -2904,7 +2905,13 @@ pub const ResourceManager = struct {
             self.unlinkPayloadRetirement(node);
             const destroy = node.destroy.?;
             const context = node.context.?;
-            // No fallible checkpoint from unlink through final destruction.
+            // The stable debt slot now owns the exact charge. Unlink under
+            // the registry lock, then release it before the allocator callback:
+            // an uninterruptible destructor must not pin unrelated registration.
+            self.payload_retirement_mutex.unlock();
+            registry_held = false;
+            // No fallible checkpoint from unlink through physical destruction
+            // and credit publication, even if the deadline expires meanwhile.
             destroy(context);
             _ = self.payload_retirement_ready.fetchSub(1, .acq_rel);
             debt.?.retire();
