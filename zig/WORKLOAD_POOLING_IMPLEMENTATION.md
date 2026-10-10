@@ -2393,3 +2393,25 @@ physically interruptible. Metadata/authority reads before apply still require
 controlled reader adoption; the retained service-holder graph still requires
 mandatory CPU reentry before capacity transfer. Full integration, physical
 envelopes, performance and default sizing remain incomplete.
+
+
+### Lite shared navigation and bounded batch scratch from main
+
+The origin/main b7e4f43a30 merge retains shared authenticated page/navigation
+leases, bounded record read-ahead, in-place value-cursor initialization and
+batch scratch independent of result storage. Original admission now flows
+through these new paths, including cache acquisition, physical record windows,
+external value output and caller-owned batch buffers. Admitted erased scopes
+expose checked buffer delivery; their fallback uses an admitted lookup and
+checked 64 KiB copy chunks. Legacy wrappers preserve ordinary entry points.
+
+The trusted-control physical fixture also exercises caller buffers and a
+record-only batch after warming index/navigation pages. This places the first
+physical CPU loan inside the new cold record window, allowing cancellation
+and scheduler closure to check that path directly. Both query and inference
+phases retain original root/bytes/deadline until owning retirement and clear
+all failed result slots. Broader native shared-navigation/integrity tests and
+independent compiled consumers still require cumulative Lite storage and
+archive integration. Fixture-owned buffers are not proof of whole-request
+memory accounting; production allocation coverage, runtime resource envelopes,
+background holder adoption, performance and default sizing remain incomplete.

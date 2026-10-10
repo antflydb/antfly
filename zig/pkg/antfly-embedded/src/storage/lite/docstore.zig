@@ -2795,6 +2795,7 @@ pub const Txn = struct {
     pub const ReadScope = struct {
         parent: *Txn,
         scratch: read_scratch,
+        batch_scratch: read_scratch,
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             return self.parent.getOwned(self.scratch.allocator(), key);
@@ -2805,14 +2806,27 @@ pub const Txn = struct {
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
-            return self.getManySortedControlled(keys, values, null);
+            return self.readBatch(keys, null, values, null);
+        }
+
+        /// Output buffers must not overlap each other or the input keys.
+        /// Output belongs to the caller, independently of scope reset/close.
+        pub fn getManySortedInto(self: *@This(), keys: []const []const u8, buffers: []const []u8, values: []?[]const u8) !void {
+            return self.readBatch(keys, buffers, values, null);
         }
 
         pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
-            return self.getManySortedControlled(keys, values, control);
+            return self.readBatch(keys, null, values, control);
         }
 
-        fn getManySortedControlled(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: ?read_admission.Port) !void {
+        pub fn getManySortedIntoWithAdmission(self: *@This(), keys: []const []const u8, buffers: []const []u8, values: []?[]const u8, control: read_admission.Port) !void {
+            return self.readBatch(keys, buffers, values, control);
+        }
+
+        fn readBatch(self: *@This(), keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8, control: ?read_admission.Port) !void {
+            if (buffers) |out| if (out.len != keys.len) return error.InvalidBatch;
+            defer self.batch_scratch.reset();
+            const temporary = self.batch_scratch.allocator();
             if (keys.len != values.len) return error.InvalidBatch;
             @memset(values, null);
             errdefer @memset(values, null);
@@ -2827,9 +2841,10 @@ pub const Txn = struct {
                 if (i == 0 or !std.mem.eql(u8, keys[i - 1], key)) unique_count += 1;
             }
             const alloc = self.scratch.allocator();
-            const pending_keys = try alloc.alloc([]const u8, unique_count);
-            const positions = try alloc.alloc(usize, unique_count);
-            const loaded = try alloc.alloc(?[]const u8, unique_count);
+            const pending_keys = try temporary.alloc([]const u8, unique_count);
+            const positions = try temporary.alloc(usize, unique_count);
+            const loaded = try temporary.alloc(?[]const u8, unique_count);
+            const pending_buffers = if (buffers != null) try temporary.alloc([]u8, unique_count) else null;
             var count: usize = 0;
             var i: usize = 0;
             while (i < keys.len) {
@@ -2838,28 +2853,40 @@ pub const Txn = struct {
                 while (end < keys.len and std.mem.eql(u8, keys[i], keys[end])) : (end += 1) {
                     if (control) |budget| try budget.checkpoint();
                 }
-                const full = if (self.parent.prefix.len == 0) keys[i] else try std.mem.concat(alloc, u8, &.{ self.parent.prefix, keys[i] });
+                const full = if (self.parent.prefix.len == 0) keys[i] else try std.mem.concat(temporary, u8, &.{ self.parent.prefix, keys[i] });
                 if (self.parent.pending_tree.getEntryFor(full).node) |node| {
-                    if (self.parent.pending.items[pendingNode(node).ordinal].value) |value| @memset(values[i..end], try alloc.dupe(u8, value));
+                    if (self.parent.pending.items[pendingNode(node).ordinal].value) |value| {
+                        if (buffers) |out| {
+                            for (out[i..end], values[i..end]) |buffer, *result| {
+                                if (value.len > buffer.len) return error.BufferTooSmall;
+                                @memcpy(buffer[0..value.len], value);
+                                result.* = buffer[0..value.len];
+                            }
+                        } else @memset(values[i..end], try alloc.dupe(u8, value));
+                    }
                 } else {
                     pending_keys[count] = full;
                     positions[count] = i;
+                    if (pending_buffers) |out| out[count] = buffers.?[i];
                     count += 1;
                 }
                 i = end;
             }
-            if (count == 0) {
-                if (control) |budget| try budget.checkpoint();
-                return;
-            }
-            try (try self.parent.readFile()).getDocumentsAtCheckpointAllocWithAdmission(alloc, self.parent.checkpoint, pending_keys[0..count], loaded[0..count], control);
+            if (count == 0) return;
+            try (try self.parent.readFile()).getDocumentsAtCheckpointWithScratchAndAdmission(alloc, temporary, self.parent.checkpoint, pending_keys[0..count], if (pending_buffers) |out| out[0..count] else null, loaded[0..count], control);
             for (loaded[0..count], positions[0..count]) |value, position| {
                 if (control) |budget| try budget.checkpoint();
                 var end = position + 1;
                 while (end < keys.len and std.mem.eql(u8, keys[position], keys[end])) : (end += 1) {
                     if (control) |budget| try budget.checkpoint();
                 }
-                @memset(values[position..end], value);
+                if (buffers) |out| {
+                    if (value) |bytes| for (position..end) |index| {
+                        if (bytes.len > out[index].len) return error.BufferTooSmall;
+                        if (index != position) @memcpy(out[index][0..bytes.len], bytes);
+                        values[index] = out[index][0..bytes.len];
+                    };
+                } else @memset(values[position..end], value);
             }
             if (control) |budget| try budget.checkpoint();
         }
@@ -2867,10 +2894,12 @@ pub const Txn = struct {
         /// Invalidates all previously returned values, retaining bounded scratch.
         pub fn reset(self: *@This()) void {
             self.scratch.reset();
+            self.batch_scratch.reset();
         }
 
         pub fn close(self: *@This()) void {
             self.scratch.deinit();
+            self.batch_scratch.deinit();
             self.* = undefined;
         }
     };
@@ -2879,7 +2908,7 @@ pub const Txn = struct {
     /// Erased adapters retain the parent automatically. Scope results are
     /// owned copies, so subsequent pending mutations cannot invalidate them.
     pub fn openReadScope(self: *Txn, allocator: Allocator) !ReadScope {
-        return .{ .parent = self, .scratch = read_scratch.init(allocator, 256 * 1024) };
+        return .{ .parent = self, .scratch = read_scratch.init(allocator, 256 * 1024), .batch_scratch = read_scratch.init(allocator, 256 * 1024) };
     }
 
     pub fn get(self: *Txn, key: []const u8) ![]const u8 {
@@ -5599,6 +5628,33 @@ test "lite scoped reads release values without growing parent point reads" {
     try std.testing.expect(budget.peak < 256 * 1024);
 }
 
+test "lite scoped batch buffers preserve external values after reset and close" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "scoped-batch-external.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    const payload = try a.alloc(u8, 65536);
+    defer a.free(payload);
+    for (payload, 0..) |*byte, i| byte.* = @truncate(i *% 13);
+    try store.file.putDocument("doc", payload);
+    var txn = try backend_erased.readTxnFrom(a, try store.beginRead());
+    var scope = try txn.openReadScope(a);
+    txn.abort();
+    const output = try a.alloc(u8, payload.len * 2);
+    defer a.free(output);
+    const buffers: []const []u8 = &.{ output[0..payload.len], output[payload.len..], &.{} };
+    var values: [3]?[]const u8 = undefined;
+    try scope.getManySortedInto(&.{ "doc", "doc", "missing" }, buffers, &values);
+    try scope.reset();
+    scope.close();
+    try std.testing.expectEqualSlices(u8, payload, values[0].?);
+    try std.testing.expectEqualSlices(u8, payload, values[1].?);
+    try std.testing.expect(values[2] == null);
+}
+
 test "lite scoped write reads preserve copied values across pending mutations" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -5653,7 +5709,8 @@ test "lite scoped sorted reads reset scratch and preserve duplicates overlays an
     defer txn.abort();
     try txn.put("a", "pending");
     try txn.delete("b");
-    var scope = try txn.openReadScope(a);
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var scope = try txn.openReadScope(budget.allocator());
     defer scope.close();
     const keys: []const []const u8 = &.{ "a", "a", "b", "c", "d", "d" };
     var values: [6]?[]const u8 = undefined;
@@ -5669,6 +5726,29 @@ test "lite scoped sorted reads reset scratch and preserve duplicates overlays an
         try std.testing.expect(scope.scratch.arena.queryCapacity() <= 256 * 1024);
         try std.testing.expectEqual(@as(u32, 0), txn.snapshot_reads.count());
     }
+    var result_buffers: [6][16]u8 = undefined;
+    var buffers: [6][]u8 = undefined;
+    for (&result_buffers, &buffers) |*buffer, *out| out.* = buffer;
+    try scope.getManySortedInto(keys, &buffers, &values);
+    scope.reset();
+    const before = budget.alloc_calls;
+    for (0..100) |_| {
+        try scope.getManySortedInto(keys, &buffers, &values);
+        try std.testing.expectEqualStrings("pending", values[0].?);
+        try std.testing.expectEqualStrings("pending", values[1].?);
+        try std.testing.expect(values[2] == null and values[3] == null);
+        try std.testing.expectEqualStrings("disk-d", values[4].?);
+        try std.testing.expectEqualStrings("disk-d", values[5].?);
+        for (values, buffers) |value, buffer| if (value) |bytes| try std.testing.expectEqual(buffer.ptr, bytes.ptr);
+        scope.reset();
+        try std.testing.expectEqualStrings("disk-d", values[4].?);
+    }
+    try std.testing.expectEqual(before, budget.alloc_calls);
+    std.debug.print("LITE_BATCH_REUSE batches=100 new_allocations={d} retained_bytes={d}\n", .{ budget.alloc_calls - before, budget.live });
+    buffers[5] = buffers[5][0..1];
+    try std.testing.expectError(error.BufferTooSmall, scope.getManySortedInto(keys, &buffers, &values));
+    for (values) |value| try std.testing.expect(value == null);
+    buffers[5] = &result_buffers[5];
     var out: [16]u8 = undefined;
     try std.testing.expectEqualStrings("pending", try scope.getInto("a", &out));
     try std.testing.expectError(error.BufferTooSmall, scope.getInto("a", out[0..1]));

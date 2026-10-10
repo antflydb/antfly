@@ -1218,7 +1218,7 @@ test "text statistics trusted controls Lite native and transaction batches loan 
         }
     };
     for ([_]native.Class{ .query, .inference }) |phase| {
-        for (0..4) |fixture| {
+        for (0..6) |fixture| {
             for ([_]Case{ .success, .cancel, .shutdown }) |mode| {
                 var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
                 defer scheduler.close();
@@ -1235,6 +1235,8 @@ test "text statistics trusted controls Lite native and transaction batches loan 
                     0 => sources.storage_lite_native.qualifyControlledBatch(port),
                     1 => sources.storage_lite_docstore.qualifyControlledReadBatch(port, .transaction),
                     2 => sources.storage_lite_docstore.qualifyControlledReadBatch(port, .scope),
+                    4 => sources.storage_lite_native.qualifyControlledBufferedBatch(port),
+                    5 => sources.storage_lite_native.qualifyControlledRecordWindow(port),
                     else => sources.storage_lite_docstore.qualifyControlledReadBatch(port, .overlay),
                 };
                 switch (mode) {
