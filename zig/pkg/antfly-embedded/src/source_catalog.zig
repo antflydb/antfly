@@ -523,6 +523,7 @@ pub const storage_lite_mod = @import("storage/lite/mod.zig");
 pub const storage_lite_native = @import("storage/lite/native.zig");
 pub const storage_lite_paths = @import("storage/lite/paths.zig");
 pub const storage_lite_portable_restore = @import("storage/lite/portable_restore.zig");
+pub const storage_lite_read_workspace = @import("storage/lite/read_workspace.zig");
 pub const storage_lite_reclamation = @import("storage/lite/reclamation.zig");
 pub const storage_lite_secret_store = @import("storage/lite/secret_store.zig");
 pub const storage_lite_snapshot_test = @import("storage/lite/snapshot_test.zig");

@@ -1407,7 +1407,7 @@ pub const ResourceManager = struct {
                 requester == .hbc_node_metadata_cache or
                 requester == .relational_preparation_working_set or
                 requester == .document_extraction_working_set or
-                requester == .lite_native_page_cache;
+                requester == .lite_native_page_cache or requester == .lite_docstore_snapshot_cache;
             const slice_target = if (!requester_slice_reclaimable or slice_hard == 0)
                 0
             else
@@ -1437,7 +1437,7 @@ pub const ResourceManager = struct {
         // table content. Include the requester's own search slice so one index
         // can reuse capacity retained by another; callbacks use non-blocking
         // owner locks and therefore skip an in-flight scratch handle safely.
-        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .relational_preparation_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache, .lite_native_page_cache };
+        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .relational_preparation_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache, .lite_native_page_cache, .lite_docstore_snapshot_cache };
         for (candidates, 0..) |candidate_slice, candidate_index| {
             if (candidate_index == 0) {
                 if (targets.slice == 0) continue;
@@ -1453,7 +1453,7 @@ pub const ResourceManager = struct {
                 candidate_slice != .hbc_node_metadata_cache and
                 candidate_slice != .relational_preparation_working_set and
                 candidate_slice != .document_extraction_working_set and
-                candidate_slice != .lite_native_page_cache) continue;
+                candidate_slice != .lite_native_page_cache and candidate_slice != .lite_docstore_snapshot_cache) continue;
             // Preserve weighted fairness on the first pass. If some owners
             // cannot use their share, offer the remaining debt once more to
             // available owners before rejecting otherwise admissible work.
@@ -3783,6 +3783,36 @@ pub const BudgetedAllocator = struct {
     last_allocation_failure: ?AllocationFailure = null,
     reservation_floor: u64 = 0,
 
+    /// Independent admission for borrowed working storage. Unlike nested
+    /// scratch floors, these leases may be released in any order.
+    pub const BorrowedScratch = struct {
+        owner: *BudgetedAllocator,
+        bytes: usize,
+        pub fn growTo(self: *BorrowedScratch, bytes: usize) !void {
+            if (bytes <= self.bytes) return;
+            lockAtomic(&self.owner.allocator_mutex);
+            defer self.owner.allocator_mutex.unlock();
+            const growth = bytes - self.bytes;
+            if (!self.owner.reserveGrowth(growth)) {
+                self.owner.recordAllocationFailure(.admission, growth, @returnAddress());
+                return error.ResourceBudgetExceeded;
+            }
+            self.bytes = bytes;
+        }
+        pub fn release(self: *BorrowedScratch) void {
+            lockAtomic(&self.owner.allocator_mutex);
+            defer self.owner.allocator_mutex.unlock();
+            self.owner.releaseBytes(self.bytes);
+            self.bytes = 0;
+        }
+    };
+
+    pub fn borrowScratch(self: *BudgetedAllocator, bytes: usize) !BorrowedScratch {
+        var receipt = BorrowedScratch{ .owner = self, .bytes = 0 };
+        try receipt.growTo(bytes);
+        return receipt;
+    }
+
     pub const ScratchReservation = struct {
         owner: *BudgetedAllocator,
         previous_floor: u64,
@@ -3883,6 +3913,22 @@ pub const BudgetedAllocator = struct {
     pub fn deinit(self: *BudgetedAllocator) void {
         self.reservation.release();
         self.* = undefined;
+    }
+
+    /// Recognize only our own allocator and standard arena wrappers. Unknown
+    /// wrappers retain their original allocation path and budget semantics.
+    pub fn fromAllocator(candidate: std.mem.Allocator) ?*BudgetedAllocator {
+        var current = candidate;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        const arena_vtable = arena.allocator().vtable;
+        for (0..8) |_| {
+            if (current.vtable.alloc == alloc or current.vtable.alloc == lockedAlloc)
+                return @ptrCast(@alignCast(current.ptr));
+            if (current.vtable != arena_vtable) return null;
+            const wrapped: *std.heap.ArenaAllocator = @ptrCast(@alignCast(current.ptr));
+            current = wrapped.child_allocator;
+        }
+        return null;
     }
 
     pub fn allocator(self: *BudgetedAllocator) std.mem.Allocator {
