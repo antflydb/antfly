@@ -262,7 +262,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 opts.admission_controls;
             var replication_mutation = if (opts.bypass_replication_write_gate) null else try mutation_admission.acquireReplicationMutationShared(self, initial_controls);
             defer if (replication_mutation) |*lease| lease.release();
-            if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrier();
+            if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrierWithAdmission(mutation_admission.retainedLeaseControls(initial_controls));
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
             if (!opts.bypass_replication_write_gate) try self.preflightReplicationBatchSyncCommit();
             const total_start_ns = monotonicTimeNs();
@@ -3167,31 +3167,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn ensureDurableReplicationStartupBarrier(self: anytype) !void {
-            // A failed primary append must complete before a later mutation can
-            // overtake its afterimage in the hot-standby tail.
-            while (self.async_context.primary_replication_append_pending.load(.acquire)) try self.flushDurableReplicationOutboxes();
-            if (!self.local_execution.durable_replication_startup_barrier_pending.load(.acquire) and
-                !self.local_execution.row_policy_replication_outbox_pending.load(.acquire)) return;
-            const io = self.backend_runtime.io() orelse std.Options.debug_io;
-            self.local_execution.durable_replication_flush_mutex.lockUncancelable(io);
-            defer self.local_execution.durable_replication_flush_mutex.unlock(io);
-            if (!self.local_execution.durable_replication_startup_barrier_pending.load(.acquire) and
-                !self.local_execution.row_policy_replication_outbox_pending.load(.acquire)) return;
-            while (true) {
-                while (self.local_execution.durable_replication_outbox_maybe.load(.acquire))
-                    try self.flushDurableReplicationOutboxesLocked();
-                // Close the race with a policy commit that published its flag just
-                // after the final scan. The same apply fence orders that commit
-                // and the flag clear against subsequent row writers.
-                try self.lockApplyForPortableRuntime();
-                const empty = !self.local_execution.durable_replication_outbox_maybe.load(.acquire);
-                if (empty) {
-                    self.local_execution.durable_replication_startup_barrier_pending.store(false, .release);
-                    self.local_execution.row_policy_replication_outbox_pending.store(false, .release);
-                }
-                self.core.unlockApply();
-                if (empty) return;
-            }
+            try self.ensureDurableReplicationStartupBarrierWithAdmission(null);
+        }
+
+        pub fn ensureDurableReplicationStartupBarrierWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+            try @import("replication_startup_admission.zig").ensure(self, controls);
         }
 
         pub fn failIfIdentityOrdinalExhaustedForNewUpserts(self: anytype, doc_ids: []const []const u8) !void {
@@ -3272,17 +3252,31 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         }
 
         pub fn flushDurableReplicationOutboxes(self: anytype) !void {
+            try self.flushDurableReplicationOutboxesWithAdmission(null);
+        }
+
+        pub fn flushDurableReplicationOutboxesWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+            const admission = @import("replication_startup_admission.zig");
+            const retained = @import("mutation_admission.zig").retainedLeaseControls(controls);
+            try @import("mutation_admission.zig").checkLifetime(retained);
             if (self.async_context.primary_replication_outbox_pending.load(.acquire)) self.local_execution.durable_replication_outbox_maybe.store(true, .release);
             if (!self.local_execution.durable_replication_outbox_maybe.load(.acquire)) return;
             const io = self.backend_runtime.io() orelse std.Options.debug_io;
-            self.local_execution.durable_replication_flush_mutex.lockUncancelable(io);
+            try admission.lockFlush(&self.local_execution.durable_replication_flush_mutex, io, retained);
             defer self.local_execution.durable_replication_flush_mutex.unlock(io);
-            try self.flushDurableReplicationOutboxesLocked();
+            try self.flushDurableReplicationOutboxesLockedWithAdmission(retained);
         }
 
         pub fn flushDurableReplicationOutboxesLocked(self: anytype) !void {
+            try self.flushDurableReplicationOutboxesLockedWithAdmission(null);
+        }
+
+        pub fn flushDurableReplicationOutboxesLockedWithAdmission(self: anytype, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+            const admission = @import("mutation_admission.zig");
+            const retained = admission.retainedLeaseControls(controls);
+            try admission.checkLifetime(retained);
             if (!self.local_execution.durable_replication_outbox_maybe.load(.acquire)) return;
-            try self.lockApplyForPortableRuntime();
+            try admission.lockApply(self, retained);
             var apply_held = true;
             errdefer if (apply_held) self.core.unlockApply();
             var page = try durable_outbox_store.readPending(self.alloc, self.core.store);
@@ -3322,22 +3316,26 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
 
             if (batch_outbox) |outbox| {
+                try admission.checkLifetime(retained);
                 var ctx = self.batchContext();
                 try recoverDurableReplicationOutboxContext(&ctx, self.local_execution.replication_async_batch_mirror.?, outbox, .batch);
                 try self.clearDurableReplicationOutbox(replication_batch_outbox_key);
             }
             if (replay_outbox) |outbox| {
+                try admission.checkLifetime(retained);
                 var ctx = self.batchContext();
                 try recoverDurableReplicationOutboxContext(&ctx, self.local_execution.replication_async_effect_mirror.?, outbox, .replay);
                 try self.clearDurableReplicationOutbox(replication_replay_outbox_key);
             }
             if (schema_outbox) |outbox| {
+                try admission.checkLifetime(retained);
                 var ctx = self.batchContext();
                 try recoverDurableReplicationOutboxContext(&ctx, self.local_execution.replication_async_metadata_mirror.?, outbox, .schema);
                 try self.clearDurableReplicationOutbox(replication_schema_outbox_key);
             }
 
             for (pending) |entry| {
+                try admission.checkLifetime(retained);
                 const kind = try durableReplicationOutboxKindFromKey(entry.key);
                 const outbox = try decodeDurableReplicationOutbox(entry.value);
                 const mirror = switch (kind) {

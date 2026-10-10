@@ -2231,3 +2231,33 @@ physical DB, HTTP server or pgwire session. It does not establish node-wide fair
 CPU adoption, end-to-end query correctness, defaults, resource envelopes or
 performance qualification. Full cumulative integration remains required for the
 physical shared-runtime SQL case and the health-source call sites.
+
+### Original lifetime through replication startup recovery
+
+A physical cumulative local commit-control test stalled in replication startup
+recovery before reaching its intended snapshot-owned apply wait. The captured
+all-thread backtrace identified the uncancelable startup apply acquisition. Its
+test lifetime callback only rejected after snapshot capture, which startup
+recovery had not yet reached. The exact test process was terminated after the
+backtrace was preserved; the compiler and controller continued. That run is
+failed evidence, not a passing or timed-out qualification.
+
+Pre-decision batch writes now pass their original lifetime into startup recovery,
+its flush mutex, initial durable-outbox scan and final ordered apply fence.
+Rejection preserves pending startup/policy flags and undelivered outbox entries.
+Each recovery delivery checks admission before starting; successful delivery
+still performs mandatory durable acknowledgement before observing rejection for
+the next entry. Legacy and mandatory completion callers retain their existing
+uncontrolled wrappers. CPU remains retained inside the service holder graph;
+mandatory CPU reentry adoption and provider physical deadlines are still open.
+Outbox page materialization and delivery/acknowledgement work are not made bounded
+by these acquisition checks.
+
+The existing snapshot-owned fixture explicitly completes startup recovery before
+holding apply, so it reaches the phase its callback measures. A new physical DB
+fixture separately covers startup flush/apply contention, deadline, cancellation
+and scheduler closure, no partial write, retained startup obligations and healthy
+retry. Both physical fixtures require cumulative integration. The small focused
+suite exercises the actual shared startup helper with real IO mutex and apply
+rw-locks in six rejection/retry scenarios, using stand-in recovery callbacks;
+it does not instantiate a DB or prove provider delivery/durable acknowledgement.

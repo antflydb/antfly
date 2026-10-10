@@ -246,10 +246,13 @@ pub fn ImplementationFor(comptime D: type) type {
         pub const enforceReplicationWriteGate = commit.enforceReplicationWriteGate;
         pub const enforceRowPolicyMutationLocked = commit.enforceRowPolicyMutationLocked;
         pub const ensureDurableReplicationStartupBarrier = commit.ensureDurableReplicationStartupBarrier;
+        pub const ensureDurableReplicationStartupBarrierWithAdmission = commit.ensureDurableReplicationStartupBarrierWithAdmission;
         pub const failIfIdentityOrdinalExhaustedForNewUpserts = commit.failIfIdentityOrdinalExhaustedForNewUpserts;
         pub const finalizePendingRowPolicyReceiptLocked = commit.finalizePendingRowPolicyReceiptLocked;
         pub const flushDurableReplicationOutboxes = commit.flushDurableReplicationOutboxes;
+        pub const flushDurableReplicationOutboxesWithAdmission = commit.flushDurableReplicationOutboxesWithAdmission;
         pub const flushDurableReplicationOutboxesLocked = commit.flushDurableReplicationOutboxesLocked;
+        pub const flushDurableReplicationOutboxesLockedWithAdmission = commit.flushDurableReplicationOutboxesLockedWithAdmission;
         pub const flushTransactionReplicationOutbox = commit.flushTransactionReplicationOutbox;
         pub const generatedPrecomputeModeForSyncLevel = preparation.generatedPrecomputeModeForSyncLevel;
         pub const graphMutationIdentityEql = materialization.graphMutationIdentityEql;
@@ -815,10 +818,13 @@ pub fn ImplementationFor(comptime D: type) type {
             pub const enforceReplicationWriteGate = Implementation.enforceReplicationWriteGate;
             pub const enforceRowPolicyMutationLocked = Implementation.enforceRowPolicyMutationLocked;
             pub const ensureDurableReplicationStartupBarrier = Implementation.ensureDurableReplicationStartupBarrier;
+            pub const ensureDurableReplicationStartupBarrierWithAdmission = Implementation.ensureDurableReplicationStartupBarrierWithAdmission;
             pub const failIfIdentityOrdinalExhaustedForNewUpserts = Implementation.failIfIdentityOrdinalExhaustedForNewUpserts;
             pub const finalizePendingRowPolicyReceiptLocked = Implementation.finalizePendingRowPolicyReceiptLocked;
             pub const flushDurableReplicationOutboxes = Implementation.flushDurableReplicationOutboxes;
+            pub const flushDurableReplicationOutboxesWithAdmission = Implementation.flushDurableReplicationOutboxesWithAdmission;
             pub const flushDurableReplicationOutboxesLocked = Implementation.flushDurableReplicationOutboxesLocked;
+            pub const flushDurableReplicationOutboxesLockedWithAdmission = Implementation.flushDurableReplicationOutboxesLockedWithAdmission;
             pub const flushTransactionReplicationOutbox = Implementation.flushTransactionReplicationOutbox;
             pub const hasConfiguredResolvers = Implementation.hasConfiguredResolvers;
             pub const lockApplyForPortableRuntime = Implementation.lockApplyForPortableRuntime;

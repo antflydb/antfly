@@ -753,3 +753,12 @@ these counts as runnable CPU grants or query queue depth. SQL consumers still jo
 their own submitted tasks before releasing a shared lease. The saturation fixture
 holds nineteen actual callbacks across execution and cleanup, admits control work,
 and joins all callbacks before any corresponding consumer is retired.
+
+Pre-decision replication startup recovery borrows the original batch lifetime.
+Flush/apply contention must check it without dropping retained service authority.
+Rejection cannot clear startup/policy flags or consume undelivered outbox keys.
+After a recovery delivery succeeds, its acknowledgement remains mandatory; the
+next entry may observe rejection. Provider waits and page materialization still
+need physical lifetime/bounded-work coverage. Legacy recovery wrappers and durable
+completion owners are preserved. Focused startup-helper fixtures use real service
+locks but stand-in recovery callbacks; physical DB tests remain a separate gate.

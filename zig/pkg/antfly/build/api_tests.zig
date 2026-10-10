@@ -2388,7 +2388,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const local_commit_control_tests = b.addTest(.{
         .name = "local-commit-control-tests",
         .root_module = local_commit_control_root,
-        .filters = &.{ "bound commit controls reject expired admission and durably abort canceled preparation", "shared stateless commit controls retain the original deadline through conflict retries", "bound batch controls retain original owner through native snapshot admission", "bound batch controls retain CPU through snapshot-owned apply rejection", "bound BEGIN and prepare retain CPU through policy-owned apply rejection", "bound transaction original lifetime rejection after BEGIN durably aborts", "bound resolution original lifetime rejection preserves prepared intents for retry" },
+        .filters = &.{ "bound batch startup recovery preserves original lifetime and pending durability", "bound commit controls reject expired admission and durably abort canceled preparation", "shared stateless commit controls retain the original deadline through conflict retries", "bound batch controls retain original owner through native snapshot admission", "bound batch controls retain CPU through snapshot-owned apply rejection", "bound BEGIN and prepare retain CPU through policy-owned apply rejection", "bound transaction original lifetime rejection after BEGIN durably aborts", "bound resolution original lifetime rejection preserves prepared intents for retry" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const local_commit_control_run = addFilteredTestRunArtifact(b, local_commit_control_tests);
@@ -2471,6 +2471,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-controlled-service-lock-test", "Verify service lock waits release CPU and preserve original lifetime and lock ownership")
         .dependOn(&b.addRunArtifact(controlled_service_lock_tests).step);
+
+    const replication_startup_admission_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/replication_startup_admission_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, replication_startup_admission_root, true, true);
+    replication_startup_admission_root.addImport("antfly_source_root", replication_startup_admission_root);
+    const replication_startup_admission_tests = b.addTest(.{
+        .name = "replication-startup-admission-tests",
+        .root_module = replication_startup_admission_root,
+        .filters = &.{"replication startup original lifetime"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-replication-startup-admission-test", "Verify original lifetime through startup flush and apply admission")
+        .dependOn(&b.addRunArtifact(replication_startup_admission_tests).step);
 
     const shared_sql_worker_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/shared_sql_workers_test_root.zig"),

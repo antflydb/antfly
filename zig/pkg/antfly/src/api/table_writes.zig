@@ -44774,12 +44774,73 @@ fn implementationTests() type {
             }
         }
 
+        test "bound batch startup recovery preserves original lifetime and pending durability" {
+            const alloc = std.testing.allocator;
+            const State = struct {
+                checks: usize = 0,
+                reject: ?anyerror,
+                transitions: usize = 0,
+                fn lifetime(raw: *const anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                    self.checks += 1;
+                    if (self.checks >= 8) if (self.reject) |err| return err;
+                }
+                fn transition(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.transitions += 1;
+                    return error.InvalidRunnableTransition;
+                }
+            };
+            for ([_]anyerror{ error.DeadlineExceeded, error.Canceled, error.SchedulerClosed }) |rejection| {
+                for (0..2) |fence| {
+                    var tmp = try TestDirectory.init("antfly-bound-startup-lifetime");
+                    defer tmp.cleanup();
+                    var db = try db_mod.DB.open(alloc, tmp.path(), .{});
+                    defer db.close();
+                    const io = db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+                    try std.testing.expect(db.local_execution.durable_replication_startup_barrier_pending.load(.acquire));
+                    if (fence == 0) db.local_execution.durable_replication_flush_mutex.lockUncancelable(io) else db.core.lockApply();
+                    var held = true;
+                    defer if (held) {
+                        if (fence == 0) db.local_execution.durable_replication_flush_mutex.unlock(io) else db.core.unlockApply();
+                    };
+                    var state: State = .{ .reject = rejection };
+                    const original: @typeInfo(@TypeOf(db_mod.DB.batchWithAdmissionControls)).@"fn".param_types[2].? = .{
+                        .lifetime = .{ .context = &state, .check_fn = State.lifetime },
+                        .execution_wait = .{ .ptr = &state, .begin = State.transition, .end = State.transition },
+                    };
+                    const request: db_mod.types.BatchRequest = .{ .writes = &.{.{ .key = "doc:startup", .value = "{}" }} };
+                    try std.testing.expectError(rejection, db.batchWithAdmissionControls(request, original, .none));
+                    try std.testing.expectEqual(@as(usize, 8), state.checks);
+                    try std.testing.expectEqual(@as(usize, 0), state.transitions);
+                    try std.testing.expect(db.local_execution.durable_replication_startup_barrier_pending.load(.acquire));
+                    if (fence == 0) db.local_execution.durable_replication_flush_mutex.unlock(io) else db.core.unlockApply();
+                    held = false;
+                    try std.testing.expect(try db.lookup(alloc, "doc:startup", .{}) == null);
+                    state.reject = null;
+                    try db.batchWithAdmissionControls(request, original, .none);
+                    try std.testing.expect(!db.local_execution.durable_replication_startup_barrier_pending.load(.acquire));
+                    const row = (try db.lookup(alloc, "doc:startup", .{})) orelse return error.MissingHealthyRetry;
+                    defer alloc.free(row);
+                    try std.testing.expectEqualStrings("{}", row);
+                    try std.testing.expectEqual(@as(usize, 0), state.transitions);
+                    try std.testing.expect(db.local_execution.durable_replication_flush_mutex.tryLock());
+                    db.local_execution.durable_replication_flush_mutex.unlock(io);
+                    try std.testing.expect(db.core.tryLockApplyExclusive());
+                    db.core.unlockApply();
+                }
+            }
+        }
+
         test "bound batch controls retain CPU through snapshot-owned apply rejection" {
             const alloc = std.testing.allocator;
             var path_tmp = try TestDirectory.init("antfly-bound-batch-retained-cpu");
             defer path_tmp.cleanup();
             var db = try db_mod.DB.open(alloc, path_tmp.path(), .{});
             defer db.close();
+            // This fixture targets the later snapshot-owned apply fence.
+            // Complete startup recovery before deliberately holding apply.
+            try db.ensureDurableReplicationStartupBarrier();
             const State = struct {
                 db: *db_mod.DB,
                 retained_checks: usize = 0,

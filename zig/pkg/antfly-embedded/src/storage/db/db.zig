@@ -3496,14 +3496,18 @@ pub const DB = struct {
     /// only for rolling-upgrade recovery. A changed/missing mirror cannot
     /// silently discard a durability obligation.
     pub const flushDurableReplicationOutboxes = local_mutation.flushDurableReplicationOutboxes;
+    pub const flushDurableReplicationOutboxesWithAdmission = local_mutation.flushDurableReplicationOutboxesWithAdmission;
 
     pub const ensureDurableReplicationStartupBarrier = local_mutation.ensureDurableReplicationStartupBarrier;
+
+    pub const ensureDurableReplicationStartupBarrierWithAdmission = local_mutation.ensureDurableReplicationStartupBarrierWithAdmission;
 
     /// The caller owns `durable_replication_flush_mutex`. Recovery may overlap foreground
     /// acknowledgement, but the apply fence ensures a committed outbox is not
     /// visible until its WAL record was appended, and WAL matching makes such
     /// overlap idempotent.
     pub const flushDurableReplicationOutboxesLocked = local_mutation.flushDurableReplicationOutboxesLocked;
+    pub const flushDurableReplicationOutboxesLockedWithAdmission = local_mutation.flushDurableReplicationOutboxesLockedWithAdmission;
 
     /// Queue remote acknowledgement without coupling it to DB open or reads.
     /// The dedicated owner gives this retry state an independent maintenance
@@ -131602,7 +131606,9 @@ pub const test_support = if (builtin.is_test) struct {
     pub const batchContext = fixture_owner.DB.batchContext;
     pub const applyRelationalTopologyControlWithReplication = fixture_owner.DB.applyRelationalTopologyControlWithReplication;
     pub const ensureDurableReplicationStartupBarrier = fixture_owner.DB.ensureDurableReplicationStartupBarrier;
+    pub const ensureDurableReplicationStartupBarrierWithAdmission = fixture_owner.DB.ensureDurableReplicationStartupBarrierWithAdmission;
     pub const flushDurableReplicationOutboxes = fixture_owner.DB.flushDurableReplicationOutboxes;
+    pub const flushDurableReplicationOutboxesWithAdmission = fixture_owner.DB.flushDurableReplicationOutboxesWithAdmission;
 } else struct {};
 
 test "document extraction catalog snapshot releases every allocation on failure" {
