@@ -1416,11 +1416,10 @@ pub const H2Connection = struct {
         } else if (@hasDecl(Child, "recv")) {
             return reader.recv(buf);
         } else if (Reader == *std.Io.Reader) {
-            var iov = [_][]u8{buf};
-            return reader.readVec(&iov) catch |err| switch (err) {
-                error.EndOfStream => @as(usize, 0),
-                else => err,
-            };
+            // Buffered readers (including TLS) may return zero from readVec
+            // while filling their own buffer. Only EndOfStream denotes EOF.
+            // This adapter fills the requested frame span through that progress.
+            return reader.readSliceShort(buf);
         } else {
             @compileError("readSome: reader must have .read() or .recv() method, got " ++ @typeName(Reader));
         }
@@ -3992,4 +3991,47 @@ test "late retired-stream HEADERS preserve shared HPACK state" {
     try std.testing.expectEqualStrings("x-retained-table", decoded[1].name);
     try std.testing.expectEqualStrings("shared-value", decoded[1].value);
     try std.testing.expect(second.completed);
+}
+
+test "pooled H2 stream buffered progress preserves frames and rejects truncated payload" {
+    const Buffered = struct {
+        reader: std.Io.Reader,
+        input: []const u8,
+        calls: usize = 0,
+        fn stream(r: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            var empty: [0][]u8 = .{};
+            return readVec(r, &empty);
+        }
+        fn readVec(r: *std.Io.Reader, _: [][]u8) std.Io.Reader.Error!usize {
+            const self: *@This() = @fieldParentPtr("reader", r);
+            self.calls += 1;
+            if (self.calls == 1) return 0;
+            if (self.calls > 2) return error.EndOfStream;
+            @memcpy(r.buffer[0..self.input.len], self.input);
+            r.seek = 0;
+            r.end = self.input.len;
+            // Same buffered-output contract as the TLS reader: the bytes are
+            // available in reader.buffer rather than copied to the caller.
+            return 0;
+        }
+    };
+    const alloc = std.testing.allocator;
+    var conn = H2Connection.initClient(alloc, std.testing.io);
+    defer conn.deinit();
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(alloc);
+    try conn.writeFrame(testWriter(&wire, alloc), .ping, H2Connection.FLAG_ACK, 0, "h2ping\x00\x00");
+    for ([_]bool{ false, true }) |truncated| {
+        var buffer: [17]u8 = undefined;
+        var source: Buffered = .{ .reader = .{ .buffer = &buffer, .seek = 0, .end = 0, .vtable = &.{ .stream = Buffered.stream, .readVec = Buffered.readVec } }, .input = wire.items[0 .. wire.items.len - @as(usize, if (truncated) 1 else 0)] };
+        if (truncated) {
+            try std.testing.expectError(error.ConnectionClosed, conn.readFrame(&source.reader));
+        } else {
+            var frame = try conn.readFrame(&source.reader);
+            defer frame.deinit(alloc);
+            try std.testing.expectEqual(Http2FrameType.ping, frame.header.frame_type);
+            try std.testing.expectEqual(H2Connection.FLAG_ACK, frame.header.flags);
+            try std.testing.expectEqualStrings("h2ping\x00\x00", frame.payload);
+        }
+    }
 }

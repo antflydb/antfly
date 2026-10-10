@@ -873,3 +873,32 @@ observer retains and joins the probe task; on a regression it releases the
 injected holder before joining. Actual TLS health-probe failure and connection
 background CPU ownership still need whole-lifecycle qualification, along with
 storage birth-root integration, holder transfers and default sizing.
+
+### Actual TLS health-probe qualification
+
+The health-probe fixture now negotiates real TLS 1.2 and TLS 1.3 with a local
+Python/OpenSSL peer, validates the encrypted PING and ACK exchange, withholds
+ACKs, and stops reading to force encrypted-output backpressure. The probe runs
+on an owned task with a bounded observer and is physically joined before the
+TLS session, HTTP/2 state or socket can be destroyed. The peer has finite
+accept/handshake/read timeouts and is joined or killed before fixture teardown.
+
+A sentinel prior TLS output control rejects any accidental invocation. The
+probe must override it only within its locked write/flush phase, then restore
+all prior control fields. Shared TLS reader controls and transport scope remain
+unchanged. Failed probes retire the connection and wake send-window waiters;
+no stream token or entry ownership is freed merely because a probe completes.
+The fixture does not qualify node CPU authority for these background fibers,
+storage birth roots, holder CPU transfers, runtime resource limits or defaults.
+
+The TLS fixtures require Python/OpenSSL with TLS 1.2 and TLS 1.3 support. Set
+`ANTFLY_TEST_TLS_PYTHON` to its executable when the default Python uses an older
+SSL library. Missing Python is a reported skip; unsupported TLS is a fixture
+failure, never passing qualification. Receipts record the selected interpreter.
+
+The real peer exposed an HTTP/2 buffered-reader defect: `std.Io.Reader.readVec`
+can return zero after filling its own buffer, especially for decrypted TLS
+records. Treating that as EOF prematurely discarded healthy encrypted frames.
+The HTTP/2 reader adapter now uses `readSliceShort`, whose zero result represents
+actual end of stream while buffered progress is consumed before returning.
+The regression also checks true truncated frame payloads are rejected and freed.

@@ -7682,3 +7682,164 @@ test "H2 health probe bounds physical lock wire and ACK waits with one deadline"
         }
     }
 }
+
+const python_h2_tls_probe_server =
+    \\import socket, ssl, sys, time
+    \\ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    \\ctx.load_cert_chain('cert.pem', 'key.pem')
+    \\ctx.set_alpn_protocols(['h2'])
+    \\ctx.minimum_version = ctx.maximum_version = getattr(ssl.TLSVersion, sys.argv[2])
+    \\listener = socket.socket()
+    \\listener.settimeout(3)
+    \\listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    \\listener.bind(('127.0.0.1', 0))
+    \\listener.listen(1)
+    \\print(listener.getsockname()[1], flush=True)
+    \\raw, _ = listener.accept()
+    \\raw.settimeout(3)
+    \\with ctx.wrap_socket(raw, server_side=True) as conn:
+    \\    print('ready', flush=True)
+    \\    if sys.argv[1] == 'blocked_wire':
+    \\        time.sleep(3)
+    \\    else:
+    \\        frame = b''
+    \\        while len(frame) < 17:
+    \\            part = conn.recv(17 - len(frame))
+    \\            if not part: raise EOFError('missing probe')
+    \\            frame += part
+    \\        assert frame[:9] == bytes([0, 0, 8, 6, 0, 0, 0, 0, 0]), frame
+    \\        assert frame[9:] == b'h2ping\x00\x00', frame
+    \\        if sys.argv[1] == 'healthy':
+    \\            conn.sendall(frame[:4] + bytes([1]) + frame[5:])
+    \\            print('acknowledged', flush=True)
+    \\        else:
+    \\            assert conn.recv(1) == b'', 'probe must shut down on missing ACK'
+    \\            print('retired', flush=True)
+;
+
+test "H2 health probe TLS preserves transport controls through wire deadline and ACK retirement" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const Mode = enum { healthy, blocked_wire, missing_ack };
+    const Probe = struct {
+        entry: *H2PoolEntry,
+        done: Io.Event = .unset,
+        result: anyerror!void = undefined,
+        fn run(self: *@This()) void {
+            self.result = Client.h2PingProbe(self.entry);
+            self.done.set(self.entry.io);
+        }
+        fn receive(entry: *H2PoolEntry) anyerror!void {
+            const reader = try entry.session.getReader();
+            const writer = try entry.session.getWriter();
+            _ = entry.h2.processOneFrameLocked(reader, writer) catch |err| {
+                std.debug.print("TLS_PROBE receive failed={s}\n", .{@errorName(err)});
+                return err;
+            };
+            std.debug.print("TLS_PROBE receive completed ack={any}\n", .{entry.h2.ping_ack_event.isSet()});
+        }
+        fn oldControl(_: ?*anyopaque) socket_mod.WriteControl.Error!void {
+            return error.Canceled;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const python_override = std.testing.environ.getAlloc(alloc, "ANTFLY_TEST_TLS_PYTHON") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => null,
+        else => return err,
+    };
+    defer if (python_override) |path| alloc.free(path);
+    const python = python_override orelse "python3";
+    for ([_][]const u8{ "TLSv1_2", "TLSv1_3" }) |version| for (std.enums.values(Mode)) |mode| {
+        std.debug.print("TLS_PROBE version={s} mode={s} stage=start\n", .{ version, @tagName(mode) });
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
+        try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
+        try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_h2_tls_probe_server });
+        var child = std.process.spawn(io, .{ .argv = &.{ python, "server.py", @tagName(mode), version }, .cwd = .{ .dir = tmp.dir }, .stdin = .ignore, .stdout = .pipe, .stderr = .inherit }) catch |err| switch (err) {
+            error.FileNotFound => return error.SkipZigTest,
+            else => return err,
+        };
+        defer child.kill(io);
+        var stdout_buffer: [128]u8 = undefined;
+        var stdout_reader = child.stdout.?.readerStreaming(io, &stdout_buffer);
+        const line = (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited;
+        const port = try std.fmt.parseUnsigned(u16, line, 10);
+        var entry: H2PoolEntry = .{ .socket = try Socket.connect(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = port } }, io), .session = TlsSession.init(TlsConfig.insecure(alloc), io), .h2 = H2Connection.initClient(alloc, io), .is_tls = true, .io = io, .ping_timeout_ms = if (mode == .healthy) 500 else 30 };
+        defer entry.socket.close();
+        defer entry.session.deinit();
+        defer entry.h2.deinit();
+        if (!entry.socket.native_timeouts) return error.SkipZigTest;
+        entry.socket.setRequestDeadline(requestDeadlineMs(io, 2000));
+        entry.session.attachSocket(&entry.socket);
+        try entry.session.handshake("127.0.0.1");
+        try std.testing.expectEqual(if (std.mem.eql(u8, version, "TLSv1_2")) std.crypto.tls.ProtocolVersion.tls_1_2 else .tls_1_3, entry.session.client.?.tls_version);
+        try std.testing.expectEqualStrings("ready", (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited);
+        entry.socket.setRequestDeadline(null);
+        try entry.socket.setRecvTimeout(500);
+        if (mode == .blocked_wire) {
+            const send_size: u32 = 4096;
+            try std.posix.setsockopt(entry.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&send_size));
+            try entry.socket.setSendTimeout(10);
+            var payload: [64 * 1024]u8 = @splat('t');
+            var saturated = false;
+            for (0..4096) |_| {
+                _ = entry.session.write(&payload) catch |err| {
+                    try std.testing.expectEqual(error.WriteFailed, err);
+                    try std.testing.expectEqual(@as(?anyerror, error.Timeout), entry.session.net_out.?.last_write_error);
+                    saturated = true;
+                    break;
+                };
+            }
+            try std.testing.expect(saturated);
+            try entry.socket.setSendTimeout(0);
+        }
+        var marker: u8 = 0;
+        const prior: socket_mod.WriteControl = .{ .ptr = &marker, .check_fn = Probe.oldControl };
+        entry.session.net_out.?.control = prior;
+        const reader_control = entry.session.net_in.?.control;
+        var receive: ?Io.Future(anyerror!void) = if (mode == .healthy) try io.concurrent(Probe.receive, .{&entry}) else null;
+        defer if (receive) |*task| {
+            entry.socket.shutdown();
+            task.cancel(io) catch {};
+        };
+        var probe: Probe = .{ .entry = &entry };
+        var task = try io.concurrent(Probe.run, .{&probe});
+        defer {
+            entry.socket.shutdown();
+            task.cancel(io);
+        }
+        try probe.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } });
+        task.await(io);
+        if (mode == .healthy) {
+            try probe.result;
+            try receive.?.await(io);
+            receive = null;
+            try std.testing.expectEqualStrings("acknowledged", (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited);
+            try std.testing.expect(!entry.broken);
+        } else {
+            if (mode == .missing_ack) try std.testing.expectError(error.Timeout, probe.result) else {
+                try std.testing.expectError(error.WriteFailed, probe.result);
+                try std.testing.expectEqual(@as(?anyerror, error.Timeout), entry.session.net_out.?.last_write_error);
+            }
+            try std.testing.expect(entry.broken);
+            try std.testing.expect(entry.h2.send_window_event.isSet());
+            if (mode == .missing_ack) try std.testing.expectEqualStrings("retired", (try stdout_reader.interface.takeDelimiter('\n')) orelse return error.TestServerExited);
+        }
+        const restored = entry.session.net_out.?.control.?;
+        try std.testing.expectEqual(prior.ptr, restored.ptr);
+        try std.testing.expectEqual(prior.check_fn, restored.check_fn);
+        try std.testing.expectEqual(prior.remaining_ms_fn, restored.remaining_ms_fn);
+        try std.testing.expectEqual(prior.wait_begin_fn, restored.wait_begin_fn);
+        try std.testing.expectEqual(prior.wait_end_fn, restored.wait_end_fn);
+        try std.testing.expectEqual(reader_control.ptr, entry.session.net_in.?.control.ptr);
+        try std.testing.expectEqual(reader_control.check_fn, entry.session.net_in.?.control.check_fn);
+        try std.testing.expectEqual(reader_control.remaining_ms_fn, entry.session.net_in.?.control.remaining_ms_fn);
+        try std.testing.expectEqual(reader_control.wait_begin_fn, entry.session.net_in.?.control.wait_begin_fn);
+        try std.testing.expectEqual(reader_control.wait_end_fn, entry.session.net_in.?.control.wait_end_fn);
+        try std.testing.expect(entry.session.transport_control == null);
+        try std.testing.expect(entry.h2.write_mutex.tryLock());
+        entry.h2.write_mutex.unlock(io);
+        try std.testing.expectEqual(@as(usize, 0), entry.h2.stream_manager.activeStreamCount());
+    };
+}
