@@ -1064,7 +1064,7 @@ pub const IndexSnapshot = struct {
         bm25_config: inverted.BM25Config,
         diagnostics: *scorer_mod.SearchDiagnostics,
     ) !scorer_mod.SearchResults {
-        return self.searchInternal(alloc, field, terms, k, null, bm25_config, diagnostics);
+        return self.searchInternal(alloc, field, terms, k, null, bm25_config, diagnostics, null);
     }
 
     pub fn searchWithOverride(
@@ -1087,7 +1087,7 @@ pub const IndexSnapshot = struct {
         override: ?distributed_stats_mod.TextFieldStats,
         bm25_config: inverted.BM25Config,
     ) !scorer_mod.SearchResults {
-        return self.searchInternal(alloc, field, terms, k, override, bm25_config, null);
+        return self.searchInternal(alloc, field, terms, k, override, bm25_config, null, null);
     }
 
     pub const TextSegmentPlan = struct {
@@ -1148,6 +1148,20 @@ pub const IndexSnapshot = struct {
         return plans;
     }
 
+    pub fn searchWithAuthority(
+        self: *const IndexSnapshot,
+        alloc: Allocator,
+        field: []const u8,
+        terms: []const []const u8,
+        k: u32,
+        override: ?distributed_stats_mod.TextFieldStats,
+        bm25_config: inverted.BM25Config,
+        diagnostics: ?*scorer_mod.SearchDiagnostics,
+        authority: ?scorer_mod.WorkAuthority,
+    ) !scorer_mod.SearchResults {
+        return self.searchInternal(alloc, field, terms, k, override, bm25_config, diagnostics, authority);
+    }
+
     fn searchInternal(
         self: *const IndexSnapshot,
         alloc: Allocator,
@@ -1157,7 +1171,9 @@ pub const IndexSnapshot = struct {
         override: ?distributed_stats_mod.TextFieldStats,
         bm25_config: inverted.BM25Config,
         diagnostics: ?*scorer_mod.SearchDiagnostics,
+        authority: ?scorer_mod.WorkAuthority,
     ) !scorer_mod.SearchResults {
+        if (authority) |owner| try owner.check();
         const live_doc_count = self.liveDocCount();
         if (live_doc_count == 0 or terms.len == 0) return .{ .hits = try alloc.alloc(scorer_mod.ScoredHit, 0), .total_count = 0 };
 
@@ -1185,6 +1201,7 @@ pub const IndexSnapshot = struct {
         if (diagnostics) |diag| diag.segments_considered +|= @intCast(plans.len);
 
         for (plans) |plan| {
+            if (authority) |owner| try owner.check();
             const seg = &self.segments[plan.segment_idx];
             // Strict inequality preserves deterministic tie-breaking: a
             // segment whose bound equals the threshold may still contain a
@@ -1207,10 +1224,12 @@ pub const IndexSnapshot = struct {
                 defer seg.shared.unlockDeletionShared();
                 var wand = scorer_mod.WANDScorer.init(alloc, k, global_doc_count, avg_dl, bm25_config);
                 defer wand.deinit();
+                wand.authority = authority;
                 if (bound_table) |table| wand.setBoundTable(table);
                 var added_terms: usize = 0;
 
                 for (terms, 0..) |term, term_idx| {
+                    if (authority) |owner| try owner.check();
                     const lookup_result = (try inv_reader.lookup(term)) orelse continue;
                     const iter = try lookup_result.iterator(alloc);
 
@@ -1250,6 +1269,7 @@ pub const IndexSnapshot = struct {
             }
         }
 
+        if (authority) |owner| try owner.check();
         return collector.finishOwned();
     }
 

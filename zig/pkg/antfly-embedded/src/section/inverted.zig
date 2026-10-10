@@ -5112,11 +5112,29 @@ pub const PostingsIterator = struct {
         bound_table: ?*const BM25BoundTable,
         allow_equal_prune: bool,
     ) !CompetitiveBlockAdvance {
+        return self.advanceToCompetitiveBlockWithAuthority(block_max, threshold, scorer, idf, bound_table, allow_equal_prune, null);
+    }
+
+    pub fn advanceToCompetitiveBlockWithAuthority(
+        self: *PostingsIterator,
+        block_max: BlockMaxInfo,
+        threshold: f32,
+        scorer: BM25TermScorer,
+        idf: f32,
+        bound_table: ?*const BM25BoundTable,
+        allow_equal_prune: bool,
+        authority: ?@import("../search/work_authority.zig").Authority,
+    ) !CompetitiveBlockAdvance {
+        var authority_steps: u8 = 0;
         if (self.impact_chunk_ids.items.len > 0) {
             const current = self.currentBlockCursor() orelse return .{ .hit = null, .chunks_skipped = 0 };
             var ordinal = current.ordinal + 1;
             var skipped: u32 = 1;
             while (ordinal < block_max.chunkCount()) : (ordinal += 1) {
+                if (authority) |owner| {
+                    if (authority_steps == 0) try owner.check();
+                    authority_steps = (authority_steps + 1) % 64;
+                }
                 const bound = block_max.maxImpactAtOrdinalWithBoundTable(ordinal, scorer, idf, bound_table);
                 if (bound > threshold or (!allow_equal_prune and bound == threshold)) {
                     const target = self.impact_chunk_ids.items[ordinal] * impact_range_doc_count;
@@ -5132,6 +5150,10 @@ pub const PostingsIterator = struct {
         var ordinal = self.current_chunk_index + 1;
         var skipped: u32 = 1; // remainder of the current non-competitive chunk
         while (ordinal < block_max.chunkCount()) : (ordinal += 1) {
+            if (authority) |owner| {
+                if (authority_steps == 0) try owner.check();
+                authority_steps = (authority_steps + 1) % 64;
+            }
             const bound = block_max.maxImpactAtOrdinalWithBoundTable(ordinal, scorer, idf, bound_table);
             if (bound > threshold or (!allow_equal_prune and bound == threshold)) {
                 try self.loadChunk(ordinal);

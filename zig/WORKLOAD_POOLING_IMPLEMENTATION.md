@@ -1314,3 +1314,19 @@ worker/retry wiring and its actual no-skip regression are proposed separately
 and still require production qualification. Provisioned/bound sources, SQL
 ingress adoption and physical durability waits remain pending. Defaults remain
 disabled.
+
+Native text scoring now borrows synchronous lifetime authority from the original
+storage request. Ordinary and filtered WAND, brute-force scoring, pivot repair,
+block interval pruning and competitive block scans check that authority at most
+every 64 loop steps. The callback uses the retained runnable owner's clock and
+shutdown/cancellation state without acquiring CPU or yielding under index read
+locks. A borrowed grant without lifetime support fails closed. Unpooled requests
+use their existing monotonic deadline and cancellation token.
+
+`zig build antfly-text-scoring-authority-test -Doptimize=ReleaseSafe -j1`
+checks cancellation, timeout and shutdown during real scoring, partial output
+retirement, successful snapshot reuse, unchanged controlled/legacy scores, and
+expiration during unscored block pruning. This is focused correctness evidence.
+It does not qualify CPU fairness under locks, arbitrary postings decoder work,
+phrase/count/sort/aggregation/vector paths, background execution, runtime resource
+limits, performance or automatic defaults. Those remain completion requirements.

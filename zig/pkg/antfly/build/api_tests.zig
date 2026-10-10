@@ -2365,6 +2365,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-transaction-capture-budget-test", "Require original transaction routing controls and capture cleanup")
         .dependOn(&transaction_capture_run.step);
 
+    const text_scoring_authority_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/text_scoring_authority_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, text_scoring_authority_root, true, true);
+    text_scoring_authority_root.addImport("antfly_source_root", text_scoring_authority_root);
+    const text_scoring_authority_tests = b.addTest(.{
+        .name = "text-scoring-authority-tests",
+        .root_module = text_scoring_authority_root,
+        .filters = &.{ "controlled WAND scoring", "native text lifetime", "native text search propagates lifetime", "scorer", "single-term", "WAND", "shared top-k" },
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-text-scoring-authority-test", "Verify original lifetime failures retire native scoring state")
+        .dependOn(&b.addRunArtifact(text_scoring_authority_tests).step);
+
     const text_filter_controls_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/text_filter_controls_test_root.zig"),
         .target = target,

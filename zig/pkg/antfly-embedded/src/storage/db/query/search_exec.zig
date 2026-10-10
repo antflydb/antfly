@@ -8918,6 +8918,7 @@ fn collectStructuredFilterDocIdsAlloc(
     ))) return null;
     const k: u32 = @intCast(@min(snapshot.liveDocCount(), @as(u64, std.math.maxInt(u32))));
     var result = try search_mod.execute(alloc, snapshot, .{
+        .authority = @import("../../query_controls.zig").nativeTextAuthority(&req),
         .query = search_query,
         .k = k,
         .offset = 0,
@@ -11977,7 +11978,7 @@ pub fn searchTextQuery(
                 const selected = try arena_alloc.alloc(u32, out.hits.len);
                 for (out.hits, selected) |hit, *doc| doc.* = hit.native_text_doc_id orelse return error.InvalidData;
                 std.mem.sort(u32, selected, {}, std.sort.asc(u32));
-                var scored = try search_mod.execute(alloc, snapshot, .{ .query = search_query, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
+                var scored = try search_mod.execute(alloc, snapshot, .{ .authority = @import("../../query_controls.zig").nativeTextAuthority(&effective_req), .query = search_query, .k = @intCast(selected.len), .include_stored = false, .filter_doc_nums = selected, .filter_doc_nums_positive = true, .distributed_text_stats = effective_req.distributed_text_stats });
                 defer scored.deinit();
                 var scores: std.AutoHashMapUnmanaged(u32, f32) = .empty;
                 defer scores.deinit(alloc);
@@ -12065,6 +12066,7 @@ pub fn searchTextQuery(
             try search_mod.executeCountCandidates(alloc, snapshot, search_query)
         else
             try search_mod.execute(alloc, snapshot, .{
+                .authority = @import("../../query_controls.zig").nativeTextAuthority(&effective_req),
                 .query = search_query,
                 .k = if (collect_window_candidates) candidate_limit else paging.limit,
                 .offset = if (collect_window_candidates) 0 else paging.offset,

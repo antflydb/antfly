@@ -59,3 +59,21 @@ pub fn applyTrustedControls(req: *types.SearchRequest, controls: types.SearchReq
     req.execution_runnable = controls.execution_runnable;
     req.cancellation = controls.cancellation;
 }
+
+/// Native scoring holds index read locks. This borrowed callback must not
+/// suspend or acquire CPU, and retains the owner's original clock authority.
+pub fn nativeTextAuthority(req: *const types.SearchRequest) @import("../search/work_authority.zig").Authority {
+    return .{ .context = req, .check_fn = checkNativeTextLifetime };
+}
+
+fn checkNativeTextLifetime(raw: *const anyopaque) !void {
+    const req: *const types.SearchRequest = @ptrCast(@alignCast(raw));
+    if (req.execution_runnable) |grant| {
+        try grant.checkLifetime();
+    } else if (req.execution_deadline_ns) |deadline| {
+        if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.Timeout;
+    }
+    if (req.cancellation) |cancellation| {
+        if (cancellation.isCancelled()) return error.Cancelled;
+    }
+}

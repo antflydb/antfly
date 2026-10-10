@@ -133,7 +133,10 @@ pub const NamedGraphResult = struct {
     result: graph_query.GraphQueryResult,
 };
 
+pub const WorkAuthority = @import("work_authority.zig").Authority;
+
 pub const SearchRequest = struct {
+    authority: ?WorkAuthority = null,
     query: SearchQuery,
     k: u32 = 10,
     offset: u32 = 0,
@@ -540,6 +543,7 @@ pub fn execute(
     snap: *const index_mod.IndexSnapshot,
     request: SearchRequest,
 ) !SearchResult {
+    if (request.authority) |owner| try owner.check();
     var result = if (request.sort != null)
         try executeSort(alloc, snap, request)
     else switch (request.query) {
@@ -731,25 +735,15 @@ fn searchSnapshotTerms(
 ) !scorer_mod.SearchResults {
     const stats = matchingFieldStats(request.distributed_text_stats, field, terms);
     const k = if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) @as(u32, @intCast(@min(snap.liveDocCount(), std.math.maxInt(u32)))) else effectiveK(request, snap);
-    if (request.diagnostics) |diagnostics| {
-        if (stats == null) {
-            return snap.searchWithConfigDiagnostics(
-                alloc,
-                field,
-                terms,
-                k,
-                request.bm25_config,
-                diagnostics,
-            );
-        }
-    }
-    return snap.searchWithOverrideAndConfig(
+    return snap.searchWithAuthority(
         alloc,
         field,
         terms,
         k,
         stats,
         request.bm25_config,
+        if (stats == null) request.diagnostics else null,
+        request.authority,
     );
 }
 
@@ -2363,6 +2357,7 @@ fn collectFastMustSegment(
 fn collectFilteredWandSegment(alloc: Allocator, seg: *const index_mod.SegmentEntry, inv_reader: anytype, terms: []const SimpleTextTerm, frequencies: []const u32, offset: u32, request: SearchRequest, collector: *FastTopK, doc_count: u32, avg_dl: f32, bound_table: ?*const inverted.BM25BoundTable) !void {
     var wand = scorer_mod.WANDScorer.init(alloc, collector.k, doc_count, avg_dl, request.bm25_config);
     defer wand.deinit();
+    wand.authority = request.authority;
     if (bound_table) |table| wand.setBoundTable(table);
     for (terms, frequencies) |term, frequency| {
         const lookup = (try inv_reader.lookup(term.term)) orelse continue;
@@ -6297,4 +6292,63 @@ test "external lake producer top k shares segment bound planning across fragment
     try std.testing.expectEqual(@as(u64, 20), diagnostics.segments_considered);
     try std.testing.expect(diagnostics.segments_pruned > 0);
     try std.testing.expect(diagnostics.segments_searched < 20);
+}
+
+test "native text search propagates lifetime authority through snapshot scoring and recovers" {
+    const a = std.testing.allocator;
+    var inv = inverted.InvertedIndexBuilder.init(a, .{});
+    defer inv.deinit();
+    for (0..512) |doc| try inv.addDocument(@intCast(doc), &.{
+        .{ .term = "hello", .freq = 1, .norm = 1 },
+    });
+    const inv_data = try inv.build();
+    defer a.free(inv_data);
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    const field = try segment.addField("title");
+    try segment.addSection(field, .inverted_text, inv_data);
+    for (0..512) |doc| {
+        const id = try std.fmt.allocPrint(a, "doc-{d}", .{doc});
+        defer a.free(id);
+        try segment.addStoredDoc(id, "{}");
+    }
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const snapshot = writer.snapshot();
+    const State = struct {
+        calls: usize = 0,
+        reject: bool = true,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.reject and self.calls == 8) return error.SchedulerClosed;
+        }
+    };
+    var state: State = .{};
+    const request: SearchRequest = .{
+        .query = .{ .term = .{ .field = "title", .term = "hello" } },
+        .k = 512,
+        .include_stored = false,
+        .authority = .{ .context = &state, .check_fn = State.check },
+    };
+    try std.testing.expectError(error.SchedulerClosed, execute(a, snapshot, request));
+    try std.testing.expectEqual(@as(usize, 8), state.calls);
+    // Reuse the snapshot after failure and compare controlled and legacy runs.
+    // The test allocator also checks retirement of request-owned output.
+    state.reject = false;
+    var controlled = try execute(a, snapshot, request);
+    defer controlled.deinit();
+    var legacy_request = request;
+    legacy_request.authority = null;
+    var legacy = try execute(a, snapshot, legacy_request);
+    defer legacy.deinit();
+    try std.testing.expectEqual(legacy.total_hits, controlled.total_hits);
+    try std.testing.expectEqual(legacy.hits.len, controlled.hits.len);
+    for (legacy.hits, controlled.hits) |expected, actual| {
+        try std.testing.expectEqual(expected.doc_id, actual.doc_id);
+        try std.testing.expectEqual(expected.score, actual.score);
+    }
 }
