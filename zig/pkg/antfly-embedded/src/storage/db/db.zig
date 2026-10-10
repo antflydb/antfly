@@ -7938,8 +7938,6 @@ pub const DB = struct {
             return 0;
         }
 
-        try self.executor.failIfUnhealthy();
-
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         // Recheck after lock acquisition to close publication racing the fast
@@ -9338,8 +9336,6 @@ pub const DB = struct {
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.executor.failIfUnhealthy();
-
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         try self.lockApplyForPortableRuntime();
@@ -27940,8 +27936,6 @@ pub const DB = struct {
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.executor.failIfUnhealthy();
-
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
         try self.lockApplyForPortableRuntime();
@@ -29542,7 +29536,7 @@ pub const DB = struct {
     }
 
     pub fn waitForCurrentSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, cancellation: types.CancellationToken) !void {
-        try self.executor.failIfUnhealthy();
+        try self.executor.checkSyncLevelHealth(sync_level);
         const sequence = self.core.nextDerivedSequence();
         try self.markPrecomputedEnrichmentAppliedForSync(sync_level, sequence);
         var sync_targets = try self.currentManagedSyncTargets(sync_level);
@@ -29556,11 +29550,8 @@ pub const DB = struct {
     pub const waitForResolvedTransactionSync = local_mutation.waitForResolvedTransactionSync;
 
     pub fn waitForResolvedTransactionSyncWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, cancellation: types.CancellationToken) !void {
-        if (sequence == 0 or sync_level == .propose or sync_level == .write) {
-            try self.executor.failIfUnhealthy();
-            return;
-        }
-        try self.executor.failIfUnhealthy();
+        try self.executor.checkSyncLevelHealth(sync_level);
+        if (sequence == 0 or sync_level == .propose or sync_level == .write) return;
         try self.markPrecomputedEnrichmentAppliedForSync(sync_level, sequence);
         var sync_targets = try self.currentManagedSyncTargets(sync_level);
         defer sync_targets.deinit(self.alloc);
@@ -33359,9 +33350,8 @@ pub const DB = struct {
             .clock = visibility_clock,
         };
         switch (sync_level) {
-            .propose, .write => try self.executor.failIfUnhealthy(),
+            .propose, .write => {},
             .enrichments => {
-                try self.executor.failIfUnhealthy();
                 if (!skip_enrichment_runtime_wait)
                     try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
             },
@@ -48701,9 +48691,8 @@ fn currentReplayTargetSequenceContext(ctx: *const BatchExecutionContext) u64 {
 
 fn waitForSyncLevelContext(ctx: *const BatchExecutionContext, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets) !void {
     switch (sync_level) {
-        .propose, .write => try ctx.executor.failIfUnhealthy(),
+        .propose, .write => {},
         .enrichments => {
-            try ctx.executor.failIfUnhealthy();
             try runEnrichmentUntilContext(ctx, sequence);
         },
         .full_text => {
@@ -134005,4 +133994,68 @@ test "lite bounded reader integration publishes full text mappings through db" {
         try std.testing.expectEqual(@as(u32, 1), result.total_hits);
         try std.testing.expectEqualStrings("b", result.hits[0].id);
     }
+}
+
+test "issue1015 primary writes survive failed derived runtime and visibility stays fail closed" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("issue1015-primary-durability");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .executor = .{ .backend = .io_threaded } });
+    var open = true;
+    defer if (open) db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const Runtime = @import("derived/io_threaded_runtime.zig").DerivedRuntime;
+    const runtime: *Runtime = @ptrCast(@alignCast(db.executor.ptr));
+    const io = runtime.threaded.io();
+    runtime.mutex.lockUncancelable(io);
+    runtime.last_error_name = "InjectedPermanentFailure";
+    runtime.mutex.unlock(io);
+    try std.testing.expectError(error.AsyncWorkerFailed, db.executor.failIfUnhealthy());
+    try db.batch(.{ .writes = &.{.{ .key = "primary", .value = "{\"search_text\":\"durable\"}" }}, .sync_level = .write });
+    const value = (try db.get(alloc, "primary")).?;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"search_text\":\"durable\"}", value);
+    try db.waitForCurrentSyncLevel(.write);
+    try std.testing.expectError(error.AsyncWorkerFailed, db.batch(.{ .writes = &.{.{ .key = "rejected", .value = "{}" }}, .sync_level = .full_text }));
+    try std.testing.expect((try db.get(alloc, "rejected")) == null);
+    db.close();
+    open = false;
+    var reopened = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .executor = .{ .backend = .io_threaded } });
+    defer reopened.close();
+    try reopened.waitForCurrentSyncLevel(.full_text);
+    const durable = (try reopened.get(alloc, "primary")).?;
+    defer alloc.free(durable);
+    try std.testing.expectEqualStrings(value, durable);
+}
+
+test "issue1015 degraded primary writes reject backlog exhaustion before commit" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{ .soft_limit_bytes = 1024, .hard_limit_bytes = 4096 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var directory = try TestDirectory.init("issue1015-bounded-degraded-writes");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .resource_manager = &manager, .start_optional_runtimes = false, .executor = .{ .backend = .io_threaded } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const Runtime = @import("derived/io_threaded_runtime.zig").DerivedRuntime;
+    const runtime: *Runtime = @ptrCast(@alignCast(db.executor.ptr));
+    const io = runtime.threaded.io();
+    runtime.mutex.lockUncancelable(io);
+    runtime.last_error_name = "InjectedPermanentFailure";
+    runtime.mutex.unlock(io);
+    var accepted: usize = 0;
+    while (accepted < 200) : (accepted += 1) {
+        var key_buffer: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "primary-{d}", .{accepted});
+        db.batch(.{ .writes = &.{.{ .key = key, .value = "{\"search_text\":\"durable\"}" }}, .sync_level = .write }) catch |err| {
+            try std.testing.expectEqual(error.ResourceBudgetExceeded, err);
+            try std.testing.expect(accepted > 0);
+            try std.testing.expect((try db.get(alloc, key)) == null);
+            try std.testing.expect(manager.sliceStats(.derived_backlog).used_bytes <= 4096);
+            return;
+        };
+    }
+    return error.TestUnexpectedResult;
 }

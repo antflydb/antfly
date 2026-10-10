@@ -266,7 +266,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
 
-            try self.executor.failIfUnhealthy();
+            try self.executor.checkSyncLevelHealth(req.sync_level);
 
             var foreground_write = resource_manager_mod.ResourceManager.ForegroundWriteLease{};
             defer foreground_write.release();

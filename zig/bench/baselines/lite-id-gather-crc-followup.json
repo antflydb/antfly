@@ -1,0 +1,221 @@
+{
+  "comparison_commit": "3b623fa0b1a874d1bf9a30a0ff7a126887cfb0a6",
+  "base_commit": "0cffd66bde45181e458ee87f2e74397cfc40cc99",
+  "environment": {
+    "platform": "aarch64-macos",
+    "optimization": "Debug",
+    "zig": "0.17.0",
+    "storage": "In-memory range provider with warm native metadata cache"
+  },
+  "id_gather": {
+    "documents": 384,
+    "identity_bytes": 2578,
+    "before_cache_probes": {
+      "dense": 6,
+      "every_third_document_deleted": 132,
+      "reverse_order": 768
+    },
+    "after_cache_probes": {
+      "dense": 6,
+      "every_third_document_deleted": 6,
+      "reverse_order": 6
+    },
+    "after_sink_appends": {
+      "dense": 3,
+      "every_third_document_deleted": 2,
+      "reverse_order": 3
+    }
+  },
+  "stored_metadata_crc": {
+    "identity_bytes": 262144,
+    "metadata_bytes": 262201,
+    "output_reread_bytes_before": 262201,
+    "output_reread_bytes_after": 65536
+  },
+  "fully_deleted_liveness": {
+    "documents": 500000,
+    "before_membership_checks": 500000,
+    "after_membership_checks": 0,
+    "after_rank_queries": 1
+  },
+  "design": [
+    "Gather at most 128 references in source document order, validate selected rows, then gather bounded identity spans in source offset order and emit in requested output order.",
+    "Reject sparse metadata/ID span expansion beyond four source rows/bytes per selected row/byte. Skip sorting already ordered references.",
+    "Validate the batch once, then gather bounded output-order windows without replaying metadata reads. Shrink windows before I/O when sparse span expansion exceeds the gather cap; stream oversized individual native IDs separately. Heap IDs borrow their reader and share packed output writes with native IDs.",
+    "Keep contiguous output writes; buffer fragmented small IDs into fixed 8 KiB writes. Returned values never borrow this gather scope.",
+    "Seal stored-metadata append CRC tracking before body writes; intersect patches with the sealed range and reread only dirty checksum pages. Plain sinks retain the existing range-CRC contract.",
+    "Use deletion rank for live-input checks with and without a prepared frozen index.",
+    "Traverse borrowed live ranges by cached Roaring container and bitmap word, with forward seeking after intact block copies. Reuse the traversal in stored-field passes and sort plans; derive streaming sort live counts from rank.",
+    "Record append provenance in live spans, retaining the dense fallback for fragmented mappings; traverse live ranges during external sorting.",
+    "Prepare ordinal section descriptors once and gather up to 128 references in source order using a fixed 512-byte read buffer. Preserve requested order, duplicates, missing ordinals and all-zero section omission.",
+    "Skip fully deleted typed-value inputs and keep complement traversal across chunks; seek within validated ordered doc IDs before constructing surviving values. Indexed streams expose authenticated per-chunk bounds and relative-ID bases; fully excluded chunks skip decoding and intact chunks copy compressed bytes with a shifted external base. Legacy streams retain bounded decoding.",
+    "Binary-search array-container seeks and contiguous deletion-run boundaries using monotonic value-minus-index deltas.",
+    "Prepare sparse consecutive source-span proofs with selected counts once per sorted plan. Store only runs of at least three coordinates (20 bytes per file descriptor); fragmented gaps keep original coordinates. Native file plans spool only qualifying runs and read at most 64 descriptors per batch; fields synthesize span coordinates without replaying original records."
+  ],
+  "bounds": {
+    "batch_documents": 128,
+    "metadata_buffer_bytes": 3072,
+    "gather_buffer_bytes": 65536,
+    "fragmented_output_buffer_bytes": 8192,
+    "metadata_span_expansion_max": 4,
+    "identity_span_expansion_max": 4,
+    "coordinate_read_records_max": 64,
+    "ordinal_batch_documents": 128,
+    "ordinal_read_buffer_bytes": 512,
+    "ordinal_stack_input_descriptors": 16,
+    "typed_chunk_directory_bytes": 32,
+    "typed_copy_buffer_bytes": 65536,
+    "source_span_descriptor_bytes": 20,
+    "source_span_read_batch": 64
+  },
+  "coverage": [
+    "Dense, sparse-deleted and reversed IDs against individual reads; mixed input numbering and duplicate references.",
+    "Empty IDs, mixed heap/native formats, oversized individual IDs and batches exceeding the gather cap.",
+    "Injected cold ID read failure and invalid selected metadata row before gathered IDs are emitted; retry after failure.",
+    "Sealed CRC ranges with unaligned tails, body-only patches and patches crossing the metadata boundary.",
+    "Empty inputs and fully/partially deleted liveness with frozen and bitmap-only navigation.",
+    "File-backed sort plans fill each 128-document gather with reads of at most 64 records; in-memory plans copy their borrowed slices into the gather buffer.",
+    "Long dense and reversed identities across the gather cap; mixed readers retain native gathering and packed writes.",
+    "Sparse/dense/missing Roaring containers, uint32 end boundary, forward seeks and randomized complement traversal; end-to-end merge with one surviving document.",
+    "Ordinal gathers with shuffled, duplicate, sparse, mixed heap/native and absent references; sorted output and all-zero omission.",
+    "Fixed and variable-width typed-value exclusion cursors across chunks against unfiltered output; provenance range mappings across fragmentation and output boundaries.",
+    "Negative base-remapping fallback preserves values; whole-chunk permutations; uncached heap/range indexed lookups; sparse span replay with gaps/duplicates, fragmented plans, shared typed-field proofs, native allocation-failure sweeps and retry."
+  ],
+  "limitations": "Cache probes count cache navigation/locking, not disk operations. Native Debug production-helper fixtures do not establish end-to-end throughput or 2 GiB soak behavior. Shuffled ID gathering adds bounded ordering/copy work; short live spans may read deleted gap bytes within the fourfold bound. Output/page checksum bookkeeping remains proportional to artifact page count. Indexed typed navigation uses 32 bytes per chunk instead of 8; copying avoids codec work but still reads and writes compressed bytes. Existing binaries do not understand the new flagged typed format.",
+  "long_id_windows": {
+    "documents": 128,
+    "bytes_per_identity": 1024,
+    "before_cache_probes": 131,
+    "after_cache_probes": 5,
+    "after_sink_appends": 2
+  },
+  "mixed_reader_windows": {
+    "native_documents": 127,
+    "heap_documents": 1,
+    "before_native_cache_probes": 254,
+    "after_native_cache_probes": 2,
+    "before_sink_appends": 128,
+    "after_sink_appends": 1
+  },
+  "sparse_survivor_navigation": {
+    "documents": 4096,
+    "survivors": 1,
+    "stored_writer_membership_checks_before": 12288,
+    "stored_writer_membership_checks_after": 0,
+    "measurement": "Review-only isDeleted instrumentation; all three stored-field production passes."
+  },
+  "array_deleted_run_navigation": {
+    "deleted_entries": 4095,
+    "before_entry_advances": 4095,
+    "after_binary_comparisons": 11,
+    "measurement": "Review-only instrumentation of production AbsentRangeIterator; warm in-memory bitmap. These counts describe different operations, not a throughput ratio."
+  },
+  "ordinal_gather": {
+    "documents": 128,
+    "before_value_cache_probes": 256,
+    "after_value_cache_probes": 1,
+    "randomized_refs": 5120,
+    "measurement": "Native Debug production helpers: scalar SegmentReader.docOrdinal versus gatherOrdinals, with warm metadata cache. Descriptor preparation is excluded from both value-read counts."
+  },
+  "typed_sparse_exclusion": {
+    "documents": 4096,
+    "survivors": 1,
+    "logical_value_bytes": 4194304,
+    "before_decoded_chunks": 32,
+    "before_format": "Legacy front directory, 128 rows per chunk",
+    "after_total_chunks": 66,
+    "after_decoded_chunks": 1,
+    "after_skipped_chunks": 65,
+    "after_format": "Indexed stream, 64 KiB raw chunk target",
+    "measurement": "Native Debug Cursor fixture; operation counts, not throughput. Chunk counts differ because byte-bounded streaming encoding splits large values."
+  },
+  "typed_intact_merge": {
+    "logical_value_bytes": 4194304,
+    "before_heap_scratch_peak": 508836,
+    "after_heap_scratch_peak": 2240,
+    "before_allocations": 11,
+    "after_allocations": 1,
+    "before_output_bytes": 215305,
+    "after_output_bytes": 216823,
+    "measurement": "Native Debug production append helper with a non-allocating sink; each build generates its own source format. Indexed source chunks copy compressed bytes; historical sources retain decoding. Fixed stack buffers and output ownership are excluded from heap scratch."
+  },
+  "typed_partial_prefix_copy": {
+    "source_chunks": 5,
+    "partially_deleted_chunks": 1,
+    "copied_chunks_append": 4,
+    "copied_chunks_sorted": 4,
+    "copied_compressed_bytes": 76,
+    "sorted_decoded_chunks": 1,
+    "measurement": "Native Debug append and sorted production helpers; compressed bytes verified equal to their source after document-ID remapping."
+  },
+  "uncached_indexed_points": {
+    "documents": 4096,
+    "chunks": 64,
+    "heap_decode_allocations_before": 64,
+    "range_decode_allocations_before": 6,
+    "heap_decode_allocations_after": 1,
+    "range_decode_allocations_after": 1,
+    "measurement": "Native Debug one getU64(4095), without PointCache; directory initialization excluded. Range source is an in-memory provider, so these are decode allocations, not physical disk reads."
+  },
+  "intact_chunk_permutation": {
+    "logical_value_bytes": 4194304,
+    "intact_chunks": 66,
+    "decoded_chunks_before": 66,
+    "decoded_chunks_after": 0,
+    "measurement": "Native Debug sorted typed helper; source chunks reversed as groups, preserving order within each chunk."
+  },
+  "prepared_source_spans": {
+    "documents": 32,
+    "typed_fields": 2,
+    "sidecar_bytes": 20,
+    "original_coordinate_reads_after_preparation": 0,
+    "typed_decodes": 0,
+    "minimum_run_coordinates": 3,
+    "descriptor_read_batch": 64,
+    "fragmented_stream_span_descriptors": 0,
+    "measurement": "Forced file-backed production plan; replace its coordinate owner with an empty run after preparation. Both fields still merge successfully. Fragmented and duplicate/gapped fixtures cover the original-coordinate fallback. No end-to-end throughput claim."
+  },
+  "monotonic_typed_gap": {
+    "logical_value_bytes": 4194304,
+    "source_chunks": 66,
+    "selected_documents": 127,
+    "copied_prefix_documents": 126,
+    "before_decoded_chunks": 63,
+    "after_decoded_chunks": 1,
+    "measurement": "Native Debug sorted typed helper with an intact two-chunk prefix and one surviving value in a distant partial chunk. Output tail verified; operation counts, not throughput."
+  },
+  "typed_borrowed_copy": {
+    "before_staging_copy_bytes": "compressed payload length",
+    "after_staging_copy_bytes": 0,
+    "measurement": "Native Debug range-provider copy fixture tracks readInto bytes after reader initialization; visitor slices append directly. Page-facade fixtures verify contiguous borrowing on cold pages, native-range borrowing on verified pages, and fail-closed cold corruption. Cold range providers retain bounded buffered authentication."
+  },
+  "shared_typed_navigation": {
+    "comparison_commit": "73127e1aa18a6b9d1768fbc863d2c41cea577bfd",
+    "documents": 50000,
+    "chunks": 49,
+    "scopes": 100,
+    "before_navigation_allocations": 100,
+    "after_navigation_allocations": 0,
+    "before_navigation_provider_reads": 400,
+    "after_navigation_provider_reads": 0,
+    "retained_directory_bytes": 1568,
+    "measurement": "Native Debug in-memory range provider. Segment admission and source binding excluded from scope measurements. Shared directory is charged to the admitted artifact; payload reads use the query-bound source. Not total query allocations or physical disk I/O."
+  },
+  "mixed_authentication": {
+    "pages": 64,
+    "page_bytes": 65536,
+    "cold_pages": 1,
+    "verified_pages": 63,
+    "before_staged_bytes": 4194304,
+    "after_staged_bytes": 65536,
+    "after_borrowed_bytes": 4128768,
+    "warm_staged_bytes": 0,
+    "measurement": "Native Debug borrowed-visitor pointer fixture. Counts copied bytes, not retained scratch or RSS; private scratch remains 64 KiB plus 1 KiB."
+  },
+  "foreground_cleanup_backoff": {
+    "requests_per_visibility_api": 20,
+    "before_truncate_attempts_per_api": 20,
+    "after_truncate_attempts_per_api": 0,
+    "measurement": "Native Debug runtime fixture, 1 ms caller deadlines within a shared retry deadline. Both all-index and selected-index visibility entrypoints preserve deadline errors and retained cleanup credit. Not a QPS measurement."
+  }
+}

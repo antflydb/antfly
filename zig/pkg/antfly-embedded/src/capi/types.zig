@@ -284,7 +284,7 @@ pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
         @backingInt(ErrorCode.busy) => "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
         @backingInt(ErrorCode.outcome_unknown) => "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
         @backingInt(ErrorCode.unsupported) => "the operation requires a capability that is not supported by this platform or filesystem",
-        @backingInt(ErrorCode.stalled) => "a bounded drain made no forward progress for its configured stall window and gave up",
+        @backingInt(ErrorCode.stalled) => "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
         @backingInt(ErrorCode.cancelled) => "the caller cancelled the operation",
         @backingInt(ErrorCode.internal) => "an internal error occurred",
         else => "unknown Antfly error code",
@@ -418,7 +418,7 @@ pub fn mapError(err: anyerror) ErrorCode {
         => .unsupported,
         error.InferenceProviderCallCapacityExhausted => .busy,
         error.DurabilityOutcomeUnknown => .outcome_unknown,
-        error.RunUntilIdleNoProgress, error.EnrichmentWaitTimeout => .stalled,
+        error.RunUntilIdleNoProgress, error.EnrichmentWaitTimeout, error.AsyncWorkerFailed => .stalled,
         // A dimension probe against a live embedder hit an operational
         // (network/transport) failure rather than a malformed request --
         // matches `managed_embedder.isOperationalEmbeddingProbeError`'s
@@ -438,6 +438,7 @@ test "run until idle no-progress error maps to a dedicated stalled ABI code, not
     // stall must be distinguishable at the C ABI from an opaque server fault.
     try std.testing.expectEqual(ErrorCode.stalled, mapError(error.RunUntilIdleNoProgress));
     try std.testing.expectEqual(ErrorCode.stalled, mapError(error.EnrichmentWaitTimeout));
+    try std.testing.expectEqual(ErrorCode.stalled, mapError(error.AsyncWorkerFailed));
     try std.testing.expect(ErrorCode.stalled != ErrorCode.internal);
     try std.testing.expectEqualStrings("ANTFLY_STALLED", std.mem.span(errorCodeName(@backingInt(ErrorCode.stalled))));
     try std.testing.expectEqualStrings(
