@@ -374,21 +374,47 @@ pub const ConcurrentBlockCache = struct {
     cache: BlockCache,
     mutex: std.atomic.Mutex = .unlocked,
     fill_mutex: std.atomic.Mutex = .unlocked,
-    fill: []u8 = &.{},
+    wait_mutex: std.Io.Mutex = .init,
+    changed: std.Io.Condition = .init,
+    flights: [4]Flight = @splat(.{}),
     budget: ?resources.BudgetedAllocator = null,
     reclaimer: u64 = 0,
 
+    const Flight = struct { bytes: []u8 = &.{}, active: bool = false, key: ?u64 = null };
+
     pub fn init(allocator: std.mem.Allocator, source: Source, byte_budget: usize) !ConcurrentBlockCache {
-        if (byte_budget < 5) return error.InvalidScratch;
+        if (byte_budget < 8) return error.InvalidScratch;
         var cache = try BlockCache.init(allocator, source, byte_budget);
-        cache.block_size = @intCast(@min(@min(64 * 1024, byte_budget / 5), @max(1, source.len())));
+        cache.block_size = @intCast(@min(@min(64 * 1024, byte_budget / 8), @max(1, source.len())));
         if (cache.block_size >= 4096) cache.block_size -= cache.block_size % 4096;
         return .{ .cache = cache };
     }
 
+    /// Reserve the complete bounded cache before sharing an immutable reader.
+    /// No slab growth is then needed while its posting iterators run in parallel.
+    pub fn preallocate(self: *ConcurrentBlockCache) !void {
+        @import("antfly_platform").sync.lockYielding(&self.fill_mutex);
+        defer self.fill_mutex.unlock();
+        try self.ensureBudget();
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        for (&self.flights) |*flight| if (flight.bytes.len == 0) {
+            flight.bytes = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| {
+                if (self.budget != null and self.budget.?.budget_denied) return error.CacheBudgetExceeded;
+                return err;
+            };
+        };
+        for (&self.cache.slots) |*slot| if (slot.bytes.len == 0) {
+            slot.bytes = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| {
+                if (self.budget != null and self.budget.?.budget_denied) return error.CacheBudgetExceeded;
+                return err;
+            };
+        };
+    }
+
     pub fn deinit(self: *ConcurrentBlockCache) void {
         if (self.budget) |*budget| budget.reservation.manager.unregisterReclaimer(self.reclaimer);
-        self.bufferAllocator().free(self.fill);
+        for (&self.flights) |*flight| self.bufferAllocator().free(flight.bytes);
         for (&self.cache.slots) |*slot| self.bufferAllocator().free(slot.bytes);
         if (self.budget) |*budget| budget.deinit();
         self.* = undefined;
@@ -417,9 +443,13 @@ pub const ConcurrentBlockCache = struct {
         defer self.fill_mutex.unlock();
         if (!self.mutex.tryLock()) return 0;
         defer self.mutex.unlock();
-        var bytes: usize = self.fill.len;
-        self.bufferAllocator().free(self.fill);
-        self.fill = &.{};
+        for (self.flights) |flight| if (flight.active) return 0;
+        var bytes: usize = 0;
+        for (&self.flights) |*flight| {
+            bytes += flight.bytes.len;
+            self.bufferAllocator().free(flight.bytes);
+            flight.* = .{};
+        }
         for (&self.cache.slots) |*slot| {
             if (slot.pins != 0) continue;
             bytes += slot.bytes.len;
@@ -429,8 +459,15 @@ pub const ConcurrentBlockCache = struct {
         return bytes;
     }
 
+    fn runtime(self: *ConcurrentBlockCache) ?std.Io {
+        return if (self.cache.source == .ranges) self.cache.source.ranges.read_io else null;
+    }
     pub fn borrowedSource(self: *ConcurrentBlockCache) Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.cache.source.len(), .read_into = readAdapter, .visit_range = visitAdapter, .checksum = checksumAdapter, .read_authenticated = authenticatedAdapter, .close = closeAdapter, .prefetch = if (self.cache.source == .ranges and self.cache.source.ranges.prefetch != null) prefetchAdapter else null, .resource_manager = self.cache.source.resourceManager() } };
+        return .{ .ranges = .{ .ptr = self, .length = self.cache.source.len(), .read_into = readAdapter, .visit_range = visitAdapter, .checksum = checksumAdapter, .read_authenticated = authenticatedAdapter, .close = closeAdapter, .prefetch = if (self.cache.source == .ranges and self.cache.source.ranges.prefetch != null) prefetchAdapter else null, .resource_manager = self.cache.source.resourceManager(), .read_io = self.runtime(), .check_read_context = checkAdapter } };
+    }
+    fn checkAdapter(raw: *anyopaque) !void {
+        const self: *ConcurrentBlockCache = @ptrCast(@alignCast(raw));
+        if (self.cache.source == .ranges) if (self.cache.source.ranges.check_read_context) |check| try check(self.cache.source.ranges.ptr);
     }
     // Called under mutex. A leased slab is immutable until its callback ends.
     fn victim(self: *ConcurrentBlockCache, offset: u64) ?*BlockCache.Slot {
@@ -515,22 +552,12 @@ pub const ConcurrentBlockCache = struct {
         if (offset > self.cache.source.len() or length > self.cache.source.len() - offset or within > length or out.len > length - within) return error.EndOfStream;
         if (expected == null) return self.readCachedInto(offset + within, out);
         if (self.cache.source == .ranges) if (self.cache.source.ranges.visit_range) |visit| {
-            @import("antfly_platform").sync.lockYielding(&self.fill_mutex);
-            defer self.fill_mutex.unlock();
-            try self.ensureBudget();
-            if (self.fill.len == 0) {
-                const fill = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| blk: {
-                    if (self.budget == null or !self.budget.?.budget_denied) return err;
-                    break :blk self.fill;
-                };
-                @import("antfly_platform").sync.lockYielding(&self.mutex);
-                self.fill = fill;
-                self.mutex.unlock();
-            }
-            var stream = AuthenticationStream{ .cache = self, .offset = offset, .within = within, .out = out };
+            const flight = try self.acquireFlight(null);
+            defer self.releaseFlight(flight);
+            var stream = AuthenticationStream{ .cache = self, .flight = flight, .offset = offset, .within = within, .out = out };
             try visit(self.cache.source.ranges.ptr, offset, length, &stream, AuthenticationStream.consume);
             if (stream.position != length) return error.EndOfStream;
-            if (stream.used != 0) try self.publishFill(stream.block, stream.used);
+            if (stream.used != 0) try self.publishFill(flight, stream.block, stream.used);
             if (stream.crc.final() != expected.?) return error.CrcMismatch;
             return;
         };
@@ -552,6 +579,7 @@ pub const ConcurrentBlockCache = struct {
 
     const AuthenticationStream = struct {
         cache: *ConcurrentBlockCache,
+        flight: *Flight,
         offset: u64,
         within: usize,
         out: []u8,
@@ -567,7 +595,7 @@ pub const ConcurrentBlockCache = struct {
             const end = @min(relative + bytes.len, @as(u64, self.within) + self.out.len);
             if (begin < end) @memcpy(self.out[@intCast(begin - self.within)..][0..@intCast(end - begin)], bytes[@intCast(begin - relative)..][0..@intCast(end - begin)]);
             self.position += bytes.len;
-            if (self.cache.fill.len == 0) return;
+            if (self.flight.bytes.len == 0) return;
             var copied: usize = 0;
             while (copied < bytes.len) {
                 const absolute = self.offset + relative + copied;
@@ -581,10 +609,10 @@ pub const ConcurrentBlockCache = struct {
                 // A page can start inside a cache block. Do not publish an
                 // uninitialized prefix outside the authenticated traversal.
                 if (self.block == block and self.used == within) {
-                    @memcpy(self.cache.fill[within..][0..take], bytes[copied..][0..take]);
+                    @memcpy(self.flight.bytes[within..][0..take], bytes[copied..][0..take]);
                     self.used += take;
                     if (self.used == self.cache.cache.block_size) {
-                        try self.cache.publishFill(block, self.used);
+                        try self.cache.publishFill(self.flight, block, self.used);
                         self.used = 0;
                     }
                 }
@@ -593,8 +621,11 @@ pub const ConcurrentBlockCache = struct {
         }
     };
 
-    // The caller owns fill_mutex; swapping happens under the hot-cache mutex.
-    fn publishFill(self: *ConcurrentBlockCache, offset: u64, length: usize) !void {
+    // Publication and allocator operations are short; backend I/O owns a flight
+    // slab and never holds either cache mutex.
+    fn publishFill(self: *ConcurrentBlockCache, flight: *Flight, offset: u64, length: usize) !void {
+        @import("antfly_platform").sync.lockYielding(&self.fill_mutex);
+        defer self.fill_mutex.unlock();
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
         const oldest = self.victim(offset) orelse return;
@@ -607,7 +638,7 @@ pub const ConcurrentBlockCache = struct {
             if (self.budget == null or !self.budget.?.budget_denied) return err;
             return;
         };
-        std.mem.swap([]u8, &oldest.bytes, &self.fill);
+        std.mem.swap([]u8, &oldest.bytes, &flight.bytes);
         self.cache.clock +%= 1;
         oldest.offset = offset;
         oldest.valid_len = length;
@@ -625,7 +656,9 @@ pub const ConcurrentBlockCache = struct {
     pub fn retainedBytes(self: *ConcurrentBlockCache) usize {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        return self.cache.retainedBytes() + self.fill.len;
+        var bytes = self.cache.retainedBytes();
+        for (self.flights) |flight| bytes += flight.bytes.len;
+        return bytes;
     }
 
     fn copyCached(self: *ConcurrentBlockCache, offset: u64, within: usize, out: []u8) bool {
@@ -642,45 +675,68 @@ pub const ConcurrentBlockCache = struct {
         return false;
     }
 
-    fn fillAndCopy(self: *ConcurrentBlockCache, offset: u64, within: usize, out: []u8) !void {
-        @import("antfly_platform").sync.lockYielding(&self.fill_mutex);
-        defer self.fill_mutex.unlock();
-        if (self.copyCached(offset, within, out)) return;
-        try self.ensureBudget();
-        if (self.fill.len == 0) {
-            const buffer = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| {
-                if (self.budget == null or !self.budget.?.budget_denied) return err;
-                // Caching is optional: concurrent active fills can consume the
-                // budget without preventing an otherwise valid range read.
-                return self.cache.source.readInto(offset + within, out);
+    fn checkWaiting(self: *ConcurrentBlockCache) !void {
+        if (self.cache.source == .ranges) if (self.cache.source.ranges.check_read_context) |check| try check(self.cache.source.ranges.ptr);
+    }
+
+    fn acquireFlight(self: *ConcurrentBlockCache, key: ?u64) !*Flight {
+        const io = self.runtime();
+        if (io) |runtime_io| try self.wait_mutex.lock(runtime_io);
+        defer if (io) |runtime_io| self.wait_mutex.unlock(runtime_io);
+        while (true) {
+            @import("antfly_platform").sync.lockYielding(&self.fill_mutex);
+            var same = false;
+            var available: ?*Flight = null;
+            for (&self.flights) |*flight| {
+                if (key != null and flight.active and flight.key == key) same = true;
+                if (!flight.active and available == null) available = flight;
+            }
+            if (!same) if (available) |flight| {
+                self.ensureBudget() catch |err| {
+                    self.fill_mutex.unlock();
+                    return err;
+                };
+                if (flight.bytes.len == 0) {
+                    const bytes = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| blk: {
+                        if (self.budget == null or !self.budget.?.budget_denied) {
+                            self.fill_mutex.unlock();
+                            return err;
+                        }
+                        break :blk flight.bytes;
+                    };
+                    @import("antfly_platform").sync.lockYielding(&self.mutex);
+                    flight.bytes = bytes;
+                    self.mutex.unlock();
+                }
+                flight.active = true;
+                flight.key = key;
+                self.fill_mutex.unlock();
+                return flight;
             };
-            @import("antfly_platform").sync.lockYielding(&self.mutex);
-            self.fill = buffer;
-            self.mutex.unlock();
+            self.fill_mutex.unlock();
+            try self.checkWaiting();
+            if (io) |runtime_io| try self.changed.wait(runtime_io, &self.wait_mutex) else std.Thread.yield() catch {};
         }
+    }
+    fn releaseFlight(self: *ConcurrentBlockCache, flight: *Flight) void {
+        const io = self.runtime();
+        if (io) |runtime_io| self.wait_mutex.lockUncancelable(runtime_io);
+        defer if (io) |runtime_io| self.wait_mutex.unlock(runtime_io);
+        @import("antfly_platform").sync.lockYielding(&self.fill_mutex);
+        flight.active = false;
+        flight.key = null;
+        self.fill_mutex.unlock();
+        if (io) |runtime_io| self.changed.broadcast(runtime_io);
+    }
+    fn fillAndCopy(self: *ConcurrentBlockCache, offset: u64, within: usize, out: []u8) !void {
+        const flight = try self.acquireFlight(offset);
+        defer self.releaseFlight(flight);
+        if (self.copyCached(offset, within, out)) return;
+        if (flight.bytes.len == 0) return self.cache.source.readInto(offset + within, out);
         const length: usize = @intCast(@min(self.cache.block_size, self.cache.source.len() - offset));
-        // The old cache entry remains valid even when this read fails.
-        try self.cache.source.readInto(offset, self.fill[0..length]);
-        @import("antfly_platform").sync.lockYielding(&self.mutex);
-        defer self.mutex.unlock();
-        const oldest = self.victim(offset) orelse {
-            @memcpy(out, self.fill[within..][0..out.len]);
-            return;
-        };
-        if (oldest.bytes.len == 0) oldest.bytes = self.bufferAllocator().alloc(u8, self.cache.block_size) catch |err| {
-            if (self.budget == null or !self.budget.?.budget_denied) return err;
-            @memcpy(out, self.fill[within..][0..out.len]);
-            return;
-        };
-        // Transfer the filled slab; readers copy only while holding this
-        // mutex, so no borrowed pointer can observe the recycled victim.
-        std.mem.swap([]u8, &oldest.bytes, &self.fill);
-        self.cache.clock +%= 1;
-        oldest.offset = offset;
-        oldest.valid_len = length;
-        oldest.age = self.cache.clock;
-        self.cache.misses += 1;
-        @memcpy(out, oldest.bytes[within..][0..out.len]);
+        try self.cache.source.readInto(offset, flight.bytes[0..length]);
+        @memcpy(out, flight.bytes[within..][0..out.len]);
+        try self.publishFill(flight, offset, length);
     }
 
     pub fn readInto(self: *ConcurrentBlockCache, offset: u64, out: []u8) !void {
@@ -799,11 +855,11 @@ test "range visitors preserve borrowing bound spans and reject malformed provide
     try std.testing.expectError(error.EndOfStream, view.visitRange(view.length, 1, &consumer, Consumer.consume));
 }
 
-test "cache leases survive reentrant fills pressure and callback errors" {
+test "segment.cache leases survive reentrant fills pressure and callback errors" {
     const a = std.testing.allocator;
     var data: [512]u8 = undefined;
     for (&data, 0..) |*byte, i| byte.* = @truncate(i);
-    var cache = try ConcurrentBlockCache.init(a, .{ .contiguous = &data }, 80);
+    var cache = try ConcurrentBlockCache.init(a, .{ .contiguous = &data }, 128);
     defer cache.deinit();
     var warm: [16]u8 = undefined;
     try cache.readInto(0, &warm);
@@ -826,7 +882,9 @@ test "cache leases survive reentrant fills pressure and callback errors" {
                 var scratch: [16]u8 = undefined;
                 try self.cache.readInto(64, &scratch);
             }
-            _ = ConcurrentBlockCache.reclaim(self.cache, 0);
+            const retained = self.cache.retainedBytes();
+            const reclaimed = ConcurrentBlockCache.reclaim(self.cache, 0);
+            try std.testing.expectEqual(retained - self.cache.retainedBytes(), reclaimed);
             try std.testing.expectEqualSlices(u8, self.original, bytes);
             if (self.fail) return error.TestVisitorFailure;
         }
