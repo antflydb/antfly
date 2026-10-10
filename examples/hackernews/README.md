@@ -663,6 +663,17 @@ enforced. Optimized archive construction and query benchmarks are being rerun.
 The original two attempts consumed $65 in conservative allowances including
 prior work. The follow-up now permits four additional attempts, up to $145 of
 allowances within the unchanged $150 ceiling. One is a separately labelled
-142,577-row raw-file search diagnostic; full-archive gates remain unchanged. `--extend-run-limit` records this
-extension in the existing ledger; it cannot reset failed reservations or change
-spend limits.
+142,577-row raw-file search diagnostic; full-archive gates remain unchanged.
+`--extend-run-limit` records each extension in the existing ledger; it cannot
+reset failed reservations or change spend limits.
+
+The bounded archive attempt ran 841.6 seconds before another
+`SqlProgramLimitExceeded`, at 267.5 MiB peak RSS. A shared spill-capacity
+regression exposed the predicate builder retaining too many runs alongside
+fused sorts; that builder now retains four runs. Its synchronized admission
+diagnostics identify spill file and byte peaks on the next attempt. The
+142,577-row diagnostic stopped at its first `Timeout` after 640.2 seconds,
+before searches. The harness now records transient timeout observations and
+waits for queued checkpoint recovery under the original build deadline.
+Permanent admission errors still fail immediately. Neither result establishes
+archive latency.

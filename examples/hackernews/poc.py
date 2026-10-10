@@ -34,6 +34,44 @@ import urllib.error
 import urllib.request
 
 
+def wait_for_index(
+    read_status,
+    deadline,
+    before_poll,
+    observed,
+    *,
+    now=time.monotonic,
+    sleep=time.sleep,
+):
+    """Allow fenced background recovery without extending the build deadline."""
+    started = now()
+    failures = observed.setdefault("transient_failures", {})
+    while True:
+        before_poll()
+        status = read_status()
+        observed["last_status"] = status
+        detail = status.get("status", {})
+        readiness = detail.get("readiness", {})
+        if now() >= deadline:
+            raise RuntimeError(
+                "Index not queryable within the build deadline: " + json.dumps(status)
+            )
+        if readiness.get("queryable"):
+            return status
+        if readiness.get("state") == "failed":
+            code = detail.get("error")
+            if code not in {"Timeout", "DeadlineExceeded"}:
+                raise RuntimeError("Index construction failed: " + json.dumps(status))
+            elapsed = round(now() - started, 2)
+            failure = failures.setdefault(
+                code,
+                {"error": code, "observations": 0, "first_elapsed_seconds": elapsed},
+            )
+            failure["observations"] += 1
+            failure["last_elapsed_seconds"] = elapsed
+        sleep(min(1, max(0, deadline - now())))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
@@ -295,7 +333,9 @@ def main():
         build_before = resource_counters()
         peak_rss_bytes = 0
         deadline = started + args.build_timeout
-        while True:
+
+        def sample_build_memory():
+            nonlocal peak_rss_bytes
             if Path(f"/proc/{process.pid}/status").exists():
                 for line in (
                     Path(f"/proc/{process.pid}/status").read_text().splitlines()
@@ -304,17 +344,14 @@ def main():
                         peak_rss_bytes = max(
                             peak_rss_bytes, int(line.split()[1]) * 1024
                         )
-            status = call("GET", "/tables/hn_archive_poc/indexes/body_text")
-            if status.get("status", {}).get("readiness", {}).get("queryable"):
-                break
-            if status.get("status", {}).get("readiness", {}).get("state") == "failed":
-                raise RuntimeError("Index construction failed: " + json.dumps(status))
-            if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    f"Index not queryable after {args.build_timeout} seconds: "
-                    + json.dumps(status)
-                )
-            time.sleep(1)
+
+        build_observed = {}
+        status = wait_for_index(
+            lambda: call("GET", "/tables/hn_archive_poc/indexes/body_text"),
+            deadline,
+            sample_build_memory,
+            build_observed,
+        )
         ready_seconds = round(time.monotonic() - started, 2)
         build_after = resource_counters()
         build_profile = (
@@ -622,6 +659,9 @@ def main():
             "sql_count": count,
             "row_count": args.expected_rows,
             "ready_seconds": ready_seconds,
+            "transient_build_failures": list(
+                build_observed["transient_failures"].values()
+            ),
             "registration_seconds": registration_seconds,
             "build_profile": build_profile,
             "build_peak_rss_bytes": peak_rss_bytes,
@@ -686,8 +726,12 @@ def main():
                 measurements[target] = scope[name]
         if len(measurements) > 1:
             failure["completed_measurements"] = measurements
-        if phase == "index_build" and "status" in locals():
-            failure["index_status"] = status
+        if "build_observed" in locals():
+            failure["transient_build_failures"] = list(
+                build_observed["transient_failures"].values()
+            )
+            if phase == "index_build" and "last_status" in build_observed:
+                failure["index_status"] = build_observed["last_status"]
         (args.state / "failure.json").write_text(json.dumps(failure, indent=2) + "\n")
         raise
     finally:

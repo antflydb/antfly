@@ -108,15 +108,31 @@
     "before": "SqlProgramLimitExceeded",
     "after": "passed",
     "cloud_failure_attribution": "The constrained-capacity regression demonstrates a remaining risk; the previous cloud error does not identify its exact limit site.",
-    "optimized_archive_rerun": "pending"
+    "optimized_archive_rerun": "pending",
+    "lake_regressions_passed": 84
   },
   "search_diagnostic": {
     "scope": "One unchanged raw BigQuery Parquet file, separately generation-fenced and copied server-side; does not qualify full-archive latency.",
     "rows": 142577,
     "bytes": 61797036,
     "source_original_preserved": true,
-    "status": "running",
+    "status": "failed_before_queries",
     "revision": "cfc382c7b419d2d5b9b3aa98a235f30d6930229b",
-    "binary_sha256": "0d53dec77003c9a676af60ffc671f3bbfa5786d998b7eebd5b6833ff5ae79bec"
+    "binary_sha256": "0d53dec77003c9a676af60ffc671f3bbfa5786d998b7eebd5b6833ff5ae79bec",
+    "stage": "index_build",
+    "error": "Timeout",
+    "table_registration_ms": 545.38,
+    "elapsed_since_build_start_seconds": 640.18,
+    "build_peak_rss_bytes": 273072128,
+    "latencies": null,
+    "pod_deleted": true,
+    "derived_objects_deleted": 7215,
+    "derived_bytes_deleted": 182131440,
+    "source_copy_retained_for_retry": true
+  },
+  "construction_recovery_harness": {
+    "shape": "Record Timeout/DeadlineExceeded observations and allow the engine queued checkpoint recovery within the original absolute build deadline; permanent admission errors fail immediately.",
+    "tests_passed": 4,
+    "note": "The first diagnostic aborted at its first timeout; it did not wait for the already queued engine retry."
   }
 }

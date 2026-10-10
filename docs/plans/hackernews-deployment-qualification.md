@@ -102,6 +102,14 @@ capped at four. Two further retry allowances fit the unchanged $150 ceiling.
 Runtime admission diagnostics distinguish file capacity from spill bytes;
 the shared error alone does not establish the exact cloud failure site.
 
+The single-file diagnostic failed at its first `Timeout` after 640.2 seconds,
+with 260.4 MiB peak RSS. The engine queues a fresh fenced retry, but the original
+harness aborted at the transient readiness state. The harness now records
+`Timeout`/`DeadlineExceeded` observations and waits for checkpoint recovery
+under its original absolute deadline. It still fails permanent admission
+errors immediately. Both owned pods and 15,701 derived objects were deleted;
+the unchanged source copy is retained only for the next diagnostic attempt.
+
 ## Bounded, resumable construction
 
 Replay now admits at most one source file into its existing 1 GiB local spill
