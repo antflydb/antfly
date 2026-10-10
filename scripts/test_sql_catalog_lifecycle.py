@@ -149,6 +149,60 @@ class IndexLifecycleTest(unittest.TestCase):
                 ).fetchall(),
             )
 
+    def test_internal_constraint_label_spellings_do_not_reserve_public_names(self):
+        cases = (
+            (
+                "id BIGINT PRIMARY KEY, email TEXT CONSTRAINT sql_primary_0 UNIQUE",
+                [("sql_primary_0", "u"), ("t_pkey", "p")],
+            ),
+            (
+                (
+                    "id BIGINT UNIQUE, CONSTRAINT sql_unique_0 CHECK (id > 0), "
+                    "CONSTRAINT sql_generated_0 CHECK (id < 100)"
+                ),
+                [("sql_generated_0", "c"), ("sql_unique_0", "c"), ("t_id_key", "u")],
+            ),
+            (
+                "id BIGINT CHECK (id > 0), CONSTRAINT sql_inline_0 UNIQUE (id)",
+                [("sql_inline_0", "u"), ("t_id_check", "c")],
+            ),
+            (
+                (
+                    "id BIGINT REFERENCES parent (id), "
+                    "CONSTRAINT sql_inline_0 CHECK (id > 0)"
+                ),
+                [("sql_inline_0", "c"), ("t_id_fkey", "f")],
+            ),
+        )
+        with postgres() as db:
+            db.execute("CREATE TABLE public.parent (id BIGINT PRIMARY KEY)")
+            for definition, expected in cases:
+                with self.subTest(definition=definition):
+                    db.execute("CREATE TABLE public.t (" + definition + ")")
+                    try:
+                        # PostgreSQL 18+ also catalogs implicit NOT NULL rules.
+                        # This fixture compares only the declared rule kinds.
+                        self.assertEqual(
+                            expected,
+                            db.execute(
+                                "SELECT conname, contype FROM pg_constraint "
+                                "WHERE conrelid='public.t'::regclass "
+                                "AND contype IN ('p', 'u', 'c', 'f') ORDER BY conname"
+                            ).fetchall(),
+                        )
+                    finally:
+                        db.execute("DROP TABLE public.t")
+            with self.assertRaises(psycopg.Error) as duplicate:
+                db.execute(
+                    "CREATE TABLE public.t (id BIGINT UNIQUE, "
+                    "CONSTRAINT repeated CHECK (id > 0), "
+                    "CONSTRAINT repeated CHECK (id < 100))"
+                )
+            self.assertEqual("42710", duplicate.exception.sqlstate)
+            self.assertIsNone(
+                db.execute("SELECT to_regclass('public.t')").fetchone()[0]
+            )
+
     def test_alter_table_pins_first_search_path_relation_and_qualified_names_bypass_it(
         self,
     ):

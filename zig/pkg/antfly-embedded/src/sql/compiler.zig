@@ -1901,7 +1901,66 @@ const Parser = struct {
                 } else return self.fail(error.InvalidSqlSyntax, "primary key references an unknown column");
             }
         };
+        try self.disambiguateGeneratedConstraintLabels(constraints.items);
         return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .constraints = try constraints.toOwnedSlice(self.alloc), .if_not_exists = if_not_exists, .tablespace = tablespace };
+    }
+
+    /// These are compiler identities, not final catalog names. Reserve every
+    /// explicit spelling before assigning generated identities, including
+    /// declarations later in the statement. Never rename an explicit name or
+    /// infer provenance from a prefix. A single increasing fallback counter
+    /// bounds aggregate collision probes by the number of reserved labels.
+    fn disambiguateGeneratedConstraintLabels(self: *Parser, constraints: []ast.SchemaChange) Error!void {
+        var has_generated = false;
+        for (constraints) |constraint| if (constraint.generatedConstraintName() != null) {
+            has_generated = true;
+            break;
+        };
+        if (!has_generated) return;
+        var occupied: std.StringHashMapUnmanaged(bool) = .empty;
+        defer occupied.deinit(self.alloc);
+        // False reserves an original generated spelling; true means explicit
+        // or already assigned. At most one fallback is added per constraint.
+        try occupied.ensureTotalCapacity(self.alloc, @intCast(constraints.len * 2));
+        for (constraints) |constraint| {
+            if (constraint.generatedConstraintName() != null) continue;
+            const label = switch (constraint) {
+                .add_unique => |rule| rule.name,
+                .add_check => |rule| rule.name,
+                .add_foreign_key => |rule| rule.name,
+                else => continue,
+            };
+            // Duplicate explicit names remain an admission error; this pass
+            // must not hide them by changing the user's declaration.
+            occupied.putAssumeCapacity(label, true);
+        }
+        // Reserve existing generated spellings too, so a fallback cannot
+        // steal a later generated identity and cause unnecessary renaming.
+        for (constraints) |constraint| if (constraint.generatedConstraintName()) |label| {
+            if (!occupied.contains(label)) occupied.putAssumeCapacity(label, false);
+        };
+        var suffix: usize = 0;
+        for (constraints) |*constraint| {
+            const original = constraint.generatedConstraintName() orelse continue;
+            const assigned = occupied.getPtr(original).?;
+            if (!assigned.*) {
+                assigned.* = true;
+                continue;
+            }
+            var buffer: [48]u8 = undefined;
+            const replacement = while (true) {
+                const label = std.fmt.bufPrint(&buffer, "sql_generated_{d}", .{suffix}) catch unreachable;
+                suffix += 1;
+                if (!occupied.contains(label)) break try self.alloc.dupe(u8, label);
+            };
+            occupied.putAssumeCapacity(replacement, true);
+            switch (constraint.*) {
+                .add_unique => |*rule| rule.name = replacement,
+                .add_check => |*rule| rule.name = replacement,
+                .add_foreign_key => |*rule| rule.name = replacement,
+                else => unreachable,
+            }
+        }
     }
 
     fn catalogDdl(self: *Parser, action: @FieldType(ast.CatalogDdl, "action")) Error!ast.CatalogDdl {

@@ -1,7 +1,7 @@
 # SQL catalog lifecycle and original-case qualification
 
-Status: follow-up to merged PR #1048, based on `origin/main` at `6339e1519c`
-(including PR #1060). This is an implementation and qualification backlog, not
+Status: follow-up to merged PR #1048, merged with `origin/main` at `c0562216e1`.
+This is an implementation and qualification backlog, not
 a completion claim. PostgreSQL is the SQL standard and independent test oracle.
 
 ## Baseline and priorities
@@ -426,6 +426,21 @@ fences still match. Hidden CREATE cursors now run in both coverage modes with
 CHECK/FK memberships; allocation and page-size assertions remain unchanged
 after adding 1,000 terminal plans. These are native metadata tests, not claims
 of distributed data-owner activation or PostgreSQL original-case completion.
+
+Compiler-local generated constraint labels now avoid every explicit spelling
+in the same CREATE statement, including later declarations, without changing
+explicit names or inferring provenance from a prefix. A single bounded hash
+table reserves original labels; one increasing fallback counter bounds total
+collision probes linearly in the statement's constraints. This prevents
+schema lowering from rejecting valid SQL merely because a user chose an
+internal label such as `sql_primary_0`. PRIMARY/UNIQUE, CHECK and FK regressions
+exercise the DDL dispatch and generated hints, and duplicate explicit names
+still reject. The focused SQL DDL gate passes six tests in Debug and ReleaseFast,
+including allocation-failure cleanup. The PostgreSQL 19beta4 catalog oracle
+passes all nine tests, including independent final-name and duplicate-name
+semantics for these statements. This fixes internal identity handling, not the
+still-pending public final-name admission. No original dispositions changed;
+inventory integrity passes with 899 unresolved cases.
 
 The next delivery is mounted catalog activation/recovery evidence for the
 original index and constraint cohort, including real ownership and readiness

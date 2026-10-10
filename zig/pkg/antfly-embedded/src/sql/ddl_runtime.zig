@@ -290,6 +290,12 @@ test "SQL DDL carries generated name provenance outside the editable public sche
         .{ .sql = "CREATE TABLE t (id BIGINT CONSTRAINT sql_primary_0 PRIMARY KEY, email TEXT CONSTRAINT sql_unique_1 UNIQUE)", .generated = &.{} },
         .{ .sql = "CREATE TABLE t (id BIGINT, PRIMARY KEY (id), CHECK (id > 0))", .generated = &.{ "sql_constraint_0", "sql_constraint_1" } },
         .{ .sql = "CREATE TABLE t (id BIGINT CHECK (id > 0))", .generated = &.{"sql_inline_0"} },
+        .{ .sql = "CREATE TABLE t (id BIGINT PRIMARY KEY, email TEXT CONSTRAINT sql_primary_0 UNIQUE)", .generated = &.{"sql_generated_0"} },
+        .{ .sql = "CREATE TABLE t (id BIGINT UNIQUE, CONSTRAINT sql_unique_0 CHECK (id > 0), CONSTRAINT sql_generated_0 CHECK (id < 100))", .generated = &.{"sql_generated_1"} },
+        .{ .sql = "CREATE TABLE t (id BIGINT CHECK (id > 0), CONSTRAINT sql_inline_0 UNIQUE (id))", .generated = &.{"sql_generated_0"} },
+        .{ .sql = "CREATE TABLE t (id BIGINT, CHECK (id > 0), CONSTRAINT sql_constraint_0 UNIQUE (id))", .generated = &.{"sql_generated_0"} },
+        .{ .sql = "CREATE TABLE t (id BIGINT REFERENCES parent (id), CONSTRAINT sql_inline_0 CHECK (id > 0))", .generated = &.{"sql_generated_0"} },
+        .{ .sql = "CREATE TABLE t (id BIGINT CONSTRAINT sql_unique_1 UNIQUE, email TEXT UNIQUE)", .generated = &.{"sql_generated_0"} },
     };
     for (cases) |case| {
         var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
@@ -301,6 +307,38 @@ test "SQL DDL carries generated name provenance outside the editable public sche
         try std.testing.expectEqual(@as(usize, 1), fake.calls);
         try std.testing.expectEqualStrings("CREATE TABLE", result.command_tag);
     }
+}
+
+test "SQL DDL internal label disambiguation preserves explicit constraints and allocation safety" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var compiled = try @import("compiler.zig").compile(a, "CREATE TABLE t (id BIGINT PRIMARY KEY, email TEXT CONSTRAINT sql_primary_0 UNIQUE, CONSTRAINT sql_generated_0 CHECK (id > 0))", .{});
+            defer compiled.deinit();
+            const create = compiled.statement.create_table;
+            try std.testing.expectEqualStrings("sql_generated_1", create.constraints[0].generatedConstraintName().?);
+            try std.testing.expectEqualStrings("sql_primary_0", create.constraints[1].add_unique.name);
+            try std.testing.expect(create.constraints[1].generatedConstraintName() == null);
+            try std.testing.expectEqualStrings("sql_generated_0", create.constraints[2].add_check.name);
+            try std.testing.expect(create.constraints[2].generatedConstraintName() == null);
+            const bytes = try createSchemaAlloc(a, create);
+            defer a.free(bytes);
+            const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+            defer parsed.deinit();
+            const uniques = parsed.value.object.get("unique_constraints").?.array.items;
+            try std.testing.expectEqual(@as(usize, 2), uniques.len);
+            try std.testing.expectEqualStrings("sql_generated_1", uniques[0].object.get("name").?.string);
+            try std.testing.expectEqualStrings("sql_primary_0", uniques[1].object.get("name").?.string);
+            try std.testing.expectEqualStrings("sql_generated_0", parsed.value.object.get("checks").?.array.items[0].object.get("name").?.string);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL DDL duplicate explicit constraint names remain definite rejection" {
+    var compiled = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE t (id BIGINT UNIQUE, CONSTRAINT repeated CHECK (id > 0), CONSTRAINT repeated CHECK (id < 100))", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlConstraintAlreadyExists, createSchemaAlloc(std.testing.allocator, compiled.statement.create_table));
 }
 
 test "SQL TRUNCATE lowers complete table set and honest durable admission receipt" {
