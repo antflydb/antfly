@@ -719,7 +719,13 @@ two-slot ordinary team, one physical cleanup and one health operation at once.
 The cleanup may hold its slot through an uninterruptible allocator callback;
 this does not loan its CPU or return live memory credit. Explicit zero retains
 the earlier shared-control CPU policy and does not qualify health progress
-through a stalled destructor. Production policy/default sizing, public schema
-and API startup qualification must adopt the dedicated reserve before claiming
-that contract by default. Whole Linux resource, protocol, durability and
+through a stalled destructor. Managed cleanup startup now establishes the dedicated reserve before its
+worker and listeners are published. A zero reserve is upgraded only on a
+quiescent scheduler, without changing total slots or health capacity; fewer
+than two ordinary slots before adoption rejects startup. An active zero-reserve
+policy also rejects startup. An explicit existing reserve is reused without
+resizing. Generic standalone schedulers may retain zero without a managed
+consumer. Metrics capture effective policy and live counters under one lock.
+Automatic default sizing, public schema and whole API startup qualification
+still require their release gates. Whole Linux resource, protocol, durability and
 performance/default gates remain required.

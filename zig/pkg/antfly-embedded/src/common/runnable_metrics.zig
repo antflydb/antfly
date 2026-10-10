@@ -18,21 +18,23 @@ const scheduling = @import("runnable_scheduler.zig");
 const prometheus = @import("prometheus.zig");
 pub const Snapshot = @import("antfly_runtime_abi").RunnableStats;
 
-/// Capacity is immutable; live ownership and counters are captured under the
+/// Effective startup policy, live ownership and counters are captured under the
 /// scheduler's lock. Disabled scheduling reports no fabricated capacity.
 pub fn snapshot(scheduler: ?*scheduling.Scheduler) Snapshot {
     const owner = scheduler orelse return .{};
-    const stats = owner.stats();
+    const observed = owner.policyAndStats();
+    const stats = observed.stats;
+    const policy = observed.config;
     return .{
         .enabled = true,
-        .capacity_slots = owner.config.slots,
-        .control_capacity_slots = owner.config.control_slots + owner.config.cleanup_slots,
-        .operation_capacity = owner.config.max_operations,
-        .metadata_capacity_bytes = owner.config.max_bytes,
-        .control_metadata_capacity_bytes = owner.config.control_bytes,
-        .max_wait_ms = owner.config.max_wait_ms,
-        .quantum_ms = owner.config.quantum_ms,
-        .checkpoint_budget = owner.config.checkpoint_budget,
+        .capacity_slots = policy.slots,
+        .control_capacity_slots = policy.control_slots + policy.cleanup_slots,
+        .operation_capacity = policy.max_operations,
+        .metadata_capacity_bytes = policy.max_bytes,
+        .control_metadata_capacity_bytes = policy.control_bytes,
+        .max_wait_ms = policy.max_wait_ms,
+        .quantum_ms = policy.quantum_ms,
+        .checkpoint_budget = policy.checkpoint_budget,
         .operations = stats.operations,
         .retained_bytes = stats.retained_bytes,
         .control_operations = stats.control_operations,

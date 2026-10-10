@@ -2070,7 +2070,7 @@ test "text statistics trusted controls manager cleanup dispatch retires canceled
         var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
         defer lane.deinit();
         const io = lane.io();
-        var scheduler = try native.Scheduler.init(.{ .slots = 3, .control_slots = 1, .max_operations = 8 });
+        var scheduler = try native.Scheduler.init(.{ .slots = 4, .control_slots = 1, .max_operations = 8 });
         defer scheduler.close();
         var parent = resources.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
         defer parent.deinit(std.testing.allocator);
@@ -2559,7 +2559,7 @@ noinline fn qualifyWarmCleanupStartupFailure(failure: CleanupStartupFailure) !vo
             return 0;
         }
     };
-    var scheduler = try native.Scheduler.init(.{ .slots = 3, .control_slots = 1, .max_operations = 8 });
+    var scheduler = try native.Scheduler.init(.{ .slots = 3, .control_slots = 1, .cleanup_slots = if (failure == .cleanup_capacity) 1 else 0, .max_operations = 8 });
     defer scheduler.close();
     var parent = resources.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
     defer parent.deinit(std.testing.allocator);
@@ -2733,4 +2733,55 @@ test "text statistics trusted controls running checkpoints reject closed publica
     for ([_]native.Class{ .query, .write, .inference, .background, .control }) |phase| {
         for ([_]bool{ false, true }) |use_abi| try qualifyClosedRunningCheckpoint(phase, use_abi);
     }
+}
+
+noinline fn qualifyCleanupStartupCpuPolicy() !void {
+    const Cleanup = @import("api/resource_manager_cleanup.zig").Runtime;
+    const resources = sources.storage_resource_manager;
+    for ([_]usize{ 0, 1, 2, 3 }) |fixture| {
+        var scheduler = try native.Scheduler.init(.{ .slots = if (fixture == 0) 2 else 4, .max_operations = 8 });
+        defer scheduler.close();
+        const original = scheduler.config;
+        var manager = resources.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+        defer manager.deinit(std.testing.allocator);
+        var active: native.Execution = .{};
+        defer active.finish();
+        if (fixture == 1) try active.startWithSlots(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 23 }, .query, 3);
+        if (fixture == 2) scheduler.close();
+        var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+        defer lane.deinit();
+        const result = Cleanup.create(std.testing.allocator, lane.io(), &manager, &scheduler);
+        if (fixture != 3) {
+            try std.testing.expectError(if (fixture == 2) error.SchedulerClosed else error.ManagerCleanupCapacityUnavailable, result);
+            try std.testing.expect(!manager.cleanup_consumer_bound.load(.acquire));
+            try std.testing.expectEqualDeep(original, scheduler.config);
+            try std.testing.expectEqual(@as(usize, if (fixture == 1) 3 else 0), scheduler.stats().runnable_slots);
+            continue;
+        }
+        const worker = try result;
+        defer worker.deinit();
+        try std.testing.expectEqual(original.slots, scheduler.config.slots);
+        try std.testing.expectEqual(original.control_slots, scheduler.config.control_slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.config.cleanup_slots);
+        try std.testing.expectEqual(@as(usize, 2), scheduler.config.ordinarySlots());
+        const reported = sources.common_request_admission.runnable_metrics.snapshot(&scheduler);
+        try std.testing.expectEqual(@as(u64, 4), reported.capacity_slots);
+        try std.testing.expectEqual(@as(u64, 2), reported.control_capacity_slots);
+        // Startup seals the same effective partition for native and opaque
+        // consumers; an idle worker never consumes an operation or CPU grant.
+        try active.startWithSlots(&scheduler, .{ .io = std.testing.io, .allow_wait = false, .retained_bytes = 23 }, .query, 2);
+        var excess: native.Execution = .{};
+        defer excess.finish();
+        try std.testing.expectError(error.InvalidRunnableDemand, excess.startWithSlots(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .query, 3));
+        try scheduler.ensureCleanupCpuBeforePublication();
+        worker.join();
+        active.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "text statistics trusted controls managed startup reserves cleanup CPU before publication without expanding total capacity" {
+    try qualifyCleanupStartupCpuPolicy();
 }

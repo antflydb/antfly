@@ -31,6 +31,7 @@ pub const Runtime = struct {
             retainedBytes() > scheduler.config.control_bytes / 2) return error.ManagerCleanupCapacityUnavailable;
         try manager.bindCleanupConsumer();
         errdefer manager.unbindCleanupConsumer();
+        try scheduler.ensureCleanupCpuBeforePublication();
         const self = try allocator.create(Runtime);
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator, .io = io, .manager = manager, .scheduler = scheduler };

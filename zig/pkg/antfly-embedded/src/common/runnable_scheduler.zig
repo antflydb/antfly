@@ -129,6 +129,18 @@ pub const Scheduler = struct {
         return .{ .config = config };
     }
 
+    /// Establish the managed server's dedicated cleanup reserve before any
+    /// runnable entry is published. Never resize an active execution policy.
+    pub fn ensureCleanupCpuBeforePublication(self: *Scheduler) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return error.SchedulerClosed;
+        if (self.config.cleanup_slots != 0) return;
+        if (self.entries != null or self.config.ordinarySlots() <= 1)
+            return error.ManagerCleanupCapacityUnavailable;
+        self.config.cleanup_slots = 1;
+    }
+
     fn lock(self: *Scheduler) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
@@ -160,7 +172,7 @@ pub const Scheduler = struct {
         e.previous = null;
         self.metrics.queued -= 1;
     }
-    fn ordinaryUsed(self: *Scheduler) usize {
+    fn ordinaryUsed(self: *const Scheduler) usize {
         return self.used[0] + self.used[1] + self.used[2] + self.used[3];
     }
     fn grant(self: *Scheduler, e: *Entry) void {
@@ -750,6 +762,14 @@ pub const Scheduler = struct {
     pub fn stats(self: *Scheduler) Stats {
         self.lock();
         defer self.mutex.unlock();
+        return self.statsLocked();
+    }
+    pub fn policyAndStats(self: *Scheduler) struct { config: Config, stats: Stats } {
+        self.lock();
+        defer self.mutex.unlock();
+        return .{ .config = self.config, .stats = self.statsLocked() };
+    }
+    fn statsLocked(self: *const Scheduler) Stats {
         var result = self.metrics;
         result.runnable_slots = self.ordinaryUsed() + self.used[4] + self.used[5];
         result.control_slots = self.used[4] + self.used[5];
