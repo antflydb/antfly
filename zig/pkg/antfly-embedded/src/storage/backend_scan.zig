@@ -226,7 +226,7 @@ pub fn scanPrefix(alloc: std.mem.Allocator, store: *backend_erased.Store, prefix
 
 pub fn scanPrefixWithAdmission(alloc: std.mem.Allocator, store: *backend_erased.Store, prefix: []const u8, control: ?@import("../common/read_admission.zig").Port) ![]OwnedKVPair {
     if (control) |owner| try owner.checkpoint();
-    var txn = try store.beginRead();
+    var txn = if (control) |owner| try store.beginReadWithAdmission(.retain, owner) else try store.beginRead();
     defer txn.abort();
     var cur = if (control) |owner| try txn.openCursorWithAdmission(owner) else try txn.openCursor();
     defer cur.close();

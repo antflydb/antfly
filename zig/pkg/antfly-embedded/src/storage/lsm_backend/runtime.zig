@@ -726,6 +726,16 @@ pub fn BoundStore(comptime BackendType: type) type {
             return try LocalReadTxn.open(self.backend, namespace);
         }
 
+        pub fn beginProbeWithAdmission(self: *@This(), admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !LocalProbeTxn {
+            var namespace = self.namespace;
+            namespace.block_cache_admission = admission;
+            return LocalProbeTxn.openWithAdmission(self.backend, namespace, control);
+        }
+
+        pub fn beginCurrentScanWithAdmission(self: *@This(), control: read_admission.Port) !LocalCurrentScanTxn {
+            return LocalCurrentScanTxn.openWithAdmission(self.backend, self.namespace, control);
+        }
+
         pub fn beginProbe(self: *@This()) !LocalProbeTxn {
             return try LocalProbeTxn.open(self.backend, self.namespace);
         }
@@ -4155,13 +4165,23 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         held_values: PointResultValues = .empty,
 
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
-            const locked = lockBackend(BackendType, backend);
+            return openControlled(backend, namespace, null);
+        }
+
+        pub fn openWithAdmission(backend: *BackendType, namespace: backend_types.Namespace, control: read_admission.Port) !@This() {
+            return openControlled(backend, namespace, control);
+        }
+
+        fn openControlled(backend: *BackendType, namespace: backend_types.Namespace, control: ?read_admission.Port) !@This() {
+            const locked = if (control) |owner| try lockBackendWithAdmission(BackendType, backend, owner) else lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             try retainReadReader(BackendType, backend, .probe_txn);
             errdefer releaseReadReader(BackendType, backend, .probe_txn);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             const stable_point_view = backend.mutable.entryCount() == 0 and backend.immutable_memtables.items.len == backend.immutable_head;
             const read_view = if (stable_point_view) try RunReadView.pin(backend, metadata_allocator) else null;
+            errdefer if (read_view) |view| view.release(backend);
+            if (control) |owner| try owner.checkpoint();
             return .{
                 .allocator = runtimeScratchAllocator(backend.allocator),
                 .metadata_allocator = metadata_allocator,
@@ -4412,7 +4432,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                 var maybe_layout: ?CurrentReadLayout(BackendType) = null;
                 {
                     if (control) |owner| try owner.checkpoint();
-                    const locked = lockBackend(BackendType, self.backend);
+                    const locked = if (control) |owner| try lockBackendWithAdmission(BackendType, self.backend, owner) else lockBackend(BackendType, self.backend);
                     defer unlockBackend(BackendType, self.backend, locked);
                     for (keys, 0..) |key, i| {
                         if (control) |owner| try owner.checkpoint();
@@ -4656,15 +4676,19 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
         const Purpose = enum { general, replay };
 
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
-            return try openWithPurpose(backend, namespace, .general);
+            return try openWithPurpose(backend, namespace, .general, null);
+        }
+
+        pub fn openWithAdmission(backend: *BackendType, namespace: backend_types.Namespace, control: read_admission.Port) !@This() {
+            return openWithPurpose(backend, namespace, .general, control);
         }
 
         pub fn openReplay(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
-            return try openWithPurpose(backend, namespace, .replay);
+            return try openWithPurpose(backend, namespace, .replay, null);
         }
 
-        fn openWithPurpose(backend: *BackendType, namespace: backend_types.Namespace, purpose: Purpose) !@This() {
-            const locked = lockBackend(BackendType, backend);
+        fn openWithPurpose(backend: *BackendType, namespace: backend_types.Namespace, purpose: Purpose, control: ?read_admission.Port) !@This() {
+            const locked = if (control) |owner| try lockBackendWithAdmission(BackendType, backend, owner) else lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
             try retainReadReader(BackendType, backend, .current_scan);
@@ -4727,6 +4751,7 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             var read_view = try RunReadView.pin(backend, metadata_allocator);
             errdefer read_view.release(backend);
             try read_view.prepareCursor(backend);
+            if (control) |owner| try owner.checkpoint();
             return .{
                 .allocator = backend.allocator,
                 .metadata_allocator = metadata_allocator,

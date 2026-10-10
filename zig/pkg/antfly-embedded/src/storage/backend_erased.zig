@@ -962,6 +962,8 @@ pub const Store = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         capabilities: *const fn (*anyopaque) backend_types.Capabilities,
         begin_read: *const fn (Allocator, *anyopaque) anyerror!ReadTxn,
+        begin_probe_with_admission: ?*const fn (Allocator, *anyopaque, backend_types.Namespace.BlockCacheAdmission, read_admission.Port) anyerror!ProbeTxn = null,
+        begin_current_scan_with_admission: ?*const fn (Allocator, *anyopaque, read_admission.Port) anyerror!CurrentScanTxn = null,
         begin_probe: ?*const fn (Allocator, *anyopaque) anyerror!ProbeTxn = null,
         begin_current_scan: ?*const fn (Allocator, *anyopaque) anyerror!CurrentScanTxn = null,
         begin_write: *const fn (Allocator, *anyopaque) anyerror!WriteTxn,
@@ -1018,6 +1020,18 @@ pub const Store = struct {
             return try BoundaryAbi.call("begin_read_with_block_cache_admission", self.boundary_dispatch, begin_read, .{ self.allocator, self.ptr, admission });
         }
         return try self.beginRead();
+    }
+
+    pub fn beginProbeWithAdmission(self: *Store, admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) !ProbeTxn {
+        try control.checkpoint();
+        const open = self.vtable.begin_probe_with_admission orelse return error.ExecutionWaitUnsupported;
+        return try BoundaryAbi.call("begin_probe_with_admission", self.boundary_dispatch, open, .{ self.allocator, self.ptr, admission, control });
+    }
+
+    pub fn beginCurrentScanWithAdmission(self: *Store, control: read_admission.Port) !CurrentScanTxn {
+        try control.checkpoint();
+        const open = self.vtable.begin_current_scan_with_admission orelse return error.ExecutionWaitUnsupported;
+        return try BoundaryAbi.call("begin_current_scan_with_admission", self.boundary_dispatch, open, .{ self.allocator, self.ptr, control });
     }
 
     pub fn beginProbe(self: *Store) !ProbeTxn {
@@ -2001,7 +2015,9 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
 
         pub fn beginReadWithAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) anyerror!ReadTxn {
             if (Handle == Store) return try unbox(ptr).handle.beginReadWithAdmission(admission, control);
-            return try readTxnFrom(alloc, try unbox(ptr).handle.beginReadWithAdmission(admission, control));
+            var txn = try unbox(ptr).handle.beginReadWithAdmission(admission, control);
+            errdefer txn.abort();
+            return try readTxnFrom(alloc, txn);
         }
 
         pub fn beginReadWithBlockCacheAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission) anyerror!ReadTxn {
@@ -2009,6 +2025,20 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
                 return try unbox(ptr).handle.beginReadWithBlockCacheAdmission(admission);
             }
             return try readTxnFrom(alloc, try unbox(ptr).handle.beginReadWithBlockCacheAdmission(admission));
+        }
+
+        pub fn beginProbeWithAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission, control: read_admission.Port) anyerror!ProbeTxn {
+            if (Handle == Store) return unbox(ptr).handle.beginProbeWithAdmission(admission, control);
+            var txn = try unbox(ptr).handle.beginProbeWithAdmission(admission, control);
+            errdefer txn.abort();
+            return probeTxnFrom(alloc, txn);
+        }
+
+        pub fn beginCurrentScanWithAdmission(alloc: Allocator, ptr: *anyopaque, control: read_admission.Port) anyerror!CurrentScanTxn {
+            if (Handle == Store) return unbox(ptr).handle.beginCurrentScanWithAdmission(control);
+            var txn = try unbox(ptr).handle.beginCurrentScanWithAdmission(control);
+            errdefer txn.abort();
+            return currentScanTxnFrom(alloc, txn);
         }
 
         pub fn beginProbe(alloc: Allocator, ptr: *anyopaque) anyerror!ProbeTxn {
@@ -2260,6 +2290,8 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             .begin_read_with_admission = if (Handle == Store or @hasDecl(Handle, "beginReadWithAdmission")) vt.beginReadWithAdmission else null,
             .begin_read_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginReadWithBlockCacheAdmission")) vt.beginReadWithBlockCacheAdmission else null,
             .begin_probe = if (Handle == Store or @hasDecl(Handle, "beginProbe")) vt.beginProbe else null,
+            .begin_probe_with_admission = if (Handle == Store or @hasDecl(Handle, "beginProbeWithAdmission")) vt.beginProbeWithAdmission else null,
+            .begin_current_scan_with_admission = if (Handle == Store or @hasDecl(Handle, "beginCurrentScanWithAdmission")) vt.beginCurrentScanWithAdmission else null,
             .begin_probe_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginProbeWithBlockCacheAdmission")) vt.beginProbeWithBlockCacheAdmission else null,
             .begin_current_scan = if (Handle == Store or @hasDecl(Handle, "beginCurrentScan")) vt.beginCurrentScan else null,
             .begin_replay_lane_scan = if (Handle == Store or @hasDecl(Handle, "beginReplayLaneScan")) vt.beginReplayLaneScan else null,

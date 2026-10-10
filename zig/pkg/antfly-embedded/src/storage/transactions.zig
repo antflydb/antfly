@@ -2398,7 +2398,7 @@ pub const TxnManager = struct {
                 for (keys.items) |key| alloc.free(key);
                 keys.deinit(alloc);
             }
-            var scan = try self.store.beginCurrentScan();
+            var scan = if (control) |owner| try self.store.beginCurrentScanWithAdmission(owner) else try self.store.beginCurrentScan();
             defer scan.abort();
             var cursor = if (control) |owner| try scan.openCursorWithAdmission(owner) else try scan.openCursor();
             defer cursor.close();
@@ -2526,7 +2526,7 @@ pub const TxnManager = struct {
         const values = try alloc.alloc(?[]const u8, full_keys.len);
         defer alloc.free(values);
         @memset(values, null);
-        var probe = try self.store.beginProbe();
+        var probe = if (control) |owner| try self.store.beginProbeWithAdmission(.retain, owner) else try self.store.beginProbe();
         defer probe.abort();
         if (control == null) try probe.getManySorted(key_refs, values);
 
@@ -5369,5 +5369,124 @@ test "transaction intent collection original admission retains legacy sidecars a
         state.checks = 0;
         source.ptr = &state;
         try std.testing.checkAllAllocationFailures(alloc, Allocation.run, .{ &manager, id, read_control.Port.init(&source) });
+    }
+}
+
+test "transaction intent collection original admission scopes bound payload and backend contention" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-scope-admission");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var backend = try lsm_backend.Backend.open(alloc, path, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const Target = enum { payload, backend };
+    const Kind = enum { read, probe, current };
+    const State = struct {
+        store: *DocStore,
+        backend: *lsm_backend.Backend,
+        target: Target,
+        expire: bool,
+        expired: bool = false,
+        waits: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.expired) return error.DeadlineExceeded;
+        }
+        fn wait(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.waits += 1;
+            if (self.expire) {
+                self.expired = true;
+            } else self.release();
+        }
+        fn release(self: *@This()) void {
+            switch (self.target) {
+                .payload => self.store.payload_policy_mutex.unlock(std.testing.io),
+                .backend => self.backend.mu.unlock(),
+            }
+        }
+        fn open(owner: *backend_erased.Store, kind: Kind, control: read_control.Port) !void {
+            switch (kind) {
+                .read => {
+                    var scope = try owner.beginReadWithAdmission(.retain, control);
+                    defer scope.abort();
+                },
+                .probe => {
+                    var scope = try owner.beginProbeWithAdmission(.retain, control);
+                    defer scope.abort();
+                },
+                .current => {
+                    var scope = try owner.beginCurrentScanWithAdmission(control);
+                    defer scope.abort();
+                },
+            }
+        }
+    };
+    for (std.enums.values(Target)) |target| for (std.enums.values(Kind)) |kind| for ([_]bool{ false, true }) |expire| {
+        var state: State = .{ .store = &store, .backend = &backend, .target = target, .expire = expire };
+        const locked = switch (target) {
+            .payload => store.payload_policy_mutex.tryLock(),
+            .backend => backend.mu.tryLock(),
+        };
+        try std.testing.expect(locked);
+        const source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .wait_for_progress = State.wait } };
+        if (expire) {
+            try std.testing.expectError(error.DeadlineExceeded, State.open(&manager.store, kind, read_control.Port.init(&source)));
+            // A rejected waiter cannot release the fixture's lock ownership.
+            const stolen = switch (target) {
+                .payload => store.payload_policy_mutex.tryLock(),
+                .backend => backend.mu.tryLock(),
+            };
+            try std.testing.expect(!stolen);
+            state.release();
+        } else try State.open(&manager.store, kind, read_control.Port.init(&source));
+        try std.testing.expectEqual(@as(usize, 1), state.waits);
+        try std.testing.expectEqual(@as(usize, 0), store.portable_import_reader_state.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    };
+
+    // An already-open live probe must use the same bounded backend capture
+    // lock. Its output references are discarded on expiry, with no fresh scope.
+    try store.put("probe:scope", "value");
+    for ([_]bool{ false, true }) |expire| {
+        {
+            var state: State = .{ .store = &store, .backend = &backend, .target = .backend, .expire = expire };
+            const source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .wait_for_progress = State.wait } };
+            const control = read_control.Port.init(&source);
+            var probe = try manager.store.beginProbeWithAdmission(.retain, control);
+            defer probe.abort();
+            try std.testing.expect(backend.mu.tryLock());
+            var values: [1]?[]const u8 = .{null};
+            if (expire) {
+                try std.testing.expectError(error.DeadlineExceeded, probe.getManySortedWithAdmission(&.{"probe:scope"}, &values, control));
+                try std.testing.expect(values[0] == null);
+                try std.testing.expect(!backend.mu.tryLock());
+                state.release();
+            } else {
+                try probe.getManySortedWithAdmission(&.{"probe:scope"}, &values, control);
+                try std.testing.expectEqualStrings("value", values[0].?);
+            }
+            try std.testing.expectEqual(@as(usize, 1), state.waits);
+        }
+        try std.testing.expectEqual(@as(usize, 0), store.portable_import_reader_state.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
+    }
+    // Reject unsupported CPU transfer before taking any payload/backend lease.
+    const Cpu = struct {
+        fn transfer(_: *anyopaque) !void {
+            @panic("CPU ownership transferred under an incomplete service graph");
+        }
+    };
+    var state: State = .{ .store = &store, .backend = &backend, .target = .backend, .expire = false };
+    const source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check, .wait_for_progress = State.wait }, .execution_wait = .{ .ptr = &state, .begin = Cpu.transfer, .end = Cpu.transfer } };
+    for (std.enums.values(Kind)) |kind| {
+        try std.testing.expectError(error.ExecutionWaitUnsupported, State.open(&manager.store, kind, read_control.Port.init(&source)));
+        try std.testing.expectEqual(@as(usize, 0), state.waits);
+        try std.testing.expectEqual(@as(usize, 0), store.portable_import_reader_state.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 0), backend.active_readers);
     }
 }

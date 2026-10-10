@@ -496,6 +496,9 @@ pub const DocStore = struct {
     pub const BackendStore = backend_adapter.Store(DocStore, Txn, Txn, Batch, .{
         .capabilities = backendCapabilities,
         .begin_read = beginReadTxn,
+        .begin_read_with_admission = beginReadTxnWithAdmission,
+        .begin_probe_with_admission = beginProbeTxnWithAdmission,
+        .begin_current_scan_with_admission = beginCurrentScanTxnWithAdmission,
         .begin_probe = beginProbeTxn,
         .begin_current_scan = beginCurrentScanTxn,
         .begin_write = beginWriteTxn,
@@ -1399,6 +1402,48 @@ pub const DocStore = struct {
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         var txn = try self.beginReadTxnUncheckedWithBlockCacheAdmission(admission);
+        txn.portable_import_reader_owner = self;
+        return txn;
+    }
+
+    /// These scopes retain payload policy ownership while admitting the
+    /// backend. CPU release requires the complete capture dependency graph.
+    fn checkRetainedReadAdmission(control: @import("../common/read_admission.zig").Port) !void {
+        try control.checkpoint();
+        if (try control.executionWait() != null) return error.ExecutionWaitUnsupported;
+    }
+
+    pub fn beginReadTxnWithAdmission(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, control: @import("../common/read_admission.zig").Port) !Txn {
+        try checkRetainedReadAdmission(control);
+        return self.beginReadTxnWithBudget(admission, control);
+    }
+
+    pub fn beginProbeTxnWithAdmission(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, control: @import("../common/read_admission.zig").Port) !Txn {
+        return self.beginLiveReadTxnWithAdmission(admission, control, false);
+    }
+
+    pub fn beginCurrentScanTxnWithAdmission(self: *DocStore, control: @import("../common/read_admission.zig").Port) !Txn {
+        return self.beginLiveReadTxnWithAdmission(.retain, control, true);
+    }
+
+    fn beginLiveReadTxnWithAdmission(self: *DocStore, admission: backend_types.Namespace.BlockCacheAdmission, control: @import("../common/read_admission.zig").Port, current: bool) !Txn {
+        try checkRetainedReadAdmission(control);
+        try self.acquirePortableImportReader();
+        errdefer self.releasePortableImportReader();
+        try @import("../common/bounded_mutex.zig").lock(&self.payload_policy_mutex, payloadPolicyIo(), control);
+        defer self.unlockPayloadPolicy();
+        const payload_session = try self.createPayloadSession();
+        var session_transferred = false;
+        errdefer if (!session_transferred) {
+            if (payload_session) |session| session.release();
+        };
+        var txn: Txn = .{ .payload_session = payload_session, .alloc = self.alloc };
+        if (current) {
+            txn.current_scan = try self.runtime_store.beginCurrentScanWithAdmission(control);
+        } else txn.probe = try self.runtime_store.beginProbeWithAdmission(admission, control);
+        session_transferred = true;
+        errdefer txn.abort();
+        try control.checkpoint();
         txn.portable_import_reader_owner = self;
         return txn;
     }

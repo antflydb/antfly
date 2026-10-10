@@ -1712,8 +1712,9 @@ point-probe entrypoint when a reference needs reconstruction.
 The indexed rejection/retry fixture runs against both a mutable view and verified
 persisted runs, with 71 intents including a large payload and a deletion. It
 warms the view before enumerating checkpoints so one-time rotation and cache
-admission do not change the rejection path. Legacy allocation-failure checks
-include admitted cursor construction. Four collector and 88 controlled-service
+admission do not change the rejection path. Legacy collection exercises admitted cursor construction while result-allocation
+failures are injected; provider/process wrapper allocation failures require
+separate qualification. Four collector and 88 controlled-service
 checks pass, plus 13 separate source ownership/accounting checks. This does not
 qualify initial backend scan/probe admission locks, lazy layout preparation,
 artifact reconstruction, the complete retained-service CPU reentry graph or
@@ -1734,3 +1735,25 @@ retirement. The focused storage/service regressions and source ownership audit
 remain green; these do not instantiate the full HTTP fixtures. The actual NDJSON
 fixture target remains queued in cumulative validation, alongside the remaining
 runtime failures. Automatic defaults remain unqualified.
+
+Initial original read admission now crosses the typed and erased storage facades
+into ordinary read, live-probe and current-scan constructors. Payload-policy
+and initial backend acquisition use the caller's bounded progress checks.
+Current scans retain their current-view semantics, and mutable probe batch
+capture also uses the admitted backend lock. Rejection retires portable-import
+reader ownership, payload sessions and backend reader pins. Newly admitted
+read/probe/scan erasure callbacks abort the physical handle if wrapper allocation
+fails; process-wrapper allocation injection remains a separate qualification gap.
+
+These constructors refuse a CPU wait boundary before acquiring service leases.
+Native intent collection already supplies original non-yielding lifetime controls;
+no new operation, CPU authority or clock deadline is created. This preserves
+lifetime rejection while the complete capture-holder CPU reentry graph remains
+open. A physical fixture holds payload/backend locks across admission, releases
+them from the original progress callback or expires that callback, checks the
+holder's lock survives rejection and checks all reader counts return to zero.
+It also covers bounded capture in an already-open probe and early CPU-boundary
+rejection. Five collector checks and 88 service checks pass, plus 13 source audits.
+Lazy layout preparation/reacquisition, bulk current-scan cloning/rotation, artifact
+reconstruction, the full capture/Raft graph, corrected HTTP fixtures, resource and
+performance gates and automatic defaults remain unqualified.
