@@ -193,16 +193,17 @@ pub const BindLimits = struct {
     constant_steps: usize = 1024 * 1024,
     /// Unknown literal input functions are binding work, not speculative
     /// execution. Keep them mandatory even when optional caches are disabled.
-    input_bytes: usize = 4 * 1024 * 1024,
-    input_steps: usize = 1024 * 1024,
+    input_bytes: usize = @import("resource_limits.zig").preparation_bytes,
+    input_steps: usize = @import("resource_limits.zig").preparation_bytes,
 };
 const decisions = @import("../functions/decisions.zig");
 pub const DecisionDemand = struct { instruction: u32, function: decisions.Function, args: []const Json };
 pub const EvalLimits = struct {
     steps: usize = 65_536,
     pattern_steps: usize = 8 * 1024 * 1024,
+    input_bytes: usize = @import("resource_limits.zig").default_memory_bytes,
     depth: usize = 64,
-    output_bytes: usize = 1024 * 1024,
+    output_bytes: usize = @import("resource_limits.zig").default_memory_bytes,
     /// Request cancellation/deadline control shared by ordinary expressions
     /// and bounded exact arithmetic, independently of regex-session control.
     checkpoint: ?*const fn (?*anyopaque) anyerror!void = null,
@@ -337,7 +338,7 @@ pub const Program = struct {
                     .typed_parameters = self.preparedValues(),
                     .constant_preparation = true,
                     .input_validation = input_validation,
-                    .limits = .{ .steps = pool.remaining, .output_bytes = @min(1024 * 1024, pool.memory.limit -| pool.memory.footprint()) },
+                    .limits = .{ .steps = pool.remaining, .output_bytes = @min(@import("resource_limits.zig").default_memory_bytes, pool.memory.limit -| pool.memory.footprint()) },
                 };
                 const value = context.runDatum(@intCast(index), 0) catch |err| {
                     pool.remaining -|= context.usedSteps();
@@ -3032,6 +3033,7 @@ const Evaluator = struct {
     // branch must remain an execution-time error, not a binding-time error.
     constant_preparation: bool = false,
     input_validation: bool = false,
+    input_bytes: usize = 0,
 
     /// One invocation owns all VM, JSON, array and exact-arithmetic work.
     /// Nested codecs may impose tighter local limits, never a fresh request
@@ -3059,11 +3061,19 @@ const Evaluator = struct {
     }
 
     fn compareValues(self: *Evaluator, left: Datum, right: Datum) !std.math.Order {
+        if (!left.sql_null and !right.sql_null and left.value == .string and right.value == .string) return self.compareJson(left.value, right.value);
         var work = self.workBudget();
         return compareDatumsWithBudget(left, right, &work);
     }
 
     fn compareJson(self: *Evaluator, left: Json, right: Json) !std.math.Order {
+        if (left == .string and right == .string) {
+            try self.workOwner().charge(0);
+            const remaining = self.limits.input_bytes -| self.input_bytes;
+            var work: json_order.Budget = .{ .remaining = remaining };
+            defer self.input_bytes += remaining - work.remaining;
+            return compareWithBudget(left, right, &work);
+        }
         var work = self.workBudget();
         return compareWithBudget(left, right, &work);
     }
@@ -4061,7 +4071,11 @@ const Evaluator = struct {
     fn castBuiltin(self: *Evaluator, value: Json, source: ?arrays.ElementType, target: arrays.ElementType) !Json {
         if (value == .string or value == .number_string) {
             const length = if (value == .string) value.string.len else value.number_string.len;
-            try self.workOwner().charge(length);
+            // Linear input decoding has a byte quota independent of the
+            // instruction/arithmetic work quota and includes cancellation.
+            try self.workOwner().charge(0);
+            if (length > self.limits.input_bytes -| self.input_bytes) return self.workOwner().limit();
+            self.input_bytes += length;
         }
         if (source == .jsonb and target != .jsonb and target != .text) {
             if (value == .null or value == .array or value == .object or value == .string) return error.SqlTypeMismatch;
@@ -4424,11 +4438,7 @@ const Evaluator = struct {
                 break :blk .{ .string = output };
             },
             .lpad, .rpad => try self.padText(function == .lpad, text_value, values[1], if (args.len == 3) values[2] else .{ .string = " " }),
-            .strpos => blk: {
-                if (values[1] != .string) return error.SqlTypeMismatch;
-                const position = std.mem.indexOf(u8, text_value, values[1].string) orelse break :blk .{ .integer = 0 };
-                break :blk .{ .integer = @intCast((std.unicode.utf8CountCodepoints(text_value[0..position]) catch return error.SqlTypeMismatch) + 1) };
-            },
+            .strpos => .{ .integer = try self.strpos(text_value, values[1].string) },
             .initcap => blk: {
                 try self.charge(text_value.len);
                 const output = try self.alloc.alloc(u8, text_value.len);
@@ -4522,6 +4532,36 @@ const Evaluator = struct {
         };
     }
 
+    fn chargePattern(self: *Evaluator, steps: usize) !void {
+        if (steps > self.limits.pattern_steps - self.pattern_steps) return error.SqlProgramLimitExceeded;
+        self.pattern_steps += steps;
+    }
+
+    fn strpos(self: *Evaluator, text: []const u8, needle: []const u8) !i64 {
+        try self.chargePattern(text.len);
+        try self.chargePattern(needle.len);
+        const view = std.unicode.Utf8View.init(text) catch return error.SqlTypeMismatch;
+        _ = std.unicode.Utf8View.init(needle) catch return error.SqlTypeMismatch;
+        if (needle.len == 0) return 1;
+        var iterator = view.iterator();
+        var position: i64 = 1;
+        while (iterator.i < text.len) : (position += 1) {
+            const offset = iterator.i;
+            _ = iterator.nextCodepointSlice();
+            if (needle.len > text.len - offset) return 0;
+            var matched = true;
+            for (needle, text[offset..][0..needle.len]) |expected, actual| {
+                try self.chargePattern(1);
+                if (expected != actual) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched) return position;
+        }
+        return 0;
+    }
+
     fn textWork(self: *Evaluator, bytes: usize) !void {
         if (bytes > self.limits.pattern_steps -| self.pattern_steps) return error.SqlProgramLimitExceeded;
         self.pattern_steps += bytes;
@@ -4599,45 +4639,54 @@ const Evaluator = struct {
         if (text_value != .string or pattern != .string) return error.SqlTypeMismatch;
         const text = text_value.string;
         const glob = pattern.string;
+        try self.chargePattern(text.len);
+        try self.chargePattern(glob.len);
+        try self.chargePattern(escape.len);
+        _ = std.unicode.Utf8View.init(text) catch return error.SqlTypeMismatch;
+        const pattern_view = std.unicode.Utf8View.init(glob) catch return error.SqlTypeMismatch;
+        const escape_view = std.unicode.Utf8View.init(escape) catch return error.SqlInvalidEscapeSequence;
+        var escape_iterator = escape_view.iterator();
+        _ = escape_iterator.nextCodepointSlice();
+        if (escape_iterator.nextCodepointSlice() != null) return error.SqlInvalidEscapeSequence;
+        // Reject a dangling escape even if an earlier mismatch would skip it.
+        var pattern_iterator = pattern_view.iterator();
+        while (pattern_iterator.nextCodepointSlice()) |character| {
+            if (escape.len > 0 and std.mem.eql(u8, character, escape) and pattern_iterator.nextCodepointSlice() == null) return error.SqlInvalidEscapeSequence;
+        }
         var i: usize = 0;
         var j: usize = 0;
         var star: ?usize = null;
         var restart: usize = 0;
         while (i < text.len) {
-            if (self.pattern_steps >= self.limits.pattern_steps) return error.SqlProgramLimitExceeded;
-            self.pattern_steps += 1;
-            const is_escape = escape.len != 0 and j < glob.len and std.mem.startsWith(u8, glob[j..], escape);
-            if (!is_escape and j < glob.len and glob[j] == '%') {
+            try self.chargePattern(1);
+            const pattern_start = j;
+            const escaped = escape.len > 0 and std.mem.startsWith(u8, glob[j..], escape);
+            if (escaped) j += escape.len;
+            if (!escaped and j < glob.len and glob[j] == '%') {
                 if (j + 1 == glob.len) return true;
                 star = j + 1;
                 j += 1;
                 restart = i;
                 continue;
             }
-            if (!is_escape and j < glob.len and glob[j] == '_') {
+            if (!escaped and j < glob.len and glob[j] == '_') {
                 i += std.unicode.utf8ByteSequenceLength(text[i]) catch return error.SqlTypeMismatch;
                 j += 1;
                 continue;
-            }
-            var escaped = false;
-            if (is_escape) {
-                j += escape.len;
-                escaped = true;
-                if (j == glob.len) return error.SqlInvalidEscapeSequence;
             }
             if (j < glob.len and (if (insensitive) std.ascii.toLower(text[i]) == std.ascii.toLower(glob[j]) else text[i] == glob[j])) {
                 i += 1;
                 j += 1;
                 continue;
             }
-            if (escaped) j -= escape.len;
+            j = pattern_start;
             if (star) |next| {
                 restart += std.unicode.utf8ByteSequenceLength(text[restart]) catch return error.SqlTypeMismatch;
                 i = restart;
                 j = next;
             } else return false;
         }
-        while (j < glob.len and glob[j] == '%' and !(escape.len != 0 and std.mem.startsWith(u8, glob[j..], escape))) : (j += 1) {}
+        while (j < glob.len and glob[j] == '%' and !(escape.len > 0 and std.mem.startsWith(u8, glob[j..], escape))) : (j += 1) {}
         return j == glob.len;
     }
 };
@@ -5563,4 +5612,16 @@ test "SQL special float keys canonicalize NaN payloads without admitting JSON nu
     try std.testing.expectEqual(try semanticHashDatum(left), try semanticHashDatum(right));
     try std.testing.expect((try semanticHashDatum(left)) != (try semanticHashDatum(Datum.json(.{ .float = std.math.inf(f64) }))));
     try std.testing.expectError(error.SqlNumericOutOfRange, semanticHash(left.value));
+}
+
+test "SQL strpos rejects invalid UTF8 and bounds adversarial substring work" {
+    const alloc = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(alloc, "strpos($1,$2)", .{});
+    defer compiled.deinit();
+    var program = try bind(alloc, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    const invalid = [_]u8{0xff};
+    try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(alloc, &.{}, &.{ .{ .string = &invalid }, .{ .string = "x" } }, .{}));
+    try std.testing.expectError(error.SqlTypeMismatch, program.evaluate(alloc, &.{}, &.{ .{ .string = "x" }, .{ .string = &invalid } }, .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(alloc, &.{}, &.{ .{ .string = "aaaaaaaaaaaaab" }, .{ .string = "aaaaab" } }, .{ .pattern_steps = 24 }));
 }

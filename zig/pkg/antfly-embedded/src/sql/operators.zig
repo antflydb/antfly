@@ -110,30 +110,40 @@ pub const TopK = struct {
     scratch: ?std.heap.ArenaAllocator = null,
 
     pub fn init(alloc: Allocator, k: usize, orders: []const Order, max_bytes: usize) !TopK {
-        // A logical row ceiling is not a cardinality estimate. Reserve only a
-        // small initial heap, then grow with admitted rows under the same
-        // retained-byte budget. Sparse nested sorts must not allocate slots
-        // for their entire scan ceiling before opening the first page.
-        const initial = @min(k, 16);
-        const bytes = std.math.add(usize, std.math.mul(usize, initial, @sizeOf(OwnedRow)) catch return error.SqlProgramLimitExceeded, std.math.mul(usize, orders.len, @sizeOf(Order)) catch return error.SqlProgramLimitExceeded) catch return error.SqlProgramLimitExceeded;
+        const bytes = std.math.mul(usize, orders.len, @sizeOf(Order)) catch return error.SqlProgramLimitExceeded;
         if (bytes > max_bytes or orders.len > 256) return error.SqlProgramLimitExceeded;
-        const entries = try alloc.alloc(OwnedRow, initial);
-        errdefer alloc.free(entries);
         const owned_orders = try alloc.dupe(Order, orders);
-        return .{ .alloc = alloc, .entries = entries, .orders = owned_orders, .max_bytes = max_bytes, .retained_bytes = bytes, .capacity = k };
+        return .{ .alloc = alloc, .entries = &.{}, .orders = owned_orders, .max_bytes = max_bytes, .retained_bytes = bytes, .capacity = k };
     }
 
     pub fn initWithSpill(alloc: Allocator, k: usize, orders: []const Order, max_bytes: usize, manager: ?*@import("spill.zig").Manager) !TopK {
-        if (manager != null and k > (max_bytes / 4) / @sizeOf(OwnedRow)) {
-            if (orders.len > 256) return error.SqlProgramLimitExceeded;
-            var top: TopK = .{ .alloc = alloc, .entries = &.{}, .orders = try alloc.dupe(Order, orders), .max_bytes = max_bytes, .retained_bytes = 0, .capacity = k, .spill_manager = manager };
-            errdefer alloc.free(top.orders);
-            try top.startSpill();
-            return top;
-        }
         var top = try init(alloc, k, orders, if (manager != null) max_bytes - max_bytes / 4 else max_bytes);
         top.spill_manager = manager;
+        errdefer top.deinit();
+        // Reserve the bounded external-sort path before a large nested sort
+        // competes with its parent for the shared statement allocator.
+        if (manager != null and k > (max_bytes / 4) / @sizeOf(OwnedRow)) try top.startSpill();
         return top;
+    }
+
+    // LIMIT/scan bounds describe maximum retained rows, not actual cardinality.
+    // Grow only for rows observed, charging both live arrays during a copy.
+    fn growEntries(self: *TopK) !void {
+        if (self.count < self.entries.len or self.count == self.capacity) return;
+        const old_len = self.entries.len;
+        var wanted = @min(self.capacity, @max(@as(usize, 8), old_len *| 2));
+        const available = (self.max_bytes -| self.retained_bytes) / @sizeOf(OwnedRow);
+        wanted = @min(wanted, old_len +| available);
+        if (wanted <= old_len) return error.SqlProgramLimitExceeded;
+        if (!self.alloc.resize(self.entries, wanted)) {
+            wanted = @min(wanted, available);
+            if (wanted <= old_len) return error.SqlProgramLimitExceeded;
+            const entries = try self.alloc.alloc(OwnedRow, wanted);
+            @memcpy(entries[0..self.count], self.entries[0..self.count]);
+            self.alloc.free(self.entries);
+            self.entries = entries;
+        } else self.entries.len = wanted;
+        self.retained_bytes += (wanted - old_len) * @sizeOf(OwnedRow);
     }
     fn startSpill(self: *TopK) !void {
         const manager = self.spill_manager orelse return error.SqlProgramLimitExceeded;
@@ -243,14 +253,7 @@ pub const TopK = struct {
             _ = try scalar.compareDatums(key, key);
         };
         if (self.count == self.capacity and (try self.compare(row, self.entries[0].row)) != .lt) return;
-        if (self.count == self.entries.len and self.count < self.capacity) {
-            const available_slots = (self.max_bytes -| self.retained_bytes) / @sizeOf(OwnedRow);
-            const next_len = @min(self.capacity, @min(self.entries.len *| 2, self.entries.len +| available_slots));
-            if (next_len <= self.entries.len) return error.SqlProgramLimitExceeded;
-            const old_len = self.entries.len;
-            self.entries = try self.alloc.realloc(self.entries, next_len);
-            self.retained_bytes += (next_len - old_len) * @sizeOf(OwnedRow);
-        }
+        try self.growEntries();
         var estimate: usize = 0;
         for (row.values) |value| estimate = std.math.add(usize, estimate, try datumBytes(value)) catch return error.SqlProgramLimitExceeded;
         for (row.keys) |value| estimate = std.math.add(usize, estimate, try datumBytes(value)) catch return error.SqlProgramLimitExceeded;
@@ -1674,7 +1677,7 @@ test "SQL top K retains bounded competitive rows with stable null ordering" {
 test "SQL top K sparse logical ceilings reserve only admitted heap capacity" {
     var top = try TopK.init(std.testing.allocator, 10_000_000, &.{.{}}, 64 * 1024);
     defer top.deinit();
-    try std.testing.expectEqual(@as(usize, 16), top.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), top.entries.len);
     for ([_]i64{ 2, 1 }, 0..) |number, ordinal| {
         const value = Datum.json(.{ .integer = number });
         try top.add(.{ .values = &.{value}, .keys = &.{value}, .ordinal = ordinal });
@@ -1863,6 +1866,22 @@ test "SQL pattern aggregate retains distinct nullable patterns within quota" {
         };
     }
     try std.testing.expect(exhausted);
+}
+
+test "SQL top K admits sparse input under a large logical row limit" {
+    var quota: MemoryBudget = .{ .backing = std.testing.allocator, .limit = 8192 };
+    var top = try TopK.init(quota.allocator(), 10_000_000, &.{.{}}, 8192);
+    defer top.deinit();
+    try std.testing.expectEqual(@as(usize, 0), top.entries.len);
+    for (0..20) |i| {
+        const value = Datum.json(.{ .integer = @intCast(20 - i) });
+        try top.add(.{ .values = &.{value}, .keys = &.{value}, .ordinal = i });
+    }
+    const result = try top.finish(std.testing.allocator);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 20), result.len);
+    for (result, 0..) |row, i| try std.testing.expectEqual(@as(i64, @intCast(i + 1)), row.values[0].value.integer);
+    try std.testing.expect(quota.peak <= quota.limit);
 }
 
 test "SQL top K replacement churn stays bounded by actual allocation quota" {

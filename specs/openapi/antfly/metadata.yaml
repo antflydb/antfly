@@ -1753,6 +1753,9 @@ components:
         message:
           type: string
           description: Human-readable diagnostic with no sensitive parameter values.
+        column_name:
+          type: string
+          description: Public column identifier for a column constraint violation; no row values are included.
         position:
           type: integer
           minimum: 1
