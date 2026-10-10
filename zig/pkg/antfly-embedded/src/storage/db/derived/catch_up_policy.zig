@@ -75,7 +75,7 @@ pub const RecoverableRetryCounters = struct {
     pub fn record(self: *@This(), err: anyerror) void {
         _ = self.total.fetchAdd(1, .monotonic);
         switch (err) {
-            error.WriterLocked => _ = self.writer_locked.fetchAdd(1, .monotonic),
+            error.WriterLocked, error.WouldBlock, error.FileBusy => _ = self.writer_locked.fetchAdd(1, .monotonic),
             error.ResourceBudgetExceeded,
             error.PostingWalTooLarge,
             error.PostingRowBackpressure,
@@ -109,6 +109,8 @@ pub const RecoverableRetryCounters = struct {
 pub fn isRecoverableAdmissionError(err: anyerror) bool {
     return switch (err) {
         error.WriterLocked,
+        error.WouldBlock,
+        error.FileBusy,
         error.ResourceBudgetExceeded,
         error.PostingWalTooLarge,
         error.PostingRowBackpressure,
@@ -501,4 +503,20 @@ test "dense replay adapts work independently from working-set units" {
     try std.testing.expectEqual(@as(u64, 64 * 1024 * 1024), combined.max_work_chunk_bytes * combined.max_windows_per_publish);
     const small_work = Policy{ .max_chunk_bytes = 64 * 1024 * 1024, .max_work_chunk_bytes = 8 * 1024 * 1024 };
     try std.testing.expectEqual(small_work, coalescedDensePolicy(small_work, &manager));
+}
+
+test "issue1015 transient storage contention uses bounded recoverable backoff" {
+    var counters = RecoverableRetryCounters{};
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(std.testing.allocator);
+    var backoff = RecoverableRetryBackoff{};
+    for ([_]anyerror{ error.WouldBlock, error.FileBusy, error.WriterLocked }) |err| {
+        try std.testing.expect(isRecoverableAdmissionError(err));
+        _ = recordRecoverableRetry(&counters, &manager, &backoff, err);
+    }
+    try std.testing.expectEqual(@as(u64, 3), counters.snapshot().writer_locked);
+    try std.testing.expectEqual(@as(u64, 3), manager.derivedRecoverableRetryStats().writer_locked);
+    for (0..300) |_| try std.testing.expect(backoff.nextDelayNs() <= 250 * std.time.ns_per_ms);
+    try std.testing.expect(!isRecoverableAdmissionError(error.InvalidData));
+    try std.testing.expect(!isRecoverableAdmissionError(error.OutOfMemory));
 }

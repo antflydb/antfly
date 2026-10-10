@@ -38,8 +38,8 @@ typedef enum antfly_error_code {
     /* The operation requires a capability unavailable on this platform or
      * filesystem. Retrying unchanged will not succeed. */
     ANTFLY_UNSUPPORTED = 8,
-    /* A bounded drain such as run-until-idle found a managed index making no
-     * forward progress for its stall window and gave up. */
+    /* Derived work stalled or a worker failed. Inspect pending-work diagnostics
+     * and repair or reopen the database; primary-only writes may still succeed. */
     ANTFLY_STALLED = 9,
     /* The caller cancelled the call by returning false from its progress or
      * stream callback. */
