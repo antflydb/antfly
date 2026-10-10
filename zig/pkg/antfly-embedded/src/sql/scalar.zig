@@ -4322,8 +4322,17 @@ const Evaluator = struct {
             .power => {
                 const base = try arithmeticNumber(first);
                 const exponent = try arithmeticNumber(values[1]);
+                // NaN inputs follow POSIX identities before domain checks.
+                if (std.math.isNan(base) or std.math.isNan(exponent))
+                    return .{ .float = if (exponent == 0 or base == 1) 1 else std.math.nan(f64) };
+                if ((base == 0 and exponent < 0) or (base < 0 and @floor(exponent) != exponent))
+                    return error.SqlInvalidPowerArgument;
                 const result = std.math.pow(f64, base, exponent);
-                return if (std.math.isFinite(base) and std.math.isFinite(exponent)) finite(result) else .{ .float = result };
+                if (std.math.isFinite(base) and std.math.isFinite(exponent)) {
+                    if (result == 0 and base != 0) return error.SqlNumericOutOfRange;
+                    return finite(result);
+                }
+                return .{ .float = result };
             },
             .mod => return arithmetic(.modulo, first, values[1]),
             else => {},
@@ -4675,6 +4684,10 @@ pub fn arithmetic(op: ast.Scalar.Binary, left: Json, right: Json) !Json {
         .modulo => if (b == 0) return error.SqlDivisionByZero else @rem(a, b),
         else => unreachable,
     };
+    // Multiplication and division of finite nonzero operands must not
+    // silently round to zero. Zero inputs and division by infinity are valid.
+    if ((op == .multiply or op == .divide) and result == 0 and a != 0 and b != 0 and std.math.isFinite(a) and std.math.isFinite(b))
+        return error.SqlNumericOutOfRange;
     return if (std.math.isFinite(a) and std.math.isFinite(b)) finite(result) else .{ .float = result };
 }
 fn arithmeticNumber(value: Json) !f64 {

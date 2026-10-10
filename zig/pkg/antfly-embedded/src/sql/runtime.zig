@@ -5043,3 +5043,80 @@ test "SQL floating special values unwind prepared reducer allocation failures" {
     defer compiled.deinit();
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{&compiled});
 }
+
+test "SQL floating arithmetic rejects underflow in literal and prepared expressions" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT '1e-300'::double precision * '1e-300'::double precision",
+        "SELECT '-1e-300'::double precision * '1e-300'::double precision",
+        "SELECT '1e-300'::double precision / '1e300'::double precision",
+        "SELECT power('1e-300'::double precision,2::double precision)",
+        "SELECT '1e-30'::real * '1e-30'::real",
+        "SELECT '1e-30'::real / '1e30'::real",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlNumericOutOfRange, execute(a, fixture.iface(), &compiled, &.{}, .{}));
+    }
+    for ([_]struct { sql: []const u8, right: f64 }{
+        .{ .sql = "SELECT $1 * $2", .right = 1e-300 },
+        .{ .sql = "SELECT $1 / $2", .right = 1e300 },
+        .{ .sql = "SELECT power($1,$2)", .right = 2 },
+    }) |case| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var backend = fixture.iface();
+        backend.parameter_descriptor_hints = &.{ .{ .kind = .number, .element_type = .float64 }, .{ .kind = .number, .element_type = .float64 } };
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlNumericOutOfRange, execute(a, backend, &compiled, &.{ .{ .float = 1e-300 }, .{ .float = case.right } }, .{}));
+    }
+}
+
+test "SQL floating POWER rejects invalid domains with PostgreSQL SQLSTATE" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT power(0::double precision,-1::double precision)",
+        "SELECT power(0::double precision,'-Infinity'::double precision)",
+        "SELECT power(-1::double precision,0.5::double precision)",
+        "SELECT power('-Infinity'::double precision,0.5::double precision)",
+        "SELECT power('-Infinity'::double precision,-0.5::double precision)",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlInvalidPowerArgument, execute(a, fixture.iface(), &compiled, &.{}, .{}));
+    }
+    var fixture: TestBackend = .{ .row_count = 0 };
+    var backend = fixture.iface();
+    backend.parameter_descriptor_hints = &.{ .{ .kind = .number, .element_type = .float64 }, .{ .kind = .number, .element_type = .float64 } };
+    var compiled = try compiler.compile(a, "SELECT power($1,$2)", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlInvalidPowerArgument, execute(a, backend, &compiled, &.{ .{ .float = -std.math.inf(f64) }, .{ .float = 0.5 } }, .{}));
+    try std.testing.expectEqualStrings("2201F", @import("errors.zig").describe(error.SqlInvalidPowerArgument).code);
+}
+
+test "SQL floating underflow and POWER checks preserve valid zero and special results" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT (0::double precision * '1e-300'::double precision) = 0",
+        "SELECT (0::double precision / '1e300'::double precision) = 0",
+        "SELECT (1::double precision / 'Infinity'::double precision) = 0",
+        "SELECT ('1e-300'::double precision * '1e-10'::double precision) = '1e-310'::double precision",
+        "SELECT power(0::double precision,2::double precision) = 0",
+        "SELECT power('NaN'::double precision,0::double precision) = 1",
+        "SELECT power(1::double precision,'NaN'::double precision) = 1",
+        "SELECT power(-1::double precision,'NaN'::double precision) = 'NaN'::double precision",
+        "SELECT power('-Infinity'::double precision,-3::double precision) = 0",
+        "SELECT power('-Infinity'::double precision,3::double precision) = '-Infinity'::double precision",
+        "SELECT power(2::double precision,'-Infinity'::double precision) = 0",
+        "SELECT power(-2::double precision,'Infinity'::double precision) = 'Infinity'::double precision",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expect(result.output.rows[0][0].bool);
+    }
+}
