@@ -1568,6 +1568,8 @@ test "external lake sparse predicate planning defers broad masks and subtracts s
     const Set = @import("lake_index_physical_set.zig").Set;
     // Only the predicate-planning fields are needed; no HTTP/server is opened.
     var execution: Execution = undefined;
+    execution.overlay = null;
+    execution.active_recent = false;
     execution.vector_include = null;
     execution.vector_exclude = Set.init(a);
     defer execution.vector_exclude.?.deinit();

@@ -36,13 +36,14 @@ pin deadlines use that same clock. The native HTTP tests qualify the wire protoc
 and restart behavior, rather than a production node/controller clock-skew race.
 GCS generation handling is implemented but was not real-cloud qualified here.
 
-The focused Zig negotiated-prefix test passed. The local lake executable passed
-**124 tests** with exit code zero. The native binary built successfully; the
-combined build reported **81/83 steps successful** because the merged baseline's
-API suite aborts in `lake_index_text_query.zig:1593`, test
-`external lake sparse predicate planning defers broad masks and subtracts selective includes`,
-when `selectSparseConstraints` returns null. This follow-up changes no sparse
-predicate code; the concurrent SQL changes in the shared workspace were preserved.
+The focused Zig negotiated-prefix test passed. The native binary built successfully.
+After initializing the sparse-predicate test fixture's `overlay` and `active_recent`
+fields, `zig build lake-api-test` completed with **48/48 steps successful**:
+**131 API tests and 124 local lake tests passed**, with no skips, failures or leaks.
+The local executable also passed directly with exit code zero. The previous
+optional-unwrapping panic was caused by undefined fixture fields selecting the
+recent-data fallback; production predicate behavior is unchanged. Concurrent SQL
+and SDK changes in the shared workspace were preserved.
 
 Production IAM/network enforcement, broader shared-data/delete-file combinations,
 larger catalogs and archive-scale performance remain additional qualifications.
