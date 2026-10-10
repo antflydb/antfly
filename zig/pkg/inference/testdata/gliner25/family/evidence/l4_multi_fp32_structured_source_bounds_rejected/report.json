@@ -1,0 +1,773 @@
+{
+  "status": "complete",
+  "qualification": false,
+  "scope": "public_test_structured_parity",
+  "task": "structured",
+  "entity_types": null,
+  "extraction_schema": {
+    "entities": [
+      "person",
+      "organization",
+      "location",
+      "date",
+      "time",
+      "product"
+    ],
+    "entity_attributes": {
+      "context": {
+        "labels": [
+          "mentioned",
+          "requested"
+        ],
+        "qualify_labels": true
+      }
+    },
+    "relations": [
+      "located in",
+      "works for",
+      "scheduled for"
+    ],
+    "structures": {
+      "request": {
+        "mode": "natural",
+        "anchor": "action",
+        "fields": [
+          {
+            "name": "action",
+            "dtype": "str",
+            "cardinality": "required_one"
+          },
+          {
+            "name": "object",
+            "dtype": "str"
+          },
+          {
+            "name": "location",
+            "dtype": "list"
+          },
+          {
+            "name": "date",
+            "dtype": "list"
+          }
+        ]
+      }
+    }
+  },
+  "model": {
+    "model_id": "fastino/gliner2.5-multi-v1",
+    "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+    "files": {
+      "config.json": {
+        "size_bytes": 3151,
+        "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146"
+      },
+      "encoder_config/config.json": {
+        "size_bytes": 857,
+        "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716"
+      },
+      "model.safetensors": {
+        "size_bytes": 1149461028,
+        "sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395"
+      },
+      "tokenizer.json": {
+        "size_bytes": 16035853,
+        "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a"
+      },
+      "tokenizer_config.json": {
+        "size_bytes": 645,
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+      }
+    },
+    "architecture": "boundary",
+    "tasks": [
+      "extraction",
+      "classification",
+      "relations",
+      "records",
+      "attributes",
+      "constraints",
+      "windowing"
+    ]
+  },
+  "precision": "fp32",
+  "dataset": {
+    "dataset": "AmazonScience/massive",
+    "revision": "1a5b2b362bcb4a6f5694396ee1ab577f91583ce2",
+    "split": "test",
+    "license": "cc-by-4.0",
+    "files": {
+      "en-US/massive-test.parquet": {
+        "size_bytes": 191261,
+        "sha256": "c418da9a5f3a7425b5cf44941bcea032a31040dbda2da85e0dd9323785c7731e"
+      },
+      "fr-FR/massive-test.parquet": {
+        "size_bytes": 228331,
+        "sha256": "aacd57aa2bcf6e1d037a350a41b70cb756bbf51199d2023f40a3ebb9d38a1981"
+      },
+      "de-DE/massive-test.parquet": {
+        "size_bytes": 225568,
+        "sha256": "3f15d6dcac758a56b4528a06b002252846208ebb8101f6159bc16ed836c55982"
+      },
+      "es-ES/massive-test.parquet": {
+        "size_bytes": 222136,
+        "sha256": "ca94eebc836e61e8bc530966c6565bb2c2b9d6184cc910c767c7fa6a9563de19"
+      },
+      "ar-SA/massive-test.parquet": {
+        "size_bytes": 235458,
+        "sha256": "fabc7afec26a29ec31c2deb016d47f9a4e38c33fa63c4b92b9f069e2b9f1054c"
+      },
+      "hi-IN/massive-test.parquet": {
+        "size_bytes": 299100,
+        "sha256": "f09ebfb9519169e5920785a1d6225d5d352c7de4a002235af99765147d219875"
+      },
+      "ja-JP/massive-test.parquet": {
+        "size_bytes": 225859,
+        "sha256": "017d55af0c9d90faa93363798976570e0f58c3c1f90bbdc4be45da43c1310d01"
+      },
+      "zh-CN/massive-test.parquet": {
+        "size_bytes": 201108,
+        "sha256": "7eca92a47e6bffeec3fc7de751948b82904680353a42eef7e8c6fdbe89adb2db"
+      }
+    }
+  },
+  "slices": [
+    {
+      "locale": "en-US",
+      "fixture_sha256": "cd6c82baa7abc492d13567c070b70340fdaa6171324d83a84f74332b6d00b4d0",
+      "native": {
+        "event": "ready",
+        "batch_size": 1,
+        "arm": "native",
+        "scope": "gliner25_direct_core_cuda_comparison_v1",
+        "cuda_runtime": {
+          "device_name": "NVIDIA L4",
+          "driver_version": 13000,
+          "compute_major": 8,
+          "compute_minor": 9
+        },
+        "backend": "cuda",
+        "synchronization_policy": "cuda_stream_before_start_and_after_extract_v1",
+        "timing_boundary": "schema_parse_compile+processor+encoder+heads+decode+temporary_cleanup",
+        "model": "multi",
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "model_files": {
+          "config.json": {
+            "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146",
+            "size_bytes": 3151
+          },
+          "encoder_config/config.json": {
+            "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716",
+            "size_bytes": 857
+          },
+          "model.safetensors": {
+            "sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395",
+            "size_bytes": 1149461028
+          },
+          "tokenizer.json": {
+            "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+            "size_bytes": 16035853
+          },
+          "tokenizer_config.json": {
+            "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+            "size_bytes": 645
+          }
+        },
+        "cases_sha256": "7a0b09a67a23203009ccc74f14e2bce096393acfd690aa73410a2fd69df63fb7",
+        "build_mode": "fast",
+        "zig_version": "0.17.0",
+        "threads": 1,
+        "scheduler": "serial_io",
+        "x86_kernel": "avx2",
+        "effective_cpu_threads": 4,
+        "system_blas": false,
+        "openblas_threads": null,
+        "dtype": "float32",
+        "precision": "fp32",
+        "compute_policy": "fp32",
+        "qualification": false
+      },
+      "documents": 200,
+      "matched": 200,
+      "agreement": 1.0,
+      "passed": true,
+      "reference_prediction_counts": {
+        "entities": 343,
+        "attributes": 343,
+        "relations": 143,
+        "records": 179
+      },
+      "max_confidence_error": 2.8014183044433594e-05
+    },
+    {
+      "locale": "fr-FR",
+      "fixture_sha256": "a2946593786bd9ff9a7e7dc24c5b6948f35ff3ac3ccfd1f419f5d15afc0f9d99",
+      "native": {
+        "event": "ready",
+        "batch_size": 1,
+        "arm": "native",
+        "scope": "gliner25_direct_core_cuda_comparison_v1",
+        "cuda_runtime": {
+          "device_name": "NVIDIA L4",
+          "driver_version": 13000,
+          "compute_major": 8,
+          "compute_minor": 9
+        },
+        "backend": "cuda",
+        "synchronization_policy": "cuda_stream_before_start_and_after_extract_v1",
+        "timing_boundary": "schema_parse_compile+processor+encoder+heads+decode+temporary_cleanup",
+        "model": "multi",
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "model_files": {
+          "config.json": {
+            "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146",
+            "size_bytes": 3151
+          },
+          "encoder_config/config.json": {
+            "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716",
+            "size_bytes": 857
+          },
+          "model.safetensors": {
+            "sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395",
+            "size_bytes": 1149461028
+          },
+          "tokenizer.json": {
+            "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+            "size_bytes": 16035853
+          },
+          "tokenizer_config.json": {
+            "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+            "size_bytes": 645
+          }
+        },
+        "cases_sha256": "72d59825f09e718245574b502fff4124eb02023ba11a2c46b4f014298f385ea3",
+        "build_mode": "fast",
+        "zig_version": "0.17.0",
+        "threads": 1,
+        "scheduler": "serial_io",
+        "x86_kernel": "avx2",
+        "effective_cpu_threads": 4,
+        "system_blas": false,
+        "openblas_threads": null,
+        "dtype": "float32",
+        "precision": "fp32",
+        "compute_policy": "fp32",
+        "qualification": false
+      },
+      "documents": 200,
+      "matched": 198,
+      "agreement": 0.99,
+      "passed": false,
+      "reference_prediction_counts": {
+        "entities": 301,
+        "attributes": 301,
+        "relations": 117,
+        "records": 175
+      },
+      "failed_rows": [
+        {
+          "source_id": "4112",
+          "passed": false,
+          "error": "public output cardinality changed"
+        },
+        {
+          "source_id": "3253",
+          "passed": false,
+          "error": "public output cardinality changed"
+        }
+      ],
+      "max_confidence_error": 1.8417835235595703e-05
+    },
+    {
+      "locale": "de-DE",
+      "fixture_sha256": "1d82450576ec2eb02f8549458f3d9a87b0c612523ba547e7ea85ae9fd4ae1f0e",
+      "native": {
+        "event": "ready",
+        "batch_size": 1,
+        "arm": "native",
+        "scope": "gliner25_direct_core_cuda_comparison_v1",
+        "cuda_runtime": {
+          "device_name": "NVIDIA L4",
+          "driver_version": 13000,
+          "compute_major": 8,
+          "compute_minor": 9
+        },
+        "backend": "cuda",
+        "synchronization_policy": "cuda_stream_before_start_and_after_extract_v1",
+        "timing_boundary": "schema_parse_compile+processor+encoder+heads+decode+temporary_cleanup",
+        "model": "multi",
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "model_files": {
+          "config.json": {
+            "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146",
+            "size_bytes": 3151
+          },
+          "encoder_config/config.json": {
+            "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716",
+            "size_bytes": 857
+          },
+          "model.safetensors": {
+            "sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395",
+            "size_bytes": 1149461028
+          },
+          "tokenizer.json": {
+            "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+            "size_bytes": 16035853
+          },
+          "tokenizer_config.json": {
+            "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+            "size_bytes": 645
+          }
+        },
+        "cases_sha256": "e2c56fac80f7685a7effe3cf3c549cabafcb01cf2d3ed0107ede9de010eb58c2",
+        "build_mode": "fast",
+        "zig_version": "0.17.0",
+        "threads": 1,
+        "scheduler": "serial_io",
+        "x86_kernel": "avx2",
+        "effective_cpu_threads": 4,
+        "system_blas": false,
+        "openblas_threads": null,
+        "dtype": "float32",
+        "precision": "fp32",
+        "compute_policy": "fp32",
+        "qualification": false
+      },
+      "documents": 200,
+      "matched": 200,
+      "agreement": 1.0,
+      "passed": true,
+      "reference_prediction_counts": {
+        "entities": 318,
+        "attributes": 318,
+        "relations": 109,
+        "records": 173
+      },
+      "max_confidence_error": 3.045797348022461e-05
+    },
+    {
+      "locale": "es-ES",
+      "fixture_sha256": "b17273e6131e8f3abf4635065f656f7bc070b60fcc848207e468f74ca8076acc",
+      "native": {
+        "event": "ready",
+        "batch_size": 1,
+        "arm": "native",
+        "scope": "gliner25_direct_core_cuda_comparison_v1",
+        "cuda_runtime": {
+          "device_name": "NVIDIA L4",
+          "driver_version": 13000,
+          "compute_major": 8,
+          "compute_minor": 9
+        },
+        "backend": "cuda",
+        "synchronization_policy": "cuda_stream_before_start_and_after_extract_v1",
+        "timing_boundary": "schema_parse_compile+processor+encoder+heads+decode+temporary_cleanup",
+        "model": "multi",
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "model_files": {
+          "config.json": {
+            "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146",
+            "size_bytes": 3151
+          },
+          "encoder_config/config.json": {
+            "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716",
+            "size_bytes": 857
+          },
+          "model.safetensors": {
+            "sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395",
+            "size_bytes": 1149461028
+          },
+          "tokenizer.json": {
+            "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+            "size_bytes": 16035853
+          },
+          "tokenizer_config.json": {
+            "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+            "size_bytes": 645
+          }
+        },
+        "cases_sha256": "d5483b55aa9cf26bc46491218117a02a2c6f9739931fb0396aed914ab22f3b36",
+        "build_mode": "fast",
+        "zig_version": "0.17.0",
+        "threads": 1,
+        "scheduler": "serial_io",
+        "x86_kernel": "avx2",
+        "effective_cpu_threads": 4,
+        "system_blas": false,
+        "openblas_threads": null,
+        "dtype": "float32",
+        "precision": "fp32",
+        "compute_policy": "fp32",
+        "qualification": false
+      },
+      "documents": 200,
+      "matched": 199,
+      "agreement": 0.995,
+      "passed": true,
+      "reference_prediction_counts": {
+        "entities": 298,
+        "attributes": 298,
+        "relations": 113,
+        "records": 158
+      },
+      "failed_rows": [
+        {
+          "source_id": "9519",
+          "passed": false,
+          "error": "public output cardinality changed"
+        }
+      ],
+      "max_confidence_error": 1.7881393432617188e-05
+    },
+    {
+      "locale": "ar-SA",
+      "fixture_sha256": "8439342e086db5a61bea22abbbce822613fa697a7949dc912be0cc945d693742",
+      "native": {
+        "event": "ready",
+        "batch_size": 1,
+        "arm": "native",
+        "scope": "gliner25_direct_core_cuda_comparison_v1",
+        "cuda_runtime": {
+          "device_name": "NVIDIA L4",
+          "driver_version": 13000,
+          "compute_major": 8,
+          "compute_minor": 9
+        },
+        "backend": "cuda",
+        "synchronization_policy": "cuda_stream_before_start_and_after_extract_v1",
+        "timing_boundary": "schema_parse_compile+processor+encoder+heads+decode+temporary_cleanup",
+        "model": "multi",
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "model_files": {
+          "config.json": {
+            "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146",
+            "size_bytes": 3151
+          },
+          "encoder_config/config.json": {
+            "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716",
+            "size_bytes": 857
+          },
+          "model.safetensors": {
+            "sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395",
+            "size_bytes": 1149461028
+          },
+          "tokenizer.json": {
+            "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+            "size_bytes": 16035853
+          },
+          "tokenizer_config.json": {
+            "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+            "size_bytes": 645
+          }
+        },
+        "cases_sha256": "02213540e06c4ab8c2b6d600464851c8fab80184a3e5a0df321f315bd76a68e5",
+        "build_mode": "fast",
+        "zig_version": "0.17.0",
+        "threads": 1,
+        "scheduler": "serial_io",
+        "x86_kernel": "avx2",
+        "effective_cpu_threads": 4,
+        "system_blas": false,
+        "openblas_threads": null,
+        "dtype": "float32",
+        "precision": "fp32",
+        "compute_policy": "fp32",
+        "qualification": false
+      },
+      "documents": 200,
+      "matched": 200,
+      "agreement": 1.0,
+      "passed": true,
+      "reference_prediction_counts": {
+        "entities": 249,
+        "attributes": 249,
+        "relations": 90,
+        "records": 111
+      },
+      "max_confidence_error": 1.7464160919189453e-05
+    },
+    {
+      "locale": "hi-IN",
+      "fixture_sha256": "8b46cf3af7436a4d5b6d263ed74061d4d7ec7c542e5a99cce6c80fec7b56c2da",
+      "native": {
+        "event": "ready",
+        "batch_size": 1,
+        "arm": "native",
+        "scope": "gliner25_direct_core_cuda_comparison_v1",
+        "cuda_runtime": {
+          "device_name": "NVIDIA L4",
+          "driver_version": 13000,
+          "compute_major": 8,
+          "compute_minor": 9
+        },
+        "backend": "cuda",
+        "synchronization_policy": "cuda_stream_before_start_and_after_extract_v1",
+        "timing_boundary": "schema_parse_compile+processor+encoder+heads+decode+temporary_cleanup",
+        "model": "multi",
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "model_files": {
+          "config.json": {
+            "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146",
+            "size_bytes": 3151
+          },
+          "encoder_config/config.json": {
+            "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716",
+            "size_bytes": 857
+          },
+          "model.safetensors": {
+            "sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395",
+            "size_bytes": 1149461028
+          },
+          "tokenizer.json": {
+            "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+            "size_bytes": 16035853
+          },
+          "tokenizer_config.json": {
+            "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+            "size_bytes": 645
+          }
+        },
+        "cases_sha256": "8e8b66d1d1b9d7a8b68f6fed5060b462880e5206a8e97aeea81fdb1c1335dbd8",
+        "build_mode": "fast",
+        "zig_version": "0.17.0",
+        "threads": 1,
+        "scheduler": "serial_io",
+        "x86_kernel": "avx2",
+        "effective_cpu_threads": 4,
+        "system_blas": false,
+        "openblas_threads": null,
+        "dtype": "float32",
+        "precision": "fp32",
+        "compute_policy": "fp32",
+        "qualification": false
+      },
+      "documents": 200,
+      "matched": 200,
+      "agreement": 1.0,
+      "passed": true,
+      "reference_prediction_counts": {
+        "entities": 35,
+        "attributes": 35,
+        "relations": 0,
+        "records": 22
+      },
+      "max_confidence_error": 1.043081283569336e-05
+    },
+    {
+      "locale": "ja-JP",
+      "fixture_sha256": "9796fe8311a34679df547cc7e98ca9303b43855d88a1c94718f5e2472fbc58c5",
+      "native": {
+        "event": "ready",
+        "batch_size": 1,
+        "arm": "native",
+        "scope": "gliner25_direct_core_cuda_comparison_v1",
+        "cuda_runtime": {
+          "device_name": "NVIDIA L4",
+          "driver_version": 13000,
+          "compute_major": 8,
+          "compute_minor": 9
+        },
+        "backend": "cuda",
+        "synchronization_policy": "cuda_stream_before_start_and_after_extract_v1",
+        "timing_boundary": "schema_parse_compile+processor+encoder+heads+decode+temporary_cleanup",
+        "model": "multi",
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "model_files": {
+          "config.json": {
+            "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146",
+            "size_bytes": 3151
+          },
+          "encoder_config/config.json": {
+            "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716",
+            "size_bytes": 857
+          },
+          "model.safetensors": {
+            "sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395",
+            "size_bytes": 1149461028
+          },
+          "tokenizer.json": {
+            "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+            "size_bytes": 16035853
+          },
+          "tokenizer_config.json": {
+            "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+            "size_bytes": 645
+          }
+        },
+        "cases_sha256": "525b6b4977095bf62f346207a2755c8082b0bb8dbe93fd6a5bb9a9a21b8bf016",
+        "build_mode": "fast",
+        "zig_version": "0.17.0",
+        "threads": 1,
+        "scheduler": "serial_io",
+        "x86_kernel": "avx2",
+        "effective_cpu_threads": 4,
+        "system_blas": false,
+        "openblas_threads": null,
+        "dtype": "float32",
+        "precision": "fp32",
+        "compute_policy": "fp32",
+        "qualification": false
+      },
+      "documents": 200,
+      "matched": 200,
+      "agreement": 1.0,
+      "passed": true,
+      "reference_prediction_counts": {
+        "entities": 92,
+        "attributes": 92,
+        "relations": 3,
+        "records": 3
+      },
+      "max_confidence_error": 9.417533874511719e-06
+    },
+    {
+      "locale": "zh-CN",
+      "fixture_sha256": "28f56554a9521e2ee4dc5c32a601efdf13ff806149eb5c1a648bc7bd79dc777e",
+      "native": {
+        "event": "ready",
+        "batch_size": 1,
+        "arm": "native",
+        "scope": "gliner25_direct_core_cuda_comparison_v1",
+        "cuda_runtime": {
+          "device_name": "NVIDIA L4",
+          "driver_version": 13000,
+          "compute_major": 8,
+          "compute_minor": 9
+        },
+        "backend": "cuda",
+        "synchronization_policy": "cuda_stream_before_start_and_after_extract_v1",
+        "timing_boundary": "schema_parse_compile+processor+encoder+heads+decode+temporary_cleanup",
+        "model": "multi",
+        "model_id": "fastino/gliner2.5-multi-v1",
+        "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+        "model_files": {
+          "config.json": {
+            "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146",
+            "size_bytes": 3151
+          },
+          "encoder_config/config.json": {
+            "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716",
+            "size_bytes": 857
+          },
+          "model.safetensors": {
+            "sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395",
+            "size_bytes": 1149461028
+          },
+          "tokenizer.json": {
+            "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+            "size_bytes": 16035853
+          },
+          "tokenizer_config.json": {
+            "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1",
+            "size_bytes": 645
+          }
+        },
+        "cases_sha256": "c142c30e8a0f8e244f299cbd7b74f432307d8dfef7ad19125492f0ff807a699c",
+        "build_mode": "fast",
+        "zig_version": "0.17.0",
+        "threads": 1,
+        "scheduler": "serial_io",
+        "x86_kernel": "avx2",
+        "effective_cpu_threads": 4,
+        "system_blas": false,
+        "openblas_threads": null,
+        "dtype": "float32",
+        "precision": "fp32",
+        "compute_policy": "fp32",
+        "qualification": false
+      },
+      "documents": 200,
+      "matched": 200,
+      "agreement": 1.0,
+      "passed": true,
+      "reference_prediction_counts": {
+        "entities": 37,
+        "attributes": 37,
+        "relations": 1,
+        "records": 46
+      },
+      "max_confidence_error": 7.3909759521484375e-06
+    }
+  ],
+  "native_binary_sha256": "9f70a8c2e620aef814fda682f3988e2aa7f9b8130b829ef338a273823d0c245d",
+  "reference": {
+    "event": "ready",
+    "arm": "fastino_cuda",
+    "model_id": "fastino/gliner2.5-multi-v1",
+    "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+    "model_files": {
+      "config.json": {
+        "size_bytes": 3151,
+        "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146"
+      },
+      "encoder_config/config.json": {
+        "size_bytes": 857,
+        "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716"
+      },
+      "model.safetensors": {
+        "size_bytes": 1149461028,
+        "sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395"
+      },
+      "tokenizer.json": {
+        "size_bytes": 16035853,
+        "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a"
+      },
+      "tokenizer_config.json": {
+        "size_bytes": 645,
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+      }
+    },
+    "packages": {
+      "gliner2": "2.0.0",
+      "torch": "2.14.0",
+      "transformers": "5.17.0",
+      "tokenizers": "0.23.2",
+      "safetensors": "0.8.0"
+    },
+    "dtype": "fp32",
+    "weight_dtype": "fp32",
+    "attention": "eager",
+    "device": "NVIDIA L4",
+    "cuda": "13.0",
+    "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+    "timing_boundary": "public_batch_api_loaded_model",
+    "qualification": false
+  },
+  "reference_prediction_counts": {
+    "entities": 1673,
+    "attributes": 1673,
+    "relations": 576,
+    "records": 867
+  },
+  "all_heads_exercised": true,
+  "measured_slices_passed": false,
+  "peak_worker_rss_bytes": 3695202304,
+  "raw_capture": {
+    "path": "raw.jsonl.gz",
+    "encoding": "gzip",
+    "uncompressed_sha256": "a587a43d42256a9f4da26b90b7447a36fb2e1d9c0b64674987ce201c9fd45f96",
+    "uncompressed_size_bytes": 7033320
+  },
+  "disposition": "Strict output parity rejected: French 198/200, Spanish 199/200, others 200/200. All three discrepancies contain upstream predictions whose end includes an appended synthetic period beyond the original input. Native retains its existing source-valid span policy. No parity exception or release qualification is granted by this report.",
+  "source_bounds_discrepancies": [
+    {
+      "locale": "fr-FR",
+      "source_id": "4112"
+    },
+    {
+      "locale": "fr-FR",
+      "source_id": "3253"
+    },
+    {
+      "locale": "es-ES",
+      "source_id": "9519"
+    }
+  ],
+  "source_report_sha256": "327cafdc10537b3323ff614b9ac248de1e362036fa34b122befa06e5e2314cd1"
+}

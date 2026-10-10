@@ -90,6 +90,22 @@ pub fn populate(
     const batch_capacity = @min(total, max_keys_per_read);
     const read_keys = try alloc.alloc([]const u8, batch_capacity);
     defer alloc.free(read_keys);
+    const scoped = comptime @hasDecl(@typeInfo(@TypeOf(txn)).pointer.child, "openReadScope");
+    const Scope = if (scoped) @typeInfo(@TypeOf(txn.openReadScope(alloc))).error_union.payload else void;
+    // Probe-only wrappers expose the method but cannot open a pinned scope.
+    // Keep their existing batched view, and propagate allocation/storage errors.
+    var scope: ?Scope = if (scoped) txn.openReadScope(alloc) catch |err|
+        (if (err == error.ReadOnly or err == error.Unsupported) null else return err) else null;
+    defer if (scoped) {
+        if (scope) |*active| active.close();
+    };
+    const direct = comptime if (scoped) @hasDecl(Scope, "getManySortedInto") else false;
+    const use_buffers = direct and scope != null;
+    const score_buffers: [][8]u8 = if (use_buffers) try alloc.alloc([8]u8, batch_capacity) else &.{};
+    defer if (use_buffers) alloc.free(score_buffers);
+    const output_buffers: [][]u8 = if (use_buffers) try alloc.alloc([]u8, batch_capacity) else &.{};
+    defer if (use_buffers) alloc.free(output_buffers);
+    for (score_buffers, output_buffers) |*buffer, *out| out.* = buffer;
     const read_values = try alloc.alloc(?[]const u8, batch_capacity);
     defer alloc.free(read_values);
     var key_bytes = std.ArrayListUnmanaged(u8).empty;
@@ -120,7 +136,14 @@ pub fn populate(
             key.* = key_bytes.items[start..];
         }
         @memset(read_values[0..len], null);
-        try txn.getManySorted(read_keys[0..len], read_values[0..len]);
+        if (scoped and scope != null) {
+            if (direct) {
+                scope.?.getManySortedInto(read_keys[0..len], output_buffers[0..len], read_values[0..len]) catch |err| switch (err) {
+                    error.BufferTooSmall => return error.InvalidGraphMetricScore,
+                    else => return err,
+                };
+            } else try scope.?.getManySorted(read_keys[0..len], read_values[0..len]);
+        } else try txn.getManySorted(read_keys[0..len], read_values[0..len]);
         for (read_values[0..len], 0..) |maybe_raw, i| {
             const raw = maybe_raw orelse continue;
             if (raw.len != 8) return error.InvalidGraphMetricScore;
@@ -128,6 +151,15 @@ pub fn populate(
             if (!std.math.isFinite(score)) return error.InvalidGraphMetricScore;
             const flat = offset + i;
             columns[owners[flat / unique_count]][unique[flat % unique_count]] = score;
+        }
+        if (scoped and @hasDecl(Scope, "reset")) {
+            if (scope) |*active| {
+                if (@typeInfo(@TypeOf(active.reset())) == .error_union) {
+                    active.reset() catch |err| {
+                        if (err != error.ReadScopeResetUnsupported) return err;
+                    };
+                } else active.reset();
+            }
         }
         offset += len;
         stats.batches += 1;
@@ -222,4 +254,90 @@ test "graph metric physical score reads deduplicate keys and retain logical owne
     };
     try Runner.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "graph metric physical score reads use caller buffers and close scope on errors" {
+    const backend = @import("../storage/backend_erased.zig");
+    const Txn = struct {
+        calls: usize = 0,
+        closed: usize = 0,
+        resets: usize = 0,
+        length: usize = 8,
+        raw: [9]u8 = .{ 0, 0, 0, 0, 0, 0, 8, 64, 0 }, // 3.0, little endian
+        const Self = @This();
+        const Scope = struct {
+            parent: *Self,
+            pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+                return error.TestUnexpectedResult;
+            }
+            pub fn getManySortedInto(self: *@This(), requested: []const []const u8, buffers: []const []u8, values: []?[]const u8) !void {
+                self.parent.calls += 1;
+                for (requested, buffers, values) |_, buffer, *value| {
+                    if (self.parent.length > buffer.len) return error.BufferTooSmall;
+                    @memcpy(buffer[0..self.parent.length], self.parent.raw[0..self.parent.length]);
+                    value.* = buffer[0..self.parent.length];
+                }
+            }
+            pub fn reset(self: *@This()) void {
+                self.parent.resets += 1;
+            }
+            pub fn close(self: *@This()) void {
+                self.parent.closed += 1;
+            }
+        };
+        pub fn getManySorted(_: *@This(), _: []const []const u8, _: []?[]const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+        pub fn openReadScope(self: *@This(), a: std.mem.Allocator) !backend.ReadScope {
+            return backend.readScopeFrom(a, Scope{ .parent = self });
+        }
+    };
+    var txn = Txn{};
+    var scores: [3]?f64 = undefined;
+    _ = try populate(std.testing.allocator, &txn, &.{"p/"}, &.{ "b", "a", "b" }, &.{&scores});
+    try std.testing.expectEqualSlices(?f64, &.{ 3, 3, 3 }, &scores);
+    try std.testing.expectEqual(@as(usize, 1), txn.calls);
+    try std.testing.expectEqual(@as(usize, 1), txn.resets);
+    try std.testing.expectEqual(@as(usize, 1), txn.closed);
+    txn.length = 9;
+    try std.testing.expectError(error.InvalidGraphMetricScore, populate(std.testing.allocator, &txn, &.{"p/"}, &.{ "b", "a", "b" }, &.{&scores}));
+    try std.testing.expectEqual(@as(usize, 2), txn.closed);
+    txn.length = 7;
+    try std.testing.expectError(error.InvalidGraphMetricScore, populate(std.testing.allocator, &txn, &.{"p/"}, &.{ "b", "a", "b" }, &.{&scores}));
+    try std.testing.expectEqual(@as(usize, 3), txn.closed);
+}
+
+test "graph metric physical score reads preserve probe-only and legacy scope fallbacks" {
+    const Probe = struct {
+        pub fn openReadScope(_: *@This(), _: std.mem.Allocator) !@import("../storage/backend_erased.zig").ReadScope {
+            return error.ReadOnly;
+        }
+        raw: [8]u8 = @bitCast(@as(f64, 3)),
+        pub fn getManySorted(self: *@This(), _: []const []const u8, values: []?[]const u8) !void {
+            for (values) |*value| value.* = &self.raw;
+        }
+    };
+    var probe = Probe{};
+    var scores: [2]?f64 = undefined;
+    _ = try populate(std.testing.allocator, &probe, &.{"p/"}, &.{ "b", "a" }, &.{&scores});
+    try std.testing.expectEqualSlices(?f64, &.{ 3, 3 }, &scores);
+    const Legacy = struct {
+        const Scope = struct {
+            raw: [8]u8 = @bitCast(@as(f64, 4)),
+            pub fn getManySorted(self: *@This(), _: []const []const u8, values: []?[]const u8) !void {
+                for (values) |*value| value.* = &self.raw;
+            }
+            pub fn reset(_: *@This()) void {}
+            pub fn close(_: *@This()) void {}
+        };
+        pub fn openReadScope(_: *@This(), _: std.mem.Allocator) !Scope {
+            return .{};
+        }
+        pub fn getManySorted(_: *@This(), _: []const []const u8, _: []?[]const u8) !void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var legacy = Legacy{};
+    _ = try populate(std.testing.allocator, &legacy, &.{"p/"}, &.{ "b", "a" }, &.{&scores});
+    try std.testing.expectEqualSlices(?f64, &.{ 4, 4 }, &scores);
 }

@@ -23988,3 +23988,1059 @@ extern "C" __global__ void termite_laya_packed_geglu_f32(
     float gelu = isfinite(x) ? 0.5f * x * (1.0f + erff(x * 0.7071067811865476f)) : 0.0f;
     dst[i] = gelu * src[(size_t)row * 2u * width + width + col];
 }
+
+// Full-head split-half RoPE for the GLiNER ModernBERT encoder. One thread
+// rotates a pair in both Q and K and copies V from the packed projection,
+// avoiding three slices and repeated trigonometry in separate RoPE launches.
+extern "C" __global__ void termite_gliner_qkv_rope_f32(
+    float* q, float* k, float* v, const float* packed,
+    unsigned int batch, unsigned int sequence, unsigned int heads,
+    unsigned int dimension, float theta
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int half = dimension / 2u;
+    const unsigned int count = batch * sequence * heads * half;
+    if (index >= count) return;
+    const unsigned int chunk = index / half, d = index % half;
+    const unsigned int row = chunk / heads, head = chunk % heads;
+    const unsigned int hidden = heads * dimension;
+    const unsigned int source = row * 3u * hidden + head * dimension + d;
+    const unsigned int dest = chunk * dimension + d;
+    const float frequency = 1.0f / powf(theta, (2.0f * (float)d) / (float)dimension);
+    const float angle = (float)(row % sequence) * frequency;
+    const float s = sinf(angle), c = cosf(angle);
+    const float q0 = packed[source], q1 = packed[source + half];
+    const float k0 = packed[source + hidden], k1 = packed[source + hidden + half];
+    q[dest] = q0 * c - q1 * s;
+    q[dest + half] = q0 * s + q1 * c;
+    k[dest] = k0 * c - k1 * s;
+    k[dest + half] = k0 * s + k1 * c;
+    v[dest] = packed[source + 2u * hidden];
+    v[dest + half] = packed[source + 2u * hidden + half];
+}
+
+// GLiNER ModernBERT: dynamic shared scores cover only the attended key
+// window. Global layers support 8192 keys; local layers retain bounded scratch.
+extern "C" __global__ void termite_gliner_encoder_attention_f32(
+    float* dst, const float* q, const float* k, const float* v,
+    const long long* mask, unsigned int batch, unsigned int seq,
+    unsigned int heads, unsigned int dim, unsigned int radius
+) {
+    const unsigned int row = blockIdx.x;
+    if (row >= batch * seq * heads || seq == 0u || seq > 8192u ||
+        (dim != 64u && dim != 128u) || blockDim.x != 128u) return;
+    const unsigned int tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const unsigned int head = row % heads, qi = (row / heads) % seq;
+    const unsigned int b = row / (heads * seq), hidden = heads * dim;
+    const unsigned int base = (b * seq + qi) * hidden + head * dim;
+    const unsigned int begin = qi > radius ? qi - radius : 0u;
+    const unsigned int end = radius >= seq - 1u - qi ? seq : qi + radius + 1u;
+    float query[4];
+    #pragma unroll
+    for (unsigned int j = 0; j < 4u; ++j)
+        query[j] = lane + j * 32u < dim ? q[base + lane + j * 32u] : 0.0f;
+    extern __shared__ float scores[];
+    __shared__ float partial[4];
+    __shared__ float maximum, denominator;
+    for (unsigned int ki = begin + warp; ki < end; ki += 4u) {
+        const bool valid = !mask || mask[b * seq + ki] != 0ll;
+        float dot = 0.0f;
+        if (valid) {
+            const unsigned int kb = (b * seq + ki) * hidden + head * dim;
+            #pragma unroll
+            for (unsigned int j = 0; j < 4u; ++j)
+                if (lane + j * 32u < dim) dot += query[j] * k[kb + lane + j * 32u];
+        }
+        for (unsigned int shift = 16u; shift; shift >>= 1u)
+            dot += __shfl_down_sync(0xffffffffu, dot, shift);
+        if (lane == 0u) scores[ki - begin] = valid ? dot * rsqrtf((float)dim) : -INFINITY;
+    }
+    __syncthreads();
+    float m = -INFINITY;
+    for (unsigned int ki = begin + tid; ki < end; ki += 128u) m = fmaxf(m, scores[ki - begin]);
+    for (unsigned int shift = 16u; shift; shift >>= 1u)
+        m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, shift));
+    if (lane == 0u) partial[warp] = m;
+    __syncthreads();
+    if (tid == 0u) maximum = fmaxf(fmaxf(partial[0], partial[1]), fmaxf(partial[2], partial[3]));
+    __syncthreads();
+    float sum = 0.0f;
+    for (unsigned int ki = begin + tid; ki < end; ki += 128u) {
+        float p = isfinite(maximum) ? expf(scores[ki - begin] - maximum) : 0.0f;
+        scores[ki - begin] = p;
+        sum += p;
+    }
+    for (unsigned int shift = 16u; shift; shift >>= 1u)
+        sum += __shfl_down_sync(0xffffffffu, sum, shift);
+    if (lane == 0u) partial[warp] = sum;
+    __syncthreads();
+    if (tid == 0u) denominator = (partial[0] + partial[1]) + (partial[2] + partial[3]);
+    __syncthreads();
+    if (tid < dim) {
+        float acc = 0.0f;
+        for (unsigned int ki = begin; ki < end; ++ki)
+            acc += scores[ki - begin] * v[(b * seq + ki) * hidden + head * dim + tid];
+        dst[base + tid] = denominator > 0.0f ? acc / denominator : 0.0f;
+    }
+}
+
+// Diagnostic mixed-precision GLiNER global and local attention. FP16 Q/K/V and
+// probabilities feed tensor cores; online softmax and output accumulate F32.
+// M32/N64 amortizes synchronization across four key fragments. Unlike the
+// vision primitive this consumes per-document key masks, including empty rows.
+extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attention_tc_f16(
+    float* dst, const float* q, const float* k, const float* v,
+    const long long* mask, unsigned int batch, unsigned int seq,
+    unsigned int heads, unsigned int dim, unsigned int radius
+) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    constexpr unsigned int M = 32u, N = 64u, D = 64u, P = 72u, T = 256u; // Skew shared rows to avoid bank conflicts.
+    if (!seq || seq > 8192u || dim != D || blockDim.x != T) return;
+    const unsigned int tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const unsigned int tiles = (seq + M - 1u) / M;
+    const unsigned int start = (blockIdx.x % tiles) * M;
+    const unsigned int matrix = blockIdx.x / tiles, head = matrix % heads, b = matrix / heads;
+    if (b >= batch) return;
+    const unsigned int hidden = heads * D, head_off = head * D;
+    __shared__ __align__(16) half qt[M * P], kt[N * P], vt[N * P], probabilities[M * N];
+    __shared__ __align__(16) float scores[M * N], output[M * D];
+    __shared__ float maximum[M], denominator[M], alpha[M];
+    for (unsigned int i = tid; i < M * D; i += T) {
+        const unsigned int row = i / D, d = i % D;
+        qt[row * P + d] = __float2half_rn(start + row < seq ? q[(b * seq + start + row) * hidden + head_off + d] : 0.0f);
+        output[i] = 0.0f;
+    }
+    if (tid < M) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; }
+    __syncthreads();
+    const unsigned int key_begin = start > radius ? ((start - radius) / N) * N : 0u;
+    const unsigned int key_end = min(seq, start + M + radius);
+    for (unsigned int key_start = key_begin; key_start < key_end; key_start += N) {
+        for (unsigned int i = tid; i < D * N; i += T) {
+            // Keep adjacent lanes on adjacent head dimensions. K is consumed
+            // as a column-major D-by-N matrix, so neither global loads nor
+            // shared stores need the strided sequence-axis transpose.
+            const unsigned int n = i / D, d = i % D, key = key_start + n;
+            const bool valid = key < seq && (!mask || mask[b * seq + key] != 0ll);
+            const unsigned int offset = (b * seq + key) * hidden + head_off + d;
+            kt[n * P + d] = __float2half_rn(valid ? k[offset] : 0.0f);
+            vt[n * P + d] = __float2half_rn(valid ? v[offset] : 0.0f);
+        }
+        __syncthreads();
+        const unsigned int qr = warp / 4u, kc = warp % 4u;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> dot;
+        wmma::fill_fragment(dot, 0.0f);
+        #pragma unroll
+        for (unsigned int d = 0u; d < D; d += 16u) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
+            wmma::load_matrix_sync(qf, qt + qr * 16u * P + d, P);
+            wmma::load_matrix_sync(kf, kt + kc * 16u * P + d, P);
+            wmma::mma_sync(dot, qf, kf, dot);
+        }
+        wmma::store_matrix_sync(scores + qr * 16u * N + kc * 16u, dot, N, wmma::mem_row_major);
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int group = 0u; group < 4u; ++group) {
+            const unsigned int row = warp * 4u + group;
+            float values[2];
+            float next_max = -INFINITY;
+            #pragma unroll
+            for (unsigned int j = 0u; j < 2u; ++j) {
+                const unsigned int n = lane + j * 32u, key = key_start + n;
+                const unsigned int query = start + row;
+                const bool valid = query < seq && key < seq && key + radius >= query && key <= query + radius &&
+                    (!mask || mask[b * seq + key] != 0ll);
+                values[j] = valid ? scores[row * N + n] * 0.125f : -INFINITY;
+                next_max = fmaxf(next_max, values[j]);
+            }
+            for (unsigned int shift = 16u; shift; shift >>= 1u)
+                next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift));
+            next_max = fmaxf(maximum[row], __shfl_sync(0xffffffffu, next_max, 0u));
+            const float a = isfinite(maximum[row]) ? __expf(maximum[row] - next_max) : 0.0f;
+            float sum = 0.0f;
+            #pragma unroll
+            for (unsigned int j = 0u; j < 2u; ++j) {
+                const float p = isfinite(next_max) ? __expf(values[j] - next_max) : 0.0f;
+                probabilities[row * N + lane + j * 32u] = __float2half_rn(p);
+                sum += p;
+            }
+            for (unsigned int shift = 16u; shift; shift >>= 1u)
+                sum += __shfl_down_sync(0xffffffffu, sum, shift);
+            if (lane == 0u) {
+                alpha[row] = a;
+                denominator[row] = denominator[row] * a + sum;
+                maximum[row] = next_max;
+            }
+        }
+        __syncthreads();
+        for (unsigned int i = tid; i < M * D; i += T) output[i] *= alpha[i / D];
+        __syncthreads();
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::load_matrix_sync(acc, output + qr * 16u * D + kc * 16u, D, wmma::mem_row_major);
+        #pragma unroll
+        for (unsigned int n = 0u; n < N; n += 16u) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
+            wmma::load_matrix_sync(pf, probabilities + qr * 16u * N + n, N);
+            wmma::load_matrix_sync(vf, vt + n * P + kc * 16u, P);
+            wmma::mma_sync(acc, pf, vf, acc);
+        }
+        wmma::store_matrix_sync(output + qr * 16u * D + kc * 16u, acc, D, wmma::mem_row_major);
+        __syncthreads();
+    }
+    for (unsigned int i = tid; i < M * D; i += T) {
+        const unsigned int row = i / D, d = i % D;
+        if (start + row < seq)
+            dst[(b * seq + start + row) * hidden + head_off + d] = denominator[row] > 0.0f ? output[i] / denominator[row] : 0.0f;
+    }
+#else
+    (void)dst; (void)q; (void)k; (void)v; (void)mask; (void)batch; (void)seq; (void)heads; (void)dim; (void)radius;
+#endif
+}
+
+// Inference-only boundary attention uses the direct boundary descriptor ABI.
+// A block owns one query/head and reduces 64 keys at a time, avoiding the
+// per-key serial softmax recurrence of the generic boundary kernel. Query and
+// key masks retain the boundary contract: padded query outputs are zero.
+extern "C" __global__ void termite_gliner_boundary_attention_f32(
+    const float* q, const float* k, const float* v, const float* qr,
+    const float* kr, const float* buckets_f32, const float* mask_f32,
+    const float* unused7, const float* unused8, const float* unused9,
+    float* output, Gliner25BoundaryParams p, unsigned int work_items
+) {
+    const uint tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const uint sequence = p.dims[1], heads = p.dims[2], dim = p.dims[3];
+    const uint h = blockIdx.x % heads, qi = (blockIdx.x / heads) % sequence;
+    const uint b = blockIdx.x / (heads * sequence), hidden = heads * dim;
+    const uint qo = (b * sequence + qi) * hidden + h * dim;
+    const int* mask = reinterpret_cast<const int*>(mask_f32);
+    const int* buckets = reinterpret_cast<const int*>(buckets_f32);
+    if (mask[b * sequence + qi] == 0) {
+        if (tid < dim) output[qo + tid] = 0.0f;
+        return;
+    }
+    __shared__ float scores[64], weights[64], partial[4], state[3];
+    __shared__ unsigned int invalid;
+    if (tid == 0u) { state[0] = -INFINITY; state[1] = 0.0f; invalid = 0u; }
+    float value = 0.0f, query[4];
+    for (uint j = 0u; j < 4u; ++j)
+        query[j] = lane + j * 32u < dim ? q[qo + lane + j * 32u] : 0.0f;
+    const float scale = rsqrtf(3.0f * float(dim));
+    __syncthreads();
+    for (uint start = 0u; start < sequence; start += 64u) {
+        const uint count = min(64u, sequence - start);
+        for (uint slot = warp; slot < count; slot += 4u) {
+            const uint ki = start + slot;
+            float score = -INFINITY;
+            if (mask[b * sequence + ki] != 0) {
+                const int bucket = buckets[qi + sequence - 1u - ki];
+                const bool legal = bucket >= 0 && uint(bucket) < p.dims[4];
+                if (!legal && lane == 0u) atomicOr(&invalid, 1u);
+                const uint ko = (b * sequence + ki) * hidden + h * dim;
+                const uint ro = (legal ? uint(bucket) : 0u) * hidden + h * dim;
+                float cc = 0.0f, cp = 0.0f, pc = 0.0f;
+                for (uint j = 0u; j < 4u; ++j) {
+                    const uint d = lane + j * 32u;
+                    if (d < dim) {
+                        const float kv = k[ko + d];
+                        cc += query[j] * kv;
+                        cp += query[j] * kr[ro + d];
+                        pc += kv * qr[ro + d];
+                    }
+                }
+                score = (gliner25_warp_sum(cc) + gliner25_warp_sum(cp) + gliner25_warp_sum(pc)) * scale;
+                if (!isfinite(score) && lane == 0u) atomicOr(&invalid, 1u);
+            }
+            if (lane == 0u) scores[slot] = score;
+        }
+        __syncthreads();
+        float maximum = tid < count ? scores[tid] : -INFINITY;
+        maximum = gliner25_warp_max(maximum);
+        if (lane == 0u) partial[warp] = maximum;
+        __syncthreads();
+        if (tid == 0u) {
+            maximum = state[0];
+            for (uint i = 0u; i < 4u; ++i) maximum = fmaxf(maximum, partial[i]);
+            state[2] = state[1] == 0.0f ? 0.0f : expf(state[0] - maximum);
+            state[0] = maximum;
+        }
+        __syncthreads();
+        float sum = tid < count && scores[tid] != -INFINITY ? expf(scores[tid] - state[0]) : 0.0f;
+        if (tid < count) weights[tid] = sum;
+        sum = gliner25_warp_sum(sum);
+        if (lane == 0u) partial[warp] = sum;
+        __syncthreads();
+        if (tid == 0u) {
+            sum = 0.0f;
+            for (uint i = 0u; i < 4u; ++i) sum += partial[i];
+            state[1] = state[1] * state[2] + sum;
+        }
+        if (tid < dim) {
+            value *= state[2];
+            for (uint i = 0u; i < count; ++i)
+                if (weights[i] != 0.0f)
+                    value += weights[i] * v[(b * sequence + start + i) * hidden + h * dim + tid];
+        }
+        __syncthreads();
+    }
+    if (tid < dim) output[qo + tid] = invalid == 0u && state[1] > 0.0f ? value / state[1] : NAN;
+}
+
+// Diagnostic boundary FP16 attention: compact relative tiles use the exact
+// processor bucket map. Model storage, heads, softmax, and outputs remain F32.
+extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16(
+    const float* q, const float* k, const float* v, const float* q_r,
+    const float* k_r, const float* bucket_values, const float* mask_values,
+    const float* unused7, const float* unused8, const float* unused9,
+    float* dst, Gliner25BoundaryParams p, unsigned int work_items
+) {
+    const unsigned int batch = p.dims[0], seq_len = p.dims[1], num_heads = p.dims[2], head_dim = p.dims[3];
+    const int* mask = reinterpret_cast<const int*>(mask_values);
+    const int* buckets = reinterpret_cast<const int*>(bucket_values);
+    constexpr unsigned int kThreads = 256u;
+    constexpr unsigned int kQueryTile = 16u;
+    constexpr unsigned int kKeyTile = 32u;
+    constexpr unsigned int kHeadDim = 64u;
+    constexpr unsigned int kPitch = 72u;
+    constexpr unsigned int kRelTile = kQueryTile + kKeyTile - 1u;
+    constexpr unsigned int kRelPitch = 48u; // WMMA requires a 16-column tail.
+    constexpr float kNegInf = -3.402823466e+38f;
+    if (seq_len == 0u || seq_len > 16384u || head_dim != kHeadDim || blockDim.x != kThreads) return;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int query_tiles = (seq_len + kQueryTile - 1u) / kQueryTile;
+    const unsigned int block = blockIdx.x;
+    const unsigned int query_tile = block % query_tiles;
+    const unsigned int matrix = block / query_tiles;
+    const unsigned int head = matrix % num_heads;
+    const unsigned int b = matrix / num_heads;
+    if (b >= batch) return;
+
+    const unsigned int hidden = num_heads * kHeadDim;
+    const unsigned int head_off = head * kHeadDim;
+    const unsigned int query_start = query_tile * kQueryTile;
+    const float scale = rsqrtf((float)(kHeadDim * 3u));
+
+    __shared__ __align__(16) half q_tile[kQueryTile * kPitch];
+    // The same coalesced [N,D] storage serves row-major A and column-major B.
+    __shared__ __align__(16) half k_rows[kKeyTile * kPitch];
+    __shared__ __align__(16) half v_tile[kKeyTile * kPitch];
+    // Relative tensors use [R,D] storage and column-major WMMA B views.
+    __shared__ __align__(16) half qr_tile[kPitch * kRelPitch];
+    __shared__ __align__(16) half kr_tile[kPitch * kRelPitch];
+    __shared__ __align__(16) float scores[kQueryTile * kKeyTile];
+    __shared__ __align__(16) float c2p_scores[kQueryTile * kRelPitch];
+    __shared__ __align__(16) float p2c_scores[kKeyTile * kRelPitch];
+    __shared__ __align__(16) half probabilities[kQueryTile * kKeyTile];
+    __shared__ __align__(16) float output[kQueryTile * kHeadDim];
+    __shared__ float running_max[kQueryTile];
+    __shared__ float running_sum[kQueryTile];
+    __shared__ float row_alpha[kQueryTile];
+    __shared__ unsigned int invalid[kQueryTile];
+
+    for (unsigned int index = tid; index < kQueryTile * kHeadDim; index += kThreads) {
+        const unsigned int row = index / kHeadDim;
+        const unsigned int d = index - row * kHeadDim;
+        const unsigned int qi = query_start + row;
+        q_tile[row * kPitch + d] = qi < seq_len ? __float2half_rn(q[(b * seq_len + qi) * hidden + head_off + d]) : __float2half_rn(0.0f);
+        output[index] = 0.0f;
+    }
+    if (tid < kQueryTile) {
+        running_max[tid] = kNegInf;
+        running_sum[tid] = 0.0f;
+        invalid[tid] = 0u;
+    }
+    __syncthreads();
+
+    for (unsigned int key_start = 0u; key_start < seq_len; key_start += kKeyTile) {
+        // The relative window spans r=(query_start - key_start) +
+        // [-(N-1), M-1], exactly the values needed by this score tile.
+        const int rel_low = (int)query_start + (int)seq_len - 1 - ((int)key_start + (int)kKeyTile - 1);
+        for (unsigned int index = tid; index < kHeadDim * kKeyTile; index += kThreads) {
+            const unsigned int n = index / kHeadDim;
+            const unsigned int d = index % kHeadDim;
+            const unsigned int ki = key_start + n;
+            const float kval = ki < seq_len && mask[b * seq_len + ki] != 0 ? k[(b * seq_len + ki) * hidden + head_off + d] : 0.0f;
+            k_rows[n * kPitch + d] = __float2half_rn(kval);
+            v_tile[n * kPitch + d] = __float2half_rn(ki < seq_len && mask[b * seq_len + ki] != 0 ? v[(b * seq_len + ki) * hidden + head_off + d] : 0.0f);
+        }
+        for (unsigned int index = tid; index < kHeadDim * kRelPitch; index += kThreads) {
+            const unsigned int r = index / kHeadDim;
+            const unsigned int d = index % kHeadDim;
+            const int rel = rel_low + (int)r;
+            const int bucket = r < kRelTile && rel >= 0 && rel < (int)(seq_len * 2u - 1u) ? buckets[rel] : -1;
+            const bool valid = bucket >= 0 && (unsigned int)bucket < p.dims[4];
+            const float qrv = valid ? q_r[(unsigned int)bucket * hidden + head_off + d] : 0.0f;
+            const float krv = valid ? k_r[(unsigned int)bucket * hidden + head_off + d] : 0.0f;
+            qr_tile[r * kPitch + d] = __float2half_rn(qrv);
+            kr_tile[r * kPitch + d] = __float2half_rn(krv);
+        }
+        __syncthreads();
+
+        // Q*K^T: two 16x16 fragments, one per warp.
+        if (warp < 2u) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.0f);
+            #pragma unroll
+            for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+                wmma::load_matrix_sync(a_frag, q_tile + d0, kPitch);
+                wmma::load_matrix_sync(b_frag, k_rows + warp * 16u * kPitch + d0, kPitch);
+                wmma::mma_sync(acc, a_frag, b_frag, acc);
+            }
+            wmma::store_matrix_sync(scores + warp * 16u, acc, kKeyTile, wmma::mem_row_major);
+        }
+
+        // Q*Kr^T: three compact relative columns. Warp 2 handles chunks 0/2
+        // and warp 3 handles chunk 1, keeping all relative gathers local.
+        if (warp == 2u || warp == 3u) {
+            const unsigned int first_chunk = warp == 2u ? 0u : 1u;
+            for (unsigned int chunk = first_chunk; chunk < 3u; chunk += 2u) {
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+                wmma::fill_fragment(acc, 0.0f);
+                #pragma unroll
+                for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+                    wmma::load_matrix_sync(a_frag, q_tile + d0, kPitch);
+                    wmma::load_matrix_sync(b_frag, kr_tile + chunk * 16u * kPitch + d0, kPitch);
+                    wmma::mma_sync(acc, a_frag, b_frag, acc);
+                }
+                wmma::store_matrix_sync(c2p_scores + chunk * 16u, acc, kRelPitch, wmma::mem_row_major);
+            }
+        }
+
+        // K*Qr^T: six compact relative fragments.  The result is indexed by
+        // key row so the p2c diagonal is a simple shared-memory gather.
+        if (warp >= 4u) {
+            for (unsigned int work = warp - 4u; work < 6u; work += 4u) {
+                const unsigned int key_chunk = work / 3u;
+                const unsigned int rel_chunk = work - key_chunk * 3u;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+                wmma::fill_fragment(acc, 0.0f);
+                #pragma unroll
+                for (unsigned int d0 = 0u; d0 < kHeadDim; d0 += 16u) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+                    wmma::load_matrix_sync(a_frag, k_rows + (key_chunk * 16u) * kPitch + d0, kPitch);
+                    wmma::load_matrix_sync(b_frag, qr_tile + rel_chunk * 16u * kPitch + d0, kPitch);
+                    wmma::mma_sync(acc, a_frag, b_frag, acc);
+                }
+                wmma::store_matrix_sync(p2c_scores + (key_chunk * 16u) * kRelPitch + rel_chunk * 16u, acc, kRelPitch, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();
+
+        // Eight warps each normalize two query rows.  Scores are kept F32;
+        // only the matrix-A probabilities are narrowed for the P*V MMA.
+        #pragma unroll
+        for (unsigned int sub = 0u; sub < 2u; ++sub) {
+            const unsigned int m = warp * 2u + sub;
+            const unsigned int qi = query_start + m;
+            const unsigned int ki = key_start + lane;
+            float score = kNegInf;
+            if (qi < seq_len && ki < seq_len && mask[b * seq_len + ki] != 0) {
+                const unsigned int rel = m + kKeyTile - 1u - lane;
+                score = (scores[m * kKeyTile + lane] + c2p_scores[m * kRelPitch + rel] + p2c_scores[lane * kRelPitch + rel]) * scale;
+                const int bucket = buckets[qi + seq_len - 1u - ki];
+                if (bucket < 0 || (unsigned int)bucket >= p.dims[4] || !isfinite(score)) atomicOr(&invalid[m], 1u);
+            }
+            scores[m * kKeyTile + lane] = score;
+            float tile_max = score;
+            #pragma unroll
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) tile_max = fmaxf(tile_max, __shfl_down_sync(0xffffffffu, tile_max, offset));
+            tile_max = __shfl_sync(0xffffffffu, tile_max, 0u);
+            const float old_max = running_max[m];
+            const float next_max = fmaxf(old_max, tile_max);
+            const float alpha = old_max > kNegInf * 0.5f ? expf(old_max - next_max) : 0.0f;
+            const float beta = score > kNegInf * 0.5f ? expf(score - next_max) : 0.0f;
+            float tile_sum = beta;
+            #pragma unroll
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) tile_sum += __shfl_down_sync(0xffffffffu, tile_sum, offset);
+            tile_sum = __shfl_sync(0xffffffffu, tile_sum, 0u);
+            probabilities[m * kKeyTile + lane] = __float2half_rn(beta);
+            if (lane == 0u) {
+                running_max[m] = next_max;
+                running_sum[m] = running_sum[m] * alpha + tile_sum;
+                row_alpha[m] = alpha;
+            }
+        }
+        __syncthreads();
+
+        for (unsigned int index = tid; index < kQueryTile * kHeadDim; index += kThreads) {
+            output[index] *= row_alpha[index / kHeadDim];
+        }
+        __syncthreads();
+
+        // P*V: four output-D fragments, accumulated into the online F32
+        // output state.  This is the only value path; no probability tensor
+        // ever reaches device memory.
+        if (warp < 4u) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::load_matrix_sync(acc, output + warp * 16u, kHeadDim, wmma::mem_row_major);
+            #pragma unroll
+            for (unsigned int key_chunk = 0u; key_chunk < 2u; ++key_chunk) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
+                wmma::load_matrix_sync(p_frag, probabilities + key_chunk * 16u, kKeyTile);
+                wmma::load_matrix_sync(v_frag, v_tile + (key_chunk * 16u) * kPitch + warp * 16u, kPitch);
+                wmma::mma_sync(acc, p_frag, v_frag, acc);
+            }
+            wmma::store_matrix_sync(output + warp * 16u, acc, kHeadDim, wmma::mem_row_major);
+        }
+        __syncthreads();
+    }
+
+    for (unsigned int index = tid; index < kQueryTile * kHeadDim; index += kThreads) {
+        const unsigned int m = index / kHeadDim;
+        const unsigned int d = index - m * kHeadDim;
+        const unsigned int qi = query_start + m;
+        if (qi < seq_len) {
+            const float denom = running_sum[m];
+            dst[(b * seq_len + qi) * hidden + head_off + d] = mask[b * seq_len + qi] == 0 ? 0.0f :
+                (invalid[m] == 0u && denom > 0.0f ? output[index] / denom : NAN);
+        }
+    }
+}
+
+// Long global attention reuses each K/V tile across 64 queries. The online
+// output lives in WMMA fragments; score storage becomes probabilities and a
+// 32-row rescaling scratch after every lane has consumed its scores.
+extern "C" __global__ __launch_bounds__(256) void termite_gliner_encoder_attention_tc_f16_m64(
+    float* dst, const float* q, const float* k, const float* v,
+    const long long* mask, unsigned int batch, unsigned int seq,
+    unsigned int heads, unsigned int dim, unsigned int radius
+) {
+    constexpr unsigned int M = 64u, N = 64u, D = 64u, P = 72u, S = 68u, T = 256u;
+    if (!seq || seq > 8192u || dim != D || radius < seq || blockDim.x != T) return;
+    const unsigned int tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const unsigned int tiles = (seq + M - 1u) / M;
+    const unsigned int start = (blockIdx.x % tiles) * M;
+    const unsigned int matrix = blockIdx.x / tiles, head = matrix % heads, b = matrix / heads;
+    if (b >= batch) return;
+    const unsigned int hidden = heads * D, head_off = head * D;
+    __shared__ __align__(16) half qt[M * P], kt[N * P], vt[N * P];
+    __shared__ __align__(16) float shared_scores[M * P / 2u + 32u * S];
+    half* probabilities = reinterpret_cast<half*>(shared_scores);
+    float* scratch = shared_scores + M * P / 2u;
+    __shared__ float maximum[M], denominator[M], alpha[M];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> output[2];
+    #pragma unroll
+    for (unsigned int g = 0u; g < 2u; ++g) wmma::fill_fragment(output[g], 0.0f);
+    for (unsigned int i = tid; i < M * D; i += T) {
+        const unsigned int row = i / D, d = i % D;
+        qt[row * P + d] = __float2half_rn(start + row < seq ? q[(b * seq + start + row) * hidden + head_off + d] : 0.0f);
+    }
+    if (tid < M) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; }
+    __syncthreads();
+    for (unsigned int key_start = 0u; key_start < seq; key_start += N) {
+        for (unsigned int i = tid; i < N * D; i += T) {
+            const unsigned int row = i / D, d = i % D, key = key_start + row;
+            const bool valid = key < seq && (!mask || mask[b * seq + key] != 0ll);
+            const unsigned int offset = (b * seq + key) * hidden + head_off + d;
+            kt[row * P + d] = __float2half_rn(valid ? k[offset] : 0.0f);
+            vt[row * P + d] = __float2half_rn(valid ? v[offset] : 0.0f);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int g = 0u; g < 2u; ++g) {
+            const unsigned int qr = warp / 4u + g * 2u, kc = warp % 4u;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> dot;
+            wmma::fill_fragment(dot, 0.0f);
+            #pragma unroll
+            for (unsigned int d = 0u; d < D; d += 16u) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
+                wmma::load_matrix_sync(qf, qt + qr * 16u * P + d, P);
+                wmma::load_matrix_sync(kf, kt + kc * 16u * P + d, P);
+                wmma::mma_sync(dot, qf, kf, dot);
+            }
+            wmma::store_matrix_sync(shared_scores + qr * 16u * S + kc * 16u, dot, S, wmma::mem_row_major);
+        }
+        __syncthreads();
+        float staged_probabilities[8][2];
+        #pragma unroll
+        for (unsigned int g = 0u; g < 8u; ++g) {
+            const unsigned int row = warp * 8u + g;
+            float values[2], next_max = -INFINITY;
+            #pragma unroll
+            for (unsigned int j = 0u; j < 2u; ++j) {
+                const unsigned int n = lane + j * 32u, key = key_start + n;
+                const bool valid = start + row < seq && key < seq && (!mask || mask[b * seq + key] != 0ll);
+                values[j] = valid ? shared_scores[row * S + n] * 0.125f : -INFINITY;
+                next_max = fmaxf(next_max, values[j]);
+            }
+            for (unsigned int shift = 16u; shift; shift >>= 1u)
+                next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift));
+            next_max = fmaxf(maximum[row], __shfl_sync(0xffffffffu, next_max, 0u));
+            const float a = isfinite(maximum[row]) ? __expf(maximum[row] - next_max) : 0.0f;
+            float sum = 0.0f;
+            #pragma unroll
+            for (unsigned int j = 0u; j < 2u; ++j) {
+                const float p = isfinite(next_max) ? __expf(values[j] - next_max) : 0.0f;
+                staged_probabilities[g][j] = p;
+                sum += p;
+            }
+            for (unsigned int shift = 16u; shift; shift >>= 1u)
+                sum += __shfl_down_sync(0xffffffffu, sum, shift);
+            if (lane == 0u) {
+                alpha[row] = a;
+                denominator[row] = denominator[row] * a + sum;
+                maximum[row] = next_max;
+            }
+        }
+        // Half probabilities alias the lower half of shared score storage.
+        // No writer may reuse it before every warp has read all of its rows.
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int g = 0u; g < 8u; ++g) {
+            const unsigned int row = warp * 8u + g;
+            #pragma unroll
+            for (unsigned int j = 0u; j < 2u; ++j)
+                probabilities[row * P + lane + j * 32u] = __float2half_rn(staged_probabilities[g][j]);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int g = 0u; g < 2u; ++g) {
+            const unsigned int qr = warp / 4u, dc = warp % 4u;
+            // WMMA's fragment layout is opaque. Store, rescale by row, and
+            // reload through the public API instead of assuming lane mapping.
+            wmma::store_matrix_sync(scratch + qr * 16u * S + dc * 16u, output[g], S, wmma::mem_row_major);
+            __syncthreads();
+            for (unsigned int i = tid; i < 32u * D; i += T) scratch[(i / D) * S + i % D] *= alpha[g * 32u + i / D];
+            __syncthreads();
+            wmma::load_matrix_sync(output[g], scratch + qr * 16u * S + dc * 16u, S, wmma::mem_row_major);
+            #pragma unroll
+            for (unsigned int n = 0u; n < N; n += 16u) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
+                wmma::load_matrix_sync(pf, probabilities + (g * 32u + qr * 16u) * P + n, P);
+                wmma::load_matrix_sync(vf, vt + n * P + dc * 16u, P);
+                wmma::mma_sync(output[g], pf, vf, output[g]);
+            }
+            __syncthreads();
+        }
+    }
+    #pragma unroll
+    for (unsigned int g = 0u; g < 2u; ++g) {
+        wmma::store_matrix_sync(scratch + (warp / 4u) * 16u * S + (warp % 4u) * 16u, output[g], S, wmma::mem_row_major);
+        __syncthreads();
+        for (unsigned int i = tid; i < 32u * D; i += T) {
+            const unsigned int row = g * 32u + i / D, d = i % D;
+            if (start + row < seq)
+                dst[(b * seq + start + row) * hidden + head_off + d] = denominator[row] > 0.0f ? scratch[(i / D) * S + d] / denominator[row] : 0.0f;
+        }
+        __syncthreads();
+    }
+}
+
+// Wider direct boundary attention for sequences of at least 512 tokens.
+// Query/key fragments stay in registers; 16-column relative tiles scatter
+// only their diagonal gathers. This requires no global relative-product cache
+// and preserves the same admitted workspace contract as the short tile.
+extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16_m64(
+    const float* q, const float* k, const float* v, const float* q_r,
+    const float* k_r, const float* bucket_values, const float* mask_values,
+    const float* unused7, const float* unused8, const float* unused9,
+    float* dst, Gliner25BoundaryParams p, unsigned int work_items
+) {
+    const unsigned int batch=p.dims[0], seq=p.dims[1], heads=p.dims[2], dim=p.dims[3], relative_rows=p.dims[4];
+    const int* mask=reinterpret_cast<const int*>(mask_values);
+    const int* buckets=reinterpret_cast<const int*>(bucket_values);
+    constexpr unsigned int M = 64u, N = 64u, D = 64u, P = 72u, S = 68u, C = 20u, T = 256u;
+    if (!seq || seq > 16384u || dim != D || blockDim.x != T) return;
+    const unsigned int tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const unsigned int tiles = (seq + M - 1u) / M;
+    const unsigned int start = (blockIdx.x % tiles) * M;
+    const unsigned int matrix = blockIdx.x / tiles, head = matrix % heads, b = matrix / heads;
+    if (b >= batch) return;
+    const unsigned int hidden = heads * D, head_off = head * D;
+    __shared__ __align__(16) half kv[N * P], qr[16u * P], kr[16u * P];
+    __shared__ __align__(16) float shared_scores[M * P / 2u + 32u * S];
+    __shared__ __align__(16) float relative_scores[2u * M * C];
+    half* qt = reinterpret_cast<half*>(shared_scores);
+    half* probabilities = reinterpret_cast<half*>(shared_scores);
+    float* scratch = shared_scores + M * P / 2u;
+    __shared__ float maximum[M], denominator[M], alpha[M];
+    __shared__ unsigned int invalid[M];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> output[2];
+    wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> rows[4];
+    #pragma unroll
+    for (unsigned int g = 0u; g < 2u; ++g) wmma::fill_fragment(output[g], 0.0f);
+    for (unsigned int i = tid; i < M * D; i += T) {
+        const unsigned int row = i / D, d = i % D;
+        qt[row * P + d] = __float2half_rn(start + row < seq ? q[(b * seq + start + row) * hidden + head_off + d] : 0.0f);
+    }
+    if (tid < M) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; invalid[tid] = 0u; }
+    __syncthreads();
+    if (warp < 4u) {
+        #pragma unroll
+        for (unsigned int d=0u;d<4u;++d) wmma::load_matrix_sync(rows[d], qt+warp*16u*P+d*16u, P);
+    }
+    __syncthreads();
+    for (unsigned int key_start = 0u; key_start < seq; key_start += N) {
+        for (unsigned int i = tid; i < N * D; i += T) {
+            const unsigned int row = i / D, d = i % D, key = key_start + row;
+            const bool valid = key < seq && (!mask || mask[b * seq + key] != 0ll);
+            const unsigned int offset = (b * seq + key) * hidden + head_off + d;
+            kv[row * P + d] = __float2half_rn(valid ? k[offset] : 0.0f);
+        }
+        __syncthreads();
+        if (warp < 4u) {
+            #pragma unroll
+            for (unsigned int kc=0u;kc<4u;++kc) {
+                wmma::fragment<wmma::accumulator,16,16,16,float> dot;
+                wmma::fill_fragment(dot,0.0f);
+                #pragma unroll
+                for (unsigned int d=0u;d<4u;++d) {
+                    wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> keys;
+                    wmma::load_matrix_sync(keys,kv+kc*16u*P+d*16u,P);
+                    wmma::mma_sync(dot,rows[d],keys,dot);
+                }
+                wmma::store_matrix_sync(shared_scores+warp*16u*S+kc*16u,dot,S,wmma::mem_row_major);
+            }
+        } else {
+            #pragma unroll
+            for (unsigned int d=0u;d<4u;++d) wmma::load_matrix_sync(rows[d],kv+(warp-4u)*16u*P+d*16u,P);
+        }
+        __syncthreads();
+        // Both relative products are computed in compact 16-column tiles.
+        // Scatter only their exact diagonal gather into QK before reusing the
+        // tile. No token-by-relative or quadratic global buffer is needed.
+        for (unsigned int rs=0u;rs<M+N-1u;rs+=16u) {
+            for (unsigned int i=tid;i<16u*D;i+=T) {
+                const unsigned int r=i/D,d=i%D;
+                const int offset=(int)start+(int)seq-1-(int)key_start-(int)(N-1u)+(int)rs+(int)r;
+                const int bucket=offset>=0 && offset<(int)(2u*seq-1u)?buckets[offset]:-1;
+                const bool valid=bucket>=0 && (unsigned int)bucket<relative_rows;
+                qr[r*P+d]=__float2half_rn(valid?q_r[(unsigned int)bucket*hidden+head_off+d]:0.0f);
+                kr[r*P+d]=__float2half_rn(valid?k_r[(unsigned int)bucket*hidden+head_off+d]:0.0f);
+            }
+            __syncthreads();
+            wmma::fragment<wmma::accumulator,16,16,16,float> relative;
+            wmma::fill_fragment(relative,0.0f);
+            #pragma unroll
+            for (unsigned int d=0u;d<4u;++d) {
+                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> rf;
+                wmma::load_matrix_sync(rf,(warp<4u?kr:qr)+d*16u,P);
+                wmma::mma_sync(relative,rows[d],rf,relative);
+            }
+            wmma::store_matrix_sync(relative_scores+warp*16u*C,relative,C,wmma::mem_row_major);
+            __syncthreads();
+            for (unsigned int i=tid;i<M*16u;i+=T) {
+                const unsigned int row=i/16u,r=rs+i%16u;
+                const int col=(int)row+(int)N-1-(int)r;
+                if (col>=0 && col<(int)N)
+                    shared_scores[row*S+col]=(shared_scores[row*S+col]+relative_scores[row*C+i%16u])+relative_scores[M*C+(unsigned int)col*C+i%16u];
+            }
+            __syncthreads();
+        }
+        float staged_probabilities[8][2];
+        #pragma unroll
+        for (unsigned int g = 0u; g < 8u; ++g) {
+            const unsigned int row = warp * 8u + g;
+            float values[2], next_max = -INFINITY;
+            #pragma unroll
+            for (unsigned int j = 0u; j < 2u; ++j) {
+                const unsigned int n = lane + j * 32u, key = key_start + n;
+                const bool valid = start + row < seq && key < seq && (!mask || mask[b * seq + key] != 0ll);
+                float score=-INFINITY;
+                if (valid) {
+                    const int bucket=buckets[start+row+seq-1u-key];
+                    if (bucket<0 || (unsigned int)bucket>=relative_rows) atomicOr(&invalid[row],1u);
+                    else {
+                        score=shared_scores[row*S+n]*rsqrtf(192.0f);
+                        if (!isfinite(score)) atomicOr(&invalid[row],1u);
+                    }
+                }
+                values[j] = score;
+                next_max = fmaxf(next_max, values[j]);
+            }
+            for (unsigned int shift = 16u; shift; shift >>= 1u)
+                next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift));
+            next_max = fmaxf(maximum[row], __shfl_sync(0xffffffffu, next_max, 0u));
+            const float a = isfinite(maximum[row]) ? expf(maximum[row] - next_max) : 0.0f;
+            float sum = 0.0f;
+            #pragma unroll
+            for (unsigned int j = 0u; j < 2u; ++j) {
+                const float p = isfinite(next_max) ? expf(values[j] - next_max) : 0.0f;
+                staged_probabilities[g][j] = p;
+                sum += p;
+            }
+            for (unsigned int shift = 16u; shift; shift >>= 1u)
+                sum += __shfl_down_sync(0xffffffffu, sum, shift);
+            if (lane == 0u) {
+                alpha[row] = a;
+                denominator[row] = denominator[row] * a + sum;
+                maximum[row] = next_max;
+            }
+        }
+        // Half probabilities alias the lower half of shared score storage.
+        // No writer may reuse it before every warp has read all of its rows.
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int g = 0u; g < 8u; ++g) {
+            const unsigned int row = warp * 8u + g;
+            #pragma unroll
+            for (unsigned int j = 0u; j < 2u; ++j)
+                probabilities[row * P + lane + j * 32u] = __float2half_rn(staged_probabilities[g][j]);
+        }
+        __syncthreads();
+        for (unsigned int i=tid;i<N*D;i+=T) {
+            const unsigned int row=i/D,d=i%D,key=key_start+row;
+            const bool valid=key<seq && (!mask||mask[b*seq+key]!=0);
+            kv[row*P+d]=__float2half_rn(valid?v[(b*seq+key)*hidden+head_off+d]:0.0f);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int g = 0u; g < 2u; ++g) {
+            const unsigned int qr = warp / 4u, dc = warp % 4u;
+            // WMMA's fragment layout is opaque. Store, rescale by row, and
+            // reload through the public API instead of assuming lane mapping.
+            wmma::store_matrix_sync(scratch + qr * 16u * S + dc * 16u, output[g], S, wmma::mem_row_major);
+            __syncthreads();
+            for (unsigned int i = tid; i < 32u * D; i += T) scratch[(i / D) * S + i % D] *= alpha[g * 32u + i / D];
+            __syncthreads();
+            wmma::load_matrix_sync(output[g], scratch + qr * 16u * S + dc * 16u, S, wmma::mem_row_major);
+            #pragma unroll
+            for (unsigned int n = 0u; n < N; n += 16u) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
+                wmma::load_matrix_sync(pf, probabilities + (g * 32u + qr * 16u) * P + n, P);
+                wmma::load_matrix_sync(vf, kv + n * P + dc * 16u, P);
+                wmma::mma_sync(output[g], pf, vf, output[g]);
+            }
+            __syncthreads();
+        }
+    }
+    #pragma unroll
+    for (unsigned int g = 0u; g < 2u; ++g) {
+        wmma::store_matrix_sync(scratch + (warp / 4u) * 16u * S + (warp % 4u) * 16u, output[g], S, wmma::mem_row_major);
+        __syncthreads();
+        for (unsigned int i = tid; i < 32u * D; i += T) {
+            const unsigned int row = g * 32u + i / D, d = i % D;
+            if (start + row < seq)
+                dst[(b * seq + start + row) * hidden + head_off + d] = (mask && mask[b*seq+start+row]==0) ? 0.0f : (invalid[row]==0u && denominator[row] > 0.0f ? scratch[(i / D) * S + i % D] / denominator[row] : NAN);
+        }
+        __syncthreads();
+    }
+}
+
+// Long-sequence direct attention. Adjacent equal relative buckets share one
+// product; the run list is derived from every actual bucket, so arbitrary
+// non-monotonic maps remain correct. Products, score addition and expf retain
+// the wider tile's arithmetic. No global cache or additional workspace.
+extern "C" __global__ __launch_bounds__(256) void termite_gliner_boundary_attention_tc_f16_compact(
+    const float* q, const float* k, const float* v, const float* q_r,
+    const float* k_r, const float* bucket_values, const float* mask_values,
+    const float* unused7, const float* unused8, const float* unused9,
+    float* dst, Gliner25BoundaryParams p, unsigned int work_items
+) {
+    const unsigned int batch=p.dims[0], seq=p.dims[1], heads=p.dims[2], dim=p.dims[3], relative_rows=p.dims[4];
+    const int* mask=reinterpret_cast<const int*>(mask_values);
+    const int* buckets=reinterpret_cast<const int*>(bucket_values);
+    constexpr unsigned int M = 64u, N = 64u, D = 64u, P = 72u, S = 68u, C = 20u, T = 256u;
+    if (!seq || seq > 16384u || dim != D || blockDim.x != T) return;
+    const unsigned int tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const unsigned int tiles = (seq + M - 1u) / M;
+    const unsigned int start = (blockIdx.x % tiles) * M;
+    const unsigned int matrix = blockIdx.x / tiles, head = matrix % heads, b = matrix / heads;
+    if (b >= batch) return;
+    const unsigned int hidden = heads * D, head_off = head * D;
+    __shared__ __align__(16) half kv[N * P], qr[16u * P], kr[16u * P];
+    __shared__ __align__(16) float shared_scores[M * P / 2u + 32u * S];
+    __shared__ __align__(16) float relative_scores[2u * M * C];
+    half* qt = reinterpret_cast<half*>(shared_scores);
+    half* probabilities = reinterpret_cast<half*>(shared_scores);
+    float* scratch = shared_scores + M * P / 2u;
+    __shared__ float maximum[M], denominator[M], alpha[M];
+    __shared__ unsigned int invalid[M], warp_counts[8], run_start[128], run_count;
+    __shared__ int run_bucket[128];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> output[2];
+    wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> rows[4];
+    #pragma unroll
+    for (unsigned int g = 0u; g < 2u; ++g) wmma::fill_fragment(output[g], 0.0f);
+    for (unsigned int i = tid; i < M * D; i += T) {
+        const unsigned int row = i / D, d = i % D;
+        qt[row * P + d] = __float2half_rn(start + row < seq ? q[(b * seq + start + row) * hidden + head_off + d] : 0.0f);
+    }
+    if (tid < M) { maximum[tid] = -INFINITY; denominator[tid] = 0.0f; invalid[tid] = 0u; }
+    __syncthreads();
+    if (warp < 4u) {
+        #pragma unroll
+        for (unsigned int d=0u;d<4u;++d) wmma::load_matrix_sync(rows[d], qt+warp*16u*P+d*16u, P);
+    }
+    __syncthreads();
+    for (unsigned int key_start = 0u; key_start < seq; key_start += N) {
+        for (unsigned int i = tid; i < N * D; i += T) {
+            const unsigned int row = i / D, d = i % D, key = key_start + row;
+            const bool valid = key < seq && (!mask || mask[b * seq + key] != 0ll);
+            const unsigned int offset = (b * seq + key) * hidden + head_off + d;
+            kv[row * P + d] = __float2half_rn(valid ? k[offset] : 0.0f);
+        }
+        __syncthreads();
+        if (warp < 4u) {
+            #pragma unroll
+            for (unsigned int kc=0u;kc<4u;++kc) {
+                wmma::fragment<wmma::accumulator,16,16,16,float> dot;
+                wmma::fill_fragment(dot,0.0f);
+                #pragma unroll
+                for (unsigned int d=0u;d<4u;++d) {
+                    wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> keys;
+                    wmma::load_matrix_sync(keys,kv+kc*16u*P+d*16u,P);
+                    wmma::mma_sync(dot,rows[d],keys,dot);
+                }
+                wmma::store_matrix_sync(shared_scores+warp*16u*S+kc*16u,dot,S,wmma::mem_row_major);
+            }
+        } else {
+            #pragma unroll
+            for (unsigned int d=0u;d<4u;++d) wmma::load_matrix_sync(rows[d],kv+(warp-4u)*16u*P+d*16u,P);
+        }
+        __syncthreads();
+        // Both relative products are computed in compact 16-column tiles.
+        // Scatter only their exact diagonal gather into QK before reusing the
+        // tile. No token-by-relative or quadratic global buffer is needed.
+        const int first_offset=(int)start+(int)seq-1-(int)key_start-(int)(N-1u);
+        const int here=first_offset+(int)tid;
+        const int bucket_value=here>=0 && here<(int)(2u*seq-1u)?buckets[here]:-1;
+        const int previous=here>0 && here<=(int)(2u*seq-1u)?buckets[here-1]:-1;
+        const bool begins=tid<M+N-1u && (tid==0 || bucket_value!=previous);
+        unsigned int prefix=begins?1u:0u;
+        #pragma unroll
+        for (unsigned int d=1;d<32;d*=2) { unsigned int earlier=__shfl_up_sync(0xffffffffu,prefix,d); if(lane>=d)prefix+=earlier; }
+        if (lane==31u)warp_counts[warp]=prefix;
+        __syncthreads();
+        for (unsigned int w=0;w<warp;++w)prefix+=warp_counts[w];
+        if (begins) { run_start[prefix-1u]=tid;run_bucket[prefix-1u]=bucket_value; }
+        if (tid==M+N-2u)run_count=prefix;
+        __syncthreads();
+        const bool uniform=run_count==1u;
+        const unsigned int relative_count=run_count;
+        for (unsigned int rs=0u;rs<relative_count;rs+=16u) {
+            for (unsigned int i=tid;i<16u*D;i+=T) {
+                const unsigned int r=i/D,d=i%D;
+                const int bucket=rs+r<run_count?run_bucket[rs+r]:-1;
+                const bool valid=bucket>=0 && (unsigned int)bucket<relative_rows;
+                qr[r*P+d]=__float2half_rn(valid?q_r[(unsigned int)bucket*hidden+head_off+d]:0.0f);
+                kr[r*P+d]=__float2half_rn(valid?k_r[(unsigned int)bucket*hidden+head_off+d]:0.0f);
+            }
+            __syncthreads();
+            wmma::fragment<wmma::accumulator,16,16,16,float> relative;
+            wmma::fill_fragment(relative,0.0f);
+            #pragma unroll
+            for (unsigned int d=0u;d<4u;++d) {
+                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> rf;
+                wmma::load_matrix_sync(rf,(warp<4u?kr:qr)+d*16u,P);
+                wmma::mma_sync(relative,rows[d],rf,relative);
+            }
+            wmma::store_matrix_sync(relative_scores+warp*16u*C,relative,C,wmma::mem_row_major);
+            __syncthreads();
+            if (uniform) {
+                for (unsigned int i=tid;i<M*N;i+=T) {
+                    const unsigned int row=i/N,col=i%N;
+                    shared_scores[row*S+col]=(shared_scores[row*S+col]+relative_scores[row*C])+relative_scores[M*C+col*C];
+                }
+            } else for (unsigned int i=tid;i<M*16u;i+=T) {
+                const unsigned int row=i/16u,r=rs+i%16u;
+                if (r<run_count) {
+                    const int lo=max(0,(int)row+(int)N-(int)(r+1u<run_count?run_start[r+1u]:M+N-1u));
+                    const int hi=min((int)N,(int)row+(int)N-(int)run_start[r]);
+                    for (int col=lo;col<hi;++col)
+                        shared_scores[row*S+col]=(shared_scores[row*S+col]+relative_scores[row*C+i%16u])+relative_scores[M*C+(unsigned int)col*C+i%16u];
+                }
+            }
+            __syncthreads();
+        }
+        float staged_probabilities[8][2];
+        #pragma unroll
+        for (unsigned int g = 0u; g < 8u; ++g) {
+            const unsigned int row = warp * 8u + g;
+            float values[2], next_max = -INFINITY;
+            #pragma unroll
+            for (unsigned int j = 0u; j < 2u; ++j) {
+                const unsigned int n = lane + j * 32u, key = key_start + n;
+                const bool valid = start + row < seq && key < seq && (!mask || mask[b * seq + key] != 0ll);
+                float score=-INFINITY;
+                if (valid) {
+                    const int bucket=buckets[start+row+seq-1u-key];
+                    if (bucket<0 || (unsigned int)bucket>=relative_rows) atomicOr(&invalid[row],1u);
+                    else {
+                        score=shared_scores[row*S+n]*rsqrtf(192.0f);
+                        if (!isfinite(score)) atomicOr(&invalid[row],1u);
+                    }
+                }
+                values[j] = score;
+                next_max = fmaxf(next_max, values[j]);
+            }
+            for (unsigned int shift = 16u; shift; shift >>= 1u)
+                next_max = fmaxf(next_max, __shfl_down_sync(0xffffffffu, next_max, shift));
+            next_max = fmaxf(maximum[row], __shfl_sync(0xffffffffu, next_max, 0u));
+            const float a = isfinite(maximum[row]) ? expf(maximum[row] - next_max) : 0.0f;
+            float sum = 0.0f;
+            #pragma unroll
+            for (unsigned int j = 0u; j < 2u; ++j) {
+                const float p = isfinite(next_max) ? expf(values[j] - next_max) : 0.0f;
+                staged_probabilities[g][j] = p;
+                sum += p;
+            }
+            for (unsigned int shift = 16u; shift; shift >>= 1u)
+                sum += __shfl_down_sync(0xffffffffu, sum, shift);
+            if (lane == 0u) {
+                alpha[row] = a;
+                denominator[row] = denominator[row] * a + sum;
+                maximum[row] = next_max;
+            }
+        }
+        // Half probabilities alias the lower half of shared score storage.
+        // No writer may reuse it before every warp has read all of its rows.
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int g = 0u; g < 8u; ++g) {
+            const unsigned int row = warp * 8u + g;
+            #pragma unroll
+            for (unsigned int j = 0u; j < 2u; ++j)
+                probabilities[row * P + lane + j * 32u] = __float2half_rn(staged_probabilities[g][j]);
+        }
+        __syncthreads();
+        for (unsigned int i=tid;i<N*D;i+=T) {
+            const unsigned int row=i/D,d=i%D,key=key_start+row;
+            const bool valid=key<seq && (!mask||mask[b*seq+key]!=0);
+            kv[row*P+d]=__float2half_rn(valid?v[(b*seq+key)*hidden+head_off+d]:0.0f);
+        }
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int g = 0u; g < 2u; ++g) {
+            const unsigned int qr = warp / 4u, dc = warp % 4u;
+            // WMMA's fragment layout is opaque. Store, rescale by row, and
+            // reload through the public API instead of assuming lane mapping.
+            wmma::store_matrix_sync(scratch + qr * 16u * S + dc * 16u, output[g], S, wmma::mem_row_major);
+            __syncthreads();
+            for (unsigned int i = tid; i < 32u * D; i += T) scratch[(i / D) * S + i % D] *= alpha[g * 32u + i / D];
+            __syncthreads();
+            wmma::load_matrix_sync(output[g], scratch + qr * 16u * S + dc * 16u, S, wmma::mem_row_major);
+            #pragma unroll
+            for (unsigned int n = 0u; n < N; n += 16u) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
+                wmma::load_matrix_sync(pf, probabilities + (g * 32u + qr * 16u) * P + n, P);
+                wmma::load_matrix_sync(vf, kv + n * P + dc * 16u, P);
+                wmma::mma_sync(output[g], pf, vf, output[g]);
+            }
+            __syncthreads();
+        }
+    }
+    #pragma unroll
+    for (unsigned int g = 0u; g < 2u; ++g) {
+        wmma::store_matrix_sync(scratch + (warp / 4u) * 16u * S + (warp % 4u) * 16u, output[g], S, wmma::mem_row_major);
+        __syncthreads();
+        for (unsigned int i = tid; i < 32u * D; i += T) {
+            const unsigned int row = g * 32u + i / D, d = i % D;
+            if (start + row < seq)
+                dst[(b * seq + start + row) * hidden + head_off + d] = (mask && mask[b*seq+start+row]==0) ? 0.0f : (invalid[row]==0u && denominator[row] > 0.0f ? scratch[(i / D) * S + i % D] / denominator[row] : NAN);
+        }
+        __syncthreads();
+    }
+}

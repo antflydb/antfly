@@ -18,6 +18,91 @@ Fixed protocol per cell: 3 warmup iterations, 20 measured iterations, quiet
 machine (no other GPU work), report p50/p95 latency and embeddings/sec. For the
 pretokenized bench also record real tok/s vs padded tok/s (padding waste).
 
+## Short-query and capacity results — 2026-10-01
+
+The local short-query and capacity implementation was measured on an Apple M4
+with 16 GiB RAM and macOS 26.5. The candidate was the uncommitted working tree
+over `60dbc97e27648e9744b91a1449482576e8684d97`; its executable SHA-256 was
+`35b506fd745cc2fb7434f53fd85a3c2c48d791129abf9a8c76411f09d7334839`.
+Both endpoints used the identical 0.6B Q8_0 GGUF with SHA-256
+`06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439`.
+The reference was llama.cpp `b8990-660b1b4bd`, executable SHA-256
+`8eee1b1fa1c65d919c94116dd286134a4a9498059c21c1ee448c45fb87f2c590`.
+The [compact qualification summary](reports/qwen3_embedding_metal_gap_m4_q8_summary.md)
+records results, provenance hashes, failures, and qualification limits. Complete
+raw receipts retain all measured rounds, source/model/fixture hashes, live process
+arguments, tests, and soak memory samples outside Git; their hashes and local
+archive location are recorded in the summary.
+
+Each cell ran three rounds of three warmups and twenty alternating AB/BA
+endpoint measurements. Exact-token fixtures include EOS. Query lengths include
+the complete rendered instruction prefix; reference slots were erased before
+each query outside timing. Every measured vector was checked against the
+reference. The table reports the worst confidence lower bound and p95 ratio
+across the three rounds, rather than selecting the best round.
+
+| Input | Tokens including EOS | Candidate mean latency | Lowest 95% throughput-ratio bound | Highest candidate/reference p95 ratio |
+|-------|----------------------|------------------------|----------------------------------|---------------------------------------|
+| Document | 20 | 23.495–23.533 ms | 1.038 | 0.973 |
+| Document | 32 | 24.066–24.221 ms | 1.010 | 0.978 |
+| Document | 64 | 35.868–35.932 ms | 1.189 | 0.849 |
+| Rendered query | 32 | 23.157–23.755 ms | 1.029 | 0.959 |
+| Rendered query | 64 | 36.255–36.501 ms | 1.164 | 0.889 |
+
+All 15 short rounds passed the lower-bound >=1.0 and p95-ratio <=1.05 gates.
+The lowest short-vector cosine was 0.9999977587. All three 32×256 capacity rounds
+passed at the default derived scratch/combined limits with a 4 GiB process
+budget. Their confidence lower bounds were 1.240, 1.244 and 1.216 against
+llama.cpp, with minimum cosine 0.9999899002. Mean request latency ranged from
+6.364 to 7.115 seconds. The API accepted all 32 rows; internal chunks were bounded
+by actual padded tokens and memory admission.
+
+All 18 paired fixed-audit-baseline regression rounds passed across six supported
+shapes (256/511/2551-token singletons, 8×20, 32×20 and 8×256). The worst lower
+bound was 0.990 against the required 0.95. This lane used explicit 1536 MiB
+scratch and 3072 MiB combined caps on both builds to admit the long singleton.
+Those overrides were absent from the capacity and soak lanes. The llama.cpp
+reference used a bounded 2048-token physical microbatch, or the full singleton
+length when longer, while accepting the same API batch. These results do not
+qualify an unbounded physical microbatch.
+
+All 25 HTTP correctness checks passed: ragged row order, finite/unit vectors,
+32/256/1024 dimensions, query-prefix limits, both error policies, partial-result
+indexes, disconnect/overload recovery and eviction/reload. The local harness
+suite passed 132 tests. The Hugging Face tokenizer suite passed 82 tests; one
+optional installed SPLADE-fixture test skipped. Focused admission/ownership and
+physical Metal checks
+passed 28 selected tests; four final short-kernel checks and an existing-kernel
+fallback replay passed with no skips. The final checks include real Q/KV/FFN
+widths and row boundaries 1/8/9/16/20/31/32/33/64/65.
+
+The initial final-binary soak completed 1835.94 seconds with 243 requests,
+7776 vectors, zero failures, unchanged worker PIDs and no host swap growth.
+Downward RSS transitions in its final half produced a 110.03 MiB range against
+the 32 MiB allowance, so that run failed the plateau gate. The cause of those
+residency changes is unproven. Its failing result remains in the summary and
+archived raw receipt.
+
+A separate repeat used a fixed 600-second, eight-worker conditioning phase
+followed by an independent 1800-second measured phase on the same supervisor
+and worker. Conditioning completed 113 requests with zero failures. The measured
+phase completed 1829.51 seconds, 310 requests and 9920 vectors with zero failures,
+no worker restart and no host swap growth. Its final-half RSS range was 2.203 MiB;
+the unchanged criterion is max-minus-min <= max(32 MiB, 5% mean). All returned
+rows retained same-binary order/vector parity at cosine >=0.99999. The archived
+raw receipt contains both full memory trajectories and the conditioning driver source.
+This is qualification of the explicitly conditioned steady-state run; it does
+not reclassify the initial failing soak.
+
+Those historical runs explicitly enabled the three serving controls:
+`TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS=1`,
+`TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING=1`, and
+`TERMITE_METAL_ENABLE_QWEN3_HEAD_NORM_SG=1`. The later
+[merged-branch default qualification](../metal_serving_defaults_m4_summary.md)
+records the current M4 default policy and fresh results. Qualification required Metal and
+resident execution. Other Apple devices, precision tiers, 4B/8B models, the full
+32K context and canonical CI remain separate qualification work.
+
 ## Native CPU admission qualification — 2026-09-04
 
 An Apple arm64 host loaded the managed Q8_0 bundle through the production model

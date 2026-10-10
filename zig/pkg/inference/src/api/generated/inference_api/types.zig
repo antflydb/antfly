@@ -2921,6 +2921,8 @@ pub const ModelRef = struct {
     /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
     name: []const u8,
     backend: ?ModelBackend = null,
+    /// Per-model GLiNER CUDA inference precision for extractor preloads. Requires CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests fail closed until the exact model/profile has release qualification. Precision is part of the loaded-session cache identity.
+    cuda_precision: ?[]const u8 = null,
     format: ?ModelFormat = null,
     quantization: ?ModelQuantization = null,
     /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits. Other model geometries reject this field.
@@ -2933,6 +2935,7 @@ pub const ModelRef = struct {
         .{ "kind", "kind", false },
         .{ "name", "name", false },
         .{ "backend", "backend", true },
+        .{ "cuda_precision", "cuda_precision", true },
         .{ "format", "format", true },
         .{ "quantization", "quantization", true },
         .{ "residency_mode", "residency_mode", true },
@@ -2955,6 +2958,10 @@ pub const ModelRef = struct {
         try jw.write(self.name);
         if (self.backend) |value| {
             try jw.objectField("backend");
+            try jw.write(value);
+        }
+        if (self.cuda_precision) |value| {
+            try jw.objectField("cuda_precision");
             try jw.write(value);
         }
         if (self.format) |value| {

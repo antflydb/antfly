@@ -4848,7 +4848,7 @@ export interface components {
          */
         SQLRequest: {
             /**
-             * @description Direct read-only statement visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. Not supported with sessions, connections or prepared execution.
+             * @description Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable external reads and accepted pgwire execution are not supported.
              * @default committed
              * @enum {string}
              */
@@ -19254,6 +19254,7 @@ export interface components {
             model_identity?: string;
             input?: string;
             inputs?: components["schemas"]["DecisionInput"][];
+            long_document?: components["schemas"]["InferenceDecideLongDocument"];
             questions: components["schemas"]["InferenceDecideQuestion"][];
             embedding_options?: components["schemas"]["EmbeddingDecisionOptions"];
         };
@@ -19800,6 +19801,14 @@ export interface components {
              */
             name: string;
             backend?: components["schemas"]["InferenceModelBackend"];
+            /**
+             * @description Per-model GLiNER CUDA inference precision for extractor preloads. Requires
+             *     CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests
+             *     fail closed until the exact model/profile has release qualification.
+             *     Precision is part of the loaded-session cache identity.
+             * @enum {string}
+             */
+            cuda_precision?: "auto" | "fp32" | "fp16" | "bf16";
             format?: components["schemas"]["InferenceModelFormat"];
             quantization?: components["schemas"]["InferenceModelQuantization"];
             /**
@@ -21080,6 +21089,23 @@ export interface components {
         DecisionInput: {
             id?: string;
             input: string;
+        };
+        /** @description Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text. */
+        InferenceDecideLongDocument: {
+            /**
+             * @default reject
+             * @enum {string}
+             */
+            mode?: "reject" | "window";
+            /** @default 1024 */
+            window_words?: number;
+            /**
+             * @description Must be smaller than window_words. Only valid in window mode.
+             * @default 32
+             */
+            overlap_words?: number;
+            /** @default 128 */
+            max_windows?: number;
         };
         /** @description Local decision models use string choice identifiers. Embedding category examples replace the description with their normalized centroid; trained models reject examples. */
         DecisionChoice: {
