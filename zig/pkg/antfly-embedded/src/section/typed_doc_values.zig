@@ -650,6 +650,8 @@ pub const TypedDocValuesReader = struct {
     num_chunks: u32,
     owned_offsets: ?[]u8 = null,
     indexed: bool = false,
+    /// Exact summary retained only after directory and footer validation.
+    largest_decoded_chunk: ?u64 = null,
     chunks_start: ?u64 = null,
     chunks_end: ?u64 = null,
     point_cache: ?*PointCache = null,
@@ -1109,7 +1111,7 @@ pub const TypedDocValuesReader = struct {
         const index = self.chunkAtOrAfterDoc(doc) orelse return null;
         return if (doc < self.chunkInfo(index).?.first) null else index;
     }
-    fn validateDirectory(self: *const TypedDocValuesReader) !void {
+    fn validateDirectory(self: *TypedDocValuesReader) !void {
         if (!self.indexed) return;
         var previous: ?u32 = null;
         var largest: u64 = 0;
@@ -1125,6 +1127,7 @@ pub const TypedDocValuesReader = struct {
         var summary: [8]u8 = undefined;
         if (self.range) |range| try range.view.readInto(range.view.length - 16, &summary) else @memcpy(&summary, self.data[self.data.len - 16 ..][0..8]);
         if (std.mem.readInt(u64, &summary, .little) != largest) return error.InvalidData;
+        self.largest_decoded_chunk = largest;
     }
     fn normalizeChunk(self: *const TypedDocValuesReader, index: u32, bytes: []u8) !void {
         const info = self.chunkInfo(index) orelse return;
