@@ -20,6 +20,26 @@ pub fn lockApply(owner: anytype, controls: ?lock.ApplyRwLock.Acquisition) !void 
     }
 }
 
+/// Pass the same original admission through the process-wide mutation/capture
+/// gate before acquiring snapshot/apply service fences. No new owner or time.
+pub fn acquireReplicationMutationShared(owner: anytype, controls: ?lock.ApplyRwLock.Acquisition) !?@import("antfly_runtime_abi").mutation_barrier.MutationBarrier.SharedLease {
+    const barrier = owner.replicationMutationBarrier() orelse return null;
+    if (controls) |original| {
+        const Adapter = struct {
+            original: lock.ApplyRwLock.Acquisition,
+            pub fn checkpoint(self: *@This()) !void {
+                try self.original.lifetime.check();
+            }
+            pub fn executionBoundary(self: *@This()) @TypeOf(self.original.execution_wait) {
+                return self.original.execution_wait;
+            }
+        };
+        var adapter: Adapter = .{ .original = original };
+        return try barrier.acquireSharedControlled(owner.core.apply_mutex.io orelse return error.MissingBackendRuntimeIo, &adapter);
+    }
+    return barrier.acquireShared();
+}
+
 test "mutation apply admission rechecks activation after original CPU resumption" {
     const std = @import("std");
     const native = @import("../../common/runnable_scheduler.zig");
@@ -148,4 +168,184 @@ test "mutation apply admission original rejection and missing Io leave legacy fe
     owner.core.unlockApply();
     try std.testing.expect(mutex.tryLockExclusive());
     mutex.unlockExclusive();
+}
+
+test "mutation apply admission replication barrier preserves original CPU lifetime and capture intent" {
+    const std = @import("std");
+    const runtime = @import("antfly_runtime_abi");
+    const native = @import("../../common/runnable_scheduler.zig");
+    const budgets = @import("../../api/mutation_admission_controls.zig");
+    const Barrier = runtime.mutation_barrier.MutationBarrier;
+    const Clock = struct {
+        var current: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return current.load(.acquire);
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            return @as(*const std.atomic.Value(bool), @ptrCast(@alignCast(raw))).load(.acquire);
+        }
+    };
+    const Bridge = struct {
+        fn from(raw: *anyopaque) *native.Execution {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn life(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            from(raw).checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+            return .ok;
+        }
+        fn check(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            @panic("lifetime checks must not yield under a mutation lease");
+        }
+        fn current(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+            out.* = @backingInt(from(raw).retainedClass() catch |err| return runtime.error_abi.statusFromError(err));
+            return .ok;
+        }
+        fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+            if (reason != @backingInt(runtime.runnable_abi.Wait.resource)) return runtime.error_abi.statusFromError(error.InvalidArgument);
+            from(raw).park(.resource_blocked) catch |err| return runtime.error_abi.statusFromError(err);
+            return .ok;
+        }
+        fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
+            const captured = std.enums.fromInt(native.Class, class) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+            from(raw).enter(captured) catch |err| return runtime.error_abi.statusFromError(err);
+            return .ok;
+        }
+    };
+    const Owner = struct {
+        barrier: *Barrier,
+        core: struct { apply_mutex: lock.ApplyRwLock },
+        pub fn replicationMutationBarrier(self: *@This()) ?*Barrier {
+            return self.barrier;
+        }
+    };
+    const Worker = struct {
+        scheduler: *native.Scheduler,
+        owner: *Owner,
+        io: std.Io,
+        canceled: *std.atomic.Value(bool),
+        exclusive: bool,
+        execution: native.Execution = .{},
+        ready: std.Io.Event = .unset,
+        finished: std.Io.Event = .unset,
+        err: ?anyerror = null,
+        acquired: bool = false,
+        fn run(self: *@This()) void {
+            self.execute() catch |err| {
+                self.err = err;
+                self.ready.set(self.io);
+            };
+            self.finished.set(self.io);
+        }
+        fn execute(self: *@This()) !void {
+            try self.execution.start(self.scheduler, .{ .io = self.io, .retained_bytes = 256, .native_now_ns = Clock.now, .deadline_ns = 20 * std.time.ns_per_s, .cancellation = .{ .ptr = self.canceled, .requested = Clock.canceled } }, .write);
+            const borrow: runtime.runnable_abi.Borrowed = .{ .context = &self.execution, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.query), .checkpoint = Bridge.check, .check_lifetime = Bridge.life, .current_class = Bridge.current, .park = Bridge.park, .enter = Bridge.enter };
+            var budget = budgets.init(.{}, borrow, self.io);
+            self.ready.set(self.io);
+            if (self.exclusive) {
+                var lease = try self.owner.barrier.acquireExclusiveControlled(self.io, &budget);
+                defer lease.release();
+                self.acquired = true;
+                try std.testing.expectEqual(native.Class.write, try self.execution.retainedClass());
+            } else {
+                var lease = (try acquireReplicationMutationShared(self.owner, budgets.acquisition(&budget))).?;
+                defer lease.release();
+                self.acquired = true;
+                // Reentrant metadata/transaction work retains the same outer
+                // physical lease and performs no new wait or CPU transition.
+                var nested = (try acquireReplicationMutationShared(self.owner, budgets.acquisition(&budget))).?;
+                try std.testing.expect(nested.nested);
+                nested.release();
+                try std.testing.expectEqual(native.Class.write, try self.execution.retainedClass());
+            }
+        }
+    };
+    const Case = enum { success, canceled, expired, closed };
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |exclusive| {
+        for (std.enums.values(Case)) |case| {
+            Clock.current.store(0, .release);
+            defer Clock.current.store(0, .release);
+            var barrier: Barrier = .{};
+            var owner: Owner = .{ .barrier = &barrier, .core = .{ .apply_mutex = .{ .io = io } } };
+            var shared: ?Barrier.SharedLease = if (exclusive) barrier.acquireShared() else null;
+            var captured: ?Barrier.ExclusiveLease = if (!exclusive) barrier.acquireExclusive() else null;
+            var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+            defer scheduler.close();
+            var canceled: std.atomic.Value(bool) = .init(false);
+            var worker: Worker = .{ .scheduler = &scheduler, .owner = &owner, .io = io, .canceled = &canceled, .exclusive = exclusive };
+            defer worker.execution.finish();
+            var group: std.Io.Group = .init;
+            defer {
+                if (shared) |*lease| {
+                    lease.release();
+                    shared = null;
+                }
+                if (captured) |*lease| {
+                    lease.release();
+                    captured = null;
+                }
+                group.await(io) catch {};
+            }
+            group.async(io, Worker.run, .{&worker});
+            try worker.ready.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            var observed = false;
+            for (0..1000) |_| {
+                if (scheduler.stats().resource_blocked == 1) {
+                    observed = true;
+                    break;
+                }
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+            try std.testing.expect(observed);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 256), scheduler.stats().retained_bytes);
+            if (exclusive) {
+                try std.testing.expectEqual(@as(u64, 1), barrier.pendingExclusiveAcquisitions());
+                // Writer intent closes new reader admission while CPU is free.
+                const unexpectedly_open = barrier.reader_gate.tryLock();
+                if (unexpectedly_open) barrier.reader_gate.unlock();
+                try std.testing.expect(!unexpectedly_open);
+            } else try std.testing.expectEqual(@as(u64, 1), barrier.pendingSharedAcquisitions());
+            var health: native.Execution = .{};
+            defer health.finish();
+            try health.start(&scheduler, .{ .io = io, .allow_wait = false }, .control);
+            try health.checkpoint();
+            health.finish();
+            if (case == .canceled) canceled.store(true, .release);
+            if (case == .expired) Clock.current.store(20 * std.time.ns_per_s, .release);
+            if (case == .closed) scheduler.close();
+            if (shared) |*lease| {
+                lease.release();
+                shared = null;
+            }
+            if (captured) |*lease| {
+                lease.release();
+                captured = null;
+            }
+            try worker.finished.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            group.await(io) catch {};
+            if (case == .success) {
+                try std.testing.expect(worker.err == null and worker.acquired);
+            } else {
+                const expected: anyerror = switch (case) {
+                    .canceled => error.Canceled,
+                    .expired => error.DeadlineExceeded,
+                    .closed => error.SchedulerClosed,
+                    .success => unreachable,
+                };
+                try std.testing.expectEqual(@as(?anyerror, expected), worker.err);
+                try std.testing.expect(!worker.acquired);
+            }
+            try std.testing.expectEqual(@as(u64, 0), barrier.pendingSharedAcquisitions());
+            try std.testing.expectEqual(@as(u64, 0), barrier.pendingExclusiveAcquisitions());
+            var reusable = barrier.tryAcquireExclusive() orelse return error.TestExpectedReleasedBarrier;
+            reusable.release();
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            worker.execution.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        }
+    }
 }

@@ -77,6 +77,56 @@ pub const MutationBarrier = struct {
         return .{ .barrier = self };
     }
 
+    /// Original non-yielding controls provide checkpoint() and an optional
+    /// executionBoundary(). Keep their owner alive through physical acquisition.
+    pub fn acquireSharedControlled(self: *@This(), io: std.Io, controls: anytype) !SharedLease {
+        try controls.checkpoint();
+        if (shared_barrier) |held| {
+            if (held != self) return error.InvalidArgument;
+            shared_depth += 1;
+            var lease: SharedLease = .{ .barrier = self, .nested = true };
+            errdefer lease.release();
+            try controls.checkpoint();
+            return lease;
+        }
+        _ = self.shared_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.shared_waiters.fetchSub(1, .acq_rel);
+        while (!self.tryLockShared()) try waitControlled(io, controls);
+        shared_barrier = self;
+        shared_depth = 1;
+        var lease: SharedLease = .{ .barrier = self };
+        errdefer lease.release();
+        try controls.checkpoint();
+        return lease;
+    }
+
+    /// Close reader admission before waiting for existing mutations. The
+    /// writer intent survives CPU parking, but every rejection releases it.
+    pub fn acquireExclusiveControlled(self: *@This(), io: std.Io, controls: anytype) !ExclusiveLease {
+        try controls.checkpoint();
+        if (shared_barrier == self) return error.InvalidArgument;
+        _ = self.exclusive_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.exclusive_waiters.fetchSub(1, .acq_rel);
+        while (!self.reader_gate.tryLock()) try waitControlled(io, controls);
+        errdefer self.reader_gate.unlock();
+        while (!self.resource_mutex.tryLock()) try waitControlled(io, controls);
+        errdefer self.resource_mutex.unlock();
+        try controls.checkpoint();
+        return .{ .barrier = self };
+    }
+
+    fn waitControlled(io: std.Io, controls: anytype) !void {
+        try controls.checkpoint();
+        const boundary = controls.executionBoundary();
+        if (boundary) |wait| try wait.beginWait();
+        // Finite owner-Io polling avoids a CPU spin without introducing a
+        // second clock/deadline. Reentry is mandatory even after I/O rejection.
+        const result = io.sleep(.fromMilliseconds(1), .awake);
+        if (boundary) |wait| try wait.endWait();
+        try result;
+        try controls.checkpoint();
+    }
+
     pub fn tryAcquireShared(self: *@This()) ?SharedLease {
         if (shared_barrier) |held| {
             if (held != self) return null;

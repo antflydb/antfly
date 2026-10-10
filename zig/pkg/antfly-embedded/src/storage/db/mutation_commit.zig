@@ -252,7 +252,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
             if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             if (!opts.bypass_replication_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
-            var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
+            var replication_mutation = if (opts.bypass_replication_write_gate) null else try @import("mutation_admission.zig").acquireReplicationMutationShared(self, opts.admission_controls);
             defer if (replication_mutation) |*lease| lease.release();
             if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrier();
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();

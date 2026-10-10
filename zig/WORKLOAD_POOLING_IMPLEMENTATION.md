@@ -1606,3 +1606,18 @@ relational/participant tests, and the compilation accounting/ownership tool has
 12 passing checks using Zig 0.17. Complete physical integration is still required
 to qualify these bindings and physical mutation/activation behavior. Runtime,
 resource/performance and automatic default gates remain open.
+
+Pre-decision batch admission now carries its original controls through the
+process-wide replication mutation barrier before snapshot/apply admission. The
+controlled shared and exclusive barrier APIs park only while acquiring a lease,
+then require CPU reacquisition before proceeding. Exclusive acquisition closes
+new reader admission while waiting for existing mutations, and rejection releases
+that capture intent. Nested shared acquisition retains the original physical
+lease and checks the same lifetime without creating another execution owner.
+
+The focused native scheduler fixture exercises both directions with one ordinary
+CPU slot, protected health progress, cancellation, original-clock deadline expiry
+and scheduler shutdown, checking barrier reuse and retained operation/byte charges
+through physical joining. Production capture callers and durable local resolve
+still need execution-control transport and their complete service-wait dependency
+graph; these APIs alone do not qualify that graph or automatic defaults.
