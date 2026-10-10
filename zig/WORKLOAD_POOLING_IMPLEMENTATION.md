@@ -2432,5 +2432,26 @@ rejection fixture now uses the owner type alignment as its inaccessible sentinel
 It still requires `InvalidAbiVersion` before inspecting the appended owner, with
 no context created. This changes only the fixture; separately linked storage
 execution remains a cumulative integration gate. The observed streaming boolean
-score mismatch also remains unresolved and must not be hidden by loosening its
-exact score assertions.
+score mismatch is addressed by the constrained-arithmetic correction below;
+separately compiled consumer integration remains pending.
+
+### Constrained streaming text scores
+
+The mixed-field randomized oracle exposed a one-unit f32 difference in the
+producer-constrained result at iteration 2. Boosted match lowering previously
+selected legacy per-term boost arithmetic only for bitmap constraints, while
+the all-hit reference used it for document-ID lists as well. Streaming term
+and match lowering now use the existing complete constraint predicate, including
+producer constraints, in both immutable lowering and segment binding. Redundant
+bitmap-only flags are removed. No score assertions or tolerances are changed.
+
+The focused scoring gate now includes all streaming boolean regressions. Native
+qualification passes 45 checks with one existing skip, covering the randomized
+all-hit and producer comparisons, full-window versus bounded ordering, positional
+verification, distributed statistics, shared preparation and parallel workspaces.
+Linux qualification and the separately compiled consumer are still pending.
+This does not qualify managed streaming parallelism: authority-aware streaming
+still requires independently owned children, bounded CPU stages and physical
+retirement before removing its existing fallback. Whole-request allocation
+coverage, runtime envelopes, throughput/fairness measurements and defaults
+also remain incomplete.
