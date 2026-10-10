@@ -205,8 +205,6 @@ const Execution = struct {
         const self: *Execution = @ptrCast(@alignCast(raw));
         var result: types.SparseOrdinalSelection = .{};
         errdefer result.deinit();
-        // Materialize only inexpensive masks. Broad constraints are checked
-        // against reached native identities inside bounded DAAT scoring.
         if (self.vector_include_provider) |provider| if (provider.complete == null) {
             result.residual = true;
             return result;
@@ -214,22 +212,35 @@ const Execution = struct {
         if (self.vector_exclude_provider) |provider| {
             if (provider.complete == null) result.residual = true;
         }
-        if (self.includeSet()) |include| {
-            if (include.boundedCardinality(4096) == null) {
-                result.residual = true;
-                return result;
+        // Translate compressed blocks under a live-byte and directory-work
+        // budget, independently of row cardinality. The pinned sparse directory
+        // proves physical-to-native identity; older generations get bounded
+        // point seeks. No partial mask is ever admitted.
+        result = try types.SparseOrdinalSelection.initBounded(a, 4 * 1024 * 1024);
+        if (self.vector_exclude_provider) |provider| result.residual = provider.complete == null;
+        self.planSparseSets(&result, lookup) catch |err| {
+            if (err == error.OrdinalPlanningBudgetExceeded or (err == error.OutOfMemory and result.budget.?.exhausted)) {
+                result.deinit();
+                return .{ .residual = true };
             }
-            // Subtract in physical space before resolving a selective include;
-            // a broad exclusion need not be converted for one included row.
-            result.include = try self.selectSparseSet(a, lookup, include, self.excludeSet());
-        } else if (self.excludeSet()) |exclude| {
-            if (exclude.boundedCardinality(4096) == null) result.residual = true else result.exclude = try self.selectSparseSet(a, lookup, exclude, null);
-        }
+            return err;
+        };
         return result;
     }
-    fn selectSparseSet(self: *Execution, a: A, lookup: types.SparseOrdinalLookup, selection_set: *const @import("lake_index_physical_set.zig").Set, subtract: ?*const @import("lake_index_physical_set.zig").Set) !local.encoding_roaring.RoaringBitmap {
+    fn planSparseSets(self: *Execution, result: *types.SparseOrdinalSelection, lookup: types.SparseOrdinalLookup) !void {
+        var work: types.SparseOrdinalWorkBudget = .{};
+        if (self.includeSet()) |include| {
+            result.include = try self.selectSparseSet(result.allocator(), lookup, include, self.excludeSet(), &work);
+        } else if (self.excludeSet()) |exclude| {
+            result.exclude = try self.selectSparseSet(result.allocator(), lookup, exclude, null, &work);
+        }
+        try result.prepareRead();
+    }
+    fn selectSparseSet(self: *Execution, a: A, lookup: types.SparseOrdinalLookup, selection_set: *const @import("lake_index_physical_set.zig").Set, subtract: ?*const @import("lake_index_physical_set.zig").Set, work: *types.SparseOrdinalWorkBudget) !local.encoding_roaring.RoaringBitmap {
         var result = local.encoding_roaring.RoaringBitmap.init(a);
         errdefer result.deinit();
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
         var files = selection_set.files.iterator();
         while (files.next()) |file| {
             const digest = self.private_digests.get(file.key_ptr.*) orelse return error.ExternalLakeSnapshotMismatch;
@@ -238,16 +249,29 @@ const Execution = struct {
                 try self.context.ensureActive();
                 var prefix: [80]u8 = undefined;
                 const bytes_prefix = try std.fmt.bufPrint(&prefix, "lake2:{s}:{x:0>8}:", .{ digest, block.key_ptr.group });
-                var selection = try block.value_ptr.clone(a);
+                _ = scratch.reset(.retain_capacity);
+                var selection = try block.value_ptr.clone(scratch.allocator());
                 defer selection.deinit();
                 if (subtract) |exclude| if (exclude.files.getPtr(file.key_ptr.*)) |excluded_blocks| if (excluded_blocks.getPtr(block.key_ptr.*)) |excluded| selection.andNotWith(excluded);
                 if (selection.isEmpty()) continue;
-                if (try lookup.block(lookup.ptr, a, bytes_prefix, block.key_ptr.high, &selection, &result)) continue;
+                if (lookup.bounded_block) |translate| {
+                    if (try translate(lookup.ptr, a, bytes_prefix, block.key_ptr.high, &selection, &result, work)) continue;
+                } else {
+                    // A legacy block callback is safe only for a small mask.
+                    // Broad generations require the work-accounted directory.
+                    if (selection.cardinality() <= work.points) {
+                        try work.takeBlock();
+                        if (try lookup.block(lookup.ptr, a, bytes_prefix, block.key_ptr.high, &selection, &result)) {
+                            work.points -= selection.cardinality();
+                            continue;
+                        }
+                    }
+                }
+                if (selection.cardinality() > work.points) return error.OrdinalPlanningBudgetExceeded;
                 var rows = selection.iterator();
-                var visited: usize = 0;
                 while (rows.next()) |low| {
-                    if (visited % 256 == 0) try self.context.ensureActive();
-                    visited += 1;
+                    try work.takePoint();
+                    if (work.points % 256 == 0) try self.context.ensureActive();
                     const row = (@as(u64, block.key_ptr.high) << 32) | low;
                     var key: [96]u8 = undefined;
                     const bytes = try std.fmt.bufPrint(&key, "lake2:{s}:{x:0>8}:{x:0>16}", .{ digest, block.key_ptr.group, row });
@@ -1235,4 +1259,82 @@ test "external lake sparse predicate planning defers broad masks and subtracts s
     defer point.deinit();
     try std.testing.expect(!point.residual and point.include.?.contains(42));
     try std.testing.expectEqual(@as(usize, 1), lookup.calls);
+}
+
+test "external lake sparse predicate planning translates broad blocks within work and byte caps" {
+    const a = std.testing.allocator;
+    const Bitmap = local.encoding_roaring.RoaringBitmap;
+    const Set = @import("lake_index_physical_set.zig").Set;
+    var execution: Execution = undefined;
+    execution.vector_include_provider = null;
+    execution.vector_exclude_provider = null;
+    execution.vector_include = null;
+    execution.vector_exclude = Set.init(a);
+    defer execution.vector_exclude.?.deinit();
+    execution.private_digests = .empty;
+    defer execution.private_digests.deinit(a);
+    execution.context = .{ .io = std.testing.io };
+    const digest: [64]u8 = @splat('0');
+    try execution.private_digests.put(a, "file", &digest);
+    try execution.vector_exclude.?.addBlock(.{ .file = "file", .group = 0, .base = 0, .selection = .{ .interval = .{ .lower = 0, .count = 100000 } } });
+    const Lookup = struct {
+        mode: enum { complete, work, memory } = .complete,
+        blocks: usize = 0,
+        fn one(_: *anyopaque, _: []const u8) !?u32 {
+            return error.UnexpectedPointSeek;
+        }
+        fn legacy(_: *anyopaque, _: A, _: []const u8, _: u32, _: *const Bitmap, _: *Bitmap) !bool {
+            return error.UnexpectedLegacyBlock;
+        }
+        fn block(raw: *anyopaque, alloc: A, _: []const u8, _: u32, rows: *const Bitmap, result: *Bitmap, work: *types.SparseOrdinalWorkBudget) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.blocks += 1;
+            try work.takeBlock();
+            if (self.mode != .complete) try result.add(42);
+            switch (self.mode) {
+                .work => return error.OrdinalPlanningBudgetExceeded,
+                .memory => {
+                    const oversized = try alloc.alloc(u8, 4 * 1024 * 1024 + 1);
+                    defer alloc.free(oversized);
+                },
+                .complete => {},
+            }
+            try result.orWith(rows);
+            return true;
+        }
+    };
+    var lookup: Lookup = .{};
+    const native: types.SparseOrdinalLookup = .{ .ptr = &lookup, .one = Lookup.one, .block = Lookup.legacy, .bounded_block = Lookup.block };
+    var result = (try Execution.selectSparseConstraints(&execution, a, native)).?;
+    defer result.deinit();
+    try std.testing.expect(!result.residual and result.include == null);
+    try std.testing.expectEqual(@as(usize, 100000), result.exclude.?.cardinality());
+    try std.testing.expect(result.budget.?.live < 128 * 1024);
+    try std.testing.expectEqual(@as(usize, 1), lookup.blocks);
+    for ([_]@TypeOf(lookup.mode){ .work, .memory }) |mode| {
+        lookup.mode = mode;
+        var fallback = (try Execution.selectSparseConstraints(&execution, a, native)).?;
+        defer fallback.deinit();
+        try std.testing.expect(fallback.residual and fallback.include == null and fallback.exclude == null and fallback.budget == null);
+    }
+    lookup.mode = .complete;
+    const Failure = struct {
+        fn run(alloc: A, owner: *Execution, resolve: types.SparseOrdinalLookup) !void {
+            var selection = (try Execution.selectSparseConstraints(owner, alloc, resolve)).?;
+            defer selection.deinit();
+            try std.testing.expect(!selection.residual);
+            try std.testing.expectEqual(@as(usize, 100000), selection.exclude.?.cardinality());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.run, .{ &execution, native });
+    // Subtract a broad exclusion before choosing legacy point work. A broad
+    // include can have a one-row difference and must still get an exact seek.
+    execution.vector_include = Set.init(a);
+    defer execution.vector_include.?.deinit();
+    try execution.vector_include.?.addBlock(.{ .file = "file", .group = 0, .base = 0, .selection = .{ .interval = .{ .lower = 0, .count = 100001 } } });
+    var difference = (try Execution.selectSparseConstraints(&execution, a, native)).?;
+    defer difference.deinit();
+    try std.testing.expect(!difference.residual);
+    try std.testing.expectEqual(@as(usize, 1), difference.include.?.cardinality());
+    try std.testing.expect(difference.include.?.contains(100000));
 }

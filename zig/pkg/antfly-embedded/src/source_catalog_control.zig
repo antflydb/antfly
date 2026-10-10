@@ -57,9 +57,9 @@ pub const api_table_create_contract = @import("api/table_create_contract.zig");
 pub const api_table_index_config = @import("api/table_index_config.zig");
 pub const api_table_read_source = @import("api/table_read_source.zig");
 pub const api_table_write_source = @import("api/table_write_source.zig");
+pub const api_relational_activation_worker = @import("api/relational_activation_worker.zig");
+pub const api_relational_constraint_recovery = @import("api/relational_constraint_recovery.zig");
 pub const asset_producer_runtime = @import("asset_producer_runtime.zig");
-pub const capi_handles = @import("capi/handles.zig");
-pub const capi_sql = @import("capi/sql.zig");
 pub const capi_types = @import("capi/types.zig");
 pub const chunking_mod = @import("chunking/mod.zig");
 pub const chunking_types = @import("chunking/types.zig");
@@ -594,7 +594,6 @@ pub const cmd_cli_io = @import("cmd/cli/io.zig");
 pub const cmd_cli_backup_wait = @import("cmd/cli/backup_wait.zig");
 pub const cmd_lite = @import("cmd/lite.zig");
 
-pub const capi_embedded_root = @import("capi_embedded_root.zig");
 
 comptime {
     if (builtin.is_test) {

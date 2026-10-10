@@ -281,7 +281,9 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
     count = 10003
     rows = pa.table(
         {
-            "body": ["common"] * count,
+            "body": [
+                "common phrase" if i % 2 == 0 else "phrase common" for i in range(count)
+            ],
             "category": ["story"] * 2 + ["comment"] * (count - 2),
             "amount": range(count),
             "sparse_native": ['{"1":1}'] * (count - 1) + ['{"1":1,"97":1}'],
@@ -407,6 +409,41 @@ def test_indexed_metadata_conjunctions_preserve_sort_and_cursor_pages(
         for restart in (False, True):
             if restart:
                 server.restart()
+            # Positional verification composes with a Boolean scorer and
+            # indexed metadata candidate providers, including exclusions.
+            phrase_filter = {
+                "conjuncts": [
+                    category,
+                    {"range": {"path": "/amount", "gte": count - 5}},
+                ]
+            }
+            phrase_query = {
+                "conjuncts": [
+                    {"match_phrase": "common phrase", "field": "body"},
+                    {"term": "common", "field": "body"},
+                ]
+            }
+            phrase_request = {
+                "full_text_search": phrase_query,
+                "filter_query": phrase_filter,
+                "fields": ["amount"],
+                "limit": 10,
+            }
+            phrase_result = call("POST", "/tables/sort_pages/query", phrase_request)
+            assert {h["_source"]["amount"] for h in phrase_result["hits"]["hits"]} == {
+                i for i in range(count - 5, count) if i % 2 == 0
+            }
+            phrase_excluded = call(
+                "POST",
+                "/tables/sort_pages/query",
+                dict(
+                    phrase_request,
+                    exclusion_query={"term": {"path": "/amount", "value": count - 3}},
+                ),
+            )
+            assert {
+                h["_source"]["amount"] for h in phrase_excluded["hits"]["hits"]
+            } == {i for i in range(count - 5, count) if i % 2 == 0 and i != count - 3}
             # A rare posting can probe a broad indexed physical predicate;
             # a common posting must cross the budget into full membership.
             sparse_base = {

@@ -838,3 +838,112 @@ allocation-failure and signed-score differential checks remain enabled.
 The real Parquet/Iceberg E2E fixture additionally exercises cold/warm selective
 conjunctions, rare/common candidates across independent metadata indexes, transition
 to a selective intersection, and composed exclusions, before and after restart.
+
+## Follow-up to #1051: compressed sparse masks, segment plans and positions
+
+The branch merges main's embedded SQL/catalog changes without changing the lake
+query API or native artifact formats. Three further native execution refinements
+address the remaining review opportunities.
+
+### Sparse constraints bounded by compressed state and translation work
+
+Completed physical sets no longer face a 4,096-matching-row cutoff. Sparse
+planning translates authenticated physical-directory blocks into native ordinal
+bitmaps in the same pinned read transaction. Consecutive native ordinals are
+coalesced into ranges; no external key list or complement is constructed. An
+include subtracts a completed exclusion in physical space before translation,
+so even two broad sets can yield an inexpensive selective ordinal mask.
+
+Optional planning owns a stable live-byte budget for masks, navigation and
+reusable translation scratch (4 MiB), plus shared directory/legacy-seek work
+budgets (4,096 physical directory blocks and 4,096 legacy identity point seeks).
+The directory block bound limits each native translation to 1,024 physical rows.
+These are optimization budgets, not public result or predicate-cardinality
+limits. They admit large compressed selections while bounding fragmented
+translations. Legacy generations retain bounded point resolution when their
+physical directory lacks a completeness proof.
+
+Memory/work exhaustion discards all partial masks and keeps the exact candidate
+predicate. Storage errors, cancellation and ordinary allocation failures still
+propagate. Mask allocator ownership moves into the sparse query state and ends
+after scoring; adaptive completion still refreshes masks only on its one-way
+revision. Incomplete providers continue probing reached candidates, so rare
+postings do not eagerly walk broad metadata indexes.
+
+### Mixed-field Boolean segment planning
+
+Fragmented snapshots (more than 16 segments, matching the existing text planner's
+amortization policy) use a metadata-only prepass. The existing scorer tree's
+lowering composes each field's term bounds, boosts, optional grouping and baseline
+in scoring arithmetic order. Unsupported signed/non-finite bounds disable
+competitive pruning. The prepass shares scoped field readers and opens no posting
+iterators. Its arena is reused by segment scoring.
+
+Segments execute in descending score-ceiling order with their original global
+document offsets. The admitted heap cutoff can reject a whole segment before
+posting streams open. Strict score/document-ID comparisons retain cutoff ties;
+pending predicate batches flush before the cutoff is observed. Pruned queries
+report lower-bound totals. Healthy small snapshots avoid the dictionary prepass.
+
+### Positional leaves in the streaming Boolean tree
+
+Exact term phrases, analyzed phrases and fixed multi-phrase alternatives compose
+with required, optional, prohibited and nested clauses. Each phrase position owns
+monotone term heads; all positions must align on a document before position
+verification. Deferred position records for rejected approximation documents are
+skipped. Two-term exact phrases reuse the packed-position kernel; other shapes
+use current-document position buffers rather than corpus-sized position maps.
+
+Exact phrases preserve phrase-frequency BM25 and the sum of constituent term IDFs,
+including repeated terms. Fixed alternatives and analyzed position gaps preserve
+the established filter score and slop semantics. Missing/empty alternatives match
+nothing. Phrase verification precedes heap/predicate admission, and the producer
+fast path accepts positional leaves directly. Query-owned analyzed tokens and
+phrase filters are shared across segment planning and execution. Fuzzy positional
+expansion, distributed statistics, aggregations and search-after continue using
+the authoritative existing paths.
+
+Regression coverage includes broad compressed mask translation and budget
+fallback, native directory seeks with signed sparse weights, fragmented mixed
+field segment pruning with stable ties, randomized positional Boolean queries,
+repeated terms, alternatives, analyzed gaps, deletes, offsets, includes/exclusions,
+and exhaustive allocation failures. The real Parquet/Iceberg fixture also checks
+phrase order under indexed metadata includes/exclusions before and after restart.
+Archive-scale cold/warm throughput and peak process memory still require separate
+measurement; no archive speedup is inferred from these work-count regressions.
+
+### Qualification of the compressed-mask/segment/position refinement
+
+`origin/main` at `f599f36da5` is merged. Its embedded relational worker move
+required regenerating `source_catalog_control.zig` from the current ownership
+graph: the two control-safe worker exports are included, and CAPI modules that
+now reach the physical owner are excluded. The generated contents match
+`tools/check_storage_compilation.py`; the production Debug server builds.
+
+Validation uses Zig 0.17.0:
+
+- Debug: 66 sparse, 390 bounded-reader, 23 focused text/scorer and five API tests
+  passed, with no failures or leaks. Two ReleaseFast-only benchmarks skipped.
+- ReleaseFast: 66 sparse, 24 text/scorer and five API tests passed, including the
+  existing collector benchmark, with no failures or leaks. Exhaustive request
+  allocation-failure tests force allocate/copy growth, following the existing
+  SQL test pattern, so backing allocator remaps cannot vary the fault sequence.
+- A 100,000-row compressed mask occupies less than 128 KiB in the API fixture.
+  A real 5,000-row native sparse selection uses six physical directory blocks,
+  preserves signed/zero scores and invokes no reverse-key predicate callbacks.
+  Explicit work/memory exhaustion discards partially built masks.
+- A 20-segment mixed-field fixture searches one segment and prunes 19 before
+  opening their postings; only two posting iterators open. Signed/zero boosts,
+  stable cutoff ties and offsets are checked against the established scorer.
+  Randomized positional trees preserve exact scores/IDs with alternative and
+  repeated terms, gaps, deletes, includes/exclusions and native range readers.
+- All four real-data E2Es passed against the freshly built server (26.05 seconds):
+  independently written Iceberg snapshots/schema IDs/partitions/deletes and
+  restart, Parquet and Iceberg indexed conjunctions/sort/cursors/phrase order,
+  and quantized sparse score/ranking preservation. The Iceberg fixtures remain
+  in `e2e-full`; the entire `e2e-full` suite was not run.
+- Zig formatting, Python lint/formatting and `git diff --check` passed.
+
+Representative archive-scale cold/warm throughput and peak process memory
+remain unmeasured. Fuzzy positional expansion continues through its existing
+authoritative execution path.

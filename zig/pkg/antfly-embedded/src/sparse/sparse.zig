@@ -238,9 +238,11 @@ const AdaptiveOrdinalConstraints = struct {
     include: ?@import("../encoding/roaring.zig").RoaringBitmap = null,
     exclude: ?@import("../encoding/roaring.zig").RoaringBitmap = null,
     resolved: bool = false,
+    budget: ?*@import("ordinal_lookup.zig").MaskBudget = null,
     fn deinit(self: *@This()) void {
         if (self.include) |*bitmap| bitmap.deinit();
         if (self.exclude) |*bitmap| bitmap.deinit();
+        if (self.budget) |budget| budget.destroy();
     }
     fn load(self: *@This()) !void {
         const predicate = self.predicate orelse return;
@@ -255,6 +257,7 @@ const AdaptiveOrdinalConstraints = struct {
         self.deinit();
         self.include = selected.include;
         self.exclude = selected.exclude;
+        self.budget = selected.budget;
         self.resolved = !selected.residual;
         self.revision = if (predicate.constraint_revision) |get| get(predicate.ptr) else 0;
     }
@@ -1539,6 +1542,9 @@ const PhysicalMaps = struct {
     }
 };
 fn selectPhysicalBlock(txn: anytype, a: Allocator, prefix: []const u8, high: u32, rows: *const @import("../encoding/roaring.zig").RoaringBitmap, result: *@import("../encoding/roaring.zig").RoaringBitmap, cancellation: ?CancellationToken) !bool {
+    return selectPhysicalBlockBounded(txn, a, prefix, high, rows, result, cancellation, null);
+}
+fn selectPhysicalBlockBounded(txn: anytype, a: Allocator, prefix: []const u8, high: u32, rows: *const @import("../encoding/roaring.zig").RoaringBitmap, result: *@import("../encoding/roaring.zig").RoaringBitmap, cancellation: ?CancellationToken, budget: ?*@import("ordinal_lookup.zig").WorkBudget) !bool {
     _ = a;
     const marker = txn.get(metaKey(meta_complete_physical)) catch |err| switch (err) {
         error.NotFound => return false,
@@ -1552,16 +1558,27 @@ fn selectPhysicalBlock(txn: anytype, a: Allocator, prefix: []const u8, high: u32
         try checkSearchCancellation(cancellation);
         const base = first & ~@as(u32, 1023);
         const row = (@as(u64, high) << 32) | base;
+        if (budget) |work| try work.takeBlock();
         const block_key = try PhysicalMaps.key(prefix, row >> 10);
         const found = try cursor.seekAtOrAfter(&block_key);
         const data: []const u8 = if (found) |entry| (if (std.mem.eql(u8, entry.key, &block_key)) entry.value else &.{}) else &.{};
         if (data.len % 6 != 0) return error.InvalidSparsePhysicalMap;
         var pos: usize = 0;
+        var run_first: ?u32 = null;
+        var run_last: u32 = 0;
         while (pos < data.len) : (pos += 6) {
             const low = std.mem.readInt(u16, data[pos..][0..2], .little);
             if (low >= 1024) return error.InvalidSparsePhysicalMap;
-            if (rows.contains(base | low)) try result.add(std.mem.readInt(u32, data[pos + 2 ..][0..4], .little));
+            if (!rows.contains(base | low)) continue;
+            const ordinal = std.mem.readInt(u32, data[pos + 2 ..][0..4], .little);
+            if (run_first != null and @as(u64, run_last) + 1 != ordinal) {
+                try result.addRange(run_first.?, @as(u64, run_last) + 1);
+                run_first = null;
+            }
+            if (run_first == null) run_first = ordinal;
+            run_last = ordinal;
         }
+        if (run_first) |start| try result.addRange(start, @as(u64, run_last) + 1);
         if (base == std.math.maxInt(u32) - 1023) break;
         iterator.seek(base + 1024);
     }
@@ -4745,13 +4762,17 @@ pub const SparseIndex = struct {
                 const ctx: *@This() = @ptrCast(@alignCast(raw));
                 return selectPhysicalBlock(ctx.txn, a, prefix, high, rows, result, ctx.cancellation);
             }
+            fn boundedBlock(raw: *anyopaque, a: Allocator, prefix: []const u8, high: u32, rows: *const @import("../encoding/roaring.zig").RoaringBitmap, result: *@import("../encoding/roaring.zig").RoaringBitmap, work: *@import("ordinal_lookup.zig").WorkBudget) !bool {
+                const ctx: *@This() = @ptrCast(@alignCast(raw));
+                return selectPhysicalBlockBounded(ctx.txn, a, prefix, high, rows, result, ctx.cancellation, work);
+            }
             fn lookup(raw: *anyopaque, key: []const u8) !?u32 {
                 const ctx: *@This() = @ptrCast(@alignCast(raw));
                 return ctx.index.docNumForDocIdTxn(ctx.txn, key);
             }
         };
         var lookup: Lookup = .{ .index = self, .txn = &txn, .cancellation = constraints.cancellation };
-        var ordinal_state: AdaptiveOrdinalConstraints = .{ .a = alloc, .predicate = constraints.key_predicate, .lookup = .{ .ptr = &lookup, .one = Lookup.lookup, .block = Lookup.block } };
+        var ordinal_state: AdaptiveOrdinalConstraints = .{ .a = alloc, .predicate = constraints.key_predicate, .lookup = .{ .ptr = &lookup, .one = Lookup.lookup, .block = Lookup.block, .bounded_block = Lookup.boundedBlock } };
         defer ordinal_state.deinit();
         try ordinal_state.load();
         if (constraints.key_predicate == null and ordinal_state.include == null and (filter_doc_nums.count() != 0 or direct_filter_doc_nums.count() != 0)) {
@@ -8099,4 +8120,67 @@ test "sparse adaptive ordinal constraints seek on upfront and mid query completi
         try std.testing.expectEqual(@as(usize, if (upfront) 0 else 3), predicate.calls);
         try std.testing.expectEqual(@as(usize, if (upfront) 1 else 2), predicate.selections);
     }
+}
+
+test "sparse broad physical masks seek through the bounded native directory" {
+    const a = std.testing.allocator;
+    const ordinals = @import("ordinal_lookup.zig");
+    const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
+    const prefix = "lake2:" ++ "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ++ ":00000000:";
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "broad-physical-seeks");
+    defer cleanupTmp(path);
+    var idx = try SparseIndex.open(a, path, .{ .chunk_size = 32 });
+    defer idx.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const writes = try ca.alloc(SparseWrite, 10000);
+    for (writes, 0..) |*write, i| write.* = .{ .doc_id = try std.fmt.allocPrint(ca, prefix ++ "{x:0>16}", .{i}), .vec = .{ .indices = &.{1}, .values = &.{1} } };
+    try idx.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    const Predicate = struct {
+        blocks: usize = 0,
+        fn allows(_: *anyopaque, _: []const u8) !bool {
+            return error.UnexpectedCandidatePredicate;
+        }
+        fn select(raw: *anyopaque, alloc: Allocator, lookup: OrdinalLookup) !?ordinals.Selection {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var selected = try ordinals.Selection.initBounded(alloc, 4 * 1024 * 1024);
+            errdefer selected.deinit();
+            selected.include = Bitmap.init(selected.allocator());
+            var rows = Bitmap.init(selected.allocator());
+            defer rows.deinit();
+            try rows.addRange(5000, 10000);
+            var work: ordinals.WorkBudget = .{};
+            try std.testing.expect(try lookup.bounded_block.?(lookup.ptr, selected.allocator(), prefix, 0, &rows, &selected.include.?, &work));
+            self.blocks = 4096 - work.blocks;
+            try selected.prepareRead();
+            try std.testing.expect(selected.budget.?.live < 64 * 1024);
+            return selected;
+        }
+    };
+    for ([_]f32{ 1, -1, 0 }) |weight| {
+        var predicate: Predicate = .{};
+        const query: SparseVector = .{ .indices = &.{1}, .values = &.{weight} };
+        const hits = try idx.searchConstrained(a, &query, 10, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_constraints = Predicate.select } });
+        defer SparseIndex.freeResults(a, hits);
+        try std.testing.expectEqual(@as(usize, 10), hits.len);
+        try std.testing.expectEqual(@as(usize, 6), predicate.blocks);
+        for (hits, 5000..) |hit, row| {
+            var expected: [96]u8 = undefined;
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&expected, prefix ++ "{x:0>16}", .{row}), hit.doc_id);
+            try std.testing.expectEqual(weight, hit.score);
+        }
+    }
+    // Work exhaustion cannot silently return a partially translated selection.
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    var physical = Bitmap.init(a);
+    defer physical.deinit();
+    try physical.addRange(0, 10000);
+    var partial = Bitmap.init(a);
+    defer partial.deinit();
+    var work: ordinals.WorkBudget = .{ .blocks = 1 };
+    try std.testing.expectError(error.OrdinalPlanningBudgetExceeded, selectPhysicalBlockBounded(&txn, a, prefix, 0, &physical, &partial, null, &work));
+    try std.testing.expect(partial.cardinality() < physical.cardinality());
 }
