@@ -1927,3 +1927,22 @@ quanta and cleanup CPU authority; coarse stage checks do not bound their interna
 The source cursor's backend construction/seek also needs complete admission
 transport. The cumulative integration run and runtime resource, performance and
 automatic default gates remain open.
+
+### Child reservation integration expectation
+
+The cumulative inference-owner fixture still expected an unactivated child to be
+CPU queued. The scheduler deliberately publishes that reservation as resource
+blocked: it owns operation/byte/parent charges before worker activation without
+claiming a CPU queue position. The fixture now checks both that state and exact
+blocked/queue counters, while retaining activation, original cancel/deadline,
+control progress and physical-join retirement checks. Its focused target passes
+41 native checks. This is a test expectation correction, not a scheduler policy
+change. The old immutable integration snapshot still reports its stale assertion;
+only an actual descendant integration run can qualify the correction.
+
+The source-marking descendant's native frozen checks succeeded. Its Linux run
+was interrupted when the host filesystem filled; Docker Desktop became unavailable
+and its validator/CLI handles vanished without a terminal compiler receipt.
+Completed generated caches were removed, preserving source, receipts and active
+caches. Linux source-marking qualification remains unproven pending Docker
+recovery and a properly observed pinned Nix/glibc rerun.

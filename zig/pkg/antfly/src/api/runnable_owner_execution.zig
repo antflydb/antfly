@@ -839,7 +839,13 @@ test "runnable execution port child reservation publishes before worker CPU and 
         try parent_borrow.reserveChild(&.{ .io = &io_borrow, .retained_bytes = 41, .out_child = &child });
         defer child.deinit();
         try std.testing.expect(capsule(child.borrow.context).execution.child_pending);
-        try std.testing.expectEqual(runnable.State.queued, capsule(child.borrow.context).execution.entry.?.state);
+        // Reservation owns the child before a worker exists. CPU queueing
+        // starts at activation; leaving a reservation queued can consume CPU
+        // or delay runnable peers before the task is physically started.
+        try std.testing.expectEqual(runnable.State.resource_blocked, capsule(child.borrow.context).execution.entry.?.state);
+        const reserved = owner.owner.scheduler.stats();
+        try std.testing.expectEqual(@as(usize, 0), reserved.queued);
+        try std.testing.expectEqual(@as(usize, 1), reserved.resource_blocked);
         try std.testing.expectEqual(@as(usize, 1), capsule(parent.?).execution.entry.?.children);
         try std.testing.expectError(error.InvalidRunnableTransition, Worker.checked(child.borrow.checkpoint(child.borrow.context)));
         const charged = owner.owner.scheduler.stats().retained_bytes;
