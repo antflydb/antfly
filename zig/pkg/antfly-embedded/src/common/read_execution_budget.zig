@@ -29,6 +29,9 @@ pub fn Budget(comptime Controls: type, comptime check: anytype) type {
             if (self.parked_class != null) return error.InvalidRunnableTransition;
             const borrow = self.controls.execution_runnable orelse return error.ExecutionWaitUnsupported;
             try borrow.validate();
+            if (@hasField(Controls, "require_checked_reentry")) {
+                if (self.controls.require_checked_reentry and borrow.enter_checked == null) return error.ExecutionWaitUnsupported;
+            }
             const phase = try borrow.currentClass();
             try checked(borrow.park(borrow.context, @backingInt(runtime.runnable_abi.Wait.resource)));
             self.parked_class = phase;
@@ -38,12 +41,21 @@ pub fn Budget(comptime Controls: type, comptime check: anytype) type {
             if (self.rejection) |err| return err;
             const phase = self.parked_class orelse return error.InvalidRunnableTransition;
             const borrow = self.controls.execution_runnable orelse return error.ExecutionWaitUnsupported;
-            checked(borrow.enter(borrow.context, @backingInt(phase))) catch |err| {
+            const resumed = if (borrow.enter_checked != null)
+                borrow.enterChecked(phase, &.{ .context = self, .check = reentryCheck })
+            else
+                checked(borrow.enter(borrow.context, @backingInt(phase)));
+            resumed catch |err| {
                 self.rejection = err;
                 return err;
             };
             self.parked_class = null;
             try self.checkpoint();
+        }
+        fn reentryCheck(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
+            return .ok;
         }
         pub fn waitForProgress(self: *@This()) !void {
             try self.checkpoint();

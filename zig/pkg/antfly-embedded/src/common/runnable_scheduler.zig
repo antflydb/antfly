@@ -19,6 +19,16 @@
 const std = @import("std");
 const admission = @import("bounded_admission.zig");
 
+/// A synchronous additional lifetime fence; callbacks never run under the
+/// scheduler mutex and convey no fresh admission or deadline authority.
+pub const AdmissionCheck = struct {
+    context: *anyopaque,
+    check: *const fn (*anyopaque) anyerror!void,
+    pub fn checkpoint(self: @This()) !void {
+        try self.check(self.context);
+    }
+};
+
 pub const Class = enum(u3) { query, write, inference, background, control };
 pub const State = enum { fresh, queued, running, resource_blocked, output_blocked, stopped, finished };
 pub const Config = struct {
@@ -408,13 +418,16 @@ pub const Scheduler = struct {
         const completing = e.scheduler == self and (e.retainedPhase() or e.children != 0);
         self.mutex.unlock();
         if (completing) return self.waitRetained(e);
-        return self.waitImpl(e, false);
+        return self.waitImpl(e, false, null);
     }
     /// A published execution may lend its retained ownership to IO or a child.
     /// Denied reentry stops runnable execution, but only its owning finish may
     /// release operation/byte reservations after those consumers are fenced.
     pub fn waitRetained(self: *Scheduler, e: *Entry) !void {
-        return self.waitImpl(e, true);
+        return self.waitImpl(e, true, null);
+    }
+    pub fn waitRetainedWithCheck(self: *Scheduler, e: *Entry, restriction: ?AdmissionCheck) !void {
+        return self.waitImpl(e, true, restriction);
     }
     fn failWait(self: *Scheduler, e: *Entry, err: anyerror, comptime retain: bool) void {
         if (!retain) return self.finish(e);
@@ -434,7 +447,7 @@ pub const Scheduler = struct {
         e.ready.set(e.options.io);
         self.dispatch();
     }
-    fn waitImpl(self: *Scheduler, e: *Entry, comptime retain: bool) !void {
+    fn waitImpl(self: *Scheduler, e: *Entry, comptime retain: bool, restriction: ?AdmissionCheck) !void {
         self.lock();
         const owned = e.scheduler == self;
         self.mutex.unlock();
@@ -456,6 +469,10 @@ pub const Scheduler = struct {
             self.mutex.unlock();
         }
         while (true) {
+            if (restriction) |fence| fence.checkpoint() catch |err| {
+                self.failWait(e, err, retain);
+                return err;
+            };
             self.checkAuthority(e) catch |err| {
                 self.failWait(e, err, retain);
                 return err;
@@ -475,6 +492,10 @@ pub const Scheduler = struct {
             }
             if (s == .running and (!closed or completing)) {
                 self.checkAuthority(e) catch |err| {
+                    self.failWait(e, err, retain);
+                    return err;
+                };
+                if (restriction) |fence| fence.checkpoint() catch |err| {
                     self.failWait(e, err, retain);
                     return err;
                 };
@@ -880,6 +901,7 @@ pub const Execution = struct {
         check_lifetime: *const fn (*anyopaque) anyerror!void,
         park: *const fn (*anyopaque, State) anyerror!void,
         enter: *const fn (*anyopaque, Class) anyerror!void,
+        enter_checked: ?*const fn (*anyopaque, Class, AdmissionCheck) anyerror!void = null,
         reserve_child: *const fn (*anyopaque, std.Io, u64, *Execution) anyerror!void,
         activate_child: *const fn (*anyopaque) anyerror!void,
         finish: *const fn (*anyopaque) void,
@@ -924,7 +946,7 @@ pub const Execution = struct {
         try owner.submit(&self.entry.?);
         // A new cleanup root has no published consumer yet. Respect its
         // fail-fast acquisition; only subsequent reentry retains ownership.
-        if (protected_cleanup) try owner.waitImpl(&self.entry.?, false) else try owner.wait(&self.entry.?);
+        if (protected_cleanup) try owner.waitImpl(&self.entry.?, false, null) else try owner.wait(&self.entry.?);
         self.resume_generation +%= 1;
         self.quantum_start_ns = options.now();
     }
@@ -1064,9 +1086,15 @@ pub const Execution = struct {
         try owner.block(e, reason);
     }
     pub fn enter(self: *Execution, class: Class) !void {
+        return self.enterWithCheck(class, null);
+    }
+    pub fn enterWithCheck(self: *Execution, class: Class, restriction: ?AdmissionCheck) !void {
         if (self.child_pending) return error.InvalidRunnableTransition;
         if (self.borrowed) |*borrow| {
-            try borrow.enter(borrow.ptr, class);
+            if (restriction) |fence| {
+                const callback = borrow.enter_checked orelse return error.ExecutionWaitUnsupported;
+                try callback(borrow.ptr, class, fence);
+            } else try borrow.enter(borrow.ptr, class);
             borrow.class = class;
             self.resume_generation +%= 1;
             return;
@@ -1077,9 +1105,13 @@ pub const Execution = struct {
             owner.failWait(e, err, true);
             return err;
         };
+        if (restriction) |fence| fence.checkpoint() catch |err| {
+            owner.failWait(e, err, true);
+            return err;
+        };
         try owner.reclassifyBlocked(e, class);
         try owner.unblock(e);
-        try owner.waitRetained(e);
+        try owner.waitRetainedWithCheck(e, restriction);
         self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
         self.checkpoints = 0;

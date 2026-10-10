@@ -1836,3 +1836,35 @@ Raft routing/proposal waits, standalone activation's subsequent local batch,
 maintenance/capture I/O, whole API/DB composition, resource/performance gates and
 automatic default sizing remain open. These focused checks cannot qualify those
 paths or the whole design.
+
+### Checked original CPU reentry
+
+Runnable ABI version 12 adds a synchronous, non-yielding restriction to return
+CPU on an already admitted execution. The scheduler checks it outside its mutex
+before queueing, during the existing finite CPU wait, and before returning a
+grant. Checks use the caller's original clocks/cancellation and can only tighten
+its lifetime. They create no root, reservation, deadline or completion authority.
+A rejected queued or just-granted execution stops and releases its CPU/queue
+position; physical operation and byte charges remain until owning finish.
+
+Read, local child, write completion, cleanup, SQL and archive owner adapters
+transport the restriction without retaining it. Native borrowing forwards it
+through the ABI back to the owning scheduler. Controlled budgets use checked
+return when the owner supports it. Routed admission requires support before
+parking and refuses incapable owners rather than entering an unbounded fallback.
+Its independent fence/catalog restriction now applies while waiting for CPU,
+closing the preceding route-subdeadline gap. Existing unscoped operation and
+legacy optional owners retain their prior paths; automatic defaults still require
+full adoption and proof rather than treating compatibility as qualification.
+
+Actual provisioned control-side fixtures force the route clock to expire only
+when the real C=1 execution enters the CPU queue while its original 30-second
+request remains alive. Capture admission stays owned, no catalog or write runs,
+health progresses, the rejected root retains its operation/bytes, and physical
+finish returns counters to zero. Additional tests cover queued and post-grant
+restriction rejection, original native/ABI borrowing, incompatible ABI prefixes
+and missing capability. These tests instantiate no physical DB. Independent
+archives must agree on the new runnable ABI version; cumulative API/DB/CLI and
+schema verification remains mandatory. Catalog/Raft/maintenance/capture wait
+adoption, mandatory cleanup mutex/CPU authority, physical resource/performance
+and default sizing qualification remain open.

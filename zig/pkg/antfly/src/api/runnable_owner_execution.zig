@@ -15,7 +15,7 @@ pub const State = struct {
     cleanup_in_use: std.atomic.Value(bool) = .init(false),
 
     pub fn port(self: *State) abi.Owner {
-        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .check_lifetime = checkLifetime, .current_class = currentClass };
+        return .{ .context = &self.owner, .retain = retain, .release = release, .start = start, .checkpoint = checkpoint, .park = park, .enter = enter, .enter_checked = enterChecked, .finish = finish, .resize_team = resizeTeam, .reserve_completion = reserveCompletion, .activate_completion = activateCompletion, .reserve_cleanup = reserveCleanup, .activate_cleanup = activateCleanup, .completion_remaining_ns = completionRemaining, .reserve_child = reserveChild, .activate_child = activateChild, .check_lifetime = checkLifetime, .current_class = currentClass };
     }
 };
 
@@ -231,6 +231,11 @@ fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
 fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
     const next = std.enums.fromInt(runnable.Class, class) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
     capsule(raw).execution.enter(next) catch |err| return runtime.error_abi.statusFromError(err);
+    return .ok;
+}
+fn enterChecked(raw: *anyopaque, class: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+    const next = std.enums.fromInt(runnable.Class, class) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+    @import("runnable_reentry.zig").enter(&capsule(raw).execution, next, restriction) catch |err| return runtime.error_abi.statusFromError(err);
     return .ok;
 }
 fn finish(raw: *anyopaque) callconv(.c) void {

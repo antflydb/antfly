@@ -37,6 +37,7 @@ const Receiver = struct {
             .checkpoint = check,
             .park = park,
             .enter = enter,
+            .enter_checked = enterChecked,
             .reserve_child = reserveNested,
             .activate_child = activate,
             .check_lifetime = lifetime,
@@ -72,6 +73,11 @@ const Receiver = struct {
     fn enter(raw: *anyopaque, next: c_int) callconv(.c) runtime.error_abi.Status {
         const class = std.enums.fromInt(scheduler.Class, next) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
         from(raw).execution.enter(class) catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn enterChecked(raw: *anyopaque, next: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+        const class = std.enums.fromInt(scheduler.Class, next) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+        @import("runnable_reentry.zig").enter(&from(raw).execution, class, restriction) catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
     fn reserveNested(raw: *anyopaque, options: *const abi.ChildStart) callconv(.c) runtime.error_abi.Status {

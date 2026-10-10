@@ -874,6 +874,21 @@ pub const Adapter = struct {
                 adapter.validateReadFence(false) catch |err| return runtime.error_abi.statusFromError(err);
                 return .ok;
             }
+            fn enterChecked(raw: *anyopaque, class: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                if (adapter.runnable.?.entry.?.cleanup_active) {
+                    const borrow = adapter.cleanup_phase.?.borrowed() catch |err| return runtime.error_abi.statusFromError(err);
+                    const phase = std.enums.fromInt(runtime.runnable_abi.Class, class) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+                    borrow.enterChecked(phase, restriction) catch |err| return runtime.error_abi.statusFromError(err);
+                    return .ok;
+                }
+                const next = std.enums.fromInt(@import("antfly_local_sources").common_request_admission.runnable_scheduler.Class, class) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+                const current = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                @import("runnable_reentry.zig").enter(current, next, restriction) catch |err| return runtime.error_abi.statusFromError(err);
+                adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
+                adapter.validateReadFence(false) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
             fn reserveCleanup(raw: *anyopaque, options: *const runtime.runnable_abi.Cleanup) callconv(.c) runtime.error_abi.Status {
                 const adapter: *Adapter = @ptrCast(@alignCast(raw));
                 adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
@@ -900,7 +915,7 @@ pub const Adapter = struct {
                 return .ok;
             }
         };
-        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter, .reserve_cleanup = if (self.cleanup_phase != null) Callback.reserveCleanup else null, .activate_cleanup = if (self.cleanup_phase != null) Callback.activateCleanup else null, .reserve_child = Callback.reserveChild, .check_lifetime = Callback.lifetime, .current_class = Callback.currentClass };
+        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter, .enter_checked = Callback.enterChecked, .reserve_cleanup = if (self.cleanup_phase != null) Callback.reserveCleanup else null, .activate_cleanup = if (self.cleanup_phase != null) Callback.activateCleanup else null, .reserve_child = Callback.reserveChild, .check_lifetime = Callback.lifetime, .current_class = Callback.currentClass };
     }
 
     fn spillWaitEnd(ptr: *anyopaque) !void {

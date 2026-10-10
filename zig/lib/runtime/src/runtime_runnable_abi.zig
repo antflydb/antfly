@@ -9,7 +9,25 @@ const native = @import("runtime_native_abi.zig");
 const errors = @import("runtime_error_abi.zig");
 const http = @import("runtime_http_abi.zig");
 
-pub const abi_version: u32 = 11;
+pub const abi_version: u32 = 12;
+/// Synchronous, non-yielding restriction on the original CPU-return wait.
+/// Borrowed only until enterChecked returns; never retained by the owner.
+/// Rejection stops that execution and does not retire physical ownership.
+pub const Reentry = extern struct {
+    version: u32 = abi_version,
+    struct_size: u32 = @sizeOf(@This()),
+    context: *anyopaque,
+    check: *const fn (*anyopaque) callconv(.c) errors.Status,
+    pub fn validate(self: *const Reentry) !void {
+        if (self.version != abi_version or self.struct_size != @sizeOf(Reentry)) return error.UnsupportedVersion;
+    }
+    pub fn checkpoint(self: *const Reentry) !void {
+        try self.validate();
+        const status = self.check(self.context);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
+};
+
 pub const Class = enum(c_int) { query, write, inference, background, control };
 pub const Wait = enum(c_int) { resource, output };
 
@@ -130,6 +148,7 @@ pub const Owner = extern struct {
     /// Observe the retained current phase without acquiring CPU. The original
     /// parent class in a borrow remains the authority for returning a transfer.
     current_class: ?*const fn (*anyopaque, *c_int) callconv(.c) errors.Status = null,
+    enter_checked: ?*const fn (*anyopaque, c_int, *const Reentry) callconv(.c) errors.Status = null,
 
     pub fn checkLifetime(self: Owner, handle: *anyopaque) !void {
         if (!self.valid()) return error.UnsupportedVersion;
@@ -261,6 +280,15 @@ pub const Borrowed = extern struct {
     /// retained cancellation/deadline/shutdown state without acquiring CPU.
     check_lifetime: ?*const fn (*anyopaque) callconv(.c) errors.Status = null,
     current_class: ?*const fn (*anyopaque, *c_int) callconv(.c) errors.Status = null,
+    enter_checked: ?*const fn (*anyopaque, c_int, *const Reentry) callconv(.c) errors.Status = null,
+
+    pub fn enterChecked(self: Borrowed, class: Class, restriction: *const Reentry) !void {
+        try self.validate();
+        try restriction.validate();
+        const callback = self.enter_checked orelse return error.ExecutionWaitUnsupported;
+        const status = callback(self.context, @backingInt(class), restriction);
+        if (!status.isOk()) return errors.errorFromStatus(status);
+    }
 
     pub fn currentClass(self: Borrowed) !Class {
         try self.validate();
@@ -375,6 +403,7 @@ pub const Borrowed = extern struct {
             .activate_child = owner.activate_child,
             .check_lifetime = owner.check_lifetime,
             .current_class = owner.current_class,
+            .enter_checked = owner.enter_checked,
         };
         try borrow.validate();
         return borrow;

@@ -7,6 +7,7 @@ const sources = @import("antfly_local_sources");
 const runtime = @import("antfly_runtime_abi");
 const Context = sources.api_local_transaction_contract.PreDecisionContext;
 const Controls = struct {
+    require_checked_reentry: bool = true,
     context: Context,
     catalog: sources.api_routing_budget.RoutingBudget,
     fence_cancellation: sources.storage_db_types.CancellationToken,

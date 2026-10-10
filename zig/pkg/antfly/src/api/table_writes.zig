@@ -36151,8 +36151,14 @@ fn consumerTests() type {
                     self.waiter.enter(phase) catch |err| return runtime.error_abi.statusFromError(err);
                     return .ok;
                 }
+                fn enterChecked(raw: *anyopaque, class: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+                    const resumed = enter(raw, class);
+                    if (!resumed.isOk()) return resumed;
+                    restriction.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
+                    return .ok;
+                }
                 fn borrow(self: *@This(), class: runtime.runnable_abi.Class) runtime.runnable_abi.Borrowed {
-                    return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(class), .checkpoint = check, .check_lifetime = life, .current_class = current, .park = park, .enter = enter };
+                    return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(class), .checkpoint = check, .check_lifetime = life, .current_class = current, .park = park, .enter = enter, .enter_checked = enterChecked };
                 }
             };
             var state: State = .{ .source = &source, .scheduler = &scheduler, .waiter = &capture, .holder = &writer, .request_held = &request_held };
@@ -36234,8 +36240,14 @@ fn consumerTests() type {
                     self.resumes += 1;
                     return runtime.error_abi.statusFromError(self.cause);
                 }
+                fn enterChecked(raw: *anyopaque, class: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+                    const resumed = enter(raw, class);
+                    if (!resumed.isOk()) return resumed;
+                    restriction.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
+                    return .ok;
+                }
                 fn borrow(self: *@This()) runtime.runnable_abi.Borrowed {
-                    return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.background), .checkpoint = check, .check_lifetime = life, .current_class = current, .park = park, .enter = enter };
+                    return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.background), .checkpoint = check, .check_lifetime = life, .current_class = current, .park = park, .enter = enter, .enter_checked = enterChecked };
                 }
             };
             const io = std.testing.io;
@@ -36288,6 +36300,114 @@ fn consumerTests() type {
             }
         }
 
+        test "routed write admission bounds real C1 CPU return by the stricter catalog clock" {
+            const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+            const runtime = @import("antfly_runtime_abi");
+            const State = struct {
+                scheduler: *native.Scheduler,
+                holder: native.Execution = .{},
+                base: runtime.runnable_abi.Borrowed,
+                parks: usize = 0,
+                health_progress: bool = false,
+                catalog_calls: usize = 0,
+                fn now(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    // The original root remains alive. Only the route clock
+                    // expires once that root is queued for a new CPU grant.
+                    return .{ .nanoseconds = if (self.scheduler.stats().queued > 0) 200 else 100 };
+                }
+                const clock_vtable = blk: {
+                    var value = std.Io.failing.vtable.*;
+                    value.now = now;
+                    break :blk value;
+                };
+                fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedCatalogCall;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn validate(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.catalog_calls += 1;
+                    return error.UnexpectedCatalogCall;
+                }
+                fn checkpoint(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                    @panic("yielding route checkpoint");
+                }
+                fn life(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.base.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+                    return .ok;
+                }
+                fn current(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.base.current_class.?(self.base.context, out);
+                }
+                fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const status = self.base.park(self.base.context, reason);
+                    if (!status.isOk()) return status;
+                    self.parks += 1;
+                    self.holder.start(self.scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .write) catch |err| return runtime.error_abi.statusFromError(err);
+                    var health: native.Execution = .{};
+                    defer health.finish();
+                    health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control) catch |err| return runtime.error_abi.statusFromError(err);
+                    self.health_progress = true;
+                    return .ok;
+                }
+                fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.base.enter(self.base.context, class);
+                }
+                fn enterChecked(raw: *anyopaque, class: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    return self.base.enter_checked.?(self.base.context, class, restriction);
+                }
+                fn borrow(self: *@This()) runtime.runnable_abi.Borrowed {
+                    return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.write), .checkpoint = checkpoint, .check_lifetime = life, .current_class = current, .park = park, .enter = enter, .enter_checked = enterChecked };
+                }
+            };
+            var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+            defer scheduler.close();
+            var original: native.Execution = .{};
+            defer original.finish();
+            const io = std.testing.io;
+            const original_deadline: u64 = @intCast(std.Io.Clock.now(.awake, io).nanoseconds + 30 * std.time.ns_per_s);
+            try original.start(&scheduler, .{ .io = io, .deadline_ns = original_deadline, .retained_bytes = 17 }, .write);
+            var read: @import("runnable_local_read.zig").Read = .{ .execution = &original, .allocator = std.testing.allocator };
+            const team = try read.team();
+            var state: State = .{ .scheduler = &scheduler, .base = team.borrow };
+            defer state.holder.finish();
+            const clock_io: std.Io = .{ .userdata = &state, .vtable = &State.clock_vtable };
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-routed-cpu-return", .{ .ptr = &state, .io = runtime.io_abi.Borrow.init(&clock_io), .vtable = &.{ .admin_snapshot = State.snapshot, .free_admin_snapshot = State.free, .validate_route = State.validate } });
+            defer source.deinit();
+            var reservation = try source.acquireHotStandbySeedTableRequestAdmissionLease();
+            defer reservation.release();
+            const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 3, .route = .{ .group_id = 4, .range_id = 5, .identity_namespace = .{ .table_id = 2, .shard_id = 4, .range_id = 5 } } };
+            const context: distributed_txn.PreDecisionContext = .{ .deadline_ns = original_deadline, .deadline_io = runtime.io_abi.Borrow.init(&io), .execution_runnable = state.borrow() };
+            var incapable = context;
+            incapable.execution_runnable.?.enter_checked = null;
+            try std.testing.expectError(error.ExecutionWaitUnsupported, source.acquireRoutedWriteAdmissionWithPreDecisionContext(std.testing.allocator, "docs", fence, 200, incapable));
+            try std.testing.expectEqual(@as(usize, 0), state.parks);
+            try std.testing.expectEqual(native.State.running, original.entry.?.state);
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.acquireRoutedWriteAdmissionWithPreDecisionContext(std.testing.allocator, "docs", fence, 200, context));
+            try std.testing.expect(state.health_progress);
+            try std.testing.expectEqual(@as(usize, 1), state.parks);
+            try std.testing.expectEqual(@as(usize, 0), state.catalog_calls);
+            try std.testing.expectEqual(@as(usize, 0), source.active_table_activities.items.len);
+            try std.testing.expect(source.hot_standby_seed_table_request_admission_closed);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().queued);
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(usize, 2), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 40), scheduler.stats().retained_bytes);
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, original.checkLifetime());
+            reservation.release();
+            original.finish();
+            state.holder.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        }
+
         test "routed write admission rejects before catalog and leaves the capture reservation owned" {
             const Catalog = struct {
                 calls: usize = 0,
@@ -36334,8 +36454,14 @@ fn consumerTests() type {
                     self.resumes += 1;
                     return runtime.error_abi.statusFromError(self.cause);
                 }
+                fn enterChecked(raw: *anyopaque, class: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+                    const resumed = enter(raw, class);
+                    if (!resumed.isOk()) return resumed;
+                    restriction.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
+                    return .ok;
+                }
                 fn borrow(self: *@This()) runtime.runnable_abi.Borrowed {
-                    return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.write), .check_lifetime = life, .checkpoint = check, .current_class = current, .park = park, .enter = enter };
+                    return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.write), .check_lifetime = life, .checkpoint = check, .current_class = current, .park = park, .enter = enter, .enter_checked = enterChecked };
                 }
             };
             var catalog: Catalog = .{};

@@ -90,6 +90,7 @@ pub const Completion = struct {
         value.borrow.checkpoint = check;
         value.borrow.park = park;
         value.borrow.enter = enter;
+        value.borrow.enter_checked = enterChecked;
         value.borrow.reserve_child = reserveChild;
         return value;
     }
@@ -174,6 +175,13 @@ pub const Completion = struct {
         self.active() catch |err| return runtime.error_abi.statusFromError(err);
         const class = std.enums.fromInt(scheduler.Class, next) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
         self.execution.enter(class) catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn enterChecked(raw: *anyopaque, next: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+        const self = from(raw);
+        self.active() catch |err| return runtime.error_abi.statusFromError(err);
+        const class = std.enums.fromInt(scheduler.Class, next) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+        @import("runnable_reentry.zig").enter(self.execution, class, restriction) catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
 };

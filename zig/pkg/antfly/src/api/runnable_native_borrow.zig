@@ -33,6 +33,7 @@ pub const Bridge = struct {
             .check_lifetime = lifetime,
             .park = park,
             .enter = enter,
+            .enter_checked = if (self.borrow.enter_checked != null) enterChecked else null,
             .reserve_child = reserveChild,
             .activate_child = activateChild,
             .finish = finish,
@@ -67,6 +68,22 @@ pub const Bridge = struct {
             inline else => |value| @field(abi.Class, @tagName(value)),
         };
         try checked(self.borrow.enter(self.borrow.context, @backingInt(next)));
+    }
+    fn enterChecked(raw: *anyopaque, class: native.Class, restriction: native.AdmissionCheck) !void {
+        const self = from(raw);
+        const Forward = struct {
+            restriction: native.AdmissionCheck,
+            fn check(context: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                const value: *@This() = @ptrCast(@alignCast(context));
+                value.restriction.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+        };
+        var forwarded: Forward = .{ .restriction = restriction };
+        const next: abi.Class = switch (class) {
+            inline else => |value| @field(abi.Class, @tagName(value)),
+        };
+        try self.borrow.enterChecked(next, &.{ .context = &forwarded, .check = Forward.check });
     }
     fn reserveChild(raw: *anyopaque, io: std.Io, retained_bytes: u64, execution: *native.Execution) !void {
         const self = from(raw);
@@ -127,7 +144,7 @@ const TestAuthority = struct {
         original_dispatch(a, b, c, d, e, f);
     }
     fn borrowed(self: *@This()) abi.Borrowed {
-        return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(abi.Class.query), .checkpoint = check, .park = park, .enter = enter, .reserve_child = reserve, .check_lifetime = lifetime, .current_class = currentClass };
+        return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(abi.Class.query), .checkpoint = check, .park = park, .enter = enter, .enter_checked = enterChecked, .reserve_child = reserve, .check_lifetime = lifetime, .current_class = currentClass };
     }
     fn owner(raw: *anyopaque) *@This() {
         return @ptrCast(@alignCast(raw));
@@ -152,6 +169,11 @@ const TestAuthority = struct {
     fn enter(raw: *anyopaque, next: c_int) callconv(.c) runtime.error_abi.Status {
         const class = classFromAbi(next) catch |err| return runtime.error_abi.statusFromError(err);
         owner(raw).execution.enter(class) catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn enterChecked(raw: *anyopaque, class: c_int, restriction: *const abi.Reentry) callconv(.c) runtime.error_abi.Status {
+        const phase = classFromAbi(class) catch |err| return runtime.error_abi.statusFromError(err);
+        @import("runnable_reentry.zig").enter(owner(raw).execution, phase, restriction) catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
     fn reserve(raw: *anyopaque, options: *const abi.ChildStart) callconv(.c) runtime.error_abi.Status {

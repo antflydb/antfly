@@ -22,7 +22,7 @@ pub const Cleanup = struct {
 
     pub fn borrowed(self: *Cleanup) !abi.Borrowed {
         const entry = self.execution.entry orelse return error.InvalidRunnableTransition;
-        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = check, .park = park, .enter = enter, .reserve_cleanup = reserve, .activate_cleanup = activate, .check_lifetime = lifetime, .current_class = currentClass };
+        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = check, .park = park, .enter = enter, .enter_checked = enterChecked, .reserve_cleanup = reserve, .activate_cleanup = activate, .check_lifetime = lifetime, .current_class = currentClass };
     }
 
     fn from(raw: *anyopaque) *Cleanup {
@@ -86,6 +86,13 @@ pub const Cleanup = struct {
         self.active() catch |err| return runtime.error_abi.statusFromError(err);
         const class = std.enums.fromInt(scheduler.Class, next) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
         self.execution.enter(class) catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn enterChecked(raw: *anyopaque, next: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+        const self = from(raw);
+        self.active() catch |err| return runtime.error_abi.statusFromError(err);
+        const class = std.enums.fromInt(scheduler.Class, next) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+        @import("runnable_reentry.zig").enter(self.execution, class, restriction) catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
 };

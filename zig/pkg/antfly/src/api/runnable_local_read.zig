@@ -23,6 +23,7 @@ pub const Read = struct {
                 .checkpoint = checkpoint,
                 .park = park,
                 .enter = enter,
+                .enter_checked = enterChecked,
                 .reserve_child = reserveChild,
                 .check_lifetime = lifetime,
                 .current_class = currentClass,
@@ -55,6 +56,11 @@ pub const Read = struct {
     fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
         const phase = std.enums.fromInt(native.Class, class) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
         from(raw).execution.enter(phase) catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn enterChecked(raw: *anyopaque, class: c_int, restriction: *const runtime.runnable_abi.Reentry) callconv(.c) runtime.error_abi.Status {
+        const phase = std.enums.fromInt(native.Class, class) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+        @import("runnable_reentry.zig").enter(from(raw).execution, phase, restriction) catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
     fn reserveChild(raw: *anyopaque, options: *const abi.ChildStart) callconv(.c) runtime.error_abi.Status {
