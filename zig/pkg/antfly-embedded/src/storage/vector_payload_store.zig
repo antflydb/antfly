@@ -994,10 +994,15 @@ pub const Store = struct {
             while (true) {
                 try original_lifetime.checkpoint(lifetime);
                 if (markBudgetExpired(started, budget_ns, limit, progress)) return;
-                const item = marking.verification.?.next() orelse break;
-                progress.rows += 1;
-                try verifyLiveLocation(&marking.source, item.key_ptr.*, item.value_ptr.*);
-                marking.verified_bytes += @as(u64, item.value_ptr.*) * 4;
+                switch (marking.verification.?.nextStep(1)) {
+                    .done => break,
+                    .yielded => progress.rows += 1,
+                    .item => |item| {
+                        progress.rows += 1;
+                        try verifyLiveLocation(&marking.source, item.key_ptr.*, item.value_ptr.*);
+                        marking.verified_bytes += @as(u64, item.value_ptr.*) * 4;
+                    },
+                }
             }
             marking.verification_done = true;
         }
@@ -7636,4 +7641,81 @@ test "source vector payloads bounded live iteration resumes sparse physical bitm
         try std.testing.expectEqualSlices(u8, last.key, legacy.next().?.key_ptr);
         try std.testing.expect(legacy.next() == null);
     }
+}
+
+test "source vector payloads live verification charges sparse searches and rejects original lifetime mid-search" {
+    const alloc = std.testing.allocator;
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    const runtime = @import("antfly_runtime_abi");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/bounded-live-verification", false);
+    defer source.deinit();
+    source.mark_outside_lock = true;
+    source.mark_step_rows = 1;
+    source.mark_step_ns = 0;
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    for (0..8) |i| {
+        var buf: [32]u8 = undefined;
+        const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&buf, "doc-{d}", .{i}), "model");
+        defer alloc.free(key);
+        try store.put(key, artifact);
+    }
+    try std.testing.expect(!try source.collectStepDeferredMark(&raw, std.math.maxInt(u64)));
+    var turns: usize = 0;
+    while (source.marking.?.verification == null) : (turns += 1) {
+        try std.testing.expect(turns < 256);
+        try source.advanceMarkingSnapshot();
+    }
+    const mark = source.marking.?;
+    try mark.live.map.ensureTotalCapacity(65536);
+    mark.verification = mark.live.iterator();
+    mark.verified_bytes = 0;
+    mark.verification_done = false;
+    mark.scan_done = false;
+    for (0..4) |_| {
+        const slots_before = mark.verification.?.keys.len;
+        const work_before = source.statsSnapshot().collection_mark_rows;
+        try source.advanceMarkingSnapshot();
+        try std.testing.expectEqual(slots_before - 1, mark.verification.?.keys.len);
+        try std.testing.expectEqual(work_before + 1, source.statsSnapshot().collection_mark_rows);
+        try std.testing.expect(!mark.verification_done);
+    }
+    const Check = struct {
+        source: *Store,
+        slots: usize,
+        fn check(raw_control: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw_control));
+            if (self.source.marking) |active| if (active.verification) |cursor| {
+                if (cursor.keys.len < self.slots) return runtime.error_abi.statusFromError(error.DeadlineExceeded);
+            };
+            return .ok;
+        }
+    };
+    var check: Check = .{ .source = &source, .slots = mark.verification.?.keys.len };
+    const lifetime: original_lifetime.Control = .{ .context = &check, .check = Check.check };
+    const work_before = source.statsSnapshot().collection_mark_rows;
+    try std.testing.expectError(error.DeadlineExceeded, source.advanceMarkingSnapshotWithLifetime(std.testing.io, &lifetime));
+    try std.testing.expectEqual(work_before + 1, source.statsSnapshot().collection_mark_rows);
+    try std.testing.expect(source.marking == null);
+    try std.testing.expect(source.mutex.tryLock());
+    source.mutex.unlock();
+    source.mark_step_rows = 4096;
+    turns = 0;
+    while (!try source.collectStep(&raw, std.math.maxInt(u64))) : (turns += 1) try std.testing.expect(turns < 256);
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc-0", "model");
+    defer alloc.free(key);
+    const restored = try store.get(alloc, key);
+    defer alloc.free(restored);
+    try std.testing.expectEqualSlices(u8, artifact, restored);
 }

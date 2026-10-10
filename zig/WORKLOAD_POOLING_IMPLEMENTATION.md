@@ -2002,3 +2002,26 @@ construction, collection copy/publication, metadata rebuild and mandatory cleanu
 remain separate bounded-work and fair CPU-ownership adoption. Full archive/API/DB
 integration, Linux recovery/validation and resource/performance/default gates
 remain open. No automatic shared-execution defaults are enabled by these checks.
+
+### Live verification search work admission
+
+The mark's all-live/cost-policy verification now consumes one resumable live-set
+search step at a time. Empty hash/bitmap searches count toward the existing mark
+work limit, and each step checks the same borrowed original lifetime. Item
+verification and verified byte counts advance only when an identity is returned;
+yielding cannot mark an incomplete search verified. Original rejection rejoins
+and destroys the failed scanner and its immutable leases before returning.
+
+The physical source fixture expands an eight-entry mark to a large sparse hash
+capacity. It proves one-slot returns under a one-step budget, rejects the original
+lifetime after actual verification search progress, observes scanner cleanup and
+then successfully collects and reads the same committed payload. The focused
+source suite passes 87 checks and the ownership audit passes 13. Source fixtures
+use memory primary/source storage and instantiate no DB/server. Independent
+archive/API/DB and runtime resource/performance/default qualification remain open.
+
+This bounds verification iteration, not its full item lookup cost. Locator
+allocation/zeroing and collision probing, source-location lookup across readers,
+other legacy iterator callers, selective planning, native reader construction,
+copy/publication and metadata work still need bounded quanta and fair CPU/cleanup
+ownership. Linux qualification remains unavailable after Docker recovery failed.
