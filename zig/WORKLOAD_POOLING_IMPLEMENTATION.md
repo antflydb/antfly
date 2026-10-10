@@ -1355,3 +1355,24 @@ Automaton construction/transitions, bulk bitmap work, specialized leaf filters,
 projection/sort/aggregation loops, physical I/O and lock-safe CPU yielding remain
 separate bounded-execution requirements. In particular, production text sources
 currently retain an analysis read lock for the query's lifetime.
+
+Controlled service-lock acquisition now preserves reader priority and writer
+intent while releasing runnable CPU only around the actual timed futex wait.
+It polls retained, non-suspending lifetime authority without translating the
+owner's deadline into the lock's Io clock. Resume is mandatory before consuming
+a wake or reporting an Io error. Failure unwinds registered waiters, writer gate
+and intent, or a newly acquired shared lease. The legacy acquisition paths keep
+their existing behavior.
+
+Local text-source acquisition, structured filter resolution and text-statistics
+analysis acquisition use this path with the original request's borrowed phase.
+Tests cover a real scheduler with one ordinary CPU slot (the waiting writer
+releases CPU so its lock holder can resume), unchanged operation/byte ownership,
+simulated timed waits and rejection, failed CPU resumption, the production text
+adapter, and all prior lock cancellation/fairness/wakeup regressions.
+`zig build antfly-controlled-service-lock-test antfly-text-scoring-authority-test`
+provides focused correctness evidence. Controlled exclusive acquisition still
+needs adoption across production writers and other service fences. CPU yielding
+inside lock-holding query work remains unqualified until the complete lock/wait
+dependency graph permits resumption and control progress; these tests do not
+prove the broader runtime resource/performance/default gates.

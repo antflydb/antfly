@@ -2338,7 +2338,7 @@ fn collectFullTextResolvedDocSetAlloc(
     text_query: types.TextQuery,
 ) !?doc_set.ResolvedDocSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
-    text_entry.lockAnalysisShared();
+    try lockTextAnalysisForSearch(text_entry, req);
     defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -2952,6 +2952,18 @@ fn logExactSortBudgetRejection(
             if (plan) |p| sortPlanExactnessName(sortExecutionPlanExactness(p)) else "unspecified",
         },
     );
+}
+
+fn checkTextLockLifetime(req: types.SearchRequest) !void {
+    try @import("../../query_controls.zig").nativeTextAuthority(&req).check();
+}
+
+fn lockTextAnalysisForSearch(entry: *index_manager_mod.IndexManager.TextIndex, req: types.SearchRequest) !void {
+    var budget: @import("../../../common/read_execution_budget.zig").Budget(types.SearchRequest, checkTextLockLifetime) = .{ .controls = req, .io = entry.io };
+    try entry.analysis_mutex.lockSharedControlledIo(entry.io, .{
+        .lifetime = @import("../../query_controls.zig").nativeTextAuthority(&req),
+        .execution_wait = budget.executionBoundary(),
+    });
 }
 
 pub fn checkSearchRequestDeadline(req: types.SearchRequest) !void {
@@ -8692,7 +8704,7 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     filter_query_json: []const u8,
 ) !?doc_set.ResolvedDocSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
-    text_entry.lockAnalysisShared();
+    try lockTextAnalysisForSearch(text_entry, req);
     defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -8801,7 +8813,7 @@ fn collectStructuredFilterTextDocNumsAlloc(
     filter_query_json: []const u8,
 ) !?TextDocNumSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
-    text_entry.lockAnalysisShared();
+    try lockTextAnalysisForSearch(text_entry, req);
     defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -8897,7 +8909,7 @@ fn collectStructuredFilterDocIdsAlloc(
     var identity_scratch = segment_mod.SegmentReadScratch.init(alloc, 64 * 1024);
     defer identity_scratch.deinit();
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
-    text_entry.lockAnalysisShared();
+    try lockTextAnalysisForSearch(text_entry, req);
     defer text_entry.unlockAnalysisShared();
 
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -11656,7 +11668,7 @@ pub fn searchTextQuery(
         try acquire(executor.ctx, effective_req.index_name)
     else local_source: {
         const entry = (try executor.text_index_entry(executor.ctx, effective_req.index_name)) orelse break :local_source null;
-        entry.lockAnalysisShared();
+        try lockTextAnalysisForSearch(entry, effective_req);
         break :local_source @as(?PinnedTextSource, .{ .snapshot = entry.persistent.acquireSnapshot(), .name = entry.config.name, .text_analysis = entry.text_analysis, .runtime_schema = entry.runtime_schema, .owner = entry, .release_owner = PinnedTextSource.releaseLocal });
     }) orelse return switch (text_query) {
         .match_all => executor.search_match_all(executor.ctx, alloc, effective_req),
@@ -12592,14 +12604,14 @@ pub fn collectSearchRequestTextStats(
         if (req.full_text) |text_query| {
             const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return &.{};
             {
-                text_entry.lockAnalysisShared();
+                try lockTextAnalysisForSearch(text_entry, req);
                 defer text_entry.unlockAnalysisShared();
                 try collectTextQueryTerms(alloc, &stats_map, req.index_name, text_query, text_entry.text_analysis, text_entry.runtime_schema);
             }
         } else if (isTextQuery(req.query) and !isDefaultMatchAll(req.query)) {
             const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return &.{};
             {
-                text_entry.lockAnalysisShared();
+                try lockTextAnalysisForSearch(text_entry, req);
                 defer text_entry.unlockAnalysisShared();
                 try collectQueryTerms(alloc, &stats_map, req.index_name, req.query, text_entry.text_analysis, text_entry.runtime_schema);
             }
@@ -12609,7 +12621,7 @@ pub fn collectSearchRequestTextStats(
             try checkSearchRequestDeadline(req);
             const text_entry = (try executor.text_index_entry(executor.ctx, item.index_name)) orelse continue;
             {
-                text_entry.lockAnalysisShared();
+                try lockTextAnalysisForSearch(text_entry, req);
                 defer text_entry.unlockAnalysisShared();
                 try collectTextQueryTerms(alloc, &stats_map, item.index_name, item.query, text_entry.text_analysis, text_entry.runtime_schema);
             }
@@ -12620,7 +12632,7 @@ pub fn collectSearchRequestTextStats(
         const filter_index_name = req.primary_text_index_name orelse req.index_name;
         const text_entry = (try executor.text_index_entry(executor.ctx, filter_index_name)) orelse return &.{};
         {
-            text_entry.lockAnalysisShared();
+            try lockTextAnalysisForSearch(text_entry, req);
             defer text_entry.unlockAnalysisShared();
             if (req.filter_query_json.len > 0) {
                 try collectPatternFilterQueryTerms(alloc, &stats_map, filter_index_name, req.filter_query_json, text_entry.text_analysis, text_entry.runtime_schema);
@@ -17367,7 +17379,7 @@ fn planMatchAllSortBeforeCandidatesAlloc(
         );
         return error.UnsupportedExactSort;
     };
-    text_entry.lockAnalysisShared();
+    try lockTextAnalysisForSearch(text_entry, req);
     defer text_entry.unlockAnalysisShared();
     const plan = try planTextNativeSortFields(effective_req, text_entry.persistent.snapshot(), text_entry.runtime_schema);
     if (plan.sorted_segment_executor_available) {
@@ -17441,7 +17453,7 @@ fn buildMatchAllNativeSortContextAlloc(
     if (req.order_by.len == 0 or !requestNeedsNativeSortValues(req)) return null;
     try validateMatchAllSortDoesNotUseScore(req);
     const text_entry = (try executor.text_index_entry(executor.ctx, req.index_name)) orelse return null;
-    text_entry.lockAnalysisShared();
+    try lockTextAnalysisForSearch(text_entry, req);
     defer text_entry.unlockAnalysisShared();
     const snapshot = text_entry.persistent.snapshot();
     const plan = try planTextNativeSortFields(req, snapshot, text_entry.runtime_schema);
@@ -32474,4 +32486,77 @@ test "statistics primary hydration adapter preserves controls and retires reject
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "controlled text analysis acquisition retains original borrow and rejects failed resume" {
+    const runtime = @import("antfly_runtime_abi");
+    // Only these fields are used by the production acquisition helper. No
+    // query publication or index storage is manufactured by this fixture.
+    var entry: index_manager_mod.IndexManager.TextIndex = undefined;
+    entry.io = std.testing.io;
+    entry.analysis_mutex = .{};
+    try lockTextAnalysisForSearch(&entry, .{});
+    entry.unlockAnalysisShared();
+    try std.testing.expectError(error.Timeout, lockTextAnalysisForSearch(&entry, .{ .execution_deadline_ns = 0 }));
+    const State = struct {
+        entry: *index_manager_mod.IndexManager.TextIndex,
+        holder: bool = false,
+        deny_resume: bool = false,
+        parks: usize = 0,
+        resumes: usize = 0,
+        checkpoints: usize = 0,
+        fn lifetime(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            return .ok;
+        }
+        fn checkpoint(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkpoints += 1;
+            return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+        }
+        fn current(_: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+            out.* = @backingInt(runtime.runnable_abi.Class.query);
+            return .ok;
+        }
+        fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (reason != @backingInt(runtime.runnable_abi.Wait.resource)) return runtime.error_abi.statusFromError(error.InvalidArgument);
+            self.parks += 1;
+            self.entry.analysis_mutex.unlockExclusive();
+            self.holder = false;
+            return .ok;
+        }
+        fn enter(raw: *anyopaque, phase: c_int) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (phase != @backingInt(runtime.runnable_abi.Class.query)) return runtime.error_abi.statusFromError(error.InvalidArgument);
+            self.resumes += 1;
+            return if (self.deny_resume) runtime.error_abi.statusFromError(error.SchedulerClosed) else .ok;
+        }
+    };
+    for ([_]bool{ false, true }) |deny_resume| {
+        entry.analysis_mutex.lockExclusive();
+        var state: State = .{ .entry = &entry, .holder = true, .deny_resume = deny_resume };
+        defer if (state.holder) entry.analysis_mutex.unlockExclusive();
+        const req: types.SearchRequest = .{ .execution_deadline_ns = 0, .execution_runnable = .{
+            .context = &state,
+            .cpu_slots = 1,
+            .parent_class = @backingInt(runtime.runnable_abi.Class.query),
+            .checkpoint = State.checkpoint,
+            .park = State.park,
+            .enter = State.enter,
+            .check_lifetime = State.lifetime,
+            .current_class = State.current,
+        } };
+        if (deny_resume) {
+            try std.testing.expectError(error.SchedulerClosed, lockTextAnalysisForSearch(&entry, req));
+        } else {
+            try lockTextAnalysisForSearch(&entry, req);
+            entry.unlockAnalysisShared();
+        }
+        try std.testing.expectEqual(@as(usize, 1), state.parks);
+        try std.testing.expectEqual(state.parks, state.resumes);
+        try std.testing.expectEqual(@as(usize, 0), state.checkpoints);
+        try std.testing.expectEqual(@as(u32, 0), entry.analysis_mutex.parked_waiters.load(.acquire));
+        try std.testing.expect(entry.analysis_mutex.tryLockExclusive());
+        entry.analysis_mutex.unlockExclusive();
+    }
 }

@@ -2365,6 +2365,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-transaction-capture-budget-test", "Require original transaction routing controls and capture cleanup")
         .dependOn(&transaction_capture_run.step);
 
+    const controlled_service_lock_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/controlled_service_lock_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, controlled_service_lock_root, true, true);
+    controlled_service_lock_root.addImport("antfly_source_root", controlled_service_lock_root);
+    const controlled_service_lock_tests = b.addTest(.{
+        .name = "controlled-service-lock-tests",
+        .root_module = controlled_service_lock_root,
+        .filters = &.{ "controlled apply lock", "controlled text analysis acquisition", "apply rw lock" },
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-controlled-service-lock-test", "Verify service lock waits release CPU and preserve original lifetime and lock ownership")
+        .dependOn(&b.addRunArtifact(controlled_service_lock_tests).step);
+
     const text_scoring_authority_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/text_scoring_authority_test_root.zig"),
         .target = target,
