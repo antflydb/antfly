@@ -44046,6 +44046,15 @@ test "global multi-query rechecks live permission before each table result" {
         .query_result_lifecycle_hook = observer.hook(),
     }, FakeSource.iface(), reads.source(), null);
     defer server.deinit();
+    const request_memory = server.request_memory.?;
+    const foreground_before = request_memory.foreground.used.load(.acquire);
+    const control_before = request_memory.control.used.load(.acquire);
+    // Response and identity ownership outlive execution retirement, then all
+    // charges must return before the server's allocator owner is destroyed.
+    defer {
+        std.testing.expectEqual(foreground_before, request_memory.foreground.used.load(.acquire)) catch @panic("foreground request ownership not retired");
+        std.testing.expectEqual(control_before, request_memory.control.used.load(.acquire)) catch @panic("control request ownership not retired");
+    }
     observer.server = &server;
     const authorization = try encodeBasicAuthorization(alloc, "reader", "secret");
     defer alloc.free(authorization);
@@ -44055,9 +44064,9 @@ test "global multi-query rechecks live permission before each table result" {
     ;
 
     var admitted = try server.authenticateRequest(.{ .authorization = authorization });
-    defer admitted.deinit(alloc);
+    defer admitted.deinit(server.alloc);
     var denied = try server.handlePublicGlobalMultiQuery(body, admitted);
-    defer denied.deinit(alloc);
+    defer denied.deinit(server.alloc);
     try std.testing.expect(observer.revoked);
     try std.testing.expectEqual(@as(u16, 403), denied.status);
     try std.testing.expectEqualStrings("{\"error\":\"forbidden\"}", denied.body);
@@ -44069,9 +44078,9 @@ test "global multi-query rechecks live permission before each table result" {
     defer restored.deinit(alloc);
     try auth.manager.addPermissionToUser("reader", restored);
     var recovered_identity = try server.authenticateRequest(.{ .authorization = authorization });
-    defer recovered_identity.deinit(alloc);
+    defer recovered_identity.deinit(server.alloc);
     var recovered = try server.handlePublicGlobalMultiQuery(body, recovered_identity);
-    defer recovered.deinit(alloc);
+    defer recovered.deinit(server.alloc);
     try std.testing.expectEqual(@as(u16, 200), recovered.status);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, recovered.body, .{});
     defer parsed.deinit();
@@ -44170,6 +44179,15 @@ test "api http server maps cancelled NDJSON multi-query to client closed respons
 
     var server = ApiHttpServer.init(alloc, .{ .runnable_policy = .{ .slots = 2 } }, FakeSource.iface(), null, null);
     defer server.deinit();
+    const request_memory = server.request_memory.?;
+    const foreground_before = request_memory.foreground.used.load(.acquire);
+    const control_before = request_memory.control.used.load(.acquire);
+    // Response and identity ownership outlive execution retirement, then all
+    // charges must return before the server's allocator owner is destroyed.
+    defer {
+        std.testing.expectEqual(foreground_before, request_memory.foreground.used.load(.acquire)) catch @panic("foreground request ownership not retired");
+        std.testing.expectEqual(control_before, request_memory.control.used.load(.acquire)) catch @panic("control request ownership not retired");
+    }
     var cancellation = http_common.RequestCancellation{};
     cancellation.cancel();
 
@@ -44180,7 +44198,7 @@ test "api http server maps cancelled NDJSON multi-query to client closed respons
         null,
         &cancellation,
     );
-    defer resp.deinit(alloc);
+    defer resp.deinit(server.alloc);
 
     try std.testing.expectEqual(@as(u16, 499), resp.status);
     try std.testing.expectEqualStrings("client closed request", resp.body);
@@ -44193,7 +44211,7 @@ test "api http server maps cancelled NDJSON multi-query to client closed respons
         null,
         &expired,
     );
-    defer timed_out.deinit(alloc);
+    defer timed_out.deinit(server.alloc);
     try std.testing.expectEqual(@as(u16, 504), timed_out.status);
     try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), server.runnable_scheduler.?.stats().retained_bytes);
@@ -57723,10 +57741,19 @@ test "system catalog NDJSON reuses one query definition without administrative s
     const reads: table_reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = Fake.scan, .query = Fake.query } };
     var server = ApiHttpServer.init(alloc, .{ .runnable_policy = .{ .slots = 2, .checkpoint_budget = 1 } }, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .admin_snapshot = Fake.snapshot, .system_catalog = Fake.catalog, .supports_query_definitions = true } }, reads, null);
     defer server.deinit();
+    const request_memory = server.request_memory.?;
+    const foreground_before = request_memory.foreground.used.load(.acquire);
+    const control_before = request_memory.control.used.load(.acquire);
+    // Response and identity ownership outlive execution retirement, then all
+    // charges must return before the server's allocator owner is destroyed.
+    defer {
+        std.testing.expectEqual(foreground_before, request_memory.foreground.used.load(.acquire)) catch @panic("foreground request ownership not retired");
+        std.testing.expectEqual(control_before, request_memory.control.used.load(.acquire)) catch @panic("control request ownership not retired");
+    }
     fake.server = &server;
     const line = "{\"table\":\"docs\",\"full_text_search\":{\"match_all\":{}}}\n";
     var response = try server.handlePublicGlobalMultiQuery(z17RepeatString(line, 20), null);
-    defer response.deinit(alloc);
+    defer response.deinit(server.alloc);
     try std.testing.expectEqual(@as(u16, 200), response.status);
     try std.testing.expectEqual(@as(usize, 20), fake.queries);
     try std.testing.expectEqual(@as(usize, 1), fake.bindings);
@@ -58341,6 +58368,15 @@ test "workload deadline survives NDJSON lines and MCP dispatch" {
     var reads = FakeReads{ .expected_deadline_ns = outer_deadline_ns };
     var server = ApiHttpServer.init(alloc, .{ .runnable_policy = .{ .slots = 2, .checkpoint_budget = 1 } }, FakeSource.iface(), reads.source(), null);
     defer server.deinit();
+    const request_memory = server.request_memory.?;
+    const foreground_before = request_memory.foreground.used.load(.acquire);
+    const control_before = request_memory.control.used.load(.acquire);
+    // Response and identity ownership outlive execution retirement, then all
+    // charges must return before the server's allocator owner is destroyed.
+    defer {
+        std.testing.expectEqual(foreground_before, request_memory.foreground.used.load(.acquire)) catch @panic("foreground request ownership not retired");
+        std.testing.expectEqual(control_before, request_memory.control.used.load(.acquire)) catch @panic("control request ownership not retired");
+    }
     reads.server = &server;
     const body = "{\"query\":{\"match_all\":{}},\"timeout_ms\":999999}";
     var cancellation: http_common.RequestCancellation = .{ .execution_deadline_ns = outer_deadline_ns };
@@ -58348,14 +58384,14 @@ test "workload deadline survives NDJSON lines and MCP dispatch" {
     const lines = try std.fmt.allocPrint(alloc, "{s}\n{s}", .{ body, body });
     defer alloc.free(lines);
     var multi = try server.handlePublicTableQueryWithContentTypeCancellation("docs", lines, "application/x-ndjson", null, &cancellation);
-    defer multi.deinit(alloc);
+    defer multi.deinit(server.alloc);
     try std.testing.expectEqual(@as(u16, 200), multi.status);
     try std.testing.expectEqual(@as(usize, 2), reads.query_count);
     try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
     reads.ndjson = false;
     reads.mutable_cancellation = null;
     var mcp_response = try server.executeMcpApplicationOperationWithContext(.{ .query = .{ .table_name = "docs", .body = body } }, null, .{ .deadline_ns = outer_deadline_ns });
-    defer mcp_response.deinit(alloc);
+    defer mcp_response.deinit(server.alloc);
     try std.testing.expectEqual(@as(u16, 200), mcp_response.status);
     try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
 }

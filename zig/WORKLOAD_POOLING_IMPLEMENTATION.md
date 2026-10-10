@@ -1722,3 +1722,15 @@ with source-profile errors fixed in descendants and additional runtime failures
 requiring review, including NDJSON ownership teardown. The newer cumulative
 snapshot is running. Resource/performance measurements and automatic defaults
 remain unqualified.
+
+Cumulative runtime diagnostics identified mismatched allocator retirement in the
+NDJSON permission, shared-catalog, cancellation and original-deadline/MCP
+fixtures. Servers with runnable policies allocate responses and authenticated
+identities from their partitioned request allocator, while these fixtures freed
+them directly through its backing allocator. The fixtures now use the server
+allocator, matching HTTP delivery, and check that both request partitions return
+to their original usage after identity/response teardown and before server
+retirement. The focused storage/service regressions and source ownership audit
+remain green; these do not instantiate the full HTTP fixtures. The actual NDJSON
+fixture target remains queued in cumulative validation, alongside the remaining
+runtime failures. Automatic defaults remain unqualified.
