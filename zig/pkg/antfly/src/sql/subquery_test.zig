@@ -25,7 +25,7 @@ const Backend = struct {
     fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
         return error.UnexpectedBackendCall;
     }
-    fn mutate(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
         return error.UnexpectedBackendCall;
     }
     fn checkpoint(_: *anyopaque) !void {}
@@ -676,7 +676,7 @@ test "SQL membership unwinds allocations admits parameters and preserves nonkeye
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT 1 IN (SELECT x FROM (SELECT 1 AS x) i)", .{});
     defer compiled.deinit();
-    try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .retained_bytes = 1 }));
+    try std.testing.expectError(error.SqlWorkingMemoryLimitExceeded, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .retained_bytes = 1 }));
     var correlated = try compiler.compile(std.testing.allocator, "SELECT o.x IN (SELECT i.x FROM (SELECT 1 AS x) i WHERE i.x > o.x) FROM (SELECT 1 AS x) o", .{});
     defer correlated.deinit();
     var correlated_result = try runtime.execute(std.testing.allocator, backend.backend(), &correlated, &.{}, .{});
@@ -1054,7 +1054,7 @@ test "SQL decorrelation unwinds every allocation and enforces shared memory admi
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT EXISTS (SELECT 1)", .{});
     defer compiled.deinit();
-    try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .retained_bytes = 1 }));
+    try std.testing.expectError(error.SqlWorkingMemoryLimitExceeded, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .retained_bytes = 1 }));
 }
 
 test "SQL correlated scalar parameter constraints propagate through join and result domains" {

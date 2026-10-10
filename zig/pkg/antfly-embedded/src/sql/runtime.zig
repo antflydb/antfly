@@ -25,11 +25,14 @@ const Json = std.json.Value;
 const operators = @import("operators.zig");
 const Datum = @import("scalar.zig").Datum;
 
+pub const resource_limits = @import("resource_limits.zig");
+
 pub const Limits = struct {
+    error_context: ?*@import("errors.zig").Context = null,
     result_rows: usize = 128,
     mutation_rows: usize = 4096,
     scan_rows: usize = 10_000_000,
-    retained_bytes: usize = 64 * 1024 * 1024,
+    retained_bytes: usize = resource_limits.default_memory_bytes,
     page_rows: u32 = 256,
     /// Native execution batches are independent of response/decision pages.
     execution_batch_rows: u32 = 4096,
@@ -122,6 +125,7 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     var pinned_settings: ?@import("setting_catalog.zig").View = null;
     defer if (pinned_settings) |*view| view.deinit();
     var statement_backend = backend;
+    if (limits.error_context) |context| statement_backend.error_context = context;
     if (parameters.len > 1024) return error.InvalidSqlParameters;
     if (backend.setting_capture) |capture| {
         pinned_settings = try @import("setting_catalog.zig").View.capture(alloc, capture.owner, capture.scope, capture.overlay);
@@ -137,7 +141,7 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     const arena = state.arena.allocator();
     statement_backend.parameter_fallback_types = try parameterFallbackTypes(arena, parameters);
     result.output = runBound(state.budget.allocator(), arena, statement_backend, compiled, parameters, limits, null) catch |err| {
-        if (err == error.OutOfMemory and state.budget.exhausted) return error.SqlProgramLimitExceeded;
+        if (err == error.OutOfMemory and state.budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return err;
     };
     return result;
@@ -189,7 +193,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     var manager: ?@import("spill.zig").Manager = null;
     defer if (manager) |*owned| owned.deinit();
     if (backend.spill_manager == null and limits.spill_bytes != 0) if (backend.execution_io) |io| {
-        manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
+        manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = limits.retained_bytes };
     };
     const context = Context{ .alloc = alloc, .arena = arena, .backend = statement_backend, .binding = binding, .parameters = prepared_parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink };
     return context.run(compiled.statement);
@@ -396,7 +400,10 @@ pub const Context = struct {
     /// cell. Arrays remain typed until here; their null JSON placeholder must
     /// never be mistaken for either a SQL NULL or a JSONB null write.
     pub fn storageDatum(self: Context, datum: Datum, column: catalog.Column) !Json {
-        return encodeStorageDatum(self.arena, datum, column, self.limits.retained_bytes);
+        return encodeStorageDatum(self.arena, datum, column, self.limits.retained_bytes) catch |err| {
+            if (err == error.SqlNotNullViolation) return @import("errors.zig").notNull(self.backend.error_context, column.name);
+            return err;
+        };
     }
 
     fn value(self: Context, input: ast.Value, column: catalog.Column) !Json {
@@ -955,6 +962,13 @@ pub const Context = struct {
         return .{ .columns = columns, .rows = rows, .sql_nulls = null_rows, .command_tag = "SELECT" };
     }
 
+    fn validateInsertRequired(self: Context, table: catalog.Table, object: std.json.ObjectMap) !void {
+        for (table.columns) |column| {
+            if (column.nullable or column.generated or column.defaulted or std.mem.eql(u8, column.name, "_id")) continue;
+            if (!object.contains(column.path)) return @import("errors.zig").notNull(self.backend.error_context, column.name);
+        }
+    }
+
     fn insert(self: Context, statement: ast.Insert) !Output {
         if (statement.source) |source| return self.insertSelect(statement, source.*);
         const table_def = self.binding.table orelse return error.InvalidSqlBackendResponse;
@@ -999,6 +1013,7 @@ pub const Context = struct {
                 const document: Json = .{ .object = object };
                 retained = std.math.add(usize, retained, jsonSize(document) + key.string.len) catch return error.SqlProgramLimitExceeded;
                 if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
+                try self.validateInsertRequired(table_def, object);
                 mutation.* = .{ .key = key.string, .expected_version = 0, .unique_absence = true, .row = document, .json_null_fields = json_null_fields.items };
             }
             first = page.end;
@@ -1065,6 +1080,7 @@ pub const Context = struct {
             if ((try keys.getOrPut(self.arena, identity)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return error.DuplicateSqlRow;
             retained = std.math.add(usize, retained, jsonSize(.{ .object = object }) + identity.len) catch return error.SqlProgramLimitExceeded;
             if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
+            try self.validateInsertRequired(table, object);
             mutation.* = .{ .key = identity, .expected_version = 0, .unique_absence = true, .row = .{ .object = object }, .json_null_fields = json_null_fields.items };
         }
         try self.checkpoint();
@@ -1203,7 +1219,7 @@ pub const Context = struct {
                 typed = try self.value(item.value, column);
                 sql_null = typed == .null and !(column.type == .json and item.value == .string);
             }
-            if (program == null and sql_null and !column.nullable) return error.SqlNotNullViolation;
+            if (program == null and sql_null and !column.nullable) return @import("errors.zig").notNull(self.backend.error_context, column.name);
             // These constants are immutable for the entire statement. Own
             // them once, then share them across the prepared replacement rows.
             bound.* = .{ .column = column, .value = try clone(self.arena, typed), .sql_null = sql_null, .program = program };
@@ -1312,7 +1328,7 @@ pub const Context = struct {
                         for (bound_assignments, 0..) |bound, assignment_index| {
                             const assigned_value = if (bound.program) |program| blk: {
                                 const assigned = if (evaluated) |batch| batch.assignments[assignment_index].?[batch.positions[row_index].?] else try self.evaluate(scratch, program, expression_cells);
-                                if (assigned.sql_null and !bound.column.nullable) return error.SqlNotNullViolation;
+                                if (assigned.sql_null and !bound.column.nullable) return @import("errors.zig").notNull(self.backend.error_context, bound.column.name);
                                 if (bound.column.type == .json and !assigned.sql_null and assigned.value == .null) try json_null_fields.append(self.arena, bound.column.path);
                                 break :blk try self.storageDatum(assigned, bound.column);
                             } else blk: {
@@ -1471,9 +1487,9 @@ pub const Context = struct {
         var commit_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer commit_arena.deinit();
         output.mutation_outcome = if (committed.len == 0) .committed else if (did_prepare)
-            try (self.backend.vtable.mutate_prepared orelse return error.UnsupportedSqlExecution)(self.backend.ptr, commit_arena.allocator(), table, committed)
+            try (self.backend.vtable.mutate_prepared orelse return error.UnsupportedSqlExecution)(self.backend.ptr, commit_arena.allocator(), self.alloc, table, committed)
         else
-            try self.backend.vtable.mutate(self.backend.ptr, commit_arena.allocator(), table, committed);
+            try self.backend.vtable.mutate(self.backend.ptr, commit_arena.allocator(), self.alloc, table, committed);
         return output;
     }
 
@@ -1707,7 +1723,7 @@ test "SQL NUMERIC predicates preserve inferred and explicit parameters for reads
             }
             return .{ .rows = rows };
         }
-        fn mutate(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(raw: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(@as(usize, 1), mutations.len);
             try std.testing.expectEqualStrings("match", mutations[0].key);
@@ -1789,7 +1805,7 @@ test "SQL floating predicates retain declared NUMERIC parameters for reads and m
             }
             return .{ .rows = rows };
         }
-        fn mutate(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(raw: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(@as(usize, 1), mutations.len);
             try std.testing.expectEqualStrings("match", mutations[0].key);
@@ -2522,7 +2538,7 @@ const TestBackend = struct {
         }
         return .{ .rows = rows, .after = if (request.primary_key == null and from + count_rows < self.row_count) try std.fmt.allocPrint(alloc, "{d}", .{from + count_rows}) else null };
     }
-    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, table_def: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, table_def: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *TestBackend = @ptrCast(@alignCast(ptr));
         self.writes += 1;
         try std.testing.expectEqual(@as(u32, 7), table_def.schema_version);
@@ -2541,7 +2557,7 @@ const TestBackend = struct {
 
 test "SQL commit serialization is released before the statement result" {
     const Provider = struct {
-        fn mutate(_: *anyopaque, alloc: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, alloc: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
             try std.testing.expect(mutations[0].unique_absence);
             // Model a provider's temporary wire buffer. The callback contract
             // supplies an arena and owns its lifetime even on allocation failure.
@@ -2590,7 +2606,7 @@ test "SQL EXPLAIN binds authorized plans without reading or writing rows" {
             self.scans += 1;
             return error.UnexpectedScan;
         }
-        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.writes += 1;
             return error.UnexpectedMutation;
@@ -2670,7 +2686,7 @@ test "SQL INSERT VALUES scalar subqueries prepare a bounded source before writin
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
             return error.UnexpectedIndependentScan;
         }
-        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.large) {
                 try std.testing.expectEqual(@as(usize, 1000), mutations.len);
@@ -2753,7 +2769,7 @@ test "SQL INSERT VALUES scalar subqueries prepare a bounded source before writin
     }
     try std.testing.expectEqual(@as(usize, 0), backend.writes);
     var limited: ValuesBackend = .{ .large = true };
-    try std.testing.expectError(error.SqlProgramLimitExceeded, execute(std.testing.allocator, limited.iface(), &large, &.{}, .{ .retained_bytes = 1024 * 1024 }));
+    try std.testing.expectError(error.SqlWorkingMemoryLimitExceeded, execute(std.testing.allocator, limited.iface(), &large, &.{}, .{ .retained_bytes = 1024 * 1024 }));
     try std.testing.expectEqual(@as(usize, 0), limited.writes);
     var canceled: ValuesBackend = .{ .large = true, .cancel_after = 8 };
     try std.testing.expectError(error.Canceled, execute(std.testing.allocator, canceled.iface(), &large, &.{}, .{ .retained_bytes = 4 * 1024 * 1024 }));
@@ -2828,7 +2844,7 @@ test "SQL INSERT VALUES self-subquery closes its captured read before commit" {
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
             return error.UnexpectedIndependentScan;
         }
-        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(self.captures, self.closes);
             try std.testing.expectEqual(@as(usize, 1), mutations.len);
@@ -3470,10 +3486,10 @@ test "SQL retained cursors close on completion early limit cancellation and writ
             return error.TestUnexpectedResult;
         }
 
-        fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, _: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(self.opens, self.closes);
-            return TestBackend.mutate(&self.base, alloc, table, mutations);
+            return TestBackend.mutate(&self.base, alloc, alloc, table, mutations);
         }
 
         fn iface(self: *@This()) catalog.Backend {
@@ -3516,7 +3532,7 @@ test "SQL memory quota rejects allocations before backend work" {
     var backend: TestBackend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT id FROM things", .{});
     defer compiled.deinit();
-    try std.testing.expectError(error.SqlProgramLimitExceeded, execute(std.testing.allocator, backend.iface(), &compiled, &.{}, .{ .retained_bytes = 1 }));
+    try std.testing.expectError(error.SqlWorkingMemoryLimitExceeded, execute(std.testing.allocator, backend.iface(), &compiled, &.{}, .{ .retained_bytes = 1 }));
     try std.testing.expectEqual(@as(usize, 0), backend.pages);
 }
 
@@ -3840,7 +3856,7 @@ test "SQL update reads only preserved columns and shares immutable assignments" 
             }
             return .{ .rows = rows };
         }
-        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, rows: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, rows: []const catalog.Mutation) !catalog.MutationOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.writes += 1;
             try std.testing.expectEqual(@as(usize, 64), rows.len);
@@ -3898,7 +3914,7 @@ test "SQL typed mutations preserve JSON null separately from SQL NULL and filter
             }
             return .{ .rows = result.items, .after = null };
         }
-        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(usize, 1), mutations.len);
             try std.testing.expectEqual(self.expected_null_fields.len, mutations[0].json_null_fields.len);
@@ -4320,7 +4336,7 @@ const InsertDecisionFixture = struct {
         }
         return results;
     }
-    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         for (mutations) |mutation| {
             try std.testing.expect(std.mem.startsWith(u8, mutation.key, "row"));
@@ -4739,7 +4755,7 @@ test "SQL native aggregate materialization retains projection and fails closed a
         fn scan(raw: *anyopaque, alloc: std.mem.Allocator, definition: catalog.Table, request: catalog.Scan) !catalog.Page {
             return TestBackend.scan(&from(raw).base, alloc, definition, request);
         }
-        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             return error.TestUnexpectedResult;
         }
         fn checkpoint(raw: *anyopaque) !void {

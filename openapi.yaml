@@ -13289,6 +13289,9 @@ components:
         message:
           type: string
           description: Human-readable diagnostic with no sensitive parameter values.
+        column_name:
+          type: string
+          description: Public column identifier for a column constraint violation; no row values are included.
         position:
           type: integer
           minimum: 1
@@ -28180,7 +28183,8 @@ components:
 
         normal relational datetime representation.
 
-        Comparisons require operands of the same type and return boolean or
+        Comparisons require operands of compatible types (integer and number may mix) and return boolean
+        or
 
         SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
 
@@ -28294,7 +28298,7 @@ components:
 
         remainder (minInt modulo -1 is zero); a zero divisor rejects the write.
 
-        in_list and not_in_list take one probe followed by 1 to 31 same-domain
+        in_list and not_in_list take one probe followed by 1 to 127 same-domain
 
         candidates. The probe is evaluated once; NULL probes return UNKNOWN.
 
@@ -28325,11 +28329,11 @@ components:
           minLength: 1
         collation:
           type: string
-          description: Optional binary or ASCII case-insensitive collation for binary string comparison
-            operations only; aliases match ordered indexes.
+          description: Optional binary or ASCII case-insensitive collation for string comparisons and
+            in_list; aliases match ordered indexes.
         args:
           type: array
-          maxItems: 32
+          maxItems: 128
           items:
             $ref: '#/components/schemas/RelationalScalarExpression'
     RelationalIndexKeyDirection:

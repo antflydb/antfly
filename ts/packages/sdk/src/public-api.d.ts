@@ -4944,6 +4944,8 @@ export interface components {
             code: string;
             /** @description Human-readable diagnostic with no sensitive parameter values. */
             message: string;
+            /** @description Public column identifier for a column constraint violation; no row values are included. */
+            column_name?: string;
             /** @description Optional one-based character position in the submitted SQL statement. */
             position?: number;
             /** @description Native transaction receipt for reconciliation when a mutation outcome is unknown. */
@@ -14040,7 +14042,7 @@ export interface components {
          *     row and expression set. An integer literal may use a decimal string
          *     for exact int64 transport; blob uses base64 and datetime uses the
          *     normal relational datetime representation.
-         *     Comparisons require operands of the same type and return boolean or
+         *     Comparisons require operands of compatible types (integer and number may mix) and return boolean or
          *     SQL UNKNOWN (null); is_distinct and is_not_distinct always return a
          *     boolean. Unary is_null and is_not_null test presence/null. AND and OR
          *     evaluate left to right with SQL three-valued short-circuit semantics;
@@ -14097,7 +14099,7 @@ export interface components {
          *     operation requires schema capability version 18.
          *     modulo takes two same-domain integer or NUMERIC operands and returns the signed
          *     remainder (minInt modulo -1 is zero); a zero divisor rejects the write.
-         *     in_list and not_in_list take one probe followed by 1 to 31 same-domain
+         *     in_list and not_in_list take one probe followed by 1 to 127 same-domain
          *     candidates. The probe is evaluated once; NULL probes return UNKNOWN.
          *     A matching candidate wins over NULL candidates; otherwise a NULL
          *     candidate makes the result UNKNOWN. These operations require schema
@@ -14113,7 +14115,7 @@ export interface components {
             /** @description Typed literal value, including null. */
             value?: unknown;
             column?: string;
-            /** @description Optional binary or ASCII case-insensitive collation for binary string comparison operations only; aliases match ordered indexes. */
+            /** @description Optional binary or ASCII case-insensitive collation for string comparisons and in_list; aliases match ordered indexes. */
             collation?: string;
             args?: components["schemas"]["RelationalScalarExpression"][];
         };

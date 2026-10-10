@@ -12783,6 +12783,8 @@ pub const SQLDiagnostic = struct {
     code: []const u8,
     /// Human-readable diagnostic with no sensitive parameter values.
     message: []const u8,
+    /// Public column identifier for a column constraint violation; no row values are included.
+    column_name: ?[]const u8 = null,
     /// Optional one-based character position in the submitted SQL statement.
     position: ?i64 = null,
     /// Native transaction receipt for reconciliation when a mutation outcome is unknown.
@@ -12795,6 +12797,7 @@ pub const SQLDiagnostic = struct {
     pub const openApiFieldMetadata = .{
         .{ "code", "code", false },
         .{ "message", "message", false },
+        .{ "column_name", "column_name", true },
         .{ "position", "position", true },
         .{ "transaction_id", "transaction_id", true },
         .{ "retryable", "retryable", true },
@@ -12815,6 +12818,10 @@ pub const SQLDiagnostic = struct {
         try jw.write(self.code);
         try jw.objectField("message");
         try jw.write(self.message);
+        if (self.column_name) |value| {
+            try jw.objectField("column_name");
+            try jw.write(value);
+        }
         if (self.position) |value| {
             try jw.objectField("position");
             try jw.write(value);

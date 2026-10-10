@@ -353,3 +353,40 @@ func TestSQLPoolUsesIndependentNativeConnections(t *testing.T) {
 		t.Fatalf("committed rows = %d, want 2", count)
 	}
 }
+
+func TestSQLLargePreparedValuesAndTransaction(t *testing.T) {
+	db, err := sql.Open("antfly", "file:"+filepath.Join(t.TempDir(), "large.aflite")+"?no_sync=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err = db.Exec("CREATE TABLE entries (id TEXT, body TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	payload := string(bytes.Repeat([]byte("é"), 1_100_000))
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.Prepare("INSERT INTO entries (_id,id,body) VALUES ($1,$1,$2)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.Close()
+	for _, id := range []string{"a", "b"} {
+		if _, err = stmt.Exec(id, payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var actual string
+	if err = db.QueryRow("SELECT body FROM entries WHERE id=$1", "a").Scan(&actual); err != nil {
+		t.Fatal(err)
+	}
+	if actual != payload {
+		t.Fatalf("large prepared value changed: got %d bytes, want %d", len(actual), len(payload))
+	}
+}

@@ -687,7 +687,7 @@ const Context = struct {
             }
             break :json entry.value_ptr.*;
         } else try bindLiteral(self.allocator, node, column.type);
-        if (assignment and typed == .null and !column.nullable and !(node == .string and column.type == .json)) return error.SqlNotNullViolation;
+        if (assignment and typed == .null and !column.nullable and !(node == .string and column.type == .json)) return @import("errors.zig").notNull(self.backend.error_context, column.name);
     }
 
     fn predicate(self: *Context, maybe_node: ?*const ast.Predicate) anyerror!void {
@@ -1043,7 +1043,7 @@ const FakeBackend = struct {
     fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
         return error.DescriptionMustNotReadRows;
     }
-    fn mutate(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
         return error.DescriptionMustNotMutate;
     }
     fn checkpoint(ptr: *anyopaque) !void {

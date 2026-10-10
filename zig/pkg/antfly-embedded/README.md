@@ -88,3 +88,11 @@ implementations share this Apache owner. `src/root.zig` and the configured
 `src/engine/` modules expose the public Zig API; `src/source_catalog.zig` is an
 internal bridge for server consumers. See the [ownership design](../../../docs/design/embedded-source-ownership.md)
 for the embedded/server boundary.
+
+SQL JSON requests through the C API are limited to 64 MiB including statement
+text and parameters. Exceeding this limit returns a JSON SQLSTATE `54000`
+diagnostic naming the 67108864-byte limit. Preparation and execution each have
+a separate 64 MiB memory budget; the default transaction intent budget is
+128 MiB. Relational rows are limited to 16 MiB and persisted index keys to
+1 MiB. See [SQL resource limits](src/sql/COMPILER_SUPPORT.md) for accounting
+and native configuration details.

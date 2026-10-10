@@ -61512,7 +61512,7 @@ test "relational cumulative prepares remain committable within the preparation e
     try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
     // Admission is table policy, deliberately independent of this process's
     // working-set budget. This fixture chooses a small logical transaction cap.
-    db.core.table_catalog.transaction_admission_bytes = 1024 * 1024;
+    db.core.table_catalog.transaction_admission_bytes = 32 * 1024;
     const payload: [1024]u8 = @splat('x');
     const document = try std.fmt.allocPrint(alloc, "{{\"body\":\"{s}\"}}", .{payload});
     defer alloc.free(document);

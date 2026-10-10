@@ -428,7 +428,7 @@ pub fn acceptsField(op: Op, name: []const u8) bool {
         .cast => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "type") or std.mem.eql(u8, name, "sql_type") or std.mem.eql(u8, name, "numeric_modifier"),
         .array => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
         .add, .subtract, .multiply, .divide, .modulo, .negate => std.mem.eql(u8, name, "args") or std.mem.eql(u8, name, "sql_type"),
-        else => std.mem.eql(u8, name, "args") or (isComparison(op) and std.mem.eql(u8, name, "collation")),
+        else => std.mem.eql(u8, name, "args") or ((isComparison(op) or op == .in_list or op == .not_in_list) and std.mem.eql(u8, name, "collation")),
     };
 }
 
@@ -437,7 +437,8 @@ pub fn acceptsArity(op: Op, count: usize) bool {
         .literal, .column => false,
         .array => count <= 32,
         .negate, .lower_ascii, .upper_ascii, .not, .is_null, .is_not_null, .cast => count == 1,
-        .concat, .coalesce, .@"and", .@"or", .in_list, .not_in_list => count >= 2 and count <= 32,
+        .concat, .coalesce, .@"and", .@"or" => count >= 2 and count <= 32,
+        .in_list, .not_in_list => count >= 2 and count <= max_nodes,
         .case_when => count >= 3 and count <= 31 and count % 2 == 1,
         else => count == 2,
     };
@@ -706,7 +707,7 @@ pub const Plan = struct {
                 };
                 if (bytes > budget.* / 2) return error.RelationalExpressionBudgetExceeded;
                 budget.* -= bytes * 2;
-                if (try compareValues(execution, probe, candidate, false) == .eq) return .{ .boolean = node.op == .in_list };
+                if (try compareValues(execution, probe, candidate, node.fold_ascii) == .eq) return .{ .boolean = node.op == .in_list };
             }
             return if (unknown) .null else .{ .boolean = node.op == .not_in_list };
         }
@@ -1838,7 +1839,7 @@ const Compiler = struct {
                         } else if (!sameOperandType(candidate, operand)) return error.InvalidRelationalExpressionType;
                     }
                 } else for (children[1..]) |child| if (!sameOperandType(self.nodes.items[child], operand)) return error.InvalidRelationalExpressionType;
-                if (isComparison(op)) {
+                if (isComparison(op) or op == .in_list or op == .not_in_list) {
                     if (input.object.get("collation")) |collation| {
                         if (collation != .string) return error.UnsupportedRelationalIndexCollation;
                         node.fold_ascii = try foldAsciiCollation(node.kind, collation.string);

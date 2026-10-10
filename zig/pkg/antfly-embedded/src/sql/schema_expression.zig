@@ -46,6 +46,18 @@ fn promoteNumeric(alloc: std.mem.Allocator, value: Json, source: scalar.Type, ta
     const identity: @import("array_value.zig").ElementType = target.element_type orelse if (target.kind == .integer) .int64 else .float64;
     const source_identity: @import("array_value.zig").ElementType = source.element_type orelse if (source.kind == .integer) .int64 else .float64;
     if (source.kind == target.kind and source_identity == identity) return value;
+    // Widen an integer literal's declared identity directly. Wrapping every
+    // candidate in a cast needlessly doubles durable IN-list node admission.
+    const casts = @import("builtin_cast.zig");
+    if (source.kind == .integer and target.kind == .integer and casts.integral(source_identity) and casts.integral(identity) and
+        @backingInt(source_identity) <= @backingInt(identity) and value == .object and
+        std.mem.eql(u8, value.object.get("op").?.string, "literal"))
+    {
+        var result: Json = .{ .object = .empty };
+        for (value.object.keys(), value.object.values()) |key, item| try result.object.put(alloc, key, item);
+        try result.object.put(alloc, "sql_type", .{ .string = @tagName(identity) });
+        return result;
+    }
     return json(alloc, .{ .op = "cast", .type = nativeType(target.kind.?, identity), .sql_type = @tagName(identity), .args = &[_]Json{value} });
 }
 
@@ -302,7 +314,7 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                 break :blk try json(alloc, .{ .op = "case_when", .args = args });
             },
             .in_list => |part| blk: {
-                if (part.values.len == 0 or part.values.len > 31) return error.SqlLimitExceeded;
+                if (part.values.len == 0 or part.values.len >= @import("../schema/relational_expression.zig").max_nodes) return error.SqlLimitExceeded;
                 const indexes = try alloc.alloc(u32, part.values.len + 1);
                 indexes[0] = part.operand;
                 @memcpy(indexes[1..], part.values);
@@ -322,6 +334,7 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
                         common_type = .{ .kind = if (@import("builtin_cast.zig").integral(identity)) .integer else .number, .element_type = identity };
                     }
                 }
+                if (common_type.kind == null) common_type = .{ .kind = .string, .element_type = .text };
                 const args = try alloc.alloc(Json, indexes.len);
                 for (indexes, args) |index, *arg| arg.* = try promoteNumeric(alloc, values[index], program.instructions[index].type, common_type);
                 break :blk try json(alloc, .{ .op = if (part.negated) "not_in_list" else "in_list", .args = args });

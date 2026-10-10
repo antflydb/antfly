@@ -1208,19 +1208,19 @@ const GuardedCatalog = struct {
         // retains the heap-owned guard and authority in its OwnedRead capsule.
         return cursor.cursor(ReadCursor.close);
     }
-    fn mutate(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(raw: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try checkpoint(raw);
         if (!Authority.allowsWrite(self.authority, table.physical_name)) return error.Forbidden;
-        return self.native.vtable.mutate(self.native.ptr, alloc, table, input);
+        return self.native.vtable.mutate(self.native.ptr, alloc, scratch_alloc, table, input);
     }
 
-    fn mutatePrepared(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutatePrepared(raw: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try checkpoint(raw);
         if (!Authority.allowsWrite(self.authority, table.physical_name)) return error.Forbidden;
         const commit = self.native.vtable.mutate_prepared orelse return error.UnsupportedSqlExecution;
-        return commit(self.native.ptr, alloc, table, input);
+        return commit(self.native.ptr, alloc, scratch_alloc, table, input);
     }
 
     fn prepareMutations(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) ![]const catalog.Mutation {

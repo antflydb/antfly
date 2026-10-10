@@ -5188,7 +5188,6 @@ pub export fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Sli
     defer guard.leave();
     const handle = guard.handle;
     if (handle.parent_id != null) return .invalid_argument;
-    if (request_json.bytes().len > 2 * 1024 * 1024) return .invalid_argument;
     // Managed owners require Raft routing and credentials supplied by API SQL.
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return .unsupported;
     executeEmbeddedSql(handle, "default", request_json.bytes(), out_buf) catch |err| {
@@ -5206,6 +5205,11 @@ pub export fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Sli
 }
 
 pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json: []const u8, out_buf: *capi.Buffer) !void {
+    const session = try @import("sql_session.zig").requestSession(handle, request_json);
+    errdefer if (session) |value| {
+        if (value.active) value.failed = true;
+    };
+    if (request_json.len > @import("sql.zig").runtime.resource_limits.request_bytes) return error.SqlRequestTooLarge;
     // Lite has no authenticated principal capability. Hold a raw lease for
     // the entire statement, including DDL paths that do not call row APIs,
     // so policy activation cannot race an already-admitted SQL statement.
@@ -5213,7 +5217,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
     defer row_policy_lease.release();
     const sql = @import("sql.zig");
     const Budget = antfly.capi_dependencies.sql_memory_budget;
-    var preparation_budget = Budget{ .backing = handle.alloc, .limit = 8 * 1024 * 1024 };
+    var preparation_budget = Budget{ .backing = handle.alloc, .limit = sql.runtime.resource_limits.preparation_bytes };
     const temporary = preparation_budget.allocator();
     const Request = struct {
         statement: []const u8,
@@ -5224,17 +5228,13 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
         namespace: ?[]const u8 = null,
     };
     var parsed = std.json.parseFromSlice(Request, temporary, request_json, .{ .allocate = .alloc_always }) catch |err| {
-        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlProgramLimitExceeded;
+        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return error.InvalidSqlParameters;
     };
     defer parsed.deinit();
     if (parsed.value.database != null or parsed.value.namespace != null) return error.UnsupportedSqlExecution;
-    const session = if (parsed.value.session_id) |id| handle.sql_sessions.get(id) orelse return error.SqlConnectionNotFound else null;
-    errdefer if (session) |value| {
-        if (value.active) value.failed = true;
-    };
     var compiled = sql.compiler.compile(temporary, parsed.value.statement, .{}) catch |err| {
-        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlProgramLimitExceeded;
+        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return err;
     };
     defer compiled.deinit();
@@ -5274,7 +5274,9 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
     try @import("sql_commit.zig").recover(handle);
     try @import("sql_ddl.zig").recover(handle);
     var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
-    var result = sql.runtime.execute(handle.alloc, adapter.backend(), &compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit }) catch |err| {
+    var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
+    var result = sql.runtime.execute(handle.alloc, adapter.backend(), &compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
+        if (err == error.SqlNotNullViolation) out_buf.* = try stringifyJson(.{ .@"error" = error_context.diagnostic(err) });
         if (err == error.SqlMutationOutcomeUnknown) if (adapter.outcome_transaction_id) |txn_id| {
             out_buf.* = embeddedSqlUnknownReceipt(&commit_receipt, txn_id);
         };
@@ -5292,7 +5294,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
             out_buf.* = embeddedSqlCommitReceipt(&commit_receipt, result.output);
             return;
         }
-        if (err == error.OutOfMemory and encoding_budget.exhausted) return error.SqlProgramLimitExceeded;
+        if (err == error.OutOfMemory and encoding_budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return err;
     };
     defer encoding_budget.allocator().free(bytes);

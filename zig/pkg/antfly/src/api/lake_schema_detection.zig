@@ -251,7 +251,7 @@ test "lake SQL inferred decimal128 and signed timestamps execute through Parquet
         fn scan(_: *anyopaque, _: A, _: catalog.Table, _: catalog.Scan) !catalog.Page {
             return error.UnexpectedStatelessScan;
         }
-        fn mutate(_: *anyopaque, _: A, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, _: A, _: A, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
             return error.UnexpectedMutation;
         }
         fn checkpoint(_: *anyopaque) !void {}
