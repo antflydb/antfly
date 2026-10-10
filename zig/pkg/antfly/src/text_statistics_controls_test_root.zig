@@ -1792,7 +1792,7 @@ test "text statistics trusted controls local construction credit retains rejecte
     };
     for ([_]native.Class{ .query, .inference }) |phase| {
         for ([_]bool{ false, true }) |parent_busy| {
-            for ([_]usize{ 0, 1, 2, 4, 8, 32, 128, 512, 2048, 6497 }) |stop_at| {
+            for ([_]usize{ 0, 1, 2, 4, 8, 32, 128, 512, 2048, 6692 }) |stop_at| {
                 var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
                 defer scheduler.close();
                 var canceled = std.atomic.Value(bool).init(false);
@@ -1851,6 +1851,94 @@ test "text statistics trusted controls managed uncached reads retire constructio
                 try std.testing.expectEqual(@as(?u64, deadline), parent.entry.?.options.deadline_ns);
                 try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
                 parent.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+            }
+        }
+    }
+}
+
+test "text statistics trusted controls published local payloads retire through independent owned cleanup" {
+    const Budget = struct {
+        execution: *native.Execution,
+        canceled: *std.atomic.Value(bool),
+        stop_at: usize,
+        calls: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls == self.stop_at) self.canceled.store(true, .release);
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        for (0..3) |fixture| {
+            var completion_checkpoint: usize = 0;
+            for ([_]usize{ 0, 1, 2, 4, 8, 32, 128, 512, 2048, std.math.maxInt(usize) }) |requested_stop| {
+                const stop_at = if (requested_stop == std.math.maxInt(usize)) completion_checkpoint else requested_stop;
+                var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+                defer scheduler.close();
+                var canceled = std.atomic.Value(bool).init(false);
+                var execution: native.Execution = .{};
+                defer execution.finish();
+                const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+                try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+                var budget = Budget{ .execution = &execution, .canceled = &canceled, .stop_at = stop_at };
+                const admission = sources.common_read_admission;
+                var adapter = admission.Adapter(*Budget){ .budget = &budget };
+                const payload = adapter.payload();
+                const result = sources.storage_lsm_backend.qualifyLocalPayloadRetirement(admission.Port.init(&payload), fixture);
+                if (requested_stop == 0) completion_checkpoint = budget.calls;
+                if (stop_at != 0 and budget.calls >= stop_at) try std.testing.expectError(error.Canceled, result) else try result;
+                try std.testing.expectEqual(phase, try execution.retainedClass());
+                try std.testing.expectEqual(@as(?u64, deadline), execution.entry.?.options.deadline_ns);
+                execution.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+            }
+        }
+    }
+}
+
+test "text statistics trusted controls published payload retirement preserves credit under pressure notification contention" {
+    const Budget = struct {
+        execution: *native.Execution,
+        canceled: *std.atomic.Value(bool),
+        stop_at: usize,
+        calls: usize = 0,
+        pub fn checkpoint(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls == self.stop_at) self.canceled.store(true, .release);
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        for (0..3) |fixture| {
+            var completion_checkpoint: usize = 0;
+            for ([_]usize{ 0, 1, 2, 4, 8, 32, std.math.maxInt(usize) }) |requested_stop| {
+                const stop_at = if (requested_stop == std.math.maxInt(usize)) completion_checkpoint else requested_stop;
+                var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+                defer scheduler.close();
+                var canceled = std.atomic.Value(bool).init(false);
+                var execution: native.Execution = .{};
+                defer execution.finish();
+                const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+                try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+                var budget = Budget{ .execution = &execution, .canceled = &canceled, .stop_at = stop_at };
+                const admission = sources.common_read_admission;
+                var adapter = admission.Adapter(*Budget){ .budget = &budget };
+                const payload = adapter.payload();
+                const result = sources.storage_resource_manager.qualifyPressurePayloadRetirement(admission.Port.init(&payload), fixture);
+                if (requested_stop == 0) completion_checkpoint = budget.calls;
+                if (stop_at != 0 and budget.calls >= stop_at) try std.testing.expectError(error.Canceled, result) else try result;
+                try std.testing.expectEqual(phase, try execution.retainedClass());
+                try std.testing.expectEqual(@as(?u64, deadline), execution.entry.?.options.deadline_ns);
+                execution.finish();
                 try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
                 try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
             }

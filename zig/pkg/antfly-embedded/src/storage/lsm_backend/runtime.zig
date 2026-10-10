@@ -8933,16 +8933,17 @@ fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_
     };
     lease.result_pins_allowed = backend.options.resource_manager == null;
     errdefer lease.release();
+    if (construction) |*credit| try lease.registerRetirementWithAdmission(credit, control.?);
     const locked = if (backend_locked) false else if (control) |budget| try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget) else lockBackend(@TypeOf(backend.*), backend);
     defer unlockBackend(@TypeOf(backend.*), backend, locked);
     if (backend.retainCachedRunBlock(path, run.id, offset, len)) |winner| {
         lease.release();
         return winner;
     }
-    // Publish credit only after every fallible scope check. A rejected lock
-    // or losing duplicate destroys the lease before its construction token
-    // retires, without falling back to blocking reservation.release().
-    lease.reservation = if (construction) |*credit| credit.transfer() else read_credit;
+    // Legacy credit transfers after the final scope check. Controlled credit
+    // already belongs to the registered physical owner; rejection or a losing
+    // duplicate only publishes readiness for independent admitted cleanup.
+    if (construction == null) lease.reservation = read_credit;
     read_credit = null;
     if (admit) _ = backend.cacheRunBlockLease(path, run.id, offset, len, lease);
     return lease;

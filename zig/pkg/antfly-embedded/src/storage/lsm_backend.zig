@@ -7296,7 +7296,7 @@ pub const Backend = struct {
             const required = payload.bytes.len + @sizeOf(SharedBytes);
             var reclaimable: u64 = 0;
             for (self.run_block_cache.items) |cached| {
-                if (cached.payload.refs.load(.acquire) == 1) {
+                if (cached.payload.refs.load(.acquire) == 1 and cached.payload.retirement.credit == null) {
                     if (cached.payload.reservation) |credit| reclaimable +|= credit.reservedBytes();
                 }
             }
@@ -9017,7 +9017,7 @@ pub const Backend = struct {
         }
         var victim = self.run_block_cache.orderedRemove(victim_index);
         self.run_block_cache_bytes -= victim.payload.bytes.len;
-        const released = if (victim.payload.refs.load(.acquire) == 1)
+        const released = if (victim.payload.refs.load(.acquire) == 1 and victim.payload.retirement.credit == null)
             (if (victim.payload.reservation) |credit| credit.reservedBytes() else 0)
         else
             0;
@@ -27300,4 +27300,93 @@ test "lsm cold optimization writer reuses mutable probe metadata across short li
     std.debug.print("lite mixed writer: 100 batches, metadata allocations={d}\n", .{metadata.alloc_calls - calls});
     try std.testing.expectEqual(@as(usize, 0), metadata.alloc_calls - calls);
     metadata.limit = std.math.maxInt(usize);
+}
+
+pub fn qualifyLocalPayloadRetirement(control: @import("../common/read_admission.zig").Port, fixture: usize) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const resources = @import("resource_manager.zig");
+    const admission = @import("../common/read_admission.zig");
+    const a = std.testing.allocator;
+    var parent = resources.ResourceManager.init(.{ .identity_allocator = a });
+    defer parent.deinit(a);
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var leases: [65]?*SharedBytes = @splat(null);
+    defer for (&leases) |*lease| if (lease.*) |value| value.release();
+    const count: usize = if (fixture == 2) 65 else 2;
+    for (leases[0..count]) |*lease| {
+        var credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, @sizeOf(SharedBytes) + 8, control);
+        defer credit.retire();
+        const value = blk: {
+            const bytes = try a.dupe(u8, "retained");
+            errdefer a.free(bytes);
+            break :blk try SharedBytes.create(a, bytes);
+        };
+        errdefer value.release();
+        try value.registerRetirementWithAdmission(&credit, control);
+        lease.* = value;
+    }
+    if (fixture != 2) {
+        var backend = Backend.init(a, .{ .resource_manager = &manager, .local_block_cache_bytes = 4096, .local_block_cache_max_block_bytes = 4096 });
+        defer backend.close();
+        try std.testing.expect(backend.cacheRunBlockLease("/pinned", 1, 0, 8, leases[0].?));
+        try std.testing.expect(backend.cacheRunBlockLease("/unpinned", 2, 0, 8, leases[1].?));
+        leases[1].?.release();
+        leases[1] = null;
+        // Eviction reports no physical reclaim for deferred registered owners.
+        try std.testing.expectEqual(@as(u64, 0), backend.evictOldestLocalBlock());
+        try std.testing.expectEqual(@as(u64, 0), backend.evictOldestLocalBlock());
+    }
+    // Backend close above precedes the final pinned result. The manager owns
+    // retirement independently; borrowed paths and backend metadata are gone.
+    try std.testing.expectEqualStrings("retained", leases[0].?.bytes);
+    const before = manager.snapshot().memory.used_bytes;
+    const result = blk: {
+        std.debug.assert(manager.mutex.tryLock());
+        defer manager.mutex.unlock();
+        std.debug.assert(parent.mutex.tryLock());
+        defer parent.mutex.unlock();
+        std.debug.assert(manager.payload_retirement_mutex.tryLock());
+        defer manager.payload_retirement_mutex.unlock();
+        const checkpoint = control.checkpoint();
+        // None of these locks, the allocator, or a rejected read scope can be
+        // entered by last release. Every physical buffer is still charged.
+        for (&leases) |*lease| if (lease.*) |value| {
+            lease.* = null;
+            value.release();
+        };
+        break :blk checkpoint;
+    };
+    try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(before, parent.snapshot().memory.used_bytes);
+    const Cleanup = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn wait(_: *anyopaque) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    var context: u8 = 0;
+    const payload: admission.Payload = .{ .ptr = &context, .vtable = &.{ .checkpoint = Cleanup.checkpoint, .wait_for_progress = Cleanup.wait } };
+    const cleanup = admission.Port.init(&payload);
+    const held = if (fixture == 0) &manager.mutex else &parent.mutex;
+    std.debug.assert(held.tryLock());
+    const retired = manager.drainPayloadRetirementWithAdmission(cleanup) catch |err| {
+        held.unlock();
+        return err;
+    };
+    try std.testing.expectEqual(@min(count, 64), retired);
+    // All 64 fixed debt slots may be busy. The 65th physical owner remains
+    // linked and charged, rather than overflowing a hidden allocation queue.
+    if (fixture == 2) try std.testing.expectEqual(@as(usize, 0), try manager.drainPayloadRetirementWithAdmission(cleanup));
+    held.unlock();
+    try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(before, parent.snapshot().memory.used_bytes);
+    try manager.drainConstructionCleanupWithAdmission(cleanup);
+    if (fixture == 2) try std.testing.expectEqual(@as(usize, 1), try manager.drainPayloadRetirementWithAdmission(cleanup));
+    try std.testing.expect(manager.payload_retirement_head == null);
+    try std.testing.expect(manager.payload_retirement_cursor == null);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+    try result;
 }
