@@ -1505,3 +1505,28 @@ an environmental NoSpaceLeft failure are preserved with its receipt. Pinned
 Nix/glibc Linux and cumulative physical storage/serving validation are queued
 separately. These focused results do not qualify automatic defaults or the
 resource/performance matrix.
+
+The independently scheduled participant window now reserves every stable child
+packet before task publication, parks the coordinator in its captured class,
+and physically joins the group before attempting coordinator resumption. Child
+receivers and operation/byte charges survive a denied resumption; retirement
+follows the physical join and destruction of each worker arena. Partial window
+reservation rolls back all unpublished children and bounded allocations.
+`Team.reserveIndependent` shrinks a quiescent ordinary team to one coordinator
+slot without requesting simultaneous CPU capacity for its participant window.
+Protected control teams reject this mode, including attempts to construct a
+window after a legacy team reservation, so independent children cannot widen
+terminal work into the health reserve. Completion children expose the remaining
+budget from their inherited original clock; observing it grants no fresh time.
+
+Native qualification covers 134 selected tests: the final run executed all 14
+SQL team/window tests and reused 120 unchanged successful tests. Real physical
+workers demonstrate two independent completion children at one ordinary CPU
+slot, original foreground cancellation/expiry, scheduler close, protected
+health progress, deadline rejection after physical join, exact arena/receiver
+retirement, operation/byte/allocator rollback, and quiescent grant shrinking.
+Current pinned Nix/glibc Linux and cumulative physical integration remain
+separate qualifications. The participant coordinator has not yet adopted this
+window; per-call hosted/local worker binding, remote wait/budget propagation and
+all four BEGIN/prepare/commit/abort phases still need that production wiring.
+Automatic defaults and the resource/performance matrix remain unqualified.

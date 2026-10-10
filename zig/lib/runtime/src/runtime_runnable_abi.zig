@@ -432,6 +432,24 @@ pub const Team = struct {
         self.state = .active;
     }
 
+    /// Reserve independently scheduled participant children rather than a
+    /// simultaneous whole-team grant. Call only before publication or after
+    /// every prior child has physically joined. The allocator and original
+    /// execution authority remain borrowed through all child retirement.
+    pub fn reserveIndependent(self: *Team) !void {
+        if (self.state == .active) return error.InvalidRunnableTransition;
+        try self.borrow.validate();
+        if (self.maximum_slots == 0 or self.borrow.cpu_slots > self.maximum_slots) return error.InvalidRunnableDemand;
+        if (self.borrow.reserve_child == null or self.borrow.check_lifetime == null or self.borrow.current_class == null)
+            return error.UnsupportedOperation;
+        try self.borrow.checkLifetime();
+        // Protected terminal teams retain their single control grant; separate
+        // control children would consume the health reserve independently.
+        if (try self.borrow.currentClass() == .control) return error.InvalidRunnableDemand;
+        try self.borrow.resizeTeam(1);
+        self.state = .active;
+    }
+
     pub fn childCapacity(self: *const Team) usize {
         std.debug.assert(self.state == .active);
         return self.borrow.cpu_slots - 1;

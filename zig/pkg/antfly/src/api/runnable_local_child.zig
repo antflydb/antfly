@@ -41,10 +41,15 @@ const Receiver = struct {
             .activate_child = activate,
             .check_lifetime = lifetime,
             .current_class = currentClass,
+            .completion_remaining_ns = remaining,
         };
     }
     fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
         from(raw).execution.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
+    fn remaining(raw: *anyopaque, out: *u64) callconv(.c) runtime.error_abi.Status {
+        out.* = from(raw).execution.completionRemainingNs() catch |err| return runtime.error_abi.statusFromError(err);
         return .ok;
     }
     fn currentClass(raw: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {

@@ -294,3 +294,7 @@ test "SQL write team completion child uses independent bounded receiver and orig
     try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
     try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
 }
+
+test {
+    _ = @import("runnable_participant_window.zig");
+}
