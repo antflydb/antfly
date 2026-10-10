@@ -948,6 +948,15 @@ pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, k
     }
     if (kind == .array and (!raw.sql_null or element_type == null)) return error.SqlTypeMismatch;
     var result = raw;
+    if (!raw.sql_null and kind == .number and element_type != null and @import("builtin_cast.zig").floating(element_type.?)) {
+        // Typed SQL row boundaries retain IEEE special values and the declared
+        // width; native untyped number coercion still uses its own admission.
+        result.value = .{ .float = if (element_type == .float32)
+            try @import("builtin_cast.zig").floatValue(f32, raw.value)
+        else
+            try @import("builtin_cast.zig").floatValue(f64, raw.value) };
+        return result;
+    }
     result.value = try coerceAlloc(alloc, raw.value, kind);
     if (!result.sql_null) if (element_type) |element| {
         const casts = @import("builtin_cast.zig");

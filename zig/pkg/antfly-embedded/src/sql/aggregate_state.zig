@@ -206,7 +206,7 @@ pub const Column = struct {
                 else => unreachable,
             }
             if (count == std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
-            const replace = count == 0 or (try @import("scalar.zig").compare(value.value, prior.?.value)) == (if (self.spec.kind == .min) std.math.Order.lt else .gt);
+            const replace = count == 0 or (try @import("scalar.zig").compareDatums(value, prior.?)) == (if (self.spec.kind == .min) std.math.Order.lt else .gt);
             switch (self.values) {
                 .integers => |*v| {
                     v.items[index].count += 1;

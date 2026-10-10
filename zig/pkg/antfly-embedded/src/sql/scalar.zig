@@ -1525,7 +1525,7 @@ fn mixedNumberQuantified(value: arrays.Value, probe: arrays.Element, op: arrays.
             unknown = true;
             continue;
         }
-        const accepted = op.accepts(try compareWithBudget(probe.value, element.value, work));
+        const accepted = op.accepts(try compareDatumsWithBudget(probe, element, work));
         if (accepted != every) return accepted;
     }
     return if (unknown) null else every;
@@ -3398,7 +3398,10 @@ const Evaluator = struct {
                         const compare_op = std.enums.fromInt(arrays.Comparison, op.integer) orelse return error.InvalidSqlProgram;
                         const mixed_number = probe.value == .float and arrayScalarType(array.element_type) == .integer;
                         const exact_number = probe.numeric != null or array.element_type == .numeric;
-                        const element: arrays.Element = if (exact_number) probe else if (probe.sql_null) .{} else arrays.Element.json(try self.convert(probe.value, if (mixed_number) .number else arrayScalarType(array.element_type)));
+                        const element: arrays.Element = if (exact_number) probe else if (probe.sql_null) .{} else if (mixed_number or builtin_cast.floating(array.element_type))
+                            try self.castDatumBuiltin(probe, self.program.instructions[call.args[0]].type.element_type, .float64)
+                        else
+                            arrays.Element.json(try self.convert(probe.value, arrayScalarType(array.element_type)));
                         const accepted = if (exact_number) try self.numericQuantified(probe, array.*, compare_op, every.bool) else ordinary: {
                             var work = self.workBudget();
                             break :ordinary if (mixed_number) try mixedNumberQuantified(array.*, element, compare_op, every.bool, &work) else try array.quantified(element, compare_op, if (every.bool) .all else .any, &work);
@@ -4733,6 +4736,14 @@ pub fn compareDatumsWithBudget(left: Datum, right: Datum, work: *json_order.Budg
         return array.compare((right.array orelse return error.SqlTypeMismatch).*, work);
     }
     if (right.array != null) return error.SqlTypeMismatch;
+    // SQL floats order NaN above all other values and treat NaNs as equal.
+    // Keep JSON comparison's finite-number admission separate from SQL cells.
+    if (left.value == .float and right.value == .float)
+        return arrays.compareElement(.float64, left, right, work);
+    if (left.value == .integer and right.value == .float and !std.math.isFinite(right.value.float))
+        return arrays.compareElement(.float64, Datum.json(.{ .float = @floatFromInt(left.value.integer) }), right, work);
+    if (left.value == .float and right.value == .integer and !std.math.isFinite(left.value.float))
+        return arrays.compareElement(.float64, left, Datum.json(.{ .float = @floatFromInt(right.value.integer) }), work);
     return compareWithBudget(left.value, right.value, work);
 }
 
@@ -4748,6 +4759,11 @@ pub fn semanticHashDatum(value: Datum) anyerror!u64 {
     if (value.array) |array| {
         var work: json_order.Budget = .{};
         return array.semanticHash(&work);
+    }
+    if (value.value == .float and !std.math.isFinite(value.value.float)) {
+        // All NaN signs and payloads represent one SQL grouping key.
+        const bits: u64 = if (std.math.isNan(value.value.float)) 0x7ff8000000000000 else @bitCast(value.value.float);
+        return std.hash.Wyhash.hash(0, std.mem.asBytes(&bits));
     }
     return semanticHash(value.value);
 }
@@ -5512,4 +5528,13 @@ test "SQL typed JSON construction and path extraction preserve scalar and NULL p
     var bounded_program = try bind(std.testing.allocator, bounded.expression, &.{}, &.{}, .{});
     defer bounded_program.deinit();
     try std.testing.expectError(error.SqlProgramLimitExceeded, bounded_program.evaluate(std.testing.allocator, &.{}, &.{}, .{ .output_bytes = 1 }));
+}
+
+test "SQL special float keys canonicalize NaN payloads without admitting JSON numbers" {
+    const left = Datum.json(.{ .float = @bitCast(@as(u64, 0x7ff8000000000001)) });
+    const right = Datum.json(.{ .float = @bitCast(@as(u64, 0xfff8000000000002)) });
+    try std.testing.expectEqual(std.math.Order.eq, try compareDatums(left, right));
+    try std.testing.expectEqual(try semanticHashDatum(left), try semanticHashDatum(right));
+    try std.testing.expect((try semanticHashDatum(left)) != (try semanticHashDatum(Datum.json(.{ .float = std.math.inf(f64) }))));
+    try std.testing.expectError(error.SqlNumericOutOfRange, semanticHash(left.value));
 }

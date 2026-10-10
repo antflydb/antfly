@@ -380,6 +380,7 @@ const ColumnInput = struct {
     pub fn fillTyped(self: ColumnInput, ordinal: u32, target: anytype) !bool {
         if (ordinal >= self.columns.len) return error.InvalidSqlBackendResponse;
         const definition = self.columns[ordinal];
+        const sql_floating = definition.element_type == .float32 or definition.element_type == .float64;
         if (self.page.native) |native| {
             const index = for (native.names, 0..) |name, i| {
                 if (std.mem.eql(u8, name, definition.name)) break i;
@@ -402,7 +403,7 @@ const ColumnInput = struct {
                         else => false,
                     };
                     if (!exact) return false;
-                    if (value.value == .float and !std.math.isFinite(value.value.float)) return error.SqlTypeMismatch;
+                    if (value.value == .float and !std.math.isFinite(value.value.float) and !sql_floating) return error.SqlTypeMismatch;
                 }
                 try target.set(row, value);
             }
@@ -426,12 +427,12 @@ const ColumnInput = struct {
             const value: std.json.Value = switch (column.values) {
                 .dictionary_i64 => |v| .{ .integer = v.at(physical) },
                 .dictionary_f64 => |v| blk: {
-                    if (!std.math.isFinite(v.at(physical))) return error.SqlTypeMismatch;
+                    if (!std.math.isFinite(v.at(physical)) and !sql_floating) return error.SqlTypeMismatch;
                     break :blk .{ .float = v.at(physical) };
                 },
                 .i64 => |v| .{ .integer = v[physical] },
                 .f64 => |v| blk: {
-                    if (!std.math.isFinite(v[physical])) return error.SqlTypeMismatch;
+                    if (!std.math.isFinite(v[physical]) and !sql_floating) return error.SqlTypeMismatch;
                     break :blk .{ .float = v[physical] };
                 },
                 .bool => |v| .{ .bool = v[physical] },

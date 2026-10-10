@@ -4828,3 +4828,88 @@ test "SQL filtered LIMIT hints require a complete bound predicate and remain adv
         try std.testing.expectEqual(case.goal, backend.row_goal);
     }
 }
+
+test "SQL special floats retain PostgreSQL comparison ordering" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT 'NaN'::real = 'NaN'::real",
+        "SELECT 'NaN'::real > 'Infinity'::double precision",
+        "SELECT '-Infinity'::real < 1::integer",
+        "SELECT 1::bigint < 'NaN'::double precision",
+        "SELECT 'NaN'::real IS NOT DISTINCT FROM 'NaN'::double precision",
+        "SELECT 'NaN'::numeric IN ('NaN'::real)",
+        "SELECT NOT ('NaN'::real NOT IN ('NaN'::real))",
+        "SELECT 'NaN'::real = ANY(ARRAY['NaN'::double precision])",
+        "SELECT 'Infinity'::real > ALL(ARRAY[1::integer,2::integer])",
+
+        "SELECT 'NaN'::real IN ('NaN'::real)",
+        "SELECT 'Infinity'::double precision IN ('Infinity'::double precision)",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expect(result.output.rows[0][0].bool);
+    }
+}
+
+test "SQL special floats survive derived row coercion" {
+    const a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, expected: []const u8 }{
+        .{ .sql = "SELECT to_jsonb(x) FROM (VALUES ('NaN'::real)) t(x)", .expected = "NaN" },
+        .{ .sql = "SELECT to_jsonb(x) FROM (VALUES ('Infinity'::double precision)) t(x)", .expected = "Infinity" },
+        .{ .sql = "SELECT to_jsonb(x) FROM (VALUES ('-Infinity'::real)) t(x)", .expected = "-Infinity" },
+        .{ .sql = "WITH t(x) AS (SELECT 'NaN'::double precision) SELECT to_jsonb(x) FROM t", .expected = "NaN" },
+    }) |case| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings(case.expected, result.output.rows[0][0].string);
+    }
+}
+
+test "SQL special floats sort group and deduplicate derived rows" {
+    const a = std.testing.allocator;
+    var fixture: TestBackend = .{ .row_count = 0 };
+    var grouped = try compiler.compile(a, "SELECT x::text,count(*) FROM (VALUES ('NaN'::real),('NaN'::real),('Infinity'::real),('-Infinity'::real),(1::real)) t(x) GROUP BY x ORDER BY x", .{});
+    defer grouped.deinit();
+    var result = try execute(a, fixture.iface(), &grouped, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 4), result.output.rows.len);
+    for (result.output.rows, [_][]const u8{ "-Infinity", "1", "Infinity", "NaN" }, [_][]const u8{ "1", "1", "1", "2" }) |row, value, count| {
+        try std.testing.expectEqualStrings(value, row[0].string);
+        try std.testing.expectEqualStrings(count, row[1].string);
+    }
+    var distinct = try compiler.compile(a, "SELECT count(DISTINCT x),to_jsonb(min(x)),to_jsonb(max(x)) FROM (VALUES ('NaN'::double precision),('NaN'::double precision),('-Infinity'::double precision),(1::double precision)) t(x)", .{});
+    defer distinct.deinit();
+    var aggregate = try execute(a, fixture.iface(), &distinct, &.{}, .{});
+    defer aggregate.deinit();
+    try std.testing.expectEqualStrings("3", aggregate.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("-Infinity", aggregate.output.rows[0][1].string);
+    try std.testing.expectEqualStrings("NaN", aggregate.output.rows[0][2].string);
+    var comparisons = try compiler.compile(a, "SELECT x = 'NaN'::double precision FROM (VALUES ('NaN'::double precision),('Infinity'::double precision),(1::double precision),('-Infinity'::double precision)) t(x)", .{});
+    defer comparisons.deinit();
+    var compared = try execute(a, fixture.iface(), &comparisons, &.{}, .{});
+    defer compared.deinit();
+    for (compared.output.rows, [_]bool{ true, false, false, false }) |row, expected| try std.testing.expectEqual(expected, row[0].bool);
+}
+
+test "SQL special floats preserve prepared derived values on allocation failures" {
+    const Harness = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var fixture: TestBackend = .{ .row_count = 0 };
+            var backend = fixture.iface();
+            backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .float64 }};
+            var result = try execute(a, backend, compiled, &.{.{ .float = std.math.nan(f64) }}, .{});
+            defer result.deinit();
+            try std.testing.expectEqualStrings("NaN", result.output.rows[0][0].string);
+            try std.testing.expect(result.output.rows[0][1].bool);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT to_jsonb(x),x IN ('NaN'::double precision) FROM (VALUES ($1)) t(x)", .{});
+    defer compiled.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{&compiled});
+}
