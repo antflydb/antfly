@@ -2216,6 +2216,24 @@ pub const SessionRegistry = struct {
         defer session.deinit(alloc);
         return cloneReadSnapshotForKey(alloc, &session.lake_cuts, table, "accepted");
     }
+    pub fn cloneLakeCuts(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) ![]SessionReadSnapshot {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var session = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        defer session.deinit(alloc);
+        const result = try alloc.alloc(SessionReadSnapshot, session.lake_cuts.count());
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |*entry| entry.deinit(alloc);
+            alloc.free(result);
+        }
+        for (session.lake_cuts.values(), result) |entry, *out| {
+            out.* = try entry.clone(alloc);
+            initialized += 1;
+        }
+        return result;
+    }
     pub fn bindLakeCut(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, table: []const u8, table_id: u64, token_json: []const u8) !void {
         const session_lock = self.sessionLock(txn_id);
         session_lock.lock();

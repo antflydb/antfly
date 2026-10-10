@@ -92,9 +92,7 @@ pub fn execute(
             // One original range needs one physical executor. Keep its origin
             // namespace while avoiding a nested coordinator and duplicate work
             // accounting. This also retains native readonly-backend handling.
-            direct.origin = direct.cover[0].namespace;
-            direct.cover = &.{};
-            direct.recipe = null;
+            direct = direct.forGroup(direct.cover[0].group_id) catch |err| return fail(err, .validate_request, out_failure);
         }
         retained = live_db.openQueryCut(direct, requestCancellationToken(request)) catch |err| return fail(err, .validate_request, out_failure);
     };
@@ -158,13 +156,22 @@ fn executeSearch(
     else
         null;
     defer if (lease) |*held| held.release();
+    var execution_req = owned.req;
+    if (db.open_mode == .query_readonly) if (execution_req.remote_snapshot) |token| if (std.mem.startsWith(u8, token, "native2:")) {
+        // This DB already owns the authenticated retained generation. Public
+        // capabilities identify that generation, not a text-index snapshot;
+        // forwarding them would reopen or recapture it on remote storage.
+        execution_req.remote_snapshot = null;
+        execution_req.native_query_cut = null;
+        execution_req.identity_read_generation = null;
+    };
     const captured: db_mod.SearchWithDenseProfileResult = if (lease) |held|
-        held.search(alloc, owned.req) catch |err| return fail(err, executeOperation(request.dialect), out_failure)
+        held.search(alloc, execution_req) catch |err| return fail(err, executeOperation(request.dialect), out_failure)
     else if (owned.req.profile)
-        db.searchWithDenseProfile(alloc, owned.req) catch |err|
+        db.searchWithDenseProfile(alloc, execution_req) catch |err|
             return fail(err, executeOperation(request.dialect), out_failure)
     else blk: {
-        const unprofiled = db.searchWithCapturedRequest(alloc, owned.req) catch |err|
+        const unprofiled = db.searchWithCapturedRequest(alloc, execution_req) catch |err|
             return fail(err, executeOperation(request.dialect), out_failure);
         break :blk .{ .request = unprofiled.request, .result = unprofiled.result };
     };
@@ -395,6 +402,7 @@ fn fail(
     operation: abi.LocalQueryOperation,
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
+    std.log.debug("local query rejected operation={s} err={s}", .{ @tagName(operation), @errorName(err) });
     out_failure.* = error_identity.failureFromError(
         err,
         .local_query,

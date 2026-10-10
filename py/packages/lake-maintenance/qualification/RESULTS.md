@@ -94,3 +94,52 @@ file reachability under the enforced gateway contract; it does not compact the
 vendor's commit database. Cross-source graph/global aggregation execution,
 pgwire accepted selection and serializable accepted external SQL remain outside
 the supported query coverage described in the design documents.
+
+
+## Retained native cuts and composed query qualification — 2026-10-10
+
+The query-coverage exclusions in the earlier extension above describe that earlier
+implementation. This extension adds remote checkpoint references, fresh split
+captures, bounded composed aggregation/graph execution and accepted pgwire reads.
+
+* The native build and full lake suites pass **91/91 steps**, including **143 API
+  and 124 local lake tests**, without failures, skips or leaks. Validation uses
+  an isolated checkout to preserve concurrent SQL/SDK changes.
+* The focused retained-checkpoint suite passes **22 tests**. It covers document
+  and vector recovery, immutable remote manifest aliases without extent transfer,
+  retention/authority rejection, distinct physical generations for split ranges
+  sharing a document namespace, request-owned cut forwarding and public rejection
+  of private controls. Single-range text continuation executes its already bound
+  checkpoint in ordinary and profiled raw-result modes.
+* A real four-process native cluster with versioned local S3 passes both live
+  tests (**2 passed**): original and fresh post-split cuts resume across finalized
+  merge and restart of all data owners after deleting local checkpoint directories;
+  composed global aggregate pagination returns the same next row and pinned totals
+  through all three public data nodes; a two-hop graph traversal crosses retained
+  source tables with logical table paths and external indexed entities.
+* That fixture caught and qualified three distributed fixes: preserving a remote
+  carrier's finalized cursor response; propagating the configured process storage
+  context into metadata-based server initialization, Raft replicas and query
+  owners; and retaining authenticated cut descriptors through internal query
+  parsing and forwarding. An API-side repository configuration alone is
+  insufficient to publish physical checkpoints remotely.
+* The pgwire suite passes **77 tests**, including accepted visibility settings,
+  transaction/local scope, savepoints and prepared/streaming execution. Focused
+  serializable accepted SQL tests validate pinned metadata and monotone WAL heads
+  at read-only commit, including conflicts after admission and publication.
+* Python lint/format, Zig formatting, staged license and whitespace checks pass.
+  These are local protocol and engine qualifications; no cloud resources were
+  provisioned for this extension.
+
+Direct manifest references require a complete immutable generation in the same
+storage authority with sufficient existing retention. Mutable generations still
+upload new extents. Serializable accepted external SQL is read-only; read-write
+lake transactions need a distributed prepare participant. Global aggregations use
+100,000-row/64 MiB limits without distributed spill. Background-corpus significance
+and indexed algebraic joins fail closed. Cross-source graph supports bounded
+traversal/neighbors; MATCH, shortest/k-paths, metrics/node predicates, composed
+joins/hierarchy and graph queries through multi-origin native covers remain
+unsupported. Leaves must supply retained graph adjacency; mounted Parquet text
+indexes alone cannot do so. Retained SQL cuts use a fixed one-hour horizon.
+Archive-scale throughput, live cloud S3/GCS snapshot latency and the previously
+listed provider/deployment qualifications remain outstanding.

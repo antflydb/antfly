@@ -109,7 +109,14 @@ fn executeBudget(a: A, body: []const u8, executor: Executor, budget: *local.sql_
         break :overlay_source V{ .array = inputs.toManaged(scratch) };
     };
     if (union_value != .array or union_value.array.items.len < 2 or union_value.array.items.len > 16) return error.InvalidQueryRequest;
-    for ([_][]const u8{ "aggregations", "hierarchy", "join", "graph_queries", "graph_searches", "analyses", "document_renderer", "search_after", "search_before", "session_id", "connection_id", "remote_snapshot" }) |name| if (root.object.contains(name)) return error.UnsupportedQueryRequest;
+    const aggregations = root.object.get("aggregations");
+    const graph_spec = root.object.get("graph_queries");
+    if (aggregations) |specification| {
+        const requests = try local.api_query.parseAggregationRequestsJson(scratch, try std.json.Stringify.valueAlloc(scratch, specification, .{}));
+        defer local.api_query.freeAggregationRequests(scratch, requests);
+        try validateGlobalAggregations(requests);
+    }
+    for ([_][]const u8{ "hierarchy", "join", "graph_searches", "analyses", "document_renderer", "search_after", "search_before", "session_id", "connection_id", "remote_snapshot" }) |name| if (root.object.contains(name)) return error.UnsupportedQueryRequest;
     const limit = if (root.object.get("limit")) |value| try integer(value) else 20;
     if (limit == 0 or limit > 4096) return error.InvalidQueryRequest;
     const offset = if (root.object.get("offset")) |value| try integer(value) else 0;
@@ -130,8 +137,10 @@ fn executeBudget(a: A, body: []const u8, executor: Executor, budget: *local.sql_
     for (orders.items) |order| if (std.mem.eql(u8, order.field, "_score") and !rrf) return error.UnsupportedQueryRequest;
     if (rrf and (orders.items.len != 1 or !std.mem.eql(u8, orders.items[0].field, "_score") or !orders.items[0].desc)) return error.UnsupportedQueryRequest;
     const cursor = root.object.get("source_cursor");
-    const expression_bytes = try std.json.Stringify.valueAlloc(scratch, .{ .source = source, .ranking = ranking, .identity = root.object.get("_source_identity") }, .{});
+    const expression_bytes = try std.json.Stringify.valueAlloc(scratch, .{ .source = source, .ranking = ranking, .identity = root.object.get("_source_identity"), .aggregations = aggregations, .graph_queries = graph_spec, .fields = root.object.get("fields") }, .{});
     _ = root.object.orderedRemove("_source_identity");
+    _ = root.object.orderedRemove("aggregations");
+    _ = root.object.orderedRemove("graph_queries");
     _ = root.object.orderedRemove("source");
     _ = root.object.orderedRemove("source_ranking");
     _ = root.object.orderedRemove("source_cursor");
@@ -139,7 +148,8 @@ fn executeBudget(a: A, body: []const u8, executor: Executor, budget: *local.sql_
     _ = root.object.orderedRemove("count");
     try root.object.put(scratch, "limit", .{ .integer = 4096 });
     const requested_fields = root.object.get("fields");
-    if (overlay != null and requested_fields != null) {
+    if (aggregations != null) _ = root.object.orderedRemove("fields");
+    if (aggregations == null and overlay != null and requested_fields != null) {
         if (requested_fields.? != .array) return error.InvalidQueryRequest;
         var fields: std.ArrayList(V) = .empty;
         try fields.appendSlice(scratch, requested_fields.?.array.items);
@@ -154,13 +164,13 @@ fn executeBudget(a: A, body: []const u8, executor: Executor, budget: *local.sql_
         }
         try root.object.put(scratch, "fields", .{ .array = fields.toManaged(scratch) });
     }
-    if (count and overlay != null) {
+    if (aggregations == null and count and overlay != null) {
         var fields: std.ArrayList(V) = .empty;
         for (overlay_keys) |key| try fields.append(scratch, .{ .string = key });
         try fields.append(scratch, .{ .string = tombstone_field });
         try root.object.put(scratch, "fields", .{ .array = fields.toManaged(scratch) });
     }
-    return executeStreams(a, scratch, root, union_value.array.items, overlay_keys, overlay_kinds, tombstone_field, requested_fields, orders.items, rrf, overlay != null, limit, offset, count, cursor, expression_bytes, executor, budget);
+    return executeStreams(a, scratch, root, union_value.array.items, overlay_keys, overlay_kinds, tombstone_field, requested_fields, orders.items, rrf, overlay != null, limit, offset, count, cursor, expression_bytes, aggregations, graph_spec, executor, budget);
 }
 
 const batch_size = 128;
@@ -173,7 +183,7 @@ const Position = struct {
     remote_snapshot: ?[]const u8 = null,
     identity: []const u8 = "null",
 };
-const Continuation = struct { version: u16 = 2, fingerprint: []const u8, sources: []const Position, total: ?usize = null };
+const Continuation = struct { version: u16 = 2, fingerprint: []const u8, sources: []const Position, total: ?usize = null, aggregations: ?V = null };
 fn clone(a: A, value: anytype, comptime T: type) !T {
     const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
     defer a.free(bytes);
@@ -265,7 +275,9 @@ const Stream = struct {
             const id = value.object.get("_id") orelse return error.InvalidQueryRequest;
             if (id != .string) return error.InvalidQueryRequest;
             const keys: []const V = if (value.object.get("_sort")) |sort| if (sort == .array) sort.array.items else return error.InvalidQueryRequest else &.{};
-            if (keys.len != orders.len + 1) return error.UnsupportedQueryRequest;
+            const id_is_last_order = std.mem.eql(u8, orders[orders.len - 1].field, "_id");
+            if (keys.len != orders.len + 1 and !(id_is_last_order and keys.len == orders.len)) return error.UnsupportedQueryRequest;
+            if (keys[keys.len - 1] != .string or !std.mem.eql(u8, keys[keys.len - 1].string, id.string)) return error.CatalogGenerationChanged;
             hit.* = .{ .value = value, .table = self.position.table, .id = id.string, .score = 0, .keys = keys };
         }
         // Leaf ordering is authoritative. A broken/nonadvancing adapter must
@@ -363,8 +375,8 @@ fn maskTombstones(stream: *Stream, field: []const u8) !void {
         }
     }
 }
-fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []const u8, kinds: []const KeyKind, tombstone: []const u8, fields: ?V, orders: []const Order, rrf: bool, overlay: bool, limit: usize, offset: usize, count: bool, cursor: ?V, expression: []const u8, executor: Executor, budget: *local.sql_memory_budget) !Response {
-    if (count and !overlay) {
+fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []const u8, kinds: []const KeyKind, tombstone: []const u8, fields: ?V, orders: []const Order, rrf: bool, overlay: bool, limit: usize, offset: usize, count: bool, cursor: ?V, expression: []const u8, aggregations: ?V, graph_spec: ?V, executor: Executor, budget: *local.sql_memory_budget) !Response {
+    if (aggregations == null and graph_spec == null and count and !overlay) {
         var total: usize = 0;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         for (leaves) |leaf| {
@@ -456,6 +468,10 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
         }
     }
     var output: std.ArrayList(V) = .empty;
+    const cached_aggregations = if (restored) |state| state.aggregations else null;
+    const collect_aggregations = aggregations != null and cached_aggregations == null;
+    var aggregation_hits: std.ArrayList(local.storage_db_types.SearchHit) = .empty;
+    var page_positions: ?[]const Position = null;
     var skipped: usize = 0;
     while (true) {
         try executor.checkpoint(executor.ptr);
@@ -500,8 +516,19 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
             }
         }
         const i = selected orelse break;
-        if (!count and skipped >= offset and output.items.len == limit) break;
-        if (!count and skipped >= offset) {
+        if (!count and skipped >= offset and output.items.len == limit) {
+            if (!collect_aggregations) break;
+            if (page_positions == null) {
+                const saved = try scratch.alloc(Position, streams.len);
+                for (streams, saved) |stream, *position| position.* = stream.position;
+                page_positions = try clone(scratch, saved, []const Position);
+            }
+        }
+        if (collect_aggregations) {
+            if (aggregation_hits.items.len == local.storage_db_aggregations.max_aggregation_source_hits) return error.QueryCandidateBudgetExceeded;
+            try aggregation_hits.append(scratch, .{ .id = try scratch.dupe(u8, best.id), .source_table = try scratch.dupe(u8, best.table), .stored_data = try std.json.Stringify.valueAlloc(scratch, best.value.object.get("_source") orelse return error.UnsupportedQueryRequest, .{}) });
+        }
+        if (!count and skipped >= offset and output.items.len < limit) {
             var hit = try clone(scratch, best.value, V);
             try hit.object.put(scratch, "_table", .{ .string = best.table });
             if (rrf) {
@@ -509,7 +536,7 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
                 _ = hit.object.orderedRemove("_index_scores");
                 _ = hit.object.orderedRemove("_score_details");
             }
-            if (overlay) if (fields) |requested| {
+            if (overlay or aggregations != null) if (fields) |requested| {
                 var projected: V = .{ .object = .empty };
                 const row = hit.object.get("_source").?;
                 for (requested.array.items) |field| {
@@ -526,24 +553,63 @@ fn executeStreams(a: A, scratch: A, root: V, leaves: []const V, keys: []const []
     }
     var seen: usize = 0;
     var complete = true;
-    const positions = try scratch.alloc(Position, streams.len);
-    for (streams, positions) |stream, *position| {
+    var positions: []const Position = try scratch.alloc(Position, streams.len);
+    for (streams, @constCast(positions)) |stream, *position| {
         position.* = stream.position;
         seen += stream.position.visible_count;
         complete = complete and stream.done();
     }
     if (complete) exact_total = seen;
+    const computed_aggregations = if (collect_aggregations) try globalAggregations(scratch, aggregations.?, aggregation_hits.items) else cached_aggregations;
+    if (page_positions) |saved| {
+        positions = saved;
+        complete = false;
+    }
     const next: ?[]const u8 = if (!count and !complete) next: {
         // Retained pagination needs an actual immutable serving token. Native
         // mutable tables without snapshot support cannot pretend to be pinned.
         if (executor.save_cursor != null) for (positions) |position| if (position.remote_snapshot == null) return error.UnsupportedQueryRequest;
-        const bytes = try std.json.Stringify.valueAlloc(scratch, Continuation{ .fingerprint = &fingerprint, .sources = positions, .total = exact_total }, .{});
+        const bytes = try std.json.Stringify.valueAlloc(scratch, Continuation{ .fingerprint = &fingerprint, .sources = positions, .total = exact_total, .aggregations = computed_aggregations }, .{});
         break :next if (executor.save_cursor) |save| try save(executor.ptr, scratch, bytes) else bytes;
     } else null;
-    const encoded = try std.json.Stringify.valueAlloc(a, .{ .responses = .{.{ .status = 200, .took = 0, .hits = .{ .total = .{ .value = exact_total orelse seen, .relation = if (exact_total != null) "exact" else "gte" }, .hits = output.items }, .source_ranking = if (rrf) "rrf" else "ordered", .next_source_cursor = next }} }, .{ .emit_null_optional_fields = false });
+    const graph_results: ?V = if (graph_spec) |specification| graph: {
+        const graph = @import("composed_graph.zig");
+        const graph_leaves = try scratch.alloc(graph.Leaf, positions.len);
+        for (positions, graph_leaves) |position, *leaf| {
+            const identity = try std.json.parseFromSliceLeaky(V, scratch, position.identity, .{});
+            const physical = if (identity == .object) identity.object.get("physical") else null;
+            leaf.* = .{ .table = position.table, .physical = if (physical) |name| name.string else position.table, .token = position.remote_snapshot orelse return error.UnsupportedQueryRequest, .identity = position.identity };
+        }
+        break :graph try graph.execute(scratch, specification, graph_leaves, keys, kinds, tombstone, root.object.get("lake_visibility"), output.items, complete and offset == 0, executor);
+    } else null;
+    const encoded = try std.json.Stringify.valueAlloc(a, .{ .responses = .{.{ .status = 200, .took = 0, .hits = .{ .total = .{ .value = exact_total orelse seen, .relation = if (exact_total != null) "exact" else "gte" }, .hits = output.items }, .source_ranking = if (rrf) "rrf" else "ordered", .next_source_cursor = next, .aggregations = computed_aggregations, .graph_results = graph_results }} }, .{ .emit_null_optional_fields = false });
     errdefer a.free(encoded);
     try executor.checkpoint(executor.ptr);
     return @import("contextual_operations.zig").json(encoded, false);
+}
+
+/// Shared native collector semantics, after overlay visibility and before
+/// projection/pagination. Complete source sets are admitted against the same
+/// bounded aggregation and memory budgets as native queries.
+fn validateGlobalAggregations(requests: []const local.storage_db_aggregations_contract.SearchAggregationRequest) !void {
+    for (requests) |request| {
+        // These require a pinned background corpus or an indexed join; visible
+        // result rows alone cannot provide their semantics.
+        if (std.mem.eql(u8, request.type, "significant_terms") or request.background_query != null or request.algebraic_join != null) return error.UnsupportedQueryRequest;
+        try validateGlobalAggregations(request.aggregations);
+    }
+}
+fn globalAggregations(a: A, specification: V, hits: []local.storage_db_types.SearchHit) !V {
+    const query_api = local.api_query;
+    const bytes = try std.json.Stringify.valueAlloc(a, specification, .{});
+    const requests = try query_api.parseAggregationRequestsJson(a, bytes);
+    defer query_api.freeAggregationRequests(a, requests);
+    const results = try local.storage_db_aggregations.computeSearchAggregations(a, requests, .{ .alloc = a, .hits = hits, .total_hits = @intCast(hits.len) }, .{});
+    defer local.storage_db_aggregations.deinitResults(a, results);
+    var response = try query_api.encodeQueryResponses(a, "composed", .{ .aggregations_json = bytes }, .{ .aggregation_results = results }, .{ .alloc = a, .hits = &.{}, .total_hits = @intCast(hits.len) });
+    defer response.deinit(a);
+    const value = try std.json.parseFromSliceLeaky(V, a, response.json, .{ .allocate = .alloc_always });
+    return value.object.get("responses").?.array.items[0].object.get("aggregations") orelse return error.InvalidSqlBackendResponse;
 }
 
 test "external lake composed union preserves equal IDs across tables and orders with deterministic provenance ties" {
@@ -559,6 +625,7 @@ test "external lake composed union preserves equal IDs across tables and orders 
 const TestExecutor = struct {
     changed: bool = false,
     overlay: bool = false,
+    compact_id_sort: bool = false,
     fn checkpoint(_: *anyopaque) !void {}
     fn run(raw: *anyopaque, a: A, table: []const u8, body: []const u8) !Response {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -585,9 +652,11 @@ const TestExecutor = struct {
                 const score = value.object.get("_score").?;
                 const id = value.object.get("_id").?;
                 if (query.object.get("search_after")) |after| {
-                    if (compareValue(score, after.array.items[0]) == .gt or (compareValue(score, after.array.items[0]) == .eq and std.mem.order(u8, id.string, after.array.items[1].string) != .gt)) continue;
+                    if (self.compact_id_sort) {
+                        if (std.mem.order(u8, id.string, after.array.items[0].string) != .gt) continue;
+                    } else if (compareValue(score, after.array.items[0]) == .gt or (compareValue(score, after.array.items[0]) == .eq and std.mem.order(u8, id.string, after.array.items[1].string) != .gt)) continue;
                 }
-                try value.object.put(scratch, "_sort", try clone(scratch, [_]V{ score, id }, V));
+                try value.object.put(scratch, "_sort", if (self.compact_id_sort) try clone(scratch, [_]V{id}, V) else try clone(scratch, [_]V{ score, id }, V));
                 try output.append(scratch, value);
             }
             hits = .{ .array = output.toManaged(scratch) };
@@ -598,6 +667,36 @@ const TestExecutor = struct {
         return .{ .ptr = self, .execute = run, .checkpoint = checkpoint };
     }
 };
+test "external lake composed global aggregations precede projection and retain totals across pages" {
+    const a = std.testing.allocator;
+    var fixture: TestExecutor = .{};
+    const body = "{\"source\":{\"union\":[{\"table\":\"history\"},{\"table\":\"current\"}]},\"source_ranking\":\"rrf\",\"fields\":[\"body\"],\"limit\":1,\"aggregations\":{\"ids\":{\"type\":\"stats\",\"field\":\"id\"}}}";
+    var first = try execute(a, body, fixture.executor());
+    defer first.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const result = (try std.json.parseFromSliceLeaky(V, scratch, first.body, .{})).object.get("responses").?.array.items[0];
+    const stats = result.object.get("aggregations").?.object.get("ids").?;
+    try std.testing.expectEqual(@as(i64, 2), stats.object.get("count").?.integer);
+    try std.testing.expectEqual(@as(f64, 3), switch (stats.object.get("sum").?) {
+        .integer => |n| @as(f64, @floatFromInt(n)),
+        .float => |n| n,
+        else => return error.TestUnexpectedResult,
+    });
+    var request = try std.json.parseFromSliceLeaky(V, scratch, body, .{});
+    try request.object.put(scratch, "source_cursor", result.object.get("next_source_cursor").?);
+    var second = try execute(a, try std.json.Stringify.valueAlloc(scratch, request, .{}), fixture.executor());
+    defer second.deinit(a);
+    const next = (try std.json.parseFromSliceLeaky(V, scratch, second.body, .{})).object.get("responses").?.array.items[0];
+    try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(scratch, stats, .{}), try std.json.Stringify.valueAlloc(scratch, next.object.get("aggregations").?.object.get("ids").?, .{}));
+    try std.testing.expectEqual(@as(i64, 2), next.object.get("hits").?.object.get("total").?.object.get("value").?.integer);
+    fixture.overlay = true;
+    var overlay = try execute(a, "{\"source\":{\"overlay\":{\"base\":{\"table\":\"history\"},\"changes\":{\"table\":\"current\"},\"key\":[\"id\"]}},\"source_ranking\":\"rrf\",\"limit\":1,\"aggregations\":{\"ids\":{\"type\":\"stats\",\"field\":\"id\"}}}", fixture.executor());
+    defer overlay.deinit(a);
+    const visible = (try std.json.parseFromSliceLeaky(V, scratch, overlay.body, .{})).object.get("responses").?.array.items[0].object.get("aggregations").?.object.get("ids").?;
+    try std.testing.expectEqual(@as(i64, 1), visible.object.get("count").?.integer);
+}
 test "external lake composed query paginates a global result and expires changed cuts" {
     const a = std.testing.allocator;
     var fixture: TestExecutor = .{};
@@ -755,4 +854,28 @@ test "external lake overlay identities canonicalize numeric and explicit timesta
     const precise = try std.json.parseFromSliceLeaky(V, a, "{\"id\":9007199254740993}", .{});
     const rounded = try std.json.parseFromSliceLeaky(V, a, "{\"id\":9007199254740992}", .{});
     try std.testing.expect(!std.mem.eql(u8, try rowIdentity(a, &.{"id"}, precise, &.{.number}), try rowIdentity(a, &.{"id"}, rounded, &.{.number})));
+}
+
+test "external lake composed ID ordering accepts native cursor without a duplicate tie breaker" {
+    const a = std.testing.allocator;
+    var fixture: TestExecutor = .{ .compact_id_sort = true };
+    const body = "{\"source\":{\"union\":[{\"table\":\"history\"},{\"table\":\"current\"}]},\"order_by\":[{\"field\":\"_id\"}],\"limit\":1}";
+    var first = try execute(a, body, fixture.executor());
+    defer first.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const result = (try std.json.parseFromSliceLeaky(V, scratch, first.body, .{})).object.get("responses").?.array.items[0];
+    try std.testing.expectEqualStrings("current", result.object.get("hits").?.object.get("hits").?.array.items[0].object.get("_table").?.string);
+    var request = try std.json.parseFromSliceLeaky(V, scratch, body, .{});
+    try request.object.put(scratch, "source_cursor", result.object.get("next_source_cursor").?);
+    var second = try execute(a, try std.json.Stringify.valueAlloc(scratch, request, .{}), fixture.executor());
+    defer second.deinit(a);
+    const next = (try std.json.parseFromSliceLeaky(V, scratch, second.body, .{})).object.get("responses").?.array.items[0];
+    try std.testing.expectEqualStrings("history", next.object.get("hits").?.object.get("hits").?.array.items[0].object.get("_table").?.string);
+}
+
+test "external lake composed aggregations reject background corpus operators" {
+    var fixture: TestExecutor = .{};
+    try std.testing.expectError(error.UnsupportedQueryRequest, execute(std.testing.allocator, "{\"source\":{\"union\":[{\"table\":\"history\"},{\"table\":\"current\"}]},\"source_ranking\":\"rrf\",\"aggregations\":{\"significant\":{\"type\":\"significant_terms\",\"field\":\"body\"}}}", fixture.executor()));
 }

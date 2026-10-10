@@ -2108,6 +2108,7 @@ fn freeOwnedMutableStrings(alloc: std.mem.Allocator, values: [][]u8) void {
 pub const OwnedQueryRequest = struct {
     fields: [][]const u8 = &.{},
     req: db_mod.types.SearchRequest = .{},
+    native_cut: ?std.json.Parsed(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child) = null,
 
     pub fn deinit(self: *OwnedQueryRequest, alloc: std.mem.Allocator) void {
         if (self.fields.len > 0) {
@@ -2115,6 +2116,7 @@ pub const OwnedQueryRequest = struct {
             alloc.free(self.fields);
         }
         freeSearchRequest(alloc, &self.req);
+        if (self.native_cut) |*cut| cut.deinit();
         self.* = undefined;
     }
 };
@@ -2667,6 +2669,31 @@ pub fn parseQueryRequest(
 /// computes this once and shares it with normalization, embedding, retries, and
 /// execution so no stage silently receives a fresh timeout window.
 pub fn parseQueryRequestWithDeadline(
+    alloc: std.mem.Allocator,
+    semantic_resolver: ?SemanticResolver,
+    table_name: []const u8,
+    body: []const u8,
+    execution_deadline_ns: ?u64,
+) !OwnedQueryRequest {
+    var owned = try parseQueryRequestWithDeadlineCore(alloc, semantic_resolver, table_name, body, execution_deadline_ns);
+    errdefer owned.deinit(alloc);
+    // Internal HTTP hops must retain the authenticated physical cut when the
+    // generated public contract strips private shard fields. Public admission
+    // rejects this control before entering the shared parser. Escaped member
+    // names still receive semantic parsing rather than bypassing retention.
+    if (std.mem.indexOf(u8, body, "_native_cut") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer raw.deinit();
+        if (raw.value == .object) if (raw.value.object.get("_native_cut")) |value| {
+            owned.native_cut = try std.json.parseFromValue(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child, alloc, value, .{ .allocate = .alloc_always });
+            try owned.native_cut.?.value.validate(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+            owned.req.native_query_cut = owned.native_cut.?.value;
+        };
+    }
+    return owned;
+}
+
+fn parseQueryRequestWithDeadlineCore(
     alloc: std.mem.Allocator,
     semantic_resolver: ?SemanticResolver,
     table_name: []const u8,

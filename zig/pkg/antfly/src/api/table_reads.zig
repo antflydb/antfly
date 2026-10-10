@@ -7382,6 +7382,12 @@ pub const HostedProvisionedTableReadSource = struct {
 
             if (route == .local)
                 return try (try self.groupLocalSourceForGroup(alloc, group_ids[0], table_name, .{ .deadline_ns = req.execution_deadline_ns }, req.cancellation)).queryGroupLocal(alloc, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name), consistency);
+            // A retained cover is executed completely by its current carrier.
+            // Preserve its finalized response when the carrier is remote too;
+            // remerging a cursor page cannot infer exhaustion from total_hits,
+            // which deliberately counts matches before the cursor.
+            if (req.native_query_cut != null and !req.native_query_cut.?.create)
+                return try queryResponseRemote(self.internalExecutor(), alloc, route.remote.base_uri, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name));
         }
 
         if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
@@ -10546,7 +10552,10 @@ fn requestRoutedSpanSnapshot(alloc: std.mem.Allocator, catalog: table_catalog.Ca
             // A topology race during capture must not yield a partial original
             // cover. Every physical owner additionally validates its namespace.
             if (current.routes.len != cut.cover.len) return error.CatalogGenerationChanged;
-            for (current.routes, cut.cover) |route, original| {
+            for (current.routes) |route| {
+                const original = for (cut.cover) |candidate| {
+                    if (candidate.group_id == route.group_id) break candidate;
+                } else return error.CatalogGenerationChanged;
                 if (route.group_id != original.group_id or route.identity_namespace.table_id != original.namespace.table_id or route.identity_namespace.shard_id != original.namespace.shard_id or route.identity_namespace.range_id != original.namespace.range_id) return error.CatalogGenerationChanged;
             }
         } else {
@@ -15531,8 +15540,12 @@ fn queryResponseRemote(
     base_uri: []const u8,
     group_id: u64,
     table_name: []const u8,
-    req: db_mod.types.SearchRequest,
+    input: db_mod.types.SearchRequest,
 ) !query_api.QueryResponse {
+    var req = input;
+    if (req.native_query_cut) |cut| if (cut.create) {
+        req.native_query_cut = try cut.forGroup(group_id);
+    };
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const prepared = try @import("prepared_query_routing.zig").encode(alloc, table_name, req);
     defer if (prepared) |value| alloc.free(value);
@@ -15564,9 +15577,13 @@ fn preflightRemote(
     base_uri: []const u8,
     group_id: u64,
     table_name: []const u8,
-    req: db_mod.types.SearchRequest,
+    input: db_mod.types.SearchRequest,
     max_work: u32,
 ) !db_mod.RuntimePreflightSummary {
+    var req = input;
+    if (req.native_query_cut) |cut| if (cut.create) {
+        req.native_query_cut = try cut.forGroup(group_id);
+    };
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const prepared = try @import("prepared_query_routing.zig").encode(alloc, table_name, req);
     defer if (prepared) |value| alloc.free(value);
@@ -15588,9 +15605,12 @@ fn textStatsRemote(
     base_uri: []const u8,
     group_id: u64,
     table_name: []const u8,
-    body: []const u8,
+    input: []const u8,
     req: db_mod.types.SearchRequest,
 ) !?query_api.QueryResponse {
+    const bound = try @import("antfly_local_sources").api_table_read_source.bindNativeCutBodyAlloc(alloc, input, group_id);
+    defer if (bound) |bytes| alloc.free(bytes);
+    const body = bound orelse input;
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const timeout_ms = try queryRemainingTimeoutMs(req);
     var cancellation = queryRequestCancellation(req);
@@ -15606,9 +15626,12 @@ fn algebraicPartialsRemote(
     base_uri: []const u8,
     group_id: u64,
     table_name: []const u8,
-    body: []const u8,
+    input: []const u8,
     req: db_mod.types.SearchRequest,
 ) !?query_api.QueryResponse {
+    const bound = try @import("antfly_local_sources").api_table_read_source.bindNativeCutBodyAlloc(alloc, input, group_id);
+    defer if (bound) |bytes| alloc.free(bytes);
+    const body = bound orelse input;
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const timeout_ms = try queryRemainingTimeoutMs(req);
     var cancellation = queryRequestCancellation(req);

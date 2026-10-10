@@ -692,6 +692,7 @@ pub const Owner = struct {
             return error.InvalidBoundaryFailureIdentity;
         }
         statusToError(status) catch |err| {
+            std.log.debug("storage-owner query rejected provider_error={s} boundary={s} operation={d}", .{ failure.errorName(), @tagName(failure.boundary), failure.operation });
             if (status == .internal) {
                 std.log.err("storage-owner query failed provider_error={s} hash={x} operation={d}", .{
                     failure.errorName(),

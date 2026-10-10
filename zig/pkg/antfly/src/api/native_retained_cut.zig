@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Server-written native cursor capabilities; physical owners retain immutable
 //! generations. Store location, incarnation and recipes are checked each page.
 const std = @import("std");
@@ -55,11 +68,27 @@ pub fn saveWithCover(a: A, store: *stores.ArtifactStore, identity: Digest, io: s
     var nonce: [32]u8 = undefined;
     try io.randomSecure(&nonce);
     const id = std.fmt.bytesToHex(nonce, .lower);
-    const descriptor: Descriptor = .{ .expires_ms = now +| retention_ms, .table_id = table.table_id, .desired = recipe(table), .id = &id, .version = if (cover.len == 0) 1 else 2, .cover = cover };
+    const physical_cover = try a.dupe(Range, cover);
+    defer a.free(physical_cover);
+    var initialized: usize = 0;
+    defer for (physical_cover[0..initialized]) |range| a.free(range.generation_id.?);
+    for (physical_cover) |*range| {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("native-physical-range-cut-v1");
+        hash.update(&id);
+        var group: [8]u8 = undefined;
+        std.mem.writeInt(u64, &group, range.group_id, .big);
+        hash.update(&group);
+        var digest: Digest = undefined;
+        hash.final(&digest);
+        range.generation_id = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+        initialized += 1;
+    }
+    const descriptor: Descriptor = .{ .expires_ms = now +| retention_ms, .table_id = table.table_id, .desired = recipe(table), .id = &id, .version = if (cover.len == 0) 1 else 3, .cover = physical_cover };
     const bytes = try std.json.Stringify.valueAlloc(a, descriptor, .{});
     defer a.free(bytes);
     if (bytes.len > 4 * 1024 * 1024) return error.QueryCandidateBudgetExceeded;
-    const validation: Request = .{ .id = descriptor.id, .table_id = table.table_id, .expires_ms = descriptor.expires_ms, .cover = cover, .recipe = .{ .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json } };
+    const validation: Request = .{ .id = descriptor.id, .table_id = table.table_id, .expires_ms = descriptor.expires_ms, .cover = physical_cover, .recipe = .{ .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json } };
     try validation.validate(now);
     const scope = try stores.UploadScope.forPublication(domain(table.table_id, identity), descriptor.expires_ms, io);
     var metadata = try store.putScoped(scope, bytes, cancellation);
@@ -80,10 +109,10 @@ pub fn load(a: A, store: *stores.ArtifactStore, identity: Digest, token: []const
     };
     defer store.allocator.free(bytes);
     const descriptor = std.json.parseFromSliceLeaky(Descriptor, a, bytes, .{ .allocate = .alloc_always }) catch return error.CatalogGenerationChanged;
-    if ((descriptor.version != 1 and descriptor.version != 2) or descriptor.expires_ms != scope.fencingToken() or descriptor.expires_ms > now +| @import("lake_retained_cut.zig").max_ttl_ms or descriptor.table_id != table.table_id or !std.mem.eql(u8, &descriptor.desired, &recipe(table)) or descriptor.id.len != 64) return error.CatalogGenerationChanged;
+    if ((descriptor.version != 1 and descriptor.version != 2 and descriptor.version != 3) or descriptor.expires_ms != scope.fencingToken() or descriptor.expires_ms > now +| @import("lake_retained_cut.zig").max_ttl_ms or descriptor.table_id != table.table_id or !std.mem.eql(u8, &descriptor.desired, &recipe(table)) or descriptor.id.len != 64) return error.CatalogGenerationChanged;
     // Legacy capabilities omitted the original routing identity. They cannot
     // safely be resumed once topology may have changed; expire them explicitly.
-    if (descriptor.version != 2 or descriptor.cover.len == 0) return error.CatalogGenerationChanged;
+    if ((descriptor.version != 2 and descriptor.version != 3) or descriptor.cover.len == 0) return error.CatalogGenerationChanged;
     const request: Request = .{ .id = descriptor.id, .table_id = descriptor.table_id, .expires_ms = descriptor.expires_ms, .cover = descriptor.cover, .recipe = .{ .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = table.indexes_json } };
     try request.validate(now);
     return descriptor;
@@ -129,5 +158,34 @@ pub fn captureCover(a: A, snapshot: @import("../metadata/api.zig").AdminSnapshot
         } else return error.CatalogGenerationChanged;
         range.* = .{ .group_id = group.group_id, .namespace = .{ .table_id = group.identity_namespace.table_id, .shard_id = group.identity_namespace.shard_id, .range_id = group.identity_namespace.range_id }, .start_key = try a.dupe(u8, record.start_key), .end_key = if (record.end_key) |end| try a.dupe(u8, end) else null };
     }
+    std.mem.sort(Range, cover, {}, struct {
+        fn less(_: void, left: Range, right: Range) bool {
+            return std.mem.lessThan(u8, left.start_key, right.start_key);
+        }
+    }.less);
     return cover;
+}
+
+test "external lake native split cover binds distinct physical generations for a shared document namespace" {
+    const a = std.testing.allocator;
+    const namespace: @FieldType(Range, "namespace") = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const logical: [64]u8 = @splat('a');
+    const left: [64]u8 = @splat('b');
+    const right: [64]u8 = @splat('c');
+    const request: Request = .{ .id = &logical, .table_id = 7, .expires_ms = 9999, .create = true, .recipe = .{ .schema_json = "{}", .read_schema_json = "{}", .indexes_json = "{}" }, .cover = &.{
+        .{ .group_id = 11, .namespace = namespace, .start_key = "", .end_key = "m", .generation_id = &left },
+        .{ .group_id = 12, .namespace = namespace, .start_key = "m", .end_key = null, .generation_id = &right },
+    } };
+    try request.validate(1);
+    try std.testing.expectEqualStrings(&left, (try request.forGroup(11)).id);
+    try std.testing.expectEqualStrings(&right, (try request.forGroup(12)).id);
+    try std.testing.expectEqual(@as(usize, 0), (try request.forGroup(11)).cover.len);
+    try std.testing.expectError(error.CatalogGenerationChanged, request.forGroup(13));
+    const body = try std.json.Stringify.valueAlloc(a, .{ .query_request = .{ ._native_cut = request } }, .{});
+    defer a.free(body);
+    const rebound = (try local.api_table_read_source.bindNativeCutBodyAlloc(a, body, 12)).?;
+    defer a.free(rebound);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, rebound, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(&right, parsed.value.object.get("query_request").?.object.get("_native_cut").?.object.get("id").?.string);
 }

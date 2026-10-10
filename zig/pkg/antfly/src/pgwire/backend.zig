@@ -50,6 +50,7 @@ pub const Request = struct {
     /// Parse-time setting catalog epoch for prepared current_setting plans.
     setting_epoch: ?u64 = null,
     /// Connection-owned, identity-fenced setting values for this statement.
+    lake_visibility: @import("session_commands.zig").LakeVisibility = .committed,
     setting_overlay: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry = &.{},
 
     pub fn check(self: Request) !void {

@@ -24066,7 +24066,7 @@ pub const DataServer = struct {
                                 },
                             },
                         },
-                        .data_apply_storage_context = if (storage_kernel_context) |context| context.handle else null,
+                        .data_apply_storage_context = cfg.storage_kernel_context_handle orelse if (storage_kernel_context) |context| context.handle else null,
                         .native_snapshot_delegate = data_raft_apply.?.nativeSnapshotDelegate(),
                     }, .{}, .{
                         .transition_runtime = null,
@@ -24099,6 +24099,7 @@ pub const DataServer = struct {
             .local_transition_runtime = if (data_raft) |raft| raft.local_transition_runtime else null,
             .provisioned_storage = provisioned_storage,
             .storage_kernel_context = storage_kernel_context,
+            .borrowed_storage_kernel_context = cfg.storage_kernel_context_handle,
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 remote_metadata.catalogSource(),
@@ -30887,6 +30888,11 @@ pub fn runFromIterator(
         defer alloc.free(security_json);
         try process_storage_kernel_context.?.configureRemoteContentSecurity(security_json);
         try process_storage_kernel_context.?.configureSecrets(if (secret_store_initialized) &secret_store else null);
+        if (loaded_config) |*cfg| if (cfg.storage.artifacts.connection != null) {
+            const retained_setup = try @import("../api/native_query_repository.zig").Repository.setupJsonAlloc(alloc, cfg, .distributed, null);
+            defer alloc.free(retained_setup);
+            try process_storage_kernel_context.?.configureNativeQueries(retained_setup);
+        };
     }
 
     var auth_backend: ?LegacyAuthBackend = null;

@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! A current, catalog-fenced carrier executes an immutable original range
 //! cover. Logical group IDs remain distinct even when every generation moves
 //! to one owner. Existing distributed rank/aggregation/graph merge is reused.
@@ -58,10 +71,7 @@ pub const Owner = struct {
         try self.cancellation.check();
         for (self.cut.cover, 0..) |origin, i| if (origin.group_id == group) {
             if (self.dbs[i] == null) {
-                var cut = self.cut;
-                cut.origin = origin.namespace;
-                cut.cover = &.{};
-                cut.recipe = null;
+                const cut = try self.cut.forGroup(origin.group_id);
                 self.dbs[i] = try self.carrier.openQueryCut(cut, self.cancellation);
             }
             return .{ .ptr = self, .db = &self.dbs[i].?, .release_fn = release };

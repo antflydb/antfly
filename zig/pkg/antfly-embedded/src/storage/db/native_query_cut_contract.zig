@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const Namespace = @import("doc_identity_namespace.zig").Namespace;
 pub const ttl_ms: u64 = 300_000;
@@ -9,6 +22,9 @@ pub const max_ttl_ms: u64 = std.time.ms_per_hour;
 pub const Range = struct {
     group_id: u64,
     namespace: Namespace,
+    /// Physical snapshot identity, independent of preserved document IDs.
+    /// Legacy covers used the public request ID plus a unique namespace.
+    generation_id: ?[]const u8 = null,
     start_key: []const u8,
     end_key: ?[]const u8 = null,
 };
@@ -21,13 +37,44 @@ pub fn validateCover(table_id: u64, cover: []const Range) !void {
     if (cover.len == 0 or cover.len > 4096 or cover[0].start_key.len != 0 or cover[cover.len - 1].end_key != null) return error.CatalogGenerationChanged;
     for (cover, 0..) |range, i| {
         if (range.group_id == 0 or range.namespace.table_id != table_id) return error.CatalogGenerationChanged;
-        for (cover[0..i]) |previous| if (previous.group_id == range.group_id or previous.namespace.eql(range.namespace)) return error.CatalogGenerationChanged;
+        if (range.generation_id) |id| try validateId(id);
+        for (cover[0..i]) |previous| {
+            if (previous.group_id == range.group_id) return error.CatalogGenerationChanged;
+            if (previous.generation_id != null and range.generation_id != null) {
+                if (std.mem.eql(u8, previous.generation_id.?, range.generation_id.?)) return error.CatalogGenerationChanged;
+            } else if (previous.namespace.eql(range.namespace)) return error.CatalogGenerationChanged;
+        }
         if (range.end_key) |end| if (std.mem.order(u8, range.start_key, end) != .lt) return error.CatalogGenerationChanged;
         if (i != 0) {
             const end = cover[i - 1].end_key orelse return error.CatalogGenerationChanged;
             if (!std.mem.eql(u8, end, range.start_key)) return error.CatalogGenerationChanged;
         }
     }
+}
+fn validateId(id: []const u8) !void {
+    if (id.len != 64) return error.InvalidQueryRequest;
+    for (id) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidQueryRequest;
+}
+/// Internal subrequests may carry a cut either at the top level or inside the
+/// retrieval envelope. Do not recapture a resume cover on its current carrier.
+pub fn bindBodyAlloc(a: std.mem.Allocator, body: []const u8, group_id: u64) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    if (!try bindValue(parsed.arena.allocator(), &parsed.value, group_id)) return null;
+    return try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+}
+fn bindValue(a: std.mem.Allocator, value: *std.json.Value, group_id: u64) !bool {
+    if (value.* != .object) return false;
+    if (value.object.getPtr("_native_cut")) |input| {
+        const bytes = try std.json.Stringify.valueAlloc(a, input.*, .{});
+        const cut = try std.json.parseFromSliceLeaky(Request, a, bytes, .{});
+        if (!cut.create or cut.cover.len == 0) return false;
+        const selected = try cut.forGroup(group_id);
+        input.* = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, selected, .{}), .{});
+        return true;
+    }
+    if (value.object.getPtr("query_request")) |query| return bindValue(a, query, group_id);
+    return false;
 }
 pub const Request = struct {
     id: []const u8,
@@ -40,6 +87,20 @@ pub const Request = struct {
     timeout_ms: ?u64 = null,
     cover: []const Range = &.{},
     recipe: ?Recipe = null,
+    /// Bind only at a catalog-fenced physical owner. A resume coordinator
+    /// retains the whole cover; its virtual owners bind each original range.
+    pub fn forGroup(self: Request, group_id: u64) !Request {
+        if (self.cover.len == 0) return self;
+        for (self.cover) |range| if (range.group_id == group_id) {
+            var selected = self;
+            selected.id = range.generation_id orelse self.id;
+            selected.origin = range.namespace;
+            selected.cover = &.{};
+            selected.recipe = null;
+            return selected;
+        };
+        return error.CatalogGenerationChanged;
+    }
     pub fn namespace(self: Request, owner: Namespace) !Namespace {
         if (owner.table_id != self.table_id) return error.CatalogGenerationChanged;
         const original = self.origin orelse owner;
@@ -79,7 +140,7 @@ pub const Request = struct {
             if (self.recipe == null) return error.CatalogGenerationChanged;
         }
         if (self.origin) |origin| if (origin.table_id != self.table_id) return error.CatalogGenerationChanged;
-        for (self.id) |byte| if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.InvalidQueryRequest;
+        try validateId(self.id);
         if (self.expires_ms <= now or self.expires_ms > now +| max_ttl_ms) return error.CatalogGenerationChanged;
     }
 };

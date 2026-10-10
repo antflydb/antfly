@@ -78,6 +78,10 @@ pub const Store = struct {
     fn expand(self: Store, a: A, record: StoredRecord) !Record {
         return .{ .lsn = record.lsn, .payload = try self.readPayload(a, record), .operation_id = record.operation_id, .previous = record.previous };
     }
+    /// Monotone admission watermark; validation must not enumerate WAL rows.
+    pub fn watermark(self: Store, a: A) !u64 {
+        return if ((try self.tail(a)).head) |head| head.lsn else 0;
+    }
     pub fn latest(self: Store, a: A) !?Record {
         const current = try self.tail(a);
         return if (current.head) |head| try self.expand(a, try self.loadRecord(a, head.key)) else null;

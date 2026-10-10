@@ -25,6 +25,7 @@ pub const ttl_ms: u64 = std.time.ms_per_hour;
 pub const max_bytes = 40 * 1024 * 1024;
 pub const Descriptor = struct {
     version: u16 = 1,
+    name: ?local.sql_ast.Name = null,
     table_id: u64,
     schema_version: u32,
     object_generation: u64,
@@ -56,17 +57,22 @@ pub fn save(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, io: std.Io,
     return std.fmt.allocPrint(a, "{s}{s}:{d}", .{ prefix, object.artifact_id, object.byte_len });
 }
 pub fn load(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, token: []const u8, table: catalog.Table, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !Descriptor {
+    const value = try loadDescriptor(a, store, identity, token, table.id, now, cancellation);
+    if (value.schema_version != table.schema_version or value.object_generation != (if (table.external_indexes) |indexes| indexes.object_generation else 0)) return error.CatalogGenerationChanged;
+    return value;
+}
+pub fn loadDescriptor(a: A, store: *artifacts.ArtifactStore, identity: [32]u8, token: []const u8, table_id: u64, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !Descriptor {
     if (!std.mem.startsWith(u8, token, prefix)) return error.CatalogGenerationChanged;
     const at = std.mem.lastIndexOfScalar(u8, token, ':') orelse return error.CatalogGenerationChanged;
     const id = token[prefix.len..at];
     const scope = (try artifacts.uploadScopeFromArtifactId(id)) orelse return error.CatalogGenerationChanged;
-    if (!std.mem.eql(u8, &scope.domain, &domain(table.id, identity))) return error.CatalogGenerationChanged;
+    if (!std.mem.eql(u8, &scope.domain, &domain(table_id, identity))) return error.CatalogGenerationChanged;
     const size = std.fmt.parseInt(u64, token[at + 1 ..], 10) catch return error.CatalogGenerationChanged;
     if (size > max_bytes or size == 0) return error.QueryCandidateBudgetExceeded;
     const bytes = try store.getVerifiedAllocWithCancellation(id, size, try artifacts.sha256ChecksumFromArtifactId(id), cancellation);
     defer store.allocator.free(bytes);
     const value = try std.json.parseFromSliceLeaky(Descriptor, a, bytes, .{ .allocate = .alloc_always });
-    if (value.version != 1 or value.table_id != table.id or value.schema_version != table.schema_version or value.object_generation != (if (table.external_indexes) |indexes| indexes.object_generation else 0) or value.expires_ms <= now or value.expires_ms != scope.fencingToken()) return error.CatalogGenerationChanged;
+    if (value.version != 1 or value.table_id != table_id or value.expires_ms <= now or value.expires_ms != scope.fencingToken()) return error.CatalogGenerationChanged;
     return value;
 }
 

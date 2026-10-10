@@ -119,7 +119,7 @@ pub const Repository = struct {
         if (self.owned_base_dir) |value| self.a.free(value);
     }
     pub fn capability(self: *Repository) port.Port {
-        const vtable: port.VTable = .{ .publish = publish, .recover = recover, .open_read = openRead, .warm = warm };
+        const vtable: port.VTable = .{ .publish = publish, .recover = recover, .open_read = openRead, .warm = warm, .reference = reference };
         return .{ .limits = self.limits, .ptr = self, .vtable = &vtable, .dispatch = @import("antfly_local_sources").runtime_callback_abi.Boundary(port.VTable).local_dispatch };
     }
     fn from(raw: *anyopaque) *Repository {
@@ -489,6 +489,42 @@ pub const Repository = struct {
         try cancellation.check();
         return true;
     }
+    /// A complete remote-native checkpoint already owns its immutable extents.
+    /// Publish only a new authenticated manifest; never read/download/re-upload
+    /// those extents or derive a checkpoint from a partial storage view.
+    fn reference(raw: *anyopaque, io: std.Io, request: cut.Request, namespace: Namespace, source: port.Storage, cancellation: Cancellation) !bool {
+        _ = io;
+        const self = from(raw);
+        try request.validate(cut.nowMs());
+        if (!request.create or !(try request.namespace(namespace)).eql(namespace)) return error.CatalogGenerationChanged;
+        try cancellation.check();
+        const bytes = (try source.nativeCheckpointReferenceAlloc(self.a)) orelse return false;
+        defer self.a.free(bytes);
+        if (bytes.len > max_manifest_bytes) return error.QueryCandidateBudgetExceeded;
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const checkpoint = try std.json.parseFromSliceLeaky(port.CheckpointReference, a, bytes, .{ .allocate = .alloc_always });
+        const authority = try self.domain(a, namespace);
+        if (checkpoint.version != 1 or !checkpoint.namespace.eql(namespace) or !std.mem.eql(u8, &authority, &checkpoint.authority)) return error.CatalogGenerationChanged;
+        const manifest = try std.json.Stringify.valueAlloc(a, Manifest{ .request = request, .namespace = namespace, .sequence = checkpoint.sequence, .files = checkpoint.files }, .{});
+        if (manifest.len > max_manifest_bytes) return error.QueryCandidateBudgetExceeded;
+        _ = try checkedManifest(a, manifest, request, namespace);
+        for (checkpoint.files) |file| for (file.chunks) |chunk| {
+            const scope = (try artifacts.uploadScopeFromArtifactId(chunk.artifact_id)) orelse return error.CatalogGenerationChanged;
+            if (!std.mem.eql(u8, &scope.domain, &authority) or scope.fencingToken() < request.expires_ms or scope.fencingToken() > request.expires_ms +| 3 * cache_window_ms) return error.CatalogGenerationChanged;
+        };
+        const bridge: TokenBridge = .{ .token = cancellation };
+        var published = self.store.opened.client.putObject(self.store.opened.bucket, try self.key(a, request, namespace), manifest, .{ .if_none_match = true, .cancellation = bridge.object() }) catch |err| {
+            try cancellation.check();
+            if (err != error.PreconditionFailed and err != error.ConditionalCheckFailed) return err;
+            if (!std.mem.eql(u8, manifest, try self.readManifest(a, request, namespace, cancellation))) return error.CatalogGenerationChanged;
+            return true;
+        };
+        published.deinit(self.store.opened.client.allocator);
+        try cancellation.check();
+        return true;
+    }
     fn readChunk(raw: *anyopaque, a: A, ref: Ref, cancellation: Cancellation) ![]u8 {
         const self: *Repository = @ptrCast(@alignCast(raw));
         var store = self.store.artifactStore();
@@ -514,6 +550,7 @@ pub const Repository = struct {
         const expiry = @import("antfly_platform").time.monotonicNs() +| (request.expires_ms -| cut.nowMs()) * std.time.ns_per_ms;
         const control: cut.Control = .{ .parent = cancellation, .deadline_ns = if (request.timeout_ms) |value| @min(expiry, @import("antfly_platform").time.monotonicNs() +| value *| std.time.ns_per_ms) else expiry };
         const reader = try port.remote_storage.Reader.create(self.a, io, root, manifest.files, .{ .ptr = self, .read = readChunk }, control);
+        reader.checkpoint_reference = try std.json.Stringify.valueAlloc(reader.arena.allocator(), port.CheckpointReference{ .authority = expected_domain, .namespace = namespace, .sequence = manifest.sequence, .files = reader.files }, .{});
         return reader.lease();
     }
     fn recover(raw: *anyopaque, io: std.Io, root: []const u8, request: cut.Request, namespace: Namespace, cancellation: Cancellation) !void {
@@ -661,6 +698,23 @@ test "external lake native repository reuses immutable extents and collects expi
     try std.testing.expectEqualStrings("immutable", remote_bytes);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, virtual_root, .{}));
     try std.testing.expectError(error.ReadOnly, remote.view.writeFileAbsolute(virtual_file, "replacement"));
+    // A replacement owner can pin the complete immutable remote generation
+    // by reference, with neither a host checkpoint nor an extent transfer.
+    const alias_id: [64]u8 = @splat('d');
+    const alias: cut.Request = .{ .id = &alias_id, .table_id = 7, .expires_ms = expires, .create = true };
+    try std.testing.expect(try repository.capability().reference(io, alias, namespace, remote.view, .none));
+    try std.testing.expect(try repository.capability().reference(io, alias, namespace, remote.view, .none));
+    const alias_manifest = try Repository.checkedManifest(scratch, try repository.readManifest(scratch, alias, namespace, .none), alias, namespace);
+    try std.testing.expectEqualStrings(first_manifest.files[0].chunks[0].artifact_id, alias_manifest.files[0].chunks[0].artifact_id);
+    var alias_reader = (try repository.capability().openRead(io, virtual_root, alias, namespace, .none)).?;
+    defer alias_reader.deinit();
+    const alias_bytes = try alias_reader.view.readFileRangeAlloc(a, virtual_file, 9, 9);
+    defer a.free(alias_bytes);
+    try std.testing.expectEqualStrings("immutable", alias_bytes);
+    var invalid_alias = alias;
+    invalid_alias.expires_ms += 4 * cache_window_ms;
+    try std.testing.expectError(error.CatalogGenerationChanged, repository.capability().reference(io, invalid_alias, namespace, remote.view, .none));
+    try std.testing.expectError(error.CatalogGenerationChanged, repository.capability().reference(io, alias, .{ .table_id = 7, .shard_id = 2, .range_id = 2 }, remote.view, .none));
     var store = repository.store.artifactStore();
     const retained = @import("native_retained_cut.zig");
     const table = .{ .table_id = @as(u64, 7), .schema_json = "{}", .read_schema_json = "{}", .indexes_json = "{}" };

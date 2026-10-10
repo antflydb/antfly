@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 //! Read-only storage over an authenticated retained generation. Metadata and
 //! immutable pages share one authority; fetching a page never recaptures rows.
 const std = @import("std");
@@ -19,6 +32,7 @@ pub const Reader = struct {
     arena: std.heap.ArenaAllocator,
     root: []const u8,
     files: []const File,
+    checkpoint_reference: ?[]const u8 = null,
     fetch: Fetch,
     control: Control,
     io: std.Io,
@@ -50,6 +64,11 @@ pub const Reader = struct {
         }
         self.files = owned;
         return self;
+    }
+    fn checkpointReference(raw: *anyopaque, a: A) !?[]u8 {
+        const self = cast(raw);
+        try self.control.token().check();
+        return if (self.checkpoint_reference) |bytes| try a.dupe(u8, bytes) else null;
     }
     fn retain(self: *Reader) void {
         _ = self.refs.fetchAdd(1, .monotonic);
@@ -203,7 +222,7 @@ pub const Reader = struct {
         return .{ .ranges = .{ .ptr = page, .length = entry.size, .read_into = PageSource.read, .close = PageSource.close } };
     }
     pub fn view(self: *Reader) storage.Storage {
-        return .{ .ptr = self, .vtable = &.{ .acquire_lease = acquire, .create_dir_path = readOnly, .read_file_alloc = readFile, .read_file_range_alloc = readRange, .file_size = fileSize, .write_file_absolute = writeOnly, .rename_absolute = writeOnly, .delete_file_absolute = readOnly, .delete_tree = readOnly, .now_ns = now, .list_file_names_alloc = list, .open_immutable_source = openSource, .open_leased_immutable_source = openSource } };
+        return .{ .ptr = self, .vtable = &.{ .native_checkpoint_reference_alloc = checkpointReference, .acquire_lease = acquire, .create_dir_path = readOnly, .read_file_alloc = readFile, .read_file_range_alloc = readRange, .file_size = fileSize, .write_file_absolute = writeOnly, .rename_absolute = writeOnly, .delete_file_absolute = readOnly, .delete_tree = readOnly, .now_ns = now, .list_file_names_alloc = list, .open_immutable_source = openSource, .open_leased_immutable_source = openSource } };
     }
 };
 

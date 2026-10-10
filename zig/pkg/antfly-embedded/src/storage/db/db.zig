@@ -19354,6 +19354,9 @@ pub const DB = struct {
         const control: @import("native_query_cut.zig").Control = .{ .parent = cancellation, .deadline_ns = deadline };
         const token = control.token();
         try token.check();
+        if (publish) if (self.backend_runtime.query_cut_repository) |repository| if (self.primary_lsm_storage) |storage| {
+            if (try repository.reference(io, request, self.core.identity_namespace, storage, token)) return;
+        };
         var guard = try @import("native_query_cut.zig").lock(self.alloc, io, self.core.path, token);
         defer guard.deinit();
         try @import("native_query_cut.zig").admit(self.alloc, io, self.core.path, request.id, if (self.backend_runtime.query_cut_repository) |repository| repository.limits else .{}, token);

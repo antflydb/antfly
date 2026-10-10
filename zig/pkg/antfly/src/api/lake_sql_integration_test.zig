@@ -85,6 +85,12 @@ const Fixture = struct {
 };
 
 test "lake SQL accepted transaction retains WAL images after publication and prepares executions against that cut" {
+    try acceptedTransactionFixture(.read_committed);
+}
+test "lake SQL serializable accepted reads validate metadata and the monotone WAL head at commit" {
+    try acceptedTransactionFixture(.serializable);
+}
+fn acceptedTransactionFixture(isolation: @import("antfly_local_sources").sql_session.Isolation) !void {
     const a = std.testing.allocator;
     const local = @import("antfly_local_sources");
     const table_manager = @import("../metadata/table_manager.zig");
@@ -138,7 +144,7 @@ test "lake SQL accepted transaction retains WAL images after publication and pre
     defer initial.deinit(a);
     var accepted = try lake_api.execute(a, &server, "events", 7, null, .{}, .{ .action = .changes, .body = "{\"batch_id\":\"first\",\"source\":\"test\",\"epoch\":\"1\",\"checkpoint\":\"1\",\"key_fields\":[\"amount\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"amount\":1}}]}" });
     defer accepted.deinit(a);
-    const transaction = try server.txn_sessions.beginForPrincipal(a, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_only } }, server.localSessionNodeId(), null);
+    const transaction = try server.txn_sessions.beginForPrincipal(a, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = isolation, .mode = .read_only } }, server.localSessionNodeId(), null);
     const id = std.fmt.bytesToHex(transaction.txn_id, .lower);
     var identity: ?server_mod.AuthenticatedIdentity = null;
     var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .session_id = &id, .lake_visibility = .accepted };
@@ -147,8 +153,10 @@ test "lake SQL accepted transaction retains WAL images after publication and pre
     var first = try adapter.execute(a, &compiled, &.{}, .{}, null);
     defer first.deinit();
     try std.testing.expectEqualStrings("1", first.output.rows[0][0].string);
+    if (isolation == .serializable) try adapter.validateAcceptedSerializable(a, transaction.txn_id);
     var next = try lake_api.execute(a, &server, "events", 7, null, .{}, .{ .action = .changes, .body = "{\"batch_id\":\"second\",\"source\":\"test\",\"epoch\":\"1\",\"checkpoint\":\"2\",\"expected_checkpoint\":\"1\",\"key_fields\":[\"amount\"],\"changes\":[{\"op\":\"upsert\",\"row\":{\"amount\":2}}]}" });
     defer next.deinit(a);
+    if (isolation == .serializable) try std.testing.expectError(error.SqlWriteConflict, adapter.validateAcceptedSerializable(a, transaction.txn_id));
     var binding = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, source.table[0].schema_json)).?;
     defer binding.deinit(a);
     try std.testing.expect(try @import("../serverless/lake_ingestion.zig").drain(a, binding.binding, .{ .node_config = &config, .catalog_table_id = 7 }, .{ .io = std.testing.io }));

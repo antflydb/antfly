@@ -21742,7 +21742,7 @@ pub const ApiHttpServer = struct {
                     const current = tables_api.findTableByName(&after, binding.physical) orelse return error.CatalogGenerationChanged;
                     if (bound.table_id != current.table_id or bound.object_storage_generation != current.object_storage_generation or bound.storage.engine != current.storage.engine) return error.CatalogGenerationChanged;
                     var parsed = try std.json.parseFromSliceLeaky(std.json.Value, scratch, response.body, .{});
-                    const identity_json = try std.json.Stringify.valueAlloc(scratch, .{ .id = bound.table_id, .generation = bound.object_storage_generation, .schema = &localDigest(bound.schema_json), .indexes = &localDigest(bound.indexes_json), .policy = &localDigest(policy orelse "null") }, .{});
+                    const identity_json = try std.json.Stringify.valueAlloc(scratch, .{ .id = bound.table_id, .physical = binding.physical, .generation = bound.object_storage_generation, .schema = &localDigest(bound.schema_json), .indexes = &localDigest(bound.indexes_json), .policy = &localDigest(policy orelse "null") }, .{});
                     const value = try std.json.parseFromSliceLeaky(std.json.Value, scratch, identity_json, .{});
                     const leaf_input = try std.json.parseFromSliceLeaky(std.json.Value, scratch, native_query, .{});
                     for (parsed.object.getPtr("responses").?.array.items) |*result| {
@@ -21795,7 +21795,7 @@ pub const ApiHttpServer = struct {
             error.Forbidden => try contextual_operations.jsonErrorAlloc(self.alloc, 403, "forbidden"),
             error.CatalogGenerationChanged, error.TableGenerationChanged => try contextual_operations.jsonErrorAlloc(self.alloc, 409, "catalog changed during query binding"),
             error.InvalidCatalogName => try contextual_operations.jsonErrorAlloc(self.alloc, 400, "invalid table target"),
-            error.InvalidQueryRequest => if (db_mod.peekLastSortRejectionDiagnostic() != null)
+            error.InvalidComposedGraphIdentity, error.InvalidQueryRequest => if (db_mod.peekLastSortRejectionDiagnostic() != null)
                 try contextualUnsupportedExactSortResponse(self.alloc)
             else
                 try contextual_operations.textAlloc(self.alloc, 400, "invalid query request"),
@@ -21824,7 +21824,7 @@ pub const ApiHttpServer = struct {
                 try public_table_http.graphMetricMaterializationRejectedBody(self.alloc),
                 false,
             ),
-            error.GraphMetricQueryBudgetExceeded => contextual_operations.jsonWithStatus(
+            error.GraphWorkLimitExceeded, error.GraphMetricQueryBudgetExceeded => contextual_operations.jsonWithStatus(
                 422,
                 try public_table_http.graphMetricQueryBudgetExceededBody(self.alloc),
                 false,

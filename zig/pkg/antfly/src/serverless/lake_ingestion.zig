@@ -177,6 +177,14 @@ pub fn drain(a: A, binding: Binding, options: Options, context: Context) !bool {
     return true;
 }
 
+pub fn watermark(a: A, binding: Binding, options: Options, context: Context) !u64 {
+    var opened = try openQueue(a, binding, options);
+    defer opened.deinit();
+    const base = try prefix(a, opened.prefix, binding, options);
+    const store: wal.Store = .{ .client = opened.client, .bucket = opened.bucket, .prefix = base, .context = context };
+    return store.watermark(a);
+}
+
 pub const Pending = struct { lsn: u64, key_fields: []const []const u8, changes: []const Batch.Change };
 /// Caller arena owns the immutable WAL cut and its normalized final images.
 pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: u64) !Pending {

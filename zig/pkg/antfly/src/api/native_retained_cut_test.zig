@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 const std = @import("std");
 const local = @import("antfly_local_sources");
 
@@ -188,7 +201,8 @@ test "external lake native cursor capability fences recipe incarnation scope and
     defer arena.deinit();
     const descriptor = try retained.load(arena.allocator(), &store, @splat(1), token, table, 101, .none);
     try std.testing.expectEqual(@as(usize, 64), descriptor.id.len);
-    try std.testing.expectEqual(@as(u16, 2), descriptor.version);
+    try std.testing.expectEqual(@as(u16, 3), descriptor.version);
+    try std.testing.expectEqual(@as(usize, 64), descriptor.cover[0].generation_id.?.len);
     try std.testing.expectEqual(@as(usize, 1), descriptor.cover.len);
     const legacy = try retained.save(a, &store, @splat(1), std.testing.io, table, 100, .none);
     defer a.free(legacy);
@@ -204,4 +218,100 @@ test "external lake native cursor capability fences recipe incarnation scope and
 
 test {
     _ = @import("native_repartition_test.zig");
+}
+
+test "external lake internal query parsing retains owned native cuts across forwarding" {
+    try verifyForwardedNativeCut(std.testing.allocator);
+}
+fn verifyForwardedNativeCut(a: std.mem.Allocator) !void {
+    const api = local.api_query;
+    const Cut = @typeInfo(@FieldType(local.storage_db_types.SearchRequest, "native_query_cut")).optional.child;
+    const id: [64]u8 = @splat('a');
+    const cut: Cut = .{ .id = &id, .table_id = 7, .expires_ms = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms + std.time.ms_per_hour, .create = true, .origin = .{ .table_id = 7, .shard_id = 11, .range_id = 11 } };
+    const body = try std.json.Stringify.valueAlloc(a, .{ ._native_cut = cut }, .{});
+    defer a.free(body);
+    var request = try api.parseQueryRequest(a, null, "docs", body);
+    defer request.deinit(a);
+    try std.testing.expect(request.native_cut != null);
+    try std.testing.expectEqualStrings(&id, request.req.native_query_cut.?.id);
+    const encoded = try local.api_local_query_contract.encodeQueryRequest(a, request.req);
+    defer a.free(encoded);
+    var forwarded = try api.parseQueryRequest(a, null, "docs", encoded);
+    defer forwarded.deinit(a);
+    try std.testing.expectEqual(cut.origin.?.shard_id, forwarded.req.native_query_cut.?.origin.?.shard_id);
+    try std.testing.expect(forwarded.req.native_query_cut.?.create);
+    if (api.parsePublicQueryRequest(a, null, "docs", body)) |value| {
+        var unexpected = value;
+        unexpected.deinit(a);
+        return error.TestUnexpectedResult;
+    } else |err| if (err != error.InvalidQueryRequest) return err;
+}
+
+test "external lake single-range remote text continuation executes its already bound checkpoint" {
+    const a = std.testing.allocator;
+    var repository_directory = try local.common_test_directory.TestDirectory.init("single-range-cursor-repository");
+    defer repository_directory.cleanup();
+    var repository = try @import("native_query_repository.zig").Repository.init(a, null, null, .standalone, repository_directory.path());
+    defer repository.deinit();
+    const DB = local.storage_db_db.DB;
+    const cut = local.storage_db_native_query_cut;
+    const namespace: local.storage_db_doc_identity_namespace.Namespace = .{ .table_id = 7, .shard_id = 1, .range_id = 1 };
+    const id: [64]u8 = @splat('f');
+    const retained: cut.Request = .{ .id = &id, .table_id = 7, .expires_ms = cut.nowMs() + 300_000 };
+    {
+        var donor_directory = try local.common_test_directory.TestDirectory.init("single-range-cursor-donor");
+        defer donor_directory.cleanup();
+        const pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{donor_directory.path()});
+        defer a.free(pins);
+        defer std.Io.Dir.cwd().deleteTree(std.testing.io, pins) catch {};
+        var donor = try DB.open(a, donor_directory.path(), .{ .identity_namespace = namespace });
+        defer donor.close();
+        donor.backend_runtime.query_cut_repository = repository.capability();
+        try donor.setSchemaJson(a, "{\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"string\"}}}}}}");
+        try donor.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{}" });
+        try donor.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"body\":\"original\"}" }, .{ .key = "z", .value = "{\"body\":\"original\"}" } }, .sync_level = .full_index });
+        var create = retained;
+        create.create = true;
+        try donor.captureQueryCut(create, .none);
+    }
+    var carrier_directory = try local.common_test_directory.TestDirectory.init("single-range-cursor-carrier");
+    defer carrier_directory.cleanup();
+    const carrier_pins = try std.fmt.allocPrint(a, "{s}.query-pins", .{carrier_directory.path()});
+    defer a.free(carrier_pins);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, carrier_pins) catch {};
+    var carrier = try DB.open(a, carrier_directory.path(), .{ .identity_namespace = namespace });
+    defer carrier.close();
+    carrier.backend_runtime.query_cut_repository = repository.capability();
+    try carrier.batch(.{ .writes = &.{.{ .key = "fresh", .value = "{\"body\":\"new generation\"}" }}, .sync_level = .full_index });
+    const token = "native2:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const body = try std.json.Stringify.valueAlloc(a, .{
+        ._native_cut = retained,
+        .remote_snapshot = token,
+        .full_text_index = "body_text",
+        .full_text_search = .{ .match = "original", .field = "body" },
+        .order_by = .{.{ .field = "_id" }},
+        .search_after = .{"a"},
+        .limit = 128,
+    }, .{});
+    defer a.free(body);
+    const abi = @import("kernel_owner_abi");
+    for ([_]bool{ false, true }) |profile| {
+        var request_body = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+        defer request_body.deinit();
+        try request_body.value.object.put(request_body.arena.allocator(), "profile", .{ .bool = profile });
+        const bytes = try std.json.Stringify.valueAlloc(a, request_body.value, .{});
+        defer a.free(bytes);
+        const request: abi.LocalQueryRequest = .{ .db = &carrier, .table_name = .fromSlice("docs"), .request_json = .fromSlice(bytes), .execution_options = .{ .enabled = 1, .raw_search_result = 1 } };
+        var response: abi.QueryOwnedResponse = .{};
+        var failure: abi.FailureIdentity = .{};
+        try std.testing.expectEqual(abi.Status.ok, @import("../storage/local_query_provider.zig").execute(&request, &response, &failure));
+        defer std.heap.c_allocator.free(response.buffer.ptr.?[0..@intCast(response.buffer.len)]);
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, response.buffer.ptr.?[0..@intCast(response.buffer.len)], .{});
+        defer parsed.deinit();
+        const result = parsed.value.object.get("responses").?.array.items[0];
+        try std.testing.expectEqualStrings(token, result.object.get("remote_snapshot").?.string);
+        const hits = result.object.get("hits").?.object.get("hits").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("z", hits[0].object.get("_id").?.string);
+    }
 }

@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import socket
 import subprocess
 import time
@@ -174,7 +175,7 @@ class Cluster:
         for log in self.logs:
             log.close()
 
-    def call(self, method, path, body=None, *, internal=False):
+    def call(self, method, path, body=None, *, internal=False, node=None):
         headers = {}
         if internal:
 
@@ -202,9 +203,14 @@ class Cluster:
                 + b64(hmac.new(self.secret.encode(), signed, hashlib.sha256).digest())
             )
             headers["X-Antfly-Trusted-Principal"] = token.decode()
+        endpoint = (
+            self.endpoint
+            if node is None
+            else f"http://127.0.0.1:{self.ports[2 + node * 2]}/db/v1"
+        )
         response = requests.request(
             method,
-            (self.metadata if internal else self.endpoint) + path,
+            (self.metadata if internal else endpoint) + path,
             json=body,
             headers=headers,
             timeout=30,
@@ -265,6 +271,64 @@ def test_public_cursor_recovers_original_cover_after_live_split_merge_restart(tm
                 },
             )
         )
+        cluster.eventually(
+            lambda: cluster.call(
+                "POST",
+                "/tables/history",
+                {
+                    "num_shards": 1,
+                    "schema": {
+                        "default_type": "row",
+                        "document_schemas": {
+                            "row": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {"body": {"type": "string"}},
+                                }
+                            }
+                        },
+                    },
+                    "indexes": {"body_text": {"type": "full_text"}},
+                },
+            )
+        )
+        cluster.eventually(
+            lambda: cluster.call(
+                "POST",
+                "/tables/history/batch",
+                {
+                    "inserts": {"archived": {"body": "original"}},
+                    "sync_level": "full_index",
+                },
+            )
+        )
+        composed = {
+            "source": {"union": [{"table": "history"}, {"table": "current"}]},
+            "full_text_search": {"match": "original", "field": "body"},
+            "order_by": [{"field": "_id"}],
+            "fields": ["body"],
+            "limit": 1,
+            "aggregations": {"bodies": {"type": "terms", "field": "body"}},
+        }
+        combined = cluster.eventually(
+            lambda: cluster.call("POST", "/query", composed)["responses"][0]
+        )
+        assert combined["hits"]["total"]["value"] == 3
+        assert combined["aggregations"]["bodies"]["buckets"][0]["doc_count"] == 3
+        # Replay the same immutable page through every public coordinator;
+        # placement must not change a local versus remote carrier's result.
+        for node in range(3):
+            combined_next = cluster.eventually(
+                lambda: cluster.call(
+                    "POST",
+                    "/query",
+                    dict(composed, source_cursor=combined["next_source_cursor"]),
+                    node=node,
+                )["responses"][0]
+            )
+            assert combined_next["aggregations"] == combined["aggregations"]
+            assert combined_next["hits"]["total"]["value"] == 3
+            assert [hit["_id"] for hit in combined_next["hits"]["hits"]] == ["archived"]
         query = {
             "full_text_search": {"match": "original", "field": "body"},
             "order_by": [{"field": "_id"}],
@@ -334,6 +398,23 @@ def test_public_cursor_recovers_original_cover_after_live_split_merge_restart(tm
             lambda: cluster.call("POST", "/tables/current/query", page)["responses"][0]
         )
         assert [hit["_id"] for hit in resumed["hits"]["hits"]] == ["z"]
+        # New cuts must distinguish both ranges even while they share the
+        # original document namespace left by the split.
+        fresh = cluster.eventually(
+            lambda: cluster.call("POST", "/tables/current/query", query)["responses"][0]
+        )
+        assert [hit["_id"] for hit in fresh["hits"]["hits"]] == ["a"]
+        fresh_page = dict(
+            page,
+            remote_snapshot=fresh["remote_snapshot"],
+            search_after=fresh["hits"]["hits"][0]["_sort"],
+        )
+        fresh_next = cluster.eventually(
+            lambda: cluster.call("POST", "/tables/current/query", fresh_page)[
+                "responses"
+            ][0]
+        )
+        assert [hit["_id"] for hit in fresh_next["hits"]["hits"]] == ["z"]
         cluster.call(
             "POST",
             f"/internal/v1/tables/{physical}/merge",
@@ -348,6 +429,12 @@ def test_public_cursor_recovers_original_cover_after_live_split_merge_restart(tm
         cluster.eventually(ranges, lambda value: len(value) == 1)
         for process in cluster.nodes:
             cluster.stop(process)
+        # Force repository recovery, rather than accidentally qualifying a
+        # colocated filesystem pin after the split/merge owner changes.
+        for retained in tmp_path.glob(
+            "data*/data/replicas/group-*/table-db.query-pins"
+        ):
+            shutil.rmtree(retained)
         cluster.nodes = [
             cluster.start("data" + str(i), cluster.data_arguments(i)) for i in range(3)
         ]
@@ -356,5 +443,129 @@ def test_public_cursor_recovers_original_cover_after_live_split_merge_restart(tm
         )
         assert [hit["_id"] for hit in restored["hits"]["hits"]] == ["z"]
         assert restored["remote_snapshot"] == first["remote_snapshot"]
+        fresh_restored = cluster.eventually(
+            lambda: cluster.call("POST", "/tables/current/query", fresh_page)[
+                "responses"
+            ][0]
+        )
+        assert [hit["_id"] for hit in fresh_restored["hits"]["hits"]] == ["z"]
+        assert fresh_restored["remote_snapshot"] == fresh["remote_snapshot"]
+    finally:
+        cluster.close()
+
+
+def test_public_composed_graph_walks_between_retained_native_sources(tmp_path):
+    cluster = Cluster(tmp_path)
+    try:
+        cluster.launch()
+        definition = {
+            "num_shards": 1,
+            "schema": {
+                "default_type": "row",
+                "document_schemas": {
+                    "row": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "body": {"type": "string"},
+                                "links": {"type": "array"},
+                            },
+                        }
+                    }
+                },
+            },
+            "indexes": {
+                "relations": {
+                    "type": "graph",
+                    "sources": [
+                        {
+                            "artifact": "links",
+                            "nodes": {
+                                "model": "document",
+                                "target": "{{ _item.target }}",
+                            },
+                            "edge": {
+                                "type": "link",
+                                "metadata": {
+                                    "target_table": "{{ _item.table }}",
+                                },
+                            },
+                        }
+                    ],
+                    "artifact": {
+                        "name": "links",
+                        "kind": "asset",
+                        "source": {
+                            "type": "field",
+                            "value": "links",
+                        },
+                        "content_type": "application/json",
+                    },
+                }
+            },
+        }
+        for table in ["history", "current"]:
+            cluster.eventually(
+                lambda: cluster.call("POST", "/tables/" + table, definition)
+            )
+        for table, rows in [
+            (
+                "history",
+                {
+                    "a": {
+                        "body": "start",
+                        "links": [{"target": "b", "table": "current"}],
+                    }
+                },
+            ),
+            (
+                "current",
+                {
+                    "b": {
+                        "body": "bridge",
+                        "links": [{"target": "c", "table": "current"}],
+                    },
+                    "c": {"body": "end", "links": []},
+                },
+            ),
+        ]:
+            cluster.eventually(
+                lambda: cluster.call(
+                    "POST",
+                    "/tables/" + table + "/batch",
+                    {
+                        "inserts": rows,
+                        "sync_level": "full_index",
+                    },
+                )
+            )
+        request = {
+            "source": {"union": [{"table": "history"}, {"table": "current"}]},
+            "order_by": [{"field": "_id"}],
+            "full_text_search": {"match_none": {}},
+            "limit": 1,
+            "graph_queries": {
+                "walk": {
+                    "index": "relations",
+                    "traverse": {
+                        "start": {"keys": ["a"]},
+                        "max_depth": 2,
+                        "limit": 10,
+                        "include_paths": True,
+                        "include_documents": True,
+                    },
+                }
+            },
+        }
+        result = cluster.eventually(
+            lambda: cluster.call("POST", "/query", request)["responses"][0]
+        )
+        nodes = result["graph_results"]["walk"]["nodes"]
+        assert [(node["table"], node["key"], node["depth"]) for node in nodes] == [
+            ("current", "b", 1),
+            ("current", "c", 2),
+        ]
+        assert [node["key"] for node in nodes[-1]["path"]] == ["a", "b", "c"]
+        assert nodes[-1]["document"]["body"] == "end"
     finally:
         cluster.close()

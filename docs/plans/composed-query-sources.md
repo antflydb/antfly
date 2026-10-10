@@ -1,6 +1,6 @@
 # Composed query sources and recent/archive visibility
 
-Status: native implementation and qualification, 2026-10-09. The implemented contracts and
+Status: native implementation and qualification, 2026-10-10. The implemented contracts and
 limits below are distinct from the remaining long-term architecture.
 
 This extends the [lake ingestion and publication plan](lake-ingestion-and-publication.md)
@@ -29,8 +29,8 @@ Pages allow 1–4096 hits; there is no 4096-position archive horizon. A 64 MiB m
 budget and request cancellation/deadlines apply. Union totals are exact. Ordinary
 large overlay totals use `relation: "gte"`; an explicit `count: true` request
 streams the entire visible relation for an exact count within its deadline.
-Aggregation, hierarchy, graph queries, joins, analyses and stateful execution are
-not composed yet.
+Global aggregations and canonical graph traversal execute after composed visibility.
+Hierarchy, joins, analyses and stateful execution remain unsupported by composition.
 
 `next_source_cursor` feeds `source_cursor` with the same source/query/ranking.
 Its server-written, content-addressed descriptor stores only per-leaf positions,
@@ -93,20 +93,28 @@ sealed generation. It is cache metadata and is excluded from snapshot inventorie
 Small remote owner registry records let the supervised collector discover expired
 generations after local owner loss or table deletion. Each pass handles one owner
 with a bounded deletion budget; registry records remain as discovery witnesses.
-This adapter still requires filesystem-managed LSM checkpoints and compatible
-native projection codecs. A retained request can carry its authenticated original
+Mutable native owners use filesystem-managed coherent LSM checkpoints and
+compatible native projection codecs. Immutable remote views can publish references
+to their complete native checkpoint instead. A retained request can carry its authenticated original
 namespace and open that generation on a replacement range in the same table
 incarnation. Each original namespace gets a separate cache root, preserving its
 physical document identities. Creation cannot capture a different owner's live
-namespace. Version-2 public capabilities retain the complete original ordered range
-cover. Capture rejects a changed cover; continuation selects one current,
+namespace. Version-3 public capabilities retain the complete original ordered range
+cover and distinct per-group physical generation IDs; version 2 remains readable for
+its unambiguous original covers. Capture rejects a changed cover; continuation selects one current,
 catalog-fenced carrier and opens each original immutable range exactly once.
 Original logical group IDs remain distinct for distributed result merging, even
 when a merged or replacement owner serves all origins. Search and work preflight
 use the retained cover; this does not grant cross-table virtual catalog access.
 Version-1 capabilities without that cover must restart their query. Storage-level
 two-origin pagination and routing split/merge/incarnation checks are qualified;
-public live-cluster topology-change qualification remains outstanding.
+the public split/merge/restart fixture additionally exercises fresh post-split capture.
+Distributed CLI startup configures the remote checkpoint repository before opening
+physical owners and passes that same storage context into Raft replica construction.
+A configured API context alone cannot make a separately opened replica durable.
+Internal query parsing owns and preserves the private cut descriptor across
+forwarded HTTP requests; public admission continues to reject that private control. The fixture removes local retained checkpoint directories before
+restarting owners, so recovery must use the repository rather than colocated pins.
 Query capture briefly closes write admission while derivations converge and
 manifests are sealed; deadlines, cancellation and WAL/capacity admission bound
 this work. The retained files never hold an apply lock across cursor pages.
@@ -118,11 +126,12 @@ worker. One private local generation is retained while uploading, then released;
 warming is disabled when configured capacity allows only one cut. The repository
 commits no readable manifest until every file is uploaded and revalidated.
 First capture can still require a complete generation when hints are cold.
-Remote-native checkpoint references and measured cold-publication latency remain
-necessary before claiming that portability is latency-neutral.
+An already immutable remote-native view can publish a new checkpoint manifest
+by reference, without reconstructing a host tree or transferring its chunks. Cold
+mutable generations still need their first upload; portability is not latency-neutral.
 
-Overlay keys are flat integer, string or boolean fields; numeric/timestamp key
-normalization is not enabled yet. The changes input must retain one unique latest
+Overlay keys are flat scalar fields, with explicit numeric/timestamp normalization
+when declared through `key_types`. The changes input must retain one unique latest
 row per key, including deleted rows with a boolean `deleted: true` (or the explicitly
 configured `tombstone_field`). Indexed anti-lookups omit the user's search and filter
 so a nonmatching edit still suppresses a matching base row. Tombstone rows never
@@ -151,20 +160,60 @@ publication and WAL reclamation therefore cannot change previously accepted rows
 Savepoint rollback preserves the base cut. A missing/expired artifact or changed
 incarnation fails explicitly. Retention is currently a fixed one-hour horizon,
 with conservative pin expiry rather than immediate release on transaction end.
-Serializable accepted external reads and pgwire accepted-mode selection remain
-unsupported. SQL scan/memory limits still apply.
+Read-only serializable transactions validate every retained lake cut against
+current catalog identity, exact committed metadata and the WAL head before commit.
+A changed cut aborts with a SQL write conflict. Serializable read-write lake
+transactions remain unsupported pending a distributed prepare participant.
+Pgwire selects accepted reads with `SET antfly.lake_visibility = accepted`;
+`SET LOCAL`, savepoints, rollback, reset and prepared/streaming execution follow
+connection and transaction scope. SQL scan/memory limits still apply.
+
+```sql
+SET antfly.lake_visibility = accepted;
+BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY;
+SELECT count(*) FROM hackernews_history;
+COMMIT;
+```
+
+Once a transaction establishes accepted visibility, its retained lake cuts remain
+pinned until it ends; changing the connection default does not replace those cuts.
+Commit validation conservatively conflicts on any later admission or publication
+in a read table, including changes outside the query's predicate. It validates
+before the existing native read-set checks and before the no-write commit shortcut.
+This avoids enumerating an archive or the WAL solely to check a read-only commit.
+
 
 Stable overlay keys include finite numeric values and timestamps. Numeric keys
 preserve integer precision and normalize integral floats and negative zero.
 Iceberg physical timestamps use microseconds; logical RFC3339 strings normalize
 to UTC so equivalent offsets compare identically. JSON source overlays declare
 `key_types: ["number", "timestamp"]` alongside their key fields when needed.
-Full-text union/overlay sorting and RRF remain supported. Cross-source graph,
-aggregation, join and hierarchy operators still need a visibility-aware execution
-stage; they are rejected instead of merging independently filtered leaf results.
+Full-text union/overlay sorting and RRF remain supported. Global aggregations
+consume the visible relation before field projection and pagination. Aggregate
+results and exact totals are retained with the continuation, so subsequent pages
+cannot recompute statistics over only the remaining suffix. This uses the shared
+native collector, bounded by 100,000 source rows and the 64 MiB request budget;
+it is not an archive-scale distributed aggregate spill implementation. Scalar
+aggregations use stored row values. Background-corpus significance and indexed
+algebraic joins are rejected, including nested requests, because visible result
+rows cannot supply those semantics.
 
-The remaining extension to accepted SQL visibility uses a transaction-pinned
-read contract. A transaction binds each writable lake table's incarnation,
+Canonical `graph_queries` traversal walks between the selected source tables,
+using each leaf's retained snapshot. Nodes and owning fact documents are checked
+against composed visibility before expansion. Paths retain logical table identity
+and edge provenance. Explicit node seeds, bounded query-result references and
+named graph-result dependencies are supported. Retrieval predicates do not filter
+adjacency. Frontier size, leaf calls, cancellation and the shared memory budget
+bound work; truncated leaf adjacency fails instead of returning a partial walk.
+MATCH, shortest/k-paths, metric ordering, graph node predicates, composed joins and
+hierarchy remain unsupported. External entities and dangling indexed endpoints
+can lack documents; their owning facts must still pass composed visibility, and
+requested missing documents are returned as null. Each leaf
+must offer graph adjacency against its retained cut. The mounted Parquet text
+executor currently rejects graph operations; composition does not manufacture
+graph adjacency from text sidecars.
+
+Accepted SQL visibility uses a transaction-pinned read contract. A transaction binds each writable lake table's incarnation,
 committed snapshot and accepted WAL watermark on its first read of that table.
 Subsequent statements, including prepared execution, reuse those cuts and add
 the transaction's own final write images. Changes accepted by other writers
@@ -174,13 +223,15 @@ binds table identity; execution binds visibility through the active transaction,
 rather than freezing rows when the statement is prepared.
 
 These cuts belong to the durable session authority, survive request boundaries,
-and retain their source files until transaction completion or lease expiry.
-Commit, rollback and session teardown release the cuts; savepoint rollback
+and retain their source files until the fixed lease expiry. Commit, rollback and
+session teardown discard session bindings; artifact collection remains conservative
+until expiry. Savepoint rollback
 changes the transaction's write overlay without recapturing its base read cut.
 Recovery must restore the exact pinned snapshot and watermark or fail the
 transaction explicitly. It must never substitute the latest published source.
 Outside a transaction, each accepted statement obtains its own cut. This is the
-agreed implementation contract; the transactional extension is still pending.
+implemented transaction contract; read-write serializable lake participation remains
+pending.
 
 Writable-lake search requests accept `lake_read` with `visibility: "accepted"` or
 `"published"`, an optional `through` receipt (`table_id`, `object_generation`,
@@ -518,11 +569,23 @@ budget. Adjacent warming epochs are probed within a bounded horizon. References
 expire with their generation inventory, so reuse cannot outlive reader protection.
 
 This reduces transfer for already published/recovered extents. New data still
-requires an initial upload. The live distributed qualification resumes an original HTTP cursor after finalized
-split, finalized merge and all data-owner restarts using a shared S3 repository.
-Fresh capture after a split needs another physical-generation identity boundary:
-split children can preserve their parent's document identity namespace while
-holding different files. A repository key must distinguish those physical groups
-without changing stored document IDs or duplicating original-cover results.
-Current cover validation rejects that ambiguous fresh capture. Direct remote-native
-checkpoint adoption and fresh post-split capture remain separate work.
+requires an initial upload. The live distributed qualification resumes an original
+HTTP cursor after finalized split, finalized merge and all data-owner restarts
+using a shared S3 repository.
+Fresh capture after a split assigns each physical group a generation ID derived
+from a random logical cut and its group ID. Split children may retain the same
+stored document namespace while holding distinct immutable files. Creation binds
+the authenticated cover entry at each physical owner; resume selects a current
+catalog-fenced carrier and opens all original entries exactly once. Repartitioning
+therefore changes neither stored document IDs nor a retained cursor's results. A
+single carrier returns its finalized page directly whether local or remote; an
+outer coordinator must not remerge the page using the pre-cursor match total as
+a measure of remaining rows.
+
+Direct remote checkpoint adoption requires an immutable, complete primary and
+projection generation supplied by the storage capability. The repository validates
+namespace, authority domain, file paths, sizes, checksums and each chunk's retention
+horizon before conditionally publishing the manifest. Foreign authorities, partial
+views and extensions beyond the chunk horizon fail closed. Mutable host storage
+falls back to a coherent native capture. A new chunk-retention extension protocol
+would be needed to pin an immutable view beyond its existing protection horizon.

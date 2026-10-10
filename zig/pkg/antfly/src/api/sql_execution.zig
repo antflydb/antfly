@@ -177,7 +177,6 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
-        if (self.lake_visibility == .accepted and guarded_backend != null) return error.UnsupportedSqlExecution;
         const previous_visibility = self.lake_visibility;
         const previous_context = self.context;
         defer self.lake_visibility = previous_visibility;
@@ -417,7 +416,7 @@ pub const Adapter = struct {
                 self.range_reads = if (transaction.isolation != .read_committed) &read_guards else null;
                 self.ranges_staged = false;
                 self.active_transaction = id;
-                self.accepted_lake_repeatable = self.lake_visibility == .accepted and transaction.isolation != .serializable;
+                self.accepted_lake_repeatable = self.lake_visibility == .accepted and (transaction.isolation != .serializable or transaction.mode == .read_only);
                 self.staged = &staged;
                 self.inserting = switch (compiled.statement) {
                     .insert => |insert| insert.conflict == null,
@@ -681,6 +680,45 @@ pub const Adapter = struct {
         if (snapshot.revision != scope.revision or snapshot.tables.len != 1) return error.CatalogGenerationChanged;
         const current = snapshot.tables[0] orelse return error.CatalogGenerationChanged;
         if (current.table_id != table.id or !std.mem.eql(u8, current.name, table.physical_name)) return error.CatalogGenerationChanged;
+    }
+
+    /// Read-only serializable lake transactions serialize immediately before
+    /// validation starts. Monotone WAL heads and exact metadata bytes prove
+    /// every captured table was unchanged from its read through that point.
+    /// Mixed native writes need a lake participant in distributed prepare;
+    /// they cannot safely use this read-only validation protocol.
+    pub fn validateAcceptedSerializable(self: *Adapter, a: std.mem.Allocator, id: db_types.TxnId) !void {
+        var state = (try self.server.txn_sessions.getSqlState(a, id)) orelse return error.SqlTransactionNotActive;
+        defer state.deinit(a);
+        if (state.metadata.isolation != .serializable or !state.metadata.accepted_lake_reads) return;
+        if (state.metadata.mode != .read_only) return error.UnsupportedSqlExecution;
+        const entries = try self.server.txn_sessions.cloneLakeCuts(a, id);
+        defer {
+            for (entries) |*entry| entry.deinit(a);
+            a.free(entries);
+        }
+        if (entries.len == 0) return;
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var store = try @import("lake_index_store.zig").Store.openNative(scratch, self.server.cfg.node_config, self.server.cfg.secret_store, false, self.server.cfg.deployment_mode, self.server.cfg.native_lake_artifact_base_dir);
+        defer store.deinit();
+        var artifacts = store.artifactStore();
+        const identity = try @import("native_retained_cut.zig").storeIdentity(scratch, store.locator);
+        const normalized = try self.context.platformDeadline();
+        const context: @import("antfly_local_sources").serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+        for (entries) |entry| {
+            try self.context.ensureActive();
+            const token = try std.json.parseFromSliceLeaky([]const u8, scratch, entry.document_json orelse return error.CatalogGenerationChanged, .{});
+            const cut = try @import("lake_sql_retained_cut.zig").loadDescriptor(scratch, &artifacts, identity, token, entry.version, @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms, self.context.cancellation);
+            const table = try resolve(self, scratch, cut.name orelse return error.CatalogGenerationChanged, .read);
+            if (table.id != cut.table_id or table.schema_version != cut.schema_version or !std.mem.eql(u8, table.physical_name, entry.table_name) or (if (table.external_indexes) |indexes| indexes.object_generation else 0) != cut.object_generation) return error.SqlWriteConflict;
+            const binding = (table.external_base_source orelse return error.SqlWriteConflict).binding;
+            const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store, .catalog_table_id = table.id, .catalog_generation = cut.object_generation };
+            var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(scratch, binding, options, context, .load);
+            defer current.deinit(scratch);
+            if (!std.mem.eql(u8, current.table.metadata_location, cut.metadata_location) or !std.mem.eql(u8, current.table.metadata_json, cut.metadata_json) or try @import("../serverless/lake_ingestion.zig").watermark(scratch, binding, options, context) != cut.pending.lsn) return error.SqlWriteConflict;
+        }
     }
 
     fn rowPolicyProof(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !?[]const u8 {
@@ -1121,6 +1159,7 @@ pub const Adapter = struct {
                     // Persist the unmodified physical WAL before SQL converts
                     // timestamp values to its logical representation.
                     if (self.active_transaction != null) try self.saveSqlLakeCut(oa, request.table, .{
+                        .name = if (request.table.scope) |scope| .{ .database = scope.database, .namespace = scope.namespace, .table = scope.name } else null,
                         .table_id = request.table.id,
                         .schema_version = request.table.schema_version,
                         .object_generation = if (request.table.external_indexes) |indexes| indexes.object_generation else 0,

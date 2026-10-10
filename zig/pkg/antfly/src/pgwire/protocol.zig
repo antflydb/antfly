@@ -110,13 +110,14 @@ pub const Session = struct {
     cursor_epoch: u64 = 0,
     statement_timeout: ?u32 = null,
     application_name: commands.ApplicationName = .{},
+    lake_visibility: commands.LakeVisibility = .committed,
     namespace_setting: ?commands.SearchPath = null,
     catalog_settings: ?settings_catalog.OverlayState = null,
     request_namespace: ?[]const u8 = null,
     request_search_path: ?commands.SearchPath = null,
     transaction_namespace: ?commands.Namespace = null,
-    timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.SearchPath, namespace_committed: ?commands.SearchPath, application_before: commands.ApplicationName, application_committed: commands.ApplicationName } = null,
-    savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.SearchPath, committed_namespace: ?commands.SearchPath, application: commands.ApplicationName, committed_application: commands.ApplicationName, catalog: ?settings_catalog.OverlayState.Savepoint = null }) = .empty,
+    timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.SearchPath, namespace_committed: ?commands.SearchPath, application_before: commands.ApplicationName, application_committed: commands.ApplicationName, lake_before: commands.LakeVisibility, lake_committed: commands.LakeVisibility } = null,
+    savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.SearchPath, committed_namespace: ?commands.SearchPath, application: commands.ApplicationName, committed_application: commands.ApplicationName, lake: commands.LakeVisibility, committed_lake: commands.LakeVisibility, catalog: ?settings_catalog.OverlayState.Savepoint = null }) = .empty,
     skip_until_sync: bool = false,
     backend_pid: i32 = 0,
     cancel_key: i32 = 0,
@@ -197,6 +198,7 @@ pub const Session = struct {
                             self.statement_timeout = settings.before;
                             self.namespace_setting = settings.namespace_before;
                             self.application_name = settings.application_before;
+                            self.lake_visibility = settings.lake_before;
                         }
                         self.timeout_transaction = null;
                         self.transaction_namespace = null;
@@ -330,6 +332,7 @@ pub const Session = struct {
             .search_path = self.effectiveSearchPath(),
             .session_namespace = if (self.transaction_namespace) |*value| value.slice() else null,
             .session_id = self.session_id,
+            .lake_visibility = self.lake_visibility,
             .setting_overlay = if (self.catalog_settings) |*state| state.values() else &.{},
             .limit = self.limits.result_rows,
             .io = self.io,
@@ -345,6 +348,7 @@ pub const Session = struct {
             return .{ .columns = switch (setting) {
                 .search_path => |value| if (value == .show) &.{.{ .name = "search_path", .type = .string }} else &.{},
                 .statement_timeout => |value| if (value == .show) &.{.{ .name = "statement_timeout", .type = .string }} else &.{},
+                .lake_visibility => |value| if (value == .show) &.{.{ .name = "antfly.lake_visibility", .type = .string }} else &.{},
                 .application_name => |value| if (value == .show) &.{.{ .name = "application_name", .type = .string }} else &.{},
                 .client_encoding => |value| if (value == .show) &.{.{ .name = "client_encoding", .type = .string }} else &.{},
                 .catalog => |value| if (value == .show) &.{.{ .name = value.show, .type = .string }} else &.{},
@@ -368,6 +372,7 @@ pub const Session = struct {
             return switch (setting) {
                 .search_path => |value| self.executeSearchPathSetting(alloc, statement, value),
                 .statement_timeout => |value| self.executeTimeoutSetting(alloc, value),
+                .lake_visibility => |value| self.executeLakeVisibilitySetting(alloc, value),
                 .application_name => |value| self.executeApplicationNameSetting(alloc, value),
                 .client_encoding => |value| self.executeEncodingSetting(alloc, value),
                 .catalog => |value| self.executeCatalogSetting(alloc, statement, value),
@@ -410,12 +415,12 @@ pub const Session = struct {
         self.status = result.transaction_status;
         if (previous_status == .idle and self.status == .in_transaction) {
             try self.settingsState().begin();
-            self.timeout_transaction = .{ .before = self.statement_timeout, .committed = self.statement_timeout, .namespace_before = self.namespace_setting, .namespace_committed = self.namespace_setting, .application_before = self.application_name, .application_committed = self.application_name };
+            self.timeout_transaction = .{ .before = self.statement_timeout, .committed = self.statement_timeout, .namespace_before = self.namespace_setting, .namespace_committed = self.namespace_setting, .application_before = self.application_name, .application_committed = self.application_name, .lake_before = self.lake_visibility, .lake_committed = self.lake_visibility };
             self.transaction_namespace = try commands.Namespace.init(req.namespace orelse "public");
         }
         if (control) |value| switch (value) {
             .savepoint => {
-                self.savepoints.appendAssumeCapacity(.{ .name = savepoint_name.?, .epoch = self.cursor_epoch, .timeout = self.statement_timeout, .committed_timeout = if (self.timeout_transaction) |settings| settings.committed else self.statement_timeout, .namespace = self.namespace_setting, .committed_namespace = if (self.timeout_transaction) |settings| settings.namespace_committed else self.namespace_setting, .application = self.application_name, .committed_application = if (self.timeout_transaction) |settings| settings.application_committed else self.application_name, .catalog = if (self.catalog_settings) |*state| try state.savepoint() else null });
+                self.savepoints.appendAssumeCapacity(.{ .name = savepoint_name.?, .epoch = self.cursor_epoch, .timeout = self.statement_timeout, .committed_timeout = if (self.timeout_transaction) |settings| settings.committed else self.statement_timeout, .namespace = self.namespace_setting, .committed_namespace = if (self.timeout_transaction) |settings| settings.namespace_committed else self.namespace_setting, .application = self.application_name, .committed_application = if (self.timeout_transaction) |settings| settings.application_committed else self.application_name, .lake = self.lake_visibility, .committed_lake = if (self.timeout_transaction) |settings| settings.lake_committed else self.lake_visibility, .catalog = if (self.catalog_settings) |*state| try state.savepoint() else null });
                 savepoint_name = null;
             },
             .release, .rollback_to => |name| {
@@ -429,10 +434,12 @@ pub const Session = struct {
                             self.statement_timeout = self.savepoints.items[index].timeout;
                             self.namespace_setting = self.savepoints.items[index].namespace;
                             self.application_name = self.savepoints.items[index].application;
+                            self.lake_visibility = self.savepoints.items[index].lake;
                             if (self.timeout_transaction) |*settings| {
                                 settings.committed = self.savepoints.items[index].committed_timeout;
                                 settings.namespace_committed = self.savepoints.items[index].committed_namespace;
                                 settings.application_committed = self.savepoints.items[index].committed_application;
+                                settings.lake_committed = self.savepoints.items[index].committed_lake;
                             }
                         }
                         const keep = index + @as(usize, if (value == .rollback_to) 1 else 0);
@@ -454,6 +461,7 @@ pub const Session = struct {
             self.statement_timeout = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.committed else settings.before;
             self.namespace_setting = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.namespace_committed else settings.namespace_before;
             self.application_name = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.application_committed else settings.application_before;
+            self.lake_visibility = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.lake_committed else settings.lake_before;
             self.timeout_transaction = null;
             self.transaction_namespace = null;
         };
@@ -515,6 +523,27 @@ pub const Session = struct {
         self.statement_timeout = update.milliseconds;
         if (!update.local) if (self.timeout_transaction) |*settings| {
             settings.committed = update.milliseconds;
+        };
+        return result;
+    }
+
+    fn executeLakeVisibilitySetting(self: *Session, alloc: std.mem.Allocator, setting: commands.LakeVisibilitySetting) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
+        if (setting == .show) {
+            result.columns = &.{.{ .name = "antfly.lake_visibility", .type = .string }};
+            const row = try alloc.alloc(std.json.Value, 1);
+            row[0] = .{ .string = try alloc.dupe(u8, @tagName(self.lake_visibility)) };
+            const rows = try alloc.alloc([]const std.json.Value, 1);
+            rows[0] = row;
+            result.rows = rows;
+            return result;
+        }
+        const update = if (setting == .reset) (commands.LakeVisibilitySetting{ .set = .{ .local = false, .value = .committed } }).set else setting.set;
+        if (update.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        self.lake_visibility = update.value;
+        if (!update.local) if (self.timeout_transaction) |*settings| {
+            settings.lake_committed = update.value;
         };
         return result;
     }
@@ -612,6 +641,7 @@ pub const Session = struct {
         self.statement_timeout = null;
         self.namespace_setting = null;
         self.application_name = .{};
+        self.lake_visibility = .committed;
         if (self.catalog_settings) |*state| state.resetAll();
         // RESET ALL is a session-level change even inside a transaction.
         // Savepoint snapshots can still roll it back locally; a committed
@@ -620,6 +650,7 @@ pub const Session = struct {
             settings.committed = null;
             settings.namespace_committed = null;
             settings.application_committed = .{};
+            settings.lake_committed = .committed;
         }
         return .{ .command_tag = "RESET", .transaction_status = self.status, .session_id = self.session_id };
     }
