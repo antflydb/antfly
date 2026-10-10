@@ -127,21 +127,32 @@ test "httpx SQL catalog original null uniqueness declarations use real leader ad
         var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr() }, owner.source(), null, null);
         defer server.deinit();
         var handler: handler_mod.AntflyApiHandler = .{ .api_server = &server };
-        try execute(a, &handler, "CREATE TABLE usage_records (id BIGINT PRIMARY KEY, email TEXT)", null);
+        const initial_version: u32 = blk: {
+            var created = try request(a, &handler, "CREATE TABLE usage_records (id BIGINT PRIMARY KEY, email TEXT)");
+            defer created.deinit();
+            try std.testing.expectEqual(@as(u16, 202), created.status.code);
+            const result = try std.json.parseFromSlice(wire.SQLResponse, a, created.body.?, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(wire.SQLMutationOutcome.committed_pending, result.value.mutation_outcome.?);
+            try std.testing.expectEqualStrings("DDL PENDING", result.value.command_tag);
+            try std.testing.expectEqual(.pending, result.value.ddl_receipt.?.state);
+            try std.testing.expectEqual(@as(i64, 0), result.value.rows_affected);
+            break :blk result.value.ddl_receipt.?.schema_version;
+        };
         try settleNativeOwner(&svc);
         const resolutions = owner.resolutions;
         const mutations = owner.mutations;
         var response = try request(a, &handler, original.sql);
         defer response.deinit();
-        if (response.status.code != 200) std.debug.print("native catalog {s}: {s}\n", .{ id, response.body orelse "" });
-        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        if (response.status.code != 202) std.debug.print("native catalog {s}: {s}\n", .{ id, response.body orelse "" });
+        try std.testing.expectEqual(@as(u16, 202), response.status.code);
         const result = try std.json.parseFromSlice(wire.SQLResponse, a, response.body.?, .{});
         defer result.deinit();
         // Without data-owner readiness, committed declarations must retain a
         // pending receipt rather than claim the unique index is usable.
         try std.testing.expectEqual(wire.SQLMutationOutcome.committed_pending, result.value.mutation_outcome.?);
         try std.testing.expectEqual(.pending, result.value.ddl_receipt.?.state);
-        try std.testing.expectEqual(@as(u32, 2), result.value.ddl_receipt.?.schema_version);
+        try std.testing.expectEqual(initial_version + 1, result.value.ddl_receipt.?.schema_version);
         try std.testing.expectEqual(resolutions + 1, owner.resolutions);
         try std.testing.expectEqual(mutations + 1, owner.mutations);
         try settleNativeOwner(&svc);

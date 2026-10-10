@@ -247,6 +247,16 @@ candidate verification/root activation, GC and admission lookup remain unwired.
 Do not interpret the default empty membership projection as evidence that a
 generated candidate is free.
 
+The corrected mounted campaign gate now proves discovery of all three HTTP
+campaigns and the guarded ALTER/index tests. Its first complete execution ran
+23 native tests: 22 passed, while the real-owner setup failed because its
+fixture incorrectly required HTTP 200 for a committed-pending CREATE TABLE.
+The production response was HTTP 202 with a pending receipt and schema
+version 0. The fixture now asserts 202/pending explicitly for setup and ALTER,
+and derives ALTER's expected version from the committed setup receipt rather
+than assuming an initial version of 1. The post-main-merge gate is rerunning;
+the new real-owner campaign is not yet claimed passing.
+
 The next delivery is mounted catalog activation/recovery evidence for the
 original index and constraint cohort, including real ownership and readiness
 checks. This checkpoint does not close the larger SQL goal or its remaining
