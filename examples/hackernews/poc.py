@@ -670,6 +670,22 @@ def main():
             failure["registration_seconds"] = registration_seconds
         if "peak_rss_bytes" in locals():
             failure["build_peak_rss_bytes"] = peak_rss_bytes
+        # Retain completed timings when a later workload fails. They are
+        # partial observations, never a passing correctness/qualification report.
+        scope = locals()
+        measurements = {"complete": False}
+        for name, target in (
+            ("first_ms", "first_search_ms"),
+            ("warm_samples", "warm_samples_ms"),
+            ("workload_results", "workloads"),
+            ("cursor_depth", "cursor_depth"),
+            ("restart_ms", "after_restart_ms"),
+            ("io_profiles", "io_profiles"),
+        ):
+            if name in scope:
+                measurements[target] = scope[name]
+        if len(measurements) > 1:
+            failure["completed_measurements"] = measurements
         if phase == "index_build" and "status" in locals():
             failure["index_status"] = status
         (args.state / "failure.json").write_text(json.dumps(failure, indent=2) + "\n")
