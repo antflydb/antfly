@@ -6922,6 +6922,10 @@ pub const DB = struct {
             // A ready directory needs no work. Idle owners must not contend
             // with user mutations for the apply lock every scheduler turn.
             if (try self.core.store.graphIncomingDirectoryReady()) return false;
+            // Directory migration publishes persistent metadata just like a
+            // cleanup page. Admit capture before apply using the same pass.
+            var mutation = try @import("mutation_admission.zig").acquireReplicationMutationShared(self, controls);
+            defer if (mutation) |*lease| lease.release();
             try @import("mutation_admission.zig").lockApply(self, controls);
             defer self.core.unlockApply();
             if (lifetime) |original| try original.check();
@@ -131615,6 +131619,82 @@ test "db graph endpoint cleanup pages preserve original pass through rejected ap
         try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStepWithLifetime(healthy.lifetime()));
         try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
         try std.testing.expect(!try db.runStandaloneGraphEndpointCleanupStepWithLifetime(healthy.lifetime()));
+    }
+}
+
+test "db graph endpoint cleanup pages directory migration preserves original capture admission" {
+    const GraphPass = @import("graph_cleanup_owner.zig").Pass;
+    const contract = @import("replication_contract.zig");
+    const Outbox = @import("durable_outbox.zig");
+    const Fixture = struct {
+        barrier: *MutationBarrier,
+        fn next(_: *anyopaque) u64 {
+            return 1;
+        }
+        fn identity(_: *anyopaque) contract.Publisher.Identity {
+            return .{ .table_id = 0, .shard_id = 0, .timeline_id = 1, .epoch = 1 };
+        }
+        fn publish(_: contract.AsyncEffectMirror, _: Outbox.Kind, _: []const u8, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedMigrationPublication;
+        }
+        fn recover(_: contract.AsyncEffectMirror, _: Outbox.Kind, _: Outbox.DurableReplicationOutbox, _: doc_identity.Namespace) !u64 {
+            return error.UnexpectedMigrationPublication;
+        }
+        fn preflight(_: contract.AsyncEffectMirror, _: bool) !void {}
+        fn complete(_: contract.AsyncEffectMirror, _: u64) !void {
+            return error.UnexpectedMigrationPublication;
+        }
+        fn publisher(self: *@This()) contract.Publisher {
+            return .{ .ptr = self, .vtable = &.{ .next_lsn = next, .identity = identity, .publish = publish, .recover = recover, .preflight = preflight, .complete = complete } };
+        }
+    };
+    const Clock = struct {
+        var barrier: *MutationBarrier = undefined;
+        var stopping: *std.atomic.Value(bool) = undefined;
+        var value: u64 = 0;
+        var cancel: bool = false;
+        fn now() u64 {
+            if (barrier.pendingSharedAcquisitions() != 0) {
+                if (cancel) stopping.store(true, .release) else value = 10;
+            }
+            return value;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |cancel| {
+        var directory = try TestDirectory.init("graph-migration-capture-admission");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.core.store.delete(internal_keys.graph_incoming_ready_key);
+        var barrier: MutationBarrier = .{};
+        var fixture: Fixture = .{ .barrier = &barrier };
+        db.local_execution.replication_async_effect_mirror = .{ .publisher = fixture.publisher(), .mutation_barrier = &barrier };
+        defer db.local_execution.replication_async_effect_mirror = null;
+        var stopping: std.atomic.Value(bool) = .init(false);
+        Clock.barrier = &barrier;
+        Clock.stopping = &stopping;
+        Clock.value = 0;
+        Clock.cancel = cancel;
+        const pass: GraphPass = .{ .stopping = &stopping, .deadline_ns = 10, .now_ns = Clock.now };
+        var capture = barrier.tryAcquireExclusive() orelse return error.TestUnexpectedResult;
+        var held = true;
+        defer if (held) capture.release();
+        try std.testing.expectError(if (cancel) error.Canceled else error.DeadlineExceeded, db.runStandaloneGraphEndpointCleanupStepWithLifetime(pass.lifetime()));
+        try std.testing.expectEqual(@as(u64, 10), pass.deadline_ns);
+        try std.testing.expectEqual(@as(u64, 0), barrier.pendingSharedAcquisitions());
+        try std.testing.expectEqual(@as(usize, 0), barrier.reader_count);
+        try std.testing.expect(!try db.core.store.graphIncomingDirectoryReady());
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, internal_keys.graph_incoming_cursor_key));
+        capture.release();
+        held = false;
+        var healthy_stopping: std.atomic.Value(bool) = .init(false);
+        const healthy: GraphPass = .{ .stopping = &healthy_stopping, .deadline_ns = 20, .now_ns = Clock.now };
+        _ = try db.runStandaloneGraphEndpointCleanupStepWithLifetime(healthy.lifetime());
+        try std.testing.expect(try db.core.store.graphIncomingDirectoryReady());
+        var after = barrier.tryAcquireExclusive() orelse return error.MigrationLeakedMutationReader;
+        after.release();
     }
 }
 

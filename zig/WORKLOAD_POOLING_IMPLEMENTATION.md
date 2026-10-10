@@ -2611,3 +2611,17 @@ hot-standby gate runs. This is direct resolver/batch retirement, not complete
 operation-root migration or CPU lending throughout every enclosing service
 holder. Full integration, broader ownership migration, resource/performance
 qualification, and enabling defaults remain required.
+
+
+### Graph directory migration uses original capture admission
+
+The resident cleanup pass's directory-migration branch now acquires mutation
+admission before the apply lock, using the same finite pass lifetime as its
+cleanup-page branch. A held capture cannot allow persistent directory metadata
+to change, and cancellation/deadline rejection rolls back the pending reader.
+The helper-level mutation consumer checks both original stop and expiry and a
+healthy subsequent acquisition. A real DB fixture additionally checks the ready
+marker and migration cursor remain unchanged after rejection and permits a
+healthy migration afterwards; it is selected by the cumulative producer-
+maintenance gate and remains unqualified until that gate runs. This does not
+supply CPU lending for graph service holders or enable pooling defaults.

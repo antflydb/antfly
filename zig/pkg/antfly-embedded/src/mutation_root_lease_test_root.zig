@@ -291,3 +291,54 @@ test "mutation root lease retires resolver and nested batch before C1 capture" {
     var cleanup = barrier.acquireShared();
     cleanup.release();
 }
+
+test "mutation root lease graph migration admission preserves original pass rejection" {
+    const admission = @import("storage/db/mutation_admission.zig");
+    const Pass = @import("storage/db/graph_cleanup_owner.zig").Pass;
+    const Apply = @import("storage/db/apply_rw_lock.zig").ApplyRwLock;
+    const Owner = struct {
+        barrier: *Barrier,
+        core: struct { apply_mutex: struct { io: ?std.Io = std.testing.io } = .{} } = .{},
+        pub fn replicationMutationBarrier(self: *@This()) ?*Barrier {
+            return self.barrier;
+        }
+    };
+    const Clock = struct {
+        var barrier: *Barrier = undefined;
+        var stopping: *std.atomic.Value(bool) = undefined;
+        var value: u64 = 0;
+        var cancel: bool = false;
+        fn now() u64 {
+            if (barrier.pendingSharedAcquisitions() != 0) {
+                if (cancel) stopping.store(true, .release) else value = 10;
+            }
+            return value;
+        }
+    };
+    for ([_]bool{ false, true }) |cancel| {
+        var barrier: Barrier = .{};
+        var owner: Owner = .{ .barrier = &barrier };
+        var stopping: std.atomic.Value(bool) = .init(false);
+        Clock.barrier = &barrier;
+        Clock.stopping = &stopping;
+        Clock.value = 0;
+        Clock.cancel = cancel;
+        const original: Pass = .{ .stopping = &stopping, .deadline_ns = 10, .now_ns = Clock.now };
+        const controls: Apply.Acquisition = .{ .lifetime = original.lifetime() };
+        var capture = barrier.tryAcquireExclusive() orelse return error.TestUnexpectedResult;
+        var held = true;
+        defer if (held) capture.release();
+        try std.testing.expectError(if (cancel) error.Canceled else error.DeadlineExceeded, admission.acquireReplicationMutationShared(&owner, controls));
+        try std.testing.expectEqual(@as(u64, 10), original.deadline_ns);
+        try std.testing.expectEqual(@as(u64, 0), barrier.pendingSharedAcquisitions());
+        try std.testing.expectEqual(@as(usize, 0), barrier.reader_count);
+        capture.release();
+        held = false;
+        var healthy_stopping: std.atomic.Value(bool) = .init(false);
+        const healthy: Pass = .{ .stopping = &healthy_stopping, .deadline_ns = 20, .now_ns = Clock.now };
+        var admitted = (try admission.acquireReplicationMutationShared(&owner, .{ .lifetime = healthy.lifetime() })).?;
+        admitted.release();
+        var after = barrier.tryAcquireExclusive() orelse return error.MigrationAdmissionLeakedReader;
+        after.release();
+    }
+}
