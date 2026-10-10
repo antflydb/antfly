@@ -275,6 +275,7 @@ def run_phase(target, phase, manifest, pid):
         workload_before=workload_before,
         workload_after=workload_after,
         admission_diagnostics=admission_diagnostics(workload_before, workload_after),
+        runnable_diagnostics=runnable_diagnostics(workload_before, workload_after),
         successful_per_second=len(successful) / elapsed,
         success_p95_seconds=percentile(successful, 0.95),
         success_p99_seconds=percentile(successful, 0.99),
@@ -313,18 +314,87 @@ def workload_snapshot(target, *, require_waiting=False):
     # Outside the timed phase: preserve server wait/allocation counters without
     # adding a candidate-only sampling load to the baseline comparison.
     policy = os.environ.get("ANTFLY_QUALIFICATION_POLICY")
-    if policy not in ("fixed", "failfast"):
+    if policy not in ("fixed", "failfast", "runnable"):
         return None
     code, snapshot = operator_request(target, "GET")
     if code != 200:
         raise RuntimeError("candidate workload telemetry unavailable")
     if (
         require_waiting
-        and policy == "fixed"
+        and policy in ("fixed", "runnable")
         and snapshot["query"].get("sql_waiting_enabled") is not True
     ):
         raise RuntimeError("fixed policy did not enable SQL waiting")
+    if policy == "runnable":
+        runnable = snapshot.get("runnable", {})
+        if runnable.get("enabled") is not True or runnable.get("capacity_slots", 0) < 3:
+            raise RuntimeError("runnable scheduler telemetry is disabled or missing")
     return snapshot
+
+
+def runnable_diagnostics(before, after):
+    if os.environ.get("ANTFLY_QUALIFICATION_POLICY") != "runnable":
+        return None
+    previous, current = before["runnable"], after["runnable"]
+    for field in (
+        "capacity_slots",
+        "control_capacity_slots",
+        "operation_capacity",
+        "metadata_capacity_bytes",
+        "control_metadata_capacity_bytes",
+        "max_wait_ms",
+        "quantum_ms",
+        "checkpoint_budget",
+    ):
+        if previous[field] != current[field]:
+            raise RuntimeError("runnable policy changed during qualification")
+    if len(previous["grants"]) != 5 or len(current["grants"]) != 5:
+        raise RuntimeError("runnable class telemetry is incomplete")
+    grants = [new - old for old, new in zip(previous["grants"], current["grants"])]
+    delta = {
+        field: current[field] - previous[field]
+        for field in ("yields", "backfills", "rejected", "wait_ns")
+    }
+    if min(grants + list(delta.values())) < 0:
+        raise RuntimeError("runnable counters decreased during qualification")
+    return dict(delta, grants=grants)
+
+
+def runnable_evidence_failures(measured, policy, minimum_yields=0):
+    diagnostics = measured.get("runnable_diagnostics")
+    stats = (measured.get("workload_after") or {}).get("runnable", {})
+    if diagnostics is None or stats.get("enabled") is not True:
+        return ["runnable scheduling was not measured"]
+    expected = {
+        "capacity_slots": policy.get("slots", 8),
+        "control_capacity_slots": policy.get("control_slots", 1)
+        + (policy.get("cleanup_slots", 0) or 1),
+        "operation_capacity": policy.get("max_operations", 128),
+        "metadata_capacity_bytes": policy.get("max_bytes", 8388608),
+        "control_metadata_capacity_bytes": policy.get("control_bytes", 65536),
+        "max_wait_ms": policy.get("max_wait_ms", 250),
+        "quantum_ms": policy.get("quantum_ms", 2),
+        "checkpoint_budget": policy.get("checkpoint_budget", 64),
+    }
+    failures = [
+        "effective runnable capacity differs from manifest"
+        for field, value in expected.items()
+        if stats.get(field) != value
+    ]
+    kinds = measured.get("by_kind", {})
+    if (
+        any(
+            kinds.get(kind, {}).get("successful", 0)
+            for kind in ("cheap", "expensive", "slow_reader")
+        )
+        and diagnostics["grants"][0] == 0
+    ):
+        failures.append("successful queries did not acquire runnable grants")
+    if kinds.get("write", {}).get("successful", 0) and diagnostics["grants"][1] == 0:
+        failures.append("successful writes did not acquire runnable grants")
+    if diagnostics["yields"] < minimum_yields:
+        failures.append("runnable yielding was not exercised")
+    return failures
 
 
 def waiting_evidence_failures(diagnostics, minimum):
@@ -447,12 +517,21 @@ def main():
             measured = run_phase(target, phase, manifest, args.pid)
             receipt["phases"].append(measured)
             limits = phase["thresholds"]
-            if os.environ.get("ANTFLY_QUALIFICATION_POLICY") == "fixed":
+            if os.environ.get("ANTFLY_QUALIFICATION_POLICY") in ("fixed", "runnable"):
                 failures.extend(
                     phase["name"] + ": " + reason
                     for reason in waiting_evidence_failures(
                         measured["admission_diagnostics"],
                         limits.get("fixed_wait_completed_min", 0),
+                    )
+                )
+            if os.environ.get("ANTFLY_QUALIFICATION_POLICY") == "runnable":
+                failures.extend(
+                    phase["name"] + ": " + reason
+                    for reason in runnable_evidence_failures(
+                        measured,
+                        manifest["runnable_policy"],
+                        limits.get("runnable_yields_min", 0),
                     )
                 )
             if (

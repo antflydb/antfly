@@ -248,5 +248,223 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(percentile([0.3, 0.1, 0.2], 0.5), 0.2)
 
 
+class RunnableQualificationTests(unittest.TestCase):
+    def manifest(self):
+        return dict(
+            configuration={"admission": {"query": {"max_concurrent_requests": 1}}},
+            candidate_configuration={
+                "admission": {
+                    "query": {
+                        "max_concurrent_requests": 1,
+                        "waiting": {"max_wait_ms": 250},
+                    },
+                    "max_request_memory_bytes": 67108864,
+                }
+            },
+            runnable_policy={"slots": 4, "cleanup_slots": 1},
+        )
+
+    def test_scheduler_matrix_selects_and_compares_each_variant(self):
+        import pathlib
+        import tempfile
+        from types import SimpleNamespace
+        import run_matrix
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            manifest = root / "profile.json"
+            manifest.write_text(
+                __import__("json").dumps(dict(self.manifest(), kind="load"))
+            )
+            calls = []
+
+            def run(argv):
+                calls.append(argv)
+                return SimpleNamespace(returncode=0)
+
+            with (
+                patch(
+                    "sys.argv",
+                    [
+                        "run_matrix",
+                        "--candidate",
+                        "/candidate",
+                        "--baseline",
+                        "/main",
+                        "--manifest",
+                        str(manifest),
+                        "--repetitions",
+                        "4",
+                        "--output-dir",
+                        str(root / "output"),
+                    ],
+                ),
+                patch("run_matrix.subprocess.run", side_effect=run),
+            ):
+                self.assertFalse(run_matrix.main())
+            launches = [call for call in calls if call[1].endswith("run_local.py")]
+            orders = [
+                [
+                    call[call.index("--policy") + 1]
+                    for call in launches[offset : offset + 4]
+                ]
+                for offset in range(0, 16, 4)
+            ]
+            for position in range(4):
+                self.assertEqual(
+                    {"baseline", "fixed", "failfast", "runnable"},
+                    {order[position] for order in orders},
+                )
+            comparisons = [
+                call for call in calls if call[1].endswith("compare_receipts.py")
+            ]
+            self.assertEqual(16, len(comparisons))
+            self.assertEqual(
+                8,
+                sum(
+                    "candidate-runnable" in call[call.index("--candidate") + 1]
+                    for call in comparisons
+                ),
+            )
+
+    def test_variant_preserves_admission_and_memory_configuration(self):
+        from run_local import configuration_for_policy
+
+        manifest = self.manifest()
+        before = copy.deepcopy(manifest)
+        fixed = configuration_for_policy(manifest, "fixed")
+        runnable = configuration_for_policy(manifest, "runnable")
+        self.assertEqual(
+            manifest["runnable_policy"], runnable["admission"].pop("runnable")
+        )
+        self.assertEqual(fixed, runnable)
+        self.assertEqual(before, manifest)
+        self.assertNotIn(
+            "runnable", configuration_for_policy(manifest, "baseline")["admission"]
+        )
+        with self.assertRaises(ValueError):
+            configuration_for_policy({}, "runnable")
+
+    def measured(self):
+        return dict(
+            workload_after={
+                "runnable": {
+                    "enabled": True,
+                    "capacity_slots": 4,
+                    "control_capacity_slots": 2,
+                    "operation_capacity": 128,
+                    "metadata_capacity_bytes": 8388608,
+                    "control_metadata_capacity_bytes": 65536,
+                    "max_wait_ms": 250,
+                    "quantum_ms": 2,
+                    "checkpoint_budget": 64,
+                }
+            },
+            runnable_diagnostics={"grants": [10, 2, 0, 0, 1], "yields": 1},
+            by_kind={"cheap": {"successful": 5}, "write": {"successful": 1}},
+        )
+
+    def test_success_requires_matching_capacity_and_real_class_grants(self):
+        from load_clients import runnable_evidence_failures
+
+        self.assertEqual(
+            [],
+            runnable_evidence_failures(
+                self.measured(), self.manifest()["runnable_policy"], 1
+            ),
+        )
+        for change in ("disabled", "capacity", "query", "write", "yield", "missing"):
+            measured = self.measured()
+            if change == "disabled":
+                measured["workload_after"]["runnable"]["enabled"] = False
+            elif change == "capacity":
+                measured["workload_after"]["runnable"]["capacity_slots"] = 8
+            elif change == "query":
+                measured["runnable_diagnostics"]["grants"][0] = 0
+            elif change == "write":
+                measured["runnable_diagnostics"]["grants"][1] = 0
+            elif change == "yield":
+                measured["runnable_diagnostics"]["yields"] = 0
+            else:
+                measured.pop("runnable_diagnostics")
+            self.assertTrue(
+                runnable_evidence_failures(
+                    measured, self.manifest()["runnable_policy"], 1
+                ),
+                change,
+            )
+
+    def test_runnable_deltas_reject_policy_changes_counter_reset_and_missing_classes(
+        self,
+    ):
+        from load_clients import runnable_diagnostics
+
+        stats = dict(
+            self.measured()["workload_after"]["runnable"],
+            grants=[10, 2, 0, 0, 1],
+            yields=1,
+            backfills=0,
+            rejected=0,
+            wait_ns=10,
+        )
+        with patch.dict("os.environ", ANTFLY_QUALIFICATION_POLICY="runnable"):
+            for field, value in (
+                ("capacity_slots", 8),
+                ("grants", [9, 2, 0, 0, 1]),
+                ("grants", [10, 2]),
+                ("wait_ns", 0),
+            ):
+                after = dict(stats, **{field: value})
+                with self.assertRaises(RuntimeError):
+                    runnable_diagnostics({"runnable": stats}, {"runnable": after})
+            after = dict(stats, grants=[11, 3, 0, 0, 1], yields=2, wait_ns=20)
+            delta = runnable_diagnostics({"runnable": stats}, {"runnable": after})
+            self.assertEqual([1, 1, 0, 0, 0], delta["grants"])
+            self.assertEqual(1, delta["yields"])
+
+    def test_runnable_snapshot_rejects_disabled_and_missing_scheduler(self):
+        with patch.dict("os.environ", ANTFLY_QUALIFICATION_POLICY="runnable"):
+            for runnable in (
+                {},
+                {"enabled": False},
+                {"enabled": True, "capacity_slots": 0},
+            ):
+                with patch(
+                    "load_clients.operator_request",
+                    return_value=(
+                        200,
+                        {"query": {"sql_waiting_enabled": True}, "runnable": runnable},
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "telemetry"):
+                        workload_snapshot(None, require_waiting=True)
+
+    def test_comparison_rejects_changes_to_admission_and_memory(self):
+        from run_local import configuration_for_policy
+
+        baseline, candidate = (
+            QualificationTests().receipt(),
+            QualificationTests().receipt(),
+        )
+        manifest = dict(candidate["manifest"], **self.manifest())
+        for receipt, policy in ((baseline, "fixed"), (candidate, "runnable")):
+            receipt["policy"] = policy
+            receipt["manifest"] = manifest
+            receipt["configuration"] = configuration_for_policy(manifest, policy)
+            receipt["configuration"]["pgwire"] = {
+                "enabled": True,
+                "bind_port": 5432,
+                "max_connections": 32,
+            }
+        self.assertTrue(compare(baseline, candidate)["passed"])
+        for field, value in (
+            ("max_request_memory_bytes", 1),
+            ("query", {"max_concurrent_requests": 5}),
+        ):
+            changed = copy.deepcopy(candidate)
+            changed["configuration"]["admission"][field] = value
+            self.assertFalse(compare(baseline, changed)["passed"])
+
+
 if __name__ == "__main__":
     unittest.main()

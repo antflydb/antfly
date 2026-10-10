@@ -6,6 +6,7 @@ import json
 import gzip
 import copy
 import pathlib
+from run_local import configuration_for_policy
 
 
 def compare(baseline, candidate):
@@ -19,6 +20,7 @@ def compare(baseline, candidate):
         if not receipt.get("binary_sha256"):
             failures.append(label + " binary identity missing")
     if baseline.get("binary_sha256") == candidate.get("binary_sha256"):
+        runnable_comparison = candidate.get("policy") == "runnable"
         configurations = []
         for receipt in (baseline, candidate):
             config = copy.deepcopy(receipt.get("configuration"))
@@ -26,10 +28,33 @@ def compare(baseline, candidate):
                 failures.append("same-binary comparison configuration missing")
                 continue
             config.get("pgwire", {}).pop("bind_port", None)
-            config.get("admission", {}).get("query", {}).pop("waiting", None)
+            if runnable_comparison:
+                if receipt.get("policy") not in ("fixed", "runnable"):
+                    failures.append(
+                        "runnable comparison requires fixed and runnable policies"
+                    )
+                    continue
+                expected = configuration_for_policy(
+                    receipt["manifest"], receipt["policy"]
+                )
+                expected.setdefault("pgwire", {})["enabled"] = True
+                # The launcher can supply a default connection ceiling.
+                expected["pgwire"].setdefault(
+                    "max_connections", receipt["manifest"].get("pgwire_connections", 32)
+                )
+                if config != expected:
+                    failures.append(
+                        "runnable comparison configuration does not match manifest policy"
+                    )
+                config.get("admission", {}).pop("runnable", None)
+            else:
+                config.get("admission", {}).get("query", {}).pop("waiting", None)
             configurations.append(config)
         if len(configurations) == 2 and configurations[0] != configurations[1]:
-            failures.append("same-binary comparison differs beyond query waiting")
+            failures.append(
+                "same-binary comparison differs beyond "
+                + ("runnable scheduling" if runnable_comparison else "query waiting")
+            )
     limits = candidate["manifest"]["comparison_thresholds"]
     baseline_phases = {p["name"]: p for p in baseline.get("phases", [])}
     candidate_phases = {p["name"]: p for p in candidate.get("phases", [])}

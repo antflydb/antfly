@@ -192,3 +192,35 @@ the ephemeral pgwire bind port. Each new receipt preserves a redacted server log
 beside its measurements. Missing idle control samples fail with `null`, never a
 passing zero. Final Linux comparisons currently fail sustained throughput; see
 [recorded outcomes](receipts/2026-10-06/README.md).
+
+
+## Runnable scheduler comparison
+
+`linux-runnable-pressure.json` adds an explicit fixed `runnable_policy` to the
+combined retention profile. `run_matrix.py` then also runs `candidate-runnable`,
+comparing it with `candidate-fixed` and main. The candidate pair shares the same
+query waiting, operation admission, memory ceilings, workload and retained peers;
+only runnable scheduling changes. Existing manifests keep their original variants.
+Use four rotated repetitions when including main, fixed, fail-fast and runnable:
+
+```sh
+python3 zig/qualification/workload-pooling/run_matrix.py \
+  --candidate /path/to/candidate/antfly --baseline /path/to/main/antfly \
+  --manifest zig/qualification/workload-pooling/linux-runnable-pressure.json \
+  --repetitions 4 --output-dir /tmp/fresh-runnable-comparison
+```
+
+Authenticated workload snapshots include `runnable` counters. Before and after
+each phase, the probe requires enabled scheduling, stable configured capacities,
+monotonic grant/yield counters and effective capacities matching the manifest.
+Successful query and write operations require corresponding grants during that
+phase. Sustained overload requires at least one cooperative yield. The existing
+request accounting, no-retry, latency, throughput, retained-peer and resource
+limits still apply. Same-binary comparisons reject any undeclared admission or
+memory change. The server build and compiler qualification stay outside the
+measurement container.
+
+This profile has not yet passed a current-source runtime matrix. It does not
+complete the concurrency sweep, inference/background fairness, distributed
+progress, durability, or automatic sizing gates. Runtime receipts are required
+before drawing performance conclusions or enabling defaults.

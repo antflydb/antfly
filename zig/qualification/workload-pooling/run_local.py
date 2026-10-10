@@ -19,6 +19,33 @@ import time
 from limits import enforced_limits, check_container
 
 
+def configuration_for_policy(manifest, policy):
+    if policy not in ("baseline", "fixed", "failfast", "runnable"):
+        raise ValueError("unknown qualification policy")
+    config = json.loads(json.dumps(manifest.get("configuration", {})))
+    if policy != "baseline":
+        for key, value in manifest.get("candidate_configuration", {}).items():
+            config.setdefault(key, {}).update(json.loads(json.dumps(value)))
+    if "runnable_policy" in manifest:
+        # The paired candidate uses exactly the same admission/memory ceilings.
+        # Baseline binaries need not recognize the new configuration field.
+        config.setdefault("admission", {}).pop("runnable", None)
+    if policy == "runnable":
+        runnable = manifest.get("runnable_policy")
+        if not isinstance(runnable, dict) or not runnable:
+            raise ValueError("runnable policy requires a fixed manifest policy")
+        config.setdefault("admission", {})["runnable"] = json.loads(
+            json.dumps(runnable)
+        )
+    if policy == "failfast":
+        config.setdefault("admission", {}).setdefault("query", {})["waiting"] = {
+            "max_queued_requests": 0,
+            "max_queued_bytes": 0,
+            "max_wait_ms": 0,
+        }
+    return config
+
+
 def free_port():
     with socket.socket() as peer:
         peer.bind(("127.0.0.1", 0))
@@ -31,7 +58,9 @@ def main():
     parser.add_argument("--manifest", required=True, type=pathlib.Path)
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument(
-        "--policy", choices=("fixed", "failfast", "baseline"), default="fixed"
+        "--policy",
+        choices=("fixed", "failfast", "baseline", "runnable"),
+        default="fixed",
     )
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text())
@@ -59,16 +88,23 @@ def main():
     while sql_port == api_port:
         sql_port = free_port()
     root = pathlib.Path(tempfile.mkdtemp(prefix="antfly-pooling-qualification-"))
-    config = json.loads(json.dumps(manifest.get("configuration", {})))
-    if args.policy != "baseline":
-        for key, value in manifest.get("candidate_configuration", {}).items():
-            config.setdefault(key, {}).update(value)
-    if args.policy == "failfast":
-        config.setdefault("admission", {}).setdefault("query", {})["waiting"] = {
-            "max_queued_requests": 0,
-            "max_queued_bytes": 0,
-            "max_wait_ms": 0,
-        }
+    try:
+        config = configuration_for_policy(manifest, args.policy)
+    except ValueError as error:
+        args.output.write_text(
+            json.dumps(
+                dict(
+                    manifest=manifest,
+                    policy=args.policy,
+                    passed=False,
+                    failures=[str(error)],
+                    enforced_limits=observed_limits,
+                ),
+                indent=2,
+            )
+            + "\n"
+        )
+        return True
     config.setdefault("pgwire", {}).update(enabled=True, bind_port=sql_port)
     config["pgwire"].setdefault(
         "max_connections", manifest.get("pgwire_connections", 32)

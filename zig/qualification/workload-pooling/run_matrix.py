@@ -34,6 +34,8 @@ def main():
             ("candidate-fixed", args.candidate, "fixed"),
             ("candidate-failfast", args.candidate, "failfast"),
         ]
+        if "runnable_policy" in json.loads(manifest.read_text()):
+            variants.append(("candidate-runnable", args.candidate, "runnable"))
         if args.baseline:
             variants.insert(0, ("origin-main", args.baseline, "baseline"))
         for repetition in range(args.repetitions):
@@ -70,10 +72,31 @@ def main():
                 if result.returncode:
                     failures.append(stem + ": " + name)
             if json.loads(manifest.read_text()).get("kind") == "load":
-                for name in ("candidate-failfast", "origin-main"):
+                comparisons = [
+                    (name, "candidate-fixed")
+                    for name in ("candidate-failfast", "origin-main")
+                    if name in outputs
+                ]
+                if "candidate-runnable" in outputs:
+                    comparisons.extend(
+                        (name, "candidate-runnable")
+                        for name in ("candidate-fixed", "origin-main")
+                        if name in outputs
+                    )
+                for name, candidate_name in comparisons:
                     if name not in outputs:
                         continue
-                    output = args.output_dir / (stem + "-compare-" + name + ".json")
+                    output = args.output_dir / (
+                        stem
+                        + "-compare-"
+                        + name
+                        + (
+                            "-runnable"
+                            if candidate_name == "candidate-runnable"
+                            else ""
+                        )
+                        + ".json"
+                    )
                     result = subprocess.run(
                         [
                             sys.executable,
@@ -81,7 +104,7 @@ def main():
                             "--baseline",
                             str(outputs[name]),
                             "--candidate",
-                            str(outputs["candidate-fixed"]),
+                            str(outputs[candidate_name]),
                             "--output",
                             str(output),
                         ]

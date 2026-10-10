@@ -4088,6 +4088,7 @@ pub const AntflyApiHandler = struct {
             .query = self.api_server.queryAdmissionStats(),
             .memory = self.api_server.workloadMemoryStats(),
             .cleanup = self.api_server.sqlCleanupStats(),
+            .runnable = self.api_server.runnableSchedulingStats(),
         });
     }
 
@@ -17027,6 +17028,9 @@ test "SQL protected executor cleanup owner reserves independent reaper and recla
     try std.testing.expectEqual(@as(u16, 200), response.status.code);
     const body = try std.json.parseFromSlice(std.json.Value, alloc, response.body.?, .{});
     defer body.deinit();
+    const runnable_stats = body.value.object.get("runnable").?.object;
+    try std.testing.expect(!runnable_stats.get("enabled").?.bool);
+    try std.testing.expectEqual(@as(i64, 0), runnable_stats.get("capacity_slots").?.integer);
     const cleanup_stats = body.value.object.get("cleanup").?.object;
     try std.testing.expectEqual(@as(i64, 4), cleanup_stats.get("capacity").?.integer);
     try std.testing.expectEqual(@as(i64, 0), cleanup_stats.get("retained").?.integer);
