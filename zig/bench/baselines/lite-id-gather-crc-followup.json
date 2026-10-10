@@ -1,0 +1,67 @@
+{
+  "comparison_commit": "3b623fa0b1a874d1bf9a30a0ff7a126887cfb0a6",
+  "base_commit": "0cffd66bde45181e458ee87f2e74397cfc40cc99",
+  "environment": {
+    "platform": "aarch64-macos",
+    "optimization": "Debug",
+    "zig": "0.17.0",
+    "storage": "In-memory range provider with warm native metadata cache"
+  },
+  "id_gather": {
+    "documents": 384,
+    "identity_bytes": 2578,
+    "before_cache_probes": {
+      "dense": 6,
+      "every_third_document_deleted": 132,
+      "reverse_order": 768
+    },
+    "after_cache_probes": {
+      "dense": 6,
+      "every_third_document_deleted": 6,
+      "reverse_order": 6
+    },
+    "after_sink_appends": {
+      "dense": 3,
+      "every_third_document_deleted": 2,
+      "reverse_order": 3
+    }
+  },
+  "stored_metadata_crc": {
+    "identity_bytes": 262144,
+    "metadata_bytes": 262201,
+    "output_reread_bytes_before": 262201,
+    "output_reread_bytes_after": 65536
+  },
+  "fully_deleted_liveness": {
+    "documents": 500000,
+    "before_membership_checks": 500000,
+    "after_membership_checks": 0,
+    "after_rank_queries": 1
+  },
+  "design": [
+    "Gather at most 128 references in source document order, validate selected rows, then gather bounded identity spans in source offset order and emit in requested output order.",
+    "Reject sparse metadata/ID span expansion beyond four source rows/bytes per selected row/byte. Skip sorting already ordered references.",
+    "Keep native large-batch fallback bounded and stream already validated IDs without rereading metadata or allocating whole IDs. Mixed historical/native batches retain the streaming path.",
+    "Keep contiguous output writes; buffer fragmented small IDs into fixed 8 KiB writes. Returned values never borrow this gather scope.",
+    "Seal stored-metadata append CRC tracking before body writes; intersect patches with the sealed range and reread only dirty checksum pages. Plain sinks retain the existing range-CRC contract.",
+    "Use deletion rank for live-input checks with and without a prepared frozen index."
+  ],
+  "bounds": {
+    "batch_documents": 128,
+    "metadata_buffer_bytes": 3072,
+    "gather_buffer_bytes": 65536,
+    "fragmented_output_buffer_bytes": 8192,
+    "metadata_span_expansion_max": 4,
+    "identity_span_expansion_max": 4,
+    "coordinate_read_records_max": 64
+  },
+  "coverage": [
+    "Dense, sparse-deleted and reversed IDs against individual reads; mixed input numbering and duplicate references.",
+    "Empty IDs, mixed heap/native formats, oversized individual IDs and batches exceeding the gather cap.",
+    "Injected cold ID read failure and invalid selected metadata row before gathered IDs are emitted; retry after failure.",
+    "Sealed CRC ranges with unaligned tails, body-only patches and patches crossing the metadata boundary.",
+    "Empty inputs and fully/partially deleted liveness with frozen and bitmap-only navigation.",
+    "File-backed sort plans fill each 128-document gather with reads of at most 64 records; in-memory plans copy their borrowed slices into the gather buffer."
+  ],
+  "limitations": "Cache probes count cache navigation/locking, not disk operations. Native Debug production-helper fixtures do not establish end-to-end throughput or 2 GiB soak behavior. Shuffled ID gathering adds bounded ordering/copy work; short live spans may read deleted gap bytes within the fourfold bound. Output/page checksum bookkeeping remains proportional to artifact page count."
+}
