@@ -25,6 +25,7 @@ const replication_effects_mod = @import("replication_effects.zig");
 const durable_outbox = @import("durable_outbox.zig");
 const Namespace = @import("doc_identity_namespace.zig").Namespace;
 const types = @import("types.zig");
+const read_admission = @import("../../common/read_admission.zig");
 const schema_mod = @import("../schema.zig");
 
 pub const ReplicationDeferredCommitGate = struct {
@@ -44,6 +45,11 @@ pub const ReplicationDeferredCommitGates = struct {
             .transition_mutex = transition_mutex,
             .transition_locked = transition_mutex != null,
         };
+    }
+
+    fn beginWithAdmission(transition_mutex: ?*std.atomic.Mutex, io: ?std.Io, control: ?read_admission.Port) !@This() {
+        if (transition_mutex) |mutex| try lockAtomicWithAdmission(mutex, io, control);
+        return .{ .transition_mutex = transition_mutex, .transition_locked = transition_mutex != null };
     }
 
     pub fn append(self: *@This(), gate: ?ReplicationDeferredCommitGate) void {
@@ -123,9 +129,33 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
     }
 }
 
+// Recovery may reject only before entering publication. Retained service leases
+// still prohibit CPU transfer; preserve the original lifetime while waiting.
+fn lockAtomicWithAdmission(mutex: *std.atomic.Mutex, io: ?std.Io, control: ?read_admission.Port) !void {
+    const original = control orelse {
+        lockAtomic(mutex);
+        return;
+    };
+    try original.checkpoint();
+    while (!mutex.tryLock()) {
+        try original.checkpoint();
+        if (io) |owner| {
+            try owner.sleep(.fromMilliseconds(1), .awake);
+        } else if (builtin.os.tag == .freestanding) {
+            std.atomic.spinLoopHint();
+        } else {
+            @import("antfly_platform").time.yieldNow();
+        }
+    }
+    errdefer mutex.unlock();
+    try original.checkpoint();
+}
+
 /// Borrowed for one recovery operation. This owner cannot access DB internals
 /// or delete pending records; the storage owner clears them after success.
 pub const RecoveryContext = struct {
+    io: ?std.Io = null,
+    admission: ?read_admission.Port = null,
     transition_mutex: ?*std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     namespace: Namespace,
@@ -140,11 +170,11 @@ pub fn recoverDurableOutbox(
     outbox: durable_outbox.DurableReplicationOutbox,
     kind: durable_outbox.Kind,
 ) !void {
-    var deferred = ReplicationDeferredCommitGates.begin(context.transition_mutex);
+    var deferred = try ReplicationDeferredCommitGates.beginWithAdmission(context.transition_mutex, context.io, context.admission);
     defer deferred.releaseTransition();
 
     const lsn = blk: {
-        lockAtomic(context.log_mutex);
+        try lockAtomicWithAdmission(context.log_mutex, context.io, context.admission);
         defer context.log_mutex.*.unlock();
 
         break :blk mirror.publisher.recover(mirror, kind, outbox, context.namespace) catch |err| {
@@ -156,6 +186,9 @@ pub fn recoverDurableOutbox(
             return err;
         };
     };
+    // Entering recover may publish an existing durable obligation. Request
+    // rejection must not replace its completion/authority result or authorize
+    // clearing it early; finish under the existing mandatory completion owner.
     mirror.notePublished(lsn);
     deferred.append(.{ .mirror = mirror, .lsn = lsn });
     try deferred.waitForDurabilityAndAuthority(context.write_gate);
@@ -454,4 +487,79 @@ test "storage.hot_standby engine pending durability releases the transition fenc
     try std.testing.expectError(error.CommitCompletionPending, gates.waitForDurabilityAndAuthority(publisher.gate()));
     try std.testing.expect(publisher.transition.tryLock());
     publisher.transition.unlock();
+}
+
+test "durable outbox storage recovery admission rejects original lifetime at held publication fences" {
+    const State = struct {
+        checks: usize = 0,
+        reject_at: usize = 8,
+        rejection: anyerror = error.Canceled,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks == self.reject_at) return self.rejection;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |rejection| {
+        // Transition holder, log holder after transition acquisition, and
+        // rejection immediately after successfully acquiring either lock.
+        for (0..4) |fence| {
+            var publisher: TestPublisher = .{};
+            const held = if (fence == 0) &publisher.transition else &publisher.log;
+            if (fence < 2) try std.testing.expect(held.tryLock());
+            var state: State = .{ .rejection = rejection, .reject_at = if (fence == 2) 2 else if (fence == 3) 4 else 8 };
+            const payload: read_admission.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check } };
+            const context: RecoveryContext = .{ .io = std.testing.io, .admission = read_admission.Port.init(&payload), .transition_mutex = &publisher.transition, .log_mutex = &publisher.log, .namespace = .{ .table_id = 1, .shard_id = 2 }, .write_gate = publisher.gate() };
+            try std.testing.expectError(rejection, recoverDurableOutbox(context, publisher.mirror(), .{ .from_lsn = 5, .payload = "payload" }, .replay));
+            try std.testing.expectEqual(state.reject_at, state.checks);
+            try std.testing.expect(!publisher.recovered and !publisher.completed);
+            if (fence < 2) {
+                try std.testing.expect(!held.tryLock());
+                held.unlock();
+            }
+            // Rejecting acquisition neither steals a held lock nor retains the
+            // transition lock acquired before the failed log acquisition.
+            try std.testing.expect(publisher.transition.tryLock());
+            publisher.transition.unlock();
+            try std.testing.expect(publisher.log.tryLock());
+            publisher.log.unlock();
+            state.reject_at = 0;
+            try recoverDurableOutbox(context, publisher.mirror(), .{ .from_lsn = 5, .payload = "payload" }, .replay);
+            try std.testing.expect(publisher.recovered and publisher.completed);
+        }
+    }
+}
+
+test "durable outbox storage recovery admission preserves mandatory completion after publication" {
+    const State = struct {
+        publisher: *TestPublisher,
+        checks: usize = 0,
+        after_publication: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.publisher.recovered) {
+                self.after_publication += 1;
+                return error.Canceled;
+            }
+        }
+    };
+    for (0..3) |outcome| {
+        var publisher: TestPublisher = .{ .fail_completion = outcome == 1, .fenced = outcome == 2 };
+        var state: State = .{ .publisher = &publisher };
+        const payload: read_admission.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check } };
+        const context: RecoveryContext = .{ .io = std.testing.io, .admission = read_admission.Port.init(&payload), .transition_mutex = &publisher.transition, .log_mutex = &publisher.log, .namespace = .{ .table_id = 1, .shard_id = 2 }, .write_gate = publisher.gate() };
+        if (outcome == 1) {
+            try std.testing.expectError(error.CommitCompletionPending, recoverDurableOutbox(context, publisher.mirror(), .{ .from_lsn = 5, .payload = "payload" }, .replay));
+        } else if (outcome == 2) {
+            try std.testing.expectError(error.PrimaryFenced, recoverDurableOutbox(context, publisher.mirror(), .{ .from_lsn = 5, .payload = "payload" }, .replay));
+        } else try recoverDurableOutbox(context, publisher.mirror(), .{ .from_lsn = 5, .payload = "payload" }, .replay);
+        try std.testing.expect(publisher.recovered and publisher.completed);
+        try std.testing.expectEqual(@as(usize, 4), state.checks);
+        try std.testing.expectEqual(@as(usize, 0), state.after_publication);
+        try std.testing.expect(publisher.transition.tryLock());
+        publisher.transition.unlock();
+        try std.testing.expect(publisher.log.tryLock());
+        publisher.log.unlock();
+    }
 }

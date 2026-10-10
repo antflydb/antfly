@@ -3322,19 +3322,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (batch_outbox) |outbox| {
                 try admission.checkLifetime(retained);
                 var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, self.local_execution.replication_async_batch_mirror.?, outbox, .batch);
+                try recoverDurableReplicationOutboxContextWithAdmission(&ctx, self.local_execution.replication_async_batch_mirror.?, outbox, .batch, read_control);
                 try self.clearDurableReplicationOutbox(replication_batch_outbox_key);
             }
             if (replay_outbox) |outbox| {
                 try admission.checkLifetime(retained);
                 var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, self.local_execution.replication_async_effect_mirror.?, outbox, .replay);
+                try recoverDurableReplicationOutboxContextWithAdmission(&ctx, self.local_execution.replication_async_effect_mirror.?, outbox, .replay, read_control);
                 try self.clearDurableReplicationOutbox(replication_replay_outbox_key);
             }
             if (schema_outbox) |outbox| {
                 try admission.checkLifetime(retained);
                 var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, self.local_execution.replication_async_metadata_mirror.?, outbox, .schema);
+                try recoverDurableReplicationOutboxContextWithAdmission(&ctx, self.local_execution.replication_async_metadata_mirror.?, outbox, .schema, read_control);
                 try self.clearDurableReplicationOutbox(replication_schema_outbox_key);
             }
 
@@ -3349,7 +3349,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 } orelse return error.ReplicationPublisherUnavailable;
                 if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
                 var ctx = self.batchContext();
-                try recoverDurableReplicationOutboxContext(&ctx, mirror, outbox, kind);
+                try recoverDurableReplicationOutboxContextWithAdmission(&ctx, mirror, outbox, kind, read_control);
                 // The key names this exact mutation, so concurrent publishers cannot
                 // replace the record which this recovery pass is about to remove.
                 try self.clearDurableReplicationOutbox(entry.key);
@@ -4761,7 +4761,19 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             outbox: DurableReplicationOutbox,
             kind: DurableReplicationOutboxKind,
         ) !void {
+            try recoverDurableReplicationOutboxContextWithAdmission(ctx, mirror, outbox, kind, null);
+        }
+
+        pub fn recoverDurableReplicationOutboxContextWithAdmission(
+            ctx: *const BatchExecutionContext,
+            mirror: ReplicationAsyncEffectMirror,
+            outbox: DurableReplicationOutbox,
+            kind: DurableReplicationOutboxKind,
+            control: ?@import("../../common/read_admission.zig").Port,
+        ) !void {
             try replication_commit.recoverDurableOutbox(.{
+                .io = ctx.io,
+                .admission = control,
                 .transition_mutex = replicationTransitionMutexFromContext(ctx),
                 .log_mutex = ctx.log_mutex,
                 .namespace = ctx.identity_namespace,

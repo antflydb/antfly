@@ -780,3 +780,25 @@ retained. The same lifetime check is valid before queue admission and after gran
 Missing lifetime capability fails before parking. Rejected resumption retains the
 original cause, phase, operation and bytes until physical users join and their
 owner finishes. Running checkpoints still charge ordinary CPU quanta.
+
+### Original lifetime during durable outbox recovery
+
+Startup recovery now uses the retained original request admission for reading and
+copying its pending page, validating each persisted CRC in at most 64 KiB updates,
+and acquiring the replication transition and log fences. Rejection before
+publication returns the original error and releases only locks acquired by that
+operation. It does not delete or acknowledge a pending effect. The three legacy
+singleton effects and mutation-specific records follow the same admission path.
+
+Entering the publisher's recovery callback starts mandatory completion work.
+Request rejection cannot replace the publisher's durability or authority result;
+transition release, remote completion, final authority recheck, and subsequent
+storage acknowledgement retain their existing ordering. The admitted acquisition
+checks cover contention and successful acquisition before publication. They do
+not make publisher callbacks or final completion waits deadline bounded.
+
+The focused owner verifies real engine locks with a stand-in publisher, exact
+original rejection, retry, and mandatory completion after publication. Physical
+DB/mirror integration remains a separate gate. Recovery still retains its service
+leases and CPU capacity: adopting the whole holder dependency graph and mandatory
+CPU reentry is required before these waits may loan CPU or qualify fair defaults.
