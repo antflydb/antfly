@@ -36,7 +36,8 @@ const modern_bert_arch = @import("../architectures/modern_bert.zig");
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Allocator = std.mem.Allocator;
-const decide = @import("decide.zig");
+const decision_api = @import("antfly_decisions");
+const decide = decision_api.legacy;
 const observation = @import("extraction_observer.zig");
 const CT = compute.CT;
 
@@ -64,7 +65,7 @@ pub const Options = struct {
     failure: ?*wire.FailureContext = null,
     observer: ?observation.Observer = null,
     /// Trusted single-item Decide route; normal extraction keeps its wire format.
-    decide_request: ?decide.Request = null,
+    decide_request: ?decision_api.Request = null,
 };
 
 fn progress(options: Options, index: ?usize, stage: []const u8) !void {
@@ -171,7 +172,11 @@ pub fn classificationLogitsProfiled(
             cb.preferEagerQuantMirrors(true);
             break :blk try deberta_arch.forwardCtProfiled(cb, allocator, deberta, sample.input_ids, attention_mask, 1, seq_len, deberta_mod.glinerPrefersWeightMirrors(deberta), if (profile) |p| &p.encoder else null);
         },
-        .modern_bert => |modern| try modern_bert_arch.forwardCT(cb, allocator, modern, sample.input_ids, attention_mask, 1, seq_len),
+        .modern_bert => |modern| blk: {
+            var execution_config = modern;
+            execution_config.metal_f16_weight_mirrors = true;
+            break :blk try modern_bert_arch.forwardCT(cb, allocator, execution_config, sample.input_ids, attention_mask, 1, seq_len);
+        },
     };
     defer cb.free(hidden);
     if (profile) |p| {
@@ -594,7 +599,7 @@ pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, c
         if (options.decide_request) |decision| {
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
-            const json = try decide.responseClassifications(arena.allocator(), decision, presented.classifications, request_plan.prompt_tokens);
+            const json = try decision_api.trainedClassifications(arena.allocator(), decision, presented.classifications, request_plan.prompt_tokens);
             if (json.len > options.max_response_bytes) return error.ExtractionOutputLimitExceeded;
             return allocator.dupe(u8, json);
         }
@@ -873,6 +878,11 @@ test "gliner span v2 GLiNER2.5-Decide CountLSTM v1 entity head parity" {
     }
 }
 
+test "gliner span v2 GLiNER2.5-Decide Q8_0 bundle native parity" {
+    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR") orelse return error.SkipZigTest;
+    try testDecideParity(directory, false, 5e-2);
+}
+
 test "gliner span v2 GLiNER2.5-Decide Q8_0 bundle Metal parity" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
     const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR") orelse return error.SkipZigTest;
@@ -1119,4 +1129,21 @@ fn expectExecuteError(expected: anyerror, result: anyerror![]u8) !void {
         std.testing.allocator.free(unexpected);
         return error.TestUnexpectedResult;
     } else |err| try std.testing.expectEqual(expected, err);
+}
+
+test "decide typed envelope retains schema and text admission limits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = try decide.parse(a,
+        \\{"model":"m","state":"long text","questions":{"act":{"type":"noul","instructions":"Act?"}}}
+    );
+    const input = try decide.extractionValue(a, request, .span_marker);
+    var parsed = try wire.parseValue(a, input.value, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(request.state, parsed.items[0].text);
+    try std.testing.expectEqualStrings("false", parsed.items[0].compiled.schema.classifications[0].task.labels[0]);
+    try std.testing.expectEqualStrings("true", parsed.items[0].compiled.schema.classifications[0].task.labels[1]);
+    try std.testing.expectError(error.ExtractionTextLimitExceeded, wire.parseValue(a, input.value, .{ .limits = .{ .max_text_bytes_per_input = 1 } }));
+    try std.testing.expectError(error.ExtractionSchemaLimitExceeded, wire.parseValue(a, input.value, .{ .limits = .{ .max_total_schema_bytes = 1 } }));
 }

@@ -48,6 +48,7 @@ pub fn create(ctx: Context) Suite {
         .test_runner = runtime_filter_test_runner,
     });
     tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
+    tests.root_module.addImport("antfly_decisions", ctx.graph.inference_mod.import_table.get("antfly_decisions").?);
     ctx.graph.identities.addImports(tests.root_module);
     runtime_build.applyCBindings(tests.root_module, ctx.graph.c_bindings);
     tests.root_module.addImport("build_options", ctx.graph.qualification_build_options_mod);

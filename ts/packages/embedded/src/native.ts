@@ -198,6 +198,21 @@ export interface NativeLibrary {
   dbClose: KoffiFunc<(handle: unknown) => void>;
   bufferFree: KoffiFunc<(buffer: object) => void>;
 
+  dbSqlJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  dbOpenTable: KoffiFunc<(handle: unknown, name: object, out: unknown[]) => number>;
+  dbCreateTableJson: KoffiFunc<(handle: unknown, name: object, schema: object) => number>;
+  dbDropTable: KoffiFunc<(handle: unknown, name: object) => number>;
+  dbListTablesJson: KoffiFunc<(handle: unknown, out: object) => number>;
+  dbSqlSessionOpen: KoffiFunc<(handle: unknown, out: unknown[]) => number>;
+  dbSqlSessionClose: KoffiFunc<(handle: unknown, session: number | bigint) => number>;
+  dbSqlOpenCursorJson: KoffiFunc<
+    (handle: unknown, request: object, cursor: unknown[], out: object) => number
+  >;
+  dbSqlFetchCursorJson: KoffiFunc<
+    (handle: unknown, cursor: number | bigint, rows: number, out: object) => number
+  >;
+  dbSqlCloseCursor: KoffiFunc<(handle: unknown, cursor: number | bigint) => number>;
+
   dbStatusJson: KoffiFunc<(handle: unknown, out: object) => number>;
   dbCapabilitiesJson: KoffiFunc<(handle: unknown, out: object) => number>;
   dbBackup: KoffiFunc<(handle: unknown, out: object) => number>;
@@ -447,6 +462,34 @@ function buildNative(): NativeLibrary {
 
     dbClose: f("antfly_db_close", "void", [PAntflyDb]),
     bufferFree: f("antfly_buffer_free", "void", [koffi.pointer(AntflyBuffer)]),
+
+    dbSqlJson: f("antfly_db_sql_json", "uint32_t", [PAntflyDb, AntflySlice, PAntflyBufferOut]),
+    dbOpenTable: f("antfly_db_open_table", "uint32_t", [PAntflyDb, AntflySlice, PAntflyDbOut]),
+    dbCreateTableJson: f("antfly_db_create_table_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      AntflySlice,
+    ]),
+    dbDropTable: f("antfly_db_drop_table", "uint32_t", [PAntflyDb, AntflySlice]),
+    dbListTablesJson: f("antfly_db_list_tables_json", "uint32_t", [PAntflyDb, PAntflyBufferOut]),
+    dbSqlSessionOpen: f("antfly_db_sql_session_open", "uint32_t", [
+      PAntflyDb,
+      koffi.out(koffi.pointer("uint64_t")),
+    ]),
+    dbSqlSessionClose: f("antfly_db_sql_session_close", "uint32_t", [PAntflyDb, "uint64_t"]),
+    dbSqlOpenCursorJson: f("antfly_db_sql_open_cursor_json", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      koffi.out(koffi.pointer("uint64_t")),
+      PAntflyBufferOut,
+    ]),
+    dbSqlFetchCursorJson: f("antfly_db_sql_fetch_cursor_json", "uint32_t", [
+      PAntflyDb,
+      "uint64_t",
+      "uint32_t",
+      PAntflyBufferOut,
+    ]),
+    dbSqlCloseCursor: f("antfly_db_sql_close_cursor", "uint32_t", [PAntflyDb, "uint64_t"]),
 
     dbStatusJson: f("antfly_db_status_json", "uint32_t", [PAntflyDb, PAntflyBufferOut]),
     dbCapabilitiesJson: f("antfly_db_capabilities_json", "uint32_t", [PAntflyDb, PAntflyBufferOut]),

@@ -46,7 +46,7 @@ pub fn isInteractiveGeneratePath(path: []const u8) bool {
     for ([_][]const u8{ inference_bridge.ai_api_prefix, inference_bridge.public_api_prefix }) |prefix| {
         if (!std.mem.startsWith(u8, path, prefix)) continue;
         const suffix = path[prefix.len..];
-        if (std.mem.eql(u8, suffix, "/decide") or
+        if (std.mem.eql(u8, suffix, "/decisions") or
             std.mem.eql(u8, suffix, "/generate") or
             std.mem.eql(u8, suffix, "/generate/batch") or
             std.mem.eql(u8, suffix, "/chat/completions")) return true;
@@ -967,6 +967,8 @@ pub fn inferenceProviderEmbedDenseTextsWithContext(
         .model = model,
         .texts = texts,
         .task_type = context.task_type.canonical(),
+        .model_identity = context.model_identity,
+        .dimensions = context.dimensions,
         .instruction = context.instruction,
     }, context.request.deadline_ns, context.request.cancellation orelse .none);
 }
@@ -1012,6 +1014,8 @@ pub fn inferenceProviderEmbedDenseParts(
         null,
         null,
         null,
+        null,
+        null,
         .none,
     );
 }
@@ -1032,6 +1036,8 @@ pub fn inferenceProviderEmbedDensePartsWithContext(
         .embed_dense_parts_with_context,
         context.task_type.canonical(),
         context.instruction,
+        context.model_identity,
+        context.dimensions,
         context.request.deadline_ns,
         context.request.cancellation orelse .none,
     );
@@ -1045,6 +1051,8 @@ pub fn inferenceProviderEmbedDensePartsBorrowed(
     operation: inference_bridge.ProviderOperation,
     task_type: ?[]const u8,
     instruction: ?[]const u8,
+    model_identity: ?[]const u8,
+    dimensions: ?u32,
     deadline_ns: ?u64,
     cancellation: CancellationToken,
 ) ![][]f32 {
@@ -1079,6 +1087,8 @@ pub fn inferenceProviderEmbedDensePartsBorrowed(
             .attachment_count = payload_count,
             .task_type = task_type,
             .instruction = instruction,
+            .model_identity = model_identity,
+            .dimensions = dimensions,
         },
         deadline_ns,
         payload_storage[0..payload_count],
@@ -1288,7 +1298,7 @@ pub fn inferenceProviderDecideJson(
         .abi_version = inference_connection_abi.abi_version,
         .target_context = &target,
         .allocator = &abi_alloc,
-        .operation = .init("decide"),
+        .operation = .init("decisions"),
         .body = .init(body),
         .deadline_ns = if (request) |context| context.deadline_ns orelse 0 else platform_time.monotonicNs() +| 5 * std.time.ns_per_min,
         .cancellation = .{ .context = &request, .is_cancelled = struct {
@@ -1794,6 +1804,8 @@ pub fn inferenceProviderEmbedDenseRasters(
         .embed_dense_rasters,
         inference_bridge.ReadRasterImagesRequest{
             .model = model,
+            .model_identity = context.model_identity,
+            .dimensions = context.dimensions,
             .raster_count = rasters.len,
             .rasters = borrowed.metadata,
         },

@@ -33,6 +33,8 @@ pub const Config = struct {
     // storage FD admission domain protects descriptor safety.
     max_pending_segments: u64 = 64,
     resume_pending_segments: u64 = 32,
+    // Heap-backed merge debt plus in-flight producer reservations. Retained
+    // mmap corpus bytes are reported in stats but cannot drain through merges.
     max_pending_bytes: u64 = 256 * 1024 * 1024,
     // Bound producer latency when a source is corrupt, quarantined, or owned
     // by a stuck worker. FD admission remains the final safety boundary.
@@ -675,7 +677,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             // Quarantine is exceptional, so keep the common admission path to
             // one catalog scan. When it is present, capture the target index's
             // state under the same apply-lock epoch as the global byte state.
-            const global_quarantine_blocked = quarantineBlocks(stats_snapshot);
+            const global_quarantine_blocked = stats_snapshot.pending_heap_bytes > 0 and quarantineBlocks(stats_snapshot);
             const index_quarantine_blocked = if (stats_snapshot.quarantined_segments > 0)
                 quarantineBlocks(self.index_manager.textMergeStatsSnapshotForIndex(index_name))
             else
@@ -701,9 +703,13 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             // publication for this index. Bytes remain process-global because
             // they protect shared memory and storage resources.
             const admitted_segments = std.math.add(u64, active_segments, reserved_index_segments) catch std.math.maxInt(u64);
-            const admitted_bytes = std.math.add(u64, stats_snapshot.pending_bytes, reserved_bytes) catch std.math.maxInt(u64);
+            // Immutable file-backed segments are the retained corpus, not
+            // producer memory debt. Merging them does not drain their bytes:
+            // charging them here eventually stops every growing index at the
+            // byte watermark, even while its merger is making progress.
+            const admitted_bytes = std.math.add(u64, stats_snapshot.pending_heap_bytes, reserved_bytes) catch std.math.maxInt(u64);
             const request_oversized_bytes = self.config.max_pending_bytes > 0 and byte_count > self.config.max_pending_bytes;
-            const no_existing_debt = stats_snapshot.pending_segments == 0 and stats_snapshot.pending_bytes == 0 and
+            const no_existing_debt = stats_snapshot.pending_heap_bytes == 0 and
                 self.producer_segment_reservations == 0 and self.producer_byte_reservations == 0;
             const segments_admissible = self.config.max_pending_segments == 0 or admitted_segments <= self.config.max_pending_segments;
             const bytes_admissible = self.config.max_pending_bytes == 0 or admitted_bytes <= self.config.max_pending_bytes;
@@ -930,7 +936,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         const stats_snapshot = self.index_manager.textMergeStatsSnapshot();
         self.apply_mutex.unlockShared();
         return (self.config.max_pending_segments > 0 and stats_snapshot.pending_segments > self.config.max_pending_segments) or
-            (self.config.max_pending_bytes > 0 and stats_snapshot.pending_bytes > self.config.max_pending_bytes);
+            (self.config.max_pending_bytes > 0 and stats_snapshot.pending_heap_bytes > self.config.max_pending_bytes);
     }
 
     fn backpressureDrained(self: *TextMergeRuntime) bool {
@@ -940,7 +946,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         const segment_low = @min(self.config.resume_pending_segments, self.config.max_pending_segments);
         const bytes_low = self.config.max_pending_bytes / 2;
         return (self.config.max_pending_segments == 0 or stats_snapshot.pending_segments <= segment_low) and
-            (self.config.max_pending_bytes == 0 or stats_snapshot.pending_bytes <= bytes_low);
+            (self.config.max_pending_bytes == 0 or stats_snapshot.pending_heap_bytes <= bytes_low);
     }
 
     fn backpressureBlockedByQuarantine(self: *TextMergeRuntime) bool {

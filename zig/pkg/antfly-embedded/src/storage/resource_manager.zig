@@ -2959,6 +2959,54 @@ pub const ResourceManager = struct {
         self.pressure_change.advance();
     }
 
+    /// Move construction credit into an observed retained owner atomically.
+    /// Destination growth includes metadata; only its excess over transferred
+    /// credit adds host usage. No reclamation callback runs under this lock.
+    pub fn adoptReservationUsage(self: *ResourceManager, reservation: *Reservation, destination: Slice, current: *u64, added: u64) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (reservation.manager != self or reservation.released) return error.ResourceAccountingMismatch;
+        const source_owned = try self.reservationIdentityLocked(reservation);
+        const credit = @min(reservation.bytes, added);
+        const key: ObserverKey = .{ .slice = destination, .identity = @intFromPtr(current) };
+        var inserted = false;
+        const observed = self.observer_identities.getPtr(key) orelse blk: {
+            if (current.* != 0) return error.ResourceAccountingMismatch;
+            const entry = try self.observer_identities.getOrPut(self.identity_allocator, key);
+            entry.value_ptr.* = .{ .current = 0 };
+            inserted = true;
+            break :blk entry.value_ptr;
+        };
+        errdefer {
+            if (inserted) _ = self.observer_identities.remove(key);
+        }
+        if (observed.current != current.*) return error.ResourceAccountingMismatch;
+        const source = &self.slices[sliceIndex(reservation.slice)];
+        const target = &self.slices[sliceIndex(destination)];
+        if (source.used_bytes < credit or self.memory.used_bytes < credit) return error.ResourceAccountingMismatch;
+        const target_previous = target.used_bytes - if (reservation.slice == destination) credit else @as(u64, 0);
+        const target_next = std.math.add(u64, target_previous, added) catch return error.ResourceBudgetExceeded;
+        const memory_next = std.math.add(u64, self.memory.used_bytes - credit, added) catch return error.ResourceBudgetExceeded;
+        const observed_next = std.math.add(u64, current.*, added) catch return error.ResourceBudgetExceeded;
+        if ((target.budget.hard_limit_bytes != 0 and target_next > target.budget.hard_limit_bytes) or
+            (self.memory.budget.hard_limit_bytes != 0 and memory_next > self.memory.budget.hard_limit_bytes))
+        {
+            target.hard_limit_rejections +|= 1;
+            if (self.memory.budget.hard_limit_bytes != 0 and memory_next > self.memory.budget.hard_limit_bytes) self.memory.hard_limit_rejections +|= 1;
+            return error.ResourceBudgetExceeded;
+        }
+        source.used_bytes -= credit;
+        target.used_bytes = target_next;
+        target.peak_bytes = @max(target.peak_bytes, target_next);
+        if (target.budget.soft_limit_bytes != 0 and target_next > target.budget.soft_limit_bytes) target.soft_limit_events +|= 1;
+        reservation.bytes -= credit;
+        source_owned.bytes = reservation.bytes;
+        observed.current = observed_next;
+        current.* = observed_next;
+        self.commitMemoryLocked(memory_next);
+        self.pressure_change.advance();
+    }
+
     pub fn adjustUsage(self: *ResourceManager, slice: Slice, current: *u64, next: u64) !void {
         errdefer if (builtin.link_libc) {
             if (std.c.getenv("ANTFLY_RESOURCE_ALLOCATION_DIAGNOSTICS")) |raw| {
@@ -6350,4 +6398,65 @@ test "resource manager reclassifies owned read credit without a second host char
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
         try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
     }
+}
+
+test "resource manager adopts construction credit without a second host charge" {
+    const a = std.testing.allocator;
+    for ([_]Slice{ .lsm_read_working_set, .lsm_block_table_cache }) |source| {
+        var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 140 } });
+        defer manager.deinit(a);
+        var credit = try manager.reserveWithoutReclaim(source, 128);
+        defer credit.release();
+        var retained: u64 = 0;
+        try manager.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 136);
+        try std.testing.expectEqual(@as(u64, 0), credit.bytes);
+        try std.testing.expectEqual(@as(u64, 136), retained);
+        try std.testing.expectEqual(@as(u64, 136), manager.snapshot().memory.peak_bytes);
+        credit.release();
+        try std.testing.expectEqual(@as(u64, 136), manager.snapshot().memory.used_bytes);
+        try manager.adjustUsage(.lsm_block_table_cache, &retained, 0);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+    }
+}
+
+test "resource manager adopts construction credit only within both destination limits" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |aggregate| {
+        var budgets = Options.defaultBudgets();
+        budgets[@backingInt(Slice.lsm_block_table_cache)] = .{ .hard_limit_bytes = if (aggregate) 0 else 128 };
+        var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = if (aggregate) 128 else 140 } });
+        defer manager.deinit(a);
+        var credit = try manager.reserveWithoutReclaim(.lsm_read_working_set, 128);
+        defer credit.release();
+        var retained: u64 = 0;
+        try std.testing.expectError(error.ResourceBudgetExceeded, manager.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 136));
+        try std.testing.expectEqual(@as(u64, 128), credit.bytes);
+        try std.testing.expectEqual(@as(u64, 0), retained);
+        try std.testing.expectEqual(@as(u64, 128), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_block_table_cache).used_bytes);
+        credit.release();
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+    }
+}
+
+test "resource manager adopts construction credit preserves ownership on identity OOM" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    var manager = ResourceManager.init(.{ .identity_allocator = failing.allocator() });
+    defer manager.deinit(a);
+    var credit = try manager.reserveWithoutReclaim(.lsm_read_working_set, 128);
+    defer credit.release();
+    failing.fail_index = failing.alloc_index;
+    var retained: u64 = 0;
+    try std.testing.expectError(error.OutOfMemory, manager.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 136));
+    try std.testing.expectEqual(@as(u64, 128), credit.bytes);
+    try std.testing.expectEqual(@as(u64, 0), retained);
+    try std.testing.expectEqual(@as(u64, 128), manager.snapshot().memory.used_bytes);
+    failing.fail_index = std.math.maxInt(usize);
+    try manager.adoptReservationUsage(&credit, .lsm_block_table_cache, &retained, 136);
+    credit.release();
+    try manager.adjustUsage(.lsm_block_table_cache, &retained, 0);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
 }

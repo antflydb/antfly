@@ -51,6 +51,63 @@ pub const SparseWrite = struct {
     doc_num: ?u32 = null,
 };
 
+// Keep already canonical batches allocation-free. Coalesce repeated dimensions
+// in input order before either the delta or immutable posting producer sees them.
+fn canonicalWorkingBytes(input: []const SparseWrite) !u64 {
+    var values: u64 = 0;
+    var scratch: u64 = 0;
+    for (input) |write| {
+        if (write.vec.indices.len != write.vec.values.len) return error.InvalidSparseVector;
+        var canonical = true;
+        for (write.vec.indices, 0..) |dimension, i| if (i != 0 and dimension <= write.vec.indices[i - 1]) {
+            canonical = false;
+        };
+        if (canonical) continue;
+        const length: u64 = @intCast(write.vec.indices.len);
+        values = try std.math.add(u64, values, try std.math.mul(u64, length, @sizeOf(u32) + @sizeOf(f32)));
+        scratch = @max(scratch, try std.math.mul(u64, length, @sizeOf(u32) + @sizeOf(f32) + @sizeOf(usize)));
+    }
+    if (values == 0) return 0;
+    return std.math.add(u64, try std.math.add(u64, values, scratch), try std.math.mul(u64, input.len, @sizeOf(SparseWrite)));
+}
+fn canonicalWrites(a: Allocator, backing: Allocator, input: []const SparseWrite) ![]const SparseWrite {
+    var scratch = std.heap.ArenaAllocator.init(backing);
+    defer scratch.deinit();
+    var output: ?[]SparseWrite = null;
+    for (input, 0..) |write, wi| {
+        if (write.vec.indices.len != write.vec.values.len) return error.InvalidSparseVector;
+        var canonical = true;
+        for (write.vec.indices, 0..) |dimension, i| {
+            if (i != 0 and dimension <= write.vec.indices[i - 1]) canonical = false;
+        }
+        if (canonical) continue;
+        if (output == null) output = try a.dupe(SparseWrite, input);
+        const Coordinate = struct { dimension: u32, value: f32, order: usize };
+        _ = scratch.reset(.retain_capacity);
+        const coordinates = try scratch.allocator().alloc(Coordinate, write.vec.indices.len);
+        for (coordinates, write.vec.indices, write.vec.values, 0..) |*coordinate, dimension, value, order| coordinate.* = .{ .dimension = dimension, .value = value, .order = order };
+        std.mem.sort(Coordinate, coordinates, {}, struct {
+            fn less(_: void, x: Coordinate, y: Coordinate) bool {
+                return x.dimension < y.dimension or (x.dimension == y.dimension and x.order < y.order);
+            }
+        }.less);
+        const indices = try a.alloc(u32, coordinates.len);
+        const values = try a.alloc(f32, coordinates.len);
+        var count: usize = 0;
+        for (coordinates) |coordinate| {
+            if (count != 0 and indices[count - 1] == coordinate.dimension) {
+                values[count - 1] = daat.addScore(values[count - 1], coordinate.value) catch return error.InvalidSparseVector;
+            } else {
+                indices[count] = coordinate.dimension;
+                values[count] = coordinate.value;
+                count += 1;
+            }
+        }
+        output.?[wi].vec = .{ .indices = indices[0..count], .values = values[0..count] };
+    }
+    return if (output) |writes| writes else input;
+}
+
 pub const OrdinalDocNumLookup = struct {
     doc_nums: []const u32,
     missing_ordinals: []const u32,
@@ -143,14 +200,19 @@ const SearchProfile = struct {
     results: usize = 0,
 };
 
-const ForwardScoreEntry = struct {
-    doc_num: u32,
-    score: f32,
-    doc_id: ?[]u8,
+pub const OrdinalLookup = @import("ordinal_lookup.zig").Lookup;
+pub const KeyPredicate = struct {
+    ptr: *anyopaque,
+    allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+    /// Resolve exact include/exclude masks without expanding a complement.
+    select_constraints: ?*const fn (*anyopaque, Allocator, OrdinalLookup) anyerror!?@import("ordinal_lookup.zig").Selection = null,
+    /// Resolve an exact positive physical selection against this read transaction.
+    /// Null retains the key predicate path (for example exclusion-only queries).
+    select_ordinals: ?*const fn (*anyopaque, Allocator, OrdinalLookup) anyerror!?@import("../encoding/roaring.zig").RoaringBitmap = null,
 };
-
-pub const KeyPredicate = struct { ptr: *anyopaque, allows: *const fn (*anyopaque, []const u8) anyerror!bool };
 pub const SearchConstraints = struct {
+    score_spill: ?@import("../spill_sort.zig").Options = null,
+    max_score_docs: usize = 65536,
     key_predicate: ?KeyPredicate = null,
     filter_doc_ids: []const []const u8 = &.{},
     exclude_doc_ids: []const []const u8 = &.{},
@@ -164,6 +226,85 @@ fn checkSearchCancellation(cancellation: ?CancellationToken) !void {
         if (value.isCancelled()) return error.Cancelled;
     }
 }
+
+const daat = @import("daat.zig");
+const posting_pages = @import("posting_pages.zig");
+const PageReader = posting_pages.Reader(backend_erased.ReadTxn);
+const ScoreEntry = daat.Entry;
+
+/// Preserve native f32 addition order while bounding accumulation memory.
+/// Each document's partial sum precedes subsequent contributions in the spill.
+const ScoreAccumulator = struct {
+    const spill = @import("../spill_sort.zig");
+    alloc: Allocator,
+    options: ?spill.Options,
+    limit: usize,
+    cancellation: ?CancellationToken = null,
+    values: std.AutoHashMapUnmanaged(u32, f32) = .empty,
+    sort: ?spill.Sorter = null,
+    sequence: u32 = 0,
+    cursor: ?spill.Cursor = null,
+    head: ?spill.Record = null,
+    iterator: ?std.AutoHashMapUnmanaged(u32, f32).Iterator = null,
+    fn deinit(self: *@This()) void {
+        if (self.cursor) |*cursor| cursor.deinit();
+        if (self.sort) |*sort| sort.deinit();
+        self.values.deinit(self.alloc);
+    }
+    fn write(self: *@This(), doc: u32, value: f32) !void {
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, @bitCast(value), .little);
+        const key = (@as(u64, doc) << 32) | self.sequence;
+        self.sequence = std.math.add(u32, self.sequence, 1) catch return error.ResourceBudgetExceeded;
+        try self.sort.?.add(key, &bytes);
+    }
+    fn add(self: *@This(), doc: u32, value: f32) !void {
+        if (!std.math.isFinite(value)) return error.SparseScoreOverflow;
+        if (self.sort == null and !self.values.contains(doc) and self.values.count() >= self.limit) {
+            var options = self.options orelse return error.ResourceBudgetExceeded;
+            options.cancellation = self.cancellation;
+            options.max_input_bytes = @min(options.max_input_bytes, 1024 * 1024 * 1024);
+            self.sort = try spill.Sorter.init(self.alloc, options);
+            var it = self.values.iterator();
+            while (it.next()) |entry| try self.write(entry.key_ptr.*, entry.value_ptr.*);
+            self.values.deinit(self.alloc);
+            self.values = .empty;
+        }
+        if (self.sort != null) return self.write(doc, value);
+        const entry = try self.values.getOrPut(self.alloc, doc);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* = try daat.addScore(entry.value_ptr.*, value);
+    }
+    fn finish(self: *@This()) !void {
+        if (self.sort) |*sort| {
+            if (try sort.finish()) |range| self.cursor = spill.Cursor.init(self.alloc, sort.run, range);
+        } else self.iterator = self.values.iterator();
+    }
+    fn next(self: *@This(), cancellation: ?CancellationToken) !?ScoreEntry {
+        if (self.iterator) |*it| {
+            const entry = it.next() orelse return null;
+            return .{ .doc_num = entry.key_ptr.*, .score = entry.value_ptr.* };
+        }
+        const cursor = if (self.cursor) |*c| c else return null;
+        var record = self.head orelse (try cursor.next() orelse return null);
+        self.head = null;
+        const doc: u32 = @intCast(record.key >> 32);
+        var score: f32 = 0;
+        var count: usize = 0;
+        while (true) {
+            if (count % 256 == 0) try checkSearchCancellation(cancellation);
+            if (record.payload.len != 4) return error.InvalidSparseSegment;
+            score = try daat.addScore(score, @bitCast(std.mem.readInt(u32, record.payload[0..4], .little)));
+            record = try cursor.next() orelse break;
+            if (record.key >> 32 != doc) {
+                self.head = record;
+                break;
+            }
+            count += 1;
+        }
+        return .{ .doc_num = doc, .score = score };
+    }
+};
 
 const BulkPosting = struct {
     term_id: u32,
@@ -213,7 +354,7 @@ const RetainedChunk = struct {
 };
 
 // ============================================================================
-// Chunk encoding (matches Go's encoding.go format v1)
+// Chunk encoding (compatible Go v1 payload; optional ordinal range metadata)
 // ============================================================================
 
 const CHUNK_FORMAT_VERSION: u8 = 1;
@@ -280,6 +421,34 @@ fn decodeChunkMaxWeight(data: []const u8) !f32 {
     return @bitCast(bits);
 }
 
+// Unextended legacy chunks can still reject disjoint selections without
+// allocating doc-number/weight arrays. New range metadata makes this O(1).
+fn chunkMayMatch(data: []const u8, bitmap: ?*const @import("../encoding/roaring.zig").RoaringBitmap) !bool {
+    if (data.len < 13 or data[0] != CHUNK_FORMAT_VERSION) return error.InvalidChunk;
+    const n = std.mem.readInt(u32, data[1..5], .little);
+    if (n == 0 or 13 + @as(u64, n) * 5 != data.len) return error.InvalidChunk;
+    if (bitmap == null) return true;
+    const lower = std.mem.readInt(u32, data[13..17], .little);
+    var upper = lower;
+    for (1..n) |i| upper = std.math.add(u32, upper, std.mem.readInt(u32, data[13 + i * 4 ..][0..4], .little)) catch return error.InvalidChunk;
+    return bitmap.?.rangeCardinality(lower, @as(u64, upper) + 1) != 0;
+}
+fn postingRangeMayMatch(range: []const u8, chunk: []const u8, bitmap: ?*const @import("../encoding/roaring.zig").RoaringBitmap) !bool {
+    if (bitmap == null) return true;
+    if (range.len < 8) return error.InvalidChunk;
+    const end = 8 + @as(u64, std.mem.readInt(u32, range[0..4], .little)) + std.mem.readInt(u32, range[4..8], .little);
+    if (end > range.len) return error.InvalidChunk;
+    const tail = range[@intCast(end)..];
+    if (tail.len != 0) {
+        if (tail.len != 12 or (!std.mem.eql(u8, tail[0..4], "O32B") and !std.mem.eql(u8, tail[0..4], "O32U"))) return error.InvalidChunk;
+        const lower = std.mem.readInt(u32, tail[4..8], .little);
+        const upper = std.mem.readInt(u32, tail[8..12], .little);
+        if (lower > upper) return error.InvalidChunk;
+        return bitmap.?.rangeCardinality(lower, @as(u64, upper) + 1) != 0;
+    }
+    return chunkMayMatch(chunk, bitmap);
+}
+
 fn decodeChunk(alloc: Allocator, data: []const u8) !DecodedChunk {
     if (data.len < 13) return error.InvalidChunk;
     var pos: usize = 0;
@@ -297,6 +466,7 @@ fn decodeChunk(alloc: Allocator, data: []const u8) !DecodedChunk {
     const min_w: f32 = @bitCast(min_w_bits);
     pos += 4;
 
+    if (@as(u64, pos) + @as(u64, n) * 5 != data.len or n == 0) return error.InvalidChunk;
     // Delta-decode doc nums
     var doc_nums = try alloc.alloc(u32, n);
     errdefer alloc.free(doc_nums);
@@ -571,6 +741,10 @@ fn encodeSegmentFromSortedPostings(
         var end = start + 1;
         while (end < postings.len and postings[end].term_id == term_id) : (end += 1) {}
 
+        var unique = true;
+        for (postings[start + 1 .. end], postings[start .. end - 1]) |next, previous| if (next.doc_num <= previous.doc_num) {
+            unique = false;
+        };
         var term_payload = std.ArrayListUnmanaged(u8).empty;
         errdefer term_payload.deinit(alloc);
         var cursor = start;
@@ -591,8 +765,9 @@ fn encodeSegmentFromSortedPostings(
 
             const chunk = try encodeChunk(alloc, doc_nums, weights);
             defer alloc.free(chunk);
-            const range = try encodeChunkRangeMeta(alloc, min_doc_id.?, max_doc_id.?);
+            const range = try encodeChunkOrdinalRange(alloc, min_doc_id.?, max_doc_id.?, doc_nums, unique);
             defer alloc.free(range);
+            if (!unique) @memcpy(range[range.len - 12 ..][0..4], "O32B");
 
             try appendU32Le(alloc, &term_payload, @intCast(chunk.len));
             try appendU32Le(alloc, &term_payload, @intCast(range.len));
@@ -636,6 +811,31 @@ fn countSegmentPayloadChunks(payload: []const u8) u32 {
         if (pos > payload.len) return count;
     }
     return count;
+}
+
+fn appendCompactionBlock(a: Allocator, builder: *posting_pages.Builder, postings: []const BulkPosting) !void {
+    const doc_nums = try a.alloc(u32, postings.len);
+    defer a.free(doc_nums);
+    const weights = try a.alloc(f32, postings.len);
+    defer a.free(weights);
+    var minimum: ?[]const u8 = null;
+    var maximum: ?[]const u8 = null;
+    for (postings, 0..) |posting, i| {
+        doc_nums[i] = posting.doc_num;
+        weights[i] = posting.weight;
+        updateBorrowedRangeBounds(&minimum, &maximum, posting.doc_id, posting.doc_id);
+    }
+    const chunk = try encodeChunk(a, doc_nums, weights);
+    defer a.free(chunk);
+    const range = try encodeChunkOrdinalRange(a, minimum.?, maximum.?, doc_nums, true);
+    defer a.free(range);
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(a);
+    try appendU32Le(a, &frame, @intCast(chunk.len));
+    try appendU32Le(a, &frame, @intCast(range.len));
+    try frame.appendSlice(a, chunk);
+    try frame.appendSlice(a, range);
+    try builder.append(postings[0].term_id, doc_nums[0], doc_nums[doc_nums.len - 1], frame.items);
 }
 
 fn segmentTermPayload(data: []const u8, term_id: u32) !?[]const u8 {
@@ -699,6 +899,9 @@ fn forEachSegmentChunk(
     comptime func: fn (@TypeOf(context), DecodedChunk) anyerror!void,
 ) !void {
     const payload = (try segmentTermPayload(segment, term_id)) orelse return;
+    return forEachPayloadChunk(alloc, payload, context, func);
+}
+fn forEachPayloadChunk(alloc: Allocator, payload: []const u8, context: anytype, comptime func: fn (@TypeOf(context), DecodedChunk) anyerror!void) !void {
     var pos: usize = 0;
     while (pos < payload.len) {
         if (pos + 8 > payload.len) return error.InvalidSparseSegment;
@@ -708,12 +911,31 @@ fn forEachSegmentChunk(
         const chunk_end = pos + @as(usize, chunk_len);
         const range_end = chunk_end + @as(usize, range_len);
         if (range_end > payload.len) return error.InvalidSparseSegment;
+        if (@hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "shouldDecode")) {
+            if (!try context.shouldDecode(payload[pos..chunk_end], payload[chunk_end..range_end])) {
+                pos = range_end;
+                continue;
+            }
+        }
         const decoded = try decodeChunk(alloc, payload[pos..chunk_end]);
         defer alloc.free(decoded.doc_nums);
         defer alloc.free(decoded.weights);
         try func(context, decoded);
         pos = range_end;
     }
+}
+
+fn forEachStoredSegmentChunk(alloc: Allocator, txn: anytype, id: u64, root: []const u8, term: u32, context: anytype, comptime func: fn (@TypeOf(context), DecodedChunk) anyerror!void) !void {
+    if (!posting_pages.paged(root)) return forEachSegmentChunk(alloc, root, term, context, func);
+    const Visitor = struct {
+        a: Allocator,
+        context: @TypeOf(context),
+        fn visit(self: *@This(), _: u32, payload: []const u8) !void {
+            try forEachPayloadChunk(self.a, payload, self.context, func);
+        }
+    };
+    var visitor: Visitor = .{ .a = alloc, .context = context };
+    try posting_pages.forEachBlock(txn, id, term, &visitor, Visitor.visit);
 }
 
 fn encodeDocMapSegment(alloc: Allocator, writes: []const SparseWrite, docs: []const BulkDoc) ![]u8 {
@@ -734,6 +956,36 @@ fn encodeDocMapSegment(alloc: Allocator, writes: []const SparseWrite, docs: []co
     return try out.toOwnedSlice(alloc);
 }
 
+const paged_docmap_magic = "ASPSDM02";
+fn pagedDocMap(data: []const u8) bool {
+    return data.len == 16 and std.mem.eql(u8, data[0..8], paged_docmap_magic);
+}
+fn docMapEntryKey(id: u64, doc: u64) [17]u8 {
+    var key: [17]u8 = undefined;
+    key[0] = 0x13;
+    std.mem.writeInt(u64, key[1..9], id, .big);
+    std.mem.writeInt(u64, key[9..17], doc, .big);
+    return key;
+}
+fn forEachStoredDocMapEntry(txn: anytype, id: u64, data: []const u8, context: anytype, comptime visit: fn (@TypeOf(context), DocMapLookup) anyerror!bool) !bool {
+    if (!pagedDocMap(data)) return forEachDocMapEntry(data, context, visit);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    const start = docMapEntryKey(id, 0);
+    var next = try cursor.seekAtOrAfter(start[0..9]);
+    var count: u64 = 0;
+    while (next) |entry| {
+        if (entry.key.len != 17 or !std.mem.eql(u8, entry.key[0..9], start[0..9])) break;
+        if (entry.value.len < 4) return error.InvalidSparseDocMapSegment;
+        const length = std.mem.readInt(u32, entry.value[0..4], .little);
+        if (length > entry.value.len - 4) return error.InvalidSparseDocMapSegment;
+        if (try visit(context, .{ .doc_num = std.mem.readInt(u64, entry.key[9..17], .big), .doc_id = entry.value[4..][0..length], .fwd_data = entry.value[4 + length ..] })) return true;
+        count += 1;
+        next = try cursor.next();
+    }
+    if (count != std.mem.readInt(u32, data[12..16], .little)) return error.InvalidSparseDocMapSegment;
+    return false;
+}
 fn forEachDocMapEntry(
     data: []const u8,
     context: anytype,
@@ -859,6 +1111,25 @@ fn encodeChunkRangeMeta(alloc: Allocator, min_doc_id: []const u8, max_doc_id: []
     @memcpy(buf[8 .. 8 + min_doc_id.len], min_doc_id);
     @memcpy(buf[8 + min_doc_id.len ..][0..max_doc_id.len], max_doc_id);
     return buf;
+}
+
+// Readers before ordinal bounds ignore trailing range bytes. Preserve that
+// wire contract: the posting payload and document-ID range prefix stay V1.
+fn encodeChunkOrdinalRange(alloc: Allocator, min_id: []const u8, max_id: []const u8, nums: []const u32, producer_unique: bool) ![]u8 {
+    if (nums.len == 0) return error.InvalidChunk;
+    const prefix = try encodeChunkRangeMeta(alloc, min_id, max_id);
+    defer alloc.free(prefix);
+    const result = try alloc.alloc(u8, prefix.len + 12);
+    @memcpy(result[0..prefix.len], prefix);
+    const tail = result[prefix.len..];
+    var unique = producer_unique;
+    for (nums[1..], nums[0 .. nums.len - 1]) |next, previous| if (next <= previous) {
+        unique = false;
+    };
+    @memcpy(tail[0..4], if (unique) "O32U" else "O32B");
+    std.mem.writeInt(u32, tail[4..8], nums[0], .little);
+    std.mem.writeInt(u32, tail[8..12], nums[nums.len - 1], .little);
+    return result;
 }
 
 fn decodeChunkRangeMeta(data: []const u8) !ChunkRangeMeta {
@@ -994,12 +1265,16 @@ const key_doc_tombstone: u8 = 0x07;
 const key_doc_incarnation: u8 = 0x08;
 const key_segment_incarnation: u8 = 0x09;
 const key_docmap_incarnation: u8 = 0x0a;
+const key_docmap_locator: u8 = 0x0b;
+const key_physical_block: u8 = 0x0c;
 const key_inv: u8 = 0x10;
 
 const meta_next_doc_num: u8 = 0x01;
 const meta_doc_count: u8 = 0x02;
 const meta_term_count: u8 = 0x03;
 const meta_next_segment_id: u8 = 0x04;
+const meta_complete_locators: u8 = 0x05;
+const meta_complete_physical: u8 = 0x06;
 
 const inv_kind_meta: u8 = 0x01;
 const inv_kind_chunk: u8 = 0x02;
@@ -1112,6 +1387,382 @@ fn segmentIncarnationKey(buf: *[17]u8, segment_id: u64, doc_num: u64, docmap: bo
     return buf;
 }
 
+// Point-addressable physical key -> native ordinal and forward-vector location.
+// The checkpoint authenticates these small typed records with the docmap data.
+fn locatorKey(buf: []u8, doc_id: []const u8) []const u8 {
+    std.debug.assert(doc_id.len + 1 <= buf.len);
+    buf[0] = key_docmap_locator;
+    @memcpy(buf[1..][0..doc_id.len], doc_id);
+    return buf[0 .. doc_id.len + 1];
+}
+const DocMapLocator = struct { num: u64, segment: u64, offset: u64, length: u32, epoch: u64 };
+fn readLocator(txn: anytype, doc_id: []const u8) !?DocMapLocator {
+    if (doc_id.len >= 256) return null;
+    var key: [256]u8 = undefined;
+    const bytes = txn.get(locatorKey(&key, doc_id)) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    if (bytes.len != 36) return error.InvalidSparseDocMapSegment;
+    const locator: DocMapLocator = .{
+        .num = std.mem.readInt(u64, bytes[0..8], .little),
+        .segment = std.mem.readInt(u64, bytes[8..16], .little),
+        .offset = std.mem.readInt(u64, bytes[16..24], .little),
+        .length = std.mem.readInt(u32, bytes[24..28], .little),
+        .epoch = std.mem.readInt(u64, bytes[28..36], .little),
+    };
+    const current = try currentIncarnation(txn, locator.num);
+    if (locator.epoch > current) return error.InvalidSparseSegment;
+    if (locator.epoch != current) return null;
+    return locator;
+}
+// Lake private identities encode immutable object/group/row coordinates. Each
+// durable 1024-row block stores only (low-row:u16, native-ordinal:u32) pairs.
+// The write overlay coalesces all modifications before one put per block.
+const PhysicalMaps = struct {
+    const Key = [89]u8; // tag + 80-byte physical prefix + block ordinal
+    a: Allocator,
+    blocks: std.AutoHashMapUnmanaged(Key, *[1024]u64) = .empty,
+    fn deinit(self: *@This()) void {
+        var values = self.blocks.valueIterator();
+        while (values.next()) |value| self.a.destroy(value.*);
+        self.blocks.deinit(self.a);
+    }
+    fn key(prefix: []const u8, block: u64) !Key {
+        if (prefix.len != 80 or !std.mem.startsWith(u8, prefix, "lake2:") or prefix[70] != ':' or prefix[79] != ':') return error.InvalidSparsePhysicalMap;
+        var result: Key = undefined;
+        result[0] = key_physical_block;
+        @memcpy(result[1..81], prefix);
+        std.mem.writeInt(u64, result[81..89], block, .big);
+        return result;
+    }
+    fn load(self: *@This(), txn: anytype, block_key: Key) !*[1024]u64 {
+        if (!self.blocks.contains(block_key) and self.blocks.count() >= 64) {
+            try self.flush(txn);
+            self.deinit();
+            self.blocks = .empty;
+        }
+        const entry = try self.blocks.getOrPut(self.a, block_key);
+        if (entry.found_existing) return entry.value_ptr.*;
+        errdefer _ = self.blocks.remove(block_key);
+        const values = try self.a.create([1024]u64);
+        errdefer self.a.destroy(values);
+        @memset(values, 0);
+        const data = txn.get(&block_key) catch |err| switch (err) {
+            error.NotFound => &.{},
+            else => return err,
+        };
+        if (data.len % 6 != 0) return error.InvalidSparsePhysicalMap;
+        var position: usize = 0;
+        while (position < data.len) : (position += 6) {
+            const row = std.mem.readInt(u16, data[position..][0..2], .little);
+            if (row >= 1024 or values[row] != 0) return error.InvalidSparsePhysicalMap;
+            values[row] = @as(u64, std.mem.readInt(u32, data[position + 2 ..][0..4], .little)) + 1;
+        }
+        entry.value_ptr.* = values;
+        return values;
+    }
+    fn update(self: *@This(), txn: anytype, id: []const u8, num: ?u32) !void {
+        if (id.len != 96 or !std.mem.startsWith(u8, id, "lake2:")) return;
+        const row = std.fmt.parseInt(u64, id[80..96], 16) catch return error.InvalidSparsePhysicalMap;
+        const values = try self.load(txn, try key(id[0..80], row >> 10));
+        values[row & 1023] = if (num) |value| @as(u64, value) + 1 else 0;
+    }
+    fn flush(self: *@This(), txn: anytype) !void {
+        var entries = self.blocks.iterator();
+        var bytes: [1024 * 6]u8 = undefined;
+        while (entries.next()) |entry| {
+            var size: usize = 0;
+            for (entry.value_ptr.*, 0..) |num, row| {
+                if (num == 0) continue;
+                std.mem.writeInt(u16, bytes[size..][0..2], @intCast(row), .little);
+                std.mem.writeInt(u32, bytes[size + 2 ..][0..4], @intCast(num - 1), .little);
+                size += 6;
+            }
+            try txn.put(entry.key_ptr, bytes[0..size]);
+        }
+    }
+};
+fn selectPhysicalBlock(txn: anytype, a: Allocator, prefix: []const u8, high: u32, rows: *const @import("../encoding/roaring.zig").RoaringBitmap, result: *@import("../encoding/roaring.zig").RoaringBitmap, cancellation: ?CancellationToken) !bool {
+    _ = a;
+    const marker = txn.get(metaKey(meta_complete_physical)) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, marker, &.{1})) return error.InvalidSparsePhysicalMap;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var iterator = rows.iterator();
+    while (iterator.next()) |first| {
+        try checkSearchCancellation(cancellation);
+        const base = first & ~@as(u32, 1023);
+        const row = (@as(u64, high) << 32) | base;
+        const block_key = try PhysicalMaps.key(prefix, row >> 10);
+        const found = try cursor.seekAtOrAfter(&block_key);
+        const data: []const u8 = if (found) |entry| (if (std.mem.eql(u8, entry.key, &block_key)) entry.value else &.{}) else &.{};
+        if (data.len % 6 != 0) return error.InvalidSparsePhysicalMap;
+        var pos: usize = 0;
+        while (pos < data.len) : (pos += 6) {
+            const low = std.mem.readInt(u16, data[pos..][0..2], .little);
+            if (low >= 1024) return error.InvalidSparsePhysicalMap;
+            if (rows.contains(base | low)) try result.add(std.mem.readInt(u32, data[pos + 2 ..][0..4], .little));
+        }
+        if (base == std.math.maxInt(u32) - 1023) break;
+        iterator.seek(base + 1024);
+    }
+    return true;
+}
+
+fn publishDocMapLocators(a: Allocator, txn: anytype, segment: u64, data: []const u8) !void {
+    var maps: PhysicalMaps = .{ .a = a };
+    defer maps.deinit();
+    const Context = struct {
+        txn: @TypeOf(txn),
+        segment: u64,
+        data: []const u8,
+        maps: *PhysicalMaps,
+        fn visit(self: *@This(), entry: DocMapLookup) !bool {
+            if (entry.doc_id.len >= 256) return false;
+            const epoch = try segmentIncarnation(self.txn, self.segment, try immutableVersion(self.data), entry.doc_num, true);
+            if (epoch != try currentIncarnation(self.txn, entry.doc_num)) return false;
+            var tombstone: [16]u8 = undefined;
+            const deleted = self.txn.get(docTombstoneKey(&tombstone, entry.doc_num)) catch |err| switch (err) {
+                error.NotFound => null,
+                else => return err,
+            };
+            if (deleted != null) return false;
+            try self.maps.update(self.txn, entry.doc_id, std.math.cast(u32, entry.doc_num) orelse return error.DocNumOverflow);
+            var bytes: [36]u8 = undefined;
+            std.mem.writeInt(u64, bytes[0..8], entry.doc_num, .little);
+            std.mem.writeInt(u64, bytes[8..16], self.segment, .little);
+            std.mem.writeInt(u64, bytes[16..24], @intFromPtr(entry.fwd_data.ptr) - @intFromPtr(self.data.ptr), .little);
+            std.mem.writeInt(u32, bytes[24..28], @intCast(entry.fwd_data.len), .little);
+            std.mem.writeInt(u64, bytes[28..36], epoch, .little);
+            var key: [256]u8 = undefined;
+            try self.txn.put(locatorKey(&key, entry.doc_id), &bytes);
+            return false;
+        }
+    };
+    var context: Context = .{ .txn = txn, .segment = segment, .data = data, .maps = &maps };
+    _ = try forEachDocMapEntry(data, &context, Context.visit);
+    try maps.flush(txn);
+}
+// A published generation retains its intent until every locator is refreshed.
+// During that gap, point-read only these in-flight roots and native ordinals;
+// never consult unpublished staging or scan document-map payloads.
+fn pendingForwardBytes(txn: anytype, locator: DocMapLocator, doc_id: []const u8) !?[]const u8 {
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var next = try cursor.seekAtOrAfter(&.{0x12});
+    while (next) |intent| {
+        if (intent.key.len != 9 or intent.key[0] != 0x12) break;
+        const id = std.mem.readInt(u64, intent.key[1..9], .big);
+        var key: [16]u8 = undefined;
+        const root = txn.get(docMapSegmentKey(&key, id)) catch |err| switch (err) {
+            error.NotFound => {
+                next = try cursor.next();
+                continue;
+            },
+            else => return err,
+        };
+        if (pagedDocMap(root)) {
+            const data = txn.get(&docMapEntryKey(id, locator.num)) catch |err| switch (err) {
+                error.NotFound => {
+                    next = try cursor.next();
+                    continue;
+                },
+                else => return err,
+            };
+            if (data.len < 4) return error.InvalidSparseDocMapSegment;
+            const len = std.mem.readInt(u32, data[0..4], .little);
+            if (len > data.len - 4) return error.InvalidSparseDocMapSegment;
+            if (std.mem.eql(u8, data[4..][0..len], doc_id) and
+                try segmentIncarnation(txn, id, SEGMENT_FORMAT_VERSION, locator.num, true) == locator.epoch)
+            {
+                const forward = data[4 + len ..];
+                if (try decodeFwdDocNum(forward) != locator.num) return error.InvalidSparseDocMapSegment;
+                return forward;
+            }
+        }
+        next = try cursor.next();
+    }
+    return null;
+}
+fn locatedForwardBytes(txn: anytype, doc_id: []const u8) !?[]const u8 {
+    const locator = (try readLocator(txn, doc_id)) orelse return null;
+    var key: [16]u8 = undefined;
+    const root = txn.get(docMapSegmentKey(&key, locator.segment)) catch |err| switch (err) {
+        error.NotFound => return pendingForwardBytes(txn, locator, doc_id),
+        else => return err,
+    };
+    const paged = pagedDocMap(root);
+    const data = if (paged) try txn.get(&docMapEntryKey(locator.segment, locator.num)) else root;
+    const end = std.math.add(u64, locator.offset, locator.length) catch return error.InvalidSparseDocMapSegment;
+    if (locator.offset < doc_id.len or end > data.len) return error.InvalidSparseDocMapSegment;
+    const offset: usize = @intCast(locator.offset);
+    if (!std.mem.eql(u8, data[offset - doc_id.len .. offset], doc_id)) return error.InvalidSparseDocMapSegment;
+    const forward = data[offset..@intCast(end)];
+    if (try decodeFwdDocNum(forward) != locator.num) return error.InvalidSparseDocMapSegment;
+    return forward;
+}
+
+fn collectPostingStreams(a: Allocator, txn: anytype, query: *const SparseVector, cancellation: ?CancellationToken, byte_budget: usize, page_reader: *PageReader, selected: ?*const @import("../encoding/roaring.zig").RoaringBitmap) !?[]daat.Stream {
+    var streams: std.ArrayList(daat.Stream) = .empty;
+    defer streams.deinit(a);
+    const max_streams = byte_budget / (@sizeOf(daat.Stream) + 64); // navigation budget is independent of archive bytes
+    var retained_bytes: usize = 0;
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    if (try posting_pages.routed(txn)) {
+        var roots = try txn.openCursor();
+        defer roots.close();
+        const bucketed = try posting_pages.bucketed(txn);
+        var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer seen.deinit(a);
+        var nodes: [8 * 17]u32 = undefined;
+        var node_count: usize = 0;
+        const narrow = bucketed and selected != null and selected.?.keys.items.len <= 8;
+        if (narrow) for (selected.?.keys.items) |bucket| {
+            for (0..17) |depth| {
+                const node = (@as(u32, @intCast(depth)) << 16) | (@as(u32, bucket) >> @as(u5, @intCast(16 - depth)));
+                if (std.mem.indexOfScalar(u32, nodes[0..node_count], node) != null) continue;
+                nodes[node_count] = node;
+                node_count += 1;
+            }
+        };
+        for (query.indices, query.values, 0..) |term, weight, query_order| {
+            seen.clearRetainingCapacity();
+            for (0..if (narrow) node_count else @as(usize, 1)) |node_index| {
+                const primary = posting_pages.routeKey(term, 0);
+                const secondary = posting_pages.bucketKey(term, if (narrow) nodes[node_index] else 0, 0);
+                const prefix: []const u8 = if (narrow) secondary[0..8] else primary[0..5];
+                var next_route = try cursor.seekAtOrAfter(prefix);
+                while (next_route) |route| {
+                    try checkSearchCancellation(cancellation);
+                    if (route.key.len != prefix.len + 8 or !std.mem.eql(u8, route.key[0..prefix.len], prefix)) break;
+                    const id = std.mem.readInt(u64, route.key[prefix.len..][0..8], .big);
+                    if (seen.contains(id)) {
+                        next_route = try cursor.next();
+                        continue;
+                    }
+                    if (route.value.len == 8 or route.value.len == 9) {
+                        if (route.value.len == 9) {
+                            if (route.value[8] != 1) return error.InvalidSparseSegment;
+                            var root_key: [16]u8 = undefined;
+                            const lookup = segmentKey(&root_key, id);
+                            const active = try roots.seekAtOrAfter(lookup);
+                            if (active == null or !std.mem.eql(u8, active.?.key, lookup)) {
+                                next_route = try cursor.next();
+                                continue;
+                            }
+                        }
+                        const lower = std.mem.readInt(u32, route.value[0..4], .little);
+                        const upper = std.mem.readInt(u32, route.value[4..8], .little);
+                        if (lower > upper) return error.InvalidSparseSegment;
+                        if (selected) |bitmap| if (bitmap.rangeCardinality(lower, @as(u64, upper) + 1) == 0) {
+                            next_route = try cursor.next();
+                            continue;
+                        };
+                        if (streams.items.len == max_streams) return null;
+                        try streams.append(a, .{ .weight = weight, .query_order = query_order, .segment = id, .version = SEGMENT_FORMAT_VERSION, .term = term, .reader = page_reader.interface(), .allocator = a });
+                    } else {
+                        if (route.value.len != 0) return error.InvalidSparseSegment;
+                        var root_key: [16]u8 = undefined;
+                        const lookup = segmentKey(&root_key, id);
+                        const entry = (try roots.seekAtOrAfter(lookup)) orelse return error.InvalidSparseSegment;
+                        if (!std.mem.eql(u8, entry.key, lookup)) return error.InvalidSparseSegment;
+                        const root = entry.value;
+                        const version = try immutableVersion(root);
+                        if (streams.items.len == max_streams) return null;
+                        if (posting_pages.paged(root)) {
+                            try streams.append(a, .{ .weight = weight, .query_order = query_order, .segment = id, .version = version, .term = term, .reader = page_reader.interface(), .allocator = a });
+                        } else {
+                            if (root.len > byte_budget - retained_bytes) return null;
+                            retained_bytes += root.len;
+                            const retained = try txn.get(lookup);
+                            const payload = (try segmentTermPayload(retained, term)) orelse return error.InvalidSparseSegment;
+                            try streams.append(a, .{ .weight = weight, .query_order = query_order, .payload = payload, .segment = id, .version = version });
+                        }
+                    }
+                    if (narrow) try seen.put(a, id, {});
+                    next_route = try cursor.next();
+                }
+            }
+        }
+        // Preserve canonical segment-major f32 accumulation order even though
+        // discovery is term-major. Query order also preserves duplicate terms.
+        std.mem.sort(daat.Stream, streams.items, {}, struct {
+            fn less(_: void, left: daat.Stream, right: daat.Stream) bool {
+                if (left.segment.? != right.segment.?) return left.segment.? < right.segment.?;
+                return left.query_order < right.query_order;
+            }
+        }.less);
+    } else {
+        var next = try cursor.seekAtOrAfter(taggedPrefix(key_segment));
+        while (next) |entry| {
+            try checkSearchCancellation(cancellation);
+            if (entry.key.len == 0 or entry.key[0] != key_segment) break;
+            const id = SparseIndex.segmentIdFromKey(entry.key) orelse return error.InvalidSparseSegment;
+            const version = try immutableVersion(entry.value);
+            if (selected) |bitmap| if (try posting_pages.ordinalBounds(entry.value)) |bounds| {
+                if (bitmap.rangeCardinality(bounds[0], @as(u64, bounds[1]) + 1) == 0) {
+                    next = try cursor.next();
+                    continue;
+                }
+            };
+            var retained: ?[]const u8 = null;
+            for (query.indices, query.values) |term, weight| {
+                if (posting_pages.paged(entry.value)) {
+                    if (!try posting_pages.hasTermTxn(txn, id, entry.value, term)) continue;
+                    if (streams.items.len == max_streams) return null;
+                    try streams.append(a, .{ .weight = weight, .segment = id, .version = version, .term = term, .reader = page_reader.interface(), .allocator = a });
+                } else if (try segmentTermPayload(entry.value, term) != null) {
+                    if (streams.items.len == max_streams) return null;
+                    // Retain only matching segments. Cursor entries may be recycled;
+                    // transaction point reads remain pinned until query completion.
+                    if (retained == null) {
+                        if (entry.value.len > byte_budget - retained_bytes) return null;
+                        retained = try txn.get(entry.key);
+                        retained_bytes += retained.?.len;
+                    }
+                    const payload = (try segmentTermPayload(retained.?, term)) orelse return error.InvalidSparseSegment;
+                    try streams.append(a, .{ .weight = weight, .payload = payload, .segment = id, .version = version });
+                }
+            }
+            next = try cursor.next();
+        }
+    }
+    for (query.indices, query.values) |term, weight| {
+        var key: [256]u8 = undefined;
+        const bytes = txn.get(invMetaKey(&key, term)) catch |err| switch (err) {
+            error.NotFound => continue,
+            else => return err,
+        };
+        const metadata = decodeTermMeta(bytes);
+        for (0..metadata.chunk_count) |i| {
+            try checkSearchCancellation(cancellation);
+            if (streams.items.len == max_streams) return null;
+            const chunk = txn.get(invChunkKey(&key, term, @intCast(i))) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            if (chunk.len > byte_budget - retained_bytes) return null;
+            retained_bytes += chunk.len;
+            try streams.append(a, .{ .weight = weight, .single = chunk });
+        }
+    }
+    return try streams.toOwnedSlice(a);
+}
+
+fn completeLocatorMap(txn: anytype) !bool {
+    const marker = txn.get(metaKey(meta_complete_locators)) catch |err| switch (err) {
+        error.NotFound => return false,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, marker, &.{1})) return error.InvalidSparseDocMapSegment;
+    return true;
+}
+
 fn currentIncarnation(txn: anytype, doc_num: u64) !u64 {
     var key: [9]u8 = undefined;
     const raw = txn.get(docIncarnationKey(&key, doc_num)) catch |err| switch (err) {
@@ -1157,6 +1808,135 @@ fn immutableVersion(data: []const u8) !u32 {
     return version;
 }
 
+/// Independent cursor leases release backend scratch as visibility advances.
+/// Epochs are copied into the bounded cache; no point-get payload survives in
+/// the parent query transaction, including when its allocator is an arena.
+const VisibilityReader = struct {
+    // Pin a bounded set of metadata prefixes. A prefix keeps its own cursor
+    // and a 64-ordinal page, so interleaved segments never restart one another.
+    // Once admitted lanes fill, other prefixes retain the point/gap fallback;
+    // they cannot evict hot lanes or trigger page-cache thrashing.
+    const Prefix = struct { tag: u8, segment: u64 };
+    const Page = struct {
+        cursor: ?backend_erased.Cursor = null,
+        prefix: [9]u8 = @splat(0),
+        prefix_len: u8 = 0,
+        block: ?u64 = null,
+        last_probe: ?u64 = null,
+        present: u64 = 0,
+        values: [64][8]u8 = undefined,
+        fn get(self: *Page, key: []const u8) ![]const u8 {
+            const doc = std.mem.readInt(u64, key[key.len - 8 ..][0..8], .big);
+            const block = doc >> 6;
+            if (self.block == null or self.block.? != block) {
+                self.block = null; // Failed reads never leave a valid page.
+                self.present = 0;
+                var lower: [17]u8 = undefined;
+                @memcpy(lower[0..self.prefix_len], self.prefix[0..self.prefix_len]);
+                std.mem.writeInt(u64, lower[self.prefix_len..][0..8], block << 6, .big);
+                var next = try self.cursor.?.seekAtOrAfter(lower[0 .. self.prefix_len + 8]);
+                while (next) |entry| {
+                    if (entry.key.len != self.prefix_len + 8 or !std.mem.eql(u8, entry.key[0..self.prefix_len], self.prefix[0..self.prefix_len])) break;
+                    const ordinal = std.mem.readInt(u64, entry.key[self.prefix_len..][0..8], .big);
+                    if (ordinal >> 6 != block) break;
+                    if (entry.value.len != 8) return error.InvalidSparseSegment;
+                    const position: u6 = @truncate(ordinal);
+                    self.values[position] = entry.value[0..8].*;
+                    self.present |= @as(u64, 1) << position;
+                    next = try self.cursor.?.next();
+                }
+                self.block = block;
+            }
+            const position: u6 = @truncate(doc);
+            if (self.present & (@as(u64, 1) << position) == 0) return error.NotFound;
+            return &self.values[position];
+        }
+    };
+    txn: ?*backend_erased.ReadTxn = null,
+    pages: [32]Page = @splat(.{}),
+    page_count: usize = 0,
+    page_slots: std.AutoHashMapUnmanaged(Prefix, usize) = .empty,
+    page_loads: usize = 0,
+    cursors: [3]backend_erased.Cursor,
+    entries: [3]?backend_erased.Entry = @splat(null),
+    lower_keys: [3][17]u8 = undefined,
+    lower_lengths: [3]u8 = @splat(0),
+    positioned: [3]bool = @splat(false),
+    fn init(txn: *backend_erased.ReadTxn) !@This() {
+        var cursors: [3]backend_erased.Cursor = undefined;
+        var count: usize = 0;
+        errdefer for (cursors[0..count]) |*cursor| cursor.close();
+        for (&cursors) |*cursor| {
+            cursor.* = try txn.openCursor();
+            count += 1;
+        }
+        return .{ .txn = txn, .cursors = cursors };
+    }
+    fn deinit(self: *@This()) void {
+        for (&self.cursors) |*cursor| cursor.close();
+        for (self.pages[0..self.page_count]) |*page| if (page.cursor) |*cursor| cursor.close();
+        if (self.txn) |txn| self.page_slots.deinit(txn.allocator);
+    }
+    pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+        const txn = self.txn orelse return self.getPoint(key);
+        if (!((key.len == 9 and key[0] == key_doc_incarnation) or
+            (key.len == 17 and (key[0] == key_segment_incarnation or key[0] == key_docmap_incarnation)))) return self.getPoint(key);
+        const prefix: Prefix = .{ .tag = key[0], .segment = if (key.len == 17) std.mem.readInt(u64, key[1..9], .big) else 0 };
+        const slot = if (self.page_slots.get(prefix)) |index| index else {
+            // Keep proven-absent intervals cheap; allocate a page only after
+            // reaching positive metadata in this pinned transaction.
+            const value = try self.getPoint(key);
+            if (self.page_count == self.pages.len) return value;
+            const index = self.page_count;
+            try self.page_slots.put(txn.allocator, prefix, index);
+            self.pages[index].last_probe = std.mem.readInt(u64, key[key.len - 8 ..][0..8], .big) >> 6;
+            self.pages[index].prefix_len = @intCast(key.len - 8);
+            @memcpy(self.pages[index].prefix[0 .. key.len - 8], key[0 .. key.len - 8]);
+            self.page_count += 1;
+            return value;
+        };
+        const page = &self.pages[slot];
+        const block = std.mem.readInt(u64, key[key.len - 8 ..][0..8], .big) >> 6;
+        if (page.cursor == null) {
+            // Selective or widely scattered probes retain point reads. Admit
+            // the scan page only after observing locality within one block.
+            const value = try self.getPoint(key);
+            if (page.last_probe == null or page.last_probe.? != block) {
+                page.last_probe = block;
+                return value;
+            }
+            page.cursor = try txn.openCursor();
+        }
+        if (page.block == null or page.block.? != block) self.page_loads += 1;
+        return page.get(key);
+    }
+    fn getPoint(self: *@This(), key: []const u8) ![]const u8 {
+        const lane: usize = if (key[0] == key_doc_tombstone) 0 else if (key[0] == key_doc_incarnation) 1 else 2;
+        if (key.len > self.lower_keys[lane].len) return error.InvalidSparseSegment;
+        // A lower-bound seek proves the entire gap before its returned key
+        // absent. Reuse that borrowed result (including EOF) while requests
+        // stay in the proven interval. Missing metadata families must not
+        // restart a merged LSM cursor for every ascending posting ordinal.
+        if (self.positioned[lane] and std.mem.order(u8, key, self.lower_keys[lane][0..self.lower_lengths[lane]]) != .lt) {
+            if (self.entries[lane]) |entry| {
+                switch (std.mem.order(u8, key, entry.key)) {
+                    .eq => return entry.value,
+                    .lt => return error.NotFound,
+                    .gt => {},
+                }
+            } else return error.NotFound;
+        }
+        self.positioned[lane] = false;
+        self.entries[lane] = try self.cursors[lane].seekAtOrAfter(key);
+        @memcpy(self.lower_keys[lane][0..key.len], key);
+        self.lower_lengths[lane] = @intCast(key.len);
+        self.positioned[lane] = true;
+        const entry = self.entries[lane] orelse return error.NotFound;
+        if (!std.mem.eql(u8, entry.key, key)) return error.NotFound;
+        return entry.value;
+    }
+};
+
 /// Query-local and hard capped: selective queries point-read only candidate
 /// incarnations, never load a segment-sized metadata blob. The caller's query
 /// allocator accounts both tables; clearing preserves the fixed high-water.
@@ -1187,6 +1967,39 @@ const IncarnationCache = struct {
     }
 };
 
+const DiskProofs = @import("compaction_proofs.zig").Proofs;
+/// Source epoch keys are already ordered by native ordinal. A separate cursor
+/// resolves current visibility without retaining point-get results in the txn.
+fn captureDiskProofs(a: Allocator, txn: anytype, id: u64, docmap: bool, options: @import("../spill_sort.zig").Options) !DiskProofs {
+    var result = try DiskProofs.init(a, options);
+    errdefer result.deinit();
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var current = try VisibilityReader.init(txn);
+    defer current.deinit();
+    var key: [17]u8 = undefined;
+    const prefix = segmentIncarnationKey(&key, id, 0, docmap)[0..9];
+    var next = try cursor.seekAtOrAfter(prefix);
+    while (next) |entry| {
+        if (entry.key.len != 17 or !std.mem.eql(u8, entry.key[0..9], prefix)) break;
+        if (entry.value.len != 8) return error.InvalidSparseSegment;
+        if (options.cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        const doc = std.math.cast(u32, std.mem.readInt(u64, entry.key[9..17], .big)) orelse return error.DocNumOverflow;
+        const epoch = std.mem.readInt(u64, entry.value[0..8], .little);
+        var current_key: [9]u8 = undefined;
+        const now = try currentIncarnation(&current, doc);
+        if (epoch > now) return error.InvalidSparseSegment;
+        const deleted_key = docTombstoneKey(&current_key, doc);
+        const deleted = if (current.get(deleted_key)) |_| true else |err| switch (err) {
+            error.NotFound => false,
+            else => return err,
+        };
+        try result.append(.{ .doc_num = doc, .epoch = epoch, .live = epoch == now and !deleted });
+        next = try cursor.next();
+    }
+    try result.seal();
+    return result;
+}
 const CapturedIncarnation = struct {
     doc_num: u32,
     epoch: u64,
@@ -1207,10 +2020,11 @@ fn findCaptured(entries: []const CapturedIncarnation, doc_num: u32) ?CapturedInc
 /// Allocation-free upper bound. Posting buffers are charged per occurrence;
 /// incarnation metadata uses a bounded cache (collisions only overestimate).
 /// Reverse values are borrowed from the same snapshot used by actual capture.
-fn incarnationWorkingBytes(txn: anytype, data: []const u8, docmap: bool) !u64 {
+fn incarnationWorkingBytes(txn: anytype, data: []const u8, docmap: bool, id: ?u64, streaming: bool) !u64 {
     const Context = struct {
         txn: @TypeOf(txn),
         bytes: u64,
+        streaming: bool,
         seen: [4096]?u64 = @splat(null),
         fn documentNumber(self: *@This(), doc_num: u64) !void {
             const slot = doc_num % self.seen.len;
@@ -1242,24 +2056,31 @@ fn incarnationWorkingBytes(txn: anytype, data: []const u8, docmap: bool) !u64 {
                 if (next > payload.len or length < 13) return error.InvalidSparseSegment;
                 const chunk = payload[pos..end];
                 if (chunk[0] != CHUNK_FORMAT_VERSION) return error.InvalidChunk;
+                const header: usize = 13;
+                if (chunk.len < header) return error.InvalidChunk;
                 const count = std.mem.readInt(u32, chunk[1..5], .little);
                 const encoded = std.math.mul(usize, count, 5) catch return error.InvalidChunk;
-                if (encoded != chunk.len - 13) return error.InvalidChunk;
+                if (encoded != chunk.len - header) return error.InvalidChunk;
                 var doc_num: u32 = 0;
                 for (0..count) |i| {
-                    const delta = std.mem.readInt(u32, chunk[13 + i * 4 ..][0..4], .little);
+                    const delta = std.mem.readInt(u32, chunk[header + i * 4 ..][0..4], .little);
                     doc_num = std.math.add(u32, doc_num, delta) catch return error.InvalidChunk;
                     try self.documentNumber(doc_num);
                 }
                 const posting_bytes = std.math.mul(u64, count, 2 * @sizeOf(BulkPosting) + @sizeOf(u32) + @sizeOf(f32)) catch return error.ResourceBudgetExceeded;
-                self.bytes = std.math.add(u64, self.bytes, posting_bytes) catch return error.ResourceBudgetExceeded;
+                if (!self.streaming) self.bytes = std.math.add(u64, self.bytes, posting_bytes) catch return error.ResourceBudgetExceeded;
                 pos = next;
             }
         }
     };
     _ = try immutableVersion(data);
-    var context: Context = .{ .txn = txn, .bytes = std.math.mul(u64, data.len, 4) catch return error.ResourceBudgetExceeded };
-    if (docmap) _ = try forEachDocMapEntry(data, &context, Context.document) else try forEachSegmentTermPayload(data, &context, Context.posting);
+    var context: Context = .{ .txn = txn, .streaming = streaming, .bytes = std.math.mul(u64, data.len, 4) catch return error.ResourceBudgetExceeded };
+    if (docmap) {
+        _ = try forEachStoredDocMapEntry(txn, id.?, data, &context, Context.document);
+    } else if (posting_pages.paged(data)) {
+        context.bytes = if (streaming) try std.math.add(u64, context.bytes, posting_pages.max_block_bytes) else std.math.mul(u64, try posting_pages.materializedSize(data), 4) catch return error.ResourceBudgetExceeded;
+        try posting_pages.forEachBlock(txn, id.?, null, &context, Context.posting);
+    } else try forEachSegmentTermPayload(data, &context, Context.posting);
     return context.bytes;
 }
 
@@ -1319,7 +2140,11 @@ fn captureIncarnations(alloc: Allocator, txn: anytype, id: u64, data: []const u8
         var it = context.entries.valueIterator();
         while (it.next()) |entry| if (entry.doc_id) |bytes| alloc.free(bytes);
     }
-    if (docmap) _ = try forEachDocMapEntry(data, &context, Context.document) else try forEachSegmentTermPayload(data, &context, Context.posting);
+    if (docmap) {
+        _ = try forEachStoredDocMapEntry(txn, id, data, &context, Context.document);
+    } else if (posting_pages.paged(data)) {
+        try posting_pages.forEachBlock(txn, id, null, &context, Context.posting);
+    } else try forEachSegmentTermPayload(data, &context, Context.posting);
     const result = try alloc.alloc(CapturedIncarnation, context.entries.count());
     var it = context.entries.valueIterator();
     for (result) |*entry| entry.* = it.next().?.*;
@@ -1347,7 +2172,7 @@ fn forEachCurrentDocMapEntry(txn: anytype, key: []const u8, data: []const u8, co
         }
     };
     var filtered: Context = .{ .txn = txn, .segment_id = std.mem.readInt(u64, key[1..9], .big), .version = try immutableVersion(data), .caller = context };
-    return forEachDocMapEntry(data, &filtered, Context.visit);
+    return forEachStoredDocMapEntry(txn, filtered.segment_id, data, &filtered, Context.visit);
 }
 
 fn metaKey(kind: u8) *const [2]u8 {
@@ -1356,6 +2181,8 @@ fn metaKey(kind: u8) *const [2]u8 {
         meta_doc_count => &.{ key_meta, meta_doc_count },
         meta_term_count => &.{ key_meta, meta_term_count },
         meta_next_segment_id => &.{ key_meta, meta_next_segment_id },
+        meta_complete_locators => &.{ key_meta, meta_complete_locators },
+        meta_complete_physical => &.{ key_meta, meta_complete_physical },
         else => unreachable,
     };
 }
@@ -1621,7 +2448,7 @@ pub const SparseIndex = struct {
             try txn.commit();
         }
 
-        return .{
+        var result: SparseIndex = .{
             .alloc = alloc,
             .store = opened.store,
             .owner = opened.owner,
@@ -1631,6 +2458,8 @@ pub const SparseIndex = struct {
             .doc_count = doc_count,
             .term_count = term_count,
         };
+        if (!opts.lsm_options.backend.read_only) try result.recoverCompactionIntents();
+        return result;
     }
 
     pub fn close(self: *SparseIndex) void {
@@ -1734,7 +2563,13 @@ pub const SparseIndex = struct {
         return try self.batchWithOptions(writes, deletes, .{});
     }
 
-    pub fn batchWithOptions(self: *SparseIndex, writes: []const SparseWrite, deletes: []const []const u8, options: BatchOptions) !void {
+    pub fn batchWithOptions(self: *SparseIndex, input: []const SparseWrite, deletes: []const []const u8, options: BatchOptions) !void {
+        var normalized = std.heap.ArenaAllocator.init(self.alloc);
+        defer normalized.deinit();
+        const working = try canonicalWorkingBytes(input);
+        var reservation: ?resource_manager_mod.Reservation = if (self.resource_manager != null and working != 0) try self.resource_manager.?.reserve(.sparse_apply_working_set, working) else null;
+        defer if (reservation) |*held| held.release();
+        const writes = try canonicalWrites(normalized.allocator(), self.alloc, input);
         self.write_profile.batch_calls += 1;
         self.write_profile.writes += writes.len;
         self.write_profile.deletes += deletes.len;
@@ -1775,12 +2610,15 @@ pub const SparseIndex = struct {
         var touched_terms = std.AutoHashMapUnmanaged(u32, void).empty;
         defer touched_terms.deinit(self.alloc);
         const touched_terms_ptr = if (options.defer_term_range_updates) &touched_terms else null;
+        var physical_maps: PhysicalMaps = .{ .a = self.alloc };
+        defer physical_maps.deinit();
 
         // Process deletes
         var phase_start_ns = nowNs();
         for (deletes) |doc_id| {
             const effect = try self.processDelete(scratch, txn, doc_id, touched_terms_ptr);
             self.applyDeleteEffect(effect);
+            try physical_maps.update(txn, doc_id, null);
             _ = scratch_arena.reset(.retain_capacity);
         }
         self.write_profile.incremental_delete_ns += elapsedSince(phase_start_ns);
@@ -1789,8 +2627,10 @@ pub const SparseIndex = struct {
         phase_start_ns = nowNs();
         for (writes) |w| {
             try self.processInsert(scratch, txn, w.doc_id, w.vec, w.doc_num, touched_terms_ptr);
+            try physical_maps.update(txn, w.doc_id, try self.docNumForDocIdTxn(txn, w.doc_id));
             _ = scratch_arena.reset(.retain_capacity);
         }
+        try physical_maps.flush(txn);
         self.write_profile.incremental_insert_ns += elapsedSince(phase_start_ns);
 
         phase_start_ns = nowNs();
@@ -1815,6 +2655,7 @@ pub const SparseIndex = struct {
         for (writes) |write| {
             total +|= write.doc_id.len;
             total +|= @sizeOf(BulkDoc) + 128; // Incarnation counter and two bounded sidecar records.
+            total +|= write.doc_id.len + 37; // Typed forward locator key/value.
             total +|= @as(u64, @intCast(write.vec.indices.len)) * (@sizeOf(BulkPosting) + @sizeOf(u32) + @sizeOf(f32));
         }
         return total;
@@ -1829,14 +2670,25 @@ pub const SparseIndex = struct {
     pub const SegmentCompactionOptions = struct {
         min_segments: usize = 32,
         max_segments: usize = 128,
+        scratch: ?@import("../spill_sort.zig").Options = null,
+        background_publication: bool = false,
     };
 
     pub const SegmentCompactionSource = struct {
         id: u64,
         data: []u8,
         incarnations: []CapturedIncarnation,
+        proofs: ?DiskProofs = null,
+        fn captured(self: @This(), doc: u32, position: *usize) !?CapturedIncarnation {
+            if (self.proofs) |proofs| return if (try proofs.findFrom(doc, position)) |entry| .{ .doc_num = doc, .epoch = entry.epoch, .live = entry.live } else null;
+            return findCaptured(self.incarnations, doc);
+        }
 
         pub fn deinit(self: @This(), alloc: Allocator) void {
+            if (self.proofs) |proofs| {
+                var owned = proofs;
+                owned.deinit();
+            }
             alloc.free(self.data);
             for (self.incarnations) |entry| if (entry.doc_id) |bytes| alloc.free(bytes);
             alloc.free(self.incarnations);
@@ -1847,8 +2699,19 @@ pub const SparseIndex = struct {
         sources: []SegmentCompactionSource,
         docmaps: []SegmentCompactionSource,
         buffer_reservation: ?resource_manager_mod.Reservation = null,
+        snapshot: ?backend_erased.ReadTxn = null,
+        scratch: ?@import("../spill_sort.zig").Options = null,
+        generation: ?u64 = null,
+        // The maintenance owner pins the store lifecycle; this copy remains
+        // stable if the IndexManager's sparse entry array moves during apply.
+        store: ?backend_erased.Store = null,
 
         pub fn deinit(self: *SegmentCompactionTask, alloc: Allocator) void {
+            if (self.snapshot) |*snapshot| snapshot.abort();
+            if (self.generation) |id| if (self.store) |store| {
+                var writer: CompactionWriter = .{ .alloc = alloc, .store = store };
+                discardStaging(&writer, id) catch {};
+            };
             if (self.buffer_reservation) |*reservation| reservation.release();
             for (self.sources) |source| source.deinit(alloc);
             alloc.free(self.sources);
@@ -1860,15 +2723,26 @@ pub const SparseIndex = struct {
 
     pub const SegmentCompactionResult = struct {
         data: ?[]u8 = null,
+        pages: ?*posting_pages.Builder.Run = null,
+        directory_run: ?*posting_pages.Builder.Run = null,
+        staged: bool = false,
+        generation: ?u64 = null,
         docmap: ?[]u8 = null,
+        map_sort: ?@import("../spill_sort.zig").Sorter = null,
+        map_range: ?@import("../spill_sort.zig").Range = null,
         incarnations: []CapturedIncarnation = &.{},
         docmap_incarnations: []CapturedIncarnation = &.{},
+        proofs: ?DiskProofs = null,
         source_segments: u64 = 0,
         postings: u64 = 0,
 
         pub fn deinit(self: *SegmentCompactionResult, alloc: Allocator) void {
             if (self.data) |data| alloc.free(data);
+            if (self.pages) |pages| pages.deinit();
+            if (self.directory_run) |run| run.deinit();
+            if (self.proofs) |*proofs| proofs.deinit();
             if (self.docmap) |data| alloc.free(data);
+            if (self.map_sort) |*sort| sort.deinit();
             alloc.free(self.incarnations);
             alloc.free(self.docmap_incarnations);
             self.* = undefined;
@@ -1922,7 +2796,8 @@ pub const SparseIndex = struct {
         const max_segments = @max(min_segments, options.max_segments);
 
         var txn = try self.beginReadTxn();
-        defer txn.abort();
+        var snapshot_transferred = false;
+        defer if (!snapshot_transferred) txn.abort();
 
         // Preflight borrows immutable source bytes; reserve before any source
         // clone, hash table, decoded posting array or captured ID allocation.
@@ -1935,7 +2810,10 @@ pub const SparseIndex = struct {
             var entry_opt = try preflight.seekAtOrAfter(&prefix);
             while (entry_opt) |entry| {
                 if (entry.key.len == 0 or entry.key[0] != tag) break;
-                const bytes = try incarnationWorkingBytes(&txn, entry.value, kind == 1);
+                const bytes = if (options.scratch != null and try immutableVersion(entry.value) == SEGMENT_FORMAT_VERSION)
+                    @as(u64, entry.value.len) * 4 + posting_pages.max_block_bytes + 256 * 1024
+                else
+                    try incarnationWorkingBytes(&txn, entry.value, kind == 1, if (kind == 0) segmentIdFromKey(entry.key) else std.mem.readInt(u64, entry.key[1..9], .big), true);
                 preflight_bytes = std.math.add(u64, preflight_bytes, bytes) catch return error.ResourceBudgetExceeded;
                 counts[kind] += 1;
                 if (counts[kind] >= max_segments) break;
@@ -1952,7 +2830,6 @@ pub const SparseIndex = struct {
             sources.deinit(alloc);
         }
 
-        var source_bytes: u64 = 0;
         var cur = try txn.openCursor();
         defer cur.close();
         var maybe_segment = try cur.seekAtOrAfter(taggedPrefix(key_segment));
@@ -1962,7 +2839,7 @@ pub const SparseIndex = struct {
             const data = try alloc.dupe(u8, entry.value);
             var transferred = false;
             errdefer if (!transferred) alloc.free(data);
-            const incarnations = try captureIncarnations(alloc, &txn, id, data, false);
+            const incarnations = if (options.scratch != null and try immutableVersion(data) == SEGMENT_FORMAT_VERSION) try alloc.alloc(CapturedIncarnation, 0) else try captureIncarnations(alloc, &txn, id, data, false);
             const source: SegmentCompactionSource = .{ .id = id, .data = data, .incarnations = incarnations };
             sources.append(alloc, source) catch |err| {
                 for (incarnations) |item| if (item.doc_id) |bytes| alloc.free(bytes);
@@ -1970,11 +2847,6 @@ pub const SparseIndex = struct {
                 return err;
             };
             transferred = true;
-            source_bytes = std.math.add(u64, source_bytes, @intCast(data.len)) catch return error.ResourceBudgetExceeded;
-            source_bytes = std.math.add(u64, source_bytes, @as(u64, @intCast(incarnations.len)) * @sizeOf(CapturedIncarnation)) catch return error.ResourceBudgetExceeded;
-            for (incarnations) |item| if (item.doc_id) |bytes| {
-                source_bytes = std.math.add(u64, source_bytes, bytes.len) catch return error.ResourceBudgetExceeded;
-            };
             if (sources.items.len >= max_segments) break;
             maybe_segment = try cur.next();
         }
@@ -1993,18 +2865,13 @@ pub const SparseIndex = struct {
             const data = try alloc.dupe(u8, entry.value);
             var transferred = false;
             errdefer if (!transferred) alloc.free(data);
-            const incarnations = try captureIncarnations(alloc, &txn, id, data, true);
+            const incarnations = if (options.scratch != null and try immutableVersion(data) == SEGMENT_FORMAT_VERSION) try alloc.alloc(CapturedIncarnation, 0) else try captureIncarnations(alloc, &txn, id, data, true);
             docmaps.append(alloc, .{ .id = id, .data = data, .incarnations = incarnations }) catch |err| {
                 for (incarnations) |item| if (item.doc_id) |bytes| alloc.free(bytes);
                 alloc.free(incarnations);
                 return err;
             };
             transferred = true;
-            source_bytes = std.math.add(u64, source_bytes, @intCast(data.len)) catch return error.ResourceBudgetExceeded;
-            source_bytes = std.math.add(u64, source_bytes, @as(u64, @intCast(incarnations.len)) * @sizeOf(CapturedIncarnation)) catch return error.ResourceBudgetExceeded;
-            for (incarnations) |item| if (item.doc_id) |bytes| {
-                source_bytes = std.math.add(u64, source_bytes, bytes.len) catch return error.ResourceBudgetExceeded;
-            };
             if (docmaps.items.len >= max_segments) break;
             maybe_docmap = try docmap_cur.next();
         }
@@ -2029,7 +2896,13 @@ pub const SparseIndex = struct {
             alloc.free(owned_docmaps);
         }
 
+        const generation = if (options.background_publication and options.scratch != null) try self.reserveCompactionId() else null;
+        snapshot_transferred = true;
         return .{
+            .snapshot = txn,
+            .generation = generation,
+            .store = self.store,
+            .scratch = options.scratch,
             .sources = owned_sources,
             .docmaps = owned_docmaps,
             .buffer_reservation = reservation,
@@ -2038,69 +2911,219 @@ pub const SparseIndex = struct {
 
     pub fn executeSegmentCompactionTask(
         alloc: Allocator,
-        task: *const SegmentCompactionTask,
+        task: *SegmentCompactionTask,
         chunk_size: u32,
     ) !SegmentCompactionResult {
         var epochs = std.AutoHashMapUnmanaged(u32, CapturedIncarnation).empty;
         defer epochs.deinit(alloc);
-        var postings = std.ArrayListUnmanaged(BulkPosting).empty;
-        defer postings.deinit(alloc);
-
-        const PayloadContext = struct {
-            alloc: Allocator,
-            source_epochs: []const CapturedIncarnation,
-            epochs: *std.AutoHashMapUnmanaged(u32, CapturedIncarnation),
-            postings: *std.ArrayListUnmanaged(BulkPosting),
-
-            fn visit(ctx: *@This(), term_id: u32, payload: []const u8) !void {
-                var pos: usize = 0;
-                while (pos < payload.len) {
-                    if (pos + 8 > payload.len) return error.InvalidSparseSegment;
-                    const chunk_len = std.mem.readInt(u32, payload[pos..][0..4], .little);
-                    const range_len = std.mem.readInt(u32, payload[pos + 4 ..][0..4], .little);
-                    pos += 8;
-                    const chunk_end = pos + @as(usize, chunk_len);
-                    const range_end = chunk_end + @as(usize, range_len);
-                    if (range_end > payload.len) return error.InvalidSparseSegment;
-
-                    const decoded = try decodeChunk(ctx.alloc, payload[pos..chunk_end]);
-                    defer ctx.alloc.free(decoded.doc_nums);
-                    defer ctx.alloc.free(decoded.weights);
-                    for (decoded.doc_nums, 0..) |doc_num, i| {
-                        const captured = findCaptured(ctx.source_epochs, doc_num) orelse return error.InvalidSparseSegment;
-                        if (!captured.live) continue;
-                        try ctx.epochs.put(ctx.alloc, doc_num, .{ .doc_num = doc_num, .epoch = captured.epoch, .live = true });
-                        try ctx.postings.append(ctx.alloc, .{
-                            .term_id = term_id,
-                            .doc_num = doc_num,
-                            .weight = decoded.weights[i],
-                            .doc_id = captured.doc_id orelse return error.InvalidSparseSegment,
-                        });
-                    }
-                    pos = range_end;
-                }
-            }
-        };
-
-        for (task.sources) |source| {
-            var payload_ctx: PayloadContext = .{ .alloc = alloc, .source_epochs = source.incarnations, .epochs = &epochs, .postings = &postings };
-            try forEachSegmentTermPayload(source.data, &payload_ctx, PayloadContext.visit);
+        // Execute owns the pinned read lease until all input blocks have been
+        // consumed. Publication retains only immutable roots and epoch proofs.
+        defer {
+            if (task.snapshot) |*snapshot| snapshot.abort();
+            task.snapshot = null;
         }
-
-        std.mem.sort(BulkPosting, postings.items, {}, struct {
-            fn lessThan(_: void, a: BulkPosting, b: BulkPosting) bool {
-                if (a.term_id != b.term_id) return a.term_id < b.term_id;
-                return a.doc_num < b.doc_num;
+        if (task.scratch) |options| {
+            for (task.sources) |*source| if (source.proofs == null and try immutableVersion(source.data) == SEGMENT_FORMAT_VERSION) {
+                source.proofs = try captureDiskProofs(alloc, &task.snapshot.?, source.id, false, options);
+            };
+            for (task.docmaps) |*source| if (source.proofs == null and try immutableVersion(source.data) == SEGMENT_FORMAT_VERSION) {
+                source.proofs = try captureDiskProofs(alloc, &task.snapshot.?, source.id, true, options);
+            };
+        }
+        var reader: PageReader = .{ .txn = if (task.snapshot) |*snapshot| snapshot else return error.InvalidSparseSegment };
+        defer reader.deinit();
+        var builder = try posting_pages.Builder.init(alloc, task.scratch);
+        defer builder.deinit();
+        const TermIterator = posting_pages.Terms(backend_erased.ReadTxn);
+        const term_iterators = try alloc.alloc(TermIterator, task.sources.len);
+        defer alloc.free(term_iterators);
+        var opened: usize = 0;
+        defer for (term_iterators[0..opened]) |*iterator| iterator.deinit();
+        const term_heads = try alloc.alloc(?[20]u8, task.sources.len);
+        defer alloc.free(term_heads);
+        for (task.sources, term_iterators, term_heads) |source, *iterator, *head| {
+            iterator.* = try TermIterator.init(&task.snapshot.?, source.id, source.data);
+            opened += 1;
+            head.* = try iterator.next();
+        }
+        const proof_positions = try alloc.alloc(usize, task.sources.len);
+        defer alloc.free(proof_positions);
+        var streams = try alloc.alloc(daat.Stream, task.sources.len);
+        defer alloc.free(streams);
+        var chunk: std.ArrayListUnmanaged(BulkPosting) = .empty;
+        defer chunk.deinit(alloc);
+        const output_chunk_size = @min(@max(1, chunk_size), 65536);
+        var posting_count: u64 = 0;
+        while (true) {
+            var term: ?u32 = null;
+            for (term_heads) |head| if (head) |entry| {
+                const candidate = std.mem.readInt(u32, entry[0..4], .little);
+                term = if (term) |prior| @min(prior, candidate) else candidate;
+            };
+            const current = term orelse break;
+            @memset(proof_positions, 0);
+            var active: usize = 0;
+            defer for (streams[0..active]) |*stream| stream.deinit();
+            for (task.sources, term_heads, 0..) |source, head, source_index| {
+                const entry = head orelse continue;
+                if (std.mem.readInt(u32, entry[0..4], .little) != current) continue;
+                term_heads[source_index] = try term_iterators[source_index].next();
+                streams[active] = if (posting_pages.paged(source.data))
+                    .{ .weight = 1, .query_order = source_index, .segment = source.id, .term = current, .reader = reader.interface(), .allocator = alloc }
+                else
+                    .{ .weight = 1, .query_order = source_index, .payload = (try segmentTermPayload(source.data, current)) orelse return error.InvalidSparseSegment };
+                active += 1;
+                try streams[active - 1].advance();
             }
-        }.lessThan);
-
-        const merged = if (postings.items.len != 0) try encodeSegmentFromSortedPostings(alloc, postings.items, chunk_size) else null;
+            const Navigation = struct {
+                fn order(input: []daat.Stream, left: usize, right: usize) std.math.Order {
+                    const relation = std.math.order(input[left].doc.?, input[right].doc.?);
+                    return if (relation == .eq) std.math.order(left, right) else relation;
+                }
+            };
+            var queue = std.PriorityQueue(usize, []daat.Stream, Navigation.order).initContext(streams[0..active]);
+            defer queue.deinit(alloc);
+            for (streams[0..active], 0..) |stream, index| if (stream.doc != null) {
+                try queue.push(alloc, index);
+            };
+            var pending: ?BulkPosting = null;
+            while (queue.pop()) |index| {
+                const stream = &streams[index];
+                const doc = stream.doc.?;
+                const captured = (try task.sources[stream.query_order].captured(doc, &proof_positions[stream.query_order])) orelse return error.InvalidSparseSegment;
+                if (captured.live) {
+                    const contribution = try stream.contribution();
+                    if (pending != null and pending.?.doc_num == doc) {
+                        pending.?.weight = try daat.addScore(pending.?.weight, contribution);
+                    } else {
+                        if (pending) |posting| {
+                            try chunk.append(alloc, posting);
+                            if (chunk.items.len >= output_chunk_size) {
+                                try appendCompactionBlock(alloc, &builder, chunk.items);
+                                chunk.clearRetainingCapacity();
+                            }
+                        }
+                        if (task.scratch == null) try epochs.put(alloc, doc, .{ .doc_num = doc, .epoch = captured.epoch, .live = true });
+                        pending = .{ .term_id = current, .doc_num = doc, .weight = contribution, .doc_id = captured.doc_id orelse &.{} };
+                        posting_count += 1;
+                    }
+                }
+                try stream.advance();
+                if (stream.doc != null) try queue.push(alloc, index);
+            }
+            if (pending) |posting| try chunk.append(alloc, posting);
+            if (chunk.items.len != 0) {
+                try appendCompactionBlock(alloc, &builder, chunk.items);
+                chunk.clearRetainingCapacity();
+            }
+        }
+        const merged = try builder.finish();
         errdefer if (merged) |bytes| alloc.free(bytes);
         const incarnations = try alloc.alloc(CapturedIncarnation, epochs.count());
         errdefer alloc.free(incarnations);
         var epoch_it = epochs.valueIterator();
         for (incarnations) |*epoch| epoch.* = epoch_it.next().?.*;
 
+        var proofs: ?DiskProofs = if (task.scratch) |options| try DiskProofs.init(alloc, options) else null;
+        errdefer if (proofs) |*owned| owned.deinit();
+        if (proofs) |*output| {
+            const positions = try alloc.alloc(usize, task.sources.len);
+            defer alloc.free(positions);
+            @memset(positions, 0);
+            const heads = try alloc.alloc(CapturedIncarnation, task.sources.len);
+            defer alloc.free(heads);
+            const Merge = struct {
+                fn at(source: SegmentCompactionSource, position: usize) !?CapturedIncarnation {
+                    if (source.proofs) |disk| {
+                        if (position >= disk.count()) return null;
+                        const entry = try disk.at(position);
+                        return .{ .doc_num = entry.doc_num, .epoch = entry.epoch, .live = entry.live };
+                    }
+                    return if (position < source.incarnations.len) source.incarnations[position] else null;
+                }
+                fn order(entries: []CapturedIncarnation, left: usize, right: usize) std.math.Order {
+                    return std.math.order(entries[left].doc_num, entries[right].doc_num);
+                }
+            };
+            var queue = std.PriorityQueue(usize, []CapturedIncarnation, Merge.order).initContext(heads);
+            defer queue.deinit(alloc);
+            for (task.sources, 0..) |source, index| if (try Merge.at(source, 0)) |entry| {
+                heads[index] = entry;
+                try queue.push(alloc, index);
+            };
+            var pending: ?CapturedIncarnation = null;
+            while (queue.pop()) |index| {
+                const entry = heads[index];
+                if (pending) |prior| if (prior.doc_num != entry.doc_num) {
+                    if (prior.live) try output.append(.{ .doc_num = prior.doc_num, .epoch = prior.epoch, .live = true });
+                    pending = null;
+                };
+                if (pending == null or entry.live) pending = entry;
+                positions[index] += 1;
+                if (try Merge.at(task.sources[index], positions[index])) |next| {
+                    heads[index] = next;
+                    try queue.push(alloc, index);
+                }
+            }
+            if (pending) |entry| if (entry.live) try output.append(.{ .doc_num = entry.doc_num, .epoch = entry.epoch, .live = true });
+            try output.seal();
+        }
+        if (task.scratch) |options| {
+            var map_sort = try @import("../spill_sort.zig").Sorter.init(alloc, options);
+            errdefer map_sort.deinit();
+            const Context = struct {
+                a: Allocator,
+                source: SegmentCompactionSource,
+                sort: *@import("../spill_sort.zig").Sorter,
+                position: usize = 0,
+                fn visit(self: *@This(), entry: DocMapLookup) !bool {
+                    const doc = std.math.cast(u32, entry.doc_num) orelse return error.DocNumOverflow;
+                    const captured = (try self.source.captured(doc, &self.position)) orelse return error.InvalidSparseDocMapSegment;
+                    if (!captured.live) return false;
+                    const bytes = try self.a.alloc(u8, 12 + entry.doc_id.len + entry.fwd_data.len);
+                    defer self.a.free(bytes);
+                    std.mem.writeInt(u64, bytes[0..8], captured.epoch, .little);
+                    std.mem.writeInt(u32, bytes[8..12], @intCast(entry.doc_id.len), .little);
+                    @memcpy(bytes[12..][0..entry.doc_id.len], entry.doc_id);
+                    @memcpy(bytes[12 + entry.doc_id.len ..], entry.fwd_data);
+                    try self.sort.add(doc, bytes);
+                    return false;
+                }
+            };
+            for (task.docmaps) |source| {
+                var context: Context = .{ .a = alloc, .source = source, .sort = &map_sort };
+                _ = try forEachStoredDocMapEntry(&task.snapshot.?, source.id, source.data, &context, Context.visit);
+            }
+            const range = try map_sort.finish();
+            var count: u32 = 0;
+            if (range) |records| {
+                var cursor = @import("../spill_sort.zig").Cursor.init(alloc, map_sort.run, records);
+                defer cursor.deinit();
+                var previous: ?u64 = null;
+                while (try cursor.nextView()) |entry| {
+                    if (previous == null or previous.? != entry.key) {
+                        count = try std.math.add(u32, count, 1);
+                        previous = entry.key;
+                    }
+                }
+            }
+            const docmap = if (count != 0) try alloc.alloc(u8, 16) else null;
+            errdefer if (docmap) |data| alloc.free(data);
+            if (docmap) |data| {
+                @memcpy(data[0..8], paged_docmap_magic);
+                std.mem.writeInt(u32, data[8..12], SEGMENT_FORMAT_VERSION, .little);
+                std.mem.writeInt(u32, data[12..16], count, .little);
+            }
+            var result: SegmentCompactionResult = .{ .data = merged, .pages = builder.run, .directory_run = builder.terms, .incarnations = incarnations, .proofs = proofs, .docmap = docmap, .map_sort = map_sort, .map_range = range, .source_segments = @intCast(task.sources.len), .postings = posting_count };
+            if (task.generation) |id| {
+                var writer: CompactionWriter = .{ .alloc = alloc, .store = task.store.? };
+                try stageCompaction(&writer, id, &result);
+                result.staged = true;
+            }
+            builder.run = null;
+            builder.terms = null;
+            return result;
+        }
         var docmap_bytes = std.ArrayListUnmanaged(u8).empty;
         defer docmap_bytes.deinit(alloc);
         try docmap_bytes.appendSlice(alloc, docmap_magic);
@@ -2128,7 +3151,7 @@ pub const SparseIndex = struct {
         };
         for (task.docmaps) |source| {
             var ctx: DocMapContext = .{ .alloc = alloc, .source_epochs = source.incarnations, .epochs = &docmap_epochs, .bytes = &docmap_bytes };
-            _ = try forEachDocMapEntry(source.data, &ctx, DocMapContext.visit);
+            _ = try forEachStoredDocMapEntry(&task.snapshot.?, source.id, source.data, &ctx, DocMapContext.visit);
         }
         std.mem.writeInt(u32, docmap_bytes.items[docmap_magic.len + 4 ..][0..4], @intCast(docmap_epochs.count()), .little);
         const docmap_incarnations = try alloc.alloc(CapturedIncarnation, docmap_epochs.count());
@@ -2136,28 +3159,297 @@ pub const SparseIndex = struct {
         var docmap_it = docmap_epochs.valueIterator();
         for (docmap_incarnations) |*epoch| epoch.* = docmap_it.next().?.*;
         const docmap = if (docmap_epochs.count() != 0) try docmap_bytes.toOwnedSlice(alloc) else null;
+        const pages = builder.run;
+        builder.run = null;
+        errdefer if (pages) |run| run.deinit();
         return .{
             .data = merged,
+            .pages = pages,
             .docmap = docmap,
             .incarnations = incarnations,
+            .proofs = proofs,
             .docmap_incarnations = docmap_incarnations,
             .source_segments = @intCast(task.sources.len),
-            .postings = @intCast(postings.items.len),
+            .postings = posting_count,
         };
     }
 
-    pub fn finishSegmentCompactionTask(
+    // Durable intent records make abandoned staging and retired generations
+    // recoverable without scanning the archive or exposing partial roots.
+    fn pendingKey(id: u64) [9]u8 {
+        var key: [9]u8 = undefined;
+        key[0] = 0x12;
+        std.mem.writeInt(u64, key[1..9], id, .big);
+        return key;
+    }
+    fn reserveCompactionId(self: *SparseIndex) !u64 {
+        var txn = try self.beginBatchTxn(.{});
+        errdefer txn.abort();
+        const id = self.next_segment_id;
+        self.next_segment_id = try std.math.add(u64, id, 1);
+        errdefer self.next_segment_id = id;
+        try persistNextSegmentId(self, &txn);
+        try txn.put(&pendingKey(id), &.{});
+        try txn.commit();
+        return id;
+    }
+    fn reclaimCompactionId(self: anytype, id: u64) !void {
+        var read = try self.beginReadTxn();
+        var root_key: [16]u8 = undefined;
+        const posting_live = if (read.get(segmentKey(&root_key, id))) |_| true else |err| switch (err) {
+            error.NotFound => false,
+            else => {
+                read.abort();
+                return err;
+            },
+        };
+        const map_live = if (read.get(docMapSegmentKey(&root_key, id))) |_| true else |err| switch (err) {
+            error.NotFound => false,
+            else => {
+                read.abort();
+                return err;
+            },
+        };
+        read.abort();
+        if (!posting_live) {
+            while (true) {
+                var txn = try self.beginBatchTxn(.{});
+                errdefer txn.abort();
+                const more = try posting_pages.reclaimDirectoryPage(&txn, id);
+                try txn.commit();
+                if (!more) break;
+            }
+        }
+        for ([_]u8{ 0x0d, 0x11, key_segment_incarnation, key_docmap_incarnation, 0x13 }) |tag| {
+            if (if (tag == key_docmap_incarnation or tag == 0x13) map_live else posting_live) continue;
+            while (true) {
+                var txn = try self.beginBatchTxn(.{});
+                var batch_open = true;
+                defer if (batch_open) txn.abort();
+                var keys: [128][17]u8 = undefined;
+                var count: usize = 0;
+                {
+                    var cursor = try txn.openCursor();
+                    defer cursor.close();
+                    var prefix: [9]u8 = undefined;
+                    prefix[0] = tag;
+                    std.mem.writeInt(u64, prefix[1..9], id, .big);
+                    var next = try cursor.seekAtOrAfter(&prefix);
+                    while (next) |entry| {
+                        if (entry.key.len != 17 or !std.mem.eql(u8, entry.key[0..9], &prefix)) break;
+                        keys[count] = entry.key[0..17].*;
+                        count += 1;
+                        if (count == keys.len) break;
+                        next = try cursor.next();
+                    }
+                }
+                if (count == 0) break;
+                for (keys[0..count]) |key| txn.delete(&key) catch |err| switch (err) {
+                    error.NotFound => {},
+                    else => return err,
+                };
+                try txn.commit();
+                batch_open = false;
+            }
+        }
+        // Another worker may retire only this generation's posting root
+        // while its live docmap still needs locator refresh. Its durable
+        // intent belongs to the refreshing owner (or restart recovery).
+        if (!map_live) try clearCompactionIntent(self, id);
+    }
+    fn clearCompactionIntent(self: anytype, id: u64) !void {
+        var txn = try self.beginBatchTxn(.{});
+        errdefer txn.abort();
+        txn.delete(&pendingKey(id)) catch |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        };
+        try txn.commit();
+    }
+    fn refreshPagedLocators(self: anytype, id: u64, gate: ?MaintenanceGate) !void {
+        var read = try self.beginReadTxn();
+        defer read.abort();
+        var root_key: [16]u8 = undefined;
+        const root = read.get(docMapSegmentKey(&root_key, id)) catch |err| switch (err) {
+            error.NotFound => return,
+            else => return err,
+        };
+        if (!pagedDocMap(root)) return;
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        var epochs = try read.openCursor();
+        defer epochs.close();
+        const prefix = docMapEntryKey(id, 0);
+        var next = try cursor.seekAtOrAfter(prefix[0..9]);
+        while (next != null) {
+            if (gate) |g| try g.enter(g.ptr);
+            defer if (gate) |g| g.leave(g.ptr);
+            var updates = try self.beginBatchTxn(.{});
+            var updates_open = true;
+            defer if (updates_open) updates.abort();
+            const active = updates.get(docMapSegmentKey(&root_key, id)) catch |err| switch (err) {
+                error.NotFound => return,
+                else => return err,
+            };
+            if (!std.mem.eql(u8, active, root)) return;
+            var count: usize = 0;
+            while (next) |entry| {
+                if (entry.key.len != 17 or !std.mem.eql(u8, entry.key[0..9], prefix[0..9])) {
+                    next = null;
+                    break;
+                }
+                const doc = std.mem.readInt(u64, entry.key[9..17], .big);
+                if (entry.value.len < 4) return error.InvalidSparseDocMapSegment;
+                const len = std.mem.readInt(u32, entry.value[0..4], .little);
+                if (len > entry.value.len - 4) return error.InvalidSparseDocMapSegment;
+                if (len < 256) {
+                    var epoch_key: [17]u8 = undefined;
+                    const wanted = segmentIncarnationKey(&epoch_key, id, doc, true);
+                    const proof = (try epochs.seekAtOrAfter(wanted)) orelse return error.InvalidSparseDocMapSegment;
+                    if (!std.mem.eql(u8, proof.key, wanted) or proof.value.len != 8) return error.InvalidSparseDocMapSegment;
+                    const epoch = std.mem.readInt(u64, proof.value[0..8], .little);
+                    var tombstone: [16]u8 = undefined;
+                    const deleted = if (updates.get(docTombstoneKey(&tombstone, doc))) |_| true else |err| switch (err) {
+                        error.NotFound => false,
+                        else => return err,
+                    };
+                    if (!deleted and epoch == try currentIncarnation(&updates, doc)) {
+                        var locator: [36]u8 = undefined;
+                        std.mem.writeInt(u64, locator[0..8], doc, .little);
+                        std.mem.writeInt(u64, locator[8..16], id, .little);
+                        std.mem.writeInt(u64, locator[16..24], 4 + @as(u64, len), .little);
+                        std.mem.writeInt(u32, locator[24..28], @intCast(entry.value.len - 4 - len), .little);
+                        std.mem.writeInt(u64, locator[28..36], epoch, .little);
+                        var key: [256]u8 = undefined;
+                        try updates.put(locatorKey(&key, entry.value[4..][0..len]), &locator);
+                    }
+                }
+                count += 1;
+                next = try cursor.next();
+                if (count == 256) break;
+            }
+            try updates.commit();
+            updates_open = false;
+        }
+    }
+    fn recoverCompactionIntents(self: *SparseIndex) !void {
+        while (true) {
+            const id = blk: {
+                var txn = try self.beginReadTxn();
+                defer txn.abort();
+                var cursor = try txn.openCursor();
+                defer cursor.close();
+                const entry = (try cursor.seekAtOrAfter(&.{0x12})) orelse return;
+                if (entry.key.len != 9 or entry.key[0] != 0x12) return;
+                break :blk std.mem.readInt(u64, entry.key[1..9], .big);
+            };
+            try self.refreshPagedLocators(id, null);
+            try self.reclaimCompactionId(id);
+            try clearCompactionIntent(self, id);
+        }
+    }
+    fn stageCompaction(self: anytype, id: u64, result: *SegmentCompactionResult) !void {
+        if (result.pages) |run| {
+            const view = try run.sealedView();
+            var offset: u64 = 0;
+            while (offset < view.length) {
+                var txn = try self.beginBatchTxn(.{});
+                errdefer txn.abort();
+                var batch_bytes: usize = 0;
+                while (offset < view.length and batch_bytes < 4 * 1024 * 1024) {
+                    var header: [12]u8 = undefined;
+                    try view.readInto(offset, &header);
+                    offset += 12;
+                    const term = std.mem.readInt(u32, header[0..4], .little);
+                    const last = std.mem.readInt(u32, header[4..8], .little);
+                    const len = std.mem.readInt(u32, header[8..12], .little);
+                    if (len > posting_pages.max_block_bytes or len > view.length - offset) return error.InvalidSparseSegment;
+                    const bytes = try self.alloc.alloc(u8, len);
+                    defer self.alloc.free(bytes);
+                    try view.readInto(offset, bytes);
+                    try posting_pages.putBlock(&txn, id, term, last, bytes);
+                    offset += len;
+                    batch_bytes += len;
+                }
+                try txn.commit();
+            }
+        }
+        if (result.directory_run) |run| {
+            const root = result.data orelse return error.InvalidSparseSegment;
+            const view = try run.sealedView();
+            const header_len = 16 + @as(u64, std.mem.readInt(u32, root[12..16], .little)) * 20;
+            var offset: u64 = 0;
+            while (offset < view.length) {
+                var entries: [posting_pages.directory_page_terms * 20]u8 = undefined;
+                const len: usize = @intCast(@min(entries.len, view.length - offset));
+                if (len % 20 != 0) return error.InvalidSparseSegment;
+                try view.readInto(offset, entries[0..len]);
+                var at: usize = 0;
+                while (at < len) : (at += 20) {
+                    const relative = std.mem.readInt(u64, entries[at + 8 ..][0..8], .little);
+                    std.mem.writeInt(u64, entries[at + 8 ..][0..8], try std.math.add(u64, header_len, relative), .little);
+                }
+                var txn = try self.beginBatchTxn(.{});
+                errdefer txn.abort();
+                try posting_pages.putDirectoryPage(&txn, id, root, entries[0..len]);
+                try txn.commit();
+                offset += len;
+            }
+        }
+        if (result.map_range) |range| {
+            var cursor = @import("../spill_sort.zig").Cursor.init(self.alloc, result.map_sort.?.run, range);
+            defer cursor.deinit();
+            var previous: ?u64 = null;
+            var done = false;
+            while (!done) {
+                var txn = try self.beginBatchTxn(.{});
+                errdefer txn.abort();
+                var bytes: usize = 0;
+                while (bytes < 4 * 1024 * 1024) {
+                    const entry = (try cursor.next()) orelse {
+                        done = true;
+                        break;
+                    };
+                    if (previous != null and previous.? == entry.key) continue;
+                    if (entry.payload.len < 12) return error.ResourceBudgetExceeded;
+                    const epoch = std.mem.readInt(u64, entry.payload[0..8], .little);
+                    try txn.put(&docMapEntryKey(id, entry.key), entry.payload[8..]);
+                    try putSegmentIncarnation(&txn, id, entry.key, epoch, true);
+                    previous = entry.key;
+                    bytes += entry.payload.len;
+                }
+                try txn.commit();
+            }
+        }
+        if (result.proofs) |proofs| {
+            var offset: usize = 0;
+            while (offset < proofs.count()) {
+                var txn = try self.beginBatchTxn(.{});
+                errdefer txn.abort();
+                const end = @min(offset + 1024, proofs.count());
+                for (offset..end) |i| {
+                    const entry = try proofs.at(i);
+                    try putSegmentIncarnation(&txn, id, entry.doc_num, entry.epoch, false);
+                }
+                try txn.commit();
+                offset = end;
+            }
+        }
+    }
+    pub fn publishSegmentCompactionTask(
         self: *SparseIndex,
         task: *const SegmentCompactionTask,
         result: *SegmentCompactionResult,
     ) !bool {
         if (task.sources.len < 2 and task.docmaps.len < 2) return false;
 
+        const segment_id = task.generation orelse try self.reserveCompactionId();
+        var published = false;
+        defer if (!published and task.generation == null) self.reclaimCompactionId(segment_id) catch {};
+        if (!result.staged) try self.stageCompaction(segment_id, result);
         var txn = try self.beginBatchTxn(.{});
         var txn_open = true;
         defer if (txn_open) txn.abort();
-        const previous_segment_id = self.next_segment_id;
-        errdefer self.next_segment_id = previous_segment_id;
 
         for (task.sources) |source| {
             var key_buf: [16]u8 = undefined;
@@ -2177,42 +3469,97 @@ pub const SparseIndex = struct {
         }
 
         if (result.data != null or result.docmap != null) {
-            const segment_id = self.next_segment_id;
-            self.next_segment_id += 1;
             var key_buf: [16]u8 = undefined;
-            if (result.data) |data| try txnAppendPut(&txn, self.dbi, segmentKey(&key_buf, segment_id), data);
+            if (result.data) |data| {
+                if (result.pages) |pages| {
+                    _ = pages;
+                    try posting_pages.ensureRoutes(self.alloc, &txn);
+                    try posting_pages.publishRoutes(&txn, segment_id, data);
+                    try txn.put(segmentKey(&key_buf, segment_id), data);
+                } else {
+                    const root = try posting_pages.publish(self.alloc, &txn, segment_id, data);
+                    defer self.alloc.free(root);
+                    try txn.put(segmentKey(&key_buf, segment_id), root);
+                }
+            }
             if (result.docmap) |data| try txnAppendPut(&txn, self.dbi, docMapSegmentKey(&key_buf, segment_id), data);
             for (result.incarnations) |epoch| try putSegmentIncarnation(&txn, segment_id, epoch.doc_num, epoch.epoch, false);
             for (result.docmap_incarnations) |epoch| try putSegmentIncarnation(&txn, segment_id, epoch.doc_num, epoch.epoch, true);
-            try persistNextSegmentId(self, &txn);
+            if (result.docmap) |data| if (!pagedDocMap(data)) try publishDocMapLocators(self.alloc, &txn, segment_id, data);
         }
 
         for (task.sources) |source| {
             var key_buf: [16]u8 = undefined;
-            txnDelete(&txn, self.dbi, segmentKey(&key_buf, source.id)) catch {};
-            for (source.incarnations) |epoch| {
-                var key: [17]u8 = undefined;
-                txn.delete(segmentIncarnationKey(&key, source.id, epoch.doc_num, false)) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
-            }
+            try posting_pages.removeRoutes(&txn, source.id);
+            try txn.delete(segmentKey(&key_buf, source.id));
+            try txn.put(&pendingKey(source.id), &.{});
         }
         for (task.docmaps) |source| {
             var key_buf: [16]u8 = undefined;
             try txn.delete(docMapSegmentKey(&key_buf, source.id));
-            for (source.incarnations) |epoch| {
-                var key: [17]u8 = undefined;
-                txn.delete(segmentIncarnationKey(&key, source.id, epoch.doc_num, true)) catch |err| switch (err) {
-                    error.NotFound => {},
-                    else => return err,
-                };
-            }
+            try txn.put(&pendingKey(source.id), &.{});
         }
-
         try txn.commit();
         txn_open = false;
+        published = true;
+        result.generation = segment_id;
         return true;
+    }
+
+    pub const MaintenanceGate = struct {
+        ptr: *anyopaque,
+        enter: *const fn (*anyopaque) anyerror!void,
+        leave: *const fn (*anyopaque) void,
+    };
+    const CompactionWriter = struct {
+        alloc: Allocator,
+        store: backend_erased.Store,
+        fn beginReadTxn(self: *@This()) !backend_erased.ReadTxn {
+            return self.store.beginRead();
+        }
+        fn beginBatchTxn(self: *@This(), options: backend_types.BatchOptions) !backend_erased.Batch {
+            return self.store.beginBatchWithOptions(options);
+        }
+    };
+    fn discardStaging(writer: *CompactionWriter, id: u64) !void {
+        var read = try writer.beginReadTxn();
+        var key_buf: [16]u8 = undefined;
+        const live = blk: {
+            const posting = read.get(segmentKey(&key_buf, id)) catch |err| switch (err) {
+                error.NotFound => null,
+                else => {
+                    read.abort();
+                    return err;
+                },
+            };
+            if (posting != null) break :blk true;
+            const map = read.get(docMapSegmentKey(&key_buf, id)) catch |err| switch (err) {
+                error.NotFound => null,
+                else => {
+                    read.abort();
+                    return err;
+                },
+            };
+            if (map != null) break :blk true;
+            break :blk false;
+        };
+        read.abort();
+        // A live root retains its intent until locator refresh completes.
+        if (!live) try reclaimCompactionId(writer, id);
+    }
+    pub fn completeSegmentCompactionTask(alloc: Allocator, task: *const SegmentCompactionTask, result: *const SegmentCompactionResult, gate: ?MaintenanceGate) !void {
+        const id = result.generation orelse return;
+        var writer: CompactionWriter = .{ .alloc = alloc, .store = task.store.? };
+        try refreshPagedLocators(&writer, id, gate);
+        try reclaimCompactionId(&writer, id);
+        try clearCompactionIntent(&writer, id);
+        for (task.sources) |source| try reclaimCompactionId(&writer, source.id);
+        for (task.docmaps) |source| try reclaimCompactionId(&writer, source.id);
+    }
+    pub fn finishSegmentCompactionTask(self: *SparseIndex, task: *const SegmentCompactionTask, result: *SegmentCompactionResult) !bool {
+        const published = try self.publishSegmentCompactionTask(task, result);
+        if (published) try completeSegmentCompactionTask(self.alloc, task, result, null);
+        return published;
     }
 
     pub fn compactSegmentsWithOptions(self: *SparseIndex, alloc: Allocator, options: SegmentCompactionOptions) !bool {
@@ -2345,6 +3692,17 @@ pub const SparseIndex = struct {
             var rev_key_buf: [16]u8 = undefined;
             try txnAppendPut(&txn, self.dbi, revKey(&rev_key_buf, doc.doc_num), write.doc_id);
         }
+        try publishDocMapLocators(self.alloc, &txn, segment_id, docmap_data);
+        const complete = for (bulk_docs.items) |doc| {
+            if (writes[doc.write_idx].doc_id.len >= 256) break false;
+        } else true;
+        if (!complete) {
+            txn.delete(metaKey(meta_complete_locators)) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
+        } else if (prev_next_doc_num == 0) try txn.put(metaKey(meta_complete_locators), &.{1});
+        if (prev_next_doc_num == 0) try txn.put(metaKey(meta_complete_physical), &.{1});
         self.write_profile.fwd_rev_put_ns += elapsedSince(phase_start_ns);
 
         phase_start_ns = nowNs();
@@ -2370,7 +3728,9 @@ pub const SparseIndex = struct {
             const segment_data = try encodeSegmentFromSortedPostings(self.alloc, postings.items, self.chunk_size);
             defer self.alloc.free(segment_data);
             var segment_key_buf: [16]u8 = undefined;
-            try txnAppendPut(&txn, self.dbi, segmentKey(&segment_key_buf, segment_id), segment_data);
+            const root = try posting_pages.publish(self.alloc, &txn, segment_id, segment_data);
+            defer self.alloc.free(root);
+            try txn.put(segmentKey(&segment_key_buf, segment_id), root);
         }
         self.write_profile.posting_write_ns += elapsedSince(phase_start_ns);
 
@@ -2861,7 +4221,7 @@ pub const SparseIndex = struct {
         if (profile) |active_profile| active_profile.chunk_put_ns += elapsedSince(phase_start_ns);
 
         phase_start_ns = nowNs();
-        const meta = try encodeChunkRangeMeta(alloc, min_doc_id, max_doc_id);
+        const meta = try encodeChunkOrdinalRange(alloc, min_doc_id, max_doc_id, doc_nums, false);
         if (profile) |active_profile| active_profile.range_meta_encode_ns += elapsedSince(phase_start_ns);
         defer alloc.free(meta);
         var meta_ck_buf: [256]u8 = undefined;
@@ -3202,6 +4562,12 @@ pub const SparseIndex = struct {
             return doc_num;
         } else |_| {}
 
+        if (try readLocator(txn, doc_id)) |locator| {
+            if (self.docNumDeleted(txn, locator.num)) return error.NotFound;
+            return locator.num;
+        }
+        if (try completeLocatorMap(txn)) return error.NotFound;
+
         const LookupContext = struct {
             wanted_doc_id: []const u8,
             index: *SparseIndex,
@@ -3238,6 +4604,13 @@ pub const SparseIndex = struct {
             return try decodeFwdEntry(alloc, fwd_data);
         } else |_| {}
 
+        if (try locatedForwardBytes(txn, doc_id)) |bytes| {
+            const num = try decodeFwdDocNum(bytes);
+            if (self.docNumDeleted(txn, num)) return error.NotFound;
+            return try decodeFwdEntry(alloc, bytes);
+        }
+        if (try completeLocatorMap(txn)) return error.NotFound;
+
         const LookupContext = struct {
             alloc: Allocator,
             wanted_doc_id: []const u8,
@@ -3273,196 +4646,6 @@ pub const SparseIndex = struct {
         return decodeChunkRangeMeta(data);
     }
 
-    fn scoreFwdDataAgainstQuery(
-        data: []const u8,
-        query_weights: *const std.AutoHashMapUnmanaged(u32, f32),
-    ) !f32 {
-        const parsed = try parseFwdDocNumAndTermCount(data);
-        const term_count: usize = @intCast(parsed.term_count);
-        const terms_start = parsed.terms_start;
-        const weights_start = terms_start + term_count * 4;
-        if (data.len < weights_start + term_count * 4) return error.InvalidChunk;
-
-        var score: f32 = 0;
-        for (0..term_count) |i| {
-            const term_pos = terms_start + i * 4;
-            const term_id = std.mem.readInt(u32, data[term_pos..][0..4], .little);
-            const query_weight = query_weights.get(term_id) orelse continue;
-            const weight_pos = weights_start + i * 4;
-            const bits = std.mem.readInt(u32, data[weight_pos..][0..4], .little);
-            const doc_weight: f32 = @bitCast(bits);
-            score += query_weight * doc_weight;
-        }
-        return score;
-    }
-
-    fn appendForwardScoreIfMatch(
-        self: *SparseIndex,
-        alloc: Allocator,
-        txn: anytype,
-        entries: *std.ArrayListUnmanaged(ForwardScoreEntry),
-        query_weights: *const std.AutoHashMapUnmanaged(u32, f32),
-        doc_num: u32,
-        doc_id: []const u8,
-        fwd_data: []const u8,
-    ) !void {
-        if (self.docNumDeleted(txn, doc_num)) return;
-        const score = try scoreFwdDataAgainstQuery(fwd_data, query_weights);
-        if (score <= 0) return;
-        try entries.append(alloc, .{
-            .doc_num = doc_num,
-            .score = score,
-            .doc_id = try alloc.dupe(u8, doc_id),
-        });
-    }
-
-    fn maybeSearchFilterDriven(
-        self: *SparseIndex,
-        alloc: Allocator,
-        txn: anytype,
-        query_vec: *const SparseVector,
-        k: u32,
-        filter_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
-        direct_filter_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
-        exclude_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
-        direct_exclude_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
-        profile: ?*SearchProfile,
-    ) !?[]SearchResult {
-        if (k == 0 or query_vec.indices.len == 0) return try alloc.alloc(SearchResult, 0);
-        if (filter_doc_nums.count() == 0 and direct_filter_doc_nums.count() == 0) return null;
-
-        const filter_estimate = if (filter_doc_nums.count() == 0)
-            direct_filter_doc_nums.count()
-        else if (direct_filter_doc_nums.count() == 0)
-            filter_doc_nums.count()
-        else
-            @min(filter_doc_nums.count(), direct_filter_doc_nums.count());
-        // Forward-vector scoring wins only when the native positive filter is
-        // genuinely selective. Medium and broad filters are faster through the
-        // postings path because postings skip non-matching query terms without
-        // loading every filtered document vector.
-        const max_filter_docs = @min(@max(@as(usize, 128), @as(usize, k) * 32), @as(usize, 4096));
-        if (filter_estimate > max_filter_docs) return null;
-
-        var query_weights = std.AutoHashMapUnmanaged(u32, f32).empty;
-        defer query_weights.deinit(alloc);
-        try query_weights.ensureTotalCapacity(alloc, @intCast(query_vec.indices.len));
-        for (query_vec.indices, 0..) |term_id, i| {
-            const gop = try query_weights.getOrPut(alloc, term_id);
-            if (!gop.found_existing) gop.value_ptr.* = 0;
-            gop.value_ptr.* += query_vec.values[i];
-        }
-
-        var selected = std.ArrayListUnmanaged(u32).empty;
-        defer selected.deinit(alloc);
-        var wanted = std.AutoHashMapUnmanaged(u32, void).empty;
-        defer wanted.deinit(alloc);
-
-        const first = if (filter_doc_nums.count() > 0 and (direct_filter_doc_nums.count() == 0 or filter_doc_nums.count() <= direct_filter_doc_nums.count()))
-            filter_doc_nums
-        else
-            direct_filter_doc_nums;
-        const second = if (first == filter_doc_nums) direct_filter_doc_nums else filter_doc_nums;
-        var filter_it = first.iterator();
-        while (filter_it.next()) |entry| {
-            const doc_num = entry.key_ptr.*;
-            if (second.count() > 0 and !second.contains(doc_num)) continue;
-            if (exclude_doc_nums.contains(doc_num)) continue;
-            if (direct_exclude_doc_nums.contains(doc_num)) continue;
-            if (self.docNumDeleted(txn, doc_num)) continue;
-            try selected.append(alloc, doc_num);
-            try wanted.put(alloc, doc_num, {});
-        }
-        if (selected.items.len == 0) return try alloc.alloc(SearchResult, 0);
-        if (selected.items.len > max_filter_docs) return null;
-
-        var entries = std.ArrayListUnmanaged(ForwardScoreEntry).empty;
-        defer {
-            for (entries.items) |entry| {
-                if (entry.doc_id) |doc_id| alloc.free(doc_id);
-            }
-            entries.deinit(alloc);
-        }
-
-        const score_start_ns = if (profile != null) nowNs() else 0;
-        for (selected.items) |doc_num| {
-            if (!wanted.contains(doc_num)) continue;
-            var rev_buf: [256]u8 = undefined;
-            const doc_id = txnGet(txn, self.dbi, revKey(&rev_buf, doc_num)) catch continue;
-            if (doc_id.len + 1 > 256) continue;
-            var fwd_buf: [256]u8 = undefined;
-            const fwd_data = txnGet(txn, self.dbi, fwdKey(&fwd_buf, doc_id)) catch continue;
-            try self.appendForwardScoreIfMatch(alloc, txn, &entries, &query_weights, doc_num, doc_id, fwd_data);
-            _ = wanted.remove(doc_num);
-        }
-
-        if (wanted.count() > 0) {
-            const LookupContext = struct {
-                alloc: Allocator,
-                index: *SparseIndex,
-                txn: @TypeOf(txn),
-                wanted: *std.AutoHashMapUnmanaged(u32, void),
-                query_weights: *const std.AutoHashMapUnmanaged(u32, f32),
-                entries: *std.ArrayListUnmanaged(ForwardScoreEntry),
-
-                fn visit(ctx: *@This(), entry: DocMapLookup) !bool {
-                    if (entry.doc_num > std.math.maxInt(u32)) return false;
-                    const doc_num: u32 = @intCast(entry.doc_num);
-                    if (!ctx.wanted.contains(doc_num)) return false;
-                    try ctx.index.appendForwardScoreIfMatch(ctx.alloc, ctx.txn, ctx.entries, ctx.query_weights, doc_num, entry.doc_id, entry.fwd_data);
-                    _ = ctx.wanted.remove(doc_num);
-                    return ctx.wanted.count() == 0;
-                }
-            };
-
-            var cur = try txn.openCursor();
-            defer cur.close();
-            var maybe_entry = try cur.seekAtOrAfter(taggedPrefix(key_docmap_segment));
-            while (maybe_entry) |entry| {
-                if (entry.key.len == 0 or entry.key[0] != key_docmap_segment) break;
-                var ctx = LookupContext{
-                    .alloc = alloc,
-                    .index = self,
-                    .txn = txn,
-                    .wanted = &wanted,
-                    .query_weights = &query_weights,
-                    .entries = &entries,
-                };
-                if (try forEachCurrentDocMapEntry(txn, entry.key, entry.value, &ctx, LookupContext.visit)) break;
-                maybe_entry = try cur.next();
-            }
-        }
-        if (profile) |p| {
-            p.filter_forward_ns += nowNs() - score_start_ns;
-            p.filter_forward_docs = selected.items.len;
-            p.scored_docs = entries.items.len;
-            p.filter_forward_path = true;
-        }
-
-        std.mem.sort(ForwardScoreEntry, entries.items, {}, struct {
-            fn cmp(_: void, a: ForwardScoreEntry, b: ForwardScoreEntry) bool {
-                return a.score > b.score;
-            }
-        }.cmp);
-
-        const n = @min(@as(usize, @intCast(k)), entries.items.len);
-        if (n == 0) return try alloc.alloc(SearchResult, 0);
-        var results = try alloc.alloc(SearchResult, n);
-        errdefer alloc.free(results);
-        for (entries.items[0..n], 0..) |*entry, i| {
-            results[i] = .{
-                .doc_id = entry.doc_id.?,
-                .doc_num = entry.doc_num,
-                .score = entry.score,
-            };
-            entry.doc_id = null;
-        }
-        if (profile) |p| p.results = n;
-        return results;
-    }
-
-    /// Search for top-k documents matching a sparse query vector.
-    /// DAAT: accumulate scores per doc, then extract top-k.
     pub fn search(self: *SparseIndex, alloc: Allocator, query_vec: *const SparseVector, k: u32) ![]SearchResult {
         return try self.searchConstrained(alloc, query_vec, k, .{});
     }
@@ -3499,50 +4682,58 @@ pub const SparseIndex = struct {
         defer direct_exclude_doc_nums.deinit(alloc);
         if (profile_enabled) profile.filter_resolve_ns = nowNs() - filter_start_ns;
 
-        if (constraints.key_predicate == null) if (try self.maybeSearchFilterDriven(
-            alloc,
-            &txn,
-            query_vec,
-            k,
-            &filter_doc_nums,
-            &direct_filter_doc_nums,
-            &exclude_doc_nums,
-            &direct_exclude_doc_nums,
-            if (profile_enabled) &profile else null,
-        )) |results| {
-            if (profile_enabled) {
-                std.log.info(
-                    "antfly_bench_sparse_search k={d} terms={d} results={d} scored_docs={d} total_ms={d} filter_ms={d} filter_forward_ms={d} filter_forward_docs={d} segment_seek_ms={d} segment_decode_ms={d} delta_chunk_ms={d} score_collect_ms={d} sort_ms={d} hydrate_ms={d} segment_entries={d} segment_chunks={d} delta_chunks={d} filter_forward={}",
-                    .{
-                        k,
-                        query_vec.indices.len,
-                        profile.results,
-                        profile.scored_docs,
-                        (nowNs() - total_start_ns) / std.time.ns_per_ms,
-                        profile.filter_resolve_ns / std.time.ns_per_ms,
-                        profile.filter_forward_ns / std.time.ns_per_ms,
-                        profile.filter_forward_docs,
-                        profile.segment_seek_ns / std.time.ns_per_ms,
-                        profile.segment_decode_ns / std.time.ns_per_ms,
-                        profile.delta_chunk_ns / std.time.ns_per_ms,
-                        profile.score_collect_ns / std.time.ns_per_ms,
-                        profile.sort_ns / std.time.ns_per_ms,
-                        profile.hydrate_ns / std.time.ns_per_ms,
-                        profile.segment_entries,
-                        profile.segment_chunks,
-                        profile.delta_chunks,
-                        profile.filter_forward_path,
-                    },
-                );
+        const Lookup = struct {
+            index: *SparseIndex,
+            txn: @TypeOf(&txn),
+            cancellation: ?CancellationToken,
+            fn block(raw: *anyopaque, a: Allocator, prefix: []const u8, high: u32, rows: *const @import("../encoding/roaring.zig").RoaringBitmap, result: *@import("../encoding/roaring.zig").RoaringBitmap) !bool {
+                const ctx: *@This() = @ptrCast(@alignCast(raw));
+                return selectPhysicalBlock(ctx.txn, a, prefix, high, rows, result, ctx.cancellation);
             }
-            return results;
+            fn lookup(raw: *anyopaque, key: []const u8) !?u32 {
+                const ctx: *@This() = @ptrCast(@alignCast(raw));
+                return ctx.index.docNumForDocIdTxn(ctx.txn, key);
+            }
         };
+        var lookup: Lookup = .{ .index = self, .txn = &txn, .cancellation = constraints.cancellation };
+        const masks = if (constraints.key_predicate) |predicate|
+            if (predicate.select_constraints) |select| try select(predicate.ptr, alloc, .{ .ptr = &lookup, .one = Lookup.lookup, .block = Lookup.block }) else null
+        else
+            null;
+        var ordinal_exclude = if (masks) |selected| selected.exclude else null;
+        defer if (ordinal_exclude) |*bitmap| bitmap.deinit();
+        var ordinal_filter = if (masks) |selected| selected.include else if (constraints.key_predicate) |predicate|
+            if (predicate.select_ordinals) |select| try select(predicate.ptr, alloc, .{ .ptr = &lookup, .one = Lookup.lookup, .block = Lookup.block }) else null
+        else
+            null;
+        defer if (ordinal_filter) |*bitmap| bitmap.deinit();
+        if (ordinal_exclude) |*bitmap| try bitmap.prepareRead();
+        const predicate_resolved = if (masks) |selection| !selection.residual else ordinal_filter != null;
+        if (constraints.key_predicate == null and ordinal_filter == null and (filter_doc_nums.count() != 0 or direct_filter_doc_nums.count() != 0)) {
+            ordinal_filter = @import("../encoding/roaring.zig").RoaringBitmap.init(alloc);
+            const first = if (filter_doc_nums.count() != 0) &filter_doc_nums else &direct_filter_doc_nums;
+            var it = first.keyIterator();
+            while (it.next()) |num| {
+                if (filter_doc_nums.count() != 0 and direct_filter_doc_nums.count() != 0 and !direct_filter_doc_nums.contains(num.*)) continue;
+                try ordinal_filter.?.add(num.*);
+            }
+        }
+        if (ordinal_filter) |*bitmap| {
+            try bitmap.prepareRead();
+            if (bitmap.isEmpty()) return try alloc.alloc(SearchResult, 0);
+        }
 
         // Accumulate scores: docNum → score
-        var scores = std.AutoHashMapUnmanaged(u32, f32).empty;
-        defer scores.deinit(alloc);
+        var score_spill = constraints.score_spill;
+        if (score_spill) |*options| if (options.resource_manager == null) {
+            options.resource_manager = self.resource_manager;
+        };
+        var scores: ScoreAccumulator = .{ .alloc = alloc, .options = score_spill, .limit = constraints.max_score_docs, .cancellation = constraints.cancellation };
+        defer scores.deinit();
         var incarnations: IncarnationCache = .{};
         defer incarnations.deinit(alloc);
+        var visibility = try VisibilityReader.init(&txn);
+        defer visibility.deinit();
 
         // Point-seek the native reverse identity only for postings reached by
         // this query. Cache compressed decisions across terms; bulk publication
@@ -3550,19 +4741,23 @@ pub const SparseIndex = struct {
         const Decisions = struct {
             allowed: @import("../encoding/roaring.zig").RoaringBitmap,
             denied: @import("../encoding/roaring.zig").RoaringBitmap,
+            complete: bool,
+            identities: ?backend_erased.Cursor = null,
         };
-        var decisions: Decisions = .{ .allowed = .init(alloc), .denied = .init(alloc) };
+        var decisions: Decisions = .{ .allowed = .init(alloc), .denied = .init(alloc), .complete = try completeLocatorMap(&txn) };
         defer decisions.allowed.deinit();
         defer decisions.denied.deinit();
+        defer if (decisions.identities) |*cursor| cursor.close();
         const ScoreSource = enum { segment, delta };
         const AccumulateContext = struct {
             alloc: Allocator,
             txn: @TypeOf(&txn),
             incarnations: *IncarnationCache,
+            visibility: *VisibilityReader,
             segment_id: ?u64 = null,
             segment_version: u32 = 1,
             query_weight: f32,
-            scores: *std.AutoHashMapUnmanaged(u32, f32),
+            scores: *ScoreAccumulator,
             filter_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
             direct_filter_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
             exclude_doc_nums: *const std.AutoHashMapUnmanaged(u32, void),
@@ -3571,35 +4766,94 @@ pub const SparseIndex = struct {
             source: ScoreSource,
             cancellation: ?CancellationToken,
             key_predicate: ?KeyPredicate,
+            ordinal_filter: ?*const @import("../encoding/roaring.zig").RoaringBitmap,
+            ordinal_exclude: ?*const @import("../encoding/roaring.zig").RoaringBitmap,
             index: *SparseIndex,
             decisions: *Decisions,
 
+            pub fn check(ctx: *@This()) !void {
+                try checkSearchCancellation(ctx.cancellation);
+            }
+            pub fn nextCandidate(ctx: *@This(), first: u32) u64 {
+                const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
+                var includes: [1]*const Bitmap = undefined;
+                var excludes: [1]*const Bitmap = undefined;
+                var ni: usize = 0;
+                var ne: usize = 0;
+                if (ctx.ordinal_filter) |bitmap| {
+                    includes[0] = bitmap;
+                    ni = 1;
+                }
+                if (ctx.ordinal_exclude) |bitmap| {
+                    excludes[0] = bitmap;
+                    ne = 1;
+                }
+                return Bitmap.candidateLowerBound(first, 0x1_0000_0000, includes[0..ni], excludes[0..ne]);
+            }
+            pub fn mayMatch(ctx: *@This(), first: u32, last: u32) bool {
+                if (ctx.ordinal_filter) |bitmap| if (bitmap.rangeCardinality(first, @as(u64, last) + 1) == 0) return false;
+                if (ctx.ordinal_exclude) |bitmap| if (bitmap.rangeCardinality(first, @as(u64, last) + 1) == @as(u64, last) + 1 - first) return false;
+                return true;
+            }
+            fn allowsKey(ctx: *@This(), doc_num: u32) !bool {
+                if (ctx.key_predicate) |predicate| if (!ctx.decisions.allowed.contains(doc_num)) {
+                    if (ctx.decisions.denied.contains(doc_num)) return false;
+                    if (ctx.index.docNumDeleted(ctx.visibility, doc_num)) return false;
+                    var owned: ?[]u8 = null;
+                    defer if (owned) |id| ctx.alloc.free(id);
+                    const id = if (ctx.decisions.complete) blk: {
+                        // Borrow one reverse identity from independent cursor
+                        // scratch. Point gets would retain every reached key
+                        // until the parent transaction closes on arena backends.
+                        if (ctx.decisions.identities == null) ctx.decisions.identities = try ctx.txn.openCursor();
+                        var key: [9]u8 = undefined;
+                        const wanted = revKey(&key, doc_num);
+                        const entry = (try ctx.decisions.identities.?.seekAtOrAfter(wanted)) orelse return false;
+                        if (!std.mem.eql(u8, entry.key, wanted)) return false;
+                        break :blk entry.value;
+                    } else blk: {
+                        owned = ctx.index.resolveDocIdByDocNum(ctx.alloc, ctx.txn, doc_num) catch |err| switch (err) {
+                            error.NotFound => return false,
+                            else => return err,
+                        };
+                        break :blk owned.?;
+                    };
+                    if (!try predicate.allows(predicate.ptr, id)) {
+                        try ctx.decisions.denied.add(doc_num);
+                        return false;
+                    }
+                    try ctx.decisions.allowed.add(doc_num);
+                };
+                return true;
+            }
+            pub fn allows(ctx: *@This(), stream: daat.Stream, doc_num: u32) !bool {
+                if (ctx.ordinal_filter) |bitmap| if (!bitmap.contains(doc_num)) return false;
+                if (ctx.ordinal_exclude) |bitmap| if (bitmap.contains(doc_num)) return false;
+                if (ctx.filter_doc_nums.count() > 0 and !ctx.filter_doc_nums.contains(doc_num)) return false;
+                if (ctx.direct_filter_doc_nums.count() > 0 and !ctx.direct_filter_doc_nums.contains(doc_num)) return false;
+                if (ctx.exclude_doc_nums.contains(doc_num) or ctx.direct_exclude_doc_nums.contains(doc_num)) return false;
+                if (ctx.index.docNumDeleted(ctx.visibility, doc_num)) return false;
+                if (stream.segment) |id| if (!try ctx.incarnations.matches(ctx.alloc, ctx.visibility, id, stream.version, doc_num)) return false;
+                return ctx.allowsKey(doc_num);
+            }
+            fn shouldDecode(ctx: *@This(), bytes: []const u8, range: []const u8) !bool {
+                try checkSearchCancellation(ctx.cancellation);
+                return postingRangeMayMatch(range, bytes, ctx.ordinal_filter);
+            }
             fn visit(ctx: *@This(), decoded: DecodedChunk) !void {
                 const collect_start_ns = if (ctx.profile != null) nowNs() else 0;
                 for (decoded.doc_nums, 0..) |doc_num, di| {
                     if (di % 256 == 0) try checkSearchCancellation(ctx.cancellation);
+                    if (ctx.ordinal_filter) |bitmap| if (!bitmap.contains(doc_num)) continue;
+                    if (ctx.ordinal_exclude) |bitmap| if (bitmap.contains(doc_num)) continue;
                     if (ctx.filter_doc_nums.count() > 0 and !ctx.filter_doc_nums.contains(doc_num)) continue;
                     if (ctx.direct_filter_doc_nums.count() > 0 and !ctx.direct_filter_doc_nums.contains(doc_num)) continue;
                     if (ctx.exclude_doc_nums.contains(doc_num)) continue;
                     if (ctx.direct_exclude_doc_nums.contains(doc_num)) continue;
-                    if (ctx.segment_id) |id| if (!try ctx.incarnations.matches(ctx.alloc, ctx.txn, id, ctx.segment_version, doc_num)) continue;
-                    if (ctx.key_predicate) |predicate| if (!ctx.decisions.allowed.contains(doc_num)) {
-                        if (ctx.decisions.denied.contains(doc_num)) continue;
-                        const id = ctx.index.resolveDocIdByDocNum(ctx.alloc, ctx.txn, doc_num) catch |err| switch (err) {
-                            error.NotFound => continue,
-                            else => return err,
-                        };
-                        defer ctx.alloc.free(id);
-                        if (!try predicate.allows(predicate.ptr, id)) {
-                            try ctx.decisions.denied.add(doc_num);
-                            continue;
-                        }
-                        try ctx.decisions.allowed.add(doc_num);
-                    };
+                    if (ctx.segment_id) |id| if (!try ctx.incarnations.matches(ctx.alloc, ctx.visibility, id, ctx.segment_version, doc_num)) continue;
+                    if (!try ctx.allowsKey(doc_num)) continue;
                     const doc_weight = decoded.weights[di];
-                    const gop = try ctx.scores.getOrPut(ctx.alloc, doc_num);
-                    if (!gop.found_existing) gop.value_ptr.* = 0;
-                    gop.value_ptr.* += ctx.query_weight * doc_weight;
+                    try ctx.scores.add(doc_num, ctx.query_weight * doc_weight);
                 }
                 if (ctx.profile) |p| {
                     p.score_collect_ns += nowNs() - collect_start_ns;
@@ -3611,106 +4865,166 @@ pub const SparseIndex = struct {
             }
         };
 
-        if (profile_enabled) profile.terms = query_vec.indices.len;
-        const segment_seek_start_ns = if (profile_enabled) nowNs() else 0;
-        var segment_cur = try txn.openCursor();
-        defer segment_cur.close();
-        var maybe_segment = try segment_cur.seekAtOrAfter(taggedPrefix(key_segment));
-        if (profile_enabled) profile.segment_seek_ns += nowNs() - segment_seek_start_ns;
-        while (maybe_segment) |segment_entry| {
-            try checkSearchCancellation(constraints.cancellation);
-            if (segment_entry.key.len == 0 or segment_entry.key[0] != key_segment) break;
-            if (profile_enabled) profile.segment_entries += 1;
-            for (query_vec.indices, 0..) |term_id, qi| {
-                var ctx = AccumulateContext{
+        var page_reader: PageReader = .{ .txn = &txn, .io = if (constraints.score_spill) |options| options.io else null };
+        defer page_reader.deinit();
+        var fast_entries: ?[]ScoreEntry = null;
+        defer if (fast_entries) |values| alloc.free(values);
+        if (decisions.complete) {
+            if (try collectPostingStreams(alloc, &txn, query_vec, constraints.cancellation, 64 * 1024 * 1024, &page_reader, if (ordinal_filter) |*bitmap| bitmap else null)) |input| {
+                defer {
+                    for (input) |*stream| stream.deinit();
+                    alloc.free(input);
+                }
+                var context = AccumulateContext{
                     .alloc = alloc,
                     .txn = &txn,
                     .incarnations = &incarnations,
-                    .segment_id = segmentIdFromKey(segment_entry.key) orelse return error.InvalidSparseSegment,
-                    .segment_version = try immutableVersion(segment_entry.value),
-                    .query_weight = query_vec.values[qi],
+                    .visibility = &visibility,
+                    .query_weight = 0,
                     .scores = &scores,
                     .filter_doc_nums = &filter_doc_nums,
                     .direct_filter_doc_nums = &direct_filter_doc_nums,
                     .exclude_doc_nums = &exclude_doc_nums,
                     .direct_exclude_doc_nums = &direct_exclude_doc_nums,
-                    .profile = if (profile_enabled) &profile else null,
+                    .profile = null,
                     .source = .segment,
                     .cancellation = constraints.cancellation,
-                    .key_predicate = constraints.key_predicate,
+                    .key_predicate = if (!predicate_resolved) constraints.key_predicate else null,
+                    .ordinal_filter = if (ordinal_filter) |*bitmap| bitmap else null,
+                    .ordinal_exclude = if (ordinal_exclude) |*bitmap| bitmap else null,
                     .index = self,
                     .decisions = &decisions,
                 };
-                const segment_decode_start_ns = if (profile_enabled) nowNs() else 0;
-                try forEachSegmentChunk(alloc, segment_entry.value, term_id, &ctx, AccumulateContext.visit);
-                if (profile_enabled) profile.segment_decode_ns += nowNs() - segment_decode_start_ns;
-            }
-            const segment_next_start_ns = if (profile_enabled) nowNs() else 0;
-            maybe_segment = try segment_cur.next();
-            if (profile_enabled) profile.segment_seek_ns += nowNs() - segment_next_start_ns;
-        }
-
-        for (query_vec.indices, 0..) |term_id, qi| {
-            try checkSearchCancellation(constraints.cancellation);
-            const query_weight = query_vec.values[qi];
-            // Check term metadata
-            var meta_key_buf: [256]u8 = undefined;
-            const mk = invMetaKey(&meta_key_buf, term_id);
-            const meta_data = txn.get(mk) catch continue;
-            const tm = decodeTermMeta(meta_data);
-
-            // Scan all chunks for this term
-            for (0..tm.chunk_count) |ci| {
-                if (ci % 32 == 0) try checkSearchCancellation(constraints.cancellation);
-                var ck_buf: [256]u8 = undefined;
-                const ck = invChunkKey(&ck_buf, term_id, @intCast(ci));
-                const chunk_data = txn.get(ck) catch continue;
-
-                const delta_start_ns = if (profile_enabled) nowNs() else 0;
-                const decoded = try decodeChunk(alloc, chunk_data);
-                defer alloc.free(decoded.doc_nums);
-                defer alloc.free(decoded.weights);
-
-                var ctx = AccumulateContext{
-                    .alloc = alloc,
-                    .txn = &txn,
-                    .incarnations = &incarnations,
-                    .query_weight = query_weight,
-                    .scores = &scores,
-                    .filter_doc_nums = &filter_doc_nums,
-                    .direct_filter_doc_nums = &direct_filter_doc_nums,
-                    .exclude_doc_nums = &exclude_doc_nums,
-                    .direct_exclude_doc_nums = &direct_exclude_doc_nums,
-                    .profile = if (profile_enabled) &profile else null,
-                    .source = .delta,
-                    .cancellation = constraints.cancellation,
-                    .key_predicate = constraints.key_predicate,
-                    .index = self,
-                    .decisions = &decisions,
+                var scoring_stats: daat.Stats = .{};
+                fast_entries = daat.collect(alloc, input, k, &context, &scoring_stats) catch |err| switch (err) {
+                    // Page sizes are learned lazily. A query exceeding the live
+                    // block budget retries through the existing bounded spill
+                    // collector after every admitted stream is released.
+                    error.ResourceBudgetExceeded => null,
+                    else => return err,
                 };
-                try AccumulateContext.visit(&ctx, decoded);
-                if (profile_enabled) profile.delta_chunk_ns += nowNs() - delta_start_ns;
+                if (profile_enabled) profile.scored_docs = scoring_stats.scored;
             }
         }
+        if (fast_entries == null) {
+            if (profile_enabled) profile.terms = query_vec.indices.len;
+            const segment_seek_start_ns = if (profile_enabled) nowNs() else 0;
+            var segment_cur = try txn.openCursor();
+            defer segment_cur.close();
+            var maybe_segment = try segment_cur.seekAtOrAfter(taggedPrefix(key_segment));
+            if (profile_enabled) profile.segment_seek_ns += nowNs() - segment_seek_start_ns;
+            while (maybe_segment) |segment_entry| {
+                try checkSearchCancellation(constraints.cancellation);
+                if (segment_entry.key.len == 0 or segment_entry.key[0] != key_segment) break;
+                if (profile_enabled) profile.segment_entries += 1;
+                for (query_vec.indices, 0..) |term_id, qi| {
+                    var ctx = AccumulateContext{
+                        .alloc = alloc,
+                        .txn = &txn,
+                        .incarnations = &incarnations,
+                        .visibility = &visibility,
+                        .segment_id = segmentIdFromKey(segment_entry.key) orelse return error.InvalidSparseSegment,
+                        .segment_version = try immutableVersion(segment_entry.value),
+                        .query_weight = query_vec.values[qi],
+                        .scores = &scores,
+                        .filter_doc_nums = &filter_doc_nums,
+                        .direct_filter_doc_nums = &direct_filter_doc_nums,
+                        .exclude_doc_nums = &exclude_doc_nums,
+                        .direct_exclude_doc_nums = &direct_exclude_doc_nums,
+                        .profile = if (profile_enabled) &profile else null,
+                        .source = .segment,
+                        .cancellation = constraints.cancellation,
+                        .key_predicate = if (!predicate_resolved) constraints.key_predicate else null,
+                        .ordinal_filter = if (ordinal_filter) |*bitmap| bitmap else null,
+                        .ordinal_exclude = if (ordinal_exclude) |*bitmap| bitmap else null,
+                        .index = self,
+                        .decisions = &decisions,
+                    };
+                    const segment_decode_start_ns = if (profile_enabled) nowNs() else 0;
+                    try forEachStoredSegmentChunk(alloc, &txn, ctx.segment_id.?, segment_entry.value, term_id, &ctx, AccumulateContext.visit);
+                    if (profile_enabled) profile.segment_decode_ns += nowNs() - segment_decode_start_ns;
+                }
+                const segment_next_start_ns = if (profile_enabled) nowNs() else 0;
+                maybe_segment = try segment_cur.next();
+                if (profile_enabled) profile.segment_seek_ns += nowNs() - segment_next_start_ns;
+            }
 
-        // Extract top-k using a simple sort (fine for reasonable result sizes)
-        const ScoreEntry = struct { doc_num: u32, score: f32 };
+            for (query_vec.indices, 0..) |term_id, qi| {
+                try checkSearchCancellation(constraints.cancellation);
+                const query_weight = query_vec.values[qi];
+                // Check term metadata
+                var meta_key_buf: [256]u8 = undefined;
+                const mk = invMetaKey(&meta_key_buf, term_id);
+                const meta_data = txn.get(mk) catch continue;
+                const tm = decodeTermMeta(meta_data);
+
+                // Scan all chunks for this term
+                for (0..tm.chunk_count) |ci| {
+                    if (ci % 32 == 0) try checkSearchCancellation(constraints.cancellation);
+                    var ck_buf: [256]u8 = undefined;
+                    const ck = invChunkKey(&ck_buf, term_id, @intCast(ci));
+                    const chunk_data = txn.get(ck) catch continue;
+
+                    if (!try chunkMayMatch(chunk_data, if (ordinal_filter) |*bitmap| bitmap else null)) continue;
+                    const delta_start_ns = if (profile_enabled) nowNs() else 0;
+                    const decoded = try decodeChunk(alloc, chunk_data);
+                    defer alloc.free(decoded.doc_nums);
+                    defer alloc.free(decoded.weights);
+
+                    var ctx = AccumulateContext{
+                        .alloc = alloc,
+                        .txn = &txn,
+                        .incarnations = &incarnations,
+                        .visibility = &visibility,
+                        .query_weight = query_weight,
+                        .scores = &scores,
+                        .filter_doc_nums = &filter_doc_nums,
+                        .direct_filter_doc_nums = &direct_filter_doc_nums,
+                        .exclude_doc_nums = &exclude_doc_nums,
+                        .direct_exclude_doc_nums = &direct_exclude_doc_nums,
+                        .profile = if (profile_enabled) &profile else null,
+                        .source = .delta,
+                        .cancellation = constraints.cancellation,
+                        .key_predicate = if (!predicate_resolved) constraints.key_predicate else null,
+                        .ordinal_filter = if (ordinal_filter) |*bitmap| bitmap else null,
+                        .ordinal_exclude = if (ordinal_exclude) |*bitmap| bitmap else null,
+                        .index = self,
+                        .decisions = &decisions,
+                    };
+                    try AccumulateContext.visit(&ctx, decoded);
+                    if (profile_enabled) profile.delta_chunk_ns += nowNs() - delta_start_ns;
+                }
+            }
+        }
         var entries = std.ArrayListUnmanaged(ScoreEntry).empty;
         defer entries.deinit(alloc);
-
-        var it = scores.iterator();
-        while (it.next()) |e| {
-            try checkSearchCancellation(constraints.cancellation);
-            try entries.append(alloc, .{ .doc_num = e.key_ptr.*, .score = e.value_ptr.* });
-        }
-        if (profile_enabled) profile.scored_docs = entries.items.len;
-
+        var heap = std.PriorityQueue(ScoreEntry, void, ScoreEntry.worse).initContext({});
+        defer heap.deinit(alloc);
+        // New checkpoints prove complete reverse identities. Tombstones must be
+        // removed before heap admission or deleted winners could hide live hits.
+        const bounded = try completeLocatorMap(&txn);
         const sort_start_ns = if (profile_enabled) nowNs() else 0;
-        std.mem.sort(ScoreEntry, entries.items, {}, struct {
-            fn cmp(_: void, a: ScoreEntry, b: ScoreEntry) bool {
-                return a.score > b.score; // descending
+        if (fast_entries) |values| try entries.appendSlice(alloc, values) else {
+            try scores.finish();
+            while (try scores.next(constraints.cancellation)) |entry| {
+                try checkSearchCancellation(constraints.cancellation);
+                if (profile_enabled) profile.scored_docs += 1;
+                if (self.docNumDeleted(&visibility, entry.doc_num)) continue;
+                if (!bounded) {
+                    try entries.append(alloc, entry);
+                } else if (heap.items.len < k) {
+                    try heap.push(alloc, entry);
+                } else if (heap.peek()) |worst| {
+                    if (ScoreEntry.better({}, entry, worst)) {
+                        _ = heap.pop();
+                        try heap.push(alloc, entry);
+                    }
+                }
             }
-        }.cmp);
+            if (bounded) try entries.appendSlice(alloc, heap.items);
+        }
+
+        std.mem.sort(ScoreEntry, entries.items, {}, ScoreEntry.better);
         if (profile_enabled) profile.sort_ns = nowNs() - sort_start_ns;
 
         const n = @min(k, @as(u32, @intCast(entries.items.len)));
@@ -4069,7 +5383,7 @@ pub const SparseIndex = struct {
                     .selected_doc_nums = &collected.selected_doc_nums,
                     .out = &out,
                 };
-                try forEachSegmentChunk(alloc, segment_entry.value, term_id, &segment_ctx, SegmentStatsContext.visit);
+                try forEachStoredSegmentChunk(alloc, &src_txn, segmentIdFromKey(segment_entry.key).?, segment_entry.value, term_id, &segment_ctx, SegmentStatsContext.visit);
             }
             maybe_segment = try src_cur.next();
         }
@@ -4537,7 +5851,7 @@ fn pruneTermPostings(
         }
         const encoded = try encodeChunk(alloc, out_doc_nums, out_weights);
         errdefer alloc.free(encoded);
-        const encoded_meta = try encodeChunkRangeMeta(alloc, range.min_doc_id, range.max_doc_id);
+        const encoded_meta = try encodeChunkOrdinalRange(alloc, range.min_doc_id, range.max_doc_id, out_doc_nums, false);
         errdefer alloc.free(encoded_meta);
         try kept.append(alloc, .{
             .chunk_bytes = encoded,
@@ -4729,7 +6043,7 @@ fn writeChunkWithRangeMetaToTxn(
     var ck_buf: [256]u8 = undefined;
     try txnPut(dest_txn, dest_dbi, invChunkKey(&ck_buf, term_id, chunk_idx), encoded);
 
-    const meta = try encodeChunkRangeMeta(alloc, min_doc_id, max_doc_id);
+    const meta = try encodeChunkOrdinalRange(alloc, min_doc_id, max_doc_id, doc_nums, false);
     defer alloc.free(meta);
     var meta_ck_buf: [256]u8 = undefined;
     try txnPut(dest_txn, dest_dbi, invChunkMetaKey(&meta_ck_buf, term_id, chunk_idx), meta);
@@ -4792,6 +6106,7 @@ test "sparse incarnation replacement preserves exact scores across compaction la
                 defer alloc.free(value);
                 std.mem.writeInt(u32, value[segment_magic.len..][0..4], 1, .little);
                 try txn.put(physical, value);
+                if (!docmap) try posting_pages.publishRoutes(&txn, id, value);
                 for ([_]u64{ 1, 2 }) |doc| {
                     var sidecar: [17]u8 = undefined;
                     try txn.delete(segmentIncarnationKey(&sidecar, id, doc, docmap));
@@ -4801,6 +6116,12 @@ test "sparse incarnation replacement preserves exact scores across compaction la
                 var key: [9]u8 = undefined;
                 try txn.delete(docIncarnationKey(&key, doc));
             }
+            // A real v1 checkpoint predates the point locator map too.
+            try txn.delete(metaKey(meta_complete_locators));
+            for ([_][]const u8{ "a", "b" }) |doc_id| {
+                var key: [256]u8 = undefined;
+                try txn.delete(locatorKey(&key, doc_id));
+            }
             try txn.commit();
         }
         try expectIncarnationSearch(&index, 1, &.{ .{ .id = "a", .score = 2 }, .{ .id = "b", .score = 5 } }, false);
@@ -4808,10 +6129,12 @@ test "sparse incarnation replacement preserves exact scores across compaction la
         try index.batchWithOptions(&.{.{ .doc_id = "a", .doc_num = 1, .vec = .{ .indices = &.{1}, .values = &.{9} } }}, &.{}, bulk);
         try expectIncarnationSearch(&index, 1, &.{ .{ .id = "a", .score = 9 }, .{ .id = "b", .score = 5 } }, false);
         try expectIncarnationSearch(&index, 3, &.{}, false);
-        var task = (try index.beginSegmentCompactionTask(alloc, .{ .min_segments = 2, .max_segments = 2 })) orelse return error.TestUnexpectedResult;
+        var task = (try index.beginSegmentCompactionTask(alloc, .{ .min_segments = 2, .max_segments = 2, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } })) orelse return error.TestUnexpectedResult;
         defer task.deinit(alloc);
         var compacted = try SparseIndex.executeSegmentCompactionTask(alloc, &task, index.chunk_size);
         defer compacted.deinit(alloc);
+        try std.testing.expect(compacted.pages != null);
+        try std.testing.expect(posting_pages.paged(compacted.data.?));
         // A fresh delta incarnation must invalidate already-built compaction
         // output without requiring any scan or rewrite in the mutation path.
         try index.batch(&.{.{ .doc_id = "a", .doc_num = 1, .vec = .{ .indices = &.{7}, .values = &.{6} } }}, &.{});
@@ -4913,14 +6236,14 @@ test "sparse incarnation preflight amortizes repeated terms and conservatively c
     defer alloc.free(repeated);
     var txn = try index.beginReadTxn();
     defer txn.abort();
-    const repeated_bytes = try incarnationWorkingBytes(&txn, repeated, false);
+    const repeated_bytes = try incarnationWorkingBytes(&txn, repeated, false, null, false);
     // Includes encoded buffers and posting arrays, not 512 metadata bytes for
     // every occurrence of the same document. Final reservation doubles this.
     try std.testing.expect(repeated_bytes < postings.len * 512);
     for (&postings, 0..) |*posting, i| posting.doc_num = if (i % 2 == 0) 1 else 4097;
     const collisions = try encodeSegmentFromSortedPostings(alloc, &postings, 128);
     defer alloc.free(collisions);
-    const collision_bytes = try incarnationWorkingBytes(&txn, collisions, false);
+    const collision_bytes = try incarnationWorkingBytes(&txn, collisions, false, null, false);
     try std.testing.expect(collision_bytes >= repeated_bytes + (postings.len - 1) * 512);
 }
 
@@ -5595,5 +6918,1085 @@ test "sparse backend store opens concrete txn handles" {
         const encoded = std.mem.toBytes(@as(u64, 10));
         try batch.put("meta:next_doc_num", &encoded);
         try batch.commit();
+    }
+}
+
+test "sparse physical ordinal selection uses canonical scoring and intersects direct constraints" {
+    const a = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "physical-ordinals");
+    defer cleanupTmp(path);
+    var idx = try SparseIndex.open(a, path, .{});
+    defer idx.close();
+    try idx.batchWithOptions(&.{
+        .{ .doc_id = "high", .vec = .{ .indices = &.{1}, .values = &.{10} } },
+        .{ .doc_id = "low", .vec = .{ .indices = &.{1}, .values = &.{1} } },
+    }, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    const Predicate = struct {
+        key: []const u8 = "low",
+        fn allows(_: *anyopaque, _: []const u8) !bool {
+            return error.UnexpectedReverseIdentityRead;
+        }
+        fn select(raw: *anyopaque, alloc: Allocator, lookup: OrdinalLookup) !?@import("../encoding/roaring.zig").RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var result = @import("../encoding/roaring.zig").RoaringBitmap.init(alloc);
+            errdefer result.deinit();
+            if (try lookup.one(lookup.ptr, self.key)) |num| try result.add(num);
+            return result;
+        }
+    };
+    var predicate: Predicate = .{};
+    const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+    const selected = try idx.searchConstrained(a, &query, 1, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_ordinals = Predicate.select } });
+    defer SparseIndex.freeResults(a, selected);
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expectEqualStrings("low", selected[0].doc_id);
+    const excluded = try idx.searchConstrained(a, &query, 1, .{ .exclude_doc_ids = &.{"low"}, .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_ordinals = Predicate.select } });
+    defer SparseIndex.freeResults(a, excluded);
+    try std.testing.expectEqual(@as(usize, 0), excluded.len);
+    for ([_]f32{ -1, 0 }) |weight| {
+        const signed_query: SparseVector = .{ .indices = &.{1}, .values = &.{weight} };
+        const signed = try idx.searchConstrained(a, &signed_query, 1, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_ordinals = Predicate.select } });
+        defer SparseIndex.freeResults(a, signed);
+        try std.testing.expectEqual(@as(usize, 1), signed.len);
+        try std.testing.expectEqual(weight, signed[0].score);
+    }
+    const absent_query: SparseVector = .{ .indices = &.{2}, .values = &.{-1} };
+    const absent = try idx.searchConstrained(a, &absent_query, 1, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_ordinals = Predicate.select } });
+    defer SparseIndex.freeResults(a, absent);
+    try std.testing.expectEqual(@as(usize, 0), absent.len);
+    predicate.key = "missing";
+    const empty = try idx.searchConstrained(a, &query, 1, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_ordinals = Predicate.select } });
+    defer SparseIndex.freeResults(a, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "sparse forward locators survive compaction replacement deletion and restart" {
+    const a = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "forward-locators");
+    defer cleanupTmp(path);
+    {
+        var idx = try SparseIndex.open(a, path, .{});
+        defer idx.close();
+        for ([_][]const u8{ "first", "second" }) |id| try idx.batchWithOptions(&.{.{ .doc_id = id, .vec = .{ .indices = &.{1}, .values = &.{1} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+        {
+            var txn = try idx.beginReadTxn();
+            defer txn.abort();
+            try std.testing.expect((try readLocator(&txn, "first")) != null);
+            const bytes = (try locatedForwardBytes(&txn, "first")).?;
+            try std.testing.expectEqual((try idx.docNumForDocIdTxn(&txn, "first")).?, try decodeFwdDocNum(bytes));
+        }
+        try std.testing.expect(try idx.compactSegmentsWithOptions(a, .{ .min_segments = 2 }));
+        {
+            var txn = try idx.beginReadTxn();
+            defer txn.abort();
+            try std.testing.expect((try locatedForwardBytes(&txn, "first")) != null);
+            try std.testing.expect((try locatedForwardBytes(&txn, "second")) != null);
+        }
+        try idx.batch(&.{.{ .doc_id = "first", .vec = .{ .indices = &.{1}, .values = &.{5} } }}, &.{"second"});
+    }
+    var reopened = try SparseIndex.open(a, path, .{});
+    defer reopened.close();
+    const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+    const hits = try reopened.searchConstrained(a, &query, 3, .{ .filter_doc_ids = &.{ "first", "second" } });
+    defer SparseIndex.freeResults(a, hits);
+    try std.testing.expectEqual(@as(usize, 1), hits.len);
+    try std.testing.expectEqualStrings("first", hits[0].doc_id);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), hits[0].score, 0.001);
+}
+
+test "sparse posting block bounds preserve v1 decoding and reject disjoint selections" {
+    const a = std.testing.allocator;
+    const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
+    const nums = &.{ @as(u32, 7), 100, std.math.maxInt(u32) };
+    const bytes = try encodeChunk(a, nums, &.{ -2, 0, 3 });
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(u8, 1), bytes[0]);
+    try std.testing.expectEqual(@as(usize, 13 + 3 * 5), bytes.len);
+    const extended = try encodeChunkOrdinalRange(a, "first", "last", nums, true);
+    defer a.free(extended);
+    const legacy = try encodeChunkRangeMeta(a, "first", "last");
+    defer a.free(legacy);
+    // The unmodified legacy decoder ignores the ordinal trailer.
+    const old_range = try decodeChunkRangeMeta(extended);
+    try std.testing.expectEqualStrings("first", old_range.min_doc_id);
+    try std.testing.expectEqualStrings("last", old_range.max_doc_id);
+    var rows = Bitmap.init(a);
+    defer rows.deinit();
+    try rows.add(1);
+    try std.testing.expect(!try chunkMayMatch(bytes, &rows));
+    try std.testing.expect(!try postingRangeMayMatch(extended, bytes, &rows));
+    try rows.add(std.math.maxInt(u32));
+    try std.testing.expect(try postingRangeMayMatch(extended, bytes, &rows));
+    try std.testing.expect(try postingRangeMayMatch(legacy, bytes, &rows));
+    const decoded = try decodeChunk(a, bytes);
+    defer a.free(decoded.doc_nums);
+    defer a.free(decoded.weights);
+    try std.testing.expectEqualSlices(u32, nums, decoded.doc_nums);
+    try std.testing.expectError(error.InvalidChunk, decodeChunk(a, bytes[0 .. bytes.len - 1]));
+}
+
+test "sparse physical block maps retain current identities across compaction edits and restart" {
+    const a = std.testing.allocator;
+    const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
+    const prefix = "lake2:" ++ "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" ++ ":00000000:";
+    const first = prefix ++ "0000000000000001";
+    const second = prefix ++ "0000000000000402";
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "physical-block-maps");
+    defer cleanupTmp(path);
+    {
+        var idx = try SparseIndex.open(a, path, .{});
+        defer idx.close();
+        for ([_][]const u8{ first, second }) |id| try idx.batchWithOptions(&.{.{ .doc_id = id, .vec = .{ .indices = &.{1}, .values = &.{1} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+        try std.testing.expect(try idx.compactSegmentsWithOptions(a, .{ .min_segments = 2 }));
+        try idx.batch(&.{.{ .doc_id = first, .vec = .{ .indices = &.{1}, .values = &.{5} } }}, &.{second});
+    }
+    var idx = try SparseIndex.open(a, path, .{});
+    defer idx.close();
+    var txn = try idx.beginReadTxn();
+    defer txn.abort();
+    var rows = Bitmap.init(a);
+    defer rows.deinit();
+    try rows.addRange(0, 2048);
+    var selected = Bitmap.init(a);
+    defer selected.deinit();
+    try std.testing.expect(try selectPhysicalBlock(&txn, a, prefix, 0, &rows, &selected, null));
+    try std.testing.expectEqual(@as(usize, 1), selected.cardinality());
+    try std.testing.expect(selected.contains((try idx.docNumForDocIdTxn(&txn, first)).?));
+    // A legacy checkpoint without the completeness proof must request fallback.
+    txn.abort();
+    var write = try idx.beginWriteTxn();
+    errdefer write.abort();
+    try write.delete(metaKey(meta_complete_physical));
+    try write.commit();
+    txn = try idx.beginReadTxn();
+    try std.testing.expect(!try selectPhysicalBlock(&txn, a, prefix, 0, &rows, &selected, null));
+}
+
+test "sparse bounded top k matches legacy collection for signed terms and deleted winners" {
+    const a = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "bounded-top-k");
+    defer cleanupTmp(path);
+    var idx = try SparseIndex.open(a, path, .{});
+    defer idx.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const writes = try ca.alloc(SparseWrite, 300);
+    for (writes, 0..) |*write, i| {
+        const weights = try ca.alloc(f32, 2);
+        weights[0] = @floatFromInt(i);
+        weights[1] = @floatFromInt(i % 7);
+        write.* = .{ .doc_id = try std.fmt.allocPrint(ca, "doc-{d}", .{i}), .vec = .{ .indices = &.{ 1, 2 }, .values = weights } };
+    }
+    try idx.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    try idx.batch(&.{}, &.{ "doc-0", "doc-1", "doc-2" });
+    const query: SparseVector = .{ .indices = &.{ 1, 2 }, .values = &.{ -1, 3 } };
+    const bounded = try idx.search(a, &query, 7);
+    defer SparseIndex.freeResults(a, bounded);
+    try std.testing.expectEqual(@as(usize, 7), bounded.len);
+    var txn = try idx.beginWriteTxn();
+    errdefer txn.abort();
+    try txn.delete(metaKey(meta_complete_locators));
+    try txn.commit();
+    const legacy = try idx.search(a, &query, 7);
+    defer SparseIndex.freeResults(a, legacy);
+    try std.testing.expectEqual(bounded.len, legacy.len);
+    for (bounded, legacy) |actual, expected| {
+        try std.testing.expectEqualStrings(expected.doc_id, actual.doc_id);
+        try std.testing.expectEqual(expected.score, actual.score);
+    }
+}
+
+test "sparse bounded accumulation preserves signed f32 addition order across spill" {
+    const a = std.testing.allocator;
+    var scores: ScoreAccumulator = .{ .alloc = a, .limit = 2, .options = .{ .io = std.testing.io, .directory = "/tmp", .chunk_records = 2, .chunk_bytes = 128 } };
+    defer scores.deinit();
+    var expected: [100]f32 = @splat(0);
+    for ([_]f32{ 16777216, 1, -16777216, -0.25, 0.25, -2 }) |term| {
+        for (0..100) |doc| {
+            const contribution = term * @as(f32, @floatFromInt(doc + 1));
+            expected[doc] += contribution;
+            try scores.add(@intCast(doc), contribution);
+            try std.testing.expect(scores.values.count() <= 2);
+        }
+    }
+    try scores.finish();
+    var count: usize = 0;
+    while (try scores.next(null)) |entry| {
+        try std.testing.expectEqual(@as(u32, @intCast(count)), entry.doc_num);
+        try std.testing.expectEqual(@as(u32, @bitCast(expected[count])), @as(u32, @bitCast(entry.score)));
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 100), count);
+}
+
+test "sparse document streams bound retained segment bytes before scoring" {
+    const a = std.testing.allocator;
+    var bytes: [256]u8 = undefined;
+    const path = tmpPath(&bytes, "stream-byte-admission");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{});
+    defer index.close();
+    try index.batchWithOptions(&.{.{ .doc_id = "one", .vec = .{ .indices = &.{1}, .values = &.{1} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    var txn = try index.beginReadTxn();
+    defer txn.abort();
+    var query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+    var page_reader: PageReader = .{ .txn = &txn };
+    defer page_reader.deinit();
+    try std.testing.expect((try collectPostingStreams(a, &txn, &query, null, 0, &page_reader, null)) == null);
+    const admitted = (try collectPostingStreams(a, &txn, &query, null, 64 * 1024 * 1024, &page_reader, null)).?;
+    defer a.free(admitted);
+    try std.testing.expectEqual(@as(usize, 1), admitted.len);
+    query = .{ .indices = &.{999}, .values = &.{1} };
+    const unmatched = (try collectPostingStreams(a, &txn, &query, null, 0, &page_reader, null)).?;
+    defer a.free(unmatched);
+    try std.testing.expectEqual(@as(usize, 0), unmatched.len);
+}
+
+test "sparse paged postings roundtrip seek and reclaim immutable blocks" {
+    const a = std.testing.allocator;
+    var path_bytes: [256]u8 = undefined;
+    const path = tmpPath(&path_bytes, "paged-postings");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{});
+    defer index.close();
+    const postings = [_]BulkPosting{
+        .{ .term_id = 1, .doc_num = 0, .weight = 1, .doc_id = "a" },
+        .{ .term_id = 1, .doc_num = 1, .weight = 1.1, .doc_id = "b" },
+        .{ .term_id = 1, .doc_num = 2, .weight = 100, .doc_id = "c" },
+        .{ .term_id = 2, .doc_num = 2, .weight = -2, .doc_id = "c" },
+    };
+    const legacy = try encodeSegmentFromSortedPostings(a, &postings, 2);
+    defer a.free(legacy);
+    {
+        var txn = try index.beginBatchTxn(.{});
+        errdefer txn.abort();
+        const root = try posting_pages.publish(a, &txn, 42, legacy);
+        defer a.free(root);
+        const restored = try posting_pages.materialize(a, &txn, 42, root);
+        defer a.free(restored);
+        try std.testing.expectEqualSlices(u8, legacy, restored);
+        try std.testing.expect(try posting_pages.hasTermTxn(&txn, 42, root, 1));
+        try std.testing.expect(!try posting_pages.hasTermTxn(&txn, 42, root, 99));
+        try txn.commit();
+    }
+    {
+        var txn = try index.beginReadTxn();
+        defer txn.abort();
+        var reader: PageReader = .{ .txn = &txn, .io = std.testing.io };
+        defer reader.deinit();
+        var stream: daat.Stream = .{ .weight = 1, .segment = 42, .version = 2, .term = 1, .reader = reader.interface(), .allocator = a };
+        defer stream.deinit();
+        try stream.seek(0);
+        try stream.seek(2);
+        try std.testing.expectEqual(@as(?u32, 2), stream.doc);
+        try std.testing.expectEqual(@as(f32, 100), try stream.contribution());
+        try std.testing.expectEqual(@as(usize, 1), reader.blocks);
+        try stream.advance();
+        try std.testing.expectEqual(null, stream.doc);
+        try std.testing.expectEqual(@as(usize, 0), reader.resident);
+    }
+    {
+        var txn = try index.beginBatchTxn(.{});
+        errdefer txn.abort();
+        try posting_pages.remove(&txn, 42);
+        try txn.commit();
+    }
+    var txn = try index.beginReadTxn();
+    defer txn.abort();
+    var reader: PageReader = .{ .txn = &txn, .io = std.testing.io };
+    defer reader.deinit();
+    var stream: daat.Stream = .{ .weight = 1, .segment = 42, .term = 1, .reader = reader.interface(), .allocator = a };
+    defer stream.deinit();
+    try stream.seek(0);
+    try std.testing.expectEqual(null, stream.doc);
+}
+
+test "sparse paged archive admission depends on live blocks rather than segment bytes" {
+    const a = std.testing.allocator;
+    var path_bytes: [256]u8 = undefined;
+    const path = tmpPath(&path_bytes, "paged-archive-admission");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{ .chunk_size = 128 });
+    defer index.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const writes = try arena.allocator().alloc(SparseWrite, 2048);
+    for (writes, 0..) |*write, i| write.* = .{ .doc_id = try std.fmt.allocPrint(arena.allocator(), "doc-{d:0>4}", .{i}), .vec = .{ .indices = &.{1}, .values = &.{1} } };
+    try index.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    for (writes, 0..) |*write, i| write.doc_id = try std.fmt.allocPrint(arena.allocator(), "doc-{d:0>4}", .{i + 2048});
+    try index.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    var selected = @import("../encoding/roaring.zig").RoaringBitmap.init(a);
+    defer selected.deinit();
+    try selected.add(2047);
+    var txn = try index.beginReadTxn();
+    defer txn.abort();
+    {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const root = (try cursor.seekAtOrAfter(taggedPrefix(key_segment))).?.value;
+        try std.testing.expect(posting_pages.paged(root));
+        try std.testing.expect(try posting_pages.materializedSize(root) > 8192);
+    }
+    const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+    var reader: PageReader = .{ .txn = &txn, .budget = 8192 };
+    defer reader.deinit();
+    const streams = (try collectPostingStreams(a, &txn, &query, null, 1024, &reader, &selected)).?;
+    defer {
+        for (streams) |*stream| stream.deinit();
+        a.free(streams);
+    }
+    try std.testing.expectEqual(@as(usize, 1), streams.len);
+    const Context = struct {
+        pub fn check(_: *@This()) !void {}
+        pub fn allows(_: *@This(), _: daat.Stream, _: u32) !bool {
+            return true;
+        }
+        pub fn nextCandidate(_: *@This(), first: u32) u64 {
+            return if (first <= 2047) 2047 else @as(u64, std.math.maxInt(u32)) + 1;
+        }
+    };
+    var context: Context = .{};
+    var stats: daat.Stats = .{};
+    const results = try daat.collect(a, streams, 1, &context, &stats);
+    defer a.free(results);
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(u32, 2047), results[0].doc_num);
+    try std.testing.expectEqual(@as(usize, 1), reader.blocks);
+    try std.testing.expect(reader.bytes < 8192);
+}
+
+test "sparse selective filters retain quantized scores and tie order" {
+    const a = std.testing.allocator;
+    var path_bytes: [256]u8 = undefined;
+    const path = tmpPath(&path_bytes, "canonical-filter-scores");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{});
+    defer index.close();
+    try index.batchWithOptions(&.{
+        .{ .doc_id = "a", .vec = .{ .indices = &.{1}, .values = &.{1} } },
+        .{ .doc_id = "b", .vec = .{ .indices = &.{1}, .values = &.{1.1} } },
+        .{ .doc_id = "c", .vec = .{ .indices = &.{1}, .values = &.{100} } },
+    }, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+    const all = try index.search(a, &query, 3);
+    defer SparseIndex.freeResults(a, all);
+    const filtered = try index.searchConstrained(a, &query, 3, .{ .filter_doc_ids = &.{ "a", "b" } });
+    defer SparseIndex.freeResults(a, filtered);
+    try std.testing.expectEqual(@as(usize, 2), filtered.len);
+    for (filtered, all[1..]) |actual, expected| {
+        try std.testing.expectEqualStrings(expected.doc_id, actual.doc_id);
+        try std.testing.expectEqual(@as(u32, @bitCast(expected.score)), @as(u32, @bitCast(actual.score)));
+    }
+}
+
+test "sparse score accumulation rejects overflow in memory and spill" {
+    const a = std.testing.allocator;
+    var memory: ScoreAccumulator = .{ .alloc = a, .limit = 2, .options = null };
+    defer memory.deinit();
+    try memory.add(0, 3e38);
+    try std.testing.expectError(error.SparseScoreOverflow, memory.add(0, 3e38));
+    try std.testing.expectError(error.SparseScoreOverflow, memory.add(1, std.math.inf(f32)));
+    var spilled: ScoreAccumulator = .{ .alloc = a, .limit = 0, .options = .{ .io = std.testing.io, .directory = "/tmp", .chunk_records = 2, .chunk_bytes = 128 } };
+    defer spilled.deinit();
+    try spilled.add(0, 3e38);
+    try spilled.add(0, 3e38);
+    try spilled.finish();
+    try std.testing.expectError(error.SparseScoreOverflow, spilled.next(null));
+}
+
+test "sparse term routing skips unrelated roots and migrates legacy discovery atomically" {
+    const a = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "sparse-term-routing");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{ .backend = .lsm });
+    defer index.close();
+    const bulk: BatchOptions = .{ .prefer_bulk_build = true, .assume_new_doc_ids = true };
+    try index.batchWithOptions(&.{.{ .doc_id = "match", .vec = .{ .indices = &.{7}, .values = &.{2} } }}, &.{}, bulk);
+    try index.batchWithOptions(&.{.{ .doc_id = "unrelated", .vec = .{ .indices = &.{9}, .values = &.{3} } }}, &.{}, bulk);
+    {
+        var txn = try index.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(&.{0x0f});
+        try txn.commit();
+    }
+    try expectIncarnationSearch(&index, 7, &.{.{ .id = "match", .score = 2 }}, false);
+    try index.batchWithOptions(&.{.{ .doc_id = "new", .vec = .{ .indices = &.{11}, .values = &.{4} } }}, &.{}, bulk);
+    {
+        var txn = try index.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expect(try posting_pages.routed(&txn));
+        _ = try txn.get(&posting_pages.routeKey(7, 1));
+        _ = try txn.get(&posting_pages.routeKey(9, 2));
+    }
+    {
+        var txn = try index.beginWriteTxn();
+        errdefer txn.abort();
+        var key_buf: [16]u8 = undefined;
+        try txn.put(segmentKey(&key_buf, 2), "unreadable unrelated root");
+        try txn.commit();
+    }
+    try expectIncarnationSearch(&index, 7, &.{.{ .id = "match", .score = 2 }}, false);
+}
+
+test "sparse streamed compaction keeps input pages pinned across competing publication" {
+    const a = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "sparse-streamed-compaction-pin");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{ .backend = .lsm, .chunk_size = 1 });
+    defer index.close();
+    const bulk: BatchOptions = .{ .prefer_bulk_build = true, .assume_new_doc_ids = true };
+    try index.batchWithOptions(&.{.{ .doc_id = "a", .vec = .{ .indices = &.{ 1, 2 }, .values = &.{ 2, -3 } } }}, &.{}, bulk);
+    try index.batchWithOptions(&.{.{ .doc_id = "b", .vec = .{ .indices = &.{ 1, 2 }, .values = &.{ 5, -7 } } }}, &.{}, bulk);
+    const options: SparseIndex.SegmentCompactionOptions = .{ .min_segments = 2, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } };
+    var older = (try index.beginSegmentCompactionTask(a, options)).?;
+    defer older.deinit(a);
+    for (older.sources) |source| try std.testing.expect(posting_pages.paged(source.data));
+    try std.testing.expect(try index.compactSegmentsWithOptions(a, options));
+    var result = try SparseIndex.executeSegmentCompactionTask(a, &older, 1);
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(u64, 4), result.postings);
+    try std.testing.expect(result.pages != null);
+    try std.testing.expect(older.snapshot == null);
+    try std.testing.expect(!try index.finishSegmentCompactionTask(&older, &result));
+    try expectIncarnationSearch(&index, 1, &.{ .{ .id = "a", .score = 2 }, .{ .id = "b", .score = 5 } }, false);
+}
+
+test "sparse streamed compaction releases snapshots blocks and scratch on allocation failures" {
+    const Probe = struct {
+        var nonce: u64 = 0;
+        fn random(_: ?*anyopaque, bytes: []u8) std.Io.RandomSecureError!void {
+            @memset(bytes, 0x80);
+            std.mem.writeInt(u64, bytes[0..8], nonce, .little);
+            nonce += 1;
+        }
+        fn run(output: Allocator) !void {
+            // Private scratch filenames must repeat across fault-injection
+            // runs: random formatting lengths change allocator growth counts.
+            nonce = 0;
+            var io = std.testing.io;
+            var vtable = io.vtable.*;
+            vtable.randomSecure = random;
+            io.vtable = &vtable;
+            const a = std.testing.allocator;
+            var index = try SparseIndex.open(a, "unused", .{ .backend = .mem, .chunk_size = 1 });
+            defer index.close();
+            const bulk: BatchOptions = .{ .prefer_bulk_build = true, .assume_new_doc_ids = true };
+            try index.batchWithOptions(&.{.{ .doc_id = "a", .vec = .{ .indices = &.{ 1, 2 }, .values = &.{ 2, -3 } } }}, &.{}, bulk);
+            try index.batchWithOptions(&.{.{ .doc_id = "b", .vec = .{ .indices = &.{ 1, 2 }, .values = &.{ 5, -7 } } }}, &.{}, bulk);
+            var task = (try index.beginSegmentCompactionTask(a, .{ .min_segments = 2, .background_publication = true, .scratch = .{ .io = io, .directory = "/tmp" } })).?;
+            defer task.deinit(a);
+            var result = try SparseIndex.executeSegmentCompactionTask(output, &task, 1);
+            defer result.deinit(output);
+            try std.testing.expect(task.snapshot == null);
+            try std.testing.expectEqual(@as(u64, 4), result.postings);
+        }
+    };
+    // Force grow/copy allocation paths instead of address-dependent in-place
+    // remaps, so each fault index denotes the same allocation on every run.
+    var vtable = std.testing.allocator.vtable.*;
+    vtable.resize = Allocator.noResize;
+    vtable.remap = Allocator.noRemap;
+    const backing: Allocator = .{ .ptr = std.testing.allocator.ptr, .vtable = &vtable };
+    try Probe.run(backing);
+    try std.testing.checkAllAllocationFailures(backing, Probe.run, .{});
+}
+
+test "sparse staged generations hide partial output recover intents and retain old readers" {
+    const a = std.testing.allocator;
+    var path_bytes: [256]u8 = undefined;
+    const path = tmpPath(&path_bytes, "staged-generations");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{});
+    defer index.close();
+    const long_id: [255]u8 = @splat('x');
+    for ([_][]const u8{ "a", "b", &long_id }) |id| try index.batchWithOptions(&.{.{ .doc_id = id, .vec = .{ .indices = &.{1}, .values = &.{2} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    var task = (try index.beginSegmentCompactionTask(a, .{ .min_segments = 2, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } })).?;
+    defer task.deinit(a);
+    for (task.sources) |source| {
+        try std.testing.expect(source.proofs == null);
+        try std.testing.expectEqual(@as(usize, 0), source.incarnations.len);
+    }
+    for (task.docmaps) |source| {
+        try std.testing.expect(source.proofs == null);
+        try std.testing.expectEqual(@as(usize, 0), source.incarnations.len);
+    }
+    var old = try index.beginReadTxn();
+    var locator_key: [256]u8 = undefined;
+    const old_locator = try a.dupe(u8, try old.get(locatorKey(&locator_key, "a")));
+    defer a.free(old_locator);
+    var old_open = true;
+    defer if (old_open) old.abort();
+    var result = try SparseIndex.executeSegmentCompactionTask(a, &task, 1);
+    defer result.deinit(a);
+    try std.testing.expect(result.proofs != null);
+    try std.testing.expectEqual(@as(usize, 0), result.incarnations.len);
+    try std.testing.expect(pagedDocMap(result.docmap.?));
+    const abandoned = try index.reserveCompactionId();
+    try index.stageCompaction(abandoned, &result);
+    {
+        var txn = try index.beginReadTxn();
+        defer txn.abort();
+        var key: [16]u8 = undefined;
+        try std.testing.expectError(error.NotFound, txn.get(segmentKey(&key, abandoned)));
+    }
+    const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+    const partial = try index.search(a, &query, 5);
+    defer SparseIndex.freeResults(a, partial);
+    try std.testing.expectEqual(@as(usize, 3), partial.len);
+    try index.recoverCompactionIntents();
+    {
+        var txn = try index.beginReadTxn();
+        defer txn.abort();
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const prefix = posting_pages.key(abandoned, 0, 0);
+        if (try cursor.seekAtOrAfter(prefix[0..9])) |entry| try std.testing.expect(!std.mem.startsWith(u8, entry.key, prefix[0..9]));
+        try std.testing.expectError(error.NotFound, txn.get(&SparseIndex.pendingKey(abandoned)));
+    }
+    try std.testing.expect(try index.finishSegmentCompactionTask(&task, &result));
+    for ([_][]const u8{ "a", "b", &long_id }) |id| {
+        var txn = try index.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expect((try locatedForwardBytes(&txn, id)) != null);
+        try std.testing.expect((try locatedForwardBytes(&old, id)) != null);
+    }
+    // Simulate a crash after root publication but before locator refresh.
+    {
+        var txn = try index.beginBatchTxn(.{});
+        errdefer txn.abort();
+        const locator = (try readLocator(&txn, "a")).?;
+        var key: [256]u8 = undefined;
+        try txn.put(locatorKey(&key, "a"), old_locator);
+        try txn.put(&SparseIndex.pendingKey(locator.segment), &.{});
+        try txn.commit();
+    }
+    {
+        var read = try index.beginReadTxn();
+        defer read.abort();
+        const forward = try index.lookupFwdEntryByDocIdAlloc(a, &read, "a");
+        defer a.free(forward.term_ids);
+        defer a.free(forward.weights);
+        try std.testing.expectEqual(@as(usize, 1), forward.term_ids.len);
+    }
+    old.abort();
+    old_open = false;
+    index.close();
+    index = try SparseIndex.open(a, path, .{});
+    {
+        var txn = try index.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expect((try locatedForwardBytes(&txn, "a")) != null);
+    }
+    const hits = try index.search(a, &query, 5);
+    defer SparseIndex.freeResults(a, hits);
+    try std.testing.expectEqual(@as(usize, 3), hits.len);
+    // A later compatibility compaction must consume the paged document map too.
+    try index.batchWithOptions(&.{.{ .doc_id = "c", .vec = .{ .indices = &.{1}, .values = &.{2} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    try std.testing.expect(try index.compactSegmentsWithOptions(a, .{ .min_segments = 2 }));
+    const next_hits = try index.search(a, &query, 5);
+    defer SparseIndex.freeResults(a, next_hits);
+    try std.testing.expectEqual(@as(usize, 4), next_hits.len);
+    var read = try index.beginReadTxn();
+    defer read.abort();
+    try std.testing.expect((try locatedForwardBytes(&read, "a")) != null);
+}
+
+test "sparse physical translation borrows one map block instead of retaining point reads" {
+    const Probe = struct {
+        const Self = @This();
+        key: [89]u8 = undefined,
+        value: [6]u8 = undefined,
+        seeks: usize = 0,
+        gets: usize = 0,
+        closed: bool = false,
+        pub fn get(self: *@This(), k: []const u8) anyerror![]const u8 {
+            // An LSM point read survives until transaction close. Only the
+            // constant completeness marker may use that ownership contract.
+            if (!std.mem.eql(u8, k, metaKey(meta_complete_physical))) return error.RetainedPhysicalMapRead;
+            self.gets += 1;
+            return &.{1};
+        }
+        const Cursor = struct {
+            p: *Self,
+            pub fn close(self: *@This()) void {
+                self.p.closed = true;
+            }
+            pub fn seekAtOrAfter(self: *@This(), k: []const u8) !?struct { key: []const u8, value: []const u8 } {
+                self.p.seeks += 1;
+                self.p.key = k[0..89].*;
+                std.mem.writeInt(u16, self.p.value[0..2], 7, .little);
+                std.mem.writeInt(u32, self.p.value[2..6], @intCast(self.p.seeks), .little);
+                return .{ .key = &self.p.key, .value = &self.p.value };
+            }
+        };
+        pub fn openCursor(self: *@This()) !Cursor {
+            return .{ .p = self };
+        }
+    };
+    const a = std.testing.allocator;
+    var rows = @import("../encoding/roaring.zig").RoaringBitmap.init(a);
+    defer rows.deinit();
+    try rows.addRange(0, 1024 * 128);
+    var result = @import("../encoding/roaring.zig").RoaringBitmap.init(a);
+    defer result.deinit();
+    var txn: Probe = .{};
+    var prefix: [80]u8 = @splat('a');
+    @memcpy(prefix[0..6], "lake2:");
+    prefix[70] = ':';
+    prefix[79] = ':';
+    try std.testing.expect(try selectPhysicalBlock(&txn, a, &prefix, 0, &rows, &result, null));
+    try std.testing.expectEqual(@as(usize, 128), txn.seeks);
+    try std.testing.expectEqual(@as(usize, 1), txn.gets);
+    try std.testing.expect(txn.closed);
+    try std.testing.expectEqual(@as(u64, 128), result.cardinality());
+}
+
+test "sparse background directory pages stage routes before activation and reclaim abandoned output" {
+    const a = std.testing.allocator;
+    var index = try SparseIndex.open(a, "unused", .{ .backend = .mem });
+    defer index.close();
+    var terms: [130]u32 = undefined;
+    const weights: [130]f32 = @splat(2);
+    for (&terms, 0..) |*term, i| term.* = @intCast(i * 2);
+    const vector: SparseVector = .{ .indices = &terms, .values = &weights };
+    const bulk: BatchOptions = .{ .prefer_bulk_build = true, .assume_new_doc_ids = true };
+    for ([_][]const u8{ "a", "b" }) |id| try index.batchWithOptions(&.{.{ .doc_id = id, .vec = vector }}, &.{}, bulk);
+    const options: SparseIndex.SegmentCompactionOptions = .{ .min_segments = 2, .background_publication = true, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } };
+    var task = (try index.beginSegmentCompactionTask(a, options)).?;
+    var task_open = true;
+    defer if (task_open) task.deinit(a);
+    const id = task.generation.?;
+    var result = try SparseIndex.executeSegmentCompactionTask(a, &task, 8);
+    defer result.deinit(a);
+    try std.testing.expect(result.staged);
+    try std.testing.expectEqual(@as(usize, 32), result.data.?.len);
+    {
+        var read = try index.beginReadTxn();
+        defer read.abort();
+        var key_buf: [16]u8 = undefined;
+        try std.testing.expectError(error.NotFound, read.get(segmentKey(&key_buf, id)));
+        var iterator = try posting_pages.Terms(backend_erased.ReadTxn).init(&read, id, result.data.?);
+        defer iterator.deinit();
+        var count: usize = 0;
+        while (try iterator.next()) |entry| {
+            try std.testing.expectEqual(terms[count], std.mem.readInt(u32, entry[0..4], .little));
+            count += 1;
+        }
+        try std.testing.expectEqual(terms.len, count);
+        for (terms) |term| try std.testing.expect(try posting_pages.hasTermTxn(&read, id, result.data.?, term));
+        try std.testing.expect(!try posting_pages.hasTermTxn(&read, id, result.data.?, 127));
+        try std.testing.expectEqual(@as(usize, 9), (try read.get(&posting_pages.routeKey(258, id))).len);
+    }
+    try expectIncarnationSearch(&index, 258, &.{ .{ .id = "a", .score = 2 }, .{ .id = "b", .score = 2 } }, false);
+    // Cancellation before activation must reclaim both route families using
+    // their page ledger, even though no generation root ever existed.
+    task.deinit(a);
+    task_open = false;
+    {
+        var read = try index.beginReadTxn();
+        defer read.abort();
+        try std.testing.expectError(error.NotFound, read.get(&posting_pages.routeKey(258, id)));
+        try std.testing.expectError(error.NotFound, read.get(&posting_pages.bucketKey(258, posting_pages.intervalNode(0, 1), id)));
+        try std.testing.expectError(error.NotFound, read.get(&posting_pages.directoryKey(id, 258)));
+        try std.testing.expectError(error.NotFound, read.get(&SparseIndex.pendingKey(id)));
+    }
+    var active = (try index.beginSegmentCompactionTask(a, options)).?;
+    defer active.deinit(a);
+    var published = try SparseIndex.executeSegmentCompactionTask(a, &active, 8);
+    defer published.deinit(a);
+    try std.testing.expect(try index.publishSegmentCompactionTask(&active, &published));
+    try SparseIndex.completeSegmentCompactionTask(a, &active, &published, null);
+    try expectIncarnationSearch(&index, 258, &.{ .{ .id = "a", .score = 2 }, .{ .id = "b", .score = 2 } }, false);
+}
+
+test "sparse locator refresh stops after a generation retires between bounded batches" {
+    const a = std.testing.allocator;
+    var index = try SparseIndex.open(a, "unused", .{ .backend = .mem });
+    defer index.close();
+    const vector: SparseVector = .{ .indices = &.{1}, .values = &.{2} };
+    var ids: [512][16]u8 = undefined;
+    var writes: [512]SparseWrite = undefined;
+    for (&writes, &ids, 0..) |*write, *id, i| write.* = .{ .doc_id = try std.fmt.bufPrint(id, "doc-{d:0>4}", .{i}), .vec = vector };
+    const bulk: BatchOptions = .{ .prefer_bulk_build = true, .assume_new_doc_ids = true };
+    try index.batchWithOptions(writes[0..256], &.{}, bulk);
+    try index.batchWithOptions(writes[256..], &.{}, bulk);
+    const options: SparseIndex.SegmentCompactionOptions = .{ .min_segments = 2, .background_publication = true, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } };
+    var task = (try index.beginSegmentCompactionTask(a, options)).?;
+    defer task.deinit(a);
+    var result = try SparseIndex.executeSegmentCompactionTask(a, &task, 64);
+    defer result.deinit(a);
+    try std.testing.expect(try index.publishSegmentCompactionTask(&task, &result));
+    try index.batchWithOptions(&.{.{ .doc_id = "later", .vec = vector }}, &.{}, bulk);
+    const Gate = struct {
+        index: *SparseIndex,
+        enters: usize = 0,
+        leaves: usize = 0,
+        fn enter(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.enters += 1;
+            // A competing compaction fully installs the newer locators after
+            // the first 256 old records have been refreshed.
+            if (self.enters == 2) try std.testing.expect(try self.index.compactSegmentsWithOptions(std.testing.allocator, .{ .min_segments = 2, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } }));
+        }
+        fn leave(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.leaves += 1;
+        }
+    };
+    var gate: Gate = .{ .index = &index };
+    try SparseIndex.completeSegmentCompactionTask(a, &task, &result, .{ .ptr = &gate, .enter = Gate.enter, .leave = Gate.leave });
+    try std.testing.expectEqual(@as(usize, 2), gate.enters);
+    try std.testing.expectEqual(gate.enters, gate.leaves);
+    var read = try index.beginReadTxn();
+    defer read.abort();
+    for (writes) |write| {
+        const locator = (try readLocator(&read, write.doc_id)).?;
+        try std.testing.expect(locator.segment != result.generation.?);
+        try std.testing.expect((try locatedForwardBytes(&read, write.doc_id)) != null);
+    }
+}
+
+test "sparse background compaction retires fully deleted inputs without publishing empty spools" {
+    const a = std.testing.allocator;
+    var index = try SparseIndex.open(a, "unused", .{ .backend = .mem });
+    defer index.close();
+    for ([_][]const u8{ "a", "b" }) |id| try index.batchWithOptions(&.{.{ .doc_id = id, .vec = .{ .indices = &.{1}, .values = &.{2} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    try index.batch(&.{}, &.{ "a", "b" });
+    var task = (try index.beginSegmentCompactionTask(a, .{ .min_segments = 2, .background_publication = true, .scratch = .{ .io = std.testing.io, .directory = "/tmp" } })).?;
+    defer task.deinit(a);
+    var result = try SparseIndex.executeSegmentCompactionTask(a, &task, 8);
+    defer result.deinit(a);
+    try std.testing.expect(result.staged);
+    try std.testing.expect(result.data == null);
+    try std.testing.expect(result.pages == null);
+    try std.testing.expect(result.directory_run == null);
+    try std.testing.expect(try index.publishSegmentCompactionTask(&task, &result));
+    try SparseIndex.completeSegmentCompactionTask(a, &task, &result, null);
+    try std.testing.expectEqual(@as(usize, 0), try index.segmentCount());
+}
+
+test "sparse visibility reuses proven missing intervals and EOF without losing backward lookups" {
+    const Fake = struct {
+        entry: backend_erased.Entry,
+        seeks: *usize,
+        fail_next: *bool,
+        pub fn close(_: *@This()) void {}
+        pub fn first(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn last(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn next(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn prev(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn seekAtOrBefore(_: *@This(), _: []const u8) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_erased.Entry {
+            self.seeks.* += 1;
+            if (self.fail_next.*) {
+                self.fail_next.* = false;
+                return error.InjectedSeekFailure;
+            }
+            return if (std.mem.order(u8, self.entry.key, key) != .lt) self.entry else null;
+        }
+    };
+    var source_key: [17]u8 = undefined;
+    _ = segmentIncarnationKey(&source_key, 42, 9000, false);
+    var seeks: [3]usize = @splat(0);
+    var failures: [3]bool = @splat(false);
+    var cursors: [3]backend_erased.Cursor = undefined;
+    var opened: usize = 0;
+    errdefer for (cursors[0..opened]) |*cursor| cursor.close();
+    for (&cursors, 0..) |*cursor, lane| {
+        cursor.* = try backend_erased.cursorFrom(std.testing.allocator, Fake{
+            .entry = .{ .key = &source_key, .value = "epoch" },
+            .seeks = &seeks[lane],
+            .fail_next = &failures[lane],
+        });
+        opened += 1;
+    }
+    var reader: VisibilityReader = .{ .cursors = cursors };
+    opened = 0;
+    defer reader.deinit();
+    var key: [9]u8 = undefined;
+    for (0..100_003) |doc| {
+        try std.testing.expectError(error.NotFound, reader.get(docTombstoneKey(&key, doc)));
+        try std.testing.expectError(error.NotFound, reader.get(docIncarnationKey(&key, doc)));
+    }
+    try std.testing.expectEqualSlices(usize, &.{ 1, 1, 0 }, &seeks);
+    var requested: [17]u8 = undefined;
+    try std.testing.expectError(error.NotFound, reader.get(segmentIncarnationKey(&requested, 42, 8999, false)));
+    try std.testing.expectEqualStrings("epoch", try reader.get(&source_key));
+    try std.testing.expectEqual(@as(usize, 1), seeks[2]);
+    try std.testing.expectError(error.NotFound, reader.get(segmentIncarnationKey(&requested, 42, 9001, false)));
+    try std.testing.expectError(error.NotFound, reader.get(segmentIncarnationKey(&requested, 42, 100_003, false)));
+    try std.testing.expectEqual(@as(usize, 2), seeks[2]);
+    try std.testing.expectEqualStrings("epoch", try reader.get(&source_key));
+    try std.testing.expectError(error.NotFound, reader.get(segmentIncarnationKey(&requested, 42, 8999, false)));
+    try std.testing.expectEqual(@as(usize, 4), seeks[2]);
+    failures[2] = true;
+    try std.testing.expectError(error.InjectedSeekFailure, reader.get(segmentIncarnationKey(&requested, 42, 9001, false)));
+    try std.testing.expectEqualStrings("epoch", try reader.get(&source_key));
+    try std.testing.expectEqual(@as(usize, 6), seeks[2]);
+}
+
+test "sparse canonical dimensions agree between bulk delta and reopen" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |bulk| {
+        var pb: [256]u8 = undefined;
+        const path = tmpPath(&pb, if (bulk) "canonical-bulk" else "canonical-delta");
+        defer cleanupTmp(path);
+        var index = try SparseIndex.open(a, path, .{ .chunk_size = 2 });
+        defer index.close();
+        try index.batchWithOptions(&.{
+            .{ .doc_id = "winner", .vec = .{ .indices = &.{ 2, 1, 1 }, .values = &.{ 0, 6, 6 } } },
+            .{ .doc_id = "other", .vec = .{ .indices = &.{1}, .values = &.{10} } },
+        }, &.{}, .{ .prefer_bulk_build = bulk, .assume_new_doc_ids = bulk });
+        const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+        for (0..2) |_| {
+            const result = try index.search(a, &query, 1);
+            defer SparseIndex.freeResults(a, result);
+            try std.testing.expectEqualStrings("winner", result[0].doc_id);
+            try std.testing.expectApproxEqAbs(@as(f32, 12), result[0].score, 0.01);
+            index.close();
+            index = try SparseIndex.open(a, path, .{ .chunk_size = 2 });
+        }
+    }
+}
+
+test "sparse legacy repeated postings survive paged scoring compaction and restart" {
+    const a = std.testing.allocator;
+    for ([_]u32{ 2, 3 }) |chunk_size| {
+        var pb: [256]u8 = undefined;
+        const path = tmpPath(&pb, if (chunk_size == 2) "legacy-repeated-split" else "legacy-repeated-block");
+        defer cleanupTmp(path);
+        var index = try SparseIndex.open(a, path, .{ .chunk_size = chunk_size });
+        defer index.close();
+        const id = index.next_segment_id;
+        const writes = [_]SparseWrite{
+            .{ .doc_id = "zero", .doc_num = 0, .vec = .{ .indices = &.{1}, .values = &.{10} } },
+            .{ .doc_id = "one", .doc_num = 1, .vec = .{ .indices = &.{1}, .values = &.{10} } },
+            .{ .doc_id = "two", .doc_num = 2, .vec = .{ .indices = &.{1}, .values = &.{10} } },
+            .{ .doc_id = "winner", .doc_num = 3, .vec = .{ .indices = &.{1}, .values = &.{6} } },
+            .{ .doc_id = "four", .doc_num = 4, .vec = .{ .indices = &.{1}, .values = &.{6} } },
+        };
+        try index.batchWithOptions(&writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+        try index.batchWithOptions(&.{.{ .doc_id = "unrelated", .doc_num = 5, .vec = .{ .indices = &.{99}, .values = &.{1} } }}, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+        const postings = [_]BulkPosting{
+            .{ .term_id = 1, .doc_num = 0, .weight = 10, .doc_id = "zero" },
+            .{ .term_id = 1, .doc_num = 1, .weight = 10, .doc_id = "one" },
+            .{ .term_id = 1, .doc_num = 2, .weight = 10, .doc_id = "two" },
+            .{ .term_id = 1, .doc_num = 3, .weight = 6, .doc_id = "winner" },
+            .{ .term_id = 1, .doc_num = 3, .weight = 6, .doc_id = "winner" },
+            .{ .term_id = 1, .doc_num = 4, .weight = 6, .doc_id = "four" },
+        };
+        const legacy = try encodeSegmentFromSortedPostings(a, &postings, chunk_size);
+        defer a.free(legacy);
+        {
+            var txn = try index.beginWriteTxn();
+            errdefer txn.abort();
+            const root = try posting_pages.publish(a, &txn, id, legacy);
+            defer a.free(root);
+            var key_buf: [16]u8 = undefined;
+            try txn.put(segmentKey(&key_buf, id), root);
+            try txn.commit();
+        }
+        const query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+        for (0..3) |phase| {
+            const result = try index.search(a, &query, 1);
+            defer SparseIndex.freeResults(a, result);
+            try std.testing.expectEqualStrings("winner", result[0].doc_id);
+            try std.testing.expectEqual(@as(f32, 12), result[0].score);
+            if (phase == 0) try std.testing.expect(try index.compactSegmentsWithOptions(a, .{ .min_segments = 2 })) else if (phase == 1) {
+                index.close();
+                index = try SparseIndex.open(a, path, .{ .chunk_size = chunk_size });
+            }
+        }
+    }
+}
+
+test "sparse visibility pages bound interleaved epochs and retain pinned snapshots" {
+    const a = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "visibility-pages");
+    defer cleanupTmp(path);
+    var index = try SparseIndex.open(a, path, .{ .backend = .lsm });
+    defer index.close();
+    {
+        var write = try index.beginWriteTxn();
+        errdefer write.abort();
+        var key: [9]u8 = undefined;
+        const epoch = [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 };
+        for (0..256) |doc| {
+            if (doc == 17) continue;
+            try write.put(docIncarnationKey(&key, doc), &epoch);
+            for (0..40) |segment| try putSegmentIncarnation(&write, segment, doc, 7, false);
+        }
+        try write.commit();
+    }
+    var old = try index.beginReadTxn();
+    defer old.abort();
+    var reader = try VisibilityReader.init(&old);
+    defer reader.deinit();
+    var current: [9]u8 = undefined;
+    var source: [17]u8 = undefined;
+    for ([_]u64{ 0, 64, 128, 192 }) |doc| try std.testing.expectEqual(@as(u64, 7), try currentIncarnation(&reader, doc));
+    try std.testing.expectEqual(@as(usize, 0), reader.page_loads);
+    for (0..256) |doc| {
+        if (doc == 17) {
+            try std.testing.expectError(error.NotFound, reader.get(docIncarnationKey(&current, doc)));
+            continue;
+        }
+        try std.testing.expectEqual(@as(u64, 7), try currentIncarnation(&reader, doc));
+        for (0..40) |segment| try std.testing.expectEqual(@as(u64, 7), try segmentIncarnation(&reader, segment, SEGMENT_FORMAT_VERSION, doc, false));
+    }
+    try std.testing.expectEqual(@as(usize, 32), reader.page_count);
+    try std.testing.expectEqual(@as(usize, 32 * 4), reader.page_loads);
+    // A backward hole and a point outside the last page cannot reuse a false
+    // presence bit from another block or an interleaved segment.
+    try std.testing.expectError(error.NotFound, reader.get(docIncarnationKey(&current, 17)));
+    try std.testing.expectError(error.NotFound, reader.get(segmentIncarnationKey(&source, 2, 256, false)));
+    try std.testing.expectEqual(@as(u64, 7), try currentIncarnation(&reader, 0));
+    {
+        var write = try index.beginWriteTxn();
+        errdefer write.abort();
+        const epoch = [_]u8{ 9, 0, 0, 0, 0, 0, 0, 0 };
+        try write.put(docIncarnationKey(&current, 200), &epoch);
+        try write.commit();
+    }
+    try std.testing.expectEqual(@as(u64, 7), try currentIncarnation(&reader, 200));
+    var newer = try index.beginReadTxn();
+    defer newer.abort();
+    var newer_reader = try VisibilityReader.init(&newer);
+    defer newer_reader.deinit();
+    try std.testing.expectEqual(@as(u64, 9), try currentIncarnation(&newer_reader, 200));
+}
+
+test "sparse visibility partial page failures never become cached absence" {
+    const Fake = struct {
+        key: []const u8,
+        value: []const u8,
+        fail: *bool,
+        pub fn close(_: *@This()) void {}
+        pub fn first(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn last(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn prev(_: *@This()) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn seekAtOrBefore(_: *@This(), _: []const u8) !?backend_erased.Entry {
+            return error.UnexpectedTraversal;
+        }
+        pub fn next(self: *@This()) !?backend_erased.Entry {
+            if (self.fail.*) {
+                self.fail.* = false;
+                return error.InjectedPageReadFailure;
+            }
+            return null;
+        }
+        pub fn seekAtOrAfter(self: *@This(), key: []const u8) !?backend_erased.Entry {
+            return if (std.mem.order(u8, self.key, key) != .lt) .{ .key = self.key, .value = self.value } else null;
+        }
+    };
+    var key: [9]u8 = undefined;
+    var failure = true;
+    const epoch = [_]u8{ 7, 0, 0, 0, 0, 0, 0, 0 };
+    var cursor = try backend_erased.cursorFrom(std.testing.allocator, Fake{ .key = docIncarnationKey(&key, 7), .value = &epoch, .fail = &failure });
+    defer cursor.close();
+    var page: VisibilityReader.Page = .{ .cursor = cursor, .prefix_len = 1 };
+    page.prefix[0] = key_doc_incarnation;
+    try std.testing.expectError(error.InjectedPageReadFailure, page.get(&key));
+    try std.testing.expect(page.block == null);
+    try std.testing.expectEqualSlices(u8, &epoch, try page.get(&key));
+    try std.testing.expectEqual(@as(?u64, 0), page.block);
+    var missing: [9]u8 = undefined;
+    try std.testing.expectError(error.NotFound, page.get(docIncarnationKey(&missing, 8)));
+}
+
+test "sparse exclusion masks retain bounded scoring without reverse key callbacks" {
+    const a = std.testing.allocator;
+    var pb: [256]u8 = undefined;
+    const path = tmpPath(&pb, "exclusion-ordinals");
+    defer cleanupTmp(path);
+    var idx = try SparseIndex.open(a, path, .{ .chunk_size = 32 });
+    defer idx.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const writes = try ca.alloc(SparseWrite, 512);
+    for (writes, 0..) |*write, i| {
+        const values = try ca.alloc(f32, 2);
+        values[0] = @floatFromInt(i + 1);
+        values[1] = 1;
+        write.* = .{ .doc_id = try std.fmt.allocPrint(ca, "doc-{d}", .{i}), .vec = .{ .indices = &.{ 1, 2 }, .values = values } };
+    }
+    try idx.batchWithOptions(writes, &.{}, .{ .prefer_bulk_build = true, .assume_new_doc_ids = true });
+    const Selection = @import("ordinal_lookup.zig").Selection;
+    const Predicate = struct {
+        mode: enum { exclude, both, empty, residual } = .exclude,
+        calls: usize = 0,
+        fn allows(raw: *anyopaque, key: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.mode != .residual) return error.UnexpectedReverseIdentityRead;
+            self.calls += 1;
+            return try std.fmt.parseInt(usize, key[4..], 10) >= 300;
+        }
+        fn select(raw: *anyopaque, alloc: Allocator, lookup: OrdinalLookup) !?Selection {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var result: Selection = .{};
+            errdefer result.deinit();
+            if (self.mode == .residual) {
+                result.residual = true;
+                return result;
+            }
+            result.exclude = .init(alloc);
+            for (0..300) |i| {
+                var key: [32]u8 = undefined;
+                if (try lookup.one(lookup.ptr, try std.fmt.bufPrint(&key, "doc-{d}", .{i}))) |num| try result.exclude.?.add(num);
+            }
+            if (self.mode != .exclude) result.include = .init(alloc);
+            if (self.mode == .both) for (400..450) |i| {
+                var key: [32]u8 = undefined;
+                if (try lookup.one(lookup.ptr, try std.fmt.bufPrint(&key, "doc-{d}", .{i}))) |num| try result.include.?.add(num);
+            };
+            return result;
+        }
+    };
+    var predicate: Predicate = .{};
+    const excluded = try ca.alloc([]const u8, 300);
+    for (excluded, 0..) |*key, i| key.* = writes[i].doc_id;
+    const included = try ca.alloc([]const u8, 50);
+    for (included, 400..) |*key, i| key.* = writes[i].doc_id;
+    for ([_]@TypeOf(predicate.mode){ .exclude, .both, .empty, .residual }) |mode| {
+        predicate.mode = mode;
+        for ([_]f32{ 1, -1, 0 }) |weight| {
+            const query: SparseVector = .{ .indices = &.{ 1, 2 }, .values = &.{ weight, -1 } };
+            predicate.calls = 0;
+            const expected = try idx.searchConstrained(a, &query, 3, .{ .exclude_doc_ids = excluded, .filter_doc_ids = if (mode == .both) included else if (mode == .empty) &.{"missing"} else &.{} });
+            defer SparseIndex.freeResults(a, expected);
+            const actual = try idx.searchConstrained(a, &query, 3, .{ .max_score_docs = 1, .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_constraints = Predicate.select } });
+            defer SparseIndex.freeResults(a, actual);
+            if (mode == .residual) try std.testing.expect(predicate.calls > 0 and predicate.calls <= 512);
+            try std.testing.expectEqual(expected.len, actual.len);
+            for (actual, expected) |hit, reference| {
+                try std.testing.expectEqualStrings(reference.doc_id, hit.doc_id);
+                try std.testing.expectEqual(reference.score, hit.score);
+            }
+        }
     }
 }

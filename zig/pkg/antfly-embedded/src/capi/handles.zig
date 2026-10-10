@@ -40,13 +40,35 @@ pub const Allocator = std.mem.Allocator;
 /// Version 2 unified the naming (antfly_db_* takes a handle, antfly_* is
 /// library-level, antfly_lite_* is the .aflite format) and merged the Lite
 /// open options into antfly_open_options.
-pub const abi_version: u32 = 2;
+pub const abi_version: u32 = 3;
 pub const Handle = struct {
     alloc: std.mem.Allocator,
     db: db_mod.DB,
+    db_live: bool = true,
+    /// Public Lite connections own a cached generation rather than a lifetime writer.
+    lite_connection: ?*@import("lite_connection.zig").Connection = null,
+    lease_snapshot: bool = false,
+    selected_table_name: ?[]u8 = null,
+    selected_table_id: u64 = 0,
+    // Table handles borrow a DB and enter their owning database's fence.
+    selected_db: ?*db_mod.DB = null,
+    parent_id: ?*anyopaque = null,
+    parent_handle: ?*Handle = null,
+    table_handles: std.ArrayList(*anyopaque) = .empty,
+    sql_decision_uncertain: bool = false,
+    embedded_path: ?[]u8 = null,
+    embedded_open_options: db_mod.OpenOptions = .{},
+    embedded_tables: std.StringHashMapUnmanaged(*@import("tables.zig").Table) = .empty,
+    embedded_catalog_loaded: bool = false,
+    embedded_next_table_id: u64 = 2,
+    sql_cursors: std.AutoHashMapUnmanaged(u64, *@import("sql_cursor.zig").Cursor) = .empty,
+    next_sql_cursor_id: u64 = 1,
+    sql_sessions: std.AutoHashMapUnmanaged(u64, *@import("sql_session.zig").Session) = .empty,
+    next_sql_session_id: u64 = 1,
     open_mode: db_mod.OpenOptions.OpenMode = .writer,
     readable_lease_hook: ?ReadableLeaseHook = null,
     owned_lite_backend: ?lite_backend.Handle = null,
+    owned_lite_runtime: ?db_mod.background_runtime.BackendRuntimeHandle = null,
     lite_profile: ?lite_backend.Profile = null,
     lite_inference_status: ?lite_backend.InferenceStatus = null,
     storage_owner_path: ?[]u8 = null,
@@ -86,7 +108,12 @@ pub const Handle = struct {
     write_mutex: std.Io.Mutex = .init,
     maintenance_mutex: std.Io.Mutex = .init,
 
+    pub fn database(self: *Handle) *db_mod.DB {
+        return self.selected_db orelse &self.db;
+    }
+
     pub fn liteAntflyProvider(self: *Handle) ?managed_embedder.AntflyProvider {
+        if (self.parent_handle) |parent| return parent.liteAntflyProvider();
         const lifetime = if (self.lite_inference_lifetime) |*value| value else return null;
         return inference_provider.inferenceBoundaryProvider(lifetime);
     }
@@ -146,18 +173,42 @@ pub fn stopLiteEmbeddedInference(handle: *Handle) void {
 }
 
 pub fn closeHandle(handle: *Handle) void {
+    if (handle.lite_connection) |connection| {
+        connection.close();
+        handle.alloc.destroy(handle);
+        return;
+    }
+    if (handle.parent_id != null) {
+        if (handle.selected_table_name) |name| handle.alloc.free(name);
+        handle.alloc.destroy(handle);
+        return;
+    }
+    for (handle.table_handles.items) |id| closeHandleId(id);
+    handle.table_handles.deinit(handle.alloc);
+    if (handle.lease_snapshot) {
+        if (handle.owned_lite_backend) |*backend| {
+            backend.native_docstore.?.read_only = true;
+            backend.native_docstore.?.file.read_only = true;
+        }
+    }
     const storage_owner_context = handle.storage_owner_context;
     const server_context_release = handle.server_context_release;
-    if (handle.owned_lite_backend != null and liteOpenModeCanWrite(handle.open_mode)) {
+    if (!handle.lease_snapshot and handle.owned_lite_backend != null and liteOpenModeCanWrite(handle.open_mode)) {
         handle.db.sync(true) catch {};
         handle.db.syncIndexes(true) catch {};
     }
-    handle.db.close();
+    @import("sql_cursor.zig").closeAll(handle);
+    @import("sql_session.zig").closeAll(handle);
+    @import("tables.zig").closeAll(handle);
+    if (handle.db_live) {
+        if (handle.lease_snapshot) handle.db.closeImmutableSnapshot() else handle.db.close();
+    }
     stopLiteEmbeddedInference(handle);
     if (handle.server_cleanup) |cleanup| cleanup(handle);
     if (handle.owned_lite_backend) |*backend| {
         backend.deinit();
     }
+    if (handle.owned_lite_runtime) |*runtime| runtime.deinit();
     if (handle.storage_owner_path) |path| handle.alloc.free(path);
     if (handle.storage_owner_table_name) |table_name| handle.alloc.free(table_name);
     if (handle.row_policy_authority_secret) |secret| {
@@ -165,6 +216,7 @@ pub fn closeHandle(handle: *Handle) void {
         handle.alloc.free(secret);
     }
     if (handle.row_policy_authority_issuer) |issuer| handle.alloc.free(issuer);
+    if (handle.embedded_path) |path| handle.alloc.free(path);
     handle.alloc.destroy(handle);
     if (storage_owner_context) |context| if (server_context_release) |release| release(context);
 }
@@ -177,7 +229,7 @@ pub fn liteOpenModeCanWrite(open_mode: db_mod.OpenOptions.OpenMode) bool {
 }
 
 pub fn currentIdentityReadGenerationForHandle(handle: *Handle, requested: ?u64) !u64 {
-    return try handle.db.currentIdentityReadGenerationForRequest(requested);
+    return try handle.database().currentIdentityReadGenerationForRequest(requested);
 }
 
 pub fn stampSearchRequestIdentityGeneration(handle: *Handle, req: *db_mod.types.SearchRequest) !void {
@@ -241,7 +293,9 @@ pub fn asHandle(ptr: ?*anyopaque) ?*Handle {
     const id = handle_registry.decode(ptr) orelse return null;
     const slot = handle_registry.slotFor(id.index) orelse return null;
     if (slot.state.load(.acquire) >> 1 != id.generation) return null;
-    return slot.handle.load(.acquire);
+    const handle = slot.handle.load(.acquire) orelse return null;
+    if (handle.lite_connection) |connection| return connection.current orelse handle;
+    return handle;
 }
 
 /// Handles given to callers are ids naming a registry slot plus a

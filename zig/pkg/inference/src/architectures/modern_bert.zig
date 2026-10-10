@@ -211,6 +211,15 @@ fn preplanMetalModernBertEncoder(
     // first it avoids even loading the 88 projection weights from safetensors.
     if (metalModernBertEncoderSlotsPrepared(cb, config)) return true;
 
+    // The measured 1B encoder path keeps packed checkpoint weights,
+    // but prepare reusable F16 MPS matrices for encoder-shaped GEMMs. Bound
+    // the shape and per-matrix staging (largest matrix is 52.5 MiB in F32;
+    // all 112 resident F16 matrices total 1,875,378,176 bytes). The override
+    // retains the direct-quant path for controlled comparisons.
+    const prefer_f16_mps = config.metal_f16_weight_mirrors and hidden == 1792 and intermediate == 3840 and
+        layer_count == 28 and heads == 28 and
+        platform.env.getenvBoolDefault("TERMITE_METAL_MODERNBERT_1B_F16_MIRRORS", true);
+
     const qkv_zero_bias = try makeZeroBias(cb, allocator, hidden * 3);
     defer cb.free(qkv_zero_bias);
     const ffn_in_zero_bias = try makeZeroBias(cb, allocator, intermediate * 2);
@@ -239,11 +248,14 @@ fn preplanMetalModernBertEncoder(
                 .out_dim = output_dim,
                 // Native F16 safetensors reach Metal directly through the
                 // prepare path. No F32 mirror is required for this layout.
-                .retain_dense_fallback = false,
+                .retain_dense_fallback = prefer_f16_mps,
+                .dense_fallback_max_bytes = if (prefer_f16_mps) 64 * 1024 * 1024 else null,
+                .allow_direct_quant_fallback = prefer_f16_mps,
+                .prefer_f16_mps_fallback = prefer_f16_mps,
                 // MPS GEMM outruns the hand-written dense kernels here
                 // (Laya-large 3.1x, OpenDecider-nano 1.4x on M4 Max); BF16
                 // weights are expanded to F32 for it.
-                .prefer_f32_mps_fallback = !platform.env.getenvBool("TERMITE_METAL_DISABLE_MODERNBERT_F32_MPS"),
+                .prefer_f32_mps_fallback = !prefer_f16_mps and !platform.env.getenvBool("TERMITE_METAL_DISABLE_MODERNBERT_F32_MPS"),
             }))) return false;
         }
     }
@@ -273,6 +285,9 @@ fn preplanMetalModernBertEncoder(
 // ---------------------------------------------------------------------------
 
 pub const Config = struct {
+    /// Execution preference enabled by the measured GLiNER decision path.
+    /// Checkpoint parsing leaves other ModernBERT callers unchanged.
+    metal_f16_weight_mirrors: bool = false,
     laya: ?@import("../models/laya.zig").Config = null,
     vocab_size: u32 = 50368,
     hidden_size: u32 = 768,
@@ -2124,6 +2139,42 @@ test "ModernBERT rejects declared semantics its fused kernels do not implement" 
         try std.testing.expectEqual(CheckpointLayout.huggingface_fused_qkv_no_bias, parsed.checkpoint_layout);
         try std.testing.expect(!parsed.rope_interleaved);
     }
+}
+
+test "ModernBERT accepts prepared Laya legacy position metadata without changing RoPE" {
+    const prefix =
+        \\{"model_type":"modernbert","hidden_size":64,"num_hidden_layers":2,
+        \\"num_attention_heads":1,"intermediate_size":96,"max_position_embeddings":128,
+        \\"global_rope_theta":160000,"local_rope_theta":10000,
+        \\"laya":{"head_layers":2,"max_len":128,"head_max_len":64},
+    ;
+    const baseline = try parseConfig(std.testing.allocator, prefix ++ "\"attention_bias\":false}");
+    for ([_][]const u8{ "\"sans_pos\"", "\"absolute\"", "null", "false", "\"relative\"" }) |position_type| {
+        const json = try std.fmt.allocPrint(std.testing.allocator, "{s}\"position_embedding_type\":{s}}}", .{ prefix, position_type });
+        defer std.testing.allocator.free(json);
+        const config = try parseConfig(std.testing.allocator, json);
+        try std.testing.expectEqualDeep(baseline, config);
+        try std.testing.expect(config.laya != null);
+        try std.testing.expect(!config.rope_interleaved);
+        try std.testing.expectEqual(CheckpointLayout.huggingface_fused_qkv_no_bias, config.checkpoint_layout);
+    }
+    for ([_][]const u8{
+        "\"position_embedding_type\":\"absolute\",\"hidden_activation\":\"relu\"}",
+        "\"position_embedding_type\":\"absolute\",\"attention_bias\":true}",
+        "\"position_embedding_type\":\"absolute\",\"mlp_bias\":true}",
+        "\"position_embedding_type\":\"absolute\",\"norm_bias\":true}",
+    }) |suffix| {
+        const json = try std.mem.concat(std.testing.allocator, u8, &.{ prefix, suffix });
+        defer std.testing.allocator.free(json);
+        try std.testing.expectError(error.UnsupportedModernBertConfig, parseConfig(std.testing.allocator, json));
+    }
+    try std.testing.expectError(error.InvalidLayaConfig, parseConfig(std.testing.allocator,
+        \\{"model_type":"modernbert","position_embedding_type":"absolute","laya":null}
+    ));
+    try std.testing.expectError(error.InvalidLayaConfig, parseConfig(std.testing.allocator,
+        \\{"model_type":"modernbert","position_embedding_type":"absolute","max_position_embeddings":128,
+        \\"laya":{"max_len":512,"head_max_len":64}}
+    ));
 }
 
 test "HuggingFace ModernBERT fused checkpoint omits layer zero attention norm and all biases" {

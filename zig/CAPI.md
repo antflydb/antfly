@@ -70,7 +70,7 @@ primitive.
 
 Portable `.afb` backups are storage-neutral:
 
-- `antfly_db_backup` writes a backup of any handle.
+- `antfly_db_backup` writes a backup of the entire embedded database.
 - `antfly_db_import_backup` imports one into an empty database of either kind.
 - `antfly_restore_backup_json` and `antfly_restore_backup_file_json` create a
   new database at a path, of the storage kind in the passed
@@ -79,8 +79,8 @@ Portable `.afb` backups are storage-neutral:
   swaps out an existing one. A failed or interrupted restore leaves the
   destination holding either the complete old or the complete new database,
   never a partial or missing one. Replacing a directory database that any
-  process has open (through libantfly or otherwise), or a Lite file that has
-  an open writer, fails with `ANTFLY_BUSY`; so does opening a directory
+  process has open (through libantfly or otherwise), or a Lite file whose
+  writer lease is held, fails with `ANTFLY_BUSY`; so does opening a directory
   database while a restore publishes it. `ANTFLY_OUTCOME_UNKNOWN` means the
   new database was published but its crash durability could not be confirmed.
 
@@ -109,7 +109,7 @@ handlers:
 | `antfly_inference_generate_json` | `POST /generate` |
 | `antfly_inference_generate_batch_json` | `POST /generate/batch` |
 | `antfly_inference_rewrite_json` | `POST /rewrite` |
-| `antfly_inference_decide_json` | `POST /decide` |
+| `antfly_inference_decide_json` | `POST /decisions` |
 | `antfly_inference_extract_json` | `POST /extract` |
 | `antfly_inference_read_json` | `POST /read` (OCR) |
 | `antfly_inference_transcribe_json` | `POST /transcribe` |
@@ -197,9 +197,10 @@ concurrently. `antfly_threading_mode()` reports it as
 `ANTFLY_THREADING_SERIALIZED`, like `sqlite3_threadsafe()`, and the Lite
 capabilities JSON carries `"threading": "serialized"`.
 
-Unlike a single SQLite connection, one handle is not a single serial queue.
-Every export that takes a handle enters through a per-handle guard, and each
-export has one of four access classes:
+Embedded database and table handles share one serialized API fence so
+local multi-table decisions and catalog changes cannot interleave with other
+API calls. Cursor snapshots remain pinned between fetches while other
+sessions execute. Managed owner handles retain four access classes:
 
 | Class | Exports | Runs concurrently with |
 |---|---|---|
@@ -208,9 +209,9 @@ export has one of four access classes:
 | maintain | run-until-idle, generated-enrichment replay, backup, stable snapshot copy | reads and writes; one maintenance call at a time per handle |
 | exclusive | set schema, add/delete index or enrichment, import a backup into a handle, range and split changes, shadow index managers, readable lease hook | nothing; waits for in-flight calls |
 
-Concurrent writes on one handle queue behind each other instead of failing
-with `ANTFLY_BUSY`. Reads run against pinned storage snapshots while a write
-commits. A search stamps the current document identity generation; if a write
+Concurrent calls on an embedded database queue behind each other instead
+of failing with `ANTFLY_BUSY`. Managed owner reads run against pinned
+storage snapshots while a write commits. A search stamps the current document identity generation; if a write
 commits before the search re-checks it, the search restamps and retries, and
 its final attempt briefly holds off writers so it always completes. A read
 with a caller-pinned `identity_read_generation` that has gone stale is
@@ -242,13 +243,34 @@ This is stronger than `sqlite3_close`, where using a closed connection is
 undefined. Bindings may still track their own handle state to report a
 closed handle before crossing the ABI.
 
-Across handles and processes the Lite model matches SQLite in WAL mode: one
-writer and any number of readers per file. The writer lock is taken when a
-writer handle opens and held until it closes. A second writer open fails
-with `ANTFLY_BUSY` immediately, or, when `busy_timeout_ms` is set in
-`antfly_open_options`, retries with capped
-exponential backoff until the timeout elapses, like `sqlite3_busy_timeout`.
-Read-only and status-only opens never contend for the writer lock.
+Lite embedded handles are independent connections. Any number of writable,
+read-only, and status-only connections may remain open to the same file.
+Opening an existing file does not reserve its writer. Complete native operations
+queue on a canonical file gate within a process, and a kernel path lease
+coordinates operations between processes. A writable operation owns the lease
+through its durable publication; SQL COMMIT retains it through the complete
+coordinator/participant recovery boundary. A competing process returns
+`ANTFLY_BUSY`, or waits up to `busy_timeout_ms`. Read-only calls use a shared
+lease. Calls on writable connections currently use an exclusive lease even
+for reads, a conservative policy that serializes those calls across processes.
+Read-only snapshots without a lock sidecar also open from read-only directories
+or media. Their calls use a shared inode fence when sidecar creation is denied;
+every sidecar creator takes the exclusive inode fence before installing it.
+Reopened native writers discover pending generated enrichment in the durable
+journals of all tables and resume it under their connection lease.
+
+After an external commit or atomic file replacement, a connection reopens its
+cached runtime before the next operation. Streaming SQL cursors retain the
+runtime and immutable pages they originally pinned; retiring that runtime
+releases caches without flushing them over a newer generation. Read-only
+connections observe new commits at operation boundaries. Automatic enrichment,
+TTL, and reclamation maintenance run under the same connection lease.
+
+This follows SQLite's separation of connection lifetime from writer ownership;
+it does not claim SQLite WAL concurrency or change Antfly SQL's existing
+READ COMMITTED transaction semantics. Low-level storage owners used by the
+standalone CLI/server retain their exclusive owner contract; a connection waits
+for an active owner at operation time, not at open time.
 
 Every thread that calls into `libantfly` needs at least
 `ANTFLY_MIN_THREAD_STACK_SIZE` (8 MiB) of native stack. The storage engine
@@ -304,3 +326,63 @@ C ABI changes should have coverage for:
 - Every new export that takes a handle must enter through `enterHandle` with
   the right access class, and a binding test should run it concurrently with
   writes (see `go/pkg/embedded/concurrency_cgo_test.go`).
+
+## Database SQL
+
+ABI 3 makes SQL database-scoped: `antfly_db_sql_json(db, request, out)` resolves
+tables from a durable catalog. `antfly_db_create_table_json`, `drop_table`,
+`list_tables_json`, and SQL CREATE/DROP TABLE manage independent table
+namespaces. Tables own their schemas, indexes, enrichment configuration, and
+document identities. Dropped IDs are never reused. The root document API
+addresses the catalog's `default` table; quote it as `"default"` in SQL.
+
+`antfly_db_open_table` returns a handle accepted by the document, schema,
+index, enrichment, graph, and search APIs. Table handles share the owning
+database's API fence and never own the file runtime. Close them with
+`antfly_db_close` before dropping their table. Closing the database drains
+entered calls, invalidates its table handles, and releases all sessions and
+cursors. Database SQL/catalog/session operations require the database handle.
+
+Portable `.afb` archives contain the complete embedded database: its live
+table catalog, schemas, documents, index and enrichment definitions, stored
+artifacts, and UNIQUE/FK constraint state. Export and import require the
+database handle. Import requires an empty database without open table handles,
+SQL sessions, or cursors. Restore builds every table in an unpublished
+file or directory generation before atomically publishing the whole database.
+Table IDs and the next-ID counter survive restoration; dropped namespaces
+are excluded. A SHA-256 digest covers the complete database archive.
+
+SQL requests contain `statement`, positional `parameters`, a materialized
+result `limit` (default 128, maximum 4096), and optional `session_id`.
+Sessions are independent connection contexts created by `sql_session_open`.
+BEGIN defaults to READ COMMITTED. COMMIT, ROLLBACK, SAVEPOINT, ROLLBACK TO,
+and RELEASE are supported; stronger isolation and transactional DDL are
+rejected. Statements read a pinned native snapshot plus their session's staged
+postimages. Session writes remain private until COMMIT, which prepares native
+version predicates and relational integrity commands across all affected
+tables. Cross-table joins and foreign keys use the same native catalog.
+Closing a session abandons staged writes. Failed transactions reject further
+data statements until ROLLBACK or ROLLBACK TO an existing savepoint.
+
+The root namespace persists the native transaction's durable decision.
+Interrupted preparation is aborted on recovery; decided commits finish
+participant intent resolution without replaying SQL. A committed-pending
+outcome remains committed. An unknown decision returns SQLSTATE 40003 and a
+transaction receipt; do not replay it. Close and reopen the database to
+recover/reconcile that receipt. Commit responses reserve a fallback buffer
+before mutation, so response allocation cannot erase a committed outcome.
+
+`sql_open_cursor_json` pins a read statement without a total row limit.
+`sql_fetch_cursor_json` returns `{result, exhausted}` in pages of 1–4096
+rows. Close cursors explicitly, including after early termination. Unsupported
+streaming plans return 0A000 and may use the bounded materialized API;
+materialized result overflow returns an error. Session close releases its
+cursors. `sql_describe_json` binds column and parameter types without executing.
+SQL buffers include structured diagnostics on failure and must always be
+freed. Integer cells are decimal strings, preserving exact signed 64-bit
+values; `sql_nulls` distinguishes SQL NULL from a JSON null value.
+
+The bindings provide Go `database/sql` (`antfly`, `file:/path/app.aflite`),
+Python `antfly_embedded.dbapi`, Rust's optional `sqlx` feature, and TypeScript
+`Connection` / `@antfly/embedded/kysely`. Their shared SQL conformance inputs
+are in `pkg/antfly-embedded/capi-conformance/sql/cases.json`.

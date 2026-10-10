@@ -106,6 +106,7 @@ pub const SegmentIndexSortField = struct {
 };
 
 pub const SegmentIndexSortBoundValue = union(enum) {
+    datetime_ns: i128,
     u64_val: u64,
     i64_val: i64,
     f64_val: f64,
@@ -1569,6 +1570,77 @@ pub const SegmentReader = struct {
         return self.v4StoredDocLocation(doc);
     }
 
+    /// Read a bounded document-table span through one block and its lookahead
+    /// row, resolving each block's offsets once. Merge eligibility uses
+    /// these rows without retaining any metadata beyond this call.
+    fn storedLocationMetadataBatch(self: *const SegmentReader, start_doc: u32, out: []V4StoredDocLocation) !usize {
+        return self.storedLocationMetadataBatchKnownFirst(start_doc, out, null);
+    }
+
+    fn storedLocationMetadataBatchKnownFirst(self: *const SegmentReader, start_doc: u32, out: []V4StoredDocLocation, known_first: ?V4StoredDocLocation) !usize {
+        const count = @min(out.len, self.doc_count -| start_doc);
+        if (count == 0) return 0;
+        if (count > stored_fields_block_doc_target + 1) return error.InvalidSegment;
+        const native = self.native orelse {
+            for (out[0..count], 0..) |*location, i| {
+                location.* = (try self.v4StoredDocLocation(start_doc + @as(u32, @intCast(i)))) orelse return error.InvalidSegment;
+                if (location.block_idx != out[0].block_idx) return i + 1;
+            }
+            return count;
+        };
+        const range = &native.range;
+        if (range.num_blocks == 0) return 0;
+        const metadata_source = native.metadata_cache.?.borrowedSource();
+        var entries: [(stored_fields_block_doc_target + 1) * stored_fields_v4_doc_entry_size]u8 = undefined;
+        // The eligibility caller already read the first row. Its raw size
+        // predicts the remaining block capacity, without a duplicate lookup.
+        // Varying document sizes may exceed that estimate; extend geometrically
+        // while rows remain in this block, always within the 129-row bound.
+        const first = known_first orelse (try self.storedLocationMetadata(start_doc)) orelse return error.InvalidSegment;
+        out[0] = first;
+        var loaded: usize = 1;
+        var batch_size: usize = @max(1, @as(usize, @intCast(@as(u64, stored_fields_block_raw_target) / (@as(u64, first.raw_len) + 4))));
+        const offsets_start = range.stored_offset + 21 + @as(u64, range.doc_count) * stored_fields_v4_doc_entry_size;
+        var previous_block = first.block_idx;
+        var block_start = first.block_start;
+        var block_end = first.block_end;
+        for (out[0..count], 0..) |*location, i| {
+            if (i == 0) continue;
+            if (i == loaded) {
+                const end = @min(count, loaded + batch_size);
+                try metadata_source.readInto(range.stored_offset + 21 + (@as(u64, start_doc) + loaded) * stored_fields_v4_doc_entry_size, entries[loaded * stored_fields_v4_doc_entry_size .. end * stored_fields_v4_doc_entry_size]);
+                loaded = end;
+                batch_size = @min(count, batch_size * 4);
+            }
+            const entry = entries[i * stored_fields_v4_doc_entry_size ..][0..stored_fields_v4_doc_entry_size];
+            const id_offset = std.mem.readInt(u64, entry[0..8], .little);
+            const id_length = std.mem.readInt(u32, entry[8..12], .little);
+            const block = std.mem.readInt(u32, entry[12..16], .little);
+            if (block >= range.num_blocks or id_offset > range.id_bytes_length or id_length > range.id_bytes_length - id_offset) return error.InvalidSegment;
+            if (previous_block != block) {
+                var offsets: [16]u8 = @splat(0);
+                if (block == 0) try metadata_source.readInto(offsets_start, offsets[8..]) else try metadata_source.readInto(offsets_start + @as(u64, block - 1) * 8, &offsets);
+                const start = std.mem.readInt(u64, offsets[0..8], .little);
+                const end = std.mem.readInt(u64, offsets[8..16], .little);
+                if (start >= end or end > range.stored_length - range.stored_metadata_length) return error.InvalidSegment;
+                block_start = @intCast(range.stored_offset + range.stored_metadata_length + start);
+                block_end = @intCast(range.stored_offset + range.stored_metadata_length + end);
+                previous_block = block;
+            }
+            location.* = .{
+                .id = &.{},
+                .id_length = id_length,
+                .block_idx = block,
+                .block_start = block_start,
+                .block_end = block_end,
+                .doc_offset = std.mem.readInt(u32, entry[16..20], .little),
+                .raw_len = std.mem.readInt(u32, entry[20..24], .little),
+            };
+            if (block != out[0].block_idx) return i + 1;
+        }
+        return count;
+    }
+
     fn nativeStoredLocationMode(self: *const SegmentReader, doc: u32, identity_allocator: ?Allocator, read_identity: bool) !?V4StoredDocLocation {
         const native = self.native.?;
         const range = &native.range;
@@ -2127,6 +2199,11 @@ const memory_segment_sink_vtable = SegmentSink.VTable{
 pub const MergeInput = struct {
     reader: *const SegmentReader,
     deleted: ?roaring.RoaringBitmap = null,
+    deletion_rank: ?*const roaring.FrozenRankIndex = null,
+
+    fn deletedBefore(self: MergeInput, doc: u32) usize {
+        return if (self.deletion_rank) |rank| rank.rank(doc) else if (self.deleted) |deleted| deleted.rank(doc) else 0;
+    }
 
     fn isDeleted(self: MergeInput, doc_id: u32) bool {
         return if (self.deleted) |deleted| deleted.contains(doc_id) else false;
@@ -2316,6 +2393,7 @@ const MergeDocRef = struct {
 };
 
 const SegmentSortValue = union(enum) {
+    datetime_ns: i128,
     u64_val: u64,
     i64_val: i64,
     f64_val: f64,
@@ -2335,6 +2413,7 @@ const SegmentSortValue = union(enum) {
 };
 
 const SegmentSortValueTag = enum {
+    datetime_ns,
     u64_val,
     i64_val,
     f64_val,
@@ -2346,6 +2425,7 @@ const SegmentSortValueTag = enum {
 
 fn segmentSortValueTag(value: SegmentSortValue) SegmentSortValueTag {
     return switch (value) {
+        .datetime_ns => .datetime_ns,
         .u64_val => .u64_val,
         .i64_val => .i64_val,
         .f64_val => .f64_val,
@@ -2374,6 +2454,7 @@ pub const TypedReadScope = struct {
     const Entry = struct { segment: *const SegmentReader, field: []const u8, reader: ?*typed_dv.TypedDocValuesReader };
     allocator: Allocator,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    signed_sort_fields: std.StringHashMapUnmanaged(bool) = .empty,
     cache: ?*typed_dv.TypedDocValuesReader.PointCache = null,
 
     pub fn init(allocator: Allocator) TypedReadScope {
@@ -2389,7 +2470,23 @@ pub const TypedReadScope = struct {
             self.allocator.destroy(reader);
         };
         self.entries.deinit(self.allocator);
+        self.signed_sort_fields.deinit(self.allocator);
         self.* = undefined;
+    }
+    // Resolve a merge field once across the pinned input set. Old unsigned
+    // datetime columns need promotion before sort-domain validation, as well
+    // as when writing the merged column.
+    fn signedSortField(self: *TypedReadScope, inputs: []const MergeInput, field: []const u8) !bool {
+        if (self.signed_sort_fields.get(field)) |signed| return signed;
+        var signed = false;
+        for (inputs) |input| {
+            if (try self.get(input.reader, field)) |reader| if (reader.value_type == .datetime_ns) {
+                signed = true;
+                break;
+            };
+        }
+        try self.signed_sort_fields.put(self.allocator, field, signed);
+        return signed;
     }
     pub fn get(self: *TypedReadScope, segment: *const SegmentReader, field: []const u8) !?*typed_dv.TypedDocValuesReader {
         for (self.entries.items) |entry| if (entry.segment == segment and std.mem.eql(u8, entry.field, field)) return entry.reader;
@@ -2714,7 +2811,23 @@ pub fn writeMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []
     try writeMergedSegmentToSinkWithOptions(alloc, sink, inputs, .{});
 }
 
-pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSink, inputs: []const MergeInput, options: MergeOptions) !void {
+pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSink, inputs_arg: []const MergeInput, options: MergeOptions) !void {
+    if (inputs_arg.len == 0) return error.NoSegments;
+    // Freeze and validate deletion navigation before any output pass.
+    const doc_counts = try alloc.alloc(u32, inputs_arg.len);
+    defer alloc.free(doc_counts);
+    const deleted_docs = try alloc.alloc(?roaring.RoaringBitmap, inputs_arg.len);
+    defer alloc.free(deleted_docs);
+    for (inputs_arg, doc_counts, deleted_docs) |input, *count, *deleted| {
+        count.* = input.reader.doc_count;
+        deleted.* = input.deleted;
+    }
+    const rank_maps = try inverted.prepareRankDocMaps(alloc, doc_counts, deleted_docs);
+    defer inverted.deinitRankDocMaps(alloc, rank_maps);
+    const inputs = try alloc.dupe(MergeInput, inputs_arg);
+    defer alloc.free(inputs);
+    for (inputs, rank_maps) |*input, *map| input.deletion_rank = if (map.rank_index) |*rank| rank else null;
+
     var tracked = PageChecksumSink.init(alloc, output);
     defer tracked.deinit();
     var tracked_sink = tracked.sink();
@@ -2738,7 +2851,7 @@ pub fn writeMergedSegmentToSinkWithOptions(alloc: Allocator, output: *SegmentSin
         }
         return;
     }
-    try writeAppendMergedSegmentToSink(alloc, sink, inputs);
+    try writeAppendMergedSegmentToSink(alloc, sink, inputs, doc_counts, rank_maps);
     if (options.source_map) |map| {
         var output_doc: u32 = 0;
         for (inputs, 0..) |input, input_idx| for (0..input.reader.doc_count) |source_doc| {
@@ -2812,11 +2925,11 @@ fn indexSortFieldsEqual(a: []const SegmentIndexSortField, b: []const SegmentInde
     return true;
 }
 
-fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput) !void {
+fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, doc_counts: []const u32, rank_maps: []const inverted.RankDocMap) !void {
     if (inputs.len == 0) return error.NoSegments;
 
     const stored_offset: u64 = @intCast(sink.len());
-    const doc_count = countLiveDocs(inputs);
+    const doc_count = try countLiveDocs(inputs);
     const stored_metadata_length = try writeMergedStoredFields(alloc, sink, inputs, doc_count);
     const stored_length: u64 = @intCast(sink.len() - @as(usize, @intCast(stored_offset)));
     const stored_metadata_crc = try sink.crc32Range(@intCast(stored_offset), @intCast(stored_metadata_length));
@@ -2839,18 +2952,6 @@ fn writeAppendMergedSegmentToSink(alloc: Allocator, sink: *SegmentSink, inputs: 
         for (built_fields.items) |*field| field.deinit(alloc);
         built_fields.deinit(alloc);
     }
-
-    // Freeze deletion navigation once for all fields in this merge.
-    const doc_counts = try alloc.alloc(u32, inputs.len);
-    defer alloc.free(doc_counts);
-    const deleted_docs = try alloc.alloc(?roaring.RoaringBitmap, inputs.len);
-    defer alloc.free(deleted_docs);
-    for (inputs, doc_counts, deleted_docs) |input, *count, *deleted| {
-        count.* = input.reader.doc_count;
-        deleted.* = input.deleted;
-    }
-    const rank_maps = try inverted.prepareRankDocMaps(alloc, doc_counts, deleted_docs);
-    defer inverted.deinitRankDocMaps(alloc, rank_maps);
 
     // For each field, append merged sections directly into the sink and retain
     // only compact section-index metadata.
@@ -3068,12 +3169,11 @@ fn writeSortedMergedSegmentToSink(
     try writeSegmentVersionChecksumAndMagic(sink, @intCast(sections_index_offset));
 }
 
-fn countLiveDocs(inputs: []const MergeInput) u32 {
+fn countLiveDocs(inputs: []const MergeInput) !u32 {
     var total: u32 = 0;
     for (inputs) |input| {
-        for (0..input.reader.doc_count) |doc_id_usize| {
-            if (!input.isDeleted(@intCast(doc_id_usize))) total += 1;
-        }
+        const deleted = input.deletedBefore(input.reader.doc_count);
+        total = try std.math.add(u32, total, input.reader.doc_count - @as(u32, @intCast(deleted)));
     }
     return total;
 }
@@ -3132,6 +3232,63 @@ const StoredTableOutput = struct {
     }
 };
 
+// Task-private output permits bounded streaming: no source-sized ID allocation
+// or published slice is needed. Every metadata row remains validated.
+fn appendStoredIdentityRange(sink: *SegmentSink, input: MergeInput, start_doc: u32, count: u32, scratch: *SegmentReadScratch) !void {
+    const reader = input.reader;
+    if (start_doc > reader.doc_count or count > reader.doc_count - start_doc) return error.InvalidSegment;
+    if (count == 0 or input.deletedBefore(start_doc + count) - input.deletedBefore(start_doc) == count) return;
+    const native = reader.native orelse {
+        for (0..count) |i| {
+            const doc = start_doc + @as(u32, @intCast(i));
+            if (input.isDeleted(doc)) continue;
+            scratch.reset();
+            const id = (try reader.storedIdAlloc(scratch.allocator(), doc)) orelse return error.InvalidSegment;
+            try sink.appendSlice(id);
+        }
+        return;
+    };
+    const range = &native.range;
+    const source = native.metadata_cache.?.borrowedSource();
+    const ids_start = range.stored_offset + 21 + @as(u64, range.doc_count) * stored_fields_v4_doc_entry_size + @as(u64, range.num_blocks) * 12;
+    var entries: [128 * stored_fields_v4_doc_entry_size]u8 = undefined;
+    var bytes: [64 * 1024]u8 = undefined;
+    var processed: u32 = 0;
+    while (processed < count) {
+        const rows = @min(@as(u32, 128), count - processed);
+        try source.readInto(range.stored_offset + 21 + (@as(u64, start_doc) + processed) * stored_fields_v4_doc_entry_size, entries[0 .. rows * stored_fields_v4_doc_entry_size]);
+        var span_start: u64 = 0;
+        var span_len: u64 = 0;
+        for (0..rows) |i| {
+            const entry = entries[i * stored_fields_v4_doc_entry_size ..][0..stored_fields_v4_doc_entry_size];
+            const offset = std.mem.readInt(u64, entry[0..8], .little);
+            const length = std.mem.readInt(u32, entry[8..12], .little);
+            const block = std.mem.readInt(u32, entry[12..16], .little);
+            if (block >= range.num_blocks or offset > range.id_bytes_length or length > range.id_bytes_length - offset) return error.InvalidSegment;
+            const deleted = input.isDeleted(start_doc + processed + @as(u32, @intCast(i)));
+            if (deleted or (span_len != 0 and offset != span_start + span_len)) {
+                try appendStoredIdentitySpan(sink, source, ids_start + span_start, span_len, &bytes);
+                span_len = 0;
+            }
+            if (deleted) continue;
+            if (span_len == 0) span_start = offset;
+            span_len += length;
+        }
+        try appendStoredIdentitySpan(sink, source, ids_start + span_start, span_len, &bytes);
+        processed += rows;
+    }
+}
+
+fn appendStoredIdentitySpan(sink: *SegmentSink, source: @import("segment_source.zig").Source, offset: u64, length: u64, scratch: []u8) !void {
+    var copied: u64 = 0;
+    while (copied < length) {
+        const bytes = scratch[0..@intCast(@min(scratch.len, length - copied))];
+        try source.readInto(offset + copied, bytes);
+        try sink.appendSlice(bytes);
+        copied += bytes.len;
+    }
+}
+
 fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const MergeInput, doc_count: u32) !u64 {
     const stored_start = sink.len();
     if (try allStoredFieldsOmitted(inputs)) return writeOmittedStoredFields(sink, doc_count);
@@ -3156,15 +3313,7 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
     defer identity_scratch.deinit();
     const id_bytes_start = sink.len();
     var copy_locations: [stored_fields_block_doc_target]SegmentReader.V4StoredDocLocation = undefined;
-    for (inputs) |input| {
-        for (0..input.reader.doc_count) |doc_id_usize| {
-            const doc_id: u32 = @intCast(doc_id_usize);
-            if (input.isDeleted(doc_id)) continue;
-            identity_scratch.reset();
-            const id = (try input.reader.storedIdAlloc(identity_scratch.allocator(), doc_id)) orelse continue;
-            try sink.appendSlice(id);
-        }
-    }
+    for (inputs) |input| try appendStoredIdentityRange(sink, input, 0, input.reader.doc_count, &identity_scratch);
     const id_bytes_len: u64 = @intCast(sink.len() - id_bytes_start);
     try sink.writeAt(id_bytes_len_pos, &@as([8]u8, @bitCast(@as(u64, id_bytes_len))));
 
@@ -3285,10 +3434,17 @@ fn writeMergedStoredFieldsInOrderWithReuse(
     defer identity_scratch.deinit();
     const id_bytes_start = sink.len();
     var record_iterator_1 = records.iterator();
-    while (try record_iterator_1.next()) |record| {
-        identity_scratch.reset();
-        const id = (try inputs[record.ref.input_idx].reader.storedIdAlloc(identity_scratch.allocator(), record.ref.doc_id)) orelse return error.InvalidSegment;
-        try sink.appendSlice(id);
+    var pending = try record_iterator_1.next();
+    while (pending) |first| {
+        var count: u32 = 1;
+        pending = try record_iterator_1.next();
+        while (count < stored_fields_block_doc_target) {
+            const next = pending orelse break;
+            if (next.ref.input_idx != first.ref.input_idx or @as(u64, next.ref.doc_id) != @as(u64, first.ref.doc_id) + count) break;
+            count += 1;
+            pending = try record_iterator_1.next();
+        }
+        try appendStoredIdentityRange(sink, inputs[first.ref.input_idx], first.ref.doc_id, count, &identity_scratch);
     }
     const id_bytes_len: u64 = @intCast(sink.len() - id_bytes_start);
     try sink.writeAt(id_bytes_len_pos, &@as([8]u8, @bitCast(@as(u64, id_bytes_len))));
@@ -3511,16 +3667,17 @@ fn copyableStoredBlockDocs(input: MergeInput, start_doc_id: u32) !?u32 {
 fn copyableStoredBlockDocsWithMetadata(input: MergeInput, start_doc_id: u32, locations: ?[]SegmentReader.V4StoredDocLocation) !?u32 {
     const reader = input.reader;
     if (reader.storedMetadata()[0] != stored_fields_version_block_compressed) return null;
+    // Reject partial prefixes before reading the following document-table span.
     const first = (try reader.storedLocationMetadata(start_doc_id)) orelse return null;
     if (first.doc_offset != 0) return null;
+    var batch: [stored_fields_block_doc_target + 1]SegmentReader.V4StoredDocLocation = undefined;
+    const length = try reader.storedLocationMetadataBatchKnownFirst(start_doc_id, &batch, first);
+    if (length == 0) return null;
 
     var count: u32 = 0;
     var raw_bytes: usize = 0;
-    var doc_id = start_doc_id;
-    while (doc_id < reader.doc_count) : (doc_id += 1) {
-        const loc = (try reader.storedLocationMetadata(doc_id)) orelse return null;
+    for (batch[0..length]) |loc| {
         if (loc.block_idx != first.block_idx) break;
-        if (input.isDeleted(doc_id)) return null;
         if (loc.block_start != first.block_start or loc.block_end != first.block_end) return null;
         if (count >= stored_fields_block_doc_target) return null;
         if (locations) |out| out[count] = loc;
@@ -3528,6 +3685,7 @@ fn copyableStoredBlockDocsWithMetadata(input: MergeInput, start_doc_id: u32, loc
         raw_bytes +|= 4 +| @as(usize, loc.raw_len);
     }
     if (count == 0) return null;
+    if (input.deletedBefore(start_doc_id + count) != input.deletedBefore(start_doc_id)) return null;
     if (count > stored_fields_block_doc_target) return null;
     if (count > 1 and raw_bytes > stored_fields_block_raw_target) return null;
     return count;
@@ -3701,6 +3859,12 @@ const ExternalCoordinateSort = struct {
                     offset += 1;
                     continue;
                 }
+                if (tag == .datetime_ns) {
+                    if (offset > bytes.len or bytes.len - offset < 16) return error.InvalidSegment;
+                    key.* = .{ .datetime_ns = std.mem.readInt(i128, bytes[offset..][0..16], .little) };
+                    offset += 16;
+                    continue;
+                }
                 var numeric_tag: u8 = 0;
                 if (tag == .numeric_val) {
                     if (offset >= bytes.len) return error.InvalidSegment;
@@ -3727,7 +3891,7 @@ const ExternalCoordinateSort = struct {
                         offset += size;
                         break :blk if (tag == .id) .{ .id = payload } else .{ .bytes_val = payload };
                     },
-                    .bool_val => unreachable,
+                    .bool_val, .datetime_ns => unreachable,
                 };
             }
             if (offset != bytes.len) return error.InvalidSegment;
@@ -3738,6 +3902,7 @@ const ExternalCoordinateSort = struct {
     fn appendRecord(self: *@This(), record: SortedMergeRecord) !void {
         var length: usize = 8;
         for (record.keys) |key| length = try std.math.add(usize, length, switch (key) {
+            .datetime_ns => 17,
             .bool_val => 2,
             .numeric_val => 10,
             .bytes_val => |v| 9 + v.len,
@@ -3753,6 +3918,12 @@ const ExternalCoordinateSort = struct {
             try self.spool.appendSlice(&.{@backingInt(segmentSortValueTag(key))});
             if (key == .bool_val) {
                 try self.spool.appendSlice(&.{@intFromBool(key.bool_val)});
+                continue;
+            }
+            if (key == .datetime_ns) {
+                var bytes: [16]u8 = undefined;
+                std.mem.writeInt(i128, &bytes, key.datetime_ns, .little);
+                try self.spool.appendSlice(&bytes);
                 continue;
             }
             const value: u64 = switch (key) {
@@ -3774,7 +3945,7 @@ const ExternalCoordinateSort = struct {
                         .f64_val => |n| @bitCast(n),
                     };
                 },
-                .bool_val => unreachable,
+                .bool_val, .datetime_ns => unreachable,
             };
             var encoded: [8]u8 = undefined;
             std.mem.writeInt(u64, &encoded, value, .little);
@@ -4187,6 +4358,7 @@ const StreamingSortReads = struct {
         while (entry.current == null or entry.current.?.doc_id < ref.doc_id) entry.current = (try segmentSortDocValue(entry.cursor.next())) orelse return error.InvalidSegment;
         if (entry.current.?.doc_id != ref.doc_id) return error.InvalidSegment;
         return switch (entry.current.?.value) {
+            .datetime_ns => |ns| .{ .datetime_ns = ns },
             .u64_val => |v| .{ .numeric_val = .{ .u64_val = v } },
             .i64_val => |v| .{ .numeric_val = .{ .i64_val = v } },
             .f64_val => |v| if (std.math.isFinite(v)) .{ .numeric_val = .{ .f64_val = v } } else error.InvalidSegment,
@@ -4218,6 +4390,10 @@ fn loadSegmentSortKeysAlloc(
     for (index_sort, 0..) |field, i| {
         keys[i] = if (streams) |stream| try stream.key(payload_alloc, ref, field.field) else try loadSegmentSortKeyAlloc(payload_alloc, reads, inputs[ref.input_idx].reader, ref.doc_id, field.field);
         initialized += 1;
+        if (keys[i] == .numeric_val and keys[i].numeric_val == .u64_val and try reads.signedSortField(inputs, field.field)) {
+            const ns: i128 = keys[i].numeric_val.u64_val;
+            keys[i] = .{ .datetime_ns = ns };
+        }
     }
     return keys;
 }
@@ -4234,6 +4410,7 @@ fn loadSegmentSortKeyAlloc(
     }
     const dv_reader = (try reads.get(reader, field)) orelse return error.UnsupportedTypedDocValues;
     return switch (dv_reader.value_type) {
+        .datetime_ns => .{ .datetime_ns = (try segmentSortDocValue(dv_reader.getDateTimeNs(doc_id))) orelse return error.InvalidSegment },
         // Normalize legacy scalar numeric columns into the exact tagged
         // domain before comparing sort keys. This keeps sorted compaction
         // valid across an on-disk format rollout without rounding integers.
@@ -4270,6 +4447,7 @@ fn sortedMergeRecordLessThan(index_sort: []const SegmentIndexSortField, a: Sorte
 
 fn compareSegmentSortValues(a: SegmentSortValue, b: SegmentSortValue) std.math.Order {
     return switch (a) {
+        .datetime_ns => |av| if (b == .datetime_ns) std.math.order(av, b.datetime_ns) else .lt,
         .u64_val => |av| switch (b) {
             .u64_val => |bv| std.math.order(av, bv),
             else => .lt,
@@ -4342,6 +4520,7 @@ fn segmentBoundValuesFromSortValuesAlloc(
 
 fn segmentBoundValueFromSortValueAlloc(alloc: Allocator, value: SegmentSortValue) !SegmentIndexSortBoundValue {
     return switch (value) {
+        .datetime_ns => |ns| .{ .datetime_ns = ns },
         .u64_val => |v| .{ .u64_val = v },
         .i64_val => |v| .{ .i64_val = v },
         .f64_val => |v| if (std.math.isFinite(v)) .{ .f64_val = v } else error.InvalidSegment,
@@ -4417,11 +4596,13 @@ fn typedDocValuesValueTypeIsNumeric(value_type: typed_dv.ValueType) bool {
 fn mergeTypedDocValuesValueType(current: ?typed_dv.ValueType, next: typed_dv.ValueType) ?typed_dv.ValueType {
     const existing = current orelse return next;
     if (existing == next) return existing;
+    if ((existing == .datetime_ns and next == .u64_val) or (existing == .u64_val and next == .datetime_ns)) return .datetime_ns;
     if (typedDocValuesValueTypeIsNumeric(existing) and typedDocValuesValueTypeIsNumeric(next)) return .numeric_val;
     return null;
 }
 
 fn addMergedTypedDocValue(writer: anytype, doc_id: u32, value: typed_dv.TypedValue) !void {
+    if (writer.value_type == .datetime_ns and value == .u64_val) return writer.add(doc_id, .{ .datetime_ns = value.u64_val });
     if (writer.value_type != .numeric_val) return writer.add(doc_id, value);
     const numeric: typed_dv.NumericValue = switch (value) {
         .u64_val => |number| .{ .u64_val = number },
@@ -4557,6 +4738,7 @@ fn writeMergeTypedDocValuesSectionsInOrder(
 /// Byte values borrow the merge scope's cache until the next lookup.
 fn typedDocValueBorrowed(reader: *const typed_dv.TypedDocValuesReader, doc: u32) !?typed_dv.TypedValue {
     return switch (reader.value_type) {
+        .datetime_ns => if (try reader.getDateTimeNs(doc)) |ns| .{ .datetime_ns = ns } else null,
         .u64_val => if (try reader.getU64(doc)) |v| .{ .u64_val = v } else null,
         .i64_val => if (try reader.getI64(doc)) |v| .{ .i64_val = v } else null,
         .f64_val => if (try reader.getF64(doc)) |v| .{ .f64_val = v } else null,
@@ -4575,6 +4757,9 @@ fn addTypedDocValueIfPresent(
     out_doc_id: u32,
 ) !void {
     switch (reader.value_type) {
+        .datetime_ns => if (try reader.getDateTimeNs(src_doc_id)) |ns| {
+            try writer.add(out_doc_id, .{ .datetime_ns = ns });
+        },
         .u64_val => if (try reader.getU64(src_doc_id)) |value| {
             try addMergedTypedDocValue(writer, out_doc_id, .{ .u64_val = value });
         },
@@ -4804,6 +4989,12 @@ fn encodeIndexSortBoundTuple(
 ) !void {
     for (values) |value| {
         switch (value) {
+            .datetime_ns => |v| {
+                try out.append(alloc, 6);
+                var bytes: [16]u8 = undefined;
+                std.mem.writeInt(i128, &bytes, v, .big);
+                try out.appendSlice(alloc, &bytes);
+            },
             .u64_val => |v| {
                 try out.append(alloc, 0);
                 try appendU64BE(alloc, out, v);
@@ -4901,6 +5092,12 @@ fn decodeIndexSortBoundTupleAlloc(
             },
             3 => .{ .bytes_val = try decodeBoundBytesAlloc(alloc, data, pos) },
             4 => .{ .id = try decodeBoundBytesAlloc(alloc, data, pos) },
+            6 => blk: {
+                if (pos.* > data.len or data.len - pos.* < 16) return error.InvalidSegment;
+                const ns = std.mem.readInt(i128, data[pos.*..][0..16], .big);
+                pos.* += 16;
+                break :blk .{ .datetime_ns = ns };
+            },
             5 => blk: {
                 if (pos.* + 8 > data.len) return error.InvalidSegment;
                 const bits = std.mem.readInt(u64, data[pos.*..][0..8], .big);
@@ -6745,9 +6942,9 @@ test "segment range typed values stream chunks with bounded navigation and propa
         fn close(_: *anyopaque) void {}
     };
     const cases = [_]typed_dv.TypedValue{
-        .{ .u64_val = 123 },                                      .{ .i64_val = -42 },   .{ .f64_val = 1.25 },
-        .{ .geo_point = .{ .lat = 42, .lon = -71 } },             .{ .bool_val = true }, .{ .bytes_val = "a value" },
-        .{ .numeric_val = .{ .u64_val = std.math.maxInt(u64) } },
+        .{ .u64_val = 123 },                                      .{ .i64_val = -42 },    .{ .f64_val = 1.25 },
+        .{ .geo_point = .{ .lat = 42, .lon = -71 } },             .{ .bool_val = true },  .{ .bytes_val = "a value" },
+        .{ .numeric_val = .{ .u64_val = std.math.maxInt(u64) } }, .{ .datetime_ns = -1 },
     };
     for (cases) |value| {
         var writer = typed_dv.TypedDocValuesWriter.init(a, switch (value) {
@@ -6758,6 +6955,7 @@ test "segment range typed values stream chunks with bounded navigation and propa
             .bool_val => .bool_val,
             .bytes_val => .bytes_val,
             .numeric_val => .numeric_val,
+            .datetime_ns => .datetime_ns,
         }, 64);
         defer writer.deinit();
         for (0..256) |doc| try writer.add(@intCast(doc), value);
@@ -9345,4 +9543,308 @@ test "authenticated cache stream covers partial blocks and preserves cache fill 
     try std.testing.expect(state.reads > reads);
     try std.testing.expectEqualSlices(u8, state.bytes[29000..29008], &point);
     try std.testing.expect(cache.retainedBytes() <= 64 * 1024);
+}
+
+test "external lake datetime compaction promotes legacy unsigned values without rounding" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(typed_dv.ValueType.datetime_ns, mergeTypedDocValuesValueType(.u64_val, .datetime_ns).?);
+    try std.testing.expectEqual(typed_dv.ValueType.datetime_ns, mergeTypedDocValuesValueType(.datetime_ns, .u64_val).?);
+    var writer = typed_dv.TypedDocValuesWriter.init(a, .datetime_ns, 2);
+    defer writer.deinit();
+    try addMergedTypedDocValue(&writer, 0, .{ .u64_val = std.math.maxInt(u64) });
+    try addMergedTypedDocValue(&writer, 1, .{ .datetime_ns = -1 });
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try typed_dv.TypedDocValuesReader.init(a, bytes);
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(i128, std.math.maxInt(u64)), (try reader.getDateTimeNs(0)).?);
+    try std.testing.expectEqual(@as(i128, -1), (try reader.getDateTimeNs(1)).?);
+}
+
+test "external lake sorted datetime compaction promotes legacy unsigned sort domains" {
+    const alloc = std.testing.allocator;
+
+    var u64_writer = typed_dv.TypedDocValuesWriter.init(alloc, .u64_val, 1024);
+    defer u64_writer.deinit();
+    try u64_writer.add(0, .{ .u64_val = 9_007_199_254_740_993 });
+    const u64_data = try u64_writer.build();
+    defer alloc.free(u64_data);
+
+    var sw1 = SegmentWriter.init(alloc);
+    defer sw1.deinit();
+    const price1 = try sw1.addField("price");
+    try sw1.addSection(price1, .typed_doc_values, u64_data);
+    try sw1.addStoredDoc("doc:b", "{\"price\":2}");
+    try sw1.addIndexSortMetadata(&.{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    });
+    const seg1 = try sw1.build();
+    defer alloc.free(seg1);
+
+    var i64_writer = typed_dv.TypedDocValuesWriter.init(alloc, .datetime_ns, 1024);
+    defer i64_writer.deinit();
+    try i64_writer.add(0, .{ .datetime_ns = -9_007_199_254_740_993 });
+    const i64_data = try i64_writer.build();
+    defer alloc.free(i64_data);
+
+    var sw2 = SegmentWriter.init(alloc);
+    defer sw2.deinit();
+    const price2 = try sw2.addField("price");
+    try sw2.addSection(price2, .typed_doc_values, i64_data);
+    try sw2.addStoredDoc("doc:a", "{\"price\":1}");
+    try sw2.addIndexSortMetadata(&.{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    });
+    const seg2 = try sw2.build();
+    defer alloc.free(seg2);
+
+    var reader1 = try SegmentReader.init(alloc, seg1);
+    defer reader1.deinit();
+    var reader2 = try SegmentReader.init(alloc, seg2);
+    defer reader2.deinit();
+
+    const sort_fields = [_]SegmentIndexSortField{
+        .{ .field = "price", .desc = false },
+        .{ .field = "_id", .desc = false },
+    };
+    const merged = try mergeSegmentInputsWithOptions(alloc, &.{
+        .{ .reader = &reader1 },
+        .{ .reader = &reader2 },
+    }, .{ .index_sort = &sort_fields });
+    defer alloc.free(merged);
+
+    var merged_reader = try SegmentReader.init(alloc, merged);
+    defer merged_reader.deinit();
+    try std.testing.expectEqualStrings("doc:a", (try merged_reader.storedDoc(0)).?.id);
+    try std.testing.expectEqualStrings("doc:b", (try merged_reader.storedDoc(1)).?.id);
+    var values = try typed_dv.TypedDocValuesReader.init(alloc, (try merged_reader.getSection("price", .typed_doc_values)) orelse return error.TestExpectedEqual);
+    defer values.deinit();
+    try std.testing.expectEqual(typed_dv.ValueType.datetime_ns, values.value_type);
+    try std.testing.expectEqual(@as(i128, -9_007_199_254_740_993), (try values.getDateTimeNs(0)).?);
+    try std.testing.expectEqual(@as(i128, 9_007_199_254_740_993), (try values.getDateTimeNs(1)).?);
+}
+
+test "stored block metadata batches preserve rows and bound warm cache probes" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    for (0..384) |doc| {
+        var id: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{doc}), "small stored document");
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = State{ .bytes = bytes };
+    var reader = try SegmentReader.initSource(a, .{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close } });
+    defer reader.deinit();
+    const cache = &reader.native.?.metadata_cache.?;
+    // Warm-cache clock increments measure probes/locking, not backing reads.
+    for (0..384) |doc| _ = try reader.storedLocationMetadata(@intCast(doc));
+    var rows: [stored_fields_block_doc_target + 1]SegmentReader.V4StoredDocLocation = undefined;
+    for ([_]u32{ 0, 128, 256, 383 }) |start| {
+        const count = try reader.storedLocationMetadataBatch(start, &rows);
+        try std.testing.expectEqual(@min(rows.len, 384 - start), count);
+        for (rows[0..count], 0..) |row, i| {
+            const point = (try reader.storedLocationMetadata(start + @as(u32, @intCast(i)))).?;
+            try std.testing.expectEqual(point.id_length, row.id_length);
+            try std.testing.expectEqual(point.block_idx, row.block_idx);
+            try std.testing.expectEqual(point.block_start, row.block_start);
+            try std.testing.expectEqual(point.block_end, row.block_end);
+            try std.testing.expectEqual(point.doc_offset, row.doc_offset);
+            try std.testing.expectEqual(point.raw_len, row.raw_len);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), try reader.storedLocationMetadataBatch(384, &rows));
+    try std.testing.expectEqual(@as(usize, 0), try reader.storedLocationMetadataBatch(std.math.maxInt(u32), &rows));
+    var too_many: [stored_fields_block_doc_target + 2]SegmentReader.V4StoredDocLocation = undefined;
+    try std.testing.expectError(error.InvalidSegment, reader.storedLocationMetadataBatch(0, &too_many));
+    var probes: [2]usize = undefined;
+    for ([_]bool{ false, true }, 0..) |batch, variant| {
+        const before = cache.cache.clock;
+        const start = @import("antfly_platform").time.monotonicNs();
+        for (0..100) |_| {
+            if (batch) {
+                try std.testing.expectEqual(@as(?u32, 128), try copyableStoredBlockDocsWithMetadata(.{ .reader = &reader }, 0, rows[0..128]));
+            } else {
+                const first = (try reader.storedLocationMetadata(0)).?;
+                var count: u32 = 0;
+                while (count < reader.doc_count) : (count += 1) {
+                    const row = (try reader.storedLocationMetadata(count)).?;
+                    if (row.block_idx != first.block_idx) break;
+                    rows[count] = row;
+                }
+                try std.testing.expectEqual(@as(u32, 128), count);
+            }
+        }
+        probes[variant] = @intCast(cache.cache.clock - before);
+        std.debug.print("LITE_STORED_METADATA batch={any} rounds=100 cache_probes={d} elapsed_ns={d} table_scratch_bytes={d}\n", .{ batch, probes[variant], @import("antfly_platform").time.monotonicNs() - start, if (batch) @as(usize, (stored_fields_block_doc_target + 1) * stored_fields_v4_doc_entry_size) else 24 });
+    }
+    try std.testing.expect(probes[1] < probes[0] / 16);
+    const before_prefix = cache.cache.clock;
+    try std.testing.expectEqual(@as(?u32, null), try copyableStoredBlockDocsWithMetadata(.{ .reader = &reader }, 1, rows[0..128]));
+    try std.testing.expect(cache.cache.clock - before_prefix <= 3);
+    var memory = try SegmentReader.init(a, bytes);
+    defer memory.deinit();
+    try std.testing.expectEqual(@as(usize, 129), try memory.storedLocationMetadataBatch(0, &rows));
+}
+
+test "stored metadata batches adapt to short blocks and changing document sizes" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    const large = try a.alloc(u8, stored_fields_block_raw_target);
+    defer a.free(large);
+    @memset(large, 'x');
+    for (0..264) |doc| {
+        var id: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{doc}), if (doc < 8) large else "small");
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = State{ .bytes = bytes };
+    var reader = try SegmentReader.initSource(a, .{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close } });
+    defer reader.deinit();
+    var rows: [129]SegmentReader.V4StoredDocLocation = undefined;
+    for ([_]u32{ 0, 1, 7, 8, 136, 263 }) |start| {
+        const count = try reader.storedLocationMetadataBatch(start, &rows);
+        try std.testing.expectEqual(@as(usize, if (start < 8) 2 else if (start == 263) 1 else if (start == 136) 128 else 129), count);
+        for (rows[0..count], 0..) |row, i| {
+            const point = (try reader.storedLocationMetadata(start + @as(u32, @intCast(i)))).?;
+            try std.testing.expectEqual(point.block_idx, row.block_idx);
+            try std.testing.expectEqual(point.raw_len, row.raw_len);
+            try std.testing.expectEqual(point.doc_offset, row.doc_offset);
+        }
+    }
+    const first = (try reader.storedLocationMetadata(0)).?;
+    const before = reader.native.?.metadata_cache.?.cache.clock;
+    for (0..100) |_| try std.testing.expectEqual(@as(usize, 2), try reader.storedLocationMetadataBatchKnownFirst(0, &rows, first));
+    const probes = reader.native.?.metadata_cache.?.cache.clock - before;
+    try std.testing.expect(probes <= 200);
+    std.debug.print("LITE_SHORT_STORED_METADATA rounds=100 cache_probes={d} table_bytes_per_block=24 previous_table_bytes_per_block=3096\n", .{probes});
+}
+
+test "stored identity streaming batches metadata and preserves ID bytes" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    for (0..384) |doc| {
+        var id: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{doc}), "small stored document");
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = State{ .bytes = bytes };
+    var reader = try SegmentReader.initSource(a, .{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close } });
+    defer reader.deinit();
+    for (0..384) |doc| {
+        const id = (try reader.storedIdAlloc(a, @intCast(doc))).?;
+        a.free(id);
+    }
+    var scratch = SegmentReadScratch.init(a, 64 * 1024);
+    defer scratch.deinit();
+    var ids: std.ArrayListUnmanaged(u8) = .empty;
+    defer ids.deinit(a);
+    const cache = &reader.native.?.metadata_cache.?;
+    const before = cache.cache.clock;
+    for (0..384) |doc| {
+        scratch.reset();
+        const id = (try reader.storedIdAlloc(scratch.allocator(), @intCast(doc))).?;
+        try ids.appendSlice(a, id);
+    }
+    const per_doc_probes = cache.cache.clock - before;
+    var output = MemorySegmentSink.init(a);
+    defer output.deinit();
+    var sink = output.sink();
+    const before_batch = cache.cache.clock;
+    try appendStoredIdentityRange(&sink, .{ .reader = &reader }, 0, reader.doc_count, &scratch);
+    const batch_probes = cache.cache.clock - before_batch;
+    try std.testing.expectEqualSlices(u8, ids.items, output.out.items);
+    std.debug.print("STORED_ID_STREAM documents=384 identity_bytes={d} cache_probes={d}->{d}\n", .{ ids.items.len, per_doc_probes, batch_probes });
+    try std.testing.expectEqual(@as(u64, 768), per_doc_probes);
+    try std.testing.expect(batch_probes <= 6);
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    for (0..384) |i| if (i % 3 == 0) try deleted.add(@intCast(i));
+    output.out.clearRetainingCapacity();
+    ids.clearRetainingCapacity();
+    for (0..384) |i| {
+        if (deleted.contains(@intCast(i))) continue;
+        scratch.reset();
+        const id = (try reader.storedIdAlloc(scratch.allocator(), @intCast(i))).?;
+        try ids.appendSlice(a, id);
+    }
+    try appendStoredIdentityRange(&sink, .{ .reader = &reader, .deleted = deleted }, 0, reader.doc_count, &scratch);
+    try std.testing.expectEqualSlices(u8, ids.items, output.out.items);
+}
+
+test "merge live counts use rank and reject overflow" {
+    const a = std.testing.allocator;
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.addRange(0, 100000);
+    var reader: SegmentReader = undefined;
+    reader.doc_count = 500000;
+    var rank = try roaring.FrozenRankIndex.init(a, deleted);
+    defer rank.deinit();
+    try std.testing.expectEqual(@as(u32, 400000), try countLiveDocs(&.{.{ .reader = &reader, .deleted = deleted, .deletion_rank = &rank }}));
+    reader.doc_count = std.math.maxInt(u32);
+    try std.testing.expectError(error.Overflow, countLiveDocs(&.{ .{ .reader = &reader }, .{ .reader = &reader } }));
+}
+
+test "stored identity streaming bounds scratch for large IDs and skips deleted ranges" {
+    const a = std.testing.allocator;
+    const id = try a.alloc(u8, 192 * 1024 + 17);
+    defer a.free(id);
+    for (id, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    try writer.addStoredDoc(id, "document");
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try SegmentReader.initSource(a, .{ .contiguous = bytes });
+    defer reader.deinit();
+    var scratch = SegmentReadScratch.init(a, 64 * 1024);
+    defer scratch.deinit();
+    var output = MemorySegmentSink.init(a);
+    defer output.deinit();
+    var sink = output.sink();
+    try appendStoredIdentityRange(&sink, .{ .reader = &reader }, 0, 1, &scratch);
+    try std.testing.expectEqualSlices(u8, id, output.out.items);
+    try std.testing.expectEqual(@as(usize, 0), scratch.arena.queryCapacity());
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.add(0);
+    // A wholly deleted input need not have stored metadata at all.
+    var omitted: SegmentReader = undefined;
+    omitted.doc_count = 1;
+    output.out.clearRetainingCapacity();
+    try appendStoredIdentityRange(&sink, .{ .reader = &omitted, .deleted = deleted }, 0, 1, &scratch);
+    try std.testing.expectEqual(@as(usize, 0), output.out.items.len);
+    try std.testing.expectError(error.InvalidSegment, appendStoredIdentityRange(&sink, .{ .reader = &reader }, 1, 1, &scratch));
 }

@@ -3481,6 +3481,12 @@ fn positionBits(positions: []const u32) u8 {
 // buffer. Legacy records can therefore survive advancement without seeking
 // from the start or materializing an entire position list.
 fn nextPackedHit(iterator: *PostingsIterator, cache: ?*PackedReadCache) !?PackedHit {
+    return packedHit(iterator, cache, false);
+}
+
+// Early-filtered merge callers already loaded and positioned the current hit.
+// Avoid repeating chunk readiness checks on the all-surviving hot path.
+fn packedHit(iterator: *PostingsIterator, cache: ?*PackedReadCache, comptime prepared: bool) !?PackedHit {
     if (iterator.is_one_hit) {
         const hit = (try iterator.takeOneHit(false)) orelse return null;
         const view = PackedPositionView{
@@ -3491,10 +3497,10 @@ fn nextPackedHit(iterator: *PostingsIterator, cache: ?*PackedReadCache) !?Packed
         return try packedHitWithSmallDecode(iterator, hit, view);
     }
     if (iterator.positionLength() == null) {
-        const hit = (try iterator.next()) orelse return null;
+        const hit = if (prepared) try iterator.takeCurrentWithPositions() else (try iterator.next()) orelse return null;
         return .{ .hit = hit, .positions = .{ .count = 0, .bits = 0 } };
     }
-    if (iterator.current_chunk_index == std.math.maxInt(usize) or iterator.chunk_doc_pos >= iterator.doc_values.items.len) {
+    if (!prepared and (iterator.current_chunk_index == std.math.maxInt(usize) or iterator.chunk_doc_pos >= iterator.doc_values.items.len)) {
         if (iterator.next_chunk_index >= iterator.chunkCount()) return null;
         const index = iterator.next_chunk_index;
         try iterator.loadChunk(index);
@@ -3541,6 +3547,116 @@ fn nextPackedHit(iterator: *PostingsIterator, cache: ?*PackedReadCache) !?Packed
     iterator.position_records_decoded +|= 1;
     iterator.noteReturnedDoc(doc_id);
     return try packedHitWithSmallDecode(iterator, .{ .doc_id = doc_id, .freq = @intCast(decoded.freq), .norm = norm }, view);
+}
+
+/// Leave the next surviving posting unconsumed. Rejected documents advance
+/// positional framing without allocating or materializing their position lists.
+/// The caller consumes the surviving record using its normal decoded/packed path.
+fn nextMappedDocument(iterator: *PostingsIterator, map: anytype, comptime strict: bool) !?u32 {
+    while (true) {
+        if (iterator.is_one_hit) {
+            if (iterator.one_hit_consumed) return null;
+        } else if (iterator.current_chunk_index == std.math.maxInt(usize) or iterator.chunk_doc_pos >= iterator.doc_values.items.len) {
+            if (iterator.next_chunk_index >= iterator.chunkCount()) return null;
+            if (try skipDeletedMappedChunk(iterator, map)) continue;
+            try iterator.loadChunk(iterator.next_chunk_index);
+            try iterator.enterPositionChunk(iterator.current_chunk_index);
+        }
+        const doc = if (iterator.is_one_hit) iterator.one_hit_doc else iterator.doc_values.items[iterator.chunk_doc_pos];
+        const mapped = if (doc < mapLength(map)) try mapDocumentCached(iterator, map, doc) else if (strict) return error.InvalidData else std.math.maxInt(u32);
+        if (mapped != std.math.maxInt(u32)) return mapped;
+        if (iterator.is_one_hit) {
+            // Validate the immutable packed window even when it is discarded.
+            if (iterator.one_hit_has_locs) _ = try (PackedPositionView{
+                .data = iterator.one_hit_positions_data,
+                .count = iterator.one_hit_freq,
+                .bits = iterator.one_hit_position_bits,
+            }).cursor();
+            iterator.one_hit_consumed = true;
+        } else {
+            try iterator.skipPositionRecord();
+            iterator.chunk_doc_pos += 1;
+        }
+    }
+}
+
+/// Metadata bounds prove every possible document in the chunk is deleted.
+/// Keep frequency decoding and positional framing validation, but avoid doc-ID
+/// decoding where packed widths prove the bounds, and all per-posting mapping.
+/// Legacy unframed positions fall back.
+fn skipDeletedMappedChunk(iterator: *PostingsIterator, map: anytype) !bool {
+    if (@TypeOf(map) != RankDocMap) return false;
+    if (iterator.version < wire_version_chunk_framed_positions) return false;
+    if (map.deleted == null) return false;
+    const rank = map.rank_index orelse return false;
+    const index = iterator.next_chunk_index;
+    const meta = try iterator.chunkMeta(index);
+    const lower: u64 = if (iterator.current_chunk_meta) |previous| @as(u64, previous.max_doc) + 1 else 0;
+    if (meta.max_doc >= map.len or lower > meta.max_doc) return false;
+    var hint: usize = iterator.mapping_rank_hint;
+    const end = rank.rankMembership(meta.max_doc, &hint);
+    if (!end.contains) return false;
+    const below = rank.rank(@intCast(lower));
+    if (end.below + 1 - below != @as(u64, meta.max_doc) + 1 - lower) return false;
+    try iterator.loadChunkMode(index, false);
+    try iterator.enterPositionChunk(index);
+    for (0..meta.doc_count) |_| {
+        try iterator.skipPositionRecord();
+        iterator.chunk_doc_pos += 1;
+    }
+    iterator.document_chunks_rejected +|= 1;
+    return true;
+}
+
+/// A lazy 512-byte mapping window is reused across posting chunks. Contiguous
+/// maps and one-hit iterators need no allocation. Sparse IDs never cause a
+/// source-sized read; every refill covers at most 128 mapping entries.
+fn mapDocumentCached(iterator: *PostingsIterator, map: anytype, doc: u32) !u32 {
+    if (@TypeOf(map) == RankDocMap) {
+        if (map.deleted != null) if (map.rank_index) |rank| {
+            const result = rank.rankMembership(doc, &iterator.mapping_rank_hint);
+            if (result.contains) return std.math.maxInt(u32);
+            return try std.math.add(u32, map.offset, doc - @as(u32, @intCast(result.below)));
+        };
+    }
+    if (@TypeOf(map) == FileDocMap or @TypeOf(map) == AffineDocMap) {
+        const ids = if (@TypeOf(map) == FileDocMap) map.ids else map.ids orelse return mapDocument(map, doc);
+        if (!iterator.is_one_hit and ids.source == .ranges) {
+            if (iterator.mapping_window.items.len == 0 or doc < iterator.mapping_window_base or @as(u64, doc) - iterator.mapping_window_base >= iterator.mapping_window.items.len / 4) {
+                const base = doc;
+                const docs = iterator.doc_values.items;
+                // Keep the right edge monotone even when density rejects a
+                // window. Each document is inspected at most once per chunk.
+                if (iterator.mapping_scan_chunk != iterator.current_chunk_index or iterator.chunk_doc_pos <= iterator.mapping_scan_start) {
+                    iterator.mapping_scan_end = iterator.chunk_doc_pos + 1;
+                    iterator.mapping_scan_chunk = iterator.current_chunk_index;
+                }
+                iterator.mapping_scan_start = iterator.chunk_doc_pos;
+                var end = @min(docs.len, @max(iterator.chunk_doc_pos + 1, iterator.mapping_scan_end));
+                while (end < docs.len and docs[end] >= doc and @as(u64, docs[end]) - doc < 128 and docs[end] < map.len) : (end += 1) {
+                    if (@import("builtin").is_test) iterator.test_mapping_scan_steps += 1;
+                }
+                iterator.mapping_scan_end = end;
+                const postings = end - iterator.chunk_doc_pos;
+                const count = @as(u64, docs[end - 1]) - doc + 1;
+                // Sparse terms keep four-byte point reads: don't trade fewer
+                // calls for arbitrarily more mapping I/O or scratch.
+                if (postings < 4 or (count + 3) / 4 > postings) return mapDocument(map, doc);
+                try iterator.mapping_window.ensureTotalCapacityPrecise(iterator.alloc, @as(usize, @intCast(count)) * 4);
+                iterator.mapping_window.items.len = @as(usize, @intCast(count)) * 4;
+                // Invalidate before reading: failed reads must not publish a
+                // partially filled window if callers retry the iterator.
+                iterator.mapping_window_base = std.math.maxInt(u32);
+                try ids.readInto(@as(u64, base) * 4, iterator.mapping_window.items);
+                iterator.mapping_window_base = base;
+                iterator.mapping_window_refills +|= 1;
+            }
+            const offset = @as(usize, doc - iterator.mapping_window_base) * 4;
+            const mapped = std.mem.readInt(u32, iterator.mapping_window.items[offset..][0..4], .little);
+            return if (@TypeOf(map) == AffineDocMap) try std.math.add(u32, map.offset, mapped) else mapped;
+        }
+    }
+    return mapDocument(map, doc);
 }
 
 fn packedHitWithSmallDecode(iterator: *PostingsIterator, hit: PostingsIterator.Hit, view: PackedPositionView) !PackedHit {
@@ -3727,6 +3843,15 @@ pub const PostingsIterator = struct {
     payload_data: []const u8 = &.{},
     payload_range: ?@import("../segment_source.zig").View = null,
     payload_buffer: std.ArrayListUnmanaged(u8) = .empty,
+    mapping_window: std.ArrayListUnmanaged(u8) = .empty,
+    mapping_window_base: u32 = std.math.maxInt(u32),
+    mapping_rank_hint: usize = 0,
+    mapping_window_refills: u64 = 0,
+    mapping_scan_chunk: usize = std.math.maxInt(usize),
+    mapping_scan_start: usize = std.math.maxInt(usize),
+    mapping_scan_end: usize = 0,
+    test_mapping_scan_steps: if (@import("builtin").is_test) usize else void = if (@import("builtin").is_test) 0 else {},
+    document_chunks_rejected: u64 = 0,
     max_payload_chunk_bytes: usize = 64 * 1024,
     norms_data: []const u8 = &.{},
     norms_reader: ?RangeInvertedIndexReader = null,
@@ -4108,6 +4233,10 @@ pub const PostingsIterator = struct {
     }
 
     fn loadChunk(self: *PostingsIterator, index: usize) !void {
+        return self.loadChunkMode(index, true);
+    }
+
+    fn loadChunkMode(self: *PostingsIterator, index: usize, comptime decode_documents: bool) !void {
         const meta = if (!self.hasStreamedRecords() and self.version >= wire_version_checkpoints and
             self.current_chunk_meta != null and
             self.current_chunk_index != std.math.maxInt(usize) and
@@ -4126,8 +4255,10 @@ pub const PostingsIterator = struct {
         else
             try self.chunkMeta(index);
         self.doc_values.clearRetainingCapacity();
-        try self.doc_values.ensureTotalCapacity(self.alloc, meta.doc_count);
-        self.doc_values.items.len = meta.doc_count;
+        if (decode_documents) {
+            try self.doc_values.ensureTotalCapacity(self.alloc, meta.doc_count);
+            self.doc_values.items.len = meta.doc_count;
+        }
 
         self.freq_values.clearRetainingCapacity();
         try self.freq_values.ensureTotalCapacity(self.alloc, meta.doc_count);
@@ -4185,18 +4316,34 @@ pub const PostingsIterator = struct {
         const expected_len = payload_cursor + doc_len + freq_len;
         if (chunk_data.len < expected_len) return error.InvalidData;
 
+        // Packed widths bound every nonnegative delta. For dense modern
+        // chunks this proves all IDs remain in the deleted interval without
+        // decoding them. Wider/sparse chunks still decode and validate IDs;
+        // metadata alone must not conceal an out-of-range strict mapping.
+        const lower: u64 = if (self.current_chunk_meta) |previous| @as(u64, previous.max_doc) + 1 else 0;
+        const bounded_documents = if (first_doc) |first|
+            count > 0 and first >= lower and @as(u64, first) + ((@as(u64, 1) << @as(u6, @intCast(doc_bits))) - 1) * (count - 1) <= meta.max_doc
+        else
+            false;
+        const materialize_documents = decode_documents or !bounded_documents;
+        if (!decode_documents and materialize_documents) {
+            try self.doc_values.ensureTotalCapacity(self.alloc, meta.doc_count);
+            self.doc_values.items.len = meta.doc_count;
+        }
         var pos = payload_cursor;
-        if (first_doc) |doc_id| {
-            if (count == 0) return error.InvalidData;
-            if (vertical_docs) {
-                const block: *[simd_bitpack.block_values]u32 = self.doc_values.items[0..simd_bitpack.block_values];
-                _ = simd_bitpack.decodeBlockPrefixSum(chunk_data[pos..][0..doc_len], block, doc_bits, doc_id) catch return error.InvalidData;
+        if (materialize_documents) {
+            if (first_doc) |doc_id| {
+                if (count == 0) return error.InvalidData;
+                if (vertical_docs) {
+                    const block: *[simd_bitpack.block_values]u32 = self.doc_values.items[0..simd_bitpack.block_values];
+                    _ = simd_bitpack.decodeBlockPrefixSum(chunk_data[pos..][0..doc_len], block, doc_bits, doc_id) catch return error.InvalidData;
+                } else {
+                    try decodePackedU32Into(chunk_data[pos..][0..doc_len], self.doc_values.items[1..], doc_bits);
+                    self.doc_values.items[0] = doc_id;
+                }
             } else {
-                try decodePackedU32Into(chunk_data[pos..][0..doc_len], self.doc_values.items[1..], doc_bits);
-                self.doc_values.items[0] = doc_id;
+                try decodePackedU32Into(chunk_data[pos..][0..doc_len], self.doc_values.items, doc_bits);
             }
-        } else {
-            try decodePackedU32Into(chunk_data[pos..][0..doc_len], self.doc_values.items, doc_bits);
         }
         pos += doc_len;
         if (constant_frequency) |value| {
@@ -4215,6 +4362,10 @@ pub const PostingsIterator = struct {
             }
         }
 
+        if (!decode_documents) {
+            for (self.doc_values.items) |doc| if (doc < lower or doc > meta.max_doc) return error.InvalidData;
+            self.doc_values.clearRetainingCapacity();
+        }
         self.current_chunk_index = index;
         self.current_chunk_meta = meta;
         self.current_chunk_min_doc = if (self.doc_values.items.len > 0) self.doc_values.items[0] else 0;
@@ -5032,6 +5183,7 @@ pub const PostingsIterator = struct {
         if (self.is_one_hit and !self.one_hit_owns_scratch) return;
         self.position_read_buffer.deinit(self.alloc);
         self.payload_buffer.deinit(self.alloc);
+        self.mapping_window.deinit(self.alloc);
         self.doc_values.deinit(self.alloc);
         self.freq_values.deinit(self.alloc);
         self.chunk_metas.deinit(self.alloc);
@@ -6156,10 +6308,8 @@ fn appendLookupResultToAccumulatorLimitedWithWorkspace(
                 } else post_iter.deinit();
             }
 
-            while (try post_iter.next()) |hit| {
-                if (hit.doc_id >= mapLength(rmap)) continue;
-                const remapped_doc = try mapDocument(rmap, hit.doc_id);
-                if (remapped_doc == std.math.maxInt(u32)) continue;
+            while (try nextMappedDocument(&post_iter, rmap, false)) |remapped_doc| {
+                const hit = if (post_iter.is_one_hit) (try post_iter.takeOneHit(true)) orelse return error.InvalidData else try post_iter.takeCurrentWithPositions();
                 if (postingAccumulatorWouldSpill(acc, hit.positions.len, byte_limit)) return false;
                 try updateMergedNorm(doc_norms, remapped_doc, hit.norm);
                 try acc.add(alloc, remapped_doc, hit.freq, hit.norm, hit.positions);
@@ -6217,11 +6367,9 @@ const ExternalPostingStream = struct {
                     owner.compact_iterator = iterator;
                 } else iterator.deinit();
             }
-            while (try nextPackedHit(&iterator, self.read_cache.?)) |packed_hit| {
+            while (try nextMappedDocument(&iterator, map, true)) |doc| {
+                const packed_hit = (try packedHit(&iterator, self.read_cache.?, true)) orelse return error.InvalidData;
                 const hit = packed_hit.hit;
-                if (hit.doc_id >= map.len) return error.InvalidData;
-                const doc = try mapDocument(map, hit.doc_id);
-                if (doc == std.math.maxInt(u32)) continue;
                 encoded.clearRetainingCapacity();
                 var header: [13]u8 = undefined;
                 std.mem.writeInt(u32, header[0..4], hit.freq, .little);
@@ -6325,7 +6473,7 @@ fn resetMergeBuffers(value: anytype, alloc: Allocator, remaining: *usize) void {
     }
 }
 
-const merge_iterator_buffers = .{ "position_read_buffer", "payload_buffer", "doc_values", "freq_values", "chunk_metas", "chunk_meta_values", "impact_chunk_ids", "positions_buf" };
+const merge_iterator_buffers = .{ "position_read_buffer", "payload_buffer", "mapping_window", "doc_values", "freq_values", "chunk_metas", "chunk_meta_values", "impact_chunk_ids", "positions_buf" };
 
 fn recycleMergeIterator(iterator: *PostingsIterator, alloc: Allocator, remaining: *usize) void {
     var recycled = PostingsIterator{ .alloc = alloc };
@@ -6509,12 +6657,6 @@ fn MergedPostingStream(comptime Maps: type) type {
         fn nextSourceHit(self: *@This(), source: usize) !?PostingsIterator.Hit {
             const iterator = &self.iterators[source].?;
             if (!iterator.is_one_hit and usesContiguousPositionGroups(iterator.version) and (iterator.positions_range != null or iterator.positions_data != null)) {
-                if (iterator.current_chunk_index == std.math.maxInt(usize) or iterator.chunk_doc_pos >= iterator.doc_values.items.len) {
-                    if (iterator.next_chunk_index >= iterator.chunkCount()) return null;
-                    const index = iterator.next_chunk_index;
-                    try iterator.loadChunk(index);
-                    try iterator.enterPositionChunk(index);
-                }
                 const decoded = decodeFreqHasLocs(iterator.freq_values.items[iterator.chunk_doc_pos]);
                 if (!decoded.has_locs or decoded.freq <= 32) {
                     const hit = try iterator.takeCurrentWithPositions();
@@ -6528,19 +6670,15 @@ fn MergedPostingStream(comptime Maps: type) type {
                     return hit;
                 }
             }
-            const packed_hit = (try nextPackedHit(iterator, self.read_cache)) orelse return null;
+            const packed_hit = (try packedHit(iterator, self.read_cache, true)) orelse return null;
             self.head_views[source] = packed_hit.positions;
             self.decoded_heads[source] = packed_hit.hit.positions;
             return packed_hit.hit;
         }
         fn advance(self: *@This(), source: usize) !void {
-            while (try self.nextSourceHit(source)) |hit| {
-                if (hit.doc_id >= mapLength(self.maps[source])) return error.InvalidData;
-                const mapped = try mapDocument(self.maps[source], hit.doc_id);
-                if (mapped == std.math.maxInt(u32)) continue;
-                try self.heap.push(self.allocator, .{ .source = source, .doc_id = mapped, .frequency = hit.freq, .norm = hit.norm });
-                return;
-            }
+            const mapped = (try nextMappedDocument(&self.iterators[source].?, self.maps[source], true)) orelse return;
+            const hit = (try self.nextSourceHit(source)) orelse return error.InvalidData;
+            try self.heap.push(self.allocator, .{ .source = source, .doc_id = mapped, .frequency = hit.freq, .norm = hit.norm });
         }
         fn packedHeadView(self: *@This(), source: usize) !PackedPositionView {
             const head = self.head_views[source];
@@ -7926,7 +8064,8 @@ test "merged inverted section cleans up partially initialized term iterators" {
             defer failing_alloc.free(merged);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{ first, second });
+    // Stable remaps keep allocation counts deterministic across fault injections.
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.run, .{ first, second });
 }
 
 test "sparse field postings beyond first chunk survive merge" {
@@ -10616,4 +10755,376 @@ test "spill preparation reuses bounded iterator scratch across distinct terms" {
     var stable = @import("../storage/lite/test_allocator.zig").NoResizeAllocator{ .backing = a };
     try std.testing.checkAllAllocationFailures(stable.allocator(), Harness.run, .{ @as([]const ?TermIterator.Entry, &entries), @as([]const FileDocMap, &maps) });
     try std.testing.expectEqual(@as(usize, 1), owner.refs);
+}
+
+test "merge filters deleted positions before decoding across current and legacy records" {
+    const a = std.testing.allocator;
+    const documents = 256;
+    var long_positions: [8192]u32 = undefined;
+    for (&long_positions, 0..) |*position, i| position.* = @intCast(i * 3);
+    const short_positions = [_]u32{ 1, 4, 9 };
+    var ids: [documents]u32 = undefined;
+    for (&ids, 0..) |*id, doc| id.* = if (doc % 32 == 0) @intCast(doc / 32) else std.math.maxInt(u32);
+    const State = struct {
+        bytes: []const u8,
+        bytes_read: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.bytes_read += out.len;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    const View = @import("../segment_source.zig").View;
+    const Budget = @import("../storage/lite/test_allocator.zig").BudgetAllocator;
+    for ([_]bool{ false, true }) |legacy| {
+        var builder = InvertedIndexBuilder.init(a, .{ .postings_layout = if (legacy) .legacy_fixture_v27 else .posting_count_v35 });
+        defer builder.deinit();
+        for (0..documents) |doc| {
+            const positions: []const u32 = if (doc % 32 == 0) &short_positions else &long_positions;
+            try builder.addDocument(@intCast(doc), &.{.{ .term = "deleted", .freq = @intCast(positions.len), .norm = 8192, .positions = positions }});
+        }
+        const bytes = try builder.build();
+        defer a.free(bytes);
+        if (legacy) bytes[4] = wire_version_compact_postings_header;
+        var reader = try InvertedIndexReader.init(a, bytes);
+        if (legacy) reader.version = wire_version_chunk_framed_positions;
+        var result = reader.lookup("deleted").?;
+        var legacy_positions = std.ArrayListUnmanaged(u8).empty;
+        defer legacy_positions.deinit(a);
+        if (legacy) {
+            for (0..documents) |doc| try appendPackedPositionsForDoc(a, &legacy_positions, if (doc % 32 == 0) &short_positions else &long_positions);
+            result.postings.version = wire_version_legacy;
+            result.postings.positions_data = legacy_positions.items;
+            result.postings.skip_data = null;
+        }
+        var state = State{ .bytes = result.postings.positions_data.? };
+        result.postings.positions_data = null;
+        result.postings.positions_range = try View.init(.{ .ranges = .{ .ptr = &state, .length = state.bytes.len, .read_into = State.read, .close = State.close } }, 0, state.bytes.len);
+        var measured_reads: [2]usize = undefined;
+        var measured_peak: [2]usize = undefined;
+        for ([_]bool{ false, true }, 0..) |filter_first, variant| {
+            state.bytes_read = 0;
+            result.postings.max_position_record_bytes = if (filter_first) 64 else 1024 * 1024;
+            var budget = Budget{ .backing = a, .limit = 512 * 1024 };
+            var iterator = try result.iterator(budget.allocator());
+            var alive = true;
+            defer if (alive) iterator.deinit();
+            const start = @import("antfly_platform").time.monotonicNs();
+            var seen: u32 = 0;
+            if (filter_first) {
+                while (try nextMappedDocument(&iterator, @as([]const u32, &ids), true)) |mapped| {
+                    const hit = (try iterator.next()).?;
+                    try std.testing.expectEqual(seen, mapped);
+                    try std.testing.expectEqual(seen * 32, hit.doc_id);
+                    try std.testing.expectEqualSlices(u32, &short_positions, hit.positions);
+                    seen += 1;
+                }
+                try std.testing.expectEqual(@as(u64, 8), iterator.position_records_decoded);
+            } else {
+                while (try iterator.next()) |hit| {
+                    if (ids[hit.doc_id] == std.math.maxInt(u32)) continue;
+                    try std.testing.expectEqual(seen, ids[hit.doc_id]);
+                    try std.testing.expectEqualSlices(u32, &short_positions, hit.positions);
+                    seen += 1;
+                }
+                try std.testing.expectEqual(@as(u64, documents), iterator.position_records_decoded);
+            }
+            const elapsed = @import("antfly_platform").time.monotonicNs() - start;
+            try std.testing.expectEqual(@as(u32, 8), seen);
+            measured_reads[variant] = state.bytes_read;
+            measured_peak[variant] = budget.peak;
+            iterator.deinit();
+            alive = false;
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            std.debug.print("LITE_DELETION_FILTER legacy={any} early={any} documents=256 survivors=8 elapsed_ns={d} position_source_bytes={d} peak={d}\n", .{ legacy, filter_first, elapsed, state.bytes_read, budget.peak });
+        }
+        try std.testing.expect(measured_reads[1] < measured_reads[0] / 8);
+        try std.testing.expect(measured_peak[1] < measured_peak[0]);
+        result.postings.max_position_record_bytes = 64;
+        var acc = PostingAccumulator{};
+        defer acc.deinit(a);
+        var norms: [8]u32 = @splat(0);
+        var total: u64 = 0;
+        try std.testing.expect(try appendLookupResultToAccumulatorLimitedWithWorkspace(a, &acc, result, @as([]const u32, &ids), &norms, &total, 256 * 1024, null));
+        try std.testing.expectEqual(@as(u64, 24), total);
+        try std.testing.expectEqual(@as(usize, 8), acc.doc_ids.items.len);
+        for (acc.doc_ids.items, acc.metas.items, 0..) |doc, meta, index| {
+            try std.testing.expectEqual(@as(u32, @intCast(index)), doc);
+            try std.testing.expectEqual(@as(u32, 3), meta.position_count);
+            try std.testing.expectEqualSlices(u32, &short_positions, acc.all_positions.items[index * 3 ..][0..3]);
+        }
+        const entries = [_]?TermIterator.Entry{.{ .term = "deleted", .result = result }};
+        const maps = [_][]const u32{&ids};
+        var workspace = PostingMergeWorkspace{};
+        defer workspace.deinit(a);
+        var stream = try MergedPostingStream(@TypeOf(&maps)).init(a, &entries, "deleted", &maps, &workspace);
+        defer stream.deinit();
+        var views = std.ArrayListUnmanaged(PackedPositionView).empty;
+        defer views.deinit(a);
+        try std.testing.expect(try stream.packedBlock(&acc, &views, 128));
+        try std.testing.expectEqual(@as(usize, 8), acc.doc_ids.items.len);
+        try std.testing.expect(stream.densePositionsReady());
+        try std.testing.expect(!try stream.packedBlock(&acc, &views, 128));
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        defer a.free(directory);
+        var mapping_bytes: [documents * 4]u8 = undefined;
+        for (ids, 0..) |id, doc| std.mem.writeInt(u32, mapping_bytes[doc * 4 ..][0..4], if (id == std.math.maxInt(u32)) id else 7 - id, .little);
+        const spill_maps = [_]FileDocMap{.{ .len = documents, .ids = try View.init(.{ .contiguous = &mapping_bytes }, 0, mapping_bytes.len), .records = try View.init(.{ .contiguous = &.{} }, 0, 0), .monotonic = false, .scratch = .{ .io = std.testing.io, .directory = directory, .chunk_records = 4 } }};
+        var spill = try ExternalPostingStream.initWithWorkspace(a, &entries, "deleted", &spill_maps, &workspace);
+        defer spill.deinit();
+        try std.testing.expect(try spill.block(&acc, 128));
+        try std.testing.expectEqual(@as(usize, 8), acc.doc_ids.items.len);
+        for (acc.doc_ids.items, 0..) |doc, index| {
+            try std.testing.expectEqual(@as(u32, @intCast(index)), doc);
+            try std.testing.expectEqualSlices(u32, &short_positions, acc.all_positions.items[index * 3 ..][0..3]);
+        }
+        try std.testing.expect(!try spill.block(&acc, 128));
+    }
+}
+
+test "deleted posting skips reject malformed legacy framing and strict mappings" {
+    const a = std.testing.allocator;
+    const invalid = [_]u8{ 1, 33, 0 };
+    var iterator = PostingsIterator{ .alloc = a, .version = wire_version_legacy, .positions_data = &invalid, .current_chunk_index = 0 };
+    defer iterator.deinit();
+    try iterator.doc_values.append(a, 0);
+    try iterator.freq_values.append(a, @intCast(encodeFreqHasLocs(1, true)));
+    const ids = [_]u32{std.math.maxInt(u32)};
+    try std.testing.expectError(error.InvalidData, nextMappedDocument(&iterator, @as([]const u32, &ids), true));
+    try std.testing.expectError(error.InvalidData, nextMappedDocument(&iterator, @as([]const u32, &.{}), true));
+    iterator.positions_data = &.{ 4, 32, 0 };
+    iterator.positions_cursor = 0;
+    try std.testing.expectError(error.InvalidData, nextMappedDocument(&iterator, @as([]const u32, &ids), true));
+    var one = PostingsIterator{ .alloc = a, .is_one_hit = true, .one_hit_has_locs = true, .one_hit_freq = 1, .one_hit_position_bits = 33, .one_hit_positions_data = &invalid };
+    defer one.deinit();
+    try std.testing.expectError(error.InvalidData, nextMappedDocument(&one, @as([]const u32, &ids), true));
+}
+
+test "mapped merge rejects deleted chunks with validated positions and bounded mapping windows" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{ .postings_layout = .posting_count_v35 });
+    defer builder.deinit();
+    for (0..512) |doc| try builder.addDocument(@intCast(doc), &.{.{ .term = "mapped", .freq = 3, .norm = 32, .positions = &.{ 1, 4, 9 } }});
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var reader = try InvertedIndexReader.init(a, bytes);
+    const result = reader.lookup("mapped").?;
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    for (0..512) |doc| if (doc < 256 or doc >= 384) {
+        try deleted.add(@intCast(doc));
+    };
+    const maps = try prepareRankDocMaps(a, &.{512}, &.{deleted});
+    defer deinitRankDocMaps(a, maps);
+    var iterator = try result.iterator(a);
+    defer iterator.deinit();
+    var seen: u32 = 0;
+    while (try nextMappedDocument(&iterator, maps[0], true)) |mapped| {
+        const hit = (try iterator.next()).?;
+        try std.testing.expectEqual(seen, mapped);
+        try std.testing.expectEqual(seen + 256, hit.doc_id);
+        try std.testing.expectEqualSlices(u32, &.{ 1, 4, 9 }, hit.positions);
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 128), seen);
+    try std.testing.expectEqual(@as(u64, 3), iterator.document_chunks_rejected);
+
+    const State = struct {
+        bytes: []const u8,
+        reads: usize = 0,
+        read_bytes: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (out.len > 512) return error.InvalidData;
+            self.reads += 1;
+            self.read_bytes += out.len;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var mapping: [512 * 4]u8 = undefined;
+    for (0..512) |doc| std.mem.writeInt(u32, mapping[doc * 4 ..][0..4], @intCast(511 - doc), .little);
+    var state = State{ .bytes = &mapping };
+    const View = @import("../segment_source.zig").View;
+    const view = try View.init(.{ .ranges = .{ .ptr = &state, .length = mapping.len, .read_into = State.read, .close = State.close } }, 0, mapping.len);
+    const map = FileDocMap{ .len = 512, .ids = view, .records = try View.init(.{ .contiguous = &.{} }, 0, 0) };
+    var cached = try result.iterator(a);
+    defer cached.deinit();
+    seen = 0;
+    while (try nextMappedDocument(&cached, map, true)) |mapped| {
+        const hit = (try cached.next()).?;
+        try std.testing.expectEqual(511 - seen, mapped);
+        try std.testing.expectEqual(seen, hit.doc_id);
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 512), seen);
+    try std.testing.expectEqual(@as(usize, 4), state.reads);
+    try std.testing.expectEqual(@as(usize, 2048), state.read_bytes);
+    try std.testing.expect(cached.mapping_window.capacity <= 512);
+    std.debug.print("LITE_MAPPING_WINDOW documents=512 logical_reads={d} bytes={d} retained={d} rejected_chunks={d}\n", .{ state.reads, state.read_bytes, cached.mapping_window.capacity, iterator.document_chunks_rejected });
+}
+
+test "deleted chunk rejection retains malformed position validation" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{ .postings_layout = .posting_count_v35 });
+    defer builder.deinit();
+    for (0..128) |doc| try builder.addDocument(@intCast(doc), &.{.{ .term = "deleted-chunk", .freq = 1, .norm = 1, .positions = &.{1} }});
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var reader = try InvertedIndexReader.init(a, bytes);
+    var result = reader.lookup("deleted-chunk").?;
+    const original = result.postings.positions_data.?;
+    const corrupt = try a.dupe(u8, original);
+    defer a.free(corrupt);
+    var cursor: usize = 0;
+    _ = try readVarintU32(corrupt, &cursor);
+    corrupt[cursor] = 33;
+    result.postings.positions_data = corrupt;
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    for (0..128) |doc| try deleted.add(@intCast(doc));
+    const maps = try prepareRankDocMaps(a, &.{128}, &.{deleted});
+    defer deinitRankDocMaps(a, maps);
+    var iterator = try result.iterator(a);
+    defer iterator.deinit();
+    try std.testing.expectError(error.InvalidData, nextMappedDocument(&iterator, maps[0], true));
+    // Corrupt the first absolute document ID while retaining valid metadata:
+    // chunk rejection must not mask the strict map's out-of-range validation.
+    result.postings.positions_data = original;
+    const payload = try a.dupe(u8, result.postings.payload_data);
+    defer a.free(payload);
+    const meta = try iterator.chunkMeta(0);
+    payload[meta.doc_ctrl_off] = 64;
+    result.postings.payload_data = payload;
+    var bad_ids = try result.iterator(a);
+    defer bad_ids.deinit();
+    try std.testing.expectError(error.InvalidData, nextMappedDocument(&bad_ids, maps[0], true));
+}
+
+test "mapping windows bound sparse reads and reuse owned scratch across terms" {
+    const a = std.testing.allocator;
+    const State = struct {
+        reads: usize = 0,
+        bytes: usize = 0,
+        fail: bool = false,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.WouldBlock;
+            self.reads += 1;
+            self.bytes += out.len;
+            for (0..out.len / 4) |i| std.mem.writeInt(u32, out[i * 4 ..][0..4], @intCast(offset / 4 + i), .little);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = State{};
+    const View = @import("../segment_source.zig").View;
+    const view = try View.init(.{ .ranges = .{ .ptr = &state, .length = 1000 * 4, .read_into = State.read, .close = State.close } }, 0, 1000 * 4);
+    const map = AffineDocMap{ .len = 1000, .offset = 7, .ids = view };
+    var iterator = PostingsIterator{ .alloc = a };
+    defer iterator.deinit();
+    try iterator.doc_values.appendSlice(a, &.{ 0, 127, 128, 999 });
+    for (iterator.doc_values.items, 0..) |doc, i| {
+        iterator.chunk_doc_pos = i;
+        try std.testing.expectEqual(doc + 7, try mapDocumentCached(&iterator, map, doc));
+    }
+    try std.testing.expectEqual(@as(usize, 4), state.reads);
+    try std.testing.expectEqual(@as(usize, 16), state.bytes);
+    try std.testing.expectEqual(@as(usize, 0), iterator.mapping_window.capacity);
+    iterator.doc_values.clearRetainingCapacity();
+    for (0..128) |doc| try iterator.doc_values.append(a, @intCast(doc));
+    iterator.chunk_doc_pos = 0;
+    state.fail = true;
+    try std.testing.expectError(error.WouldBlock, mapDocumentCached(&iterator, map, 0));
+    state.fail = false;
+    try std.testing.expectEqual(@as(u32, 7), try mapDocumentCached(&iterator, map, 0));
+    const pointer = iterator.mapping_window.items.ptr;
+    var remaining: usize = 4096;
+    recycleMergeIterator(&iterator, a, &remaining);
+    try std.testing.expectEqual(pointer, iterator.mapping_window.items.ptr);
+    try std.testing.expectEqual(@as(usize, 0), iterator.mapping_window.items.len);
+    try std.testing.expectEqual(std.math.maxInt(u32), iterator.mapping_window_base);
+    try iterator.doc_values.appendSlice(a, &.{ 128, 129, 130, 131 });
+    try std.testing.expectEqual(@as(u32, 135), try mapDocumentCached(&iterator, map, 128));
+    try std.testing.expectEqual(pointer, iterator.mapping_window.items.ptr);
+}
+
+test "deleted modern chunks avoid document scratch while retaining frequency framing" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{ .postings_layout = .posting_count_v35 });
+    defer builder.deinit();
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    for (0..4096) |doc| {
+        try builder.addDocument(@intCast(doc), &.{.{ .term = "all-deleted", .freq = 3, .norm = 32, .positions = &.{ 1, 4, 9 } }});
+        try deleted.add(@intCast(doc));
+    }
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var reader = try InvertedIndexReader.init(a, bytes);
+    const result = reader.lookup("all-deleted").?;
+    const maps = try prepareRankDocMaps(a, &.{4096}, &.{deleted});
+    defer deinitRankDocMaps(a, maps);
+    const Budget = @import("../storage/lite/test_allocator.zig").BudgetAllocator;
+    var peaks: [2]usize = undefined;
+    for ([_]bool{ false, true }, 0..) |reject_chunks, variant| {
+        var budget = Budget{ .backing = a, .limit = 64 * 1024 };
+        var iterator = try result.iterator(budget.allocator());
+        var alive = true;
+        defer if (alive) iterator.deinit();
+        const start = platform_time.monotonicNs();
+        if (reject_chunks) {
+            try std.testing.expectEqual(@as(?u32, null), try nextMappedDocument(&iterator, maps[0], true));
+            try std.testing.expectEqual(@as(u64, 32), iterator.document_chunks_rejected);
+            try std.testing.expectEqual(@as(usize, 0), iterator.doc_values.capacity);
+        } else {
+            while (iterator.next_chunk_index < iterator.chunkCount()) {
+                try iterator.loadChunk(iterator.next_chunk_index);
+                try iterator.enterPositionChunk(iterator.current_chunk_index);
+                for (iterator.doc_values.items) |doc| {
+                    try std.testing.expectEqual(std.math.maxInt(u32), try mapDocument(maps[0], doc));
+                    try iterator.skipPositionRecord();
+                    iterator.chunk_doc_pos += 1;
+                }
+            }
+        }
+        const elapsed = platform_time.monotonicNs() - start;
+        peaks[variant] = budget.peak;
+        iterator.deinit();
+        alive = false;
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        std.debug.print("LITE_DELETED_CHUNKS reject={any} documents=4096 elapsed_ns={d} peak={d}\n", .{ reject_chunks, elapsed, budget.peak });
+    }
+    try std.testing.expect(peaks[1] < peaks[0]);
+}
+
+test "mapping windows use linear lookahead for moderately sparse chunks" {
+    const a = std.testing.allocator;
+    const State = struct {
+        reads: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            for (0..out.len / 4) |i| std.mem.writeInt(u32, out[i * 4 ..][0..4], @intCast(offset / 4 + i), .little);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = State{};
+    const view = try @import("../segment_source.zig").View.init(.{ .ranges = .{ .ptr = &state, .length = 1000 * 4, .read_into = State.read, .close = State.close } }, 0, 1000 * 4);
+    const map = AffineDocMap{ .len = 1000, .offset = 7, .ids = view };
+    var iterator = PostingsIterator{ .alloc = a };
+    defer iterator.deinit();
+    for (0..128) |i| try iterator.doc_values.append(a, @intCast(i * 5));
+    iterator.test_mapping_scan_steps = 0;
+    for (iterator.doc_values.items, 0..) |doc, i| {
+        iterator.chunk_doc_pos = i;
+        try std.testing.expectEqual(doc + 7, try mapDocumentCached(&iterator, map, doc));
+    }
+    std.debug.print("LINEAR_SPARSE_MAPPING postings=128 stride=5 reads={d} scan_steps={d} refills={d}\n", .{ state.reads, iterator.test_mapping_scan_steps, iterator.mapping_window_refills });
+    try std.testing.expectEqual(@as(usize, 125), state.reads);
+    try std.testing.expectEqual(@as(u64, 1), iterator.mapping_window_refills);
+    try std.testing.expect(iterator.test_mapping_scan_steps <= 128);
 }

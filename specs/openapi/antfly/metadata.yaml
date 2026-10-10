@@ -9227,8 +9227,13 @@ components:
           x-go-type-skip-optional-pointer: false
         decider: {type: string, minLength: 1}
         questions:
-          type: object
-          additionalProperties: true
+          type: array
+          minItems: 1
+          maxItems: 64
+          description: Named decision question array using choice choices, score levels, or predicate instructions.
+          items:
+            type: object
+            additionalProperties: true
         statement: {type: string, minLength: 1}
         instructions: {type: string, minLength: 1}
         criteria:
@@ -10251,6 +10256,10 @@ components:
           type: integer
           format: int64
           description: Candidate documents considered by sort execution.
+        ordered_scanned_count:
+          type: integer
+          format: int64
+          description: Ordered lake entries traversed before native membership filtering.
         cursor_rejected_count:
           type: integer
           format: int64

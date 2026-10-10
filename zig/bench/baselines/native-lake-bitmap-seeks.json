@@ -1,0 +1,14 @@
+{
+  "platform": "macos-aarch64",
+  "zig": "0.17.0",
+  "optimization": "ReleaseFast",
+  "rows": 50000000,
+  "probes": 1000000,
+  "probe_stride": 50,
+  "before_fresh_seek_ns": 383519375,
+  "after_fresh_seek_ns": 9662500,
+  "after_prepared_rank_select_ns": 74272833,
+  "checksum": 24999975000000,
+  "scope": "Single local CPU kernel measurement; concurrent compilation was active. Not remote query latency or archive throughput.",
+  "command": "zig build lake-bitmap-seek-bench -Doptimize=ReleaseFast"
+}

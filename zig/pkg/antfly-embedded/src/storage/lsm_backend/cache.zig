@@ -106,6 +106,9 @@ pub const Cache = struct {
         ref_count: usize,
         transient_ref_count: std.atomic.Value(usize) = .init(0),
         last_access: u64,
+        // First attempt after eight hits, then one probe per 256 hits. The
+        // sentinel elects one in-flight promoter even across the retry window.
+        point_promotion_hits: std.atomic.Value(u16) = .init(7),
         invalidated: bool = false,
         lru_prev: ?*Entry = null,
         lru_next: ?*Entry = null,
@@ -448,6 +451,13 @@ pub const Cache = struct {
         );
     }
 
+    /// Consume a decoded buffer and transfer its construction admission into
+    /// cache retention when both owners use the same ResourceManager.
+    pub fn putRunTableBlockWithCredit(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, block: []u8, credit: ?*resource_manager_mod.Reservation) !Handle {
+        errdefer self.allocator.free(block);
+        return self.putWithBlockCredit(path, run_id, generation, .{ .run_table_block = block }, estimateTableBlockCost(path, block), block_offset, block_len, false, credit);
+    }
+
     pub fn putTransientRunTableBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, block_offset: u64, block_len: u32, block: []u8) !Handle {
         errdefer self.allocator.free(block);
         return try self.putWithBlock(
@@ -507,13 +517,30 @@ pub const Cache = struct {
                 continue;
             }
 
-            const gop = try shard.pending_loads.getOrPutContextAdapted(self.allocator, key, KeyContext{}, KeyContext{});
-            if (!gop.found_existing) {
-                gop.key_ptr.* = try copyKey(self.allocator, key);
-                gop.value_ptr.* = .{};
-                return;
-            }
+            try self.publishPendingLoadLocked(shard, key);
+            return;
         }
+    }
+
+    /// Optional work never waits for a loader or the pending-map mutex.
+    pub fn tryBeginLoadWithBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, kind: Kind, block_offset: u64, block_len: u32) !bool {
+        const key = makeKey(path, run_id, generation, kind, block_offset, block_len);
+        const shard = self.shardForKey(key);
+        if (!shard.pending_sync.tryLock()) return false;
+        defer shard.pending_sync.unlock();
+        if (shard.pending_loads.getPtrAdapted(key, KeyContext{}) != null) return false;
+        try self.publishPendingLoadLocked(shard, key);
+        return true;
+    }
+
+    fn publishPendingLoadLocked(self: *Cache, shard: *Shard, key: Key) !void {
+        // Own the key before publishing a map slot. OOM leaves no pending owner.
+        const owned_key = try copyKey(self.allocator, key);
+        errdefer self.allocator.free(owned_key.path);
+        const gop = try shard.pending_loads.getOrPutContextAdapted(self.allocator, key, KeyContext{}, KeyContext{});
+        std.debug.assert(!gop.found_existing);
+        gop.key_ptr.* = owned_key;
+        gop.value_ptr.* = .{};
     }
 
     pub fn finishLoad(self: *Cache, path: []const u8, run_id: u64, generation: u64, kind: Kind) void {
@@ -633,6 +660,10 @@ pub const Cache = struct {
     }
 
     fn putWithBlock(self: *Cache, path: []const u8, run_id: u64, generation: u64, value: Value, byte_cost: usize, block_offset: u64, block_len: u32, force_transient: bool) !Handle {
+        return self.putWithBlockCredit(path, run_id, generation, value, byte_cost, block_offset, block_len, force_transient, null);
+    }
+
+    fn putWithBlockCredit(self: *Cache, path: []const u8, run_id: u64, generation: u64, value: Value, byte_cost: usize, block_offset: u64, block_len: u32, force_transient: bool, credit: ?*resource_manager_mod.Reservation) !Handle {
         const kind = std.meta.activeTag(value);
         const key = makeKey(path, run_id, generation, kind, block_offset, block_len);
         const owned_path = try self.allocator.dupe(u8, path);
@@ -656,7 +687,7 @@ pub const Cache = struct {
         // Retention is optional. Reserve its aggregate budget before making
         // the entry visible; when the budget cannot be reclaimed, ownership
         // stays in a transient handle so the read still succeeds.
-        const retention_admitted = !force_transient and byte_cost <= self.effectiveMaxBytes() and self.admitResourceGrowth(byte_cost);
+        const retention_admitted = !force_transient and byte_cost <= self.effectiveMaxBytes() and (if (credit) |construction| self.admitResourceGrowthWithCredit(byte_cost, construction) else self.admitResourceGrowth(byte_cost));
         var reservation_active = retention_admitted;
         errdefer if (reservation_active) self.releaseResourceBytes(byte_cost);
 
@@ -786,7 +817,12 @@ pub const Cache = struct {
         while (self.currentBytes() > self.effectiveMaxBytes() and self.evictOne()) {}
     }
 
-    fn effectiveMaxBytes(self: *Cache) usize {
+    /// Atomic, advisory signal only; ownership admission remains authoritative.
+    pub fn resultPinsUnderPressure(self: *const Cache) bool {
+        return self.pressure_target_bytes.load(.monotonic) != 0 or self.currentBytes() >= self.effectiveMaxBytes();
+    }
+
+    fn effectiveMaxBytes(self: *const Cache) usize {
         const pressure_target = self.pressure_target_bytes.load(.monotonic);
         if (pressure_target == 0) return self.max_bytes;
         return @min(self.max_bytes, pressure_target);
@@ -901,6 +937,20 @@ pub const Cache = struct {
             if (locked) self.resource_accounting_mutex.unlock();
             return true;
         }
+    }
+
+    fn admitResourceGrowthWithCredit(self: *Cache, bytes: usize, credit: *resource_manager_mod.Reservation) bool {
+        const locked = lockAtomic(&self.resource_accounting_mutex);
+        const manager = self.resource_manager;
+        if (manager == null or manager.? != credit.manager) {
+            if (locked) self.resource_accounting_mutex.unlock();
+            return self.admitResourceGrowth(bytes);
+        }
+        defer if (locked) self.resource_accounting_mutex.unlock();
+        // Optional promotion never evicts other entries to rescue a failed
+        // transfer. The caller retains construction credit until transient free.
+        manager.?.adoptReservationUsage(credit, .lsm_block_table_cache, &self.resource_accounted_bytes, bytes) catch return false;
+        return true;
     }
 
     fn releaseResourceBytes(self: *Cache, bytes: usize) void {
@@ -1043,6 +1093,10 @@ const PendingSync = if (supports_waitable_pending)
         mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
         cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
 
+        fn tryLock(self: *@This()) bool {
+            return std.c.pthread_mutex_trylock(&self.mutex) == .SUCCESS;
+        }
+
         fn lock(self: *@This()) void {
             if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
         }
@@ -1062,6 +1116,10 @@ const PendingSync = if (supports_waitable_pending)
 else
     struct {
         mutex: std.atomic.Mutex = .unlocked,
+
+        fn tryLock(self: *@This()) bool {
+            return self.mutex.tryLock();
+        }
 
         fn lock(self: *@This()) void {
             _ = lockAtomic(&self.mutex);
@@ -1132,6 +1190,28 @@ pub const Handle = struct {
     pub fn runTableBlock(self: *const Handle) []const u8 {
         std.debug.assert(self.kind == .run_table_block);
         return self.entry.value.run_table_block;
+    }
+
+    /// Elect one promoter without allocating a separate hot-block directory.
+    /// Transient/policy-bypassed blocks and oversized expansions stay direct.
+    pub fn claimPointBlockPromotion(self: *const Handle, decoded_bytes: usize) bool {
+        const cache = self.cache orelse return false;
+        if (self.kind != .run_table_physical_block or decoded_bytes > 64 * 1024 or
+            decoded_bytes +| self.entry.path.len > cache.effectiveMaxBytes() / 16) return false;
+        const promoting = std.math.maxInt(u16);
+        var remaining = self.entry.point_promotion_hits.load(.monotonic);
+        while (remaining != promoting) {
+            const next = if (remaining == 0) promoting else remaining - 1;
+            if (self.entry.point_promotion_hits.cmpxchgWeak(remaining, next, .monotonic, .monotonic)) |observed| {
+                remaining = observed;
+            } else return remaining == 0;
+        }
+        return false;
+    }
+
+    pub fn finishPointBlockPromotion(self: *const Handle) void {
+        std.debug.assert(self.entry.point_promotion_hits.load(.monotonic) == std.math.maxInt(u16));
+        self.entry.point_promotion_hits.store(255, .monotonic);
     }
 
     pub fn runTablePhysicalBlock(self: *const Handle) []const u8 {
@@ -1667,4 +1747,117 @@ test "cache invalidates ownership move prefix without reviving pinned generation
     try std.testing.expectEqual(@as(usize, 2), cache.entryCount());
     old_handle.release();
     try std.testing.expectEqual(@as(usize, 1), cache.entryCount());
+}
+
+test "cache pending load allocation failure leaves no published entry" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var cache = try Cache.initFallible(a, 1024);
+            defer cache.deinit();
+            cache.beginLoad("run-1", 1, 1, .run_table_index) catch |err| {
+                try std.testing.expectEqual(@as(usize, 0), cache.pendingLoadCountForTests());
+                return err;
+            };
+            cache.finishLoad("run-1", 1, 1, .run_table_index);
+            try std.testing.expectEqual(@as(usize, 0), cache.pendingLoadCountForTests());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "lsm cache hot prefix promotion elects one concurrent owner and bounds expansion" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var cache = Cache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    var handle = try cache.putRunTablePhysicalBlock("promotion", 1, 1, 0, 1, try a.dupe(u8, "x"));
+    defer handle.release();
+    try std.testing.expect(!handle.claimPointBlockPromotion(64 * 1024 + 1));
+    cache.max_bytes = 1024;
+    try std.testing.expect(!handle.claimPointBlockPromotion(4096));
+    cache.max_bytes = 1024 * 1024;
+    const Worker = struct {
+        handle: *const Handle,
+        winners: *std.atomic.Value(usize),
+        fn run(self: @This()) void {
+            for (0..64) |_| if (self.handle.claimPointBlockPromotion(4096)) {
+                _ = self.winners.fetchAdd(1, .monotonic);
+            };
+        }
+    };
+    var winners = std.atomic.Value(usize).init(0);
+    var threads: [4]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |thread| thread.join();
+    for (&threads) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{Worker{ .handle = &handle, .winners = &winners }});
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |thread| thread.join();
+    spawned = 0;
+    try std.testing.expectEqual(@as(usize, 1), winners.load(.monotonic));
+    try std.testing.expect(!handle.claimPointBlockPromotion(4096));
+    handle.finishPointBlockPromotion();
+    for (0..255) |_| try std.testing.expect(!handle.claimPointBlockPromotion(4096));
+    try std.testing.expect(handle.claimPointBlockPromotion(4096));
+    handle.finishPointBlockPromotion();
+    var transient = try cache.putTransientRunTablePhysicalBlock("transient", 2, 1, 0, 1, try a.dupe(u8, "x"));
+    defer transient.release();
+    for (0..16) |_| try std.testing.expect(!transient.claimPointBlockPromotion(4096));
+}
+
+test "lsm cache optional load gate skips busy owners and mutexes" {
+    const a = std.testing.allocator;
+    var cache = try Cache.initFallible(a, 1024 * 1024);
+    defer cache.deinit();
+    try std.testing.expect(try cache.tryBeginLoadWithBlock("optional", 1, 1, .run_table_block, 10, 20));
+    try std.testing.expect(!try cache.tryBeginLoadWithBlock("optional", 1, 1, .run_table_block, 10, 20));
+    cache.finishLoadWithBlock("optional", 1, 1, .run_table_block, 10, 20);
+    const shard = cache.shardForKey(makeKey("optional", 1, 1, .run_table_block, 10, 20));
+    shard.pending_sync.lock();
+    const busy = cache.tryBeginLoadWithBlock("optional", 1, 1, .run_table_block, 10, 20);
+    shard.pending_sync.unlock();
+    try std.testing.expect(!try busy);
+    try std.testing.expectEqual(@as(u64, 0), cache.snapshotStats().run_table_block.waits);
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var c = try Cache.initFallible(alloc, 1024 * 1024);
+            defer c.deinit();
+            const started = c.tryBeginLoadWithBlock("optional", 1, 1, .run_table_block, 10, 20) catch |err| {
+                for (c.shards) |*part| try std.testing.expectEqual(@as(usize, 0), part.pending_loads.count());
+                return err;
+            };
+            try std.testing.expect(started);
+            c.finishLoadWithBlock("optional", 1, 1, .run_table_block, 10, 20);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{});
+}
+
+test "lsm cache construction handoff cleans duplicate winners and allocation failures" {
+    const a = std.testing.allocator;
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var manager = resource_manager_mod.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+            defer manager.deinit(std.testing.allocator);
+            defer std.debug.assert(manager.snapshot().memory.used_bytes == 0 and manager.snapshot().memory.accounting_errors == 0);
+            var cache = try Cache.initFallible(alloc, 1024 * 1024);
+            defer cache.deinit();
+            cache.attachResourceManager(&manager);
+            for (0..2) |_| {
+                var credit = try manager.reserveWithoutReclaim(.lsm_read_working_set, 1024);
+                defer credit.release();
+                const bytes = try alloc.alloc(u8, 1024);
+                @memset(bytes, 17);
+                var handle = try cache.putRunTableBlockWithCredit("handoff", 1, 0, 0, 1024, bytes, &credit);
+                defer handle.release();
+                try std.testing.expect(handle.isRetained());
+                try std.testing.expectEqual(@as(u64, 0), credit.bytes);
+                try std.testing.expectEqual(@as(u8, 17), handle.runTableBlock()[0]);
+                try std.testing.expectEqual(@as(u64, @intCast(cache.currentBytes())), manager.sliceStats(.lsm_block_table_cache).used_bytes);
+            }
+            try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.lsm_read_working_set).used_bytes);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fixture.run, .{});
 }

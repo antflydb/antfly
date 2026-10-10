@@ -608,6 +608,9 @@ pub const Storage = struct {
         list_file_names_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![][]u8 = null,
         now_ns: *const fn (*anyopaque) u64,
         root_identity_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![]u8 = null,
+        /// Writes require a caller-owned publication lease, including staging
+        /// immutable files whose namespace shares the primary database.
+        requires_foreground_publication: ?*const fn (*anyopaque) bool = null,
         /// The host guarantees that rename_absolute is an atomic replacement
         /// when source and destination are siblings on the same storage.
         rename_is_atomic: bool = false,
@@ -861,6 +864,11 @@ pub const Storage = struct {
 
     pub fn nowNs(self: Storage) u64 {
         return self.vtable.now_ns(self.ptr);
+    }
+
+    pub fn requiresForegroundPublication(self: Storage) bool {
+        const requires = self.vtable.requires_foreground_publication orelse return false;
+        return requires(self.ptr);
     }
 
     pub fn rootIdentityAlloc(self: Storage, allocator: Allocator, root_dir: []const u8) ![]u8 {
@@ -4137,13 +4145,15 @@ fn memoryRenameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const
     const locked = lockAtomic(&self.mutex);
     defer if (locked) self.mutex.unlock();
 
-    const removed = self.files.fetchRemove(old_path) orelse return error.FileNotFound;
+    if (!self.files.contains(old_path)) return error.FileNotFound;
+    if (std.mem.eql(u8, old_path, new_path)) return;
+    // Finish fallible preparation while both paths still own their bytes.
+    // Removing the source guarantees capacity for one nonfallible insertion.
+    const new_key = try self.allocator.dupe(u8, new_path);
+    const removed = self.files.fetchRemove(old_path).?;
     const old_key = removed.key;
     const value = removed.value;
-
-    const new_key = try self.allocator.dupe(u8, new_path);
-    errdefer self.allocator.free(new_key);
-    const gop = try self.files.getOrPut(self.allocator, new_key);
+    const gop = self.files.getOrPutAssumeCapacity(new_key);
     if (gop.found_existing) {
         self.allocator.free(new_key);
         self.allocator.free(gop.value_ptr.*);
@@ -5549,4 +5559,26 @@ test "native buffered atomic cleanup removes staging and restores cancellation" 
     const retained = try tmp.dir.readFileAlloc(io, "published", a, .limited(32));
     defer a.free(retained);
     try std.testing.expectEqualStrings("retained", retained);
+}
+
+test "memory storage rename preserves both paths on allocation failure" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var memory = MemoryStorage.init(a);
+            defer memory.deinit();
+            const storage = memory.storage();
+            try storage.writeFileAbsolute("/source", "source bytes");
+            try storage.writeFileAbsolute("/destination", "destination bytes");
+            storage.renameAbsolute("/source", "/destination") catch |err| {
+                try std.testing.expectEqualStrings("source bytes", memory.files.get("/source").?);
+                try std.testing.expectEqualStrings("destination bytes", memory.files.get("/destination").?);
+                return err;
+            };
+            try std.testing.expect(!memory.files.contains("/source"));
+            try std.testing.expectEqualStrings("source bytes", memory.files.get("/destination").?);
+            try storage.renameAbsolute("/destination", "/destination");
+            try std.testing.expectEqualStrings("source bytes", memory.files.get("/destination").?);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

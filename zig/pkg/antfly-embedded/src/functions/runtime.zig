@@ -52,7 +52,7 @@ fn parseResponse(a: std.mem.Allocator, bytes: []const u8) !decisions.Json {
 
 fn requestBody(a: std.mem.Allocator, cfg: decisions.DeciderConfig, request: decisions.Request) ![]const u8 {
     if (cfg.provider == .openai) return openai.requestBody(a, cfg.modelName(), request.input, request.questions);
-    return std.json.Stringify.valueAlloc(a, .{ .model = cfg.modelName(), .state = request.input, .questions = request.questions }, .{});
+    return decisions.wireRequest(a, cfg, request.input, request.questions);
 }
 
 pub const Runtime = struct {
@@ -74,7 +74,11 @@ pub const Runtime = struct {
     profile_allocator: ?std.mem.Allocator = null,
     provenance: std.ArrayList(struct { decider: []const u8, provider: decisions.Provider, model: []const u8, rows: u64 = 0 }) = .empty,
     pub fn provider(self: *@This()) decisions.DecisionProvider {
-        return .{ .ptr = self, .validate_fn = validate, .evaluate_batch_fn = evaluate, .checkpoint_fn = checkpoint };
+        return .{ .ptr = self, .validate_fn = validate, .evaluate_batch_fn = evaluate, .checkpoint_fn = checkpoint, .capabilities_fn = resolvedCapabilities };
+    }
+    fn resolvedCapabilities(ptr: *anyopaque, name: []const u8) !decisions.Capabilities {
+        const self: *Runtime = @ptrCast(@alignCast(ptr));
+        return (try self.registry.getDeciderConfig(name)).resolvedCapabilities();
     }
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
@@ -85,7 +89,7 @@ pub const Runtime = struct {
         const cfg = try self.registry.getDeciderConfig(name);
         try cfg.validate();
         _ = try quotas.Policy.fromConfig(cfg.rate_limit);
-        try decisions.validateQuestions(questions, decisions.capabilities(cfg.provider));
+        try decisions.validateQuestions(questions, cfg.resolvedCapabilities());
     }
     const Job = struct {
         runtime: *Runtime,
@@ -113,7 +117,7 @@ pub const Runtime = struct {
             const body = try requestBody(a, cfg, self.request);
             const base = if (cfg.provider == .antfly and cfg.url.len == 0) self.runtime.antfly_url orelse cfg.baseUrl() else cfg.baseUrl();
             const url = try std.fmt.allocPrint(a, "{s}{s}", .{ std.mem.trimEnd(u8, base, "/"), switch (cfg.provider) {
-                .antfly => "/decide",
+                .antfly => "/decisions",
                 .jev => "/v1/systemone",
                 .openai => "/decisions",
             } });
@@ -181,6 +185,11 @@ pub const Runtime = struct {
             };
             const bytes = response.body orelse return error.InvalidDecisionOutput;
             const parsed = try parseResponse(a, bytes);
+            if (cfg.provider == .antfly) {
+                const root = try decisions.object(parsed);
+                const answers = root.get("answers") orelse return error.InvalidDecisionOutput;
+                if (answers != .array) return error.InvalidDecisionOutput;
+            }
             return if (cfg.provider == .openai) openai.response(a, self.request.questions, parsed) else parsed;
         }
     };
@@ -196,7 +205,7 @@ pub const Runtime = struct {
         for (requests) |request| {
             const cfg = try self.registry.getDeciderConfig(request.decider);
             if (self.rows + requests.len > cfg.max_rows or self.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
-            if (request.input.len > decisions.capabilities(cfg.provider).max_input_bytes) return error.DecisionLimitExceeded;
+            if (request.input.len > cfg.resolvedCapabilities().max_input_bytes) return error.DecisionLimitExceeded;
             // Reserve conservatively before any provider I/O. The same byte-based
             // token estimate is used by the shared provider quota implementation.
             const body = try requestBody(a, cfg, request);
@@ -226,7 +235,12 @@ pub const Runtime = struct {
             self.batches += 1;
             for (jobs, out[begin..end]) |*job, *value| {
                 if (job.failure) |err| return err;
-                const normalized = try decisions.normalizeResponse(a, job.request.questions, job.response.?);
+                if (job.cfg.model_identity) |expected| {
+                    const root = try decisions.object(job.response.?);
+                    const actual = root.get("model_identity") orelse return error.InvalidDecisionOutput;
+                    if (actual != .string or !std.mem.eql(u8, actual.string, expected)) return error.InvalidDecisionOutput;
+                }
+                const normalized = try decisions.normalizeResponseWithConfig(a, job.request.questions, job.response.?, job.cfg);
                 const usage = normalized.object.get("usage").?.object;
                 if (self.profile_allocator) |stats_a| {
                     const model = normalized.object.get("model").?.string;
@@ -258,19 +272,23 @@ test "decision functions Antfly and Jev HTTP adapters preserve payload credentia
     const Check = struct {
         fn request(req: httpx.testing_mod.RequestInfo) !void {
             try std.testing.expectEqualStrings("Bearer decision-test", req.header("Authorization") orelse return error.TestUnexpectedResult);
-            if (std.mem.eql(u8, req.path, "/decide")) try std.testing.expectEqualStrings("docs", req.header(execution.source_table_header) orelse return error.TestUnexpectedResult) else try std.testing.expect(req.header(execution.source_table_header) == null);
+            if (std.mem.eql(u8, req.path, "/decisions")) try std.testing.expectEqualStrings("docs", req.header(execution.source_table_header) orelse return error.TestUnexpectedResult) else try std.testing.expect(req.header(execution.source_table_header) == null);
             const parsed = try std.json.parseFromSlice(decisions.Json, std.testing.allocator, req.body, .{});
             defer parsed.deinit();
-            try std.testing.expectEqualStrings("refund", parsed.value.object.get("state").?.string);
+            try std.testing.expectEqualStrings("refund", parsed.value.object.get(if (std.mem.eql(u8, req.path, "/decisions")) "input" else "state").?.string);
             try std.testing.expectEqualStrings("test-model", parsed.value.object.get("model").?.string);
-            try decisions.validateQuestions(parsed.value.object.get("questions").?, decisions.capabilities(.jev));
+            const questions = parsed.value.object.get("questions").?;
+            if (questions == .array) {
+                try std.testing.expectEqualStrings("predicate", questions.array.items[0].object.get("type").?.string);
+            } else try decisions.validateQuestions(questions, decisions.capabilities(.jev));
         }
     };
-    const response = "{\"model\":\"test-model\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
+    const response = "{\"model\":\"test-model\",\"answers\":[{\"name\":\"answer\",\"type\":\"predicate\",\"decision_method\":\"typed\",\"probability\":0.9}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
+    const jev_response = "{\"model\":\"test-model\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
     var server = try httpx.TestServer.start(a, io, &.{
-        .{ .method = .POST, .path = "/decide", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = response } },
-        .{ .method = .POST, .path = "/v1/systemone", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = response } },
-        .{ .method = .POST, .path = "/decide", .respond = .{ .body = "{\"model\":\"test-model\",\"answers\":{},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}" } },
+        .{ .method = .POST, .path = "/decisions", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = response } },
+        .{ .method = .POST, .path = "/v1/systemone", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = jev_response } },
+        .{ .method = .POST, .path = "/decisions", .respond = .{ .body = "{\"model\":\"test-model\",\"answers\":{},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}" } },
         .{ .method = .POST, .path = "/v1/systemone", .respond = .{ .status = 429, .body = "rate limited" } },
     });
     defer server.deinit();
@@ -340,7 +358,7 @@ test "decision functions HTTP ceiling rejects oversized advertised bodies before
     defer a.free(oversized);
     @memset(oversized, 'x');
     var server = try httpx.TestServer.start(a, io, &.{
-        .{ .method = .POST, .path = "/decide", .max_uses = 1, .respond = .{ .body = oversized, .truncate_body_at = 0 } },
+        .{ .method = .POST, .path = "/decisions", .max_uses = 1, .respond = .{ .body = oversized, .truncate_body_at = 0 } },
         .{ .method = .POST, .path = "/v1/systemone", .max_uses = 1, .respond = .{ .body = oversized, .truncate_body_at = 0 } },
         .{ .method = .POST, .path = "/decisions", .max_uses = 1, .respond = .{ .body = oversized, .truncate_body_at = 0 } },
     });
@@ -374,6 +392,74 @@ test "decision functions HTTP ceiling rejects oversized advertised bodies before
         try std.testing.expectEqual(@as(?anyerror, error.DecisionLimitExceeded), failure);
         try std.testing.expectEqual(@as(u64, 0), runtime.rows);
     }
+}
+
+test "decision functions EmbeddingGemma 2 HTTP preserves identity calibration and request budgets" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Check = struct {
+        const identity = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            const parsed = try std.json.parseFromSlice(decisions.Json, std.testing.allocator, req.body, .{});
+            defer parsed.deinit();
+            const root = parsed.value.object;
+            try std.testing.expectEqualStrings("embeddinggemma2", root.get("model").?.string);
+            try std.testing.expectEqualStrings(identity, root.get("model_identity").?.string);
+            try std.testing.expectEqualStrings("reset password", root.get("input").?.string);
+            const options = root.get("embedding_options").?.object;
+            try std.testing.expectEqual(@as(i64, 128), options.get("dimensions").?.integer);
+            try std.testing.expectEqualStrings("routing_v1", root.get("questions").?.array.items[0].object.get("embedding_options").?.object.get("calibration_id").?.string);
+            try std.testing.expectEqualStrings("choice", root.get("questions").?.array.items[0].object.get("type").?.string);
+        }
+    };
+    const response = "{\"model\":\"embeddinggemma2\",\"model_identity\":\"" ++ Check.identity ++ "\",\"answers\":[{\"name\":\"answer\",\"type\":\"choice\",\"choice\":\"account\",\"decision_method\":\"embedding_similarity\",\"similarity_metric\":\"cosine\",\"prototype_set_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"similarities\":[{\"value\":\"account\",\"similarity\":0.8},{\"value\":\"billing\",\"similarity\":0.1}],\"margin\":0.7,\"calibration_id\":\"routing_v1\",\"status\":\"selected\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
+    var server = try httpx.TestServer.start(a, io, &.{
+        .{ .method = .POST, .path = "/decisions", .max_uses = 1, .assert_request = Check.request, .respond = .{ .body = response } },
+    });
+    defer server.deinit();
+    var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+    defer client.deinit();
+    var registry = registry_mod.Registry.init(a);
+    defer registry.deinit();
+    const cfg: decisions.DeciderConfig = .{ .provider = .antfly, .decision_method = .embedding_similarity, .model = "embeddinggemma2", .model_identity = Check.identity, .embedding_options = .{ .dimensions = 128, .calibration_id = "routing_v1" }, .url = server.baseUrl() };
+    try registry.registerDeciderConfig("similarity", cfg);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const questions = try decisions.questionsFor(alloc, .ai_choice, &.{ .{ .string = "reset password" }, .{ .string = "Route request" }, .{ .string = "{\"account\":\"Login issues\",\"billing\":\"Payments\"}" }, .{ .string = "similarity" } });
+    const expected_body = try decisions.wireRequest(alloc, cfg, "reset password", questions);
+    var budgeted_cfg = cfg;
+    budgeted_cfg.max_input_tokens = expected_body.len - 1;
+    try registry.registerDeciderConfig("budgeted-similarity", budgeted_cfg);
+    const Run = struct {
+        fn run(runtime: *Runtime, allocator: std.mem.Allocator, q: decisions.Json, failure: *?anyerror) void {
+            const results = runtime.provider().evaluateBatch(allocator, &.{.{ .input = "reset password", .decider = "similarity", .questions = q }}) catch |err| {
+                failure.* = err;
+                return;
+            };
+            const choice = decisions.selectResult(.ai_choice, results[0]) catch |err| {
+                failure.* = err;
+                return;
+            };
+            std.testing.expectEqualStrings("account", choice.string) catch |err| {
+                failure.* = err;
+            };
+        }
+    };
+    var runtime: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+    var failure: ?anyerror = null;
+    var group = std.Io.Group.init;
+    defer group.cancel(io);
+    try group.concurrent(io, Run.run, .{ &runtime, alloc, questions, &failure });
+    try server.handleOne();
+    try group.await(io);
+    if (failure) |err| return err;
+    try std.testing.expectEqual(@as(u64, expected_body.len), runtime.estimated_input_tokens);
+    var budgeted: Runtime = .{ .registry = &registry, .http = &client, .io = io };
+    try std.testing.expectError(error.DecisionLimitExceeded, budgeted.provider().evaluateBatch(alloc, &.{.{ .input = "reset password", .decider = "budgeted-similarity", .questions = questions }}));
+    try std.testing.expectEqual(@as(u64, 0), budgeted.rows);
 }
 
 test "decision functions OpenAI HTTP routing alignment provenance budgets and errors" {

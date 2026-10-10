@@ -83,13 +83,14 @@ pub const HistogramResult = struct {
 };
 
 pub const DateHistogramResult = struct {
-    keys: []u64,
+    keys: []i128,
     counts: []u64,
 };
 
 pub const BucketKey = union(enum) {
     int: i64,
     uint: u64,
+    timestamp: i128,
     range_idx: u32,
     string: []const u8,
 };
@@ -269,8 +270,8 @@ pub const NumericRangeQuery = struct {
 
 pub const DateRangeQuery = struct {
     field: []const u8,
-    start_ns: ?u64 = null,
-    end_ns: ?u64 = null,
+    start_ns: ?i128 = null,
+    end_ns: ?i128 = null,
     inclusive_start: bool = true,
     inclusive_end: bool = false,
     boost: f32 = 1.0,
@@ -284,6 +285,7 @@ pub const DocIdQuery = struct {
 pub const DocNumQuery = struct {
     ids: []const u32,
     bitmap: ?*const roaring.RoaringBitmap = null,
+    producer: ?query_mod.DocNumProducer = null,
     boost: f32 = 1.0,
 };
 
@@ -1225,7 +1227,7 @@ fn executeDocNum(
     dq: DocNumQuery,
     request: SearchRequest,
 ) !SearchResult {
-    return executeFilterQuery(alloc, snap, .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } }, request, dq.boost);
+    return executeFilterQuery(alloc, snap, .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap, .producer = dq.producer } }, request, dq.boost);
 }
 
 fn executeBoolField(
@@ -1652,6 +1654,14 @@ const FastTermState = struct {
     }
 };
 
+const ProducerConstraints = struct {
+    include: ?query_mod.DocNumProducer = null,
+    exclude: ?query_mod.DocNumProducer = null,
+    fn present(self: @This()) bool {
+        return self.include != null or self.exclude != null;
+    }
+};
+
 const FastTopK = struct {
     alloc: Allocator,
     k: u32,
@@ -1664,6 +1674,63 @@ const FastTopK = struct {
     total_count: u32 = 0,
     worst_index: usize = 0,
     pruned: bool = false,
+    producers: ProducerConstraints = .{},
+    segment_offset: u32 = 0,
+    segment_count: u32 = 0,
+    pending: [64]scorer_mod.ScoredHit = undefined,
+    pending_count: usize = 0,
+
+    fn complete(producer: ?query_mod.DocNumProducer) ?*const roaring.RoaringBitmap {
+        const value = producer orelse return null;
+        const get = value.materialized orelse return null;
+        return get(value.ptr);
+    }
+    fn nextAllowed(self: *const FastTopK, gate: *BitmapGate, first: u32) u64 {
+        var includes: [2]*const roaring.RoaringBitmap = undefined;
+        var excludes: [2]*const roaring.RoaringBitmap = undefined;
+        var ni: usize = 0;
+        var ne: usize = 0;
+        for ([_]?*const roaring.RoaringBitmap{ self.filter_doc_bitmap, complete(self.producers.include) }) |maybe| if (maybe) |bitmap| {
+            includes[ni] = bitmap;
+            ni += 1;
+        };
+        for ([_]?*const roaring.RoaringBitmap{ self.exclude_doc_bitmap, complete(self.producers.exclude) }) |maybe| if (maybe) |bitmap| {
+            excludes[ne] = bitmap;
+            ne += 1;
+        };
+        if (first >= gate.end) return 0x1_0000_0000;
+        const target = roaring.RoaringBitmap.candidateLowerBound(first, gate.end, includes[0..ni], excludes[0..ne]);
+        return if (target == gate.end) 0x1_0000_0000 else target;
+    }
+
+    fn beginSegment(self: *FastTopK, offset: u32, count: u32) !void {
+        try self.flushPending();
+        self.segment_offset = offset;
+        self.segment_count = count;
+    }
+    fn flushPending(self: *FastTopK) !void {
+        if (self.pending_count == 0) return;
+        var candidates = roaring.RoaringBitmap.init(self.alloc);
+        defer candidates.deinit();
+        for (self.pending[0..self.pending_count]) |hit| try candidates.add(hit.doc_id - self.segment_offset);
+        // Complete global membership is immutable for the request. Borrow it
+        // directly instead of copying a full segment bitmap for every batch.
+        const include_global = complete(self.producers.include);
+        const exclude_global = complete(self.producers.exclude);
+        var include = if (include_global == null) if (self.producers.include) |producer| try producer.produce(producer.ptr, self.alloc, self.segment_offset, self.segment_count, &candidates) else null else null;
+        defer if (include) |*bitmap| bitmap.deinit();
+        var exclude = if (exclude_global == null) if (self.producers.exclude) |producer| try producer.produce(producer.ptr, self.alloc, self.segment_offset, self.segment_count, &candidates) else null else null;
+        defer if (exclude) |*bitmap| bitmap.deinit();
+        for (self.pending[0..self.pending_count]) |hit| {
+            const local_id = hit.doc_id - self.segment_offset;
+            if (include_global) |bitmap| if (!bitmap.contains(hit.doc_id)) continue;
+            if (exclude_global) |bitmap| if (bitmap.contains(hit.doc_id)) continue;
+            if (include) |*bitmap| if (!bitmap.contains(local_id)) continue;
+            if (exclude) |*bitmap| if (bitmap.contains(local_id)) continue;
+            try self.collectAdmitted(hit);
+        }
+        self.pending_count = 0;
+    }
 
     pub fn deinit(self: *FastTopK) void {
         self.hits.deinit(self.alloc);
@@ -1671,9 +1738,18 @@ const FastTopK = struct {
 
     pub fn collect(self: *FastTopK, doc_id: u32, score: f32) !void {
         if (!self.allows(doc_id)) return;
+        const hit = scorer_mod.ScoredHit{ .doc_id = doc_id, .score = score };
+        if (self.producers.present()) {
+            self.pending[self.pending_count] = hit;
+            self.pending_count += 1;
+            if (self.pending_count == self.pending.len) try self.flushPending();
+            return;
+        }
+        try self.collectAdmitted(hit);
+    }
+    fn collectAdmitted(self: *FastTopK, hit: scorer_mod.ScoredHit) !void {
         self.total_count += 1;
         if (self.k == 0) return;
-        const hit = scorer_mod.ScoredHit{ .doc_id = doc_id, .score = score };
         if (self.hits.items.len < self.k) {
             try self.hits.append(self.alloc, hit);
             if (self.hits.items.len == self.k) self.refreshWorst();
@@ -1694,6 +1770,8 @@ const FastTopK = struct {
     }
 
     fn finish(self: *FastTopK) ![]scorer_mod.ScoredHit {
+        try self.flushPending();
+        if (self.k > 0 and self.hits.items.len < self.k) self.pruned = false;
         scorer_mod.sortScoredHits(self.hits.items);
         return try self.alloc.dupe(scorer_mod.ScoredHit, self.hits.items);
     }
@@ -1929,7 +2007,7 @@ const BitmapGate = struct {
     }
     fn target(self: *BitmapGate, current: u32) ?u32 {
         if (self.iterator == null) return current;
-        while (self.next != null and self.next.? < current) self.next = self.iterator.?.next();
+        if (self.next != null and self.next.? < current) self.next = self.iterator.?.seekTo(current);
         const value = self.next orelse return null;
         return if (value < self.end) value else null;
     }
@@ -1956,7 +2034,9 @@ fn collectFastShouldSegment(
             if (min_doc == null or doc_id < min_doc.?) min_doc = doc_id;
         }
         const doc_id = min_doc orelse break;
-        const admitted = gate.target(doc_offset + doc_id) orelse break;
+        const admitted64 = collector.nextAllowed(&gate, doc_offset + doc_id);
+        if (admitted64 >= gate.end) break;
+        const admitted: u32 = @intCast(admitted64);
         if (admitted > doc_offset + doc_id) {
             for (should_states) |*state| if (!state.exhausted) {
                 try state.advanceTo(admitted - doc_offset);
@@ -2218,7 +2298,9 @@ fn collectFastMustSegment(
 
     var gate = BitmapGate.init(collector.filter_doc_bitmap, doc_offset, seg.reader.doc_count);
     while (!must_states[lead_idx].exhausted) {
-        const admitted = gate.target(doc_offset + must_states[lead_idx].current.?.doc_id) orelse return;
+        const admitted64 = collector.nextAllowed(&gate, doc_offset + must_states[lead_idx].current.?.doc_id);
+        if (admitted64 >= gate.end) return;
+        const admitted: u32 = @intCast(admitted64);
         if (admitted > doc_offset + must_states[lead_idx].current.?.doc_id) {
             try must_states[lead_idx].advanceTo(admitted - doc_offset);
             if (must_states[lead_idx].exhausted) return;
@@ -2276,11 +2358,104 @@ fn collectFastMustSegment(
     }
 }
 
+/// Feed bounded batches into membership before raising the global WAND cutoff.
+/// A pending batch only delays the cutoff; it can never prune a competitive hit.
+fn collectFilteredWandSegment(alloc: Allocator, seg: *const index_mod.SegmentEntry, inv_reader: anytype, terms: []const SimpleTextTerm, frequencies: []const u32, offset: u32, request: SearchRequest, collector: *FastTopK, doc_count: u32, avg_dl: f32, bound_table: ?*const inverted.BM25BoundTable) !void {
+    var wand = scorer_mod.WANDScorer.init(alloc, collector.k, doc_count, avg_dl, request.bm25_config);
+    defer wand.deinit();
+    if (bound_table) |table| wand.setBoundTable(table);
+    for (terms, frequencies) |term, frequency| {
+        const lookup = (try inv_reader.lookup(term.term)) orelse continue;
+        const iter = try lookup.iterator(alloc);
+        try wand.addTerm(iter, frequency, switch (lookup) {
+            .postings => |p| p.block_max,
+            .one_hit => null,
+        }, switch (lookup) {
+            .postings => |p| p.scoringChunkSize(),
+            .one_hit => 1024,
+        }, offset);
+    }
+    const Collector = struct {
+        base: *FastTopK,
+        segment: *const index_mod.SegmentEntry,
+        offset: u32,
+        gate: BitmapGate,
+        pub fn nextCandidate(self: *@This(), first: u32) u64 {
+            return self.base.nextAllowed(&self.gate, first);
+        }
+        pub fn topKLimit(self: *@This()) u32 {
+            return self.base.k;
+        }
+        pub fn minCompetitiveScore(self: *@This()) f32 {
+            return self.base.minCompetitiveScore();
+        }
+        pub fn worstCompetitiveDocId(self: *@This()) ?u32 {
+            return self.base.worstCompetitiveDocId();
+        }
+        pub fn markLowerBound(self: *@This()) void {
+            self.base.pruned = true;
+        }
+        pub fn collect(self: *@This(), hit: scorer_mod.ScoredHit) !void {
+            if (!isSegmentDocDeleted(self.segment, hit.doc_id - self.offset)) try self.base.collect(hit.doc_id, hit.score);
+        }
+    };
+    var live: Collector = .{ .base = collector, .segment = seg, .offset = offset, .gate = .init(collector.filter_doc_bitmap, offset, seg.reader.doc_count) };
+    seg.shared.lockDeletionShared();
+    defer seg.shared.unlockDeletionShared();
+    try wand.executeInto(&live);
+    try collector.flushPending();
+    if (request.diagnostics) |diag| {
+        diag.segments_searched +|= 1;
+        diag.addWand(&wand);
+    }
+}
+
+/// Query-wide statistics and segment planning are shared with unfiltered WAND.
+fn collectFilteredWandQuery(alloc: Allocator, snap: *const index_mod.IndexSnapshot, field: []const u8, terms: []const SimpleTextTerm, request: SearchRequest, collector: *FastTopK, doc_count: u32, avg_dl: f32) !void {
+    const names = try alloc.alloc([]const u8, terms.len);
+    defer alloc.free(names);
+    const frequencies = try alloc.alloc(u32, terms.len);
+    defer alloc.free(frequencies);
+    for (terms, names) |term, *name| name.* = term.term;
+    try snap.termDocFreqs(alloc, field, names, frequencies);
+    const bound_table = try snap.bm25BoundTable(avg_dl, request.bm25_config);
+    const plans = try snap.planTextSegments(alloc, field, names, frequencies, doc_count, avg_dl, request.bm25_config);
+    defer alloc.free(plans);
+    if (request.diagnostics) |diag| diag.segments_considered +|= @intCast(plans.len);
+    for (plans) |plan| {
+        // Publish the preceding batch before observing the global cutoff.
+        try collector.flushPending();
+        const threshold = collector.minCompetitiveScore();
+        if (threshold > 0 and plan.score_upper_bound < threshold) {
+            collector.pruned = true;
+            if (request.diagnostics) |diag| diag.segments_pruned +|= 1;
+            continue;
+        }
+        const seg = &snap.segments[plan.segment_idx];
+        try collector.beginSegment(plan.doc_offset, seg.reader.doc_count);
+        seg.beginAccess();
+        defer seg.endAccess();
+        var inv_reader = (try seg.reader.invertedIndexScoped(alloc, field)) orelse continue;
+        defer inv_reader.deinit();
+        try collectFilteredWandSegment(alloc, seg, inv_reader, terms, frequencies, plan.doc_offset, request, collector, doc_count, avg_dl, bound_table);
+    }
+}
+
 fn executeSimpleTextBool(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
     bq: BoolQuery,
     request: SearchRequest,
+) !?SearchResult {
+    return executeSimpleTextBoolWithProducers(alloc, snap, bq, request, .{});
+}
+
+fn executeSimpleTextBoolWithProducers(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    bq: BoolQuery,
+    request: SearchRequest,
+    producers: ProducerConstraints,
 ) !?SearchResult {
     if (request.aggregations.len != 0 or
         request.search_after != null or
@@ -2331,13 +2506,13 @@ fn executeSimpleTextBool(
     if (bq.pure_should_optional and must_terms.items.len == 0) return null;
 
     // A pure, minimum-one disjunction is exactly the query shape handled by
-    // the production Block-Max WAND scorer. Keep constrained, prohibited,
-    // minimum-N, and per-term-boosted shapes on the boolean iterator path
-    // until their scorer semantics are represented directly in WAND.
+    // the production Block-Max WAND scorer. Unconstrained requests use the
+    // snapshot helper; constrained requests use its shared segment scorer below.
+    // Prohibited, minimum-N, and per-term-boosted shapes retain boolean iterators.
     if (must_terms.items.len == 0 and
         must_not_terms.items.len == 0 and
         effective_min_should == 1 and
-        !requestHasDocNumConstraints(request))
+        !requestHasDocNumConstraints(request) and !producers.present())
     {
         var wand_compatible = true;
         for (should_terms.items) |term| {
@@ -2364,6 +2539,7 @@ fn executeSimpleTextBool(
     var collector = FastTopK{
         .alloc = alloc,
         .k = effectiveK(request, snap),
+        .producers = producers,
         .filter_doc_bitmap = request.filter_doc_bitmap,
         .exclude_doc_bitmap = request.exclude_doc_bitmap,
         .filter_doc_nums = request.filter_doc_nums,
@@ -2376,7 +2552,6 @@ fn executeSimpleTextBool(
     var allow_must_block_pruning = must_terms.items.len > 0 and
         should_terms.items.len == 0 and
         must_not_terms.items.len == 0 and
-        !requestHasDocNumConstraints(request) and
         bq.boost > 0;
     if (allow_must_block_pruning) {
         for (must_terms.items) |term| {
@@ -2386,39 +2561,50 @@ fn executeSimpleTextBool(
             }
         }
     }
-    if (request.diagnostics) |diag| diag.segments_considered +|= @intCast(snap.segments.len);
-    var doc_offset: u32 = 0;
-    for (snap.segments) |*seg| {
-        const segment_doc_offset = doc_offset;
-        doc_offset += seg.reader.doc_count;
+    var filtered_wand = must_terms.items.len == 0 and must_not_terms.items.len == 0 and effective_min_should == 1 and bq.boost == 1 and
+        (producers.present() or requestHasDocNumConstraints(request));
+    for (should_terms.items) |term| if (term.boost != 1) {
+        filtered_wand = false;
+        break;
+    };
+    if (filtered_wand) {
+        try collectFilteredWandQuery(alloc, snap, text_field, should_terms.items, request, &collector, scoring_doc_count, avg_dl);
+    } else {
+        if (request.diagnostics) |diag| diag.segments_considered +|= @intCast(snap.segments.len);
+        var doc_offset: u32 = 0;
+        for (snap.segments) |*seg| {
+            const segment_doc_offset = doc_offset;
+            doc_offset += seg.reader.doc_count;
 
-        var inv_reader = (try seg.reader.invertedIndexScoped(alloc, text_field)) orelse continue;
-        defer inv_reader.deinit();
-        {
-            const maybe_must_states = try initFastTermStates(alloc, snap, inv_reader, text_field, must_terms.items, true);
-            const must_states = maybe_must_states orelse continue;
-            defer deinitFastTermStates(alloc, must_states);
+            try collector.beginSegment(segment_doc_offset, seg.reader.doc_count);
+            var inv_reader = (try seg.reader.invertedIndexScoped(alloc, text_field)) orelse continue;
+            defer inv_reader.deinit();
+            {
+                const maybe_must_states = try initFastTermStates(alloc, snap, inv_reader, text_field, must_terms.items, true);
+                const must_states = maybe_must_states orelse continue;
+                defer deinitFastTermStates(alloc, must_states);
 
-            const maybe_should_states = try initFastTermStates(alloc, snap, inv_reader, text_field, should_terms.items, false);
-            var should_states: []FastTermState = &[_]FastTermState{};
-            if (maybe_should_states) |states| should_states = states;
-            defer if (maybe_should_states) |states| deinitFastTermStates(alloc, states);
+                const maybe_should_states = try initFastTermStates(alloc, snap, inv_reader, text_field, should_terms.items, false);
+                var should_states: []FastTermState = &[_]FastTermState{};
+                if (maybe_should_states) |states| should_states = states;
+                defer if (maybe_should_states) |states| deinitFastTermStates(alloc, states);
 
-            const maybe_must_not_states = try initFastTermStates(alloc, snap, inv_reader, text_field, must_not_terms.items, false);
-            var must_not_states: []FastTermState = &[_]FastTermState{};
-            if (maybe_must_not_states) |states| must_not_states = states;
-            defer if (maybe_must_not_states) |states| deinitFastTermStates(alloc, states);
-            if (request.diagnostics) |diag| {
-                diag.segments_searched +|= 1;
-                diag.postings_iterators_opened +|= @intCast(must_states.len + should_states.len + must_not_states.len);
-            }
+                const maybe_must_not_states = try initFastTermStates(alloc, snap, inv_reader, text_field, must_not_terms.items, false);
+                var must_not_states: []FastTermState = &[_]FastTermState{};
+                if (maybe_must_not_states) |states| must_not_states = states;
+                defer if (maybe_must_not_states) |states| deinitFastTermStates(alloc, states);
+                if (request.diagnostics) |diag| {
+                    diag.segments_searched +|= 1;
+                    diag.postings_iterators_opened +|= @intCast(must_states.len + should_states.len + must_not_states.len);
+                }
 
-            seg.shared.lockDeletionShared();
-            defer seg.shared.unlockDeletionShared();
-            if (must_terms.items.len > 0) {
-                try collectFastMustSegment(&collector, seg, must_states, should_states, must_not_states, effective_min_should, segment_doc_offset, scoring_doc_count, avg_dl, request.bm25_config, bq.boost, allow_must_block_pruning, request.diagnostics);
-            } else if (should_states.len > 0) {
-                try collectFastShouldSegment(&collector, seg, should_states, must_not_states, effective_min_should, segment_doc_offset, scoring_doc_count, avg_dl, request.bm25_config, bq.boost);
+                seg.shared.lockDeletionShared();
+                defer seg.shared.unlockDeletionShared();
+                if (must_terms.items.len > 0) {
+                    try collectFastMustSegment(&collector, seg, must_states, should_states, must_not_states, effective_min_should, segment_doc_offset, scoring_doc_count, avg_dl, request.bm25_config, bq.boost, allow_must_block_pruning, request.diagnostics);
+                } else if (should_states.len > 0) {
+                    try collectFastShouldSegment(&collector, seg, should_states, must_not_states, effective_min_should, segment_doc_offset, scoring_doc_count, avg_dl, request.bm25_config, bq.boost);
+                }
             }
         }
     }
@@ -2438,6 +2624,37 @@ fn executeBool(
     if (bq.boost == 1 and bq.should.len == 0 and bq.must.len >= 1 and bq.must.len <= 2 and bq.must_not.len <= 1 and
         request.filter_doc_bitmap == null and request.exclude_doc_bitmap == null)
     {
+        const producer_include = bq.must.len == 2 and bq.must[1] == .doc_num and bq.must[1].doc_num.producer != null and bq.must[1].doc_num.boost == 0;
+        const producer_exclude = bq.must_not.len == 1 and bq.must_not[0] == .doc_num and bq.must_not[0].doc_num.producer != null;
+        const native_include = bq.must.len == 1 or (bq.must[1] == .doc_num and bq.must[1].doc_num.ids.len == 0 and bq.must[1].doc_num.boost == 0 and (bq.must[1].doc_num.bitmap != null or producer_include));
+        const native_exclude = bq.must_not.len == 0 or (bq.must_not[0] == .doc_num and bq.must_not[0].doc_num.ids.len == 0 and (bq.must_not[0].doc_num.bitmap != null or producer_exclude));
+        if ((producer_include or producer_exclude) and native_include and native_exclude) {
+            var constrained = request;
+            if (bq.must.len == 2 and !producer_include) constrained.filter_doc_bitmap = bq.must[1].doc_num.bitmap;
+            if (bq.must_not.len == 1 and !producer_exclude) constrained.exclude_doc_bitmap = bq.must_not[0].doc_num.bitmap;
+            const producers: ProducerConstraints = .{
+                .include = if (producer_include) bq.must[1].doc_num.producer else null,
+                .exclude = if (producer_exclude) bq.must_not[0].doc_num.producer else null,
+            };
+            const base = bq.must[0];
+            const simple: ?BoolQuery = switch (base) {
+                .term, .match => .{ .should = &.{base} },
+                .bool_query => |query| query,
+                else => null,
+            };
+            if (simple) |query| if (try executeSimpleTextBoolWithProducers(alloc, snap, query, constrained, producers)) |result| return result;
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const filter = try searchQueryToFilterArena(arena.allocator(), .{ .bool_query = bq });
+            var membership = try snap.executeFilterBitmap(alloc, filter);
+            defer membership.deinit();
+            constrained = request;
+            constrained.query = bq.must[0];
+            constrained.filter_doc_bitmap = &membership;
+            constrained.graph_queries = &.{};
+            return execute(alloc, snap, constrained);
+        }
+
         var constrained = request;
         var recognized = bq.must.len == 2 or bq.must_not.len == 1;
         if (bq.must.len == 2) {
@@ -2624,7 +2841,7 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
             .inclusive_end = rq.inclusive_end,
         } },
         .doc_id => |dq| .{ .doc_id = .{ .doc_ids = dq.ids } },
-        .doc_num => |dq| .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } },
+        .doc_num => |dq| .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap, .producer = dq.producer } },
         .bool_field => |bq| .{ .bool_field = .{ .field = bq.field, .value = bq.value } },
         .geo_distance => |gq| .{ .geo_distance = .{
             .field = gq.field,
@@ -2788,7 +3005,7 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             .filter_slice = &.{},
         },
         .doc_num => |dq| .{
-            .filter = .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap } },
+            .filter = .{ .doc_num = .{ .doc_nums = dq.ids, .bitmap = dq.bitmap, .producer = dq.producer } },
             .duped_terms = &.{},
             .filter_slice = &.{},
         },
@@ -3242,11 +3459,11 @@ fn collectSubAggs(
         while (it.next()) |v| v.deinit(alloc);
         i64_buckets.deinit(alloc);
     }
-    var u64_buckets = std.AutoHashMapUnmanaged(u64, BucketList){};
+    var timestamp_buckets = std.AutoHashMapUnmanaged(i128, BucketList){};
     defer {
-        var it = u64_buckets.valueIterator();
+        var it = timestamp_buckets.valueIterator();
         while (it.next()) |v| v.deinit(alloc);
-        u64_buckets.deinit(alloc);
+        timestamp_buckets.deinit(alloc);
     }
     var u32_buckets = std.AutoHashMapUnmanaged(u32, BucketList){};
     defer {
@@ -3268,9 +3485,9 @@ fn collectSubAggs(
         },
         .date_histogram => |dh| {
             for (scored) |hit| {
-                if (try readU64ForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
-                    const bk = aggregation_mod.truncateToInterval(ns, dh.interval);
-                    const gop = try u64_buckets.getOrPut(alloc, bk);
+                if (try readTimestampForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
+                    const bk = try aggregation_mod.truncateSignedToInterval(ns, dh.interval);
+                    const gop = try timestamp_buckets.getOrPut(alloc, bk);
                     if (!gop.found_existing) gop.value_ptr.* = .empty;
                     try gop.value_ptr.append(alloc, hit);
                 }
@@ -3322,8 +3539,8 @@ fn collectSubAggs(
     // Build BucketSubResult array from whichever bucket map was used
     if (i64_buckets.count() > 0) {
         return try buildSubResultsI64(alloc, reads, snap, &i64_buckets, spec.sub_aggs);
-    } else if (u64_buckets.count() > 0) {
-        return try buildSubResultsU64(alloc, reads, snap, &u64_buckets, spec.sub_aggs);
+    } else if (timestamp_buckets.count() > 0) {
+        return try buildSubResultsTimestamp(alloc, reads, snap, &timestamp_buckets, spec.sub_aggs);
     } else if (u32_buckets.count() > 0) {
         return try buildSubResultsU32(alloc, reads, snap, &u32_buckets, spec.sub_aggs);
     }
@@ -3376,11 +3593,11 @@ fn buildSubResultsI64(
     return results;
 }
 
-fn buildSubResultsU64(
+fn buildSubResultsTimestamp(
     alloc: Allocator,
     reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
-    buckets: *std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(scorer_mod.ScoredHit)),
+    buckets: *std.AutoHashMapUnmanaged(i128, std.ArrayListUnmanaged(scorer_mod.ScoredHit)),
     sub_specs: []const AggSpec,
 ) ![]const BucketSubResult {
     var results = try alloc.alloc(BucketSubResult, buckets.count());
@@ -3388,14 +3605,14 @@ fn buildSubResultsU64(
     var it = buckets.iterator();
     while (it.next()) |entry| {
         results[idx] = .{
-            .bucket_key = .{ .uint = entry.key_ptr.* },
+            .bucket_key = .{ .timestamp = entry.key_ptr.* },
             .aggs = try collectLeafAggs(alloc, reads, snap, entry.value_ptr.items, sub_specs),
         };
         idx += 1;
     }
     std.mem.sort(BucketSubResult, results, {}, struct {
         fn cmp(_: void, a: BucketSubResult, b: BucketSubResult) bool {
-            return a.bucket_key.uint < b.bucket_key.uint;
+            return a.bucket_key.timestamp < b.bucket_key.timestamp;
         }
     }.cmp);
     return results;
@@ -3475,11 +3692,11 @@ fn collectOneAgg(
             return .{ .terms = entries };
         },
         .date_histogram => |dh| {
-            var agg = aggregation_mod.DateHistogramAgg.init(alloc, dh.interval);
+            var agg = aggregation_mod.SignedDateHistogramAgg.init(alloc, dh.interval);
             defer agg.deinit();
 
             for (scored) |hit| {
-                if (try readU64ForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
+                if (try readTimestampForDoc(alloc, reads, snap, hit.doc_id, spec.field)) |ns| {
                     try agg.collect(ns);
                 }
             }
@@ -3695,20 +3912,21 @@ fn readBytesForDoc(
     return reader.getBytesAllocWithAllocator(alloc, resolved.local_id);
 }
 
-/// Read a u64 typed doc value for a global doc ID.
-fn readU64ForDoc(
+/// Read signed timestamps, promoting legacy unsigned doc values exactly.
+fn readTimestampForDoc(
     alloc: Allocator,
     reads: *segment_mod.TypedReadScope,
     snap: *const index_mod.IndexSnapshot,
     global_id: u32,
     field: []const u8,
-) !?u64 {
+) !?i128 {
     _ = alloc;
     const resolved = snap.resolveDocId(global_id) orelse return null;
     const seg = &snap.segments[resolved.seg_idx];
     const reader = (try reads.get(&seg.reader, field)) orelse return null;
+    if (reader.value_type == .datetime_ns) return try reader.getDateTimeNs(resolved.local_id);
     if (reader.value_type != .u64_val) return null;
-    return try reader.getU64(resolved.local_id);
+    return if (try reader.getU64(resolved.local_id)) |ns| @as(i128, ns) else null;
 }
 
 /// Read a geo_point typed doc value for a global doc ID.
@@ -5801,4 +6019,282 @@ test "external lake indexed bitmap filters preserve ranking disjunction and exac
     defer remaining.deinit();
     try std.testing.expectEqual(@as(usize, 1), remaining.hits.len);
     try std.testing.expectEqual(@as(u32, 0), remaining.hits[0].doc_id);
+}
+
+test "search signed date histogram retains negative wide and nested buckets" {
+    const alloc = std.testing.allocator;
+
+    // Build inverted index (all docs match "x")
+    var inv_builder = inverted.InvertedIndexBuilder.init(alloc, .{});
+    defer inv_builder.deinit();
+    try inv_builder.addDocument(0, &.{.{ .term = "x", .freq = 1, .norm = 10 }});
+    try inv_builder.addDocument(1, &.{.{ .term = "x", .freq = 1, .norm = 10 }});
+    try inv_builder.addDocument(2, &.{.{ .term = "x", .freq = 1, .norm = 10 }});
+    const inv_data = try inv_builder.build();
+    defer alloc.free(inv_data);
+
+    var dv_writer = typed_dv.TypedDocValuesWriter.init(alloc, .datetime_ns, 1024);
+    defer dv_writer.deinit();
+    try dv_writer.add(0, .{ .datetime_ns = -1 });
+    try dv_writer.add(1, .{ .datetime_ns = 0 });
+    try dv_writer.add(2, .{ .datetime_ns = 253402300799999999999 });
+    const dv_data = try dv_writer.build();
+    defer alloc.free(dv_data);
+
+    var seg_writer = segment_mod.SegmentWriter.init(alloc);
+    defer seg_writer.deinit();
+    const title_idx = try seg_writer.addField("title");
+    try seg_writer.addSection(title_idx, .inverted_text, inv_data);
+    const ts_idx = try seg_writer.addField("timestamp");
+    try seg_writer.addSection(ts_idx, .typed_doc_values, dv_data);
+    try seg_writer.addStoredDoc("d1", "{}");
+    try seg_writer.addStoredDoc("d2", "{}");
+    try seg_writer.addStoredDoc("d3", "{}");
+    const seg_bytes = try seg_writer.build();
+    defer alloc.free(seg_bytes);
+
+    var writer = try index_mod.IndexWriter.init(alloc);
+    defer writer.deinit();
+    try writer.addSegment(seg_bytes);
+
+    const snap = writer.snapshot();
+    var result = try execute(alloc, snap, .{
+        .query = .{ .term = .{ .field = "title", .term = "x" } },
+        .k = 10,
+        .aggregations = &.{
+            .{ .name = "by_hour", .field = "timestamp", .agg_type = .{ .date_histogram = .{ .interval = .hour } }, .sub_aggs = &.{.{ .name = "nested", .field = "timestamp", .agg_type = .{ .date_histogram = .{ .interval = .day } } }} },
+        },
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.aggregations.len);
+    const dh = result.aggregations[0].result.date_histogram;
+    try std.testing.expectEqual(@as(usize, 3), dh.keys.len);
+    try std.testing.expectEqual(@as(i128, -std.time.ns_per_hour), dh.keys[0]);
+    try std.testing.expectEqual(@as(i128, 0), dh.keys[1]);
+    try std.testing.expect(dh.keys[2] > std.math.maxInt(u64));
+    for (dh.counts) |count| try std.testing.expectEqual(@as(u64, 1), count);
+    const nested = result.aggregations[0].sub_results.?;
+    try std.testing.expectEqual(@as(usize, 3), nested.len);
+    try std.testing.expectEqual(dh.keys[0], nested[0].bucket_key.timestamp);
+    try std.testing.expectEqual(@as(i128, -std.time.ns_per_day), nested[0].aggs[0].result.date_histogram.keys[0]);
+}
+
+test "external lake deferred membership refines text candidates with exact scores counts and exclusions" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "zero", .data = "{}", .terms = &.{.{ .term = "rare", .freq = 4, .norm = 10 }} },
+        .{ .id = "one", .data = "{}", .terms = &.{.{ .term = "common", .freq = 2, .norm = 10 }} },
+        .{ .id = "two", .data = "{}", .terms = &.{.{ .term = "rare", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    const Producer = struct {
+        calls: usize = 0,
+        probed: usize = 0,
+        fail: bool = false,
+        fn produce(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.InjectedMembershipFailure;
+            self.calls += 1;
+            var result = roaring.RoaringBitmap.init(alloc);
+            errdefer result.deinit();
+            const selected = candidates orelse return error.ExpectedTextCandidates;
+            self.probed += selected.cardinality();
+            var iterator = selected.iterator();
+            while (iterator.next()) |doc| {
+                if (doc >= count) return error.InvalidArgument;
+                if ((offset + doc) % 2 == 0) try result.add(doc);
+            }
+            return result;
+        }
+    };
+    var producer: Producer = .{};
+    const deferred: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = &producer, .produce = Producer.produce }, .boost = 0 } };
+    const base: SearchQuery = .{ .match = .{ .field = "title", .text = "rare" } };
+    const included: SearchQuery = .{ .bool_query = .{ .must = &.{ base, deferred } } };
+    const excluded: SearchQuery = .{ .bool_query = .{ .must = &.{base}, .must_not = &.{deferred} } };
+    var original = try execute(a, writer.snapshot(), .{ .query = base, .k = 6, .include_stored = false });
+    defer original.deinit();
+    var bitmap = roaring.RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    for ([_]u32{ 0, 2, 4 }) |doc| try bitmap.add(doc);
+    const bitmap_clause: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap, .boost = 0 } };
+    for ([_]SearchQuery{ included, excluded }) |query| {
+        const reference_query: SearchQuery = if (query.bool_query.must.len == 2)
+            .{ .bool_query = .{ .must = &.{ base, bitmap_clause } } }
+        else
+            .{ .bool_query = .{ .must = &.{base}, .must_not = &.{bitmap_clause} } };
+        var reference = try execute(a, writer.snapshot(), .{ .query = reference_query, .k = 6, .include_stored = false });
+        defer reference.deinit();
+        var result = try execute(a, writer.snapshot(), .{ .query = query, .k = 6, .include_stored = false });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+        try std.testing.expectEqual(@as(u32, 2), try countMatches(a, writer.snapshot(), query));
+        var count = try executeCountCandidates(a, writer.snapshot(), query);
+        defer count.deinit();
+        try std.testing.expectEqual(@as(u32, 2), count.total_hits);
+        for (result.hits) |hit| {
+            try std.testing.expectEqual(query.bool_query.must.len == 2, hit.doc_id % 2 == 0);
+            const expected = for (original.hits) |before| {
+                if (before.doc_id == hit.doc_id) break before.score;
+            } else return error.TestUnexpectedResult;
+            // Existing filtered/unfiltered scorer kernels can differ by an
+            // f32 ULP; deferred membership must exactly match bitmap scoring.
+            try std.testing.expectApproxEqAbs(expected, hit.score, 0.000001);
+            const bitmap_score = for (reference.hits) |before| {
+                if (before.doc_id == hit.doc_id) break before.score;
+            } else return error.TestUnexpectedResult;
+            try std.testing.expectEqual(bitmap_score, hit.score);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 12), producer.calls);
+    try std.testing.expectEqual(@as(usize, 24), producer.probed);
+    producer.fail = true;
+    try std.testing.expectError(error.InjectedMembershipFailure, execute(a, writer.snapshot(), .{ .query = included, .k = 2 }));
+}
+
+test "external lake producer top k prunes common text without a complete membership pass" {
+    const a = std.testing.allocator;
+    var builder = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 128 });
+    defer builder.deinit();
+    for (0..8192) |i| try builder.addDocument(@intCast(i), &.{
+        .{ .term = "common", .freq = if (i < 128) 100 else 1, .norm = 100 },
+        .{ .term = "other", .freq = if (i < 128) 30 else 1, .norm = 100 },
+    });
+    const section = try builder.build();
+    defer a.free(section);
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for (0..8192) |i| {
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{i}), "{}");
+    }
+    const field = try segment.addField("title");
+    try segment.addSection(field, .inverted_text, section);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    const Producer = struct {
+        probed: usize = 0,
+        max_batch: usize = 0,
+        fn produce(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const selected = candidates orelse return error.ExpectedBoundedCandidates;
+            self.probed += selected.cardinality();
+            self.max_batch = @max(self.max_batch, selected.cardinality());
+            var result = roaring.RoaringBitmap.init(alloc);
+            errdefer result.deinit();
+            var it = selected.iterator();
+            while (it.next()) |doc| {
+                if (doc >= count) return error.InvalidArgument;
+                if ((offset + doc) % 2 == 0) try result.add(doc);
+            }
+            return result;
+        }
+    };
+    var producer: Producer = .{};
+    const deferred: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .producer = .{ .ptr = &producer, .produce = Producer.produce }, .boost = 0 } };
+    const term: SearchQuery = .{ .term = .{ .field = "title", .term = "common" } };
+    const other: SearchQuery = .{ .term = .{ .field = "title", .term = "other" } };
+    var bitmap = roaring.RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    for (0..8192) |i| try bitmap.add(@intCast(i * 2));
+    const fixed: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .bitmap = &bitmap, .boost = 0 } };
+    for ([_]SearchQuery{ term, .{ .match = .{ .field = "title", .text = "common other" } }, .{ .bool_query = .{ .must = &.{ term, other } } } }) |base| {
+        for ([_]bool{ false, true }) |exclude| {
+            const query: SearchQuery = if (exclude) .{ .bool_query = .{ .must = &.{base}, .must_not = &.{deferred} } } else .{ .bool_query = .{ .must = &.{ base, deferred } } };
+            const reference_query: SearchQuery = if (exclude) .{ .bool_query = .{ .must = &.{base}, .must_not = &.{fixed} } } else .{ .bool_query = .{ .must = &.{ base, fixed } } };
+            var reference = try execute(a, writer.snapshot(), .{ .query = reference_query, .k = 16384, .include_stored = false });
+            defer reference.deinit();
+            producer = .{};
+            var diagnostics: SearchDiagnostics = .{};
+            var result = try execute(a, writer.snapshot(), .{ .query = query, .k = 3, .include_stored = false, .diagnostics = &diagnostics });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 3), result.hits.len);
+            for (result.hits, reference.hits[0..3]) |hit, expected| {
+                try std.testing.expectEqual(expected.doc_id, hit.doc_id);
+                try std.testing.expectEqual(expected.score, hit.score);
+            }
+            try std.testing.expect(producer.max_batch <= 64);
+            try std.testing.expect(producer.probed < 8192);
+            try std.testing.expect(diagnostics.wand_chunks_skipped + diagnostics.boolean_chunks_skipped > 0);
+            try std.testing.expectEqual(TotalHitsRelation.gte, result.total_hits_relation);
+            try std.testing.expectEqual(@as(u32, 8192), try countMatches(a, writer.snapshot(), query));
+        }
+    }
+    // Once adaptive probing switches to complete membership, the same scorer
+    // must seek to the sparse answer in a later segment instead of scanning onward.
+    var point = roaring.RoaringBitmap.init(a);
+    defer point.deinit();
+    try point.add(15193);
+    try point.prepareRead();
+    const Materialized = struct {
+        bitmap: *const roaring.RoaringBitmap,
+        ready: bool = false,
+        probed: usize = 0,
+        fn complete(raw: *anyopaque) ?*const roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.ready) self.bitmap else null;
+        }
+        fn produce(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.probed += (candidates orelse return error.ExpectedBoundedCandidates).cardinality();
+            self.ready = true;
+            return self.bitmap.sliceRebased(alloc, offset, @as(u64, offset) + count);
+        }
+    };
+    var materialized: Materialized = .{ .bitmap = &point };
+    const adaptive: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .boost = 0, .producer = .{ .ptr = &materialized, .produce = Materialized.produce, .materialized = Materialized.complete } } };
+    var sparse_answer = try execute(a, writer.snapshot(), .{ .query = .{ .bool_query = .{ .must = &.{ term, adaptive } } }, .k = 3, .include_stored = false });
+    defer sparse_answer.deinit();
+    try std.testing.expectEqual(@as(usize, 1), sparse_answer.hits.len);
+    try std.testing.expectEqual(@as(u32, 15193), sparse_answer.hits[0].doc_id);
+    try std.testing.expectEqual(TotalHitsRelation.exact, sparse_answer.total_hits_relation);
+    try std.testing.expectEqual(@as(usize, 64), materialized.probed);
+}
+
+test "external lake producer top k overlapping masks bound navigation to a posting window" {
+    const a = std.testing.allocator;
+    var bitmap = roaring.RoaringBitmap.init(a);
+    defer bitmap.deinit();
+    for (0..500000) |i| try bitmap.add(@intCast(i * 2));
+    try bitmap.prepareRead();
+    var collector: FastTopK = .{ .alloc = a, .k = 1, .filter_doc_bitmap = &bitmap, .exclude_doc_bitmap = &bitmap };
+    defer collector.deinit();
+    var gate = BitmapGate.init(&bitmap, 0, 1000000);
+    try std.testing.expectEqual(@as(u64, 4096), collector.nextAllowed(&gate, 0));
+    try std.testing.expectEqual(@as(u64, 0x1_0000_0000), collector.nextAllowed(&gate, 999999));
+}
+
+test "external lake producer top k shares segment bound planning across fragmented snapshots" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    for (0..20) |i| {
+        const id = try std.fmt.allocPrint(ca, "segment-{d}", .{i});
+        const bytes = try buildTestSegmentWithStoredDocs(ca, &.{.{ .id = id, .data = "{}", .terms = &.{.{ .term = "ranked", .freq = if (i == 19) 100 else 1, .norm = 10 }} }});
+        try writer.addSegment(bytes);
+    }
+    var included = roaring.RoaringBitmap.init(a);
+    defer included.deinit();
+    try included.addRange(0, 20);
+    try included.prepareRead();
+    var diagnostics: SearchDiagnostics = .{};
+    var result = try execute(a, writer.snapshot(), .{ .query = .{ .term = .{ .field = "title", .term = "ranked" } }, .filter_doc_bitmap = &included, .k = 1, .include_stored = false, .diagnostics = &diagnostics });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(u32, 19), result.hits[0].doc_id);
+    try std.testing.expectEqual(@as(u64, 20), diagnostics.segments_considered);
+    try std.testing.expect(diagnostics.segments_pruned > 0);
+    try std.testing.expect(diagnostics.segments_searched < 20);
 }

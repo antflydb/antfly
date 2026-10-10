@@ -64,6 +64,7 @@ pub const Identity = struct {
     markers: Markers,
     inventory: TensorInventory,
     weight: Digest,
+    weight_companion: ?Digest = null,
     sidecars: Sidecars,
 };
 
@@ -81,6 +82,8 @@ const legacy_tokenizer_config = FilePin{ .path = "tokenizer_config.json", .size_
 // capture. Runtime request admission remains bounded separately below.
 pub const decide_1b_production_qualified = true;
 const decide_1b_weight = FilePin{ .path = "model.safetensors", .size_bytes = 4_755_208_228, .sha256 = "02c567d791aed26550d300064c7f0c0094fd65291503c65969b45b30786e33b3" };
+const decide_1b_q8_encoder = FilePin{ .path = "gliner2-encoder.Q8_0.gguf", .size_bytes = 1_118_356_576, .sha256 = "9ba4aea751bc8ce3586e70c4dfb3db93d0a850da5023b39d1bb68d21247f1694" };
+const decide_1b_q8_head = FilePin{ .path = "gliner_head.gguf", .size_bytes = 617_195_872, .sha256 = "9a6c1a8ae0f58158404ea6875012e0c27e5923188906492ec7d948968741f558" };
 const decide_1b_config = FilePin{ .path = "config.json", .size_bytes = 464, .sha256 = "d2732928820b95649bc87f051345b2394fff87fc28c01f945610f943d6f402b2" };
 const decide_1b_encoder_config = FilePin{ .path = "encoder_config/config.json", .size_bytes = 2160, .sha256 = "c2cc4c15c7504b9e15651f2a32dff82b84fa9a99060a3218671a930da0a9b50d" };
 const decide_1b_tokenizer = FilePin{ .path = "tokenizer.json", .size_bytes = 3_585_055, .sha256 = "ddb379b6a4679ee16646bf0b726de9ec538d7c80ea9d4d4e33b069f19c9e1efb" };
@@ -119,7 +122,7 @@ fn isLegacyDecide(identity: Identity) bool {
             .sep_struct = 128001,
             .sep_text = 128002,
         }) and
-        identity.inventory.count == 419 and identity.inventory.all_f32 and
+        identity.inventory.count == 419 and identity.inventory.all_f32 and identity.weight_companion == null and
         digestMatches(identity.weight, legacy_weight) and
         sidecarsMatch(identity.sidecars, legacy_config, legacy_encoder_config, legacy_tokenizer, legacy_tokenizer_config, legacy_special_tokens);
 }
@@ -143,8 +146,11 @@ fn isDecide1B(identity: Identity) bool {
             .sep_struct = 50368,
             .sep_text = 50369,
         }) and
-        identity.inventory.count == 199 and identity.inventory.all_f32 and
-        digestMatches(identity.weight, decide_1b_weight) and
+        identity.inventory.count == 199 and
+        (if (identity.weight_companion) |head|
+            !identity.inventory.all_f32 and digestMatches(identity.weight, decide_1b_q8_encoder) and digestMatches(head, decide_1b_q8_head)
+        else
+            identity.inventory.all_f32 and digestMatches(identity.weight, decide_1b_weight)) and
         sidecarsMatch(identity.sidecars, decide_1b_config, decide_1b_encoder_config, decide_1b_tokenizer, decide_1b_tokenizer_config, null);
 }
 
@@ -232,6 +238,32 @@ test "GLiNER Decide 1B qualification binds exact loaded identity" {
     try std.testing.expectEqual(QualifiedVariant.decide_1b, try require(identity));
     identity.inventory.all_f32 = false;
     try std.testing.expect(!isDecide1B(identity));
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
+
+    identity.weight = digestFromPin(decide_1b_q8_encoder);
+    identity.weight_companion = digestFromPin(decide_1b_q8_head);
+    try std.testing.expectEqual(QualifiedVariant.decide_1b, try require(identity));
+    const quantized = identity;
+    identity.weight_companion = null;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
+    identity = quantized;
+    identity.weight_companion.?.sha256[0] ^= 1;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
+    identity = quantized;
+    identity.weight.sha256[0] ^= 1;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
+    identity = quantized;
+    identity.sidecars.tokenizer.sha256[0] ^= 1;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
+    identity = quantized;
+    identity.inventory.count -= 1;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
+    identity = quantized;
+    identity.inventory.all_f32 = true;
+    try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
+    identity = quantized;
+    identity.weight = digestFromPin(decide_1b_weight);
+    identity.inventory.all_f32 = true;
     try std.testing.expectError(error.UnsupportedGlinerDecisionArtifact, require(identity));
 }
 

@@ -58,6 +58,10 @@ const Options = struct {
     order: std.ArrayListUnmanaged(InputRef) = .empty,
     graph_runtime_strategy: ?graph_runtime.Strategy = null,
     print_timing: bool = false,
+    group: bool = false,
+    title: ?[]const u8 = null,
+    task_type: []const u8 = "RETRIEVAL_DOCUMENT",
+    dimensions: usize = 768,
 
     pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         self.texts.deinit(allocator);
@@ -95,8 +99,14 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
 
-    const model = try model_manager.loadFromDir(opts.model_dir);
+    var model_handle = try model_manager.acquireFromDir(opts.model_dir);
+    defer model_handle.release();
+    const model = model_handle.get();
     const loaded_model_at = std.Io.Timestamp.now(io, .awake);
+    if (model.manifest.embedding_style == .embedding_gemma2) {
+        return embedGemma2(allocator, io, &stdout.interface, model, opts);
+    }
+    if (opts.group or opts.title != null or opts.dimensions != 768 or !std.mem.eql(u8, opts.task_type, "RETRIEVAL_DOCUMENT")) return error.UnsupportedEmbeddingOptions;
     if (model.manifest.hasCapability("sparse")) {
         if (opts.image_paths.items.len > 0 or opts.audio_paths.items.len > 0) {
             print("error: sparse embedding models only support --text inputs\n", .{});
@@ -254,6 +264,22 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Options {
             opts.graph_runtime_strategy = graph_runtime.parseStrategy(arg["--graph-runtime=".len..]) orelse return error.InvalidGraphRuntime;
         } else if (std.mem.eql(u8, arg, "--print-timing")) {
             opts.print_timing = true;
+        } else if (std.mem.eql(u8, arg, "--group")) {
+            opts.group = true;
+        } else if (std.mem.eql(u8, arg, "--title")) {
+            i += 1;
+            if (i >= args.len) return error.MissingTitleValue;
+            opts.title = args[i];
+        } else if (std.mem.eql(u8, arg, "--task-type")) {
+            i += 1;
+            if (i >= args.len) return error.MissingTaskTypeValue;
+            _ = try @import("architectures/embedding_gemma2.zig").taskPrefix(args[i]);
+            opts.task_type = args[i];
+        } else if (std.mem.eql(u8, arg, "--dimensions")) {
+            i += 1;
+            if (i >= args.len) return error.MissingDimensionsValue;
+            opts.dimensions = try std.fmt.parseInt(usize, args[i], 10);
+            if (!@import("architectures/embedding_gemma2.zig").validDimension(opts.dimensions)) return error.InvalidEmbeddingDimensions;
         } else if (std.mem.eql(u8, arg, "--text")) {
             i += 1;
             if (i >= args.len) return error.MissingTextValue;
@@ -281,6 +307,48 @@ fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) !Options {
     return opts;
 }
 
+fn embedGemma2(a: std.mem.Allocator, io: std.Io, writer: *std.Io.Writer, model: *model_manager_mod.LoadedModel, opts: Options) !void {
+    const grouped = @import("pipelines/embedding_gemma2.zig");
+    const watchdog = if (model.session.interruption() == .process_required) try @import("hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
+    defer if (watchdog) |owned| owned.destroy();
+    if (watchdog) |owned| try owned.start(io);
+    const control = @import("execution_control.zig").InferenceExecutionControl{ .io = io, .hard_cancellation = if (watchdog) |owned| owned.boundary() else null };
+    try model.verifyEmbeddingIdentity();
+    if (opts.title != null and !opts.group) return error.InvalidEmbeddingTitle;
+    const images = try loadFiles(a, opts.image_paths.items);
+    defer freeOwnedBytes(a, images);
+    const audio = try loadFiles(a, opts.audio_paths.items);
+    defer freeOwnedBytes(a, audio);
+    const parts = try a.alloc(grouped.Part, opts.order.items.len);
+    defer a.free(parts);
+    for (opts.order.items, parts) |item, *part| part.* = switch (item.modality) {
+        .text => .{ .text = opts.texts.items[item.index] },
+        .image => .{ .image = images[item.index] },
+        .audio => .{ .audio = audio[item.index] },
+    };
+    var lease = model.acquireEmbeddingAssetLease(false);
+    defer lease.release();
+    try model.ensureEmbeddingAssets(true, false, false);
+    var vectors: std.ArrayListUnmanaged([]f32) = .empty;
+    defer {
+        for (vectors.items) |vector| a.free(vector);
+        vectors.deinit(a);
+    }
+    var tokens: usize = 0;
+    for (0..if (opts.group) 1 else parts.len) |i| {
+        const result = try grouped.embed(a, model.session, model.getTokenizer(), .{ .title = opts.title, .content = if (opts.group) parts else parts[i..][0..1] }, .{ .task_type = opts.task_type, .dimensions = opts.dimensions }, model.embeddingExecutionLock(), control);
+        errdefer a.free(result.vector);
+        try vectors.append(a, result.vector);
+        tokens += result.input_tokens;
+    }
+    try model.verifyEmbeddingIdentity();
+    const json = try std.json.Stringify.valueAlloc(a, .{ .model = opts.model_dir, .model_identity = model.embedding_identity.?[0..], .embeddings = vectors.items, .dimensions = opts.dimensions, .input_tokens = tokens, .grouped = opts.group }, .{});
+    defer a.free(json);
+    try writer.writeAll(json);
+    try writer.writeAll("\n");
+    try writer.flush();
+}
+
 fn loadFiles(allocator: std.mem.Allocator, paths: []const []const u8) ![][]const u8 {
     const out = try allocator.alloc([]const u8, paths.len);
     for (out) |*bytes| bytes.* = &.{};
@@ -297,7 +365,7 @@ fn loadFiles(allocator: std.mem.Allocator, paths: []const []const u8) ![][]const
     }
 
     for (paths, 0..) |path, i| {
-        out[i] = try c_file.readFile(allocator, path);
+        out[i] = try c_file.readFileMax(allocator, path, 64 * 1024 * 1024);
         loaded += 1;
     }
     return out;
@@ -496,6 +564,9 @@ fn printUsage() void {
         \\  graph-runtime controls imported static graph execution; default is environment fallback, then interpreter.
         \\  Benchmark gates: TERMITE_GRAPH_RUNTIME_FAIL_CLOSED=1, TERMITE_GRAPH_EXECUTOR_STATS=1, TERMITE_GRAPH_PARTITION_REPORT=1.
         \\  --print-timing prints phase timings to stderr.
+        \\  EmbeddingGemma 2: --task-type <task> --dimensions 768|512|256|128.
+        \\  --group combines all text/image/audio parts in argument order into one vector.
+        \\  --title <title> requires --group and RETRIEVAL_DOCUMENT with text.
         \\
     , .{});
 }

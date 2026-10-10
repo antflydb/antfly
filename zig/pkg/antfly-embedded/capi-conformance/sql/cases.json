@@ -1,0 +1,84 @@
+[
+  {
+    "statement": "CREATE TABLE values_test (n BIGINT, label TEXT, enabled BOOLEAN, payload JSON)"
+  },
+  {
+    "statement": "INSERT INTO values_test (_id,n,label,enabled,payload) VALUES ($1,$2,$3,$4,$5)",
+    "parameters": [
+      "first",
+      9007199254740993,
+      "hello",
+      true,
+      {
+        "a": [
+          1,
+          2
+        ]
+      }
+    ]
+  },
+  {
+    "statement": "INSERT INTO values_test (_id,n,label,enabled,payload) VALUES ($1,$2,$3,$4,$5)",
+    "parameters": [
+      "second",
+      null,
+      null,
+      false,
+      null
+    ]
+  },
+  {
+    "statement": "SELECT n,label,enabled,payload FROM values_test ORDER BY _id",
+    "rows": [
+      [
+        "9007199254740993",
+        "hello",
+        true,
+        {
+          "a": [
+            1,
+            2
+          ]
+        }
+      ],
+      [
+        null,
+        null,
+        false,
+        null
+      ]
+    ]
+  },
+  {
+    "statement": "CREATE TABLE scalar_test (minimum BIGINT, maximum BIGINT, ratio DOUBLE PRECISION, recorded_at TIMESTAMPTZ)"
+  },
+  {
+    "statement": "INSERT INTO scalar_test (_id,minimum,maximum,ratio,recorded_at) VALUES ($1,$2,$3,$4,$5)",
+    "parameters": [
+      "value",
+      "-9223372036854775808",
+      "9223372036854775807",
+      1.25,
+      "2026-10-08T12:30:00Z"
+    ]
+  },
+  {
+    "statement": "SELECT minimum,maximum,ratio,recorded_at FROM scalar_test",
+    "rows": [
+      [
+        "-9223372036854775808",
+        "9223372036854775807",
+        1.25,
+        "2026-10-08T12:30:00.000000000Z"
+      ]
+    ]
+  },
+  {
+    "statement": "SELECT n FROM values_test WHERE n=$1",
+    "sqlstate": "22023"
+  },
+  {
+    "statement": "SELECT n FROM missing_table",
+    "sqlstate": "42P01"
+  }
+]

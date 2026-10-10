@@ -384,7 +384,7 @@ export class Inference implements AsyncDisposable {
   decideRaw(request: JsonInput): Promise<Buffer> {
     return this.#invokeJson(this.#native.inferenceDecideJson, request);
   }
-  /** Parsed DecideResponse from the same contract as POST /ai/v1/decide. */
+  /** Parsed DecideResponse from the same contract as POST /ai/v1/decisions. */
   async decide(request: JsonInput): Promise<unknown> {
     return parseJson(await this.decideRaw(request));
   }

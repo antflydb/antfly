@@ -2874,12 +2874,18 @@ pub fn validateCompleteDatabaseImageAlloc(alloc: Allocator, store: *DocStore) !v
 }
 
 pub fn validateCompleteDatabaseImageWithCohort(alloc: Allocator, store: *DocStore, cohort: ?CohortProof) !void {
-    return validateCompleteDatabaseImageWithProofs(alloc, store, cohort, null);
+    return validateCompleteDatabaseImageWithProofs(alloc, store, cohort, null, false);
 }
 pub fn validateCompleteSourceCopyImage(alloc: Allocator, store: *DocStore, proof: SourceCopyProof) !void {
-    return validateCompleteDatabaseImageWithProofs(alloc, store, null, proof);
+    return validateCompleteDatabaseImageWithProofs(alloc, store, null, proof, false);
 }
-fn validateCompleteDatabaseImageWithProofs(alloc: Allocator, store: *DocStore, cohort: ?CohortProof, source_copy: ?SourceCopyProof) !void {
+/// Complete embedded images retain all local constraint owners and namespace
+/// identities together. They need no table-transfer proof, but must pass the
+/// same primary identity coverage and public/compiled schema checks.
+pub fn validateCompleteEmbeddedDatabaseImageAlloc(alloc: Allocator, store: *DocStore) !void {
+    return validateCompleteDatabaseImageWithProofs(alloc, store, null, null, true);
+}
+fn validateCompleteDatabaseImageWithProofs(alloc: Allocator, store: *DocStore, cohort: ?CohortProof, source_copy: ?SourceCopyProof, embedded_database: bool) !void {
     const raw_source = store.get(alloc, source_copy_proof_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
@@ -2919,7 +2925,7 @@ fn validateCompleteDatabaseImageWithProofs(alloc: Allocator, store: *DocStore, c
                 else => return error.InvalidBackupRequest,
             };
             defer public_schema.deinit(alloc);
-            if (cohort == null and source_copy == null and (public_schema.unique_constraints != null or public_schema.foreign_keys != null)) return error.CoordinatedConstraintPortableBackupUnsupported;
+            if (!embedded_database and cohort == null and source_copy == null and (public_schema.unique_constraints != null or public_schema.foreign_keys != null)) return error.CoordinatedConstraintPortableBackupUnsupported;
             const derived = public_table_schema.deriveRuntimeTableSchema(alloc, public_schema) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidBackupRequest,
