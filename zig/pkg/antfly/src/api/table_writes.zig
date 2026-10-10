@@ -11364,20 +11364,33 @@ pub const ProvisionedTableWriteSource = struct {
         deadline_ns: u64,
         cancellation: db_mod.types.CancellationToken,
     ) !RoutedWriteAdmission {
+        return self.acquireRoutedWriteAdmissionWithPreDecisionContext(alloc, table_name, fence, deadline_ns, .{ .cancellation = cancellation });
+    }
+
+    /// Borrow the original execution only until admission returns. The table
+    /// lease owns activity, never the caller's execution or cancellation.
+    pub fn acquireRoutedWriteAdmissionWithPreDecisionContext(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        fence: metadata_api.CatalogRouteFence,
+        deadline_ns: u64,
+        context: distributed_txn.PreDecisionContext,
+    ) !RoutedWriteAdmission {
         try fence.validate();
-        const admission_deadline_ns = if (self.catalog.routeFenceDeadline(fence)) |fence_deadline|
+        var admission_deadline_ns = if (self.catalog.routeFenceDeadline(fence)) |fence_deadline|
             @min(deadline_ns, fence_deadline)
         else
             deadline_ns;
-        while (!self.tryBeginTableRequest(table_name)) {
-            try cancellation.check();
-            try fence.admission_cancellation.check();
-            if (self.catalog.budget(null).nowNs() >= admission_deadline_ns) return error.CatalogRoutingSnapshotTimeout;
-            try self.catalog.budget(null).sleepNs(std.time.ns_per_ms);
-        }
+        if (self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io })) |original_deadline|
+            admission_deadline_ns = @min(admission_deadline_ns, original_deadline);
+        var controls = @import("routed_write_admission.zig").init(context, self.catalog.budget(admission_deadline_ns), fence.admission_cancellation, self.tableActivityIo());
+        try self.beginTableRequestControlled(table_name, &controls);
         errdefer self.endTableRequest(table_name);
-        try cancellation.check();
-        try fence.admission_cancellation.check();
+        try controls.checkpoint();
+        // Catalog holders do not yet promise mandatory CPU reentry; retain
+        // the admitted CPU through validation and check the original lifetime
+        // on both sides. Do not park under this retained table lease.
         try table_catalog.validateCatalogRouteFenceUntil(
             alloc,
             self.catalog,
@@ -11385,8 +11398,7 @@ pub const ProvisionedTableWriteSource = struct {
             fence,
             admission_deadline_ns,
         );
-        try cancellation.check();
-        try fence.admission_cancellation.check();
+        try controls.checkpoint();
         return .{ .source = self, .table_name = table_name };
     }
 
@@ -21632,7 +21644,12 @@ pub const ProvisionedTableWriteSource = struct {
                 // this exact catalog route and committing the durable marker.
                 // The owner DB serializes activation against guarded prepares.
                 const deadline = self.catalog.routeFenceDeadline(fence) orelse std.math.maxInt(u64);
-                var admission = try self.acquireRoutedWriteAdmission(alloc, table, fence, deadline, context.cancellation);
+                var admission = try self.acquireRoutedWriteAdmissionWithPreDecisionContext(alloc, table, fence, deadline, .{
+                    .deadline_ns = context.deadline_ns,
+                    .deadline_io = context.deadline_io,
+                    .cancellation = context.cancellation,
+                    .execution_runnable = if (context.execution_team) |team| team.borrow else null,
+                });
                 defer admission.deinit();
                 _ = (try self.source().batchGroupLocal(alloc, route.group_id, table, .{ .activate_range_tracking = true })) orelse return error.StorageKernelOwnerUnavailable;
             }
@@ -23595,7 +23612,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (context.route_fence) |fence| {
             if (req.restore_staging_scope != null or fence.route.group_id != group_id or fence.topology_epoch != topology_epoch) return error.TopologyChanged;
             const deadline = self.catalog.deadlineFrom(.{ .deadline_ns = context.deadline_ns, .io = context.deadline_io }) orelse self.catalog.budget(null).nowNs() +| std.time.ns_per_s * 5;
-            guarded_admission = try self.acquireRoutedWriteAdmission(alloc, table_name, fence, deadline, context.cancellation);
+            guarded_admission = try self.acquireRoutedWriteAdmissionWithPreDecisionContext(alloc, table_name, fence, deadline, context);
         }
         try enforceReplicationWriteGateOptional(self.replication_write_gate);
         var admission = @import("group_admission_wait.zig").preDecision(context, self.tableActivityIo());
@@ -36061,11 +36078,14 @@ fn consumerTests() type {
                     return error.UnexpectedCatalogCall;
                 }
                 fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn validateRoute(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+                    return error.UnexpectedCatalogCall;
+                }
             };
             const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
             const runtime = @import("antfly_runtime_abi");
             const ha = @import("../storage/hot_standby/operation_admission.zig");
-            var source = ProvisionedTableWriteSource.init("/tmp/unused-ha-controlled-drain", .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = NoCatalog.snapshot, .free_admin_snapshot = NoCatalog.free } });
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-ha-controlled-drain", .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = NoCatalog.snapshot, .free_admin_snapshot = NoCatalog.free, .validate_route = NoCatalog.validateRoute } });
             defer source.deinit();
             var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
             defer scheduler.close();
@@ -36152,6 +36172,11 @@ fn consumerTests() type {
             defer later.finish();
             try later.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 31 }, .write);
             state = .{ .source = &source, .scheduler = &scheduler, .waiter = &later, .holder = &capture, .reservation = &reservation, .request_held = &request_held };
+            const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 3, .route = .{ .group_id = 4, .range_id = 5, .identity_namespace = .{ .table_id = 2, .shard_id = 4, .range_id = 5 } } };
+            // The routed writer must relinquish CPU to capture, then retire
+            // its newly admitted table activity if catalog validation fails.
+            try std.testing.expectError(error.UnexpectedCatalogCall, source.acquireRoutedWriteAdmissionWithPreDecisionContext(std.testing.allocator, "docs", fence, std.math.maxInt(u64), .{ .execution_runnable = state.borrow(.write) }));
+            try std.testing.expectEqual(@as(usize, 0), source.active_table_activities.items.len);
             var late_admission = @import("group_admission_wait.zig").preDecision(.{ .execution_runnable = state.borrow(.write) }, source.tableActivityIo());
             try source.beginTableRequestControlled("docs", &late_admission);
             request_held = true;
@@ -36261,6 +36286,146 @@ fn consumerTests() type {
                 source.table_activity_mutex.unlock(source.tableActivityIo());
                 externally_held = false;
             }
+        }
+
+        test "routed write admission rejects before catalog and leaves the capture reservation owned" {
+            const Catalog = struct {
+                calls: usize = 0,
+                fn snapshot(raw: *anyopaque) !metadata_api.AdminSnapshot {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    return error.UnexpectedCatalogCall;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn validateRoute(raw: *anyopaque, _: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    return error.UnexpectedCatalogCall;
+                }
+            };
+            const runtime = @import("antfly_runtime_abi");
+            const State = struct {
+                source: *ProvisionedTableWriteSource,
+                cause: anyerror,
+                held: bool = false,
+                parks: usize = 0,
+                resumes: usize = 0,
+                fn life(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                    return .ok;
+                }
+                fn check(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                    @panic("yielding checkpoint under table gate");
+                }
+                fn current(_: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+                    out.* = @backingInt(runtime.runnable_abi.Class.write);
+                    return .ok;
+                }
+                fn park(raw: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.parks += 1;
+                    return .ok;
+                }
+                fn enter(raw: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (self.held) std.debug.assert(!self.source.table_activity_mutex.tryLock()) else {
+                        std.debug.assert(self.source.table_activity_mutex.tryLock());
+                        self.source.table_activity_mutex.unlock(self.source.tableActivityIo());
+                    }
+                    self.resumes += 1;
+                    return runtime.error_abi.statusFromError(self.cause);
+                }
+                fn borrow(self: *@This()) runtime.runnable_abi.Borrowed {
+                    return .{ .context = self, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.write), .check_lifetime = life, .checkpoint = check, .current_class = current, .park = park, .enter = enter };
+                }
+            };
+            var catalog: Catalog = .{};
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-routed-admission", .{ .ptr = &catalog, .vtable = &.{ .admin_snapshot = Catalog.snapshot, .free_admin_snapshot = Catalog.free, .validate_route = Catalog.validateRoute } });
+            defer source.deinit();
+            const fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 3, .route = .{ .group_id = 4, .range_id = 5, .identity_namespace = .{ .table_id = 2, .shard_id = 4, .range_id = 5 } } };
+            var reservation = try source.acquireHotStandbySeedTableRequestAdmissionLease();
+            defer reservation.release();
+            for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+                for ([_]bool{ false, true }) |held| {
+                    var state: State = .{ .source = &source, .cause = cause, .held = held };
+                    if (held) source.table_activity_mutex.lockUncancelable(source.tableActivityIo());
+                    defer if (held) source.table_activity_mutex.unlock(source.tableActivityIo());
+                    try std.testing.expectError(cause, source.acquireRoutedWriteAdmissionWithPreDecisionContext(std.testing.allocator, "docs", fence, std.math.maxInt(u64), .{ .execution_runnable = state.borrow() }));
+                    try std.testing.expectEqual(@as(usize, 1), state.parks);
+                    try std.testing.expectEqual(state.parks, state.resumes);
+                    try std.testing.expectEqual(@as(usize, 0), catalog.calls);
+                    try std.testing.expectEqual(@as(usize, 0), source.active_table_activities.items.len);
+                    try std.testing.expect(source.hot_standby_seed_table_request_admission_closed);
+                }
+            }
+            reservation.release();
+            try std.testing.expectError(error.PreDecisionDeadlineExceeded, source.acquireRoutedWriteAdmissionWithPreDecisionContext(std.testing.allocator, "docs", fence, std.math.maxInt(u64), .{ .deadline_ns = 0 }));
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.acquireRoutedWriteAdmission(std.testing.allocator, "docs", fence, 0, .none));
+            var canceled = std.atomic.Value(bool).init(true);
+            var canceled_fence = fence;
+            canceled_fence.admission_cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled);
+            try std.testing.expectError(error.Canceled, source.acquireRoutedWriteAdmission(std.testing.allocator, "docs", canceled_fence, std.math.maxInt(u64), .none));
+            try std.testing.expectEqual(@as(usize, 0), catalog.calls);
+            try std.testing.expectEqual(@as(usize, 0), source.active_table_activities.items.len);
+            try std.testing.expect(source.tryBeginTableRequest("docs"));
+            source.endTableRequest("docs");
+        }
+
+        test "routed write admission retains activity only after exact validation and original lifetime" {
+            const runtime = @import("antfly_runtime_abi");
+            const Fixture = struct {
+                source: ?*ProvisionedTableWriteSource = null,
+                canceled: std.atomic.Value(bool) = .init(false),
+                now_ns: i96 = 100,
+                deadline_ns: u64 = 20 * std.time.ns_per_s,
+                mode: enum { success, canceled, expired, changed } = .success,
+                calls: usize = 0,
+                fence: metadata_api.CatalogRouteFence = .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 3, .route = .{ .group_id = 4, .range_id = 5, .identity_namespace = .{ .table_id = 2, .shard_id = 4, .range_id = 5 } } },
+                fn now(raw: ?*anyopaque, _: std.Io.Clock) std.Io.Timestamp {
+                    const self: *@This() = @ptrCast(@alignCast(raw.?));
+                    return .{ .nanoseconds = self.now_ns };
+                }
+                const vtable = blk: {
+                    var value = std.Io.failing.vtable.*;
+                    value.now = now;
+                    break :blk value;
+                };
+                fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedCatalogCall;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn validate(raw: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: table_catalog.RouteQuery, _: ?u64) !table_catalog.RouteResult {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    try std.testing.expectEqual(@as(usize, 1), self.source.?.active_table_activities.items[0].table_request_active);
+                    if (self.mode == .canceled) self.canceled.store(true, .release);
+                    if (self.mode == .expired) self.now_ns = self.deadline_ns;
+                    const routes = try alloc.dupe(table_catalog.CatalogGroupRoute, &.{self.fence.route});
+                    return .{ .found = .{ .metadata_group_id = self.fence.metadata_group_id, .metadata_incarnation = self.fence.metadata_incarnation, .catalog_revision = self.fence.catalog_revision, .table_id = self.fence.table_id, .topology_epoch = self.fence.topology_epoch + @intFromBool(self.mode == .changed), .groups = routes } };
+                }
+            };
+            var fixture: Fixture = .{};
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-routed-validation", .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.free, .validate_route = Fixture.validate } });
+            defer source.deinit();
+            fixture.source = &source;
+            const owner_io: std.Io = .{ .userdata = &fixture, .vtable = &Fixture.vtable };
+            const context: distributed_txn.PreDecisionContext = .{ .deadline_ns = fixture.deadline_ns, .deadline_io = runtime.io_abi.Borrow.init(&owner_io), .cancellation = db_mod.types.CancellationToken.fromAtomic(&fixture.canceled) };
+            var admitted = try source.acquireRoutedWriteAdmissionWithPreDecisionContext(std.testing.allocator, "docs", fixture.fence, std.math.maxInt(u64), context);
+            try std.testing.expectEqual(@as(usize, 1), source.active_table_activities.items[0].table_request_active);
+            admitted.deinit();
+            for ([_]@TypeOf(fixture.mode){ .canceled, .expired, .changed }) |mode| {
+                fixture.mode = mode;
+                fixture.canceled.store(false, .release);
+                fixture.now_ns = 100;
+                const expected: anyerror = switch (mode) {
+                    .canceled => error.Canceled,
+                    .expired => error.PreDecisionDeadlineExceeded,
+                    .changed => error.TopologyChanged,
+                    .success => unreachable,
+                };
+                try std.testing.expectError(expected, source.acquireRoutedWriteAdmissionWithPreDecisionContext(std.testing.allocator, "docs", fixture.fence, std.math.maxInt(u64), context));
+                try std.testing.expectEqual(@as(usize, 0), source.active_table_activities.items.len);
+            }
+            try std.testing.expectEqual(@as(usize, 4), fixture.calls);
         }
 
         test "HA seed request admission drains accepted writes and closes the preflight race" {

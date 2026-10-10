@@ -1807,3 +1807,32 @@ The local single-group pre-decision commit path now uses controlled top-level ta
 Tests use actual provisioned activity gates in a control-side source profile, with no physical DB: C=1 grants an accepted writer CPU to retire during capture draining, then grants capture CPU to release its reservation while a later writer waits. Health progresses in both handoffs, operations/bytes retire after physical gate release, and Canceled/DeadlineExceeded/SchedulerClosed preserve original sticky rejection, reopen only the rejecting capture reservation, and leave an existing capture reservation intact when a later waiter rejects. Full DataServer/API and physical DB integration remain required. Other write entry points, routed fence admission, maintenance preflight, capture I/O/completion, mandatory cleanup reentry and default gates remain open.
 
 The frozen `21ef0d1b9ad14393454afd5e3827486002f7adbb` cumulative integration run reported retrieval-read-owner compilation peaking at 19,611,156,480 bytes on macOS, above its 17 GiB declaration. That run remains unqualified. The descendant raises only this macOS compiler bound to 22 GiB within the serialized 32 GiB build envelope; Linux and runtime resource limits are unchanged. The next actual cumulative run must verify the revised bound.
+
+
+### Original routed-write table admission
+
+Routed writes now use the controlled table activity gate for both its initial
+mutex and waits behind capture, restore or structural activity. The original
+pre-decision execution, cancellation and clock remain borrowed through the
+synchronous admission; independent fence cancellation and catalog deadlines are
+checked by one sticky budget. Both scoped callers (group prepare and standalone
+range-tracking activation) forward their existing execution. The unscoped
+wrapper keeps its caller-supplied catalog-domain absolute deadline.
+
+No table activity is registered before admission. Rejection after registration,
+including exact route validation or a lifetime change during validation, retires
+that activity. The returned lease owns only table activity, and its caller keeps
+the execution alive through physical work. Tests cover actual provisioned gates,
+C=1 capture/writer/health progress, initial mutex and condition rejection without
+stealing another reservation, independent clock/cancellation rejection, exact
+route validation, post-validation lifetime checks and activity retirement. The
+focused source profile instantiates no physical DB.
+
+Catalog validation retains CPU until catalog holders support mandatory reentry.
+The execution ABI bounds CPU return by the original execution lifetime; a
+stricter catalog/fence subdeadline is checked after return and does not yet bound
+the scheduler's internal CPU-return wait. Mandatory cleanup mutex reacquisition,
+Raft routing/proposal waits, standalone activation's subsequent local batch,
+maintenance/capture I/O, whole API/DB composition, resource/performance gates and
+automatic default sizing remain open. These focused checks cannot qualify those
+paths or the whole design.

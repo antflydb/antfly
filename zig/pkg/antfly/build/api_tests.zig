@@ -2433,7 +2433,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const ha_table_request_admission_tests = b.addTest(.{
         .name = "ha-table-request-admission-tests",
         .root_module = ha_table_request_admission_root,
-        .filters = &.{"HA controlled table request admission"},
+        .filters = &.{ "HA controlled table request admission", "routed write admission" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-ha-table-request-admission-test", "Verify actual HA table request drain and closed admission with C1 CPU progress")
