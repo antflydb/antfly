@@ -26,6 +26,7 @@ pub const BudgetAllocator = struct {
     live: usize = 0,
     peak: usize = 0,
     alloc_calls: usize = 0,
+    alloc_attempts: usize = 0,
     limit: usize = std.math.maxInt(usize),
     cancel: ?*maintenance.CancelToken = null,
     cancel_after: usize = std.math.maxInt(usize),
@@ -50,6 +51,7 @@ pub const BudgetAllocator = struct {
         if (self.cancel_after == 0) {
             if (self.cancel) |token| token.request();
         } else self.cancel_after -= 1;
+        self.alloc_attempts += 1;
         if (len > self.limit -| self.live) return null;
         const result = self.backing.rawAlloc(len, alignment, ra) orelse return null;
         self.alloc_calls += 1;
