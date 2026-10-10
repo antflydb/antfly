@@ -849,3 +849,27 @@ activation, zero-width success and successful one- and three-slot reports.
 Full SQL/API/storage integration, holder CPU transfers, bounded outbound
 lifetimes, runtime pressure, performance and default sizing remain separate
 qualification gates.
+
+### HTTP/2 health probes share one physical deadline
+
+The HTTP client captures one monotonic deadline for each health probe before
+acquiring the connection write mutex. Lock admission, PING output, TLS flushing
+and the ACK wait consume that same deadline. An expired or failed probe shuts
+down the connection and wakes send-window waiters; it does not wait for an
+unacquired write mutex or retire pooled entry ownership. The connection's
+existing receive/probe joins still govern physical destruction.
+
+The probe temporarily installs its finite wire control on the TLS output while
+holding the write mutex and restores the prior control before releasing it.
+No stack deadline receiver is retained by the pooled connection. ACK observation
+uses an absolute timestamp and is checked again against the original deadline.
+This closes a path where lock and wire waits were unlimited and the ACK wait
+started a fresh budget afterward. It supplies a transport deadline, not runnable
+CPU authority for the connection's background tasks.
+
+Physical loopback fixtures cover a healthy wire PING/ACK, held write mutex,
+saturated TCP output, missing ACK, stale ready event and zero budget. A bounded
+observer retains and joins the probe task; on a regression it releases the
+injected holder before joining. Actual TLS health-probe failure and connection
+background CPU ownership still need whole-lifecycle qualification, along with
+storage birth-root integration, holder transfers and default sizing.
