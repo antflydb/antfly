@@ -732,7 +732,7 @@ const DerivedRecoverableRetryCounters = struct {
     fn record(self: *@This(), err: anyerror) void {
         _ = self.total.fetchAdd(1, .monotonic);
         switch (err) {
-            error.WriterLocked => _ = self.writer_locked.fetchAdd(1, .monotonic),
+            error.WriterLocked, error.WouldBlock, error.FileBusy => _ = self.writer_locked.fetchAdd(1, .monotonic),
             error.ResourceBudgetExceeded,
             error.PostingWalTooLarge,
             error.PersistentDescriptorAdmissionExhausted,
