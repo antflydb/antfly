@@ -1946,3 +1946,33 @@ and its validator/CLI handles vanished without a terminal compiler receipt.
 Completed generated caches were removed, preserving source, receipts and active
 caches. Linux source-marking qualification remains unproven pending Docker
 recovery and a properly observed pinned Nix/glibc rerun.
+
+### Resumable background source collection planning
+
+Default nonselective background collection now defers live-item materialization
+and sorting until after the DB apply fence is released. A collection owns its
+immutable live-set iterator and an in-place heap-sort cursor; it performs at most
+4,096 item/heap steps in each maintenance visit. Heap steps compare fixed-size
+keys along at most log2(live-count) levels and need no second full-size buffer.
+The cursor stores no borrowed caller lifetime. Each step checks the current
+caller's original restriction. Rejection rejoins the planner, clears its running
+flag and leaves the same unpublished collection available for later maintenance.
+Only complete plans become eligible for copying/publication.
+
+The focused source suite passes 84 checks. Real source/primary fixtures exercise
+original cancellation, deadline and scheduler rejection during fill, heap building
+and sorting, continued ownership with no generation publication, resumption and
+intact committed values after successful collection. A separate 4,097-item plan
+proves the production quantum returns between turns; ordering matches the existing
+deterministic shard/hash/digest comparator across empty, short and larger plans.
+These fixtures open no physical DB or server. Independent archive/DB/capture
+composition remains pending the actual cumulative integration run.
+
+The quantum bounds planner operations, not every internal cost: sparse/hash live-
+set iterator searches still need bounded stepping. Partial selective-GC planning
+and explicit non-background inline planning remain separate adoption work.
+Immutable reader construction, collection copy/publication, metadata rebuilds,
+mandatory cleanup CPU and complete dependency-graph reentry still need bounds and
+fair execution ownership. Linux validation remains unqualified after host disk
+exhaustion; Docker Desktop restart failed while stopping helper processes.
+Resource/performance gates and automatic shared-execution defaults remain open.

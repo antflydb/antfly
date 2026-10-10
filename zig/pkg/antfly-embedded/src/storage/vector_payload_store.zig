@@ -676,8 +676,70 @@ pub const Store = struct {
         }
     };
 
+    /// Each turn performs at most the requested number of item/heap steps.
+    /// A heap step has at most log2(live.count()) fixed-size comparisons;
+    /// no full-size sort scratch or caller capability survives a turn.
+    const CollectionPlan = struct {
+        phase: enum { fill, heap, sort, done } = .fill,
+        iterator: ?LiveSet.Iterator = null,
+        written: usize = 0,
+        heap_remaining: usize = 0,
+        sort_end: usize = 0,
+
+        fn advance(self: *CollectionPlan, collection: *Collection, quantum: usize, lifetime: ?*const original_lifetime.Control) !void {
+            for (0..quantum) |_| {
+                try original_lifetime.checkpoint(lifetime);
+                switch (self.phase) {
+                    .fill => {
+                        if (self.iterator == null) self.iterator = collection.live.iterator();
+                        if (self.iterator.?.next()) |item| {
+                            const hash = vector_block.keyHash(&item.key_ptr.*);
+                            collection.items[self.written] = .{ .digest = item.key_ptr.*, .dims = item.value_ptr.*, .hash = hash, .shard = @intCast(hash & (collection.shards - 1)) };
+                            self.written += 1;
+                        } else {
+                            std.debug.assert(self.written == collection.items.len);
+                            self.iterator = null;
+                            self.heap_remaining = collection.items.len / 2;
+                            self.sort_end = collection.items.len;
+                            self.phase = .heap;
+                        }
+                    },
+                    .heap => {
+                        if (self.heap_remaining == 0) {
+                            self.phase = .sort;
+                        } else {
+                            self.heap_remaining -= 1;
+                            sift(collection.items, self.heap_remaining);
+                        }
+                    },
+                    .sort => {
+                        if (self.sort_end <= 1) {
+                            self.phase = .done;
+                            return;
+                        }
+                        self.sort_end -= 1;
+                        std.mem.swap(CollectionItem, &collection.items[0], &collection.items[self.sort_end]);
+                        sift(collection.items[0..self.sort_end], 0);
+                    },
+                    .done => return,
+                }
+            }
+        }
+        fn sift(items: []CollectionItem, initial: usize) void {
+            var root = initial;
+            while (root < items.len / 2) {
+                var child = root * 2 + 1;
+                if (child + 1 < items.len and CollectionItem.less({}, items[child], items[child + 1])) child += 1;
+                if (!CollectionItem.less({}, items[root], items[child])) return;
+                std.mem.swap(CollectionItem, &items[root], &items[child]);
+                root = child;
+            }
+        }
+    };
+
     const Collection = struct {
         plan_ready: bool = true,
+        plan: CollectionPlan = .{},
         background_hint: bool = false,
         input: native.Opened,
         live: LiveSet,
@@ -1142,28 +1204,26 @@ pub const Store = struct {
             self.stats.collection_retire_outside_lock_ns += time.monotonicNs() -| start;
         }
         defer self.mutex.unlock();
-        if (!self.detached_collection or self.poisoned) return;
+        if (self.poisoned) return;
         const collection = self.collection orelse return;
         if (collection.validation_running or collection.validation_error != null) return;
         if (!collection.plan_ready) {
             collection.validation_running = true;
             self.mutex.unlock();
             const start = time.monotonicNs();
-            var it = collection.live.iterator();
-            var pos: usize = 0;
-            while (it.next()) |item| : (pos += 1) {
-                const hash = vector_block.keyHash(&item.key_ptr.*);
-                collection.items[pos] = .{ .digest = item.key_ptr.*, .dims = item.value_ptr.*, .hash = hash, .shard = @intCast(hash & (collection.shards - 1)) };
-            }
-            std.debug.assert(pos == collection.items.len);
-            std.mem.sort(CollectionItem, collection.items, {}, CollectionItem.less);
+            const result = collection.plan.advance(collection, 4096, lifetime);
             const elapsed = time.monotonicNs() -| start;
+            // A claimed planner must rejoin before its caller can reject.
+            // Its cursor belongs to the immutable collection, never the
+            // borrowed lifetime, so later maintenance can resume the same cut.
             self.lock();
-            collection.plan_ready = true;
             collection.validation_running = false;
+            collection.plan_ready = collection.plan.phase == .done;
             self.stats.collection_plan_outside_lock_ns += elapsed;
+            try result;
             return;
         }
+        if (!self.detached_collection) return;
         if (collection.validated.items.len == collection.staged.items.len) return;
         collection.validated.ensureUnusedCapacity(self.alloc, 1) catch |err| {
             collection.validation_error = err;
@@ -2906,7 +2966,7 @@ pub const Store = struct {
         while (copy_dims.next()) |dims| copy_bytes += @as(u64, dims.*) * 4;
         const items = try self.alloc.alloc(CollectionItem, copying.count());
         errdefer if (constructing) self.alloc.free(items);
-        const detached_plan = self.detached_collection and !partial;
+        const detached_plan = (self.detached_collection or self.background_gc) and !partial;
         if (!detached_plan) {
             var it = copying.iterator();
             var pos: usize = 0;
@@ -7353,4 +7413,136 @@ test "source vector payloads original maintenance lifetime rejects actual markin
     const restored = try store.get(alloc, key);
     defer alloc.free(restored);
     try std.testing.expectEqualSlices(u8, artifact, restored);
+}
+
+test "source vector payloads resumable heap planning matches deterministic shard ordering" {
+    const alloc = std.testing.allocator;
+    for (0..66) |count| {
+        const items = try alloc.alloc(Store.CollectionItem, count);
+        defer alloc.free(items);
+        for (items, 0..) |*item, i| {
+            var digest: payload.Digest = @splat(0);
+            std.mem.writeInt(u64, digest[0..8], @intCast(count - i), .little);
+            const hash = vector_block.keyHash(&digest);
+            item.* = .{ .digest = digest, .dims = @intCast(i + 1), .hash = hash, .shard = @intCast(hash & 15) };
+        }
+        const expected = try alloc.dupe(Store.CollectionItem, items);
+        defer alloc.free(expected);
+        std.mem.sort(Store.CollectionItem, expected, {}, Store.CollectionItem.less);
+        // Sorting touches only initialized items and its explicit cursors.
+        var collection: Store.Collection = .{ .input = undefined, .live = undefined, .tail = undefined, .items = items, .shards = 16, .generation = 0, .boundary = undefined, .total_live_bytes = 0, .marked_live_bytes = 0, .primary_epoch = 0, .ann = @splat(0) };
+        var plan: Store.CollectionPlan = .{ .phase = .heap, .written = count, .heap_remaining = count / 2, .sort_end = count };
+        var turns: usize = 0;
+        while (plan.phase != .done) : (turns += 1) {
+            try std.testing.expect(turns < count * 3 + 8);
+            try plan.advance(&collection, 1, null);
+        }
+        for (expected, items) |a, b| try std.testing.expectEqualDeep(a, b);
+    }
+}
+
+test "source vector payloads default background planning resumes original lifetime rejection without publication" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    const runtime = @import("antfly_runtime_abi");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/original-collection-plan", false);
+    defer source.deinit();
+    source.background_gc = true;
+    source.mark_outside_lock = true;
+    source.mark_step_ns = 0;
+    source.detached_collection = false;
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    for (0..80) |i| {
+        var buf: [32]u8 = undefined;
+        const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&buf, "doc-{d}", .{i}), "model");
+        defer alloc.free(key);
+        try store.put(key, artifact);
+    }
+    // One uncommitted preparation requires a genuine collection plan rather
+    // than the all-live fast path; it never changes primary query authority.
+    const orphan = try payload.Reference.forArtifact("uncommitted", artifact);
+    try Store.prepare(&source, &.{.{ .reference = orphan, .artifact = artifact }});
+    try std.testing.expect(!try source.collectBackgroundStepDeferredMark(&raw, std.math.maxInt(u64)));
+    try source.advanceMarkingSnapshot();
+    try std.testing.expect(!try source.collectBackgroundStepDeferredMark(&raw, std.math.maxInt(u64)));
+    const collection = source.collection.?;
+    try std.testing.expect(!collection.plan_ready);
+    const original_generation = source.currentGeneration();
+    const Check = struct {
+        plan: *Store.CollectionPlan,
+        calls: usize = 0,
+        phase: @FieldType(Store.CollectionPlan, "phase"),
+        cause: ?anyerror,
+        fn check(raw_control: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw_control));
+            self.calls += 1;
+            if (self.calls >= 16 and self.plan.phase == self.phase) if (self.cause) |cause| return runtime.error_abi.statusFromError(cause);
+            return .ok;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }, [_]@FieldType(Store.CollectionPlan, "phase"){ .fill, .heap, .sort }) |cause, phase| {
+        var check: Check = .{ .plan = &collection.plan, .phase = phase, .cause = cause };
+        const lifetime: original_lifetime.Control = .{ .context = &check, .check = Check.check };
+        try std.testing.expectError(cause, source.advanceMarkingSnapshotWithLifetime(std.testing.io, &lifetime));
+        try std.testing.expect(source.collection == collection);
+        try std.testing.expect(collection.plan.written > 0);
+        try std.testing.expect(!collection.validation_running);
+        try std.testing.expect(!collection.plan_ready);
+        try std.testing.expectEqual(phase, collection.plan.phase);
+        try std.testing.expectEqual(original_generation, source.currentGeneration());
+        try std.testing.expectEqual(@as(u64, 0), source.statsSnapshot().collections);
+        try std.testing.expect(source.mutex.tryLock());
+        source.mutex.unlock();
+    }
+    try source.advanceMarkingSnapshot();
+    try std.testing.expect(collection.plan_ready);
+    for (collection.items[1..], collection.items[0 .. collection.items.len - 1]) |item, previous| try std.testing.expect(!Store.CollectionItem.less({}, item, previous));
+    var turns: usize = 0;
+    while (!try source.collectBackgroundStepDeferredMark(&raw, std.math.maxInt(u64))) : (turns += 1) try std.testing.expect(turns < 256);
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc-0", "model");
+    defer alloc.free(key);
+    const restored = try store.get(alloc, key);
+    defer alloc.free(restored);
+    try std.testing.expectEqualSlices(u8, artifact, restored);
+    try std.testing.expectEqual(@as(u64, 80), source.statsSnapshot().retained_payloads);
+}
+
+test "source vector payloads production planning quantum returns before finishing a large plan" {
+    const alloc = std.testing.allocator;
+    const count = 4097;
+    const items = try alloc.alloc(Store.CollectionItem, count);
+    defer alloc.free(items);
+    var collection: Store.Collection = .{ .plan_ready = false, .input = undefined, .live = LiveSet.init(alloc), .tail = undefined, .items = items, .shards = 16, .generation = 0, .boundary = undefined, .total_live_bytes = 0, .marked_live_bytes = 0, .primary_epoch = 0, .ann = @splat(0) };
+    defer collection.live.deinit();
+    for (0..count) |i| {
+        var digest: payload.Digest = @splat(0);
+        std.mem.writeInt(u64, digest[0..8], @intCast(i), .little);
+        try collection.live.put(digest, @intCast(i + 1));
+    }
+    try collection.plan.advance(&collection, 4096, null);
+    try std.testing.expectEqual(@as(usize, 4096), collection.plan.written);
+    try std.testing.expectEqual(.fill, collection.plan.phase);
+    try collection.plan.advance(&collection, 4096, null);
+    try std.testing.expectEqual(.sort, collection.plan.phase);
+    try std.testing.expect(collection.plan.sort_end > 1);
+    const expected = try alloc.dupe(Store.CollectionItem, items);
+    defer alloc.free(expected);
+    std.mem.sort(Store.CollectionItem, expected, {}, Store.CollectionItem.less);
+    try collection.plan.advance(&collection, 4096, null);
+    try std.testing.expectEqual(.done, collection.plan.phase);
+    for (expected, items) |a, b| try std.testing.expectEqualDeep(a, b);
 }
