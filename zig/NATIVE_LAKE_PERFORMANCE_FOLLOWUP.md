@@ -1576,6 +1576,13 @@ passed all 51 focused tests, including the collector benchmark. All 16 page-tree
 tests also passed independently, including generic legacy encoding, integrity,
 snapshot retention, allocation failure and recovery.
 
+The branch then merged origin/main through `b7e4f43a30`, including its Lite read
+navigation and batch-scratch changes, without conflicts. The combined production
+Debug server rebuilt successfully and all six real-data E2Es passed again in
+253.16 seconds. License headers and the Apache dependency boundary also pass
+after that merge. The focused/integration and optimized scheduling results above
+were collected with the same I/O refinement before this additional main merge.
+
 Regressions cover scalar-bound tightening, conservative envelope coarsening over
 custom BM25 configurations, saturation, dense-merge/COW equivalence, zero dense
 point seeks, changed/removed directory contributions, unchanged-root reuse, rare
@@ -1593,8 +1600,8 @@ zero/negative scores, repeated requests and cold restart. They also cover the
 oversized-term competitive-refinement fallback, limit-1 ranking, broad
 alternatives and prohibited-only queries. All six real-data E2Es passed in one
 fresh run after the I/O refinement against the rebuilt production server
-(253.11 seconds), with the disk safety floor enabled. The Parquet and Iceberg pagination fixtures
-exercise retained snapshot tokens with forward and backward cursors. These are
+(253.11 seconds), with the disk safety floor enabled. The Parquet and Iceberg
+pagination fixtures exercise retained snapshot tokens with forward and backward cursors. These are
 the five Iceberg/Parquet SQL fixtures and the native sparse metadata score/ranking
 regression. Iceberg remains in `e2e-full`.
 
