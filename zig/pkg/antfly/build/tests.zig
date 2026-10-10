@@ -1836,6 +1836,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx inference connection requires inference write permission",
         "httpx inference connection propagates failures after stream commit",
         "httpx retrieval SSE",
+        "httpx retrieval read failures preserve retryable JSON and conflict status",
         "retrieval agent sse",
         "retrieval agent streaming emits go-shaped tree",
         "inference connection invocation forwards streaming and deadline through stable target ABI",

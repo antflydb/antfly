@@ -15364,7 +15364,12 @@ pub const ApiHttpServer = struct {
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
                     const now_ns = retryMonotonicNs(retry_io);
                     if (retryDeadlineExpired(retry_deadline_ns, now_ns)) return error.Timeout;
-                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return if (err == error.GenerationTransitionActive) error.StorageReadTemporarilyUnavailable else err;
+                    const sleep_ns = boundedRetrySleepNs(retry_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return switch (err) {
+                        // These are failed attempts to acquire a fresh read,
+                        // not a conflict with a caller-pinned generation.
+                        error.GenerationTransitionActive, error.IdentityReadGenerationChanged => error.StorageReadTemporarilyUnavailable,
+                        else => err,
+                    };
                     if (sleep_ns == 0) return error.Timeout;
                     try sleepNsCancellable(retry_io, sleep_ns, req.cancellation);
                     continue;
@@ -31479,6 +31484,7 @@ test "api http transient read retry stops before source query when client cancel
 test "api http retries identity generation and topology churn from a fresh query snapshot" {
     const FakeReads = struct {
         attempts: u32 = 0,
+        exhaust_budget: bool = false,
         transient: anyerror = error.IdentityReadGenerationChanged,
 
         fn source(self: *@This()) table_reads.TableReadSource {
@@ -31519,12 +31525,18 @@ test "api http retries identity generation and topology churn from a fresh query
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             _: []const u8,
-            _: db_mod.types.SearchRequest,
+            req: db_mod.types.SearchRequest,
             _: raft_mod.ReadConsistency,
         ) anyerror!?query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.attempts += 1;
-            if (self.attempts == 1) return self.transient;
+            if (self.attempts == 1) {
+                if (self.exhaust_budget) try sleepNsCancellable(null, 5 * std.time.ns_per_s, req.cancellation);
+                return self.transient;
+            }
+            // Unpinned retries must enter the source with a fresh request;
+            // internal per-phase stamps must never escape a failed attempt.
+            try std.testing.expect(req.identity_read_generation == null);
             return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}") };
         }
     };
@@ -31562,6 +31574,32 @@ test "api http retries identity generation and topology churn from a fresh query
     var transition_response = (try ApiHttpServer.queryWithTransientReadRetry(std.testing.allocator, null, reads.source(), "docs", .{}, .read_index, .none)).?;
     defer transition_response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+
+    reads.attempts = 0;
+    reads.transient = error.IdentityReadGenerationChanged;
+    try std.testing.expectError(error.IdentityReadGenerationChanged, ApiHttpServer.queryWithTransientReadRetry(
+        std.testing.allocator,
+        null,
+        reads.source(),
+        "docs",
+        .{ .identity_read_generation = 7 },
+        .read_index,
+        .none,
+    ));
+    try std.testing.expectEqual(@as(u32, 1), reads.attempts);
+
+    reads.attempts = 0;
+    reads.exhaust_budget = true;
+    try std.testing.expectError(error.StorageReadTemporarilyUnavailable, ApiHttpServer.queryWithTransientReadRetry(
+        std.testing.allocator,
+        null,
+        reads.source(),
+        "docs",
+        .{},
+        .read_index,
+        .none,
+    ));
+    try std.testing.expectEqual(@as(u32, 1), reads.attempts);
 }
 
 test "api http index generation retry refreshes once and preserves readiness cancellation and deadlines" {
