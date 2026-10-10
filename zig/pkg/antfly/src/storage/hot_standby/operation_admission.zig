@@ -298,3 +298,143 @@ test "HA original admission separates same-thread mutation from capture ownershi
     var reusable = barrier.tryAcquireShared() orelse return error.LeakedCaptureBarrier;
     reusable.release();
 }
+
+test "HA original admission rejects parked capture without retiring another same-thread mutation" {
+    const native = sources.common_request_admission.runnable_scheduler;
+    const Cause = enum { canceled, expired, closed, denied };
+    const Clock = struct {
+        var value: std.atomic.Value(u64) = .init(0);
+        fn now() u64 {
+            return value.load(.acquire);
+        }
+    };
+    const Signal = struct {
+        value: std.atomic.Value(bool) = .init(false),
+        fn requested(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.value.load(.acquire);
+        }
+    };
+    for (std.enums.values(Cause)) |cause| {
+        Clock.value.store(0, .release);
+        var signal: Signal = .{};
+        var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+        defer scheduler.close();
+        var holder: native.Execution = .{};
+        defer holder.finish();
+        var capture: native.Execution = .{};
+        defer capture.finish();
+        try holder.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 17 }, .background);
+        var barrier: runtime.mutation_barrier.MutationBarrier = .{};
+        var mutation = barrier.acquireShared();
+        var held = true;
+        defer if (held) mutation.release();
+        try holder.park(.resource_blocked);
+        try capture.start(&scheduler, .{
+            .io = std.testing.io,
+            .retained_bytes = 23,
+            .deadline_ns = 10,
+            .native_now_ns = Clock.now,
+            .cancellation = .{ .ptr = &signal, .requested = Signal.requested },
+        }, .background);
+        const State = struct {
+            scheduler: *native.Scheduler,
+            capture: *native.Execution,
+            barrier: *runtime.mutation_barrier.MutationBarrier,
+            signal: *Signal,
+            cause: Cause,
+            parks: usize = 0,
+            resumes: usize = 0,
+            fn life(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.capture.checkLifetime() catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn check(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                @panic("capture lifetime checks must not yield");
+            }
+            fn current(_: *anyopaque, out: *c_int) callconv(.c) runtime.error_abi.Status {
+                out.* = @backingInt(runtime.runnable_abi.Class.background);
+                return .ok;
+            }
+            fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                std.debug.assert(reason == @backingInt(runtime.runnable_abi.Wait.resource));
+                self.parks += 1;
+                self.capture.park(.resource_blocked) catch |err| return runtime.error_abi.statusFromError(err);
+                const parked = self.scheduler.stats();
+                std.debug.assert(parked.runnable_slots == 0 and parked.operations == 2 and parked.retained_bytes == 40);
+                std.debug.assert(self.barrier.pendingExclusiveAcquisitions() == 1);
+                // Protected health can progress while the sole ordinary CPU
+                // is loaned. The mutation lease remains physically owned.
+                var health: native.Execution = .{};
+                defer health.finish();
+                health.start(self.scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control) catch |err| return runtime.error_abi.statusFromError(err);
+                std.debug.assert(self.scheduler.stats().control_slots == 1);
+                switch (self.cause) {
+                    .canceled => self.signal.value.store(true, .release),
+                    .expired => Clock.value.store(10, .release),
+                    .closed => self.scheduler.close(),
+                    .denied => {},
+                }
+                return .ok;
+            }
+            fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                std.debug.assert(class == @backingInt(runtime.runnable_abi.Class.background));
+                self.resumes += 1;
+                if (self.cause == .denied) return runtime.error_abi.statusFromError(error.Forbidden);
+                self.capture.enter(.background) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+        };
+        var state: State = .{ .scheduler = &scheduler, .capture = &capture, .barrier = &barrier, .signal = &signal, .cause = cause };
+        const io = std.testing.io;
+        var admission: Session = .{};
+        try admission.bind(.{ .io = runtime.io_abi.Borrow.init(&io), .execution = .{
+            .context = &state,
+            .cpu_slots = 1,
+            .parent_class = @backingInt(runtime.runnable_abi.Class.background),
+            .checkpoint = State.check,
+            .check_lifetime = State.life,
+            .current_class = State.current,
+            .park = State.park,
+            .enter = State.enter,
+        } });
+        // Legacy nested operations still reject a shared-to-exclusive upgrade.
+        try std.testing.expectError(error.InvalidArgument, barrier.acquireExclusiveControlled(io, &admission.budget));
+        const expected = switch (cause) {
+            .canceled => error.Canceled,
+            .expired => error.DeadlineExceeded,
+            .closed => error.SchedulerClosed,
+            .denied => error.Forbidden,
+        };
+        try std.testing.expectError(expected, admission.acquireExclusive(&barrier));
+        try std.testing.expectEqual(@as(usize, 1), state.parks);
+        try std.testing.expectEqual(state.parks, state.resumes);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 2), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 40), scheduler.stats().retained_bytes);
+        try std.testing.expectEqual(@as(?u64, 10), capture.entry.?.options.deadline_ns);
+        try std.testing.expectEqual(@as(u64, 0), barrier.pendingExclusiveAcquisitions());
+        try std.testing.expect(barrier.tryAcquireExclusive() == null);
+        // Clearing the trigger cannot replace the first failure or make the
+        // parked capture retry. Only its owning finish retires its metadata.
+        signal.value.store(false, .release);
+        Clock.value.store(0, .release);
+        try std.testing.expectError(expected, admission.acquireExclusive(&barrier));
+        try std.testing.expectEqual(@as(usize, 1), state.parks);
+        try std.testing.expectEqual(@as(usize, 1), state.resumes);
+        capture.finish();
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+        try std.testing.expect(barrier.tryAcquireExclusive() == null);
+        mutation.release();
+        held = false;
+        holder.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        var reusable = barrier.tryAcquireExclusive() orelse return error.LeakedCaptureBarrier;
+        reusable.release();
+    }
+}

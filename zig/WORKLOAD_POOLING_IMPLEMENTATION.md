@@ -2319,3 +2319,30 @@ preserved separately. The transport fixture uses a loopback test server, not a
 production deployment. Full generic-helper consumers, independent archives,
 physical DB/API integration, provider deadlines, background holder adoption and
 runtime/performance/default qualification still require their own evidence.
+
+
+### Fresh HA capture ownership during rejected CPU return
+
+Authenticated HA fence and seed-capture requests now acquire the mutation
+barrier as fresh operations. Another Io operation can own a legacy shared
+mutation lease on the same OS thread; its thread-local nesting marker does not
+authorize or reject this capture. Existing nested callers retain the guarded
+shared-to-exclusive upgrade path. Acquisition preserves the original execution
+and deadline, holds writer intent while CPU is parked, and releases that intent
+and its reader gate on rejection without releasing another operation's lease.
+
+The focused HA regression uses the actual barrier, scheduler and ingress
+admission adapter with one ordinary CPU and a separate protected control lane.
+It checks successful same-thread contention and cancellation, original expiry,
+scheduler closure and denied CPU return after parking. The mutation remains
+physically held on every rejected path; health progresses, capture and holder
+metadata/bytes remain owned until their respective finishes, and the first
+failure remains sticky after clearing its trigger. Legacy nested upgrade
+rejection and barrier reuse are checked separately.
+
+This qualifies fresh capture admission, not CPU transfer inside the retained
+HA state/cache/native snapshot holder graph. Those holders still use original
+non-yielding lifetime checks while retaining CPU. Legacy shared leases retain
+thread-local nesting and same-thread release requirements. Production background
+holder adoption, physical syscall bounds, full archive/API/DB integration,
+resource envelopes, performance and default sizing remain open requirements.
