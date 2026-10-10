@@ -1223,6 +1223,40 @@ test "opaque hidden restore prepares without mutation and reopens exact canceled
     try std.testing.expectError(error.RestoreStagingScopeChanged, client.Owner.open(options));
 }
 
+test "HA seed maintenance lifetime crosses the compiled owner boundary and remains reusable" {
+    const runtime = @import("antfly_runtime_abi");
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(path);
+    var context: client.Context = .{};
+    try context.ensure();
+    defer context.deinit();
+    var owner = try client.Owner.open(.{ .context = context.handle, .path = .fromSlice(path), .table_name = .fromSlice("docs"), .group_id = 7001, .has_identity_namespace = 1, .identity_table_id = 7, .identity_shard_id = 7001, .identity_range_id = 7001, .schema_json = .fromSlice("{}") });
+    defer owner.close();
+    const Check = struct {
+        calls: usize = 0,
+        cause: ?anyerror,
+        fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            // First check is in the client; reject only after the native
+            // provider received this exact borrowed invocation capability.
+            if (self.calls >= 2) if (self.cause) |cause| return runtime.error_abi.statusFromError(cause);
+            return .ok;
+        }
+    };
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+        var check: Check = .{ .cause = cause };
+        const lifetime: runtime.runnable_abi.Reentry = .{ .context = &check, .check = Check.check };
+        try std.testing.expectError(cause, owner.prepareHotStandbySeedSnapshotWithLifetime("docs", std.math.maxInt(u64), &lifetime));
+        try std.testing.expect(check.calls >= 2);
+        check.cause = null;
+        try owner.prepareHotStandbySeedSnapshotWithLifetime("docs", std.math.maxInt(u64), &lifetime);
+    }
+}
+
 test "HA seed storage-owner boundary preserves exact operational errors" {
     try std.testing.expectError(
         error.InvalidArgument,

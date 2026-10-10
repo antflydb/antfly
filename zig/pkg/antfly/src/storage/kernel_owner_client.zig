@@ -1078,6 +1078,15 @@ pub const Owner = struct {
         table_name: []const u8,
         deadline_ns: u64,
     ) !void {
+        return self.prepareHotStandbySeedSnapshotWithLifetime(table_name, deadline_ns, null);
+    }
+    pub fn prepareHotStandbySeedSnapshotWithLifetime(
+        self: *Owner,
+        table_name: []const u8,
+        deadline_ns: u64,
+        lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !void {
+        if (lifetime) |original| try original.checkpoint();
         var result: abi.MaintenanceResult = .{};
         try statusToError(abi.antfly_storage_owner_maintenance(
             self.handle,
@@ -1085,10 +1094,12 @@ pub const Owner = struct {
                 .action = @backingInt(abi.MaintenanceAction.prepare_ha_seed_snapshot),
                 .table_name = .fromSlice(table_name),
                 .deadline_ns = deadline_ns,
+                .lifetime_check = lifetime,
             },
             &result,
         ));
         if (result.version != abi.abi_version) return error.InvalidAbiVersion;
+        if (lifetime) |original| try original.checkpoint();
     }
 };
 

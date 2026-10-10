@@ -19131,28 +19131,33 @@ pub const DB = struct {
     /// so callers must drain before taking an exclusive mutation barrier.
     /// The deadline is in this DB's BackendRuntime.monotonicClock domain.
     pub fn drainSnapshotMaintenance(self: *DB, deadline_ns: u64) !void {
+        return self.drainSnapshotMaintenanceWithLifetime(deadline_ns, null);
+    }
+    pub fn drainSnapshotMaintenanceWithLifetime(self: *DB, deadline_ns: u64, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !void {
+        const original = @import("../../common/seed_snapshot_lifetime.zig");
         while (true) {
+            try original.checkpoint(lifetime);
             self.runMaintenanceUntilWithCancellation(
                 self.currentMaintenanceTargetSequence(),
                 .{},
-                .none,
+                original.cancellation(lifetime),
                 deadline_ns,
-            ) catch |err| switch (err) {
-                // A retryable provider failure has already committed its
-                // source mutation. Seed preflight is the safe place to absorb
-                // that finite retry: returning it to the operator adds a full
-                // reconciliation round trip, while waiting after the global
-                // barrier closes would deadlock its eventual publication.
-                error.EnrichmentRetryInProgress => {
-                    const wait_clock = self.backend_runtime.monotonicClock();
-                    const now_ns = wait_clock.nowRealtimeNs();
-                    if (now_ns >= deadline_ns) return error.EnrichmentWaitTimeout;
-                    const sleep_ns = @min(25 * std.time.ns_per_ms, deadline_ns - now_ns);
-                    wait_clock.sleepMs(@max(1, @divTrunc(sleep_ns +| std.time.ns_per_ms - 1, std.time.ns_per_ms)));
-                    continue;
-                },
-                else => return err,
+            ) catch |err| {
+                try original.checkpoint(lifetime);
+                switch (err) {
+                    // A retryable provider failure has already committed its
+                    // source mutation. Seed preflight is the safe place to absorb
+                    // that finite retry: returning it to the operator adds a full
+                    // reconciliation round trip, while waiting after the global
+                    // barrier closes would deadlock its eventual publication.
+                    error.EnrichmentRetryInProgress => {
+                        try original.retryWait(self.backend_runtime.monotonicClock(), deadline_ns, lifetime, if (lifetime != null) self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo else null);
+                        continue;
+                    },
+                    else => return err,
+                }
             };
+            try original.checkpoint(lifetime);
             return;
         }
     }

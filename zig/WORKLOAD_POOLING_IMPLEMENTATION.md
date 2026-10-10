@@ -1868,3 +1868,34 @@ archives must agree on the new runnable ABI version; cumulative API/DB/CLI and
 schema verification remains mandatory. Catalog/Raft/maintenance/capture wait
 adoption, mandatory cleanup mutex/CPU authority, physical resource/performance
 and default sizing qualification remain open.
+
+
+### HA maintenance preflight original lifetime
+
+The production capture callback now forwards its existing sticky lifetime into
+preflight for public, private and native restore owners. Managed owner acquisition
+receives a fallible token; typed source callbacks and storage-owner ABI version
+89 carry the same synchronous check through native maintenance. Scoped callers
+refuse an incapable source before legacy work runs. Native enrichment/derived
+visibility polls receive that token, retry pacing polls it each millisecond,
+and cache transition/lifecycle mutex admission checks it while retaining CPU.
+Original cancellation, deadline and scheduler errors survive visibility error
+normalization. No replacement execution or deadline is created.
+
+The legacy 25 ms retry and manual-clock behavior remains available to unscoped
+callers. Once a cache entry is removed from its close queue, close is mandatory
+and cannot be abandoned because the capture lifetime expires. Initial locks and
+unclaimed scan work reject; acquired locks unwind independently on all failures.
+Control-side checks exercise actual provisioned source callbacks, typed foreign
+dispatch, refusal of legacy fallback, retained atomic/Io mutex ownership and retry
+pacing. They instantiate no physical DB. Separate selected cumulative fixtures
+exercise every actual cache transition fence and the compiled native owner
+boundary; these require the actual cumulative run.
+
+This is original-lifetime transport, not full fair maintenance/capture proof.
+Retained owner/cache dependencies still hold CPU until their complete graph
+supports mandatory reentry. Metadata checkpoint/catalog/private inventory I/O,
+native artifact repair scans/publication, provider work quanta, mandatory native
+close/cleanup CPU, file/WAL capture completion, independent archive/API/DB/CLI
+compatibility, physical resource/performance and automatic default gates remain
+open. The focused compiler/container bounds do not qualify runtime envelopes.

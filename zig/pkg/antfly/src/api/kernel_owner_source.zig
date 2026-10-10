@@ -915,6 +915,7 @@ pub const ProvisionedKernelOwnerSource = struct {
                 .text_memory_attribution_stats_best_effort = textMemoryAttributionStatsBestEffort,
                 .preflight_write_admission_group_local = preflightWriteAdmissionGroupLocal,
                 .prepare_hot_standby_seed_snapshot_group_local = prepareHotStandbySeedSnapshotGroupLocal,
+                .prepare_hot_standby_seed_snapshot_group_local_with_lifetime = prepareHotStandbySeedSnapshotGroupLocalWithLifetime,
                 .capture_hot_standby_seed_snapshot_group_local = captureHotStandbySeedSnapshotGroupLocal,
                 .find_median_key_group_local = findMedianKeyGroupLocal,
                 .reconcile_table_group_local = reconcileTableGroupLocal,
@@ -1426,6 +1427,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
         defer lease.deinit();
         try lease.owner().prepareHotStandbySeedSnapshot(table_name, deadline_ns);
+        return {};
+    }
+
+    fn prepareHotStandbySeedSnapshotGroupLocalWithLifetime(
+        ptr: *anyopaque,
+        group_id: u64,
+        table_name: []const u8,
+        deadline_ns: u64,
+        lifetime: *const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !?void {
+        const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
+        const original = @import("antfly_local_sources").common_seed_snapshot_lifetime;
+        try original.checkpoint(lifetime);
+        // Retain CPU during the native owner/cache dependency graph. This
+        // fallible token preserves the original error in descriptor waits.
+        var lease = try self.acquireWithControls(group_id, table_name, .{ .cancellation = original.cancellation(lifetime) });
+        defer lease.deinit();
+        try original.checkpoint(lifetime);
+        try lease.owner().prepareHotStandbySeedSnapshotWithLifetime(table_name, deadline_ns, lifetime);
+        try original.checkpoint(lifetime);
         return {};
     }
 

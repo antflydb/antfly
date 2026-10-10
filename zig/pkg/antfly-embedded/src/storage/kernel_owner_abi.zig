@@ -19,7 +19,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 88;
+pub const abi_version: u32 = 89;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -1358,6 +1358,9 @@ pub const MaintenanceRequest = extern struct {
     deadline_ns: u64 = 0,
     snapshot_token: BorrowedBytes = .{},
     destination_root: BorrowedBytes = .{},
+    /// Synchronous borrowed runtime_runnable_abi.Reentry lifetime check.
+    /// Never serialized or retained beyond this maintenance invocation.
+    lifetime_check: ?*const anyopaque = null,
 };
 
 pub const MaintenanceResult = extern struct {

@@ -8398,9 +8398,16 @@ pub const DataServer = struct {
     /// The bounded verification inside DB.snapshotWithMaintenanceDeadline closes the remaining
     /// race and converts it into a retryable busy result.
     fn prepareDefaultHotStandbySeedSnapshotMaintenance(self: *DataServer) !void {
+        return self.prepareDefaultHotStandbySeedSnapshotMaintenanceWithLifetime(null);
+    }
+    fn prepareDefaultHotStandbySeedSnapshotMaintenanceWithLifetime(self: *DataServer, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !void {
+        const original = @import("antfly_local_sources").common_seed_snapshot_lifetime;
+        try original.checkpoint(lifetime);
         if (self.status_source.standalone_hot_standby) |metadata_hot_standby| try metadata_hot_standby.prepareCheckpoint();
+        try original.checkpoint(lifetime);
         var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
         defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
+        try original.checkpoint(lifetime);
         if ((metadata_snapshot.tables.len == 0) != (metadata_snapshot.ranges.len == 0))
             return error.HASeedSnapshotIncompleteTopology;
 
@@ -8416,24 +8423,26 @@ pub const DataServer = struct {
         defer terminal_snapshot.deinit();
         var native_inventory = try @import("../storage/hot_standby/restore_owner_registry.zig").loadWithTerminalSnapshot(self.alloc, registry_io, registry_root, metadata_snapshot.tables, &terminal_snapshot);
         defer native_inventory.deinit();
-        for (native_inventory.owners) |owner| try self.liveRuntimeWriteSource().prepareHotStandbySeedReplicaSnapshot(owner.table_name, owner.scope.target_namespace.shard_id, deadline_ns);
+        try original.checkpoint(lifetime);
+        for (native_inventory.owners) |owner| {
+            if (lifetime) |control| try self.liveRuntimeWriteSource().prepareHotStandbySeedReplicaSnapshotWithLifetime(owner.table_name, owner.scope.target_namespace.shard_id, deadline_ns, control) else try self.liveRuntimeWriteSource().prepareHotStandbySeedReplicaSnapshot(owner.table_name, owner.scope.target_namespace.shard_id, deadline_ns);
+        }
         var private = try self.captureHotStandbyPrivateProvisioning(self.alloc, &metadata_snapshot);
         defer if (private) |*value| value.deinit();
         if (private) |value| {
             for (value.value.ranges) |range| {
                 const table = findHotStandbySeedTable(value.value.tables, range.table_id) orelse return error.HASeedSnapshotTableMissingFromTopology;
-                try self.liveRuntimeWriteSource().prepareHotStandbySeedReplicaSnapshot(table.name, range.group_id, deadline_ns);
+                try original.checkpoint(lifetime);
+                if (lifetime) |control| try self.liveRuntimeWriteSource().prepareHotStandbySeedReplicaSnapshotWithLifetime(table.name, range.group_id, deadline_ns, control) else try self.liveRuntimeWriteSource().prepareHotStandbySeedReplicaSnapshot(table.name, range.group_id, deadline_ns);
             }
         }
         for (metadata_snapshot.ranges) |range| {
             const table = findHotStandbySeedTable(metadata_snapshot.tables, range.table_id) orelse
                 return error.HASeedSnapshotTableMissingFromTopology;
-            try self.write_source.prepareHotStandbySeedReplicaSnapshot(
-                table.name,
-                range.group_id,
-                deadline_ns,
-            );
+            try original.checkpoint(lifetime);
+            if (lifetime) |control| try self.write_source.prepareHotStandbySeedReplicaSnapshotWithLifetime(table.name, range.group_id, deadline_ns, control) else try self.write_source.prepareHotStandbySeedReplicaSnapshot(table.name, range.group_id, deadline_ns);
         }
+        try original.checkpoint(lifetime);
     }
 
     fn hotStandbyRestoreOwnerMetadataRoot(self: *DataServer, alloc: std.mem.Allocator) ![]u8 {
@@ -8838,8 +8847,9 @@ pub const DataServer = struct {
         // finite replay/enrichment tail before closing the process-wide
         // mutation barrier; the provider performs a second bounded check after
         // the close. Custom providers own their own immutable source contract.
+        var maintenance_lifetime = if (control != null) admission.lifetime() else null;
         if (self.hot_standby_cfg.seed_snapshot_provider == null)
-            self.prepareDefaultHotStandbySeedSnapshotMaintenance() catch |err| {
+            self.prepareDefaultHotStandbySeedSnapshotMaintenanceWithLifetime(if (maintenance_lifetime) |*original| original else null) catch |err| {
                 std.log.warn("HA seed preparation failed err={s}", .{@errorName(err)});
                 return err;
             };

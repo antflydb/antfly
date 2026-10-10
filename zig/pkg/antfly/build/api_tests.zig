@@ -1718,6 +1718,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "write cache local mutation preempts stale startup writer",
             "hosted runtime status reads owner snapshot without inspecting live writer",
             "HA seed preflight drains writer released after promotion cache clear before capture freeze",
+            "HA seed cache transition original lifetime unwinds every acquired fence",
             "runtime status collection leaves active stale write lease live",
             "resident DB lease adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
@@ -2433,7 +2434,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const ha_table_request_admission_tests = b.addTest(.{
         .name = "ha-table-request-admission-tests",
         .root_module = ha_table_request_admission_root,
-        .filters = &.{ "HA controlled table request admission", "routed write admission", "controlled CPU reentry" },
+        .filters = &.{ "HA controlled table request admission", "routed write admission", "controlled CPU reentry", "HA seed maintenance lifetime" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-ha-table-request-admission-test", "Verify actual HA table request drain and closed admission with C1 CPU progress")

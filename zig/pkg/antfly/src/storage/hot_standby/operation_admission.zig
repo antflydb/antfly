@@ -34,6 +34,14 @@ pub const Session = struct {
     pub fn checkpoint(self: *Session) !void {
         try self.budget.checkpoint();
     }
+    pub fn lifetime(self: *Session) runtime.runnable_abi.Reentry {
+        return .{ .context = self, .check = checkLifetime };
+    }
+    fn checkLifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+        const self: *Session = @ptrCast(@alignCast(raw));
+        self.checkpoint() catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
+    }
     pub fn lockActivity(self: *Session, io: std.Io, mutex: *std.Io.Mutex) !void {
         try self.budget.checkpoint();
         while (!mutex.tryLock()) try self.budget.waitForProgress();

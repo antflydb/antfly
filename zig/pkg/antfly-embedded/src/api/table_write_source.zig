@@ -473,6 +473,13 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             deadline_ns: u64,
         ) anyerror!?void = null,
+        prepare_hot_standby_seed_snapshot_group_local_with_lifetime: ?*const fn (
+            ptr: *anyopaque,
+            group_id: u64,
+            table_name: []const u8,
+            deadline_ns: u64,
+            lifetime: *const @import("antfly_runtime_abi").runnable_abi.Reentry,
+        ) anyerror!?void = null,
         find_median_key_group_local: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -1592,6 +1599,20 @@ pub const TableWriteSource = struct {
     ) !?void {
         const fn_ptr = self.vtable.prepare_hot_standby_seed_snapshot_group_local orelse return null;
         return try BoundaryAbi.call("prepare_hot_standby_seed_snapshot_group_local", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, deadline_ns });
+    }
+
+    pub fn prepareHotStandbySeedSnapshotGroupLocalWithLifetime(
+        self: TableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+        deadline_ns: u64,
+        lifetime: *const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !?void {
+        try lifetime.checkpoint();
+        const fn_ptr = self.vtable.prepare_hot_standby_seed_snapshot_group_local_with_lifetime orelse return error.ExecutionWaitUnsupported;
+        const result = try BoundaryAbi.call("prepare_hot_standby_seed_snapshot_group_local_with_lifetime", self.boundary_dispatch, fn_ptr, .{ self.ptr, group_id, table_name, deadline_ns, lifetime });
+        try lifetime.checkpoint();
+        return result;
     }
 
     pub fn findMedianKeyGroupLocal(

@@ -4778,29 +4778,39 @@ pub const ProvisionedTableWriteCache = struct {
         group_id: u64,
         table_name: []const u8,
     ) void {
+        self.drainPendingClosesForGroupTableAssumeOpenMutexHeldWithLifetime(group_id, table_name, null) catch unreachable;
+    }
+    fn drainPendingClosesForGroupTableAssumeOpenMutexHeldWithLifetime(self: *ProvisionedTableWriteCache, group_id: u64, table_name: []const u8, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !void {
+        const original = @import("antfly_local_sources").common_seed_snapshot_lifetime;
         while (true) {
-            var entry_to_close: ?*Entry = null;
-            lockAtomic(&self.entry_lifecycle_mutex);
-            var i: usize = 0;
-            while (i < self.retired_entries.items.len) : (i += 1) {
-                const entry = self.retired_entries.items[i];
-                if (entry.group_id != group_id) continue;
-                if (entry.active_leases != 0) continue;
-                if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-                entry_to_close = self.retired_entries.orderedRemove(i);
-                break;
-            }
-            if (entry_to_close == null) {
-                i = 0;
-                while (i < self.closing_entries.items.len) : (i += 1) {
-                    const entry = self.closing_entries.items[i];
+            try original.checkpoint(lifetime);
+            const entry_to_close: ?*Entry = blk: {
+                if (lifetime) |control| try original.lockAtomic(self.openMutexIo(), &self.entry_lifecycle_mutex, control) else lockAtomic(&self.entry_lifecycle_mutex);
+                defer self.entry_lifecycle_mutex.unlock();
+                var selected: ?*Entry = null;
+                var i: usize = 0;
+                while (i < self.retired_entries.items.len) : (i += 1) {
+                    if (i % 64 == 0) try original.checkpoint(lifetime);
+                    const entry = self.retired_entries.items[i];
                     if (entry.group_id != group_id) continue;
+                    if (entry.active_leases != 0) continue;
                     if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
-                    entry_to_close = self.closing_entries.orderedRemove(i);
+                    selected = self.retired_entries.orderedRemove(i);
                     break;
                 }
-            }
-            self.entry_lifecycle_mutex.unlock();
+                if (selected == null) {
+                    i = 0;
+                    while (i < self.closing_entries.items.len) : (i += 1) {
+                        if (i % 64 == 0) try original.checkpoint(lifetime);
+                        const entry = self.closing_entries.items[i];
+                        if (entry.group_id != group_id) continue;
+                        if (!std.mem.eql(u8, entry.table_name, table_name)) continue;
+                        selected = self.closing_entries.orderedRemove(i);
+                        break;
+                    }
+                }
+                break :blk selected;
+            };
 
             const entry = entry_to_close orelse return;
             self.closeEntryNow(entry);
@@ -7223,6 +7233,27 @@ pub const ProvisionedTableWriteSource = struct {
             lockAtomic(&owner.local_db_mutex);
             if (first) |cache| lockAtomic(&cache.entry_lifecycle_mutex);
             if (second) |cache| lockAtomic(&cache.entry_lifecycle_mutex);
+            return .{ .source = owner, .first = first, .second = second };
+        }
+
+        fn initWithLifetime(owner: *ProvisionedTableWriteSource, include_write: bool, include_startup: bool, lifetime: *const @import("antfly_runtime_abi").runnable_abi.Reentry) !WriteCacheTransitionLocks {
+            const original = @import("antfly_local_sources").common_seed_snapshot_lifetime;
+            var first: ?*ProvisionedTableWriteCache = if (include_write) owner.write_cache else null;
+            var second: ?*ProvisionedTableWriteCache = if (include_startup) owner.startup_write_cache else null;
+            if (first == second) second = null;
+            if (first == null) {
+                first = second;
+                second = null;
+            }
+            if (first) |cache| try original.lockIo(cache.openMutexIo(), &cache.open_mutex, lifetime);
+            errdefer if (first) |cache| cache.unlockOpenMutex();
+            if (second) |cache| try original.lockIo(cache.openMutexIo(), &cache.open_mutex, lifetime);
+            errdefer if (second) |cache| cache.unlockOpenMutex();
+            try original.lockAtomic(owner.tableActivityIo(), &owner.local_db_mutex, lifetime);
+            errdefer owner.local_db_mutex.unlock();
+            if (first) |cache| try original.lockAtomic(cache.openMutexIo(), &cache.entry_lifecycle_mutex, lifetime);
+            errdefer if (first) |cache| cache.entry_lifecycle_mutex.unlock();
+            if (second) |cache| try original.lockAtomic(cache.openMutexIo(), &cache.entry_lifecycle_mutex, lifetime);
             return .{ .source = owner, .first = first, .second = second };
         }
 
@@ -15824,14 +15855,34 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         deadline_ns: u64,
     ) !void {
+        return self.prepareHotStandbySeedReplicaSnapshotInternal(table_name, group_id, deadline_ns, null);
+    }
+    pub fn prepareHotStandbySeedReplicaSnapshotWithLifetime(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        deadline_ns: u64,
+        lifetime: *const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !void {
+        return self.prepareHotStandbySeedReplicaSnapshotInternal(table_name, group_id, deadline_ns, lifetime);
+    }
+    fn prepareHotStandbySeedReplicaSnapshotInternal(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        deadline_ns: u64,
+        lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !void {
+        const original = @import("antfly_local_sources").common_seed_snapshot_lifetime;
+        try original.checkpoint(lifetime);
         if (comptime control_only_storage_sources) {
             const local_source = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            _ = (try local_source.prepareHotStandbySeedSnapshotGroupLocal(
-                group_id,
-                table_name,
-                deadline_ns,
-            )) orelse return error.StorageKernelOwnerUnavailable;
+            _ = (if (lifetime) |control|
+                try local_source.prepareHotStandbySeedSnapshotGroupLocalWithLifetime(group_id, table_name, deadline_ns, control)
+            else
+                try local_source.prepareHotStandbySeedSnapshotGroupLocal(group_id, table_name, deadline_ns)) orelse return error.StorageKernelOwnerUnavailable;
+            try original.checkpoint(lifetime);
             return;
         }
         {
@@ -15840,12 +15891,15 @@ pub const ProvisionedTableWriteSource = struct {
             switch (probe) {
                 .unknown => return error.HASeedSnapshotRuntimeBusy,
                 .absent => {},
-                .leased => |*cached| cached.db.drainSnapshotMaintenance(deadline_ns) catch |err| switch (err) {
-                    error.EnrichmentWaitCanceled,
-                    error.EnrichmentWaitTimeout,
-                    error.EnrichmentRetryInProgress,
-                    => return error.HASeedSnapshotRuntimeBusy,
-                    else => return err,
+                .leased => |*cached| cached.db.drainSnapshotMaintenanceWithLifetime(deadline_ns, lifetime) catch |err| {
+                    try original.checkpoint(lifetime);
+                    switch (err) {
+                        error.EnrichmentWaitCanceled,
+                        error.EnrichmentWaitTimeout,
+                        error.EnrichmentRetryInProgress,
+                        => return error.HASeedSnapshotRuntimeBusy,
+                        else => return err,
+                    }
                 },
             }
         }
@@ -15856,14 +15910,18 @@ pub const ProvisionedTableWriteSource = struct {
         // mutation admission remains available, never after capture freezes the
         // process-wide barrier.
         if (self.write_cache != null or self.startup_write_cache != null) {
-            var locks = WriteCacheTransitionLocks.init(self, true, true);
+            var locks = if (lifetime) |control|
+                try WriteCacheTransitionLocks.initWithLifetime(self, true, true, control)
+            else
+                WriteCacheTransitionLocks.init(self, true, true);
             defer locks.deinit();
             locks.releaseStateLocks();
             if (locks.first) |cache|
-                cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
+                try cache.drainPendingClosesForGroupTableAssumeOpenMutexHeldWithLifetime(group_id, table_name, lifetime);
             if (locks.second) |cache|
-                cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
+                try cache.drainPendingClosesForGroupTableAssumeOpenMutexHeldWithLifetime(group_id, table_name, lifetime);
         }
+        try original.checkpoint(lifetime);
     }
 
     fn captureHotStandbySeedDbSnapshot(alloc: std.mem.Allocator, db: *db_mod.DB, db_path: []const u8, snapshot_token: []const u8, destination_root: []const u8) !void {
@@ -36552,6 +36610,89 @@ fn consumerTests() type {
                 try std.testing.expectEqual(@as(usize, 0), source.active_table_activities.items.len);
             }
             try std.testing.expectEqual(@as(usize, 4), fixture.calls);
+        }
+
+        test "HA seed maintenance lifetime keeps the original token through actual source and typed foreign callbacks" {
+            const runtime = @import("antfly_runtime_abi");
+            const Contract = @import("antfly_local_sources").api_local_table_writes.TableWriteSource;
+            const Fixture = struct {
+                calls: usize = 0,
+                legacy_calls: usize = 0,
+                foreign_calls: usize = 0,
+                reject: ?anyerror = null,
+                expire_in_callback: bool = false,
+                expected: ?*const runtime.runnable_abi.Reentry = null,
+                fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedCatalogCall;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+                fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (self.reject) |cause| return runtime.error_abi.statusFromError(cause);
+                    return .ok;
+                }
+                fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) !?void {
+                    return error.UnexpectedBatch;
+                }
+                fn legacy(raw: *anyopaque, _: u64, _: []const u8, _: u64) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.legacy_calls += 1;
+                    return {};
+                }
+                fn scoped(raw: *anyopaque, group: u64, table: []const u8, deadline: u64, original: *const runtime.runnable_abi.Reentry) !?void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    try std.testing.expectEqualStrings("docs", table);
+                    try std.testing.expectEqual(@as(u64, 7001), group);
+                    try std.testing.expectEqual(@as(u64, 1234), deadline);
+                    // Typed foreign dispatch preserves the external check's
+                    // callback/context, rather than copying an execution root.
+                    try std.testing.expect(original.context == self.expected.?.context);
+                    try std.testing.expect(original.check == self.expected.?.check);
+                    try original.checkpoint();
+                    if (self.expire_in_callback) self.reject = error.DeadlineExceeded;
+                    return {};
+                }
+                const Dispatch = @FieldType(Contract, "boundary_dispatch");
+                const Parameters = @typeInfo(@typeInfo(Dispatch).pointer.child).@"fn".param_types;
+                var original_dispatch: Dispatch = undefined;
+                var observer: ?*@This() = null;
+                fn dispatch(a: Parameters[0].?, b: Parameters[1].?, c: Parameters[2].?, d: Parameters[3].?) callconv(.c) runtime.error_abi.Status {
+                    observer.?.foreign_calls += 1;
+                    return original_dispatch(a, b, c, d);
+                }
+            };
+            var fixture: Fixture = .{};
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-seed-maintenance-lifetime", .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.free } });
+            defer source.deinit();
+            var owner: Contract = .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .prepare_hot_standby_seed_snapshot_group_local = Fixture.legacy, .prepare_hot_standby_seed_snapshot_group_local_with_lifetime = Fixture.scoped } };
+            Fixture.original_dispatch = owner.boundary_dispatch;
+            Fixture.observer = &fixture;
+            defer Fixture.observer = null;
+            owner.boundary_dispatch = Fixture.dispatch;
+            source.local_write_source = owner;
+            const lifetime: runtime.runnable_abi.Reentry = .{ .context = &fixture, .check = Fixture.check };
+            fixture.expected = &lifetime;
+            try source.prepareHotStandbySeedReplicaSnapshotWithLifetime("docs", 7001, 1234, &lifetime);
+            try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            try std.testing.expectEqual(@as(usize, 1), fixture.foreign_calls);
+            try std.testing.expectEqual(@as(usize, 0), fixture.legacy_calls);
+            for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+                fixture.reject = cause;
+                try std.testing.expectError(cause, source.prepareHotStandbySeedReplicaSnapshotWithLifetime("docs", 7001, 1234, &lifetime));
+                try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+            }
+            fixture.reject = null;
+            fixture.expire_in_callback = true;
+            try std.testing.expectError(error.DeadlineExceeded, source.prepareHotStandbySeedReplicaSnapshotWithLifetime("docs", 7001, 1234, &lifetime));
+            try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+            fixture.reject = null;
+            fixture.expire_in_callback = false;
+            source.local_write_source.?.vtable = &.{ .batch = Fixture.batch, .prepare_hot_standby_seed_snapshot_group_local = Fixture.legacy };
+            try std.testing.expectError(error.ExecutionWaitUnsupported, source.prepareHotStandbySeedReplicaSnapshotWithLifetime("docs", 7001, 1234, &lifetime));
+            try std.testing.expectEqual(@as(usize, 0), fixture.legacy_calls);
+            try source.prepareHotStandbySeedReplicaSnapshot("docs", 7001, 1234);
+            try std.testing.expectEqual(@as(usize, 1), fixture.legacy_calls);
         }
 
         test "HA seed request admission drains accepted writes and closes the preflight race" {
@@ -62738,6 +62879,53 @@ fn implementationTests() type {
             try std.testing.expect(write_cache.entries.items[0].allow_generation_adoption);
             try std.testing.expectEqual(@as(usize, 2), write_cache.entries.items[0].active_leases);
             try std.testing.expectEqual(misses_before, write_cache.miss_count.load(.monotonic));
+        }
+
+        test "HA seed cache transition original lifetime unwinds every acquired fence" {
+            const runtime = @import("antfly_runtime_abi");
+            const Catalog = struct {
+                fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                    return error.UnexpectedCatalogCall;
+                }
+                fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+            };
+            const Check = struct {
+                calls: usize = 0,
+                fail_after: usize,
+                fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.calls += 1;
+                    if (self.calls >= self.fail_after) return runtime.error_abi.statusFromError(error.DeadlineExceeded);
+                    return .ok;
+                }
+            };
+            var first = ProvisionedTableWriteCache.init(std.testing.allocator);
+            defer first.deinit();
+            var second = ProvisionedTableWriteCache.init(std.testing.allocator);
+            defer second.deinit();
+            var source = ProvisionedTableWriteSource.init("/tmp/unused-seed-cache-transition", .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = Catalog.snapshot, .free_admin_snapshot = Catalog.free } });
+            defer source.deinit();
+            source.write_cache = &first;
+            source.startup_write_cache = &second;
+            for (1..11) |fail_after| {
+                var check: Check = .{ .fail_after = fail_after };
+                const original: runtime.runnable_abi.Reentry = .{ .context = &check, .check = Check.check };
+                try std.testing.expectError(error.DeadlineExceeded, ProvisionedTableWriteSource.WriteCacheTransitionLocks.initWithLifetime(&source, true, true, &original));
+                try std.testing.expect(first.open_mutex.tryLock());
+                first.unlockOpenMutex();
+                try std.testing.expect(second.open_mutex.tryLock());
+                second.unlockOpenMutex();
+                try std.testing.expect(source.local_db_mutex.tryLock());
+                source.local_db_mutex.unlock();
+                try std.testing.expect(first.entry_lifecycle_mutex.tryLock());
+                first.entry_lifecycle_mutex.unlock();
+                try std.testing.expect(second.entry_lifecycle_mutex.tryLock());
+                second.entry_lifecycle_mutex.unlock();
+            }
+            var success: Check = .{ .fail_after = std.math.maxInt(usize) };
+            const original: runtime.runnable_abi.Reentry = .{ .context = &success, .check = Check.check };
+            var locks = try ProvisionedTableWriteSource.WriteCacheTransitionLocks.initWithLifetime(&source, true, true, &original);
+            locks.deinit();
         }
 
         test "HA seed preflight drains writer released after promotion cache clear before capture freeze" {

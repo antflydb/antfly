@@ -5961,7 +5961,8 @@ pub fn storageOwnerMaintenance(
         },
         .prepare_ha_seed_snapshot => {
             if (request.deadline_ns == 0) return .invalid_argument;
-            handle.db.drainSnapshotMaintenance(request.deadline_ns) catch |err| {
+            const lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry = if (request.lifetime_check) |raw| @ptrCast(@alignCast(raw)) else null;
+            handle.db.drainSnapshotMaintenanceWithLifetime(request.deadline_ns, lifetime) catch |err| {
                 std.log.warn("storage owner HA seed preparation failed err={s}", .{@errorName(err)});
                 return storageOwnerStatusFromError(err);
             };
