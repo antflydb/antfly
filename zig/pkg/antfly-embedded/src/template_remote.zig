@@ -78,7 +78,9 @@ fn remoteByteBudget(remote_content: ?*const scraping.RemoteContentConfig) u64 {
         if (held.config.security) |security| security.max_download_size_bytes else null
     else
         null;
-    return @min(default_remote_fetch_max_download_size_bytes, configured orelse default_remote_fetch_max_download_size_bytes);
+    // An explicit operator setting may raise or lower the budget; the default
+    // applies only when nothing is configured.
+    return configured orelse default_remote_fetch_max_download_size_bytes;
 }
 
 test "template remote byte budget reads the reloadable config snapshot" {
