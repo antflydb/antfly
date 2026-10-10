@@ -92,6 +92,8 @@ pub const Scan = struct {
         upper: ?Bound = null,
         after: ?[]const u8 = null,
     };
+    pub const Search = struct { expression: ast.Search, request_text: ?[]const u8 = null, limit: ?u32 = null };
+    search: ?*const Search = null,
     /// A request, never proof. Providers explicitly attest the entire order.
     order: []const Order = &.{},
     /// Advisory SQL OFFSET + LIMIT for costing only. Never a scan stop bound.
@@ -300,12 +302,14 @@ pub const Ddl = union(enum) {
     policy_ddl: ast.PolicyDdl,
 };
 pub const DdlReceipt = struct {
+    pub const State = enum { ready, pending, invalid, admission_unknown };
+
     database: []const u8,
     namespace: []const u8,
     table: []const u8,
     table_id: []const u8,
     schema_version: u32,
-    state: enum { ready, pending, invalid, admission_unknown },
+    state: State,
     diagnostic: ?[]const u8 = null,
     restore_job_id: ?[]const u8 = null,
     idempotency_key: ?[]const u8 = null,
@@ -324,6 +328,7 @@ pub const AggregatePartialCursor = struct {
 };
 
 pub const Backend = struct {
+    supports_search_relations: bool = false,
     execution_io: ?std.Io = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,

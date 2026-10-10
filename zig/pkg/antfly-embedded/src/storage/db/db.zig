@@ -22126,7 +22126,13 @@ pub const DB = struct {
     }
 
     pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
-        return self.setSchemaJsonMode(alloc, schema_json, null);
+        return self.setSchemaJsonMode(alloc, schema_json, null, null);
+    }
+
+    /// SQL schema changes pin the version used by the pure DDL translator.
+    /// The prepared schema epoch is checked again at atomic publication.
+    pub fn compareAndSetSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8, expected_version: u32) !void {
+        return self.setSchemaJsonMode(alloc, schema_json, null, expected_version);
     }
 
     pub const PublishedChildSchema = struct {
@@ -22549,10 +22555,10 @@ pub const DB = struct {
         // old→new catalog comparison; the apply-locked check below still
         // closes the race with another entry.
         if (!publication.native and try self.orderedMutationAlreadyApplied(publication.ordered_receipt)) return;
-        return self.setSchemaJsonMode(alloc, schema_json, publication);
+        return self.setSchemaJsonMode(alloc, schema_json, publication, null);
     }
 
-    fn setSchemaJsonMode(self: *DB, alloc: Allocator, schema_json: []const u8, publication: ?PublishedChildSchema) !void {
+    fn setSchemaJsonMode(self: *DB, alloc: Allocator, schema_json: []const u8, publication: ?PublishedChildSchema, expected_version: ?u32) !void {
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
@@ -22640,6 +22646,8 @@ pub const DB = struct {
         }
         var prepared_schema = if (publication != null)
             try self.core.prepareSchemaMetadataPublishedChild(runtime_schema, schema_metadata_writes[0..schema_metadata_write_count])
+        else if (expected_version) |expected|
+            try self.core.prepareSchemaMetadataAtVersion(runtime_schema, schema_metadata_writes[0..schema_metadata_write_count], expected)
         else
             try self.core.prepareSchemaMetadata(runtime_schema, schema_metadata_writes[0..schema_metadata_write_count]);
         defer prepared_schema.deinit();
@@ -28951,6 +28959,9 @@ pub const DB = struct {
         cancellation: types.CancellationToken = .none,
         max_windows_per_index: usize = 0,
         deadline_ns: ?u64 = null,
+        /// Explicit idle calls drain all relational work. A borrowed writer
+        /// advances one fair page and returns its remaining debt to its owner.
+        drain_relational_indexes: bool = true,
         /// Run the foreground enrichment catch-up pass to full completion
         /// instead of bounding it at the request-visibility default
         /// (`sync_wait_timeout_ms`, 5 minutes). Only `runUntilIdle` sets
@@ -30194,6 +30205,51 @@ pub const DB = struct {
         return collected or validated;
     }
 
+    /// Foreground idle maintenance uses the same bounded, fair pages
+    /// as the native worker. A clean sweep, rather than one no-work slice,
+    /// proves that every current index has been considered.
+    pub fn runRelationalIndexMaintenanceUntilIdle(self: *DB, cancellation: types.CancellationToken, deadline_ns: ?u64) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        const sweep = &self.local_execution.relational_index_maintenance_sweep;
+        sweep.request();
+        var last_progress = platform_time.monotonicNs();
+        while (sweep.isPending()) {
+            try ensureSnapshotActive(cancellation);
+            const now = platform_time.monotonicNs();
+            if (deadline_ns) |deadline| if (now >= deadline) return error.DeadlineExceeded;
+            if (self.run_until_idle_no_progress_timeout_ns != 0 and now -| last_progress >= self.run_until_idle_no_progress_timeout_ns) return error.RunUntilIdleNoProgress;
+            if (try self.runRelationalIndexMaintenancePass()) {
+                last_progress = platform_time.monotonicNs();
+            } else if (sweep.isPending()) {
+                const io = self.backend_runtime.io() orelse return error.UnsupportedOperation;
+                try io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    }
+
+    /// Admission depends only on these index identities. Do not spend its
+    /// deadline on unrelated builds, CHECK validation, or index reclamation.
+    /// Each round gives every required building index one bounded page.
+    pub fn ensureRelationalIndexesReady(self: *DB, names: []const []const u8, cancellation: types.CancellationToken, deadline_ns: ?u64) !void {
+        if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        while (true) {
+            try ensureSnapshotActive(cancellation);
+            var pending = false;
+            for (names) |name| {
+                switch ((try self.relationalIndexBuildStatus(name)).state) {
+                    .ready => continue,
+                    .failed => return error.RelationalIndexNotReady,
+                    .building => {},
+                }
+                if (deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+                try ensureSnapshotActive(cancellation);
+                try self.buildRelationalIndexStep(name, .{});
+                pending = true;
+            }
+            if (!pending) return;
+        }
+    }
+
     pub fn runRelationalColumnMaintenancePass(self: *DB) !usize {
         const started = self.independentMaintenanceNowNs();
         // Artifact repair can keep the shared worker on its active cadence;
@@ -30404,6 +30460,12 @@ pub const DB = struct {
         try self.flushAppliedSequencesForIdle();
         try self.drainScheduledTextMerges();
         try self.runArtifactRepairMetadataMaintenanceUntilIdle();
+        if (options.drain_relational_indexes) {
+            try self.runRelationalIndexMaintenanceUntilIdle(options.cancellation, options.deadline_ns);
+        } else {
+            try ensureSnapshotActive(options.cancellation);
+            _ = try self.runRelationalIndexMaintenancePass();
+        }
         // Preserve the ordinary bounded maintenance pass at the lifecycle
         // boundary: besides posting repair it advances tree-link repair,
         // posting checkpoints, and quiescent vector-block publication.
@@ -30870,6 +30932,14 @@ pub const DB = struct {
         cancellation: types.CancellationToken,
     ) !void {
         try self.runUntilIdleWithReplayDrainOptions(.{ .cancellation = cancellation });
+    }
+
+    /// A Lite background turn borrows the file's writer lease. Return pending
+    /// relational debt after one page so its caller can release that lease
+    /// before another turn; explicit runUntilIdle still proves full coverage.
+    pub fn runBackgroundMaintenanceWithCancellation(self: *DB, cancellation: types.CancellationToken) !bool {
+        try self.runUntilIdleWithReplayDrainOptions(.{ .cancellation = cancellation, .drain_relational_indexes = false });
+        return self.local_execution.relational_index_maintenance_sweep.isPending();
     }
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
@@ -37949,6 +38019,19 @@ pub const DB = struct {
     pub const QueryReadLease = struct {
         db: *DB,
         row_policy_lease: row_policy_gate_mod.Gate.Lease,
+
+        /// Capture a primary typed reader under this lease's existing apply
+        /// fence. Do not recursively acquire the fence behind a queued writer.
+        pub fn relationalRows(self: *const QueryReadLease, alloc: Allocator, fields: []const []const u8, schema_version: u32) !RelationalRows.Reader {
+            var view = self.db.core.acquireSchemaView() orelse return error.RelationalTableRequired;
+            defer view.release();
+            var reader = try RelationalRows.Reader.open(alloc, self.db.core.store, view, null, .{
+                .fields = fields,
+                .expected_schema_version = schema_version,
+            }, currentTimeNs());
+            reader.row_policy_lease = self.row_policy_lease.clone();
+            return reader;
+        }
 
         pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
             const db = self.db;

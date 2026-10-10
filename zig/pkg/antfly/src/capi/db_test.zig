@@ -1701,6 +1701,59 @@ test "capi SQL local integrity refuses partial ownership instead of inventing co
     try std.testing.expect(try database.lookup(alloc, "k", .{}) == null);
 }
 
+fn sqlFkRecoveryStatement(handle: ?*anyopaque, statement: []const u8) !void {
+    const alloc = std.testing.allocator;
+    const request = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement }, .{});
+    defer alloc.free(request);
+    var response: capi.Buffer = .{};
+    const status = antfly_db_sql_json(handle, .fromSlice(request), &response);
+    defer freeRawBuffer(response.ptr, response.len);
+    if (status != .ok) std.debug.print("FK recovery SQL failure {s}: {s}\n", .{ statement, if (response.ptr) |ptr| ptr[0..response.len] else "" });
+    try std.testing.expectEqual(capi.ErrorCode.ok, status);
+}
+
+test "capi SQL FK publication recovers lost owner replies at every phase" {
+    const alloc = std.testing.allocator;
+    const fk = @import("antfly_local_sources").capi_sql_fk;
+    defer fk.interruptAfterPhaseForTest(null);
+    for (0..4) |operation| for (1..6) |phase| {
+        std.debug.print("FK recovery operation={d} phase={d}\n", .{ operation, phase });
+        var directory = try TestDirectory.init("capi-sql-fk-recovery");
+        defer directory.cleanup();
+        const path = try tempTestAflitePath(alloc, directory.path(), "database");
+        defer alloc.free(path);
+        defer cleanupTestFile(path);
+        var options: capi.OpenOptions = .{};
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&options));
+        options.storage_kind = capi.storage_kind_lite;
+        var handle: ?*anyopaque = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &options, &handle));
+        defer if (handle != null) antfly_db_close(handle);
+        try sqlFkRecoveryStatement(handle, "CREATE TABLE parents(n BIGINT PRIMARY KEY)");
+        try sqlFkRecoveryStatement(handle, "INSERT INTO parents(_id,n) VALUES ('p',1)");
+        if (operation != 0) {
+            try sqlFkRecoveryStatement(handle, if (operation == 1) "CREATE TABLE children(n BIGINT)" else "CREATE TABLE children(n BIGINT,CONSTRAINT fk FOREIGN KEY(n) REFERENCES parents(n))");
+            try sqlFkRecoveryStatement(handle, "INSERT INTO children(_id,n) VALUES ('c',1)");
+        }
+        fk.interruptAfterPhaseForTest(@intCast(phase));
+        try sqlFkRecoveryStatement(handle, switch (operation) {
+            0 => "CREATE TABLE children(n BIGINT,CONSTRAINT fk FOREIGN KEY(n) REFERENCES parents(n))",
+            1 => "ALTER TABLE children ADD CONSTRAINT fk FOREIGN KEY(n) REFERENCES parents(n)",
+            2 => "ALTER TABLE children DROP CONSTRAINT fk",
+            3 => "DROP TABLE children",
+            else => unreachable,
+        });
+        antfly_db_close(handle);
+        handle = null;
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &handle));
+        if (operation == 0 or operation == 1) {
+            try sqlFkRecoveryStatement(handle, "INSERT INTO children(_id,n) VALUES ('c2',1)");
+            try sqlFkRecoveryStatement(handle, "DROP TABLE children");
+        }
+        try sqlFkRecoveryStatement(handle, "DELETE FROM parents");
+    };
+}
+
 test "capi SQL RETURNING uses native defaults generated values and versioned preimages" {
     var directory = try TestDirectory.init("capi-sql-returning");
     defer directory.cleanup();
@@ -1753,6 +1806,45 @@ test "capi SQL RETURNING uses native defaults generated values and versioned pre
     try std.testing.expectEqual(@as(usize, 32), first.len);
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expectEqualStrings("5", generated_rows[0].array.items[1].string);
+}
+
+test "capi SQL relational search preserves typed nulls and exact JSON numbers" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-sql-search-typed");
+    defer directory.cleanup();
+    var database = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer database.close();
+    try database.setSchemaJson(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"body":{"type":"string"},"payload":{"type":"json","nullable":true}},"additionalProperties":false}}}}
+    );
+    try database.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    const sql = @import("antfly_local_sources").capi_sql;
+    var adapter = sql.Adapter(antfly){ .db = &database, .table_name = "rows" };
+    var inserted = try sql.compiler.compile(alloc,
+        \\INSERT INTO rows(_id,body,payload) VALUES ('a','alpha',NULL),('b','alpha',CAST('null' AS JSONB)),('c','alpha',CAST('{"amount":9007199254740993.0,"fraction":0.123456789012345678901}' AS JSONB))
+    , .{});
+    defer inserted.deinit();
+    var mutation = try sql.runtime.execute(alloc, adapter.backend(), &inserted, &.{}, .{});
+    defer mutation.deinit();
+    try database.runUntilIdle();
+    var scanned = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction' FROM rows ORDER BY _id", .{});
+    defer scanned.deinit();
+    var baseline = try sql.runtime.execute(alloc, adapter.backend(), &scanned, &.{}, .{});
+    defer baseline.deinit();
+    var searched = try sql.compiler.compile(alloc, "SELECT _id,payload,payload IS NULL,payload->>'amount',payload->>'fraction' FROM antfly_search('rows','body:alpha') ORDER BY _id", .{});
+    defer searched.deinit();
+    var hits = try sql.runtime.execute(alloc, adapter.backend(), &searched, &.{}, .{});
+    defer hits.deinit();
+    try std.testing.expectEqual(@as(usize, 3), hits.output.rows.len);
+    const expected = try std.json.Stringify.valueAlloc(alloc, .{ .rows = baseline.output.rows, .nulls = baseline.output.sql_nulls }, .{});
+    defer alloc.free(expected);
+    const actual = try std.json.Stringify.valueAlloc(alloc, .{ .rows = hits.output.rows, .nulls = hits.output.sql_nulls }, .{});
+    defer alloc.free(actual);
+    try std.testing.expectEqualStrings(expected, actual);
+    try std.testing.expect(hits.output.rows[0][2].bool);
+    try std.testing.expect(!hits.output.rows[1][2].bool);
+    try std.testing.expectEqualStrings("9007199254740993", hits.output.rows[2][3].string);
+    try std.testing.expectEqualStrings("0.123456789012345678901", hits.output.rows[2][4].string);
 }
 
 test "capi SQL uses native typed snapshots and atomic mutations" {

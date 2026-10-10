@@ -100,10 +100,13 @@ pub fn commit(handle: *h.Handle, requests: []const contract.TableCommitRequest, 
             .schema_version = request.schema_version,
             .relational_schema_version = request.relational_schema_version,
             .relational_integrity_generation_set = request.relational_integrity_generation_set,
+            .relational_repair = request.relational_repair,
             .writes = request.writes,
             .deletes = request.deletes,
             .predicates = request.predicates,
             .integrity_commands = request.integrity_commands,
+            .relational_activation = request.relational_activation,
+            .relational_retirement = request.relational_retirement,
         });
     }
     out_id.* = id;
