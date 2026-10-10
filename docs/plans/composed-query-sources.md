@@ -227,9 +227,10 @@ flat archive-sized retirement list. Reader admission remains fenced by durable
 snapshot pins. Destructive REST vacuum cannot use an exclusive-ownership assertion
 to bypass catalog coordination. Optional Nessie/Polaris controller integrations
 journal and delegate provider-owned maintenance, with explicit capability checks
-for writer fencing, external readers and the shared Antfly pin registry. Those are
-integration protocols; actual provider controller implementation and deployment
-remain required. See [external maintenance](../design/external-lake-maintenance.md).
+for writer fencing, external readers and the shared Antfly pin registry. The provider-side gateway/controller implements both integrations with conditional
+object-store authority, real catalog operations and local real-provider qualification.
+Production deployment must enforce private vendor credentials and external reader
+leases; archive-scale qualification remains. See [external maintenance](../design/external-lake-maintenance.md).
 
 Example policy (serialized as the Iceberg property value):
 

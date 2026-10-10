@@ -132,7 +132,11 @@ pub const Rest = struct {
         }
         const ns = try encode(a, namespace.items);
         defer a.free(ns);
-        const prefix = try encode(a, n.prefix);
+        // Nessie returns an already escaped prefix (main%7Cwarehouse).
+        // Canonicalize one escaping layer before constructing the path.
+        const prefix_bytes = try a.dupe(u8, n.prefix);
+        defer a.free(prefix_bytes);
+        const prefix = try encode(a, std.Uri.percentDecodeInPlace(prefix_bytes));
         defer a.free(prefix);
         const name = try encode(a, self.config.name.?);
         defer a.free(name);
@@ -468,4 +472,15 @@ fn durationMs(value: []const u8) !u64 {
     }
     if (start != value.len or total == 0) return error.InvalidLakeCatalog;
     return total;
+}
+
+test "lake catalog negotiated prefixes preserve vendor warehouse escaping" {
+    const a = std.testing.allocator;
+    const client: Rest = .{ .config = .{ .type = .rest, .connection = "catalog", .uri = "https://catalog.example", .namespace = &.{"items"}, .name = "archive" }, .transport = undefined };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const negotiated: Rest.Negotiated = .{ .arena = arena, .prefix = "main%7Cwarehouse", .endpoints = null, .idempotency_ms = null };
+    const uri = try client.endpoint(a, negotiated, false);
+    defer a.free(uri);
+    try std.testing.expectEqualStrings("https://catalog.example/v1/main%7Cwarehouse/namespaces/items/tables/archive", uri);
 }

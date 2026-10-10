@@ -13,14 +13,39 @@ it does not implement this controller protocol.
 
 ## Implementation status
 
-Antfly implements the client integration for both `nessie` and `polaris`: node
-connection authorization, origin restriction, capability negotiation, immutable
-object-store job journals, exact replay after restart, bounded/cancellable HTTP,
-and receipt binding to provider, operation, request and table incarnation.
-Focused tests exercise both adapters through a protocol fixture. This does **not**
-qualify a real Nessie or Polaris maintenance deployment. The provider-side
-controllers described below still need implementation, deployment and qualification.
-Destructive vacuum remains disabled without a suitable controller.
+Antfly implements the client integration and the provider-side gateway/controller
+for both `nessie` and `polaris`. The implementation lives in
+[`py/packages/lake-maintenance`](../../py/packages/lake-maintenance/README.md).
+Authority, write intents, immutable job plans, retirement records and receipts use
+conditional object storage. There is no separate SQLite state.
+
+Destructive external vacuum is available under the explicitly selected **enforced
+gateway contract**: vendor endpoints are private, only the gateway holds catalog
+write credentials, and external readers acquire leases through the gateway.
+Antfly readers retain their existing durable snapshot pins. The gateway validates
+proposed metadata against irreversible file retirement before forwarding commits.
+A configuration flag alone is insufficient: deployment networking and IAM must
+actually enforce these rules. Direct vendor writers or unleased object readers
+invalidate the contract and must not be enabled with destructive vacuum.
+
+The controller performs real Polaris snapshot-expiration commits and protects all
+catalog table roots. Nessie protects all reachable branch/tag and commit-history
+roots, then deletes unreferenced objects; shortening Nessie history remains a
+separate provider retention operation. Deletion targets exact S3 VersionIds or GCS
+generations. Orphan version inventory and per-version progress ensure deletion
+does not leave an older version visible or skip it after restart. S3 versioning must remain enabled and its administrative permission
+must be denied to data clients. Unknown provider-write outcomes remain fenced;
+a positive durable commit marker permits recovery.
+
+Local qualification exercises official Nessie 0.109.0 and Polaris 1.7.0 against
+versioned RustFS storage, including retained reads, writer exclusion during
+vacuum, native HTTP restart/replay, lost commit responses, replacement-version survival,
+native pins racing retirement, and DNS/IP isolation on an internal backend network.
+This is local real-provider qualification, not a production deployment or
+full-archive performance qualification. The package documents bounded traversal,
+unsupported mutations, uncertain reference-change recovery, private deployment
+configuration and the lease-aware Python catalog client. GCS requires separate
+real-cloud qualification.
 
 ## Configuration
 
@@ -127,36 +152,56 @@ insufficient. Unsupported guarantees must reject deletion.
 
 ## Nessie controller
 
-Nessie maintenance must retain all relevant catalog branches, tags and historical
-content references. A single Iceberg REST branch's current metadata is incomplete.
-Use Nessie's maintained GC tooling for provider root discovery, with durable
-live-content sets and separate mark, deferred sweep and deletion phases. Antfly
-reader roots must be included before sweep and revalidated before deletion.
-Catalog-wide coordination must cover all writers, and persisted job state must
-retain the live-set identity across restart. The standard GC CLI alone does not
-supply Antfly's reader admission or irreversible writer fence.
+The controller enumerates native Nessie v2 references and paginated commit history
+at immutable reference hashes. It retains every reachable Iceberg metadata root,
+including branches, tags and historical PUT content. This conservative policy does
+not shorten Nessie commit history. Native reference changes validate the complete
+source tree against retired URIs before reaching the vendor. Unknown content types
+fail closed. Real qualification covers branch creation/root retention and v2
+pagination, including the provider's actual detached-reference and content syntax.
 
-See [Nessie management](https://projectnessie.org/guides/management/) and
-[GC sweep options](https://projectnessie.org/nessie-latest/generated-docs/gc-help-sweep/).
+Nessie's GC tooling can provide a future bounded historical live set, but its
+standard CLI alone does not integrate Antfly's leases or irreversible writer
+fence. Introducing a shorter history cutoff requires equivalent protection for
+external readers and native historical pins.
+
+See [Nessie REST API](https://projectnessie.org/develop/rest/) and
+[Nessie management](https://projectnessie.org/guides/management/).
 
 ## Polaris controller
 
-Polaris maintenance must use the actual catalog's complete Iceberg snapshot and
-named-ref roots and its authorized file access. Table snapshot expiration and
-orphan-file removal are distinct from Polaris persistence-store maintenance.
-An Iceberg/Spark maintenance job can execute the table operations, but the
-controller still must establish writer coordination, integrate external and
-Antfly readers, enforce retention and own the durable job/receipt lifecycle.
-Do not treat a Polaris metadata-store compaction CronJob as table-file GC.
+The controller enumerates namespaces and tables with pagination, retains complete
+current snapshot/named-ref roots and protected historical reader roots, and expires
+eligible snapshots through actual Iceberg REST requirements and updates. It marks
+metadata, manifest lists, manifests, live data/delete entries and statistics files
+before selecting old orphan object versions. Polaris persistence-store compaction
+is unrelated to this table-file vacuum.
+
+Polaris OAuth client credentials are exchanged and refreshed inside the gateway.
+Vendor tokens, data signers and upstream idempotency promises are not advertised
+through the public gateway. External clients use their own scoped data identity and
+the lease-aware catalog client; native Antfly uses its durable pin protocol.
 
 See [Polaris documentation](https://polaris.apache.org/releases/1.7.0/) and
 [Iceberg maintenance](https://iceberg.apache.org/docs/latest/maintenance/).
 
-## Qualification still required
+## Qualification and deployment scope
 
-Each provider controller needs real tests for racing external commits, active
-external readers, Antfly admission races, branch/tag preservation, a lost job
-acknowledgement, restart between sweep and deletion, shared data/delete files,
-and receipt replay after table replacement. No provider may enable physical
-deletion until these guarantees hold. Provider controllers are not automatically
-provisioned by table creation.
+Local real-provider qualification passes 33 tests with four provider-specific
+skips, against Nessie 0.109.0, Polaris 1.7.0 and versioned RustFS. It covers actual
+native Antfly HTTP delegation and daemon restart, multi-turn owner replacement,
+exact receipts after metadata advancement, writer exclusion, external reader
+retention, lost commit responses, native admission/retirement races, revoked
+planner epochs, retired-file resurrection rejection, branch roots, pagination,
+and independently journaled orphan versions. A separate Docker qualification
+confirms both gateway endpoints are reachable while vendor/object administration
+is inaccessible from the client network by DNS **and IP**.
+
+The fixture advances the controller clock for retention tests; native pin race
+fixtures use that same clock. This does not qualify production clock skew, cloud
+IAM or real GCS deletion. Shared-file/delete-file combinations, larger catalogs,
+production deployment and full-archive performance need additional qualification.
+Unsupported mutations and exceeded inventory/metadata bounds fail closed. Retain
+all Nessie commit-history roots until an equally protected provider history
+retention integration is configured. Table creation never automatically provisions
+the external catalog, gateway, private network or provider identities.

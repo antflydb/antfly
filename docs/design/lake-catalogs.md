@@ -159,8 +159,9 @@ establish deletion authority. The optional provider controller integration deleg
 physical deletion to a separately authorized maintenance service. Both Nessie and
 Polaris protocol adapters validate provider-specific root capabilities and journal
 an exact job before submitting it. A standard vendor REST endpoint alone does not
-implement this maintenance protocol. Controller implementations/deployment and real
-vendor qualification remain outstanding. See [configuration, required guarantees
+implement this maintenance protocol. Provider controllers and local real-vendor qualification are implemented under
+the enforced private gateway and reader-lease contract. Production deployment and
+archive-scale qualification remain. See [configuration, required guarantees
 and provider-specific work](external-lake-maintenance.md).
 
 ## Boundaries and next layers

@@ -1,0 +1,65 @@
+# Local qualification only. Production catalogs need durable vendor databases,
+# restricted object identities and TLS at the gateway. No vendor port is published.
+services:
+  s3:
+    container_name: antfly-maintenance-s3
+    image: rustfs/rustfs:1.0.0-alpha.81
+    environment:
+      RUSTFS_ACCESS_KEY: antfly_qualification
+      RUSTFS_SECRET_KEY: antfly_qualification_secret
+    networks: [backend]
+    mem_limit: 1g
+    cpus: 2
+  nessie:
+    container_name: antfly-maintenance-nessie
+    image: ghcr.io/projectnessie/nessie:0.109.0
+    environment:
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: warehouse
+      NESSIE_CATALOG_WAREHOUSES_WAREHOUSE_LOCATION: s3://warehouse/nessie
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: http://s3:9000
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_EXTERNAL_ENDPOINT: http://s3:9000
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: us-west-2
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: 'true'
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY: urn:nessie-secret:quarkus:qualification.s3
+      QUALIFICATION_S3_NAME: antfly_qualification
+      QUALIFICATION_S3_SECRET: antfly_qualification_secret
+    networks: [backend]
+    mem_limit: 2g
+    cpus: 2
+  polaris:
+    container_name: antfly-maintenance-polaris
+    image: apache/polaris:1.7.0
+    environment:
+      POLARIS_BOOTSTRAP_CREDENTIALS: POLARIS,root,qualification_only
+      POLARIS_REALM_CONTEXT_REALMS: POLARIS
+      AWS_ACCESS_KEY_ID: antfly_qualification
+      AWS_SECRET_ACCESS_KEY: antfly_qualification_secret
+      AWS_REGION: us-west-2
+      OTEL_SDK_DISABLED: 'true'
+    networks: [backend]
+    mem_limit: 2g
+    cpus: 2
+  gateway:
+    build: ..
+    volumes:
+      - ${ANTFLY_CONTROLLER_CONFIG:?set an absolute controller config path}:/config/controller.json:ro
+    env_file: ${ANTFLY_CONTROLLER_ENV:?set an absolute secret env file path}
+    networks: [backend, clients]
+    ports: ['127.0.0.1:8089:8089']
+    mem_limit: 1g
+    cpus: 2
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+  network-probe:
+    image: python:3.12-slim
+    profiles: [qualification]
+    networks: [clients]
+    environment:
+      PRIVATE_TARGETS: ${ANTFLY_PRIVATE_TARGETS:?set JSON pairs of private vendor/object IPs and ports}
+    command: [python, -c, "import json,os,socket; targets=json.loads(os.environ['PRIVATE_TARGETS']); assert len(targets)>=3; targets+=[('nessie',19120),('polaris',8181),('s3',9000)]; bad=[]; exec('for h,p in targets:\n try:\n  socket.create_connection((h,p),2).close(); bad.append(h)\n except OSError: pass'); assert not bad,bad; socket.create_connection(('gateway',8089),5).close(); print('gateway reachable; vendor catalogs and object administration isolated')"]
+networks:
+  backend:
+    internal: true
+  clients: {}
