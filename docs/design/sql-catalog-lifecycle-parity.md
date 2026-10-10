@@ -134,9 +134,12 @@ Distributed owner/failover qualification and the larger pools remain open.
   The reference statements are loaded from the frozen original inventory.
 - Formatting, new Python lint, inventory integrity and the 1,991-file Apache
   source boundary pass. Original dispositions remain 478 / 136 / 73 / 899.
-- Final current-source debug SQL validation and the server-side
-  `antfly-sql-index-ddl-test` are still running; their completion is not claimed.
-  An earlier broad, pre-change API build was retired, not counted as passing.
+- Full debug `zig build sql-test`: 17/17 steps, 691 local tests passed with
+  three deliberate benchmark skips, and all 226 native tests passed, with no
+  failures or leaks.
+- The server-side `antfly-sql-index-ddl-test` is still compiling; its completion
+  is not claimed. An earlier broad, pre-change API build was retired, not
+  counted as passing.
 
 The next delivery is mounted catalog activation/recovery evidence for the
 original index and constraint cohort, including real ownership and readiness
