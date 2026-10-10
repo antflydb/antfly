@@ -1450,3 +1450,31 @@ queued in `antfly-mutation-service-admission-test` and
 `antfly-local-commit-control-test`, not yet production qualification. The full
 storage/ABI integration, real overload/resource/performance matrix and automatic
 defaults remain unqualified.
+
+Active write completion can now create independently scheduled children from a
+quiescent, single-slot parent. Children inherit the already accepted finite
+completion authority, class and original clock; they cannot reserve a new
+completion/cleanup fence or promote capacity. The validated child factory may
+continue that bounded completion family after scheduler close, while new roots
+remain rejected. Operation and byte partitions still apply before publication,
+and every child must physically retire before its parent finishes. Cleanup
+roots and inactive completion authority remain outside this child capability.
+The write-completion bridge exposes this factory through the existing child ABI;
+a wider whole team must first shrink to its coordinator slot.
+
+Child creation also preserves an implicit parent Io clock explicitly before
+installing the independent worker Io. Both foreground and completion children
+therefore keep the original deadline domain, including when worker clocks differ.
+Completion options retain the child's charged bytes and worker lane without
+refreshing its inherited deadline.
+
+All 52 native scheduler tests, shared admission/lock/snapshot adapters, native
+text regressions and 8 write-team bridge tests passed: 121 native tests within
+the declared compiler bounds. Tests cover close, original foreground expiry,
+finite completion expiry, operation/byte exhaustion, denied wider-team receiver
+retirement, cleanup/extension rejection, original clocks and final zero ownership.
+Pinned Nix/glibc Linux and cumulative physical storage/ABI validation are queued
+for this revision. Participant fanout still needs independently owned children,
+per-call group control transport and mandatory joins; shared coordinator borrows
+must not be forwarded into concurrent workers. Broad wait/body coverage, real
+resource/overload/performance gates and automatic defaults remain unfinished.

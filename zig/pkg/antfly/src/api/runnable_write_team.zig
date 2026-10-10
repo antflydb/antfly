@@ -90,7 +90,15 @@ pub const Completion = struct {
         value.borrow.checkpoint = check;
         value.borrow.park = park;
         value.borrow.enter = enter;
+        value.borrow.reserve_child = reserveChild;
         return value;
+    }
+
+    fn reserveChild(raw: *anyopaque, options: *const runtime.runnable_abi.ChildStart) callconv(.c) runtime.error_abi.Status {
+        const self = from(raw);
+        self.active() catch |err| return runtime.error_abi.statusFromError(err);
+        @import("runnable_local_child.zig").reserve(self.execution, self.allocator, options) catch |err| return runtime.error_abi.statusFromError(err);
+        return .ok;
     }
 
     fn from(raw: *anyopaque) *Completion {

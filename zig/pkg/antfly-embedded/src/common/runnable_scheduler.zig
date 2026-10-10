@@ -267,7 +267,7 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         if (e.parent != null) return error.InvalidRunnableTransition;
-        try self.submitLocked(e, now);
+        try self.submitLocked(e, now, false);
     }
 
     /// Reserve a child before publishing its task. Each child uses the same
@@ -279,25 +279,34 @@ pub const Scheduler = struct {
         const now = parent.options.now();
         self.lock();
         defer self.mutex.unlock();
-        if (parent == child or parent.scheduler != self or parent.state != .running or parent.retainedPhase() or
+        if (parent == child or parent.scheduler != self or parent.state != .running or parent.cleanup_active or parent.protected_cleanup_root or
             child.state != .fresh or child.scheduler != null or child.parent != null or child.children != 0 or parent.slots != 1) return error.InvalidRunnableTransition;
         try self.checkAncestorsLocked(parent);
         if (child.bytes < @sizeOf(Entry)) return error.InvalidRunnableDemand;
         child.options = parent.options;
+        // An implicit owner clock belongs to the parent Io, not to the
+        // independently supplied worker lane. Preserve that clock explicitly.
+        child.options.clock_io = parent.options.clock_io orelse parent.options.io;
         child.options.io = io;
         child.options.retained_bytes = child.bytes;
         child.class = parent.class;
         child.slots = 1;
-        try self.submitLocked(child, now);
+        // Accepted completion is inherited, never reserved or extended by the
+        // child. The parent and its original clock live through every join.
+        child.completion_options = if (parent.completion_active) child.options else null;
+        child.completion_active = parent.completion_active;
+        try self.submitLocked(child, now, parent.completion_active);
         child.parent = parent;
         parent.children += 1;
         self.metrics.child_operations += 1;
     }
 
-    fn submitLocked(self: *Scheduler, e: *Entry, now: u64) !void {
+    fn submitLocked(self: *Scheduler, e: *Entry, now: u64, completion_child: bool) !void {
         if (e.state != .fresh or e.scheduler != null) return error.InvalidRunnableTransition;
         const capacity = self.capacityFor(e, e.class);
-        if (self.closed) return error.SchedulerClosed;
+        // Only the validated child factory can extend an already accepted
+        // completion family after close. New roots remain fenced out.
+        if (self.closed and !completion_child) return error.SchedulerClosed;
         if (e.slots == 0 or e.slots > capacity) return error.InvalidRunnableDemand;
         const control = e.class == .control;
         const control_count = @min(@as(usize, 4), self.config.max_operations / 2);
@@ -2565,7 +2574,7 @@ test "runnable scheduler children inherit original deadline cancellation and sto
     }
 }
 
-test "runnable scheduler children do not inherit completion cleanup or capacity promotion" {
+test "runnable scheduler children do not inherit inactive completion cleanup or capacity promotion" {
     var owner = try Scheduler.init(.{ .slots = 4 });
     defer owner.close();
     var parent: Execution = .{};
@@ -2587,9 +2596,20 @@ test "runnable scheduler children do not inherit completion cleanup or capacity 
     try std.testing.expectError(error.InvalidRunnableTransition, child.enter(.control));
     child.finish();
     try parent.activateCompletion();
+    try child.startChild(&parent, std.testing.io, @sizeOf(Execution));
+    try std.testing.expect(child.entry.?.completion_active);
+    try std.testing.expect(child.entry.?.cleanup_options == null);
+    try std.testing.expectError(error.InvalidRunnableTransition, child.reserveCompletion(.{ .io = std.testing.io, .deadline_ns = until + 1 }));
+    try std.testing.expectError(error.InvalidRunnableTransition, child.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = until + 1 }));
+    child.finish();
+    var cleanup: Execution = .{};
+    defer cleanup.finish();
+    try cleanup.start(&owner, .{ .io = std.testing.io }, .write);
+    try cleanup.reserveCleanup(.{ .io = std.testing.io, .deadline_ns = until });
+    try cleanup.activateCleanup();
     var denied: Execution = .{};
     defer denied.finish();
-    try std.testing.expectError(error.InvalidRunnableTransition, denied.startChild(&parent, std.testing.io, @sizeOf(Execution)));
+    try std.testing.expectError(error.InvalidRunnableTransition, denied.startChild(&cleanup, std.testing.io, @sizeOf(Execution)));
     try std.testing.expect(denied.entry == null);
 }
 
@@ -2769,4 +2789,140 @@ test "runnable scheduler managed cleanup capacity rejects insufficient metadata 
     try std.testing.expectEqual(@as(usize, 3), policy.slots);
     try std.testing.expectEqual(@as(usize, 1), policy.ordinarySlots());
     try std.testing.expectEqual(@as(usize, 1), policy.cleanup_slots);
+}
+
+test "runnable scheduler completion child inherits finite authority through close and retirement" {
+    const std_test = @import("std");
+    const Clock = struct {
+        var foreground: u64 = 0;
+        var completion: u64 = 0;
+        fn original() u64 {
+            return foreground;
+        }
+        fn retained() u64 {
+            return completion;
+        }
+        fn canceled(raw: *const anyopaque) bool {
+            const flag: *const std_test.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+            return flag.load(.acquire);
+        }
+    };
+    for ([_]bool{ false, true }) |close_before_child| {
+        Clock.foreground = 0;
+        Clock.completion = 0;
+        var scheduler = try Scheduler.init(.{ .slots = 3, .control_slots = 1 });
+        defer scheduler.close();
+        var parent: Execution = .{};
+        defer parent.finish();
+        var child: Execution = .{};
+        defer child.finish();
+        var flag = std_test.atomic.Value(bool).init(false);
+        try parent.start(&scheduler, .{ .io = std_test.testing.io, .native_now_ns = Clock.original, .deadline_ns = 5, .retained_bytes = 256, .cancellation = .{ .ptr = &flag, .requested = Clock.canceled } }, .write);
+        try parent.reserveCompletion(.{ .io = std_test.testing.io, .native_now_ns = Clock.retained, .deadline_ns = 20 });
+        try parent.activateCompletion();
+        Clock.foreground = 100;
+        flag.store(true, .release);
+        if (close_before_child) scheduler.close();
+        try child.reserveChild(&parent, std_test.testing.io, @sizeOf(Execution));
+        try std_test.testing.expect(child.entry.?.completion_active);
+        try std_test.testing.expectEqual(@as(?u64, 20), child.entry.?.options.deadline_ns);
+        try std_test.testing.expectEqual(@as(usize, 2), scheduler.stats().operations);
+        try std_test.testing.expectEqual(@as(u64, 256 + @sizeOf(Execution)), scheduler.stats().retained_bytes);
+        try child.activateChild();
+        try child.checkLifetime();
+        try child.park(.resource_blocked);
+        try std_test.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+        try child.enter(.write);
+        try std_test.testing.expectError(error.InvalidRunnableTransition, child.enter(.query));
+        if (close_before_child) {
+            var fresh: Execution = .{};
+            defer fresh.finish();
+            try std_test.testing.expectError(error.SchedulerClosed, fresh.start(&scheduler, .{ .io = std_test.testing.io }, .query));
+        }
+        Clock.completion = 20;
+        try std_test.testing.expectError(error.DeadlineExceeded, child.checkLifetime());
+        child.finish();
+        try std_test.testing.expectEqual(@as(usize, 0), parent.entry.?.children);
+        parent.finish();
+        try std_test.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std_test.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std_test.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "runnable scheduler completion child remains bounded by original operation and byte partitions" {
+    const std_test = @import("std");
+    const Clock = struct {
+        fn now() u64 {
+            return 0;
+        }
+    };
+    for ([_]bool{ false, true }) |byte_limit| {
+        var scheduler = try Scheduler.init(.{ .slots = 3, .control_slots = 1, .max_operations = if (byte_limit) 16 else 4, .max_bytes = 8192, .control_bytes = 4096 });
+        defer scheduler.close();
+        var parent: Execution = .{};
+        defer parent.finish();
+        var first: Execution = .{};
+        defer first.finish();
+        var denied: Execution = .{};
+        defer denied.finish();
+        try parent.start(&scheduler, .{ .io = std_test.testing.io, .native_now_ns = Clock.now, .retained_bytes = 256 }, .write);
+        try parent.reserveCompletion(.{ .io = std_test.testing.io, .native_now_ns = Clock.now, .deadline_ns = 20 });
+        try parent.activateCompletion();
+        scheduler.close();
+        try first.reserveChild(&parent, std_test.testing.io, @sizeOf(Execution));
+        const before = scheduler.stats();
+        try std_test.testing.expectError(error.SchedulerFull, denied.reserveChild(&parent, std_test.testing.io, if (byte_limit) 4096 else @sizeOf(Execution)));
+        const after = scheduler.stats();
+        try std_test.testing.expectEqual(before.operations, after.operations);
+        try std_test.testing.expectEqual(before.retained_bytes, after.retained_bytes);
+        try std_test.testing.expectEqual(@as(usize, 1), parent.entry.?.children);
+        try std_test.testing.expect(denied.entry == null);
+        first.finish();
+        parent.finish();
+        try std_test.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std_test.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "runnable scheduler completion child preserves implicit parent clock on independent worker Io" {
+    const std_test = @import("std");
+    const Clock = struct {
+        var current: i96 = 10;
+        fn now(_: ?*anyopaque, _: std_test.Io.Clock) std_test.Io.Timestamp {
+            return .{ .nanoseconds = current };
+        }
+    };
+    var vtable = std_test.testing.io.vtable.*;
+    vtable.now = Clock.now;
+    const original_io: std_test.Io = .{ .userdata = std_test.testing.io.userdata, .vtable = &vtable };
+    for ([_]bool{ false, true }) |completing| {
+        Clock.current = 10;
+        var scheduler = try Scheduler.init(.{ .slots = 3, .control_slots = 1 });
+        defer scheduler.close();
+        var parent: Execution = .{};
+        defer parent.finish();
+        var child: Execution = .{};
+        defer child.finish();
+        try parent.start(&scheduler, .{ .io = original_io, .deadline_ns = 20, .retained_bytes = 256 }, .write);
+        if (completing) {
+            try parent.reserveCompletion(.{ .io = original_io, .deadline_ns = 30 });
+            try parent.activateCompletion();
+        }
+        try child.reserveChild(&parent, std_test.testing.io, @sizeOf(Execution));
+        try child.activateChild();
+        try child.checkLifetime();
+        try std_test.testing.expectEqual(@as(u64, 10), child.entry.?.options.now());
+        try std_test.testing.expectEqual(@as(u64, @sizeOf(Execution)), child.entry.?.options.retained_bytes);
+        if (completing) {
+            try std_test.testing.expectEqual(@as(u64, 20), try child.completionRemainingNs());
+            try std_test.testing.expectEqual(@as(u64, @sizeOf(Execution)), child.entry.?.completion_options.?.retained_bytes);
+        }
+        Clock.current = if (completing) 30 else 20;
+        try std_test.testing.expectError(error.DeadlineExceeded, child.checkLifetime());
+        child.finish();
+        parent.finish();
+        try std_test.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std_test.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
 }

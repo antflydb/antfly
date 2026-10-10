@@ -246,3 +246,51 @@ test "SQL write team remaining completion budget preserves the independent Io cl
     try std.testing.expectEqual(@as(usize, 1), owner.stats().operations);
     try std.testing.expectEqual(@as(usize, 1), owner.stats().runnable_slots);
 }
+
+test "SQL write team completion child uses independent bounded receiver and original completion deadline" {
+    Clock.current = 0;
+    defer Clock.current = 0;
+    const io = std.testing.io;
+    const io_borrow = runtime.native_abi.IoBorrow.init(&io);
+    var owner = try scheduler.Scheduler.init(.{ .slots = 3, .control_slots = 1 });
+    defer owner.close();
+    var memory: allocation.Shared = .{ .child = std.testing.allocator, .limit = 16384 };
+    var execution: scheduler.Execution = .{};
+    defer execution.finish();
+    try execution.start(&owner, .{ .io = io, .native_now_ns = Clock.now, .deadline_ns = 5, .retained_bytes = 256 }, .write);
+    var bridge = try writes.Completion.init(&execution, memory.allocator());
+    var team = try bridge.team();
+    var child: runtime.runnable_abi.Child = undefined;
+    const options: runtime.runnable_abi.ChildStart = .{ .io = &io_borrow, .retained_bytes = 17, .out_child = &child };
+    try std.testing.expectError(error.ExecutionWaitUnsupported, team.borrow.reserveChild(&options));
+    try std.testing.expectEqual(@as(usize, 0), memory.used.load(.acquire));
+    try team.borrow.reserveCompletion(&.{ .io = &io_borrow, .native_deadline = 1, .deadline_ns = 20 });
+    try team.borrow.activateCompletion();
+    // A whole team must shrink to its coordinator slot before independent
+    // children are published. Denial releases the allocated receiver exactly.
+    try team.borrow.resizeTeam(2);
+    try std.testing.expectError(error.InvalidRunnableTransition, team.borrow.reserveChild(&options));
+    try std.testing.expectEqual(@as(usize, 0), memory.used.load(.acquire));
+    try team.borrow.resizeTeam(1);
+    Clock.current = 6;
+    owner.close();
+    try team.borrow.reserveChild(&options);
+    var child_active = true;
+    defer if (child_active) child.deinit();
+    try std.testing.expect(memory.used.load(.acquire) > 0);
+    try std.testing.expectEqual(@as(usize, 2), owner.stats().operations);
+    try child.activate();
+    try child.borrow.checkLifetime();
+    try checked(child.borrow.park(child.borrow.context, @backingInt(runtime.runnable_abi.Wait.resource)));
+    try std.testing.expectEqual(@as(usize, 1), owner.stats().runnable_slots);
+    try checked(child.borrow.enter(child.borrow.context, @backingInt(runtime.runnable_abi.Class.write)));
+    Clock.current = 20;
+    try std.testing.expectError(error.DeadlineExceeded, child.borrow.checkLifetime());
+    child.deinit();
+    child_active = false;
+    try std.testing.expectEqual(@as(usize, 0), memory.used.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), execution.entry.?.children);
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), owner.stats().retained_bytes);
+}

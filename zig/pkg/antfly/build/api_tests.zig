@@ -2391,7 +2391,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const controlled_service_lock_tests = b.addTest(.{
         .name = "controlled-service-lock-tests",
         .root_module = controlled_service_lock_root,
-        .filters = &.{ "controlled apply lock", "controlled text analysis acquisition", "apply rw lock", "snapshot admission", "mutation admission controls", "mutation apply admission" },
+        .filters = &.{ "controlled apply lock", "controlled text analysis acquisition", "apply rw lock", "snapshot admission", "mutation admission controls", "mutation apply admission", "runnable scheduler", "runnable execution", "runnable fail-fast" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-controlled-service-lock-test", "Verify service lock waits release CPU and preserve original lifetime and lock ownership")
