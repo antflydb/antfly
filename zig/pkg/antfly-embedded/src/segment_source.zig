@@ -715,7 +715,13 @@ pub const ConcurrentBlockCache = struct {
             };
             self.fill_mutex.unlock();
             try self.checkWaiting();
-            if (io) |runtime_io| try self.changed.wait(runtime_io, &self.wait_mutex) else std.Thread.yield() catch {};
+            if (io) |runtime_io| {
+                try self.changed.wait(runtime_io, &self.wait_mutex);
+            } else if (@import("builtin").single_threaded) {
+                // No other thread can release a flight while we wait. Keep
+                // bounded admission explicit instead of spinning forever.
+                return error.CacheBudgetExceeded;
+            } else std.Thread.yield() catch {};
         }
     }
     fn releaseFlight(self: *ConcurrentBlockCache, flight: *Flight) void {
