@@ -5243,6 +5243,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     }));
     antfly_imports.configureRuntimeContracts(vector_payload_test_mod);
+    vector_payload_test_mod.addImport("runtime_memory_abi", antfly_imports.storage_boundary.memory);
     vector_payload_test_mod.addImport("bloom", bloom_mod);
     vector_payload_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     vector_payload_test_mod.addImport("antfly-json", json_mod);

@@ -1899,3 +1899,31 @@ native artifact repair scans/publication, provider work quanta, mandatory native
 close/cleanup CPU, file/WAL capture completion, independent archive/API/DB/CLI
 compatibility, physical resource/performance and automatic default gates remain
 open. The focused compiler/container bounds do not qualify runtime envelopes.
+
+### Original lifetime during source-vector maintenance marking
+
+Native HA maintenance carries the same borrowed lifetime through enrichment and
+visibility stabilization into artifact repair. Source-vector marking checks it
+for each locator, primary ownership row, ANN row/WAL record, verification item
+and segment-planning row. Initial source mutex admission and DB exclusive apply
+admission poll the original lifetime using the existing backend Io. Rejection
+while a scan is outside the mutex rejoins its owned scanner, resets its running
+state and releases immutable snapshots before returning the original cause.
+It does not leave a canceled cut available for garbage publication.
+
+The physical source-vector fixture uses the real source store, memory-backed
+primary and payload references. It rejects actual initial mutex contention and
+mid-scan cancellation, deadline and scheduler closure after observable progress;
+then verifies intact committed values and successful reuse. The focused source
+suite passes 81 checks and the direct custom test binary exits zero despite its
+expected-error runner diagnostic. The focused target now imports its required
+memory ABI. These tests instantiate no DB/server and do not qualify the full
+native capture path or independent compiled archives.
+
+CPU remains retained under the existing dependency graph. Mandatory scanner
+rejoin and lease destruction use the existing cleanup path. Reader construction,
+collection planning/sort, metadata rebuild and publication still need bounded
+quanta and cleanup CPU authority; coarse stage checks do not bound their internals.
+The source cursor's backend construction/seek also needs complete admission
+transport. The cumulative integration run and runtime resource, performance and
+automatic default gates remain open.

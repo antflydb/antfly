@@ -26,6 +26,7 @@ const vector_block = @import("antfly_vectorindex").vector_block;
 const Allocator = std.mem.Allocator;
 const resources = @import("resource_manager.zig");
 const time = @import("antfly_platform").time;
+const original_lifetime = @import("../common/seed_snapshot_lifetime.zig");
 const LiveSet = @import("source_vector_live_set.zig").LiveSet;
 const generation_publication = @import("generation_publication.zig");
 
@@ -869,12 +870,14 @@ pub const Store = struct {
         }
     }
 
-    fn scanMarking(marking: *Marking, started: u64, budget_ns: u64, limit: usize, allow_verification: bool, progress: *ScanProgress) !void {
+    fn scanMarking(marking: *Marking, started: u64, budget_ns: u64, limit: usize, allow_verification: bool, progress: *ScanProgress, lifetime: ?*const original_lifetime.Control) !void {
         while (marking.live.locatorPending()) {
+            try original_lifetime.checkpoint(lifetime);
             if (markBudgetExpired(started, budget_ns, limit, progress)) return;
             if (try marking.live.advanceLocator()) progress.rows += 1;
         }
         while (!marking.primary_done) {
+            try original_lifetime.checkpoint(lifetime);
             if (markBudgetExpired(started, budget_ns, limit, progress)) return;
             const entry = if (!marking.started)
                 (if (marking.indexed) try marking.cursor.seekAtOrAfter(payload.ownership_prefix) else try marking.cursor.first())
@@ -903,6 +906,7 @@ pub const Store = struct {
             while (marking.ann_reader < ann.readers.len) {
                 const reader = ann.readers[marking.ann_reader];
                 while (marking.ann_row < reader.count) : (marking.ann_row += 1) {
+                    try original_lifetime.checkpoint(lifetime);
                     if (markBudgetExpired(started, budget_ns, limit, progress)) return;
                     progress.rows += 1;
                     const row = reader.sourceIdentityAt(marking.ann_row);
@@ -912,6 +916,7 @@ pub const Store = struct {
                 marking.ann_reader += 1;
             }
             while (marking.ann_wal < ann.wal.records.items.len) : (marking.ann_wal += 1) {
+                try original_lifetime.checkpoint(lifetime);
                 if (markBudgetExpired(started, budget_ns, limit, progress)) return;
                 progress.rows += 1;
                 const record = ann.wal.records.items[marking.ann_wal];
@@ -921,6 +926,7 @@ pub const Store = struct {
         if (marking.cost_policy or (allow_verification and marking.live.count() == marking.retained_at_cut)) {
             if (marking.verification == null) marking.verification = marking.live.iterator();
             while (true) {
+                try original_lifetime.checkpoint(lifetime);
                 if (markBudgetExpired(started, budget_ns, limit, progress)) return;
                 const item = marking.verification.?.next() orelse break;
                 progress.rows += 1;
@@ -933,6 +939,7 @@ pub const Store = struct {
             if (!marking.verification_done or marking.planning_required) while (marking.planning_reader < marking.source.readers.len) {
                 const reader = marking.source.readers[marking.planning_reader];
                 while (marking.planning_row < reader.count) : (marking.planning_row += 1) {
+                    try original_lifetime.checkpoint(lifetime);
                     if (markBudgetExpired(started, budget_ns, limit, progress)) return;
                     progress.rows += 1;
                     try stats[marking.planning_reader].add(reader, marking.planning_row, &marking.live);
@@ -947,6 +954,9 @@ pub const Store = struct {
     // Enter and return with the source mutex held, including on scan failure.
     // A running mark owns its snapshots until this function rejoins the writer.
     fn scanMarkingLocked(self: *Store, outside_lock: bool) !bool {
+        return self.scanMarkingLockedWithLifetime(outside_lock, null);
+    }
+    fn scanMarkingLockedWithLifetime(self: *Store, outside_lock: bool, lifetime: ?*const original_lifetime.Control) !bool {
         const marking = self.marking orelse return false;
         if (marking.running) {
             self.stats.collection_mark_busy_deferrals += 1;
@@ -963,7 +973,7 @@ pub const Store = struct {
             if (self.mark_test_hook) |hook| hook(self);
         }
         var progress: ScanProgress = .{};
-        const result = scanMarking(marking, started, budget_ns, limit, allow_verification, &progress);
+        const result = scanMarking(marking, started, budget_ns, limit, allow_verification, &progress, lifetime);
         const elapsed = time.monotonicNs() -| started;
         if (outside_lock) self.lock();
         marking.running = false;
@@ -1079,19 +1089,30 @@ pub const Store = struct {
     /// No primary publication or catalog access: safe before taking DB.apply.
     /// Only immutable leases and scanner-private state are accessed unlocked.
     pub fn advanceMarkingSnapshot(self: *Store) !void {
+        return self.advanceMarkingSnapshotInternal(null, null);
+    }
+    pub fn advanceMarkingSnapshotWithLifetime(self: *Store, io: std.Io, lifetime: *const original_lifetime.Control) !void {
+        return self.advanceMarkingSnapshotInternal(io, lifetime);
+    }
+    fn lockWithLifetime(self: *Store, io: ?std.Io, lifetime: ?*const original_lifetime.Control) !void {
+        if (lifetime) |control| try original_lifetime.lockAtomic(io.?, &self.mutex, control) else self.lock();
+    }
+    fn advanceMarkingSnapshotInternal(self: *Store, io: ?std.Io, lifetime: ?*const original_lifetime.Control) !void {
+        try original_lifetime.checkpoint(lifetime);
         if (self.cost_based_gc) if (self.preparation_manager) |manager| if (manager.capacitySource()) |probe| {
             const observation = probe.current() catch null;
-            self.lock();
+            try self.lockWithLifetime(io, lifetime);
             self.capacity_observation = observation;
             self.mutex.unlock();
         };
-        try self.advanceCollectionReaders();
+        try self.advanceCollectionReadersInternal(io, lifetime);
+        try original_lifetime.checkpoint(lifetime);
         if (!self.mark_outside_lock) return;
-        self.lock();
+        try self.lockWithLifetime(io, lifetime);
         defer self.mutex.unlock();
         if (self.poisoned) return error.VectorPayloadStorePoisoned;
         if (self.stats.unresolved_primary_commits != 0) return;
-        _ = try self.scanMarkingLocked(true);
+        _ = try self.scanMarkingLockedWithLifetime(true, lifetime);
     }
 
     fn advanceMarkingLocked(self: *Store, budget_bytes: u64) !bool {
@@ -1108,7 +1129,10 @@ pub const Store = struct {
     /// Build one immutable reader per turn; neither a corpus validation nor old
     /// generation destruction belongs inside the publication fence.
     pub fn advanceCollectionReaders(self: *Store) !void {
-        self.lock();
+        return self.advanceCollectionReadersInternal(null, null);
+    }
+    fn advanceCollectionReadersInternal(self: *Store, io: ?std.Io, lifetime: ?*const original_lifetime.Control) !void {
+        try self.lockWithLifetime(io, lifetime);
         if (self.retiring) |retired| {
             self.retiring = null;
             self.mutex.unlock();
@@ -5378,7 +5402,7 @@ test "source vector payloads mark workspace admission releases snapshots and res
         source.sparse_gc_copy_bytes = 64 * 1024 * 1024;
         try std.testing.expect(!try source.startMarkingLocked(&raw));
         var progress: Store.ScanProgress = .{};
-        try Store.scanMarking(source.marking.?, time.monotonicNs(), 0, std.math.maxInt(usize), true, &progress);
+        try Store.scanMarking(source.marking.?, time.monotonicNs(), 0, std.math.maxInt(usize), true, &progress, null);
         try std.testing.expect(source.marking.?.scan_done);
         budget.reservation.shrink(budget.reservation.bytes - budget.live_bytes);
         var plan_pressure = try manager.reserve(.dense_source_payload_state, limit - manager.sliceStats(.dense_source_payload_state).used_bytes);
@@ -6617,7 +6641,7 @@ test "source vector payloads GC scan preserves snapshots without admitting prima
     try store.delete(key);
     const before = cache.snapshotStats();
     var progress: Store.ScanProgress = .{};
-    try Store.scanMarking(source.marking.?, time.monotonicNs(), 0, std.math.maxInt(usize), true, &progress);
+    try Store.scanMarking(source.marking.?, time.monotonicNs(), 0, std.math.maxInt(usize), true, &progress, null);
     try std.testing.expect(source.marking.?.verification_done);
     try std.testing.expectEqual(@as(u64, 12), source.marking.?.verified_bytes);
     const after = cache.snapshotStats();
@@ -7258,4 +7282,75 @@ test "source vector payloads session duplicate insertion at capacity does not gr
     for (0..256) |_| _ = try session.put(first, artifact);
     try std.testing.expectEqual(capacity, session.prepared.capacity());
     try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+}
+
+test "source vector payloads original maintenance lifetime rejects actual marking and remains reusable" {
+    var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const alloc = allocator_state.allocator();
+    const mem = @import("mem_backend.zig");
+    const docs = @import("docstore.zig");
+    const keys = @import("internal_keys.zig");
+    const runtime = @import("antfly_runtime_abi");
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var backend = mem.Backend.init(alloc, .{});
+    defer backend.close();
+    var raw = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer raw.deinit();
+    var source = try Store.open(alloc, memory.storage(), "/original-maintenance-mark", false);
+    defer source.deinit();
+    source.mark_outside_lock = true;
+    source.mark_step_rows = 16384;
+    source.mark_step_ns = 0;
+    var store = try docs.DocStore.openRuntime(alloc, &raw);
+    defer store.close();
+    store.payload_store = source.interface();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 1, &.{ 1, 2, 3 });
+    defer alloc.free(artifact);
+    for (0..80) |i| {
+        var buf: [32]u8 = undefined;
+        const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&buf, "doc-{d}", .{i}), "model");
+        defer alloc.free(key);
+        try store.put(key, artifact);
+    }
+    const Check = struct {
+        calls: usize = 0,
+        fail_after: usize,
+        cause: anyerror,
+        fn check(raw_control: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw_control));
+            self.calls += 1;
+            if (self.calls >= self.fail_after) return runtime.error_abi.statusFromError(self.cause);
+            return .ok;
+        }
+    };
+    // Initial source contention must reject without unlocking another holder.
+    try std.testing.expect(source.mutex.tryLock());
+    var held: Check = .{ .fail_after = 3, .cause = error.DeadlineExceeded };
+    const held_control: original_lifetime.Control = .{ .context = &held, .check = Check.check };
+    const held_result = source.advanceMarkingSnapshotWithLifetime(std.testing.io, &held_control);
+    try std.testing.expect(!source.mutex.tryLock());
+    source.mutex.unlock();
+    try std.testing.expectError(error.DeadlineExceeded, held_result);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+        try std.testing.expect(!try source.collectStepDeferredMark(&raw, std.math.maxInt(u64)));
+        try std.testing.expect(source.marking != null);
+        const before = source.statsSnapshot().collection_mark_rows;
+        var check: Check = .{ .fail_after = 16, .cause = cause };
+        const lifetime: original_lifetime.Control = .{ .context = &check, .check = Check.check };
+        try std.testing.expectError(cause, source.advanceMarkingSnapshotWithLifetime(std.testing.io, &lifetime));
+        try std.testing.expect(source.statsSnapshot().collection_mark_rows > before);
+        try std.testing.expect(source.marking == null);
+        try std.testing.expect(source.mutex.tryLock());
+        source.mutex.unlock();
+        try std.testing.expectEqual(@as(u64, 80), source.statsSnapshot().retained_payloads);
+    }
+    var turns: usize = 0;
+    while (!try source.collectStep(&raw, std.math.maxInt(u64))) : (turns += 1) try std.testing.expect(turns < 256);
+    const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc-0", "model");
+    defer alloc.free(key);
+    const restored = try store.get(alloc, key);
+    defer alloc.free(restored);
+    try std.testing.expectEqualSlices(u8, artifact, restored);
 }

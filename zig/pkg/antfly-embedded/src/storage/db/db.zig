@@ -19137,11 +19137,12 @@ pub const DB = struct {
         const original = @import("../../common/seed_snapshot_lifetime.zig");
         while (true) {
             try original.checkpoint(lifetime);
-            self.runMaintenanceUntilWithCancellation(
+            self.runMaintenanceUntilWithCancellationAndLifetime(
                 self.currentMaintenanceTargetSequence(),
                 .{},
                 original.cancellation(lifetime),
                 deadline_ns,
+                lifetime,
             ) catch |err| {
                 try original.checkpoint(lifetime);
                 switch (err) {
@@ -29316,20 +29317,34 @@ pub const DB = struct {
         cancellation: types.CancellationToken,
         deadline_ns: u64,
     ) !void {
+        return self.runMaintenanceUntilWithCancellationAndLifetime(sequence, sync_targets, cancellation, deadline_ns, null);
+    }
+    fn runMaintenanceUntilWithCancellationAndLifetime(
+        self: *DB,
+        sequence: u64,
+        sync_targets: ManagedSyncTargets,
+        cancellation: types.CancellationToken,
+        deadline_ns: u64,
+        lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry,
+    ) !void {
         const wait = derived_executor_mod.VisibilityWait{
             .cancellation = cancellation,
             .deadline_ns = deadline_ns,
             .clock = self.backend_runtime.monotonicClock(),
         };
+        const original = @import("../../common/seed_snapshot_lifetime.zig");
+        try original.checkpoint(lifetime);
         var stable_target = sequence;
         while (true) {
+            try original.checkpoint(lifetime);
             try self.runEnrichmentUntilWithVisibilityDeadline(stable_target, cancellation, deadline_ns);
+            try original.checkpoint(lifetime);
             try self.runDerivedUntilWithVisibilityWait(stable_target, wait);
 
             const next_target = self.core.nextDerivedSequence();
             if (next_target <= stable_target) {
                 try waitForManagedIndexesApplied(self, sequence, sync_targets.all_indexes);
-                _ = try self.runArtifactRepairMetadataMaintenancePass();
+                _ = try self.runArtifactRepairMetadataMaintenancePassWithLifetime(lifetime);
                 return;
             }
             stable_target = next_target;
@@ -29608,24 +29623,57 @@ pub const DB = struct {
     }
 
     fn runArtifactRepairMetadataMaintenancePass(self: *DB) !bool {
+        return self.runArtifactRepairMetadataMaintenancePassWithLifetime(null);
+    }
+    fn runArtifactRepairMetadataMaintenancePassWithLifetime(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        const original = @import("../../common/seed_snapshot_lifetime.zig");
+        try original.checkpoint(lifetime);
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         // The mark owns immutable primary/ANN/source leases. Scan before
         // taking apply; only setup, planning, and publication need that fence.
-        if (self.local_execution.source_vectors.load(.acquire)) |source| try source.advanceMarkingSnapshot();
-        return self.runArtifactRepairMetadataMaintenanceAfterScan();
+        if (self.local_execution.source_vectors.load(.acquire)) |source| {
+            if (lifetime) |control| {
+                const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+                try source.advanceMarkingSnapshotWithLifetime(io, control);
+            } else try source.advanceMarkingSnapshot();
+        }
+        try original.checkpoint(lifetime);
+        return self.runArtifactRepairMetadataMaintenanceAfterScanWithLifetime(lifetime);
     }
 
     fn runArtifactRepairMetadataMaintenanceAfterScan(self: *DB) !bool {
-        try self.lockApplyForPortableRuntime();
+        return self.runArtifactRepairMetadataMaintenanceAfterScanWithLifetime(null);
+    }
+    fn runArtifactRepairMetadataMaintenanceAfterScanWithLifetime(self: *DB, lifetime: ?*const @import("antfly_runtime_abi").runnable_abi.Reentry) !bool {
+        const original = @import("../../common/seed_snapshot_lifetime.zig");
+        try original.checkpoint(lifetime);
+        if (lifetime) |control| {
+            const io = self.backend_runtime.controlIo() orelse self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+            try self.enforcePortableRuntimeGate();
+            while (!self.core.tryLockApplyExclusive()) {
+                try control.checkpoint();
+                io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                    try control.checkpoint();
+                    return err;
+                };
+            }
+            errdefer self.core.unlockApply();
+            try control.checkpoint();
+            try self.enforcePortableRuntimeGate();
+        } else try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
 
         var more = try self.core.index_manager.runGraphOwnershipCleanupStep();
+        try original.checkpoint(lifetime);
         more = (try self.rebuildArtifactRepairSummaryIfMissing(self.alloc)) or more;
+        try original.checkpoint(lifetime);
         more = (try self.rebuildArtifactRepairKindIndexIfMissing(self.alloc)) or more;
         if (self.local_execution.source_vectors.load(.acquire)) |source| {
             const step_bytes = source.backgroundCollectionStepBytes();
             if (step_bytes != 0) {
+                try original.checkpoint(lifetime);
                 try self.refreshSourceVectorOwnershipScopes();
+                try original.checkpoint(lifetime);
                 const prior_generation = source.currentGeneration();
                 if (try source.collectBackgroundStepDeferredMark(&self.core.store.runtime_store, step_bytes)) {
                     if (source.currentGeneration() != prior_generation) try self.core.index_manager.refreshSourcePayloadGeneration();
@@ -29633,6 +29681,7 @@ pub const DB = struct {
                 if (source.collectionPending()) more = true;
             }
         }
+        try original.checkpoint(lifetime);
         return more;
     }
 
