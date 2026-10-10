@@ -102,18 +102,17 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         retained_pending = cut.pending;
         if (cut.pending.changes.len != 0) overlay = try overlay_api.Overlay.init(oa, cut.pending);
     }
-    if (published_only or retained != null) {
-        const base_id = publication.base_source.external_iceberg.snapshot_id;
-        source_schema.binding.write_policy = .read_only;
-        source_schema.binding.snapshot_mode = if (std.mem.startsWith(u8, base_id, "empty:")) .current else .{ .snapshot_id = base_id };
-    }
+    if (published_only or retained != null) try pinPublishedSource(&source_schema.binding, publication.base_source);
     if (retained == null and schema.binding.write_policy == .iceberg_writer and server.cfg.node_config != null and server.cfg.node_config.?.storage.artifacts.connection != null) {
         const catalog = local.serverless_external_source_mod.lake_catalog;
         var current = try @import("../serverless/configured_object_store_support.zig").executeLakeCatalogAlloc(a, schema.binding, options, context, .load);
         defer current.deinit(a);
         const root = try catalog.metadata.parse(oa, current.table.metadata_json);
         retained_metadata = try std.json.parseFromSliceLeaky(catalog.types.Table, oa, try std.json.Stringify.valueAlloc(oa, current.table, .{}), .{ .allocate = .alloc_always });
-        const base_id = publication.base_source.external_iceberg.snapshot_id;
+        const base_id = switch (publication.base_source) {
+            .external_iceberg => |base| base.snapshot_id,
+            else => return error.ExternalLakeSnapshotMismatch,
+        };
         const cut = try overlay_api.snapshotCoverage(root, base_id);
         if (published_only) {
             if (req.lake_read.?.through) |receipt| if (cut < receipt.wal_lsn) return error.IndexRebuilding;
@@ -1572,6 +1571,48 @@ fn projectionMayUse(pattern: []const u8, path: []const u8) bool {
         const part = parts.next() orelse return true;
         if (!std.mem.eql(u8, token, "*") and !std.mem.eql(u8, token, part)) return false;
     }
+}
+
+// A retained cut exists for both raw Parquet and Iceberg. Only Iceberg
+// snapshot IDs are catalog selectors; Parquet retains its object-version policy
+// and the publication selection below verifies the exact resolved inventory.
+fn pinPublishedSource(binding: *local.serverless_external_source_mod.ExternalTableBinding, base: @FieldType(local.metadata_lake_index_catalog.Publication, "base_source")) !void {
+    switch (base) {
+        .external_parquet => {
+            if (binding.format != .parquet) return error.ExternalLakeSnapshotMismatch;
+        },
+        .external_iceberg => |source| {
+            if (binding.format != .iceberg) return error.ExternalLakeSnapshotMismatch;
+            binding.snapshot_mode = if (std.mem.startsWith(u8, source.snapshot_id, "empty:")) .current else .{ .snapshot_id = source.snapshot_id };
+        },
+        else => return error.ExternalLakeSnapshotMismatch,
+    }
+    binding.write_policy = .read_only;
+}
+
+test "external lake retained source binding distinguishes Parquet inventories from Iceberg snapshot selectors" {
+    const Source = @FieldType(@FieldType(local.metadata_lake_index_catalog.Publication, "base_source"), "external_parquet");
+    const parquet: Source = .{ .format = .parquet_prefix, .source_uri = "s3://bucket/parquet", .snapshot_id = "inventory-digest", .schema_fingerprint = "schema" };
+    var binding: local.serverless_external_source_mod.ExternalTableBinding = .{ .table_id = "table", .format = .parquet, .source_uri = parquet.source_uri, .schema_fingerprint = "schema" };
+    try pinPublishedSource(&binding, .{ .external_parquet = parquet });
+    try std.testing.expect(binding.snapshot_mode == .current);
+    binding.snapshot_mode = .{ .object_version_digest = "explicit-digest" };
+    try pinPublishedSource(&binding, .{ .external_parquet = parquet });
+    try std.testing.expectEqualStrings("explicit-digest", binding.snapshot_mode.object_version_digest);
+    var iceberg = parquet;
+    iceberg.format = .iceberg;
+    iceberg.snapshot_id = "42";
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, pinPublishedSource(&binding, .{ .external_iceberg = iceberg }));
+    binding.format = .iceberg;
+    binding.write_policy = .iceberg_writer;
+    try pinPublishedSource(&binding, .{ .external_iceberg = iceberg });
+    try std.testing.expect(binding.write_policy == .read_only);
+    try std.testing.expectEqualStrings("42", binding.snapshot_mode.snapshot_id);
+    iceberg.snapshot_id = "empty:table-uuid";
+    try pinPublishedSource(&binding, .{ .external_iceberg = iceberg });
+    try std.testing.expect(binding.snapshot_mode == .current);
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, pinPublishedSource(&binding, .{ .external_parquet = parquet }));
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, pinPublishedSource(&binding, .{ .antfly_document_segments = {} }));
 }
 
 test "external lake hydration projection narrows includes and retains exclusion semantics" {

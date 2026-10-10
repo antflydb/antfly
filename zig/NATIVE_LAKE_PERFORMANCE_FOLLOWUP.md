@@ -1519,10 +1519,16 @@ matching document count and average length for both planning and scoring.
 Differential tests use unequal local/global frequencies and compare exact scores
 across numeric includes/exclusions, repeated match tokens and signed boosts.
 
+Retained cursor source binding dispatches on the publication's source kind. Raw
+Parquet preserves its object-version selection policy and validates the resolved
+inventory against the publication. Only Iceberg uses a catalog snapshot ID; its
+empty-publication sentinel retains current-snapshot discovery. Mismatched source
+kinds return a catalog-generation error rather than accessing an inactive union.
+
 ### Qualification
 
 With Zig 0.17.0 after merging origin/main at `083142678c`, Debug qualification
-passed 50 focused tests (one optimized-only benchmark skipped), all 313 lake
+passed 50 focused tests (one optimized-only benchmark skipped), all 314 lake
 integration tests and the production server build. ReleaseFast passed all 51
 focused tests, including the collector
 benchmark. All 16 page-tree tests also passed independently, including generic
@@ -1545,11 +1551,12 @@ Real-data fixtures now include 17-file Parquet and Iceberg corpora, forcing the
 fragmented parallel text path. They compare nested Boolean and phrase results,
 zero/negative scores, repeated requests and cold restart. They also cover the
 oversized-term competitive-refinement fallback, limit-1 ranking, broad
-alternatives and prohibited-only queries. All six real-data E2Es passed across
-the initial run and a targeted retry after reclaiming obsolete build outputs;
-the disk safety floor remained enabled. These are the five Iceberg/Parquet SQL
-fixtures and the native sparse metadata score/ranking regression. Iceberg
-remains in `e2e-full`.
+alternatives and prohibited-only queries. All six real-data E2Es passed in one
+fresh post-merge run against the rebuilt production server (250.83 seconds),
+with the disk safety floor enabled. The Parquet and Iceberg pagination fixtures
+exercise retained snapshot tokens with forward and backward cursors. These are
+the five Iceberg/Parquet SQL fixtures and the native sparse metadata score/ranking
+regression. Iceberg remains in `e2e-full`.
 
 Representative archive benchmarks remain pending. Qualification uses work-count
 assertions; it makes no archive-scale throughput claim. Measure cold/warm latency,
