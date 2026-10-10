@@ -69,8 +69,8 @@ class RegexParityCampaignTest(unittest.TestCase):
         )
 
     def test_regression_scope_is_independent_of_enumeration_bounds(self):
-        self.assertEqual(37, len(regressions()))
-        self.assertEqual(37, len(set(regressions())))
+        self.assertEqual(41, len(regressions()))
+        self.assertEqual(41, len(set(regressions())))
 
     def test_postgres_18_cannot_certify_the_19_lane(self):
         db = Mock()

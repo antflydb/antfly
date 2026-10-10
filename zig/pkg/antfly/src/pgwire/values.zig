@@ -64,7 +64,13 @@ pub fn oid(kind: Type) !u32 {
 
 pub fn columnOid(column: Column) !u32 {
     if (column.type == .array) return (column.element_type orelse return error.InvalidResult).arrayOid();
-    if (column.element_type == .numeric) return 1700;
+    if (column.element_type) |element| {
+        try @import("antfly_local_sources").sql_scalar.validateParameterType(.{ .kind = switch (column.type) {
+            .unknown => null,
+            inline else => |tag| @field(@import("antfly_local_sources").sql_ast.ColumnType, @tagName(tag)),
+        }, .element_type = element });
+        return element.oid();
+    }
     return oid(column.type);
 }
 
@@ -75,7 +81,41 @@ pub fn columnModifier(column: Column) !i32 {
 }
 
 pub fn columnTypeSize(column: Column) i16 {
-    return if (column.element_type == .numeric) -1 else typeSize(column.type);
+    if (column.type == .array) return -1;
+    if (column.element_type) |element| return switch (element) {
+        .int16 => 2,
+        .int32, .float32 => 4,
+        .int64, .float64 => 8,
+        .boolean => 1,
+        .uuid => 16,
+        .text, .jsonb, .numeric => -1,
+    };
+    return typeSize(column.type);
+}
+
+fn encodeNarrowScalar(writer: *std.Io.Writer, element: @import("antfly_local_sources").sql_array_value.ElementType, format: u16, value: std.json.Value) !void {
+    switch (element) {
+        .int16 => {
+            const number = std.math.cast(i16, try integer(value)) orelse return error.InvalidResult;
+            if (format == 0) try writer.print("{d}", .{number}) else try writer.writeInt(i16, number, .big);
+        },
+        .int32 => {
+            const number = std.math.cast(i32, try integer(value)) orelse return error.InvalidResult;
+            if (format == 0) try writer.print("{d}", .{number}) else try writer.writeInt(i32, number, .big);
+        },
+        .float32 => {
+            const number: f64 = switch (value) {
+                .float => |n| n,
+                .integer => |n| @floatFromInt(n),
+                .number_string, .string => |n| std.fmt.parseFloat(f64, n) catch return error.InvalidResult,
+                else => return error.InvalidResult,
+            };
+            const narrowed: f32 = @floatCast(number);
+            if (!std.math.isFinite(narrowed) or (number != 0 and narrowed == 0)) return error.InvalidResult;
+            if (format == 0) try writer.print("{d}", .{narrowed}) else try writer.writeInt(u32, @bitCast(narrowed), .big);
+        },
+        else => unreachable,
+    }
 }
 
 /// Array payloads are validated against the bound descriptor, never inferred
@@ -83,6 +123,7 @@ pub fn columnTypeSize(column: Column) i16 {
 /// JSONB payloads borrow the live result owner and stream directly to pgwire.
 pub fn encodeColumnInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, value: std.json.Value, wire_bytes: usize) !void {
     if (format > 1) return error.UnsupportedResultFormat;
+    _ = try columnOid(column);
     if (column.type == .number and column.element_type == .numeric) {
         if (value != .string) return error.InvalidResult;
         const sources = @import("antfly_local_sources");
@@ -93,6 +134,15 @@ pub fn encodeColumnInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Co
         return sources.sql_numeric_binary.encode(&context, number.value, writer);
     }
     if (column.type != .array) {
+        if (column.element_type) |element| switch (element) {
+            .int16, .int32, .float32 => {
+                var size: std.Io.Writer.Discarding = .init(&.{});
+                try encodeNarrowScalar(&size.writer, element, format, value);
+                if (size.count > wire_bytes) return error.ProgramLimitExceeded;
+                return encodeNarrowScalar(writer, element, format, value);
+            },
+            else => {},
+        };
         var size: std.Io.Writer.Discarding = .init(&.{});
         try encodeInto(a, &size.writer, column.type, format, value);
         if (size.count > wire_bytes) return error.ProgramLimitExceeded;
@@ -397,6 +447,48 @@ pub fn timestampNanos(value: std.json.Value) !u64 {
 pub fn timestampValue(alloc: std.mem.Allocator, nanos: u64) !std.json.Value {
     if (std.math.cast(i64, nanos)) |signed| return .{ .integer = signed };
     return .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{nanos}) };
+}
+
+test "SQL pgwire scalar builtin descriptors match binary widths and round trip values" {
+    const a = std.testing.allocator;
+    const Element = @import("antfly_local_sources").sql_array_value.ElementType;
+    const cases = [_]struct { kind: Type, element: Element, oid: u32, size: i16, value: std.json.Value, expected: std.json.Value }{
+        .{ .kind = .integer, .element = .int16, .oid = 21, .size = 2, .value = .{ .integer = -1234 }, .expected = .{ .integer = -1234 } },
+        .{ .kind = .integer, .element = .int32, .oid = 23, .size = 4, .value = .{ .integer = -2000000000 }, .expected = .{ .integer = -2000000000 } },
+        .{ .kind = .integer, .element = .int64, .oid = 20, .size = 8, .value = .{ .integer = 9007199254740993 }, .expected = .{ .integer = 9007199254740993 } },
+        .{ .kind = .number, .element = .float32, .oid = 700, .size = 4, .value = .{ .float = 0.1 }, .expected = .{ .float = @as(f32, 0.1) } },
+        .{ .kind = .number, .element = .float64, .oid = 701, .size = 8, .value = .{ .float = 1.25 }, .expected = .{ .float = 1.25 } },
+    };
+    var output: std.Io.Writer.Allocating = .init(a);
+    defer output.deinit();
+    for (cases) |case| {
+        const column: Column = .{ .name = "v", .type = case.kind, .element_type = case.element };
+        try std.testing.expectEqual(case.oid, try columnOid(column));
+        try std.testing.expectEqual(case.size, columnTypeSize(column));
+        output.writer.end = 0;
+        try encodeColumnInto(a, &output.writer, column, 1, case.value, 8);
+        try std.testing.expectEqual(@as(usize, @intCast(case.size)), output.written().len);
+        const restored = try decode(a, case.oid, 1, output.written());
+        switch (case.expected) {
+            .integer => |expected| try std.testing.expectEqual(expected, restored.integer),
+            .float => |expected| try std.testing.expectEqual(expected, restored.float),
+            else => unreachable,
+        }
+        output.writer.end = 0;
+        try std.testing.expectError(error.ProgramLimitExceeded, encodeColumnInto(a, &output.writer, column, 1, case.value, @intCast(case.size - 1)));
+        try std.testing.expectEqual(@as(usize, 0), output.written().len);
+        try encodeColumnInto(a, &output.writer, column, 0, case.value, 128);
+        if (case.element == .float32) try std.testing.expectEqualStrings("0.1", output.written());
+    }
+    for ([_]struct { column: Column, value: std.json.Value }{
+        .{ .column = .{ .name = "v", .type = .integer, .element_type = .int16 }, .value = .{ .integer = 32768 } },
+        .{ .column = .{ .name = "v", .type = .integer, .element_type = .int32 }, .value = .{ .integer = 2147483648 } },
+        .{ .column = .{ .name = "v", .type = .number, .element_type = .float32 }, .value = .{ .float = 1e100 } },
+    }) |case| {
+        output.writer.end = 0;
+        try std.testing.expectError(error.InvalidResult, encodeColumnInto(a, &output.writer, case.column, 1, case.value, 128));
+        try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    }
 }
 
 test "pgwire NUMERIC preserves scalar array OIDs scale and exact binary payloads" {

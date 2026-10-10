@@ -221,12 +221,14 @@ pub const Program = struct {
         const root = try parser.parse();
         for (parser.nodes.items) |*node| setWidth(node, parser.nodes.items);
         // Empty capture participation is separate from whole-match preference.
-        // Required repetitions of a strictly zero-width child cannot use their
-        // lazy extent attribute to suppress that child's required captures.
+        // Fixed-count repetitions of a strictly zero-width child cannot use
+        // their lazy extent attribute to suppress required captures. Variable
+        // repetitions retain that preference when an outer repetition chooses
+        // whether the entire child participates.
         for (parser.nodes.items) |*node| node.empty_short = switch (node.tag) {
             .capture => parser.nodes.items[node.left].empty_short,
             .concat => parser.nodes.items[node.left].empty_short orelse parser.nodes.items[node.right].empty_short,
-            .repeat => if (node.maximum == 0) null else if (node.minimum > 0 and node.max_width == 0) parser.nodes.items[node.left].empty_short else node.short,
+            .repeat => if (node.maximum == 0) null else if (node.minimum > 0 and node.maximum == node.minimum and node.max_width == 0) parser.nodes.items[node.left].empty_short else node.short,
             else => node.short,
         };
         for (parser.nodes.items) |*node| node.captures = switch (node.tag) {

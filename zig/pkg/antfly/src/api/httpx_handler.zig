@@ -5569,6 +5569,11 @@ pub const AntflyApiHandler = struct {
                         } else if (value.array) |array| {
                             if (definition.type != .array or definition.element_type != array.element_type or value.value != .null or value.patterns != null) return error.InvalidSqlBackendResponse;
                             try @import("antfly_local_sources").sql_array_wire.encode(array.*, &writer.writer, .{ .wire_bytes = self.prepared_response_budget.limit });
+                        } else if (value.numeric) |number| {
+                            if (definition.type != .number or definition.element_type != .numeric or value.value != .null or value.patterns != null) return error.InvalidSqlBackendResponse;
+                            var context: @import("antfly_local_sources").sql_numeric_value.Context = .{ .alloc = page.arena.allocator(), .max_output_bytes = self.prepared_response_budget.limit };
+                            const exact = try @import("antfly_local_sources").sql_numeric_value.format(&context, number.*);
+                            try std.json.Stringify.value(exact, .{}, &writer.writer);
                         } else if (value.patterns) |patterns| {
                             try writer.writer.writeByte('[');
                             var offset: u64 = 0;
@@ -6036,9 +6041,10 @@ pub const AntflyApiHandler = struct {
             .type = switch (column.type) {
                 inline else => |kind| @field(sql_wire.SQLColumnType, @tagName(kind)),
             },
-            .element_type = if (column.type == .array) switch (column.element_type orelse return error.InvalidSqlBackendResponse) {
+            .element_type = if (column.type == .array or column.element_type == .numeric) switch (column.element_type orelse return error.InvalidSqlBackendResponse) {
                 inline else => |kind| @field(sql_wire.SQLArrayElementType, @tagName(kind)),
             } else null,
+            .numeric_modifier = if (column.numeric_modifier) |modifier| .{ .precision = modifier.precision, .scale = modifier.scale } else null,
         };
         const output: sql_wire.SQLResponse = .{
             .columns = columns,
@@ -17108,4 +17114,51 @@ test "httpx lake query delivery requires a transport and forwards delegated JSON
     try sink.write_fn(sink.ptr, "{}");
     try delivery.writer.?.close();
     try std.testing.expect(state.closed);
+}
+
+test "SQL catalog NUMERIC HTTP delivery preserves exact cells descriptors and NULLs" {
+    const alloc = std.testing.allocator;
+    const schema = "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("http-numeric-delivery");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.setSchemaJson(alloc, schema);
+    try db.batch(.{ .writes = &.{.{ .key = "1", .value = "{\"id\":1}" }} });
+    const Source = @import("sql_parity_sources.zig").Tables(1);
+    var source: Source = .{ .records = .{.{ .table_id = 7, .name = "docs", .schema_json = schema }}, .reads = .{table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier())} };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    for ([_][]const u8{
+        "SELECT '9007199254740993.1200'::numeric(24,4) AS n, NULL::numeric AS missing, 'NaN'::numeric AS special",
+        "SELECT '9007199254740993.1200'::numeric(24,4) AS n, NULL::numeric AS missing, 'NaN'::numeric AS special FROM docs",
+    }) |statement| {
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement }, .{});
+        defer alloc.free(body);
+        request.body = body;
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.executeSQL(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const parsed = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+        defer parsed.deinit();
+        const result = parsed.value;
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqualStrings("9007199254740993.1200", result.rows[0][0].string);
+        try std.testing.expect(result.rows[0][1] == .null);
+        try std.testing.expectEqualStrings("NaN", result.rows[0][2].string);
+        try std.testing.expectEqualSlices(bool, &.{ false, true, false }, result.sql_nulls.?[0]);
+        for (result.columns) |column| {
+            try std.testing.expectEqual(sql_wire.SQLColumnType.number, column.type);
+            try std.testing.expectEqual(sql_wire.SQLArrayElementType.numeric, column.element_type.?);
+        }
+        try std.testing.expectEqual(@as(i64, 24), result.columns[0].numeric_modifier.?.precision);
+        try std.testing.expectEqual(@as(i64, 4), result.columns[0].numeric_modifier.?.scale);
+    }
 }

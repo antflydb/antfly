@@ -77,9 +77,9 @@ uv run --no-project --with 'psycopg[binary]==3.3.6' python \
 That qualified 24,575-case C/UTF8 campaign passes against PostgreSQL 18.6.
 Omit the major override to require PostgreSQL 19; use `ANTFLY_PG_BIN` to select
 its installed binaries. There is no fallback or successful missing-oracle skip.
-Use `--suite regressions` for the 37 permanent selection/rejection witnesses.
+Use `--suite regressions` for the 41 permanent selection/rejection witnesses.
 The regular native and WASM gates replay those witnesses without PostgreSQL;
-WASM now executes 1,062 component contracts twice.
+WASM now executes 1,066 component contracts twice.
 
 Artifacts record the exact reference build/binary and campaign bounds. The
 native runner returns the exact witness digest and complete outcome count;
