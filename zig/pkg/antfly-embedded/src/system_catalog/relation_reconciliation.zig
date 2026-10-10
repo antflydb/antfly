@@ -272,7 +272,7 @@ pub fn candidateGenerationKey(buf: []u8, generation: Generation, key: names.Key)
     return buf[0..end];
 }
 fn decodeCandidateKey(bytes: []const u8, state: *const State) !names.Key {
-    return decodeCandidateGenerationKey(bytes, Generation.of(state));
+    return decodeCandidateGenerationKeyWithCoverage(bytes, Generation.of(state), state.coverage);
 }
 fn decodeCandidateGenerationKey(bytes: []const u8, generation: Generation) !names.Key {
     return decodeCandidateGenerationKeyWithCoverage(bytes, generation, .relations);
@@ -475,7 +475,7 @@ pub fn LiveStore(comptime Txn: type) type {
             return if (try self.getEntry(key)) |entry| entry.active else null;
         }
         pub fn getEntry(self: *@This(), key: names.Key) !?names.Entry {
-            if (key.membership_table_id != 0) return error.CatalogOccupancyNotReady;
+            if (key.membership_table_id != 0 and self.root.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
             var buf: [max_cursor_bytes]u8 = undefined;
             const bytes = (try optionalGet(self.txn, try candidateGenerationKey(&buf, self.root.generation, key))) orelse return null;
             const entry = try names.Entry.decode(bytes);
@@ -488,13 +488,13 @@ pub fn LiveStore(comptime Txn: type) type {
                 return self.base.getEntry(key);
             }
             pub fn putEntry(self: *@This(), key: names.Key, entry: names.Entry) !void {
-                if (key.membership_table_id != 0) return error.CatalogOccupancyNotReady;
+                if (key.membership_table_id != 0 and self.base.root.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
                 try key.validateEntry(entry);
                 var buf: [max_cursor_bytes]u8 = undefined;
                 try self.base.txn.put(try candidateGenerationKey(&buf, self.base.root.generation, key), &(try entry.encode()));
             }
             pub fn deleteEntry(self: *@This(), key: names.Key) !void {
-                if (key.membership_table_id != 0) return error.CatalogOccupancyNotReady;
+                if (key.membership_table_id != 0 and self.base.root.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
                 var buf: [max_cursor_bytes]u8 = undefined;
                 try self.base.txn.delete(try candidateGenerationKey(&buf, self.base.root.generation, key));
             }
@@ -534,7 +534,7 @@ pub fn LiveVerifier(comptime Reader: type) type {
             var buf: [max_cursor_bytes]u8 = undefined;
             const prefix = try candidateGenerationPrefix(&buf, self.root.generation);
             if (!std.mem.startsWith(u8, key, prefix)) return;
-            const logical = try decodeCandidateGenerationKey(key, self.root.generation);
+            const logical = try decodeCandidateGenerationKeyWithCoverage(key, self.root.generation, self.root.coverage);
             const claim = try names.Claim.fromEntry(logical, try names.Entry.decode(bytes));
             self.claims = std.math.add(u64, self.claims, try claimCount(claim)) catch return error.InvalidCatalogRecord;
             addClaimHash(&self.claim_hash, try claimHash(claim));
@@ -603,6 +603,11 @@ pub fn retirementsForGroup(buf: []u8, group: u64) ![]const u8 {
 }
 pub const Record = struct { kind: RecordKind, group_id: u64, generation: ?Generation = null };
 pub fn classify(key: []const u8) !?Record {
+    return classifyWithCoverage(key, .relations);
+}
+// Structural classification is not coverage authorization. Verifiers select
+// the owning job/root/retirement below before interpreting candidate entries.
+fn classifyWithCoverage(key: []const u8, coverage: Coverage) !?Record {
     inline for (std.meta.tags(RecordKind)) |kind| {
         const prefix = allGroupsPrefix(kind);
         if (std.mem.startsWith(u8, key, prefix)) {
@@ -621,7 +626,7 @@ pub fn classify(key: []const u8) !?Record {
                     try generation.validate();
                     if (kind == .retirement) {
                         if (tail.len != 24) return error.InvalidCatalogRecord;
-                    } else _ = try decodeCandidateGenerationKey(key, generation);
+                    } else _ = try decodeCandidateGenerationKeyWithCoverage(key, generation, coverage);
                     return .{ .kind = kind, .group_id = group, .generation = generation };
                 },
             }
@@ -732,7 +737,7 @@ pub fn Verifier(comptime Reader: type) type {
             return retired;
         }
         pub fn feed(self: *@This(), key: []const u8, value: []const u8) !void {
-            const record = (try classify(key)) orelse return;
+            const record = (try classifyWithCoverage(key, .constraint_names)) orelse return;
             if (record.group_id != self.group_id) return error.InvalidCatalogRecord;
             switch (record.kind) {
                 .source => _ = try sourceRevision(value),
@@ -754,16 +759,19 @@ pub fn Verifier(comptime Reader: type) type {
                 .candidate => {
                     const generation = record.generation.?;
                     const owner = try names.Entry.decode(value);
-                    const logical = try decodeCandidateGenerationKey(key, generation);
                     if (self.live) |live| if (live.generation.eql(generation)) {
+                        const logical = try decodeCandidateGenerationKeyWithCoverage(key, generation, live.coverage);
                         const claim = try names.Claim.fromEntry(logical, owner);
                         self.live_claims = std.math.add(u64, self.live_claims, try claimCount(claim)) catch return error.InvalidCatalogRecord;
                         addClaimHash(&self.live_hash, try claimHash(claim));
                         return;
                     };
                     if (try self.retirementFor(generation)) |retired| {
+                        const logical = try decodeCandidateGenerationKeyWithCoverage(key, generation, retired.coverage);
+                        try logical.validateEntry(owner);
                         if (std.mem.order(u8, retired.cursor(), key) != .lt) return error.InvalidCatalogRecord;
                     } else {
+                        const logical = try decodeCandidateGenerationKeyWithCoverage(key, generation, self.current.?.coverage);
                         self.claims = std.math.add(u64, self.claims, try claimCount(try names.Claim.fromEntry(logical, owner))) catch return error.InvalidCatalogRecord;
                         addClaimHash(&self.claim_hash, try claimHash(try names.Claim.fromEntry(logical, owner)));
                     }
@@ -812,6 +820,7 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
                 const next = current orelse return error.InvalidCatalogRecord;
                 if (prior.group_id != group or std.mem.order(u8, &prior.job_id, &next.job_id) == .gt) return error.InvalidCatalogRecord;
                 if (std.mem.eql(u8, &prior.job_id, &next.job_id)) {
+                    if (prior.coverage != next.coverage) return error.InvalidCatalogRecord;
                     if (prior.failure != .none and !std.meta.eql(prior, next)) return error.InvalidCatalogRecord;
                     if (!prior.epoch.eql(next.epoch) or @backingInt(next.phase) < @backingInt(prior.phase)) return error.InvalidCatalogRecord;
                     if (prior.phase != .building and !totalsEqual(prior.expected, next.expected)) return error.InvalidCatalogRecord;
@@ -837,6 +846,7 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
                 const next = live orelse return error.InvalidCatalogRecord;
                 if (!std.mem.eql(u8, &prior.epoch.incarnation, &next.epoch.incarnation) or next.epoch.revision < prior.epoch.revision) return error.InvalidCatalogRecord;
                 if (prior.generation.eql(next.generation)) {
+                    if (prior.coverage != next.coverage) return error.InvalidCatalogRecord;
                     if (!std.meta.eql(prior, next)) {
                         if (next.epoch.revision <= prior.epoch.revision or prior.sequence == std.math.maxInt(u64) or
                             next.sequence != prior.sequence + 1) return error.InvalidCatalogRecord;
@@ -871,6 +881,19 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
             self.arena.deinit();
             self.* = undefined;
         }
+        fn coverageFor(self: *@This(), generation: Generation) !Coverage {
+            if (self.live) |live| if (live.generation.eql(generation)) return live.coverage;
+            if (self.current) |state| if (Generation.of(&state).eql(generation)) return state.coverage;
+            var buf: [128]u8 = undefined;
+            if (try optionalGet(self.before, try retirementKey(&buf, generation))) |bytes| {
+                const retired = try Retirement.decode(bytes);
+                if (!retired.generation.eql(generation)) return error.InvalidCatalogRecord;
+                return retired.coverage;
+            }
+            const state = self.old orelse return error.InvalidCatalogRecord;
+            if (!Generation.of(&state).eql(generation)) return error.InvalidCatalogRecord;
+            return state.coverage;
+        }
         fn checkRetirement(self: *@This(), generation: Generation) !void {
             if (self.retirements.contains(generation.job_id)) return;
             if (self.retirements.count() == names.max_claims) return error.CatalogCommandTooLarge;
@@ -882,9 +905,11 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
             const next = if (try optionalGet(self.after, key)) |bytes| try Retirement.decode(bytes) else null;
             if (old) |prior| {
                 if (!prior.generation.eql(generation)) return error.InvalidCatalogRecord;
+                if (next) |retired| if (retired.coverage != prior.coverage) return error.InvalidCatalogRecord;
             } else {
                 const prior = self.old orelse return error.InvalidCatalogRecord;
                 if (!Generation.of(&prior).eql(generation) or std.mem.order(u8, &prior.job_id, &current.job_id) != .lt) return error.InvalidCatalogRecord;
+                if (next) |retired| if (retired.coverage != prior.coverage) return error.InvalidCatalogRecord;
             }
             const resume_key = if (old) |*prior| prior.cursor() else "";
             if (next) |*retired| {
@@ -909,7 +934,7 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
             try self.retirements.put(self.arena.allocator(), generation.job_id, {});
         }
         pub fn feed(self: *@This(), key: []const u8) !void {
-            const record = (try classify(key)) orelse return;
+            const record = (try classifyWithCoverage(key, .constraint_names)) orelse return;
             if (record.group_id != self.group_id) return error.InvalidCatalogRecord;
             self.records += 1;
             if (self.records > names.max_claims + max_tables_per_page) return error.CatalogCommandTooLarge;
@@ -928,12 +953,17 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
                     const generation = record.generation.?;
                     const prior = if (old) |bytes| try names.Entry.decode(bytes) else null;
                     const owner = if (next) |bytes| try names.Entry.decode(bytes) else null;
+                    // Validate even identical replay records: equality cannot
+                    // promote a typed key under a relation-only generation.
+                    const decoded = try decodeCandidateGenerationKeyWithCoverage(key, generation, try self.coverageFor(generation));
+                    if (prior) |value| try decoded.validateEntry(value);
+                    if (owner) |value| try decoded.validateEntry(value);
                     if (prior) |value| if (owner) |final| if (value.eql(final)) return;
                     if (self.live) |live| if (live.generation.eql(generation)) {
                         // Publication itself inherits the sealed generation;
                         // only a previously live generation accepts deltas.
                         if (self.old_live == null or !self.old_live.?.generation.eql(generation)) return error.InvalidCatalogRecord;
-                        const logical = try decodeCandidateGenerationKey(key, generation);
+                        const logical = decoded;
                         if (prior) |value| {
                             const claim = try names.Claim.fromEntry(logical, value);
                             self.live_count = std.math.sub(u64, self.live_count, try claimCount(claim)) catch return error.InvalidCatalogRecord;
@@ -949,7 +979,7 @@ pub fn ReplayVerifier(comptime Before: type, comptime After: type) type {
                     if (std.mem.eql(u8, &generation.job_id, &current.job_id)) {
                         if (owner == null) return error.InvalidCatalogRecord;
                         if (self.old) |before| if (std.mem.eql(u8, &before.job_id, &current.job_id) and before.phase != .building) return error.InvalidCatalogRecord;
-                        const logical = try decodeCandidateGenerationKey(key, generation);
+                        const logical = decoded;
                         if (prior) |value| {
                             // Building may add exactly one pending slot to a
                             // previously contributed active predecessor.
@@ -1064,7 +1094,7 @@ pub const GarbagePage = struct {
         while (rows.items.len < max_tables_per_page) {
             const row: CandidateRow = (try source.nextAfter(after)) orelse break;
             if (row.key.len > max_cursor_bytes or std.mem.order(u8, after, row.key) != .lt) return error.InvalidCatalogRecord;
-            const logical = try decodeCandidateGenerationKey(row.key, before.generation);
+            const logical = try decodeCandidateGenerationKeyWithCoverage(row.key, before.generation, before.coverage);
             try logical.validateEntry(try names.Entry.decode(row.value));
             const key = try owned.dupe(u8, row.key);
             try rows.append(owned, .{ .key = key, .value = try owned.dupe(u8, row.value) });
@@ -1108,7 +1138,7 @@ pub const GarbagePage = struct {
         // Check every exact before-image before deleting any candidate entry.
         var after = self.before;
         for (self.rows) |row| {
-            const logical = try decodeCandidateGenerationKey(row.key, generation);
+            const logical = try decodeCandidateGenerationKeyWithCoverage(row.key, generation, self.before.coverage);
             try logical.validateEntry(try names.Entry.decode(row.value));
             if (std.mem.order(u8, after.cursor(), row.key) != .lt) return error.InvalidCatalogRecord;
             after.cursor_len = @intCast(row.key.len);
@@ -1171,7 +1201,7 @@ pub const Page = struct {
             var row_bytes: usize = row.key.len;
             for (row.claims) |claim| {
                 try claim.key.validate();
-                if (claim.key.membership_table_id != 0) return error.CatalogOccupancyNotReady;
+                if (claim.key.membership_table_id != 0 and state.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
                 const entry = try claim.entry();
                 if (entry.active) |owner| if (owner.table_id != row.table_id) return error.InvalidCatalogRecord;
                 if (entry.pending) |owner| if (owner.table_id != (row.pending_table_id orelse row.table_id)) return error.InvalidCatalogRecord;
@@ -1298,12 +1328,15 @@ pub fn CandidateStore(comptime Txn: type) type {
             return if (try self.getEntry(key)) |entry| entry.active else null;
         }
         pub fn getEntry(self: *@This(), key: names.Key) !?names.Entry {
+            if (key.membership_table_id != 0 and self.state.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
             var buf: [max_cursor_bytes]u8 = undefined;
             const value = self.txn.get(try candidateKey(&buf, self.state, key)) catch |err| {
                 if (err == error.NotFound) return null;
                 return err;
             };
-            return try names.Entry.decode(value);
+            const entry = try names.Entry.decode(value);
+            try key.validateEntry(entry);
+            return entry;
         }
     };
 }
@@ -1314,11 +1347,14 @@ fn CandidateWriter(comptime Txn: type) type {
             return self.base.getEntry(key);
         }
         pub fn putEntry(self: *@This(), key: names.Key, entry: names.Entry) !void {
+            if (key.membership_table_id != 0 and self.base.state.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
+            try key.validateEntry(entry);
             var buf: [max_cursor_bytes]u8 = undefined;
             const value = try entry.encode();
             try self.base.txn.put(try candidateKey(&buf, self.base.state, key), &value);
         }
         pub fn deleteEntry(self: *@This(), key: names.Key) !void {
+            if (key.membership_table_id != 0 and self.base.state.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
             var buf: [max_cursor_bytes]u8 = undefined;
             try self.base.txn.delete(try candidateKey(&buf, self.base.state, key));
         }
@@ -1581,6 +1617,162 @@ test "relation candidate typed membership codec preserves exact-name prefixes bu
     try std.testing.expectError(error.InvalidCatalogRecord, complete.feed(member, &entry));
     @memset(member_buf[ordinary.len..member.len], 0);
     try std.testing.expectError(error.InvalidCatalogRecord, decodeTypedCandidateGenerationKey(member_buf[0..member.len], root.generation));
+}
+
+test "relation occupancy source verification, live retirement and replay preserve relation names" {
+    try exerciseOccupancyLifecycle(std.testing.allocator);
+}
+
+test "relation occupancy lifecycle unwinds preparation and replay allocation faults" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseOccupancyLifecycle, .{});
+}
+
+fn exerciseOccupancyLifecycle(a: A) !void {
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    var owner = test_owner;
+    owner.kind = .constraint_name;
+    const claims = [_]names.Claim{ test_claims[0], .{
+        .key = .{ .namespace_id = 5, .name = "orders", .membership_table_id = 7 },
+        .owner = owner,
+    } };
+    const rows = [_]SourceRow{.{ .key = "table:7", .table_id = 7, .claims = &claims }};
+    var source: TestSource = .{ .rows = &rows };
+    const legacy = try State.init(41, try nextJobId(null), test_epoch);
+    if (Page.prepareSource(a, legacy, test_epoch, &source)) |page| {
+        var unexpected = page;
+        unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expect(err == error.CatalogOccupancyNotReady);
+    }
+    const initial = try State.initWithCoverage(41, legacy.job_id, test_epoch, .constraint_names);
+    for (0..test_epoch.revision) |_| try advanceSource(&txn, 41);
+    try start(&txn, &initial, test_epoch, null);
+    var build = try Page.prepareSource(a, initial, test_epoch, &source);
+    defer build.deinit();
+    try build.apply(&txn, test_epoch);
+    var verify = try Page.prepareSource(a, build.after, test_epoch, &source);
+    defer verify.deinit();
+    try verify.apply(&txn, test_epoch);
+    var key_buffers: [2][max_cursor_bytes]u8 = undefined;
+    var values: [2][names.Entry.encoded_len]u8 = undefined;
+    var candidates: [2]CandidateRow = undefined;
+    for (claims, 0..) |claim, i| {
+        values[i] = try (try claim.entry()).encode();
+        candidates[i] = .{ .key = try candidateKey(&key_buffers[i], &initial, claim.key), .value = &values[i] };
+    }
+    var candidate_source: TestCandidates = .{ .rows = &candidates };
+    try std.testing.expectError(error.InvalidCatalogRecord, classify(candidates[1].key));
+    var ready = try Page.prepareCandidate(a, verify.after, test_epoch, &candidate_source);
+    defer ready.deinit();
+    try ready.apply(&txn, test_epoch);
+    const root = try publishVerifiedRoot(&txn, ready.after, test_epoch, null);
+    try std.testing.expectEqual(@as(u64, 2), root.claims);
+    try verifyLiveRootForTest(&txn, test_epoch);
+    var before = TestTxn.init();
+    defer before.deinit();
+    var entries = txn.values.iterator();
+    while (entries.next()) |entry| try before.put(entry.key_ptr.*, entry.value_ptr.*);
+    var live = (try LiveStore(TestTxn).open(&txn, 41)).?;
+    try std.testing.expectEqual(names.Kind.constraint_name, (try live.getClaim(claims[1].key)).?.kind);
+    var plan = try names.Plan.init(a, &claims, &test_claims);
+    defer plan.deinit();
+    var epoch = test_epoch;
+    epoch.revision += 1;
+    try advanceSource(&txn, 41);
+    try live.apply(&plan, epoch);
+    try std.testing.expect((try live.getClaim(claims[1].key)) == null);
+    try std.testing.expect((try live.getClaim(test_claims[0].key)) != null);
+    try verifyLiveRootForTest(&txn, epoch);
+    var replay = try ReplayVerifier(TestTxn, TestTxn).init(a, &before, &txn, 41);
+    defer replay.deinit();
+    var buf: [max_cursor_bytes]u8 = undefined;
+    try replay.feed(try candidateKey(&buf, &ready.after, claims[1].key));
+    try replay.feed(try sourceKey(&buf, 41));
+    try replay.feed(try liveKey(&buf, 41));
+    try replay.finish();
+}
+
+test "relation occupancy garbage and authenticated replay retain retired coverage" {
+    const a = std.testing.allocator;
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    var owner = test_owner;
+    owner.kind = .constraint_name;
+    const claim: names.Claim = .{
+        .key = .{ .namespace_id = 5, .name = "orders_check", .membership_table_id = 7 },
+        .owner = owner,
+    };
+    var prior = try seedLiveRootForTest(&txn, &.{claim}, try nextJobId(null), test_epoch);
+    prior.coverage = .constraint_names;
+    var buf: [max_cursor_bytes]u8 = undefined;
+    try txn.put(try jobKey(&buf, 41), &(try prior.encode()));
+    const next = try State.initWithCoverage(41, try nextJobId(&prior), test_epoch, .constraint_names);
+    try start(&txn, &next, test_epoch, &(try prior.encode()));
+    var key_buf: [max_cursor_bytes]u8 = undefined;
+    const candidate = try candidateKey(&key_buf, &prior, claim.key);
+    const value = try (try claim.entry()).encode();
+    const rows = [_]CandidateRow{.{ .key = candidate, .value = &value }};
+    var source: TestCandidates = .{ .rows = &rows };
+    const retirement: Retirement = .{ .generation = Generation.of(&prior), .coverage = .constraint_names };
+    var legacy = retirement;
+    legacy.coverage = .relations;
+    try std.testing.expectError(error.InvalidCatalogRecord, GarbagePage.prepare(a, legacy, &source));
+    var garbage = try GarbagePage.prepare(a, retirement, &source);
+    defer garbage.deinit();
+    var before = TestTxn.init();
+    defer before.deinit();
+    var entries = txn.values.iterator();
+    var verifier = try Verifier(TestTxn).init(&txn, 41);
+    while (entries.next()) |entry| {
+        try before.put(entry.key_ptr.*, entry.value_ptr.*);
+        try verifier.feed(entry.key_ptr.*, entry.value_ptr.*);
+    }
+    try verifier.finish();
+    try std.testing.expect(try garbage.apply(&txn));
+    try std.testing.expectError(error.NotFound, txn.get(candidate));
+    var replay = try ReplayVerifier(TestTxn, TestTxn).init(a, &before, &txn, 41);
+    defer replay.deinit();
+    try replay.feed(candidate);
+    try replay.feed(try retirementKey(&buf, retirement.generation));
+    try replay.finish();
+}
+
+test "relation replay rejects same-generation coverage promotion before accepting deltas" {
+    var before = TestTxn.init();
+    defer before.deinit();
+    var after = TestTxn.init();
+    defer after.deinit();
+    const prior = try State.init(41, try nextJobId(null), test_epoch);
+    var promoted = prior;
+    promoted.coverage = .constraint_names;
+    var buf: [128]u8 = undefined;
+    const key = try jobKey(&buf, 41);
+    try before.put(key, &(try prior.encode()));
+    try after.put(key, &(try promoted.encode()));
+    try std.testing.expectError(error.InvalidCatalogRecord, ReplayVerifier(TestTxn, TestTxn).init(std.testing.allocator, &before, &after, 41));
+}
+
+test "relation replay rejects unchanged typed entries hidden under legacy coverage" {
+    var before = TestTxn.init();
+    defer before.deinit();
+    var after = TestTxn.init();
+    defer after.deinit();
+    var owner = test_owner;
+    owner.kind = .constraint_name;
+    const claim: names.Claim = .{
+        .key = .{ .namespace_id = 5, .name = "orders_check", .membership_table_id = 7 },
+        .owner = owner,
+    };
+    const legacy = try seedLiveRootForTest(&before, &.{claim}, try nextJobId(null), test_epoch);
+    var entries = before.values.iterator();
+    while (entries.next()) |entry| try after.put(entry.key_ptr.*, entry.value_ptr.*);
+    var replay = try ReplayVerifier(TestTxn, TestTxn).init(std.testing.allocator, &before, &after, 41);
+    defer replay.deinit();
+    var buf: [max_cursor_bytes]u8 = undefined;
+    try std.testing.expectError(error.InvalidCatalogRecord, replay.feed(try candidateKey(&buf, &legacy, claim.key)));
 }
 
 test "relation live root publishes by constant point CAS and rejects noncanonical manifests" {

@@ -309,8 +309,9 @@ The codec alone is deliberately NOT serving authority. Legacy direct registry
 and live-root lookup/write/delete reject typed membership keys with
 `CatalogOccupancyNotReady`, rather than treating missing keys as free.
 Relation-only reconciliation preparation, candidate/restore/replay verifiers
-and GC reject extended records until an occupancy-capable coverage contract
-exists. No producer emits these typed records yet. This prevents accidental
+and GC reject extended records. Shared reconciliation now accepts typed records
+only under the owning job, live-root or retirement coverage contract. Native
+source and writer producers do not emit these records yet. This prevents accidental
 activation through the old v1 root seal while the next publication stage is
 implemented. The new kind is private catalog metadata, not a new public index
 type or a table/index relation that should appear in the OpenAPI relation API.
@@ -348,6 +349,21 @@ decoders must reject the new header rather than ignore a JSON extension or
 reinterpret a relation-only seal. Startup, active/pending FK/restore sources,
 ordinary writer deltas, bounded candidate verification and GC must all select
 the same coverage mode before generated-name admission can be enabled.
+
+The shared reconciliation consumers now carry coverage through source pages,
+candidate scans, point reads, exact-owner mutations, independent verification,
+authenticated replay and bounded garbage collection. Replay validates key and
+owner classes even for unchanged entries, rejects same-generation mode changes,
+and retains the original retirement mode after intent deletion. Legacy public
+classification remains fail-closed until native restore/replay callers select
+coverage from their attested cuts. New tests exercise a relation and a
+same-named table-qualified membership through source verification, publication,
+membership-only deletion and replay; a separate retired-generation test covers
+GC and replay after retirement intent removal. The complete lifecycle also
+passes allocation-failure injection. The Debug reconciliation gate passes all
+69 tests; the optimized gate passed 68 tests before the final unchanged-replay
+regression was added, and its updated run is in progress. This does not activate production
+occupancy, generated-name admission, or change original-case dispositions.
 
 The mounted native campaign must adopt source tracking through the actual
 membership-fenced reconciliation command before waiting for publication.
