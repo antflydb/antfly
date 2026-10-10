@@ -444,6 +444,7 @@ fn executeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authent
     } else switch (owner.owner.kind) {
         .index => {},
         .constraint_index => return error.SqlConstraintOwnedIndex,
+        .constraint_name => return error.InvalidCatalogRecord,
         else => return error.SqlWrongObjectType,
     }
     var transition = ddl;

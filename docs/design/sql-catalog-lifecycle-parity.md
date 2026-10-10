@@ -294,6 +294,57 @@ counts/hashes and replay/backup verification, and force a fresh reconciliation
 generation when the coverage format changes. Do not silently reinterpret old
 v1 root seals as proof of the new projection.
 
+The shared registry now has a typed owner-qualified key codec for constraint
+memberships: namespace/name plus a nonzero table-identity suffix, and a private
+`constraint_name` owner kind distinct from relation kinds. Existing relation
+key bytes and hashes are unchanged. An exact-name physical prefix contains
+the exclusive relation key and every table-qualified membership, enabling a
+bounded seek/early-exit occupancy probe once coverage is activated. Empty owner
+suffixes and wrong key/owner classes or table identities are rejected. The CAS
+planner, key ownership/copying, registry adapters and candidate hash preparation
+preserve the qualifier; different tables can retain the same constraint name
+without colliding with each other or with a real relation of that name.
+
+The codec alone is deliberately NOT serving authority. Legacy direct registry
+and live-root lookup/write/delete reject typed membership keys with
+`CatalogOccupancyNotReady`, rather than treating missing keys as free.
+Relation-only reconciliation preparation, candidate/restore/replay verifiers
+and GC reject extended records until an occupancy-capable coverage contract
+exists. No producer emits these typed records yet. This prevents accidental
+activation through the old v1 root seal while the next publication stage is
+implemented. The new kind is private catalog metadata, not a new public index
+type or a table/index relation that should appear in the OpenAPI relation API.
+
+Typed-key tests cover canonical quoted/UTF-8 names, exact-name prefixes,
+noncanonical suffixes, whole-suffix truncation paired with a mismatched owner,
+cross-table/relation coexistence, exact-owner retirement, rejected replay with
+zero writes, input retirement, and allocation-failure cleanup. Current Debug
+registry/reconciliation gates pass 95 tests. The optimized SQL gate passed
+697 local plus 226 native tests and 93 registry/reconciliation tests, including
+the final legacy-adapter guard. The additional prepared-cut tests passed in
+Debug; their optimized SQL gate is now running. Native mounted catalog
+campaign validation is still running separately.
+
+Combined typed-cut preparation now caches the result per owned schema cut,
+retains both active/pending fences for same-table successors, and releases its
+temporary lookup map before returning. It borrows already-owned name bytes,
+reserves a bounded claim array, and rejects aggregate claim-budget overflow.
+A relation-only source cut cannot invoke this path as if an empty membership
+list were complete: its projection flag remains explicitly unready. The
+source-lifetime/allocation-failure sweep exercises combined preparation too.
+
+For the next coverage-format integration, retain the current fixed-size binary
+state layouts but use distinct equal-length format headers (current AFRC04
+job state and AFRL01 live root versus occupancy-capable successors). Carry the
+coverage kind through decoding, encoding, independent verification, replay and
+publication so old cuts round-trip without being promoted. New root seals must
+cover both typed relations and memberships, while a new topology decoder floor
+gates production of the extended state/entries and writer adoption. Old
+decoders must reject the new header rather than ignore a JSON extension or
+reinterpret a relation-only seal. Startup, active/pending FK/restore sources,
+ordinary writer deltas, bounded candidate verification and GC must all select
+the same coverage mode before generated-name admission can be enabled.
+
 The next delivery is mounted catalog activation/recovery evidence for the
 original index and constraint cohort, including real ownership and readiness
 checks. This checkpoint does not close the larger SQL goal or its remaining
