@@ -710,6 +710,22 @@ pub const DocStore = struct {
             return try self.read.?.getManySorted(keys, values);
         }
 
+        /// Batch physical values from the admitted snapshot. The borrow lives
+        /// only for this call; unsupported transaction modes never fall back to
+        /// an unbudgeted point loop or a live probe.
+        pub fn getManySortedPhysicalWithBudget(self: *Txn, keys: []const []const u8, values: []?[]const u8, budget: anytype) !void {
+            if (keys.len != values.len) return error.InvalidArgument;
+            @memset(values, null);
+            errdefer @memset(values, null);
+            try budget.checkpoint();
+            if (self.write != null or self.probe != null or self.current_scan != null) return error.ExecutionWaitUnsupported;
+            const admission = @import("../common/read_admission.zig");
+            var adapter = admission.Adapter(@TypeOf(budget)){ .budget = budget };
+            const payload = adapter.payload();
+            try self.read.?.getManySortedWithAdmission(keys, values, admission.Port.init(&payload));
+            try budget.checkpoint();
+        }
+
         /// Fetch values without admitting their source data blocks to the LSM
         /// cache. Callers should use this only when they retain a decoded or
         /// otherwise more useful representation of every returned value.
@@ -6284,4 +6300,36 @@ test "graph endpoint cleanup bulk retirement mask releases ownership on decoding
     var batch = try store.beginWriteBatch();
     defer batch.abort();
     try std.testing.expectError(error.InvalidGraphRetirement, DocStore.graphBulkRetirementMask(alloc, batch.asTxn(), &.{.{ .key = edge, .value = "edge" }}));
+}
+
+pub fn qualifyBudgetedPhysicalBatch(budget: anytype) !void {
+    if (!@import("builtin").is_test) @compileError("test fixture only");
+    const alloc = std.testing.allocator;
+    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try store.putBatch(&.{
+        .{ .key = "a", .value = "old-a" },
+        .{ .key = "b", .value = "old-b" },
+    }, &.{});
+    var txn = try store.beginReadTxnWithBudget(.retain, budget);
+    defer txn.abort();
+    try store.putBatch(&.{
+        .{ .key = "a", .value = "new-a" },
+        .{ .key = "c", .value = "new-c" },
+    }, &.{"b"});
+    const before = backend.snapshotMaintenanceStats();
+    const keys: []const []const u8 = &.{ "a", "a", "b", "c", "missing" };
+    var values: [5]?[]const u8 = @splat(null);
+    txn.getManySortedPhysicalWithBudget(keys, &values, budget) catch |err| {
+        for (values) |value| try std.testing.expect(value == null);
+        return err;
+    };
+    try std.testing.expectEqualStrings("old-a", values[0].?);
+    try std.testing.expectEqualStrings("old-a", values[1].?);
+    try std.testing.expectEqualStrings("old-b", values[2].?);
+    try std.testing.expect(values[3] == null and values[4] == null);
+    const after = backend.snapshotMaintenanceStats();
+    try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
 }

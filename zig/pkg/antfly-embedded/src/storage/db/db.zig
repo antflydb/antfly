@@ -43186,6 +43186,11 @@ fn loadStoredSearchDocumentsManyControlled(
     }
 
     errdefer freeOptionalOwnedBytes(alloc, loaded);
+    const bounded = if (controls) |request| request.execution_runnable != null or request.execution_deadline_ns != null or request.cancellation != null else false;
+    var wait_io: ?std.Io.Threaded = if (bounded) .init(alloc, .{}) else null;
+    defer if (wait_io) |*io| io.deinit();
+    const ReadBudget = @import("../../common/read_execution_budget.zig").Budget(types.SearchRequest, db_query_search.checkSearchRequestDeadline);
+    var budget: ?ReadBudget = if (bounded) .{ .controls = controls.?, .io = wait_io.?.io() } else null;
 
     // Pin the active keyspace once for the whole batch. This both avoids one
     // schema-registry acquisition per hit and prevents a mixed key encoding if
@@ -43203,11 +43208,17 @@ fn loadStoredSearchDocumentsManyControlled(
     if (bench_profile) key_ns = platform_time.monotonicNs() - key_start_ns;
 
     const sort_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    std.mem.sort(PendingStoredSearchLoad, pending.items, {}, struct {
+    const PendingOrder = struct {
         fn lessThan(_: void, lhs: PendingStoredSearchLoad, rhs: PendingStoredSearchLoad) bool {
             return std.mem.order(u8, lhs.store_key, rhs.store_key) == .lt;
         }
-    }.lessThan);
+    };
+    if (budget) |*original| {
+        const admission = @import("../../common/read_admission.zig");
+        var adapter = admission.Adapter(*ReadBudget){ .budget = original };
+        const payload = adapter.payload();
+        try admission.sort(PendingStoredSearchLoad, pending.items, {}, PendingOrder.lessThan, admission.Port.init(&payload));
+    } else std.mem.sort(PendingStoredSearchLoad, pending.items, {}, PendingOrder.lessThan);
     if (bench_profile) sort_ns = platform_time.monotonicNs() - sort_start_ns;
 
     var schema_plans = SearchSchemaPlans{
@@ -43219,41 +43230,30 @@ fn loadStoredSearchDocumentsManyControlled(
     defer schema_plans.deinit();
     const values_authenticated = self.core.store.valuesAreAuthenticated();
     const txn_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    const bounded = if (controls) |request| request.execution_runnable != null or request.execution_deadline_ns != null or request.cancellation != null else false;
+
     var materialize_start_ns: u64 = 0;
-    if (bounded) {
-        // A single snapshot preserves batch consistency. Cursor scratch is
-        // copied into the result before the next seek can invalidate it.
-        var wait_io = std.Io.Threaded.init(alloc, .{});
-        defer wait_io.deinit();
-        const ReadBudget = @import("../../common/read_execution_budget.zig").Budget(types.SearchRequest, db_query_search.checkSearchRequestDeadline);
-        var budget = ReadBudget{ .controls = controls.?, .io = wait_io.io() };
-        var txn = try self.core.store.beginReadTxnWithBudget(.retain, &budget);
+    const read_keys = try alloc.alloc([]const u8, pending.items.len);
+    defer alloc.free(read_keys);
+    const read_values = try alloc.alloc(?[]const u8, pending.items.len);
+    defer alloc.free(read_values);
+    @memset(read_values, null);
+    for (pending.items, 0..) |item, i| read_keys[i] = item.store_key;
+    if (budget) |*original| {
+        // Keep one admitted snapshot and the backend's grouped batch plan.
+        var txn = try self.core.store.beginReadTxnWithBudget(.retain, original);
         defer txn.abort();
-        var cursor = try txn.openCursorWithBudget(&budget);
-        defer cursor.close();
-        const admission = @import("../../common/read_admission.zig");
-        var adapter = admission.Adapter(*ReadBudget){ .budget = &budget };
-        const payload = adapter.payload();
-        const port = admission.Port.init(&payload);
         if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
+        const get_many_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
+        try txn.getManySortedPhysicalWithBudget(read_keys, read_values, original);
+        if (bench_profile) get_many_ns = platform_time.monotonicNs() - get_many_start_ns;
         materialize_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        for (pending.items) |item| {
-            try budget.checkpoint();
-            const value = (try cursor.seekAtOrAfterWithAdmission(item.store_key, port)) orelse continue;
-            if (!std.mem.eql(u8, value.key, item.store_key)) continue;
-            loaded[item.original_index] = try schema_plans.materialize(item.store_key, value.value, values_authenticated);
+        for (pending.items, read_values) |item, value| {
+            try original.checkpoint();
+            const raw = value orelse continue;
+            loaded[item.original_index] = try schema_plans.materialize(item.store_key, raw, values_authenticated);
         }
-        try budget.checkpoint();
+        try original.checkpoint();
     } else {
-        const read_keys = try alloc.alloc([]const u8, pending.items.len);
-        defer alloc.free(read_keys);
-        const read_values = try alloc.alloc(?[]const u8, pending.items.len);
-        defer alloc.free(read_values);
-        @memset(read_values, null);
-
-        for (pending.items, 0..) |item, i| read_keys[i] = item.store_key;
-
         var txn = try self.core.store.beginProbeTxn();
         defer txn.abort();
         if (bench_profile) txn_ns = platform_time.monotonicNs() - txn_start_ns;
