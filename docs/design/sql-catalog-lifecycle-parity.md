@@ -442,6 +442,12 @@ semantics for these statements. This fixes internal identity handling, not the
 still-pending public final-name admission. No original dispositions changed;
 inventory integrity passes with 899 unresolved cases.
 
+The post-merge mounted campaign exposed a fixture switch missing main's new
+global `query_source` kind; it now uses the domain's global parent identity.
+The mounted campaign and coordinator builds also failed on a missing local
+cached Metal object. Fresh CPU-backed runs (`-Dmetal=false`) are in progress;
+neither earlier build is a completed native or service qualification claim.
+
 The next delivery is mounted catalog activation/recovery evidence for the
 original index and constraint cohort, including real ownership and readiness
 checks. This checkpoint does not close the larger SQL goal or its remaining
