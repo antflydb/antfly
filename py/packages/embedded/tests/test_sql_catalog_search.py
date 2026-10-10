@@ -144,12 +144,21 @@ def test_sql_repairs_failed_unique_coverage(require_native, aflite_path, session
                 connection.execute("COMMIT")
         else:
             db.sql(repair)
-        assert db.sql("ALTER TABLE items VALIDATE CONSTRAINT u")["ddl_receipt"]["state"] == "ready"
+        with pytest.raises(SQLStateError) as rejected:
+            db.sql("ALTER TABLE items VALIDATE CONSTRAINT u")
+        assert rejected.value.sqlstate == "42704"
+        db.sql("DROP INDEX u")
+        assert db.sql("CREATE UNIQUE INDEX u ON items(n)")["ddl_receipt"]["state"] == "ready"
         with pytest.raises(SQLStateError) as duplicate:
             db.sql("INSERT INTO items(_id,n) VALUES ('bad',1)")
         assert duplicate.value.sqlstate == "23505"
     with af.open(aflite_path) as db:
-        assert db.sql("ALTER TABLE items VALIDATE CONSTRAINT u")["ddl_receipt"]["state"] == "ready"
+        with pytest.raises(SQLStateError) as rejected:
+            db.sql("ALTER TABLE items VALIDATE CONSTRAINT u")
+        assert rejected.value.sqlstate == "42704"
+        with pytest.raises(SQLStateError) as duplicate:
+            db.sql("INSERT INTO items(_id,n) VALUES ('still_bad',1)")
+        assert duplicate.value.sqlstate == "23505"
 
 
 def test_sql_add_drop_foreign_key_publishes_parent_generations(require_native, aflite_path):
@@ -933,3 +942,326 @@ def test_sql_partial_index_null_safe_historical_rows(require_native, aflite_path
         assert db.sql(f"SELECT _id,flag FROM historical WHERE n>=0 AND {predicate}")["rows"] == [["old", None]]
     with af.open(aflite_path) as db:
         assert db.sql(f"SELECT _id,flag FROM historical WHERE n>=0 AND {predicate}")["rows"] == [["old", None]]
+
+
+@pytest.mark.parametrize(
+    "predicate,allowed",
+    [
+        ("x IN (1, 2)", [1, 2, None]),
+        ("x NOT IN (1, 2)", [3, None]),
+        ("x IN (1, NULL)", [1, 2, 3, None]),
+        ("x NOT IN (1, NULL)", [2, 3, None]),
+        ("x IN (y, 2)", [1, 2, None]),
+        ("x IN (1, 1 / y)", [1, None]),
+        ("NULL IN (NULL)", [1, 2, 3, None]),
+        ("x IN (NULL)", [1, 2, 3, None]),
+    ],
+)
+def test_sql_check_in_list_enforces_three_valued_membership(require_native, aflite_path, predicate, allowed):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql(f"CREATE TABLE membership(x BIGINT, y BIGINT, CONSTRAINT allowed CHECK({predicate}))")
+        for index, value in enumerate([1, 2, 3, None]):
+            if value in allowed:
+                db.sql(
+                    "INSERT INTO membership(_id,x,y) VALUES ($1,$2,$3)",
+                    [str(index), value, 0 if "/ y" in predicate and value is not None else 1],
+                )
+            else:
+                with pytest.raises(SQLStateError) as rejected:
+                    db.sql("INSERT INTO membership(_id,x,y) VALUES ($1,$2,1)", [str(index), value])
+                assert rejected.value.sqlstate == "23514"
+    with af.open(aflite_path) as db:
+        assert len(db.sql("SELECT x FROM membership")["rows"]) == len(allowed)
+        if 3 not in allowed:
+            with pytest.raises(SQLStateError) as rejected:
+                db.sql("UPDATE membership SET x=3,y=1 WHERE x=1")
+            assert rejected.value.sqlstate == "23514"
+
+
+def test_sql_check_in_list_activation_and_exact_integer_membership(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE checked(x BIGINT)")
+        db.sql("INSERT INTO checked(_id,x) VALUES ('bad',9007199254740992)")
+        receipt = db.sql("ALTER TABLE checked ADD CONSTRAINT exact CHECK(x IN (9007199254740993, NULL))")
+        assert receipt["ddl_receipt"]["state"] == "ready"
+        assert (
+            db.sql("ALTER TABLE checked ADD CONSTRAINT strict CHECK(x IN (9007199254740993))")["ddl_receipt"]["state"]
+            == "invalid"
+        )
+        with pytest.raises(SQLStateError) as rejected:
+            db.sql("INSERT INTO checked(_id,x) VALUES ('newbad',9007199254740992)")
+        assert rejected.value.sqlstate == "23514"
+        db.sql("UPDATE checked SET x=9007199254740993 WHERE _id='bad'")
+        assert db.sql("ALTER TABLE checked VALIDATE CONSTRAINT strict")["ddl_receipt"]["state"] == "ready"
+        db.sql("INSERT INTO checked(_id,x) VALUES ('newgood',9007199254740993)")
+
+
+def test_sql_strpos_parameters_unicode_and_thread_filter(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE titles(title TEXT)")
+        db.sql("INSERT INTO titles(_id,title) VALUES ('a','é🍎needle'),('b','absent'),('c',NULL),('d','needleneedle')")
+        assert db.sql("SELECT _id, strpos(title,$1) FROM titles WHERE strpos(title,$1)>0 ORDER BY _id", ["needle"])[
+            "rows"
+        ] == [["a", "3"], ["d", "1"]]
+        assert db.sql("SELECT strpos($1,$2),strpos($3,$2),strpos($1,$4)", ["é🍎needle", "needle", None, ""])[
+            "rows"
+        ] == [["3", None, "1"]]
+        for statement, parameters in [
+            ("SELECT strpos(1,'x')", []),
+            ("SELECT strpos('x',1)", []),
+            ("SELECT strpos('x')", []),
+        ]:
+            with pytest.raises(SQLStateError):
+                db.sql(statement, parameters)
+
+
+def test_sql_check_in_list_large_bounded_lists(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as db:
+        allowed = ",".join(str(n) for n in range(100))
+        db.sql(f"CREATE TABLE bounded(x BIGINT CHECK(x IN ({allowed})))")
+        db.sql("INSERT INTO bounded(_id,x) VALUES ('last',99)")
+        with pytest.raises(SQLStateError) as rejected:
+            db.sql("INSERT INTO bounded(_id,x) VALUES ('absent',100)")
+        assert rejected.value.sqlstate == "23514"
+
+
+def test_sql_explicit_like_escape_parameters_and_validation(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE escaped(title TEXT)")
+        db.sql("INSERT INTO escaped(_id,title) VALUES ('literal','a_b'),('wildcard','axb'),('null',NULL)")
+        assert db.sql("SELECT _id FROM escaped WHERE title LIKE $1 ESCAPE $2 ORDER BY _id", ["%é_%", "é"])["rows"] == [
+            ["literal"]
+        ]
+        assert db.sql("SELECT _id FROM escaped WHERE title NOT ILIKE $1 ESCAPE $2 ORDER BY _id", ["A!_B", "!"])[
+            "rows"
+        ] == [["wildcard"]]
+        assert db.sql("SELECT 'a_b' LIKE $1 ESCAPE $2", ["a_b", ""])["rows"] == [[True]]
+        assert db.sql("SELECT 'a_b' LIKE $1 ESCAPE $2", ["a_b", None])["rows"] == [[None]]
+        for pattern, escape in [("a", "xx"), ("x!", "!"), ("!", "!")]:
+            with pytest.raises(SQLStateError) as rejected:
+                db.sql("SELECT 'a' LIKE $1 ESCAPE $2", [pattern, escape])
+            assert rejected.value.sqlstate == "22025"
+
+
+def test_sql_correlated_projection_and_insert_select_not_exists(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE parents(n BIGINT)")
+        db.sql("CREATE TABLE children(parent_id TEXT, label TEXT)")
+        db.sql("CREATE TABLE copied(n BIGINT)")
+        db.sql("INSERT INTO parents(_id,n) VALUES ('p',1),('empty',2)")
+        db.sql("INSERT INTO children(_id,parent_id,label) VALUES ('c','p','child')")
+        assert db.sql(
+            "SELECT p._id,(SELECT c.label FROM children c WHERE c.parent_id=p._id) AS label FROM parents p ORDER BY p._id"
+        )["rows"] == [["empty", None], ["p", "child"]]
+        assert db.sql("INSERT INTO copied(_id,n) SELECT p._id,p.n FROM parents p")["rows_affected"] == 2
+        db.sql("DELETE FROM copied WHERE _id='p'")
+        statement = "INSERT INTO copied(_id,n) SELECT p._id,p.n FROM parents p WHERE NOT EXISTS (SELECT 1 FROM copied c WHERE c._id=p._id)"
+        assert db.sql(statement)["rows_affected"] == 1
+        assert db.sql(statement)["rows_affected"] == 0
+        assert db.sql("SELECT _id,n FROM copied ORDER BY _id")["rows"] == [["empty", "2"], ["p", "1"]]
+
+
+@pytest.mark.parametrize(
+    "eviction",
+    [
+        "DELETE FROM entries WHERE id IN (SELECT id FROM entries ORDER BY updated DESC,id OFFSET 2)",
+        "DELETE FROM entries WHERE id IN (SELECT id FROM (SELECT id,ROW_NUMBER() OVER "
+        "(ORDER BY updated DESC,id) AS rank FROM entries) ranked WHERE rank>2)",
+        "WITH ranked AS (SELECT id,ROW_NUMBER() OVER (ORDER BY updated DESC,id) AS rank FROM entries) "
+        "DELETE FROM entries WHERE id IN (SELECT id FROM ranked WHERE rank>2)",
+        "WITH ranked AS (SELECT id,ROW_NUMBER() OVER (ORDER BY updated DESC,id) AS rank FROM entries) "
+        "DELETE FROM entries USING ranked WHERE entries.id=ranked.id AND ranked.rank>2",
+    ],
+)
+def test_sql_eviction_subqueries_and_window_derived_tables(require_native, aflite_path, eviction):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE entries (id TEXT, updated BIGINT)")
+        db.sql("INSERT INTO entries (_id,id,updated) VALUES ('a','a',1),('b','b',2),('c','c',2),('d','d',3)")
+        assert db.sql(
+            "SELECT id FROM (SELECT id,ROW_NUMBER() OVER (ORDER BY updated DESC,id) AS rank "
+            "FROM entries) ranked WHERE rank>2 ORDER BY rank"
+        )["rows"] == [["c"], ["a"]]
+        assert db.sql(eviction)["rows_affected"] == 2
+        assert db.sql("SELECT id FROM entries ORDER BY updated DESC,id")["rows"] == [["d"], ["b"]]
+    with af.open(aflite_path) as db:
+        assert db.sql("SELECT id FROM entries ORDER BY id")["rows"] == [["b"], ["d"]]
+
+
+def test_sql_partitioned_window_eviction(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE entries (id TEXT, category TEXT, updated BIGINT)")
+        db.sql(
+            "INSERT INTO entries (_id,id,category,updated) VALUES "
+            "('a','a','x',1),('b','b','x',2),('c','c','y',1),('d','d','y',2)"
+        )
+        assert (
+            db.sql(
+                "DELETE FROM entries WHERE id IN (SELECT id FROM (SELECT id,ROW_NUMBER() OVER "
+                "(PARTITION BY category ORDER BY updated DESC,id) AS rank FROM entries) ranked WHERE rank>1)"
+            )["rows_affected"]
+            == 2
+        )
+        assert db.sql("SELECT id FROM entries ORDER BY id")["rows"] == [["b"], ["d"]]
+
+
+def test_sql_large_values_requests_and_transactions(require_native, aflite_path):
+    payload = "é" * 1_100_000
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE entries (id TEXT, body TEXT)")
+        db.sql("CREATE TABLE other (id TEXT, body TEXT)")
+        # Exercise data admission independently of the SQL source/AST limits.
+        assert db.sql("SELECT CAST($1 AS TEXT) AS body", [payload])["rows"] == [[payload]]
+        assert db.sql("SELECT '" + payload + "' AS body")["rows"] == [[payload]]
+        with closing(db.sql_session()) as session:
+            session.execute("BEGIN")
+            session.execute("INSERT INTO entries (_id,id,body) VALUES ('a','a',$1)", [payload])
+            session.execute("INSERT INTO entries (_id,id,body) VALUES ('c','c',$1)", [payload])
+            session.execute("INSERT INTO other (_id,id,body) VALUES ('b','b',$1)", [payload])
+            session.execute("COMMIT")
+            session.execute("BEGIN")
+            session.execute("UPDATE entries SET body=$1", [payload + "rollback"])
+            session.execute("ROLLBACK")
+        assert db.sql("SELECT body FROM entries")["rows"] == [[payload], [payload]]
+        assert db.sql("SELECT body FROM other")["rows"] == [[payload]]
+        assert db.sql("SELECT body FROM (SELECT body FROM entries ORDER BY body) sorted")["rows"] == [
+            [payload],
+            [payload],
+        ]
+        with closing(db.sql_cursor("SELECT body FROM entries WHERE body=$1", [payload])) as cursor:
+            assert cursor.fetch(2)["result"]["rows"] == [[payload], [payload]]
+    with af.open(aflite_path) as db:
+        assert db.sql("SELECT body FROM entries")["rows"] == [[payload], [payload]]
+        assert db.sql("SELECT body FROM other")["rows"] == [[payload]]
+
+
+def test_sql_large_search_values_fall_back_from_index_bounds(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE entries (body TEXT)")
+        db.sql("INSERT INTO entries (_id,body) VALUES ('a','short')")
+        db.sql("CREATE INDEX by_body ON entries (body)")
+        payload = "z" * 1_100_000
+        assert db.sql("SELECT body FROM entries WHERE body<$1", [payload])["rows"] == [["short"]]
+        with closing(db.sql_cursor("SELECT body FROM entries WHERE body=$1", [payload])) as cursor:
+            assert cursor.fetch(10)["result"]["rows"] == []
+        assert db.sql("SELECT CAST($1 AS JSONB) AS data", [{"body": payload}])["rows"] == [[{"body": payload}]]
+
+
+@pytest.mark.parametrize("predicate", ["n IN (1, 2.0)", "n NOT IN (0, 3.5)", "n IN (NULL, 1, 2.0)"])
+def test_sql_check_mixed_numeric_membership(require_native, aflite_path, predicate):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql(f"CREATE TABLE entries (n BIGINT CHECK ({predicate}))")
+        db.sql("INSERT INTO entries (_id,n) VALUES ('one',1),('two',2),('null',NULL)")
+        # UNKNOWN passes a CHECK, while a definite nonmember fails.
+        if "NULL," not in predicate:
+            with pytest.raises(SQLStateError) as failure:
+                db.sql("INSERT INTO entries (_id,n) VALUES ('bad',0)")
+            assert failure.value.sqlstate == "23514"
+    with af.open(aflite_path) as db:
+        db.sql("INSERT INTO entries (_id,n) VALUES ('reopened',2)")
+
+
+def test_sql_check_numeric_membership_keeps_large_integers_exact(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE entries (n BIGINT CHECK (n NOT IN (9007199254740992.0)))")
+        db.sql("INSERT INTO entries (_id,n) VALUES ('exact',9007199254740993)")
+        with pytest.raises(SQLStateError) as failure:
+            db.sql("INSERT INTO entries (_id,n) VALUES ('rounded',9007199254740992)")
+        assert failure.value.sqlstate == "23514"
+        db.sql("CREATE TABLE numbers (n DOUBLE PRECISION CHECK (n IN (1, 2.5)))")
+        db.sql("INSERT INTO numbers (_id,n) VALUES ('integer',1),('fraction',2.5)")
+        with pytest.raises(SQLStateError) as failure:
+            db.sql("INSERT INTO numbers (_id,n) VALUES ('bad',2)")
+        assert failure.value.sqlstate == "23514"
+
+
+def test_sql_describe_enforces_preparation_budget(require_native, aflite_path):
+    import ctypes
+
+    from antfly_embedded import _ffi
+
+    with af.create(aflite_path, no_sync=True) as db:
+        # Describe is exposed by the C ABI; Python does not wrap it yet.
+        describe = db._lib.antfly_db_sql_describe_json
+        describe.argtypes = [ctypes.c_void_p, _ffi.AntflySlice, ctypes.POINTER(_ffi.AntflyBuffer)]
+        describe.restype = ctypes.c_int
+
+        def request(statement):
+            source, keepalive = _ffi.make_slice(json.dumps({"statement": statement}).encode())
+            output = _ffi.AntflyBuffer()
+            status = describe(db._handle, source, ctypes.byref(output))
+            try:
+                result = json.loads(ctypes.string_at(output.ptr, output.len))
+            finally:
+                db._lib.antfly_buffer_free(ctypes.byref(output))
+            assert keepalive is not None
+            return status, result
+
+        # Legal request size, but its compilation exceeds the preparation working set.
+        status, result = request("SELECT '" + "x" * (56 * 1024 * 1024) + "' AS value")
+        assert status != 0
+        assert result["error"]["code"] == "54000"
+        # Rejection must release allocations and leave the handle usable.
+        status, result = request("SELECT '" + "x" * (2 * 1024 * 1024) + "' AS value")
+        assert status == 0
+        assert result == {"columns": [{"name": "value", "type": "string"}], "parameter_types": []}
+        assert db.sql("SELECT 7 AS n")["rows"] == [["7"]]
+
+
+@pytest.mark.parametrize("phase", ["parse", "compile"])
+def test_sql_cursor_preparation_budget_rejection(require_native, aflite_path, phase):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE entries (body TEXT)")
+        db.sql("INSERT INTO entries (_id,body) VALUES ('ok','usable')")
+        if phase == "parse":
+            statement = "SELECT body FROM entries WHERE body=$1"
+            parameters = ["x" * (40 * 1024 * 1024)]
+        else:
+            statement = "SELECT body FROM entries WHERE body='" + "x" * (56 * 1024 * 1024) + "'"
+            parameters = []
+        with pytest.raises(SQLStateError) as failure:
+            db.sql_cursor(statement, parameters)
+        assert failure.value.sqlstate == "54000"
+        # Failed preparation must release its allocations and cursor slot.
+        with closing(db.sql_cursor("SELECT body FROM entries WHERE body=$1", ["usable"])) as cursor:
+            assert cursor.fetch(1)["result"]["rows"] == [["usable"]]
+        assert db.sql("SELECT 7 AS n")["rows"] == [["7"]]
+
+
+@pytest.mark.parametrize("api", ["execute", "cursor"])
+@pytest.mark.parametrize("phase", ["parse", "compile"])
+@pytest.mark.parametrize("recovery", ["rollback", "savepoint"])
+def test_sql_preparation_failure_aborts_session(require_native, aflite_path, api, phase, recovery):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE entries (body TEXT)")
+        with closing(db.sql_session()) as session, closing(db.sql_session()) as other:
+            session.execute("BEGIN")
+            session.execute("INSERT INTO entries (_id,body) VALUES ('before','pending')")
+            session.execute("SAVEPOINT checkpoint")
+            session.execute("INSERT INTO entries (_id,body) VALUES ('after','pending')")
+            if phase == "parse":
+                statement = "SELECT body FROM entries WHERE body=$1"
+                parameters = ["x" * (40 * 1024 * 1024)]
+            else:
+                statement = "SELECT body FROM entries WHERE body='" + "x" * (56 * 1024 * 1024) + "'"
+                parameters = []
+            with pytest.raises(SQLStateError) as failure:
+                if api == "execute":
+                    session.execute(statement, parameters)
+                else:
+                    session.open_cursor(statement, parameters)
+            assert failure.value.sqlstate == "54000"
+            for statement in ["SELECT body FROM entries", "COMMIT"]:
+                with pytest.raises(SQLStateError) as aborted:
+                    session.execute(statement)
+                assert aborted.value.sqlstate == "25P02"
+            assert other.execute("SELECT _id FROM entries")["rows"] == []
+            if recovery == "savepoint":
+                session.execute("ROLLBACK TO SAVEPOINT checkpoint")
+                expected = [["before"], ["recovered"]]
+            else:
+                session.execute("ROLLBACK")
+                session.execute("BEGIN")
+                expected = [["recovered"]]
+            session.execute("INSERT INTO entries (_id,body) VALUES ('recovered','usable')")
+            session.execute("COMMIT")
+            assert db.sql("SELECT _id FROM entries ORDER BY _id")["rows"] == expected

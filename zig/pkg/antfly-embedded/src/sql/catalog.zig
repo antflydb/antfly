@@ -28,7 +28,20 @@ pub const Column = struct {
     nullable: bool = true,
     /// Native stored generated columns are readable but never SQL assignable.
     generated: bool = false,
+    /// Native row preparation fills absent DEFAULT cells after SQL evaluation.
+    defaulted: bool = false,
 };
+
+pub fn hasColumnDefault(schema: anytype, name: []const u8) bool {
+    const entries = schema.column_defaults orelse return false;
+    if (entries.value != .array) return false;
+    for (entries.value.array.items) |entry| {
+        if (entry != .object) continue;
+        const column = entry.object.get("column") orelse continue;
+        if (column == .string and std.mem.eql(u8, column.string, name)) return true;
+    }
+    return false;
+}
 
 pub const Index = struct {
     name: []const u8,
@@ -505,6 +518,7 @@ pub const AggregatePartialCursor = struct {
 };
 
 pub const Backend = struct {
+    error_context: ?*@import("errors.zig").Context = null,
     /// Execution-local only: never store this owner in an immutable plan.
     regex_execution: ?*@import("regex_execution.zig") = null,
     /// Native scalar callbacks cannot suspend/yield or perform provider I/O.
@@ -578,11 +592,14 @@ pub const Backend = struct {
         // any data retained after return into their own durable/session owner.
         // Exactly one atomic commit, retaining all schema/row-version fences.
         // An ambiguous outcome is propagated, never replayed by SQL.
-        mutate: *const fn (*anyopaque, std.mem.Allocator, Table, []const Mutation) anyerror!MutationOutcome,
+        /// First allocator owns commit-scoped wire buffers; the second is a
+        /// reclaiming, budgeted backing allocator for nested temporary regions.
+        /// Borrowed scratch must never escape the mutation call.
+        mutate: *const fn (*anyopaque, std.mem.Allocator, std.mem.Allocator, Table, []const Mutation) anyerror!MutationOutcome,
         /// Commit the exact images returned by prepare_mutations without
         /// applying defaults/generated values a second time. Required when
         /// SQL exposes a prepared postimage through RETURNING.
-        mutate_prepared: ?*const fn (*anyopaque, std.mem.Allocator, Table, []const Mutation) anyerror!MutationOutcome = null,
+        mutate_prepared: ?*const fn (*anyopaque, std.mem.Allocator, std.mem.Allocator, Table, []const Mutation) anyerror!MutationOutcome = null,
         /// Native deterministic defaults/generated/check preparation under the
         /// bound schema epoch. No writes occur. Mutation consumes these exact
         /// normalized values; SQL must never guess postimages or read them back

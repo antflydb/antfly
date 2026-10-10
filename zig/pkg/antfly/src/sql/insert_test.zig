@@ -36,7 +36,7 @@ const Fixture = struct {
         return error.UnexpectedScan;
     }
     fn checkpoint(_: *anyopaque) !void {}
-    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
         self.calls += 1;
         self.rows = mutations.len;
@@ -219,7 +219,7 @@ const SourceFixture = struct {
         rows[0] = .{ .id = if (self.pages == 1) "a" else "b", .version = 1, .value = .{ .object = object }, .sql_nulls = if (self.pages == 1) &.{ false, false } else &.{ false, true } };
         return .{ .rows = rows, .after = if (self.pages == 1) "a" else null };
     }
-    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.calls += 1;
         try std.testing.expect(self.source_closed);
@@ -315,7 +315,7 @@ test "SQL original prepared CTE INSERT captures source before one target mutatio
             self.generated += 1;
             return std.fmt.allocPrint(allocator, "archive-{d}", .{self.generated});
         }
-        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(u64, 2), table.id);
             try std.testing.expectEqual(@as(usize, 1), self.closes);

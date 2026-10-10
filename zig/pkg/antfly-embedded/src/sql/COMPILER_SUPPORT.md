@@ -213,11 +213,24 @@ field provenance into native validation and row preparation, so a JSON null
 value does not become SQL NULL. SQL `NULL` and nested JSON nulls remain supported. JSON literal nesting is admitted before tree allocation and bounded
 to 64 container levels.
 
-The default quotas are 1 MiB statement bytes, 16,384 tokens, 8,192 AST nodes,
+The default quotas are 64 MiB statement bytes, 16,384 tokens, 8,192 AST nodes,
 64 levels of nesting/tree depth, 1,024 positional parameter slots, and 1,000
 insert rows. Token admission happens before decoding/allocating the excess
 token. Associative boolean chains are balanced so a long flat clause cannot
 create a linear-depth binding/evaluation stack.
+
+Embedded SQL JSON requests (SQL text plus parameters) are capped at 64 MiB.
+An oversized request returns a SQL diagnostic with SQLSTATE `54000` and the
+67108864-byte limit, including through the C API. Preparation and execution
+have separate 64 MiB memory budgets; exceeding either still returns `54000`.
+These budgets include retained allocations, so the request ceiling is not a
+promise that every request of that size can execute. The default transaction
+intent budget is 128 MiB, charged by retained row/key data and bookkeeping,
+rather than a multiplier that imposed an effective 2 MiB payload ceiling.
+Native callers may configure runtime retained-memory and transaction budgets;
+the embedded JSON admission policy is centralized in `resource_limits.zig`.
+Individual relational rows remain bounded at 16 MiB and stored index keys at
+1 MiB. Temporary predicate keys and sort runs use their own execution budgets.
 
 Run compiler tests from `zig/`:
 

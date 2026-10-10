@@ -40,7 +40,7 @@ pub fn Adapter(comptime native: type) type {
         outcome_transaction_id: ?types.TxnId = null,
 
         pub fn backend(self: *Self) catalog.Backend {
-            return .{ .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
+            return .{ .execution_io = self.db.backend_runtime.io(), .ptr = self, .supports_search_relations = true, .predicate_only_mutations = true, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = open, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepareMutations, .checkpoint = checkpoint, .ddl = ddl } };
         }
 
         fn selected(self: *Self, name: []const u8) !Self {
@@ -586,7 +586,7 @@ pub fn Adapter(comptime native: type) type {
                         };
                     }
                 }
-                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .element_type = column.sql_element_type, .type = dependencies.sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
+                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .defaulted = catalog.hasColumnDefault(parsed, column.name), .element_type = column.sql_element_type, .type = dependencies.sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
                     .string => .string,
                     .integer => .integer,
                     .number => .number,
@@ -721,7 +721,7 @@ pub fn Adapter(comptime native: type) type {
             return images.merge(alloc, input, normalized);
         }
 
-        fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, scratch_alloc: std.mem.Allocator, table: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
             const adapter_owner: *Self = @ptrCast(@alignCast(ptr));
             var selected_adapter = try adapter_owner.selected(table.physical_name);
             const self = &selected_adapter;
@@ -759,7 +759,7 @@ pub fn Adapter(comptime native: type) type {
                 const input_writes = try temporary.alloc(types.TransactionWrite, writes.items.len);
                 for (writes.items, input_writes) |write, *out| out.* = .{ .key = write.key, .value = write.value, .json_null_fields = write.json_null_fields };
                 const input: contract.TableCommitRequest = .{ .table_name = self.table_name, .writes = input_writes, .deletes = deletes.items, .predicates = predicates, .schema_version = table.schema_version, .relational_schema_version = table.schema_version, .relational_integrity_generation_set = generation, .integrity_commands = commands.items };
-                prepared = try integrity.prepareWithRepairAdmission(temporary, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{});
+                prepared = try integrity.prepareWithRepairAdmission(scratch_alloc, self.localSource(), metadata.table, metadata.range, &.{input}, self.repairAdmission(), .{});
                 if (self.handle) |handle| return @import("sql_commit.zig").commit(handle, prepared.?.tables, &self.outcome_transaction_id);
                 if (prepared.?.tables.len != 1 or !std.mem.eql(u8, prepared.?.tables[0].table_name, self.table_name)) return error.UnsupportedSqlExecution;
                 return self.commitCoordinated(prepared.?.tables[0]);

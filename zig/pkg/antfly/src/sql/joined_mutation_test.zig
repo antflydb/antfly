@@ -198,7 +198,7 @@ const Backend = struct {
         }
         return normalized;
     }
-    fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try std.testing.expectEqual(self.captures, self.closes);
         for (mutations) |mutation| {
@@ -1544,7 +1544,7 @@ test "SQL row subquery expanded width releases every allocation on failure" {
 
 test "SQL row subquery empty expanded source assigns SQL NULL to every target" {
     const Empty = struct {
-        fn mutate(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(raw: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
             const self: *Backend = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(self.captures, self.closes);
             try std.testing.expectEqual(@as(usize, 2), mutations.len);
@@ -1710,7 +1710,7 @@ test "SQL original prepared CTE UPDATE DELETE and MERGE capture before one mutat
             const self: *Self = @ptrCast(@alignCast(ptr));
             self.closes += 1;
         }
-        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
             const self: *Self = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(usize, 1), self.closes);
             try std.testing.expectEqual(@as(usize, 2), mutations.len);
