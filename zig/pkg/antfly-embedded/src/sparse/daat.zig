@@ -224,6 +224,59 @@ pub const Stream = struct {
 };
 
 pub const Range = struct { first: u32, end: u64 };
+/// Immutable interval directory. Its implicit balanced tree retains one record
+/// per stream, never a ranges-by-streams incidence matrix. Query results are
+/// restored to input order before scoring, including signed f32 contributions.
+pub const Routing = struct {
+    const Node = struct { index: u32, first: u32, end: u64, max_end: u64 };
+    nodes: []Node,
+    pub fn init(a: A, streams: []const Stream, span: u64) !Routing {
+        if (span > 0x1_0000_0000 or streams.len > std.math.maxInt(u32)) return error.InvalidChunk;
+        const nodes = try a.alloc(Node, streams.len);
+        errdefer a.free(nodes);
+        for (streams, nodes, 0..) |stream, *node, index| {
+            if (stream.ordinal_range) |r| if (r.first > r.last) return error.InvalidChunk;
+            const first = if (stream.ordinal_range) |r| r.first else 0;
+            const end = if (stream.ordinal_range) |r| @as(u64, r.last) + 1 else span;
+            if (first > end or end > span) return error.InvalidChunk;
+            node.* = .{ .index = @intCast(index), .first = first, .end = end, .max_end = end };
+        }
+        std.mem.sort(Node, nodes, {}, struct {
+            fn less(_: void, left: Node, right: Node) bool {
+                return left.first < right.first or (left.first == right.first and left.index < right.index);
+            }
+        }.less);
+        _ = augment(nodes);
+        return .{ .nodes = nodes };
+    }
+    pub fn deinit(self: Routing, a: A) void {
+        a.free(self.nodes);
+    }
+    fn augment(nodes: []Node) u64 {
+        if (nodes.len == 0) return 0;
+        const mid = nodes.len / 2;
+        nodes[mid].max_end = @max(nodes[mid].end, @max(augment(nodes[0..mid]), augment(nodes[mid + 1 ..])));
+        return nodes[mid].max_end;
+    }
+    fn visit(nodes: []const Node, a: A, range: Range, out: *std.ArrayListUnmanaged(u32), visited: *usize) !void {
+        if (nodes.len == 0) return;
+        visited.* += 1;
+        const mid = nodes.len / 2;
+        const node = nodes[mid];
+        if (node.max_end <= range.first) return;
+        try visit(nodes[0..mid], a, range, out, visited);
+        if (node.first >= range.end) return;
+        if (node.end > range.first) try out.append(a, node.index);
+        try visit(nodes[mid + 1 ..], a, range, out, visited);
+    }
+    pub fn active(self: Routing, a: A, range: Range, out: *std.ArrayListUnmanaged(u32)) !usize {
+        out.clearRetainingCapacity();
+        var visited: usize = 0;
+        try visit(self.nodes, a, range, out, &visited);
+        std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+        return visited;
+    }
+};
 /// Coalesce authenticated stream coverage before dividing work. Every interval
 /// is a superset; unknown legacy coverage keeps the entire pinned ordinal domain.
 /// Complete masks can reject empty tasks without reading any posting metadata.
@@ -780,4 +833,34 @@ test "sparse range planning coalesces coverage skips holes and masks and preserv
     };
     var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
     try std.testing.checkAllAllocationFailures(no_resize.allocator(), Failure.run, .{@as([]const Stream, &streams)});
+}
+
+test "sparse routing visits active intervals with bounded canonical lane inventories" {
+    const a = std.testing.allocator;
+    const streams = try a.alloc(Stream, 8192);
+    defer a.free(streams);
+    for (streams, 0..) |*stream, i| stream.* = .{ .weight = 1, .ordinal_range = .{ .first = @intCast((8191 - i) * 4096), .last = @intCast((8191 - i) * 4096 + 31) } };
+    streams[1].ordinal_range = null;
+    streams[2].ordinal_range = .{ .first = 0, .last = std.math.maxInt(u32) };
+    const routing = try Routing.init(a, streams, 0x1_0000_0000);
+    defer routing.deinit(a);
+    var indices: std.ArrayListUnmanaged(u32) = .empty;
+    defer indices.deinit(a);
+    const visited = try routing.active(a, .{ .first = 4096, .end = 4097 }, &indices);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 8190 }, indices.items);
+    try std.testing.expect(visited < 64);
+    _ = try routing.active(a, .{ .first = std.math.maxInt(u32), .end = 0x1_0000_0000 }, &indices);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, indices.items);
+    const Check = struct {
+        fn run(alloc: A, input: []const Stream) !void {
+            const plan = try Routing.init(alloc, input, 0x1_0000_0000);
+            defer plan.deinit(alloc);
+            var active: std.ArrayListUnmanaged(u32) = .empty;
+            defer active.deinit(alloc);
+            _ = try plan.active(alloc, .{ .first = 0, .end = 4097 }, &active);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{streams[0..16]});
+    const invalid = [_]Stream{.{ .weight = 1, .ordinal_range = .{ .first = 4, .last = 3 } }};
+    try std.testing.expectError(error.InvalidChunk, Routing.init(a, &invalid, 8));
 }

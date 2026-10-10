@@ -5082,6 +5082,7 @@ pub const SparseIndex = struct {
             input: []const daat.Stream,
             span: u64,
             work: []const daat.Range = &.{},
+            routing: daat.Routing = undefined,
             k: u32,
             workspace: usize,
             a: Allocator,
@@ -5179,28 +5180,30 @@ pub const SparseIndex = struct {
                 lane_context.key_predicate = lane_self.predicate();
                 lane_context.profile = null;
                 lane_context.shared_cutoff = &lane_self.cutoff;
-                const streams = try a.alloc(daat.Stream, lane_self.input.len);
-                defer a.free(streams);
+                var indices: std.ArrayListUnmanaged(u32) = .empty;
+                defer indices.deinit(a);
+                var streams: std.ArrayListUnmanaged(daat.Stream) = .empty;
+                defer streams.deinit(a);
                 while (!lane_self.capped.load(.acquire)) {
                     const work_index = lane_self.next.fetchAdd(1, .monotonic);
                     if (work_index >= lane_self.work.len) return;
                     const range = lane_self.work[work_index];
-                    var active: usize = 0;
-                    for (lane_self.input) |input| {
-                        if (input.ordinal_range) |bounds| if (bounds.first >= range.end or bounds.last < range.first) continue;
-                        const stream = &streams[active];
+                    try checkSearchCancellation(lane_self.base.cancellation);
+                    _ = try lane_self.routing.active(a, range, &indices);
+                    try streams.resize(a, indices.items.len);
+                    for (indices.items, streams.items) |index, *stream| {
+                        const input = lane_self.input[index];
                         stream.* = input;
                         stream.allocator = a;
                         if (stream.reader != null) stream.reader = reader.interface();
-                        active += 1;
                     }
                     var lane_stats: daat.Stats = .{};
-                    const result = daat.collectRange(a, streams[0..active], lane_self.k, &lane_context, &lane_stats, range.first, range.end) catch |err| {
-                        for (streams[0..active]) |*stream| stream.deinit();
+                    const result = daat.collectRange(a, streams.items, lane_self.k, &lane_context, &lane_stats, range.first, range.end) catch |err| {
+                        for (streams.items) |*stream| stream.deinit();
                         return err;
                     };
                     defer a.free(result);
-                    for (streams[0..active]) |*stream| stream.deinit();
+                    for (streams.items) |*stream| stream.deinit();
                     try lane_self.mutex.lock(lane_self.io);
                     defer lane_self.mutex.unlock(lane_self.io);
                     lane_self.scored += lane_stats.scored;
@@ -5214,11 +5217,21 @@ pub const SparseIndex = struct {
             }
             fn execute(lane_self: *@This(), tasks_count: ?*u64) !?[]ScoreEntry {
                 defer lane_self.winners.deinit(lane_self.a);
-                const work = try daat.planRanges(lane_self.a, lane_self.input, lane_self.span, if (lane_self.base.ordinals.include) |*bitmap| bitmap else null, if (lane_self.base.ordinals.exclude) |*bitmap| bitmap else null);
-                defer lane_self.a.free(work);
+                var routing_budget: @import("ordinal_lookup.zig").MaskBudget = .{ .backing = lane_self.a, .limit = 4 * 1024 * 1024 };
+                const routing_a = routing_budget.allocator();
+                const work = daat.planRanges(routing_a, lane_self.input, lane_self.span, if (lane_self.base.ordinals.include) |*bitmap| bitmap else null, if (lane_self.base.ordinals.exclude) |*bitmap| bitmap else null) catch |err| {
+                    if (err == error.OutOfMemory and routing_budget.exhausted) return null;
+                    return err;
+                };
+                defer routing_a.free(work);
                 lane_self.work = work;
                 const lanes = @min(4, scheduler.global().fanout(work.len, 64 * 1024 * 1024, lane_self.workspace));
                 if (lanes < 2) return null;
+                lane_self.routing = daat.Routing.init(routing_a, lane_self.input, lane_self.span) catch |err| {
+                    if (err == error.OutOfMemory and routing_budget.exhausted) return null;
+                    return err;
+                };
+                defer lane_self.routing.deinit(routing_a);
                 try lane_self.winners.ensureTotalCapacity(lane_self.a, lane_self.k);
                 var tasks: [3]?scheduler.Task(anyerror!void) = @splat(null);
                 defer for (&tasks) |*slot| if (slot.*) |*task| if (task.future != null) task.cancel(lane_self.io) catch {};
