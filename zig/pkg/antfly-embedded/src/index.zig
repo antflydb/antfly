@@ -944,9 +944,59 @@ pub const IndexSnapshot = struct {
     term_doc_freq_cache_misses: u64,
     bm25_bound_table_cache_mu: std.atomic.Mutex,
     bm25_bound_table_cache: BM25BoundTableCache,
+    // Scalars only: no source, reader, query capability or borrowed navigation.
+    text_summary_mu: std.atomic.Mutex = .unlocked,
+    text_summaries: std.StringHashMapUnmanaged(TextTermSummary) = .empty,
+    text_summary_key_bytes: usize = 0,
     /// Query facades share scoring state only with this exact immutable corpus.
     /// The owner contains no query capability; cache misses use this facade.
     scoring_owner: ?*IndexSnapshot = null,
+
+    pub const TextTermSummary = struct { frequency: u32, tf_upper: f32 };
+    fn textSummaryKey(a: Allocator, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config) ![]u8 {
+        const key = try a.alloc(u8, 28 + field.len + term.len);
+        std.mem.writeInt(u64, key[0..8], segment, .little);
+        std.mem.writeInt(u32, key[8..12], @bitCast(average), .little);
+        std.mem.writeInt(u32, key[12..16], @bitCast(config.k1), .little);
+        std.mem.writeInt(u32, key[16..20], @bitCast(config.b), .little);
+        std.mem.writeInt(u64, key[20..28], field.len, .little);
+        @memcpy(key[28..][0..field.len], field);
+        @memcpy(key[28 + field.len ..], term);
+        return key;
+    }
+    pub fn cachedTextTermSummary(self: *const IndexSnapshot, a: Allocator, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config) !?TextTermSummary {
+        if (self.segments[segment].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+        const key = try textSummaryKey(a, segment, field, term, average, config);
+        defer a.free(key);
+        const owner = self.scoringCache();
+        while (!owner.text_summary_mu.tryLock()) spinOrYield();
+        defer owner.text_summary_mu.unlock();
+        return owner.text_summaries.get(key);
+    }
+    pub fn rememberTextTermSummary(self: *const IndexSnapshot, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config, value: TextTermSummary) !void {
+        const owner = self.scoringCache();
+        while (!owner.text_summary_mu.tryLock()) spinOrYield();
+        defer owner.text_summary_mu.unlock();
+        if (28 + field.len + term.len > 256 * 1024) return;
+        const key = try textSummaryKey(owner.alloc, segment, field, term, average, config);
+        errdefer owner.alloc.free(key);
+        if (owner.text_summaries.contains(key)) {
+            owner.alloc.free(key);
+            return;
+        }
+        // Bounded eviction keeps hot repeated queries reusable without
+        // accumulating a per-segment cache for an archive-sized inventory.
+        while (owner.text_summaries.count() >= 4096 or key.len > 256 * 1024 - owner.text_summary_key_bytes) {
+            var it = owner.text_summaries.iterator();
+            const first = it.next() orelse break;
+            const old = first.key_ptr.*;
+            _ = owner.text_summaries.remove(old);
+            owner.text_summary_key_bytes -= old.len;
+            owner.alloc.free(old);
+        }
+        try owner.text_summaries.put(owner.alloc, key, value);
+        owner.text_summary_key_bytes += key.len;
+    }
 
     fn scoringCache(self: *const IndexSnapshot) *IndexSnapshot {
         return self.scoring_owner orelse @constCast(self);
@@ -1002,6 +1052,9 @@ pub const IndexSnapshot = struct {
             while (table_it.next()) |table| alloc.destroy(table.*);
             self.bm25_bound_table_cache.deinit(alloc);
         }
+        var summaries = self.text_summaries.keyIterator();
+        while (summaries.next()) |key| alloc.free(key.*);
+        self.text_summaries.deinit(alloc);
         self.global_total_field_len.deinit(alloc);
         if (self.scoring_owner) |owner| owner.release();
         alloc.destroy(self);
@@ -3873,11 +3926,16 @@ test "external lake query scoring caches share only the exact immutable generati
     try std.testing.expectEqual(@as(u64, 1), owner.term_doc_freq_cache_misses);
     try std.testing.expectEqual(@as(u32, 1), try second.termDocFreq(a, "body", "common"));
     try std.testing.expectEqual(@as(u64, 1), owner.term_doc_freq_cache_hits);
+    try first.rememberTextTermSummary(0, "body", "common", 2, .{}, .{ .frequency = 1, .tf_upper = 2 });
+    try std.testing.expectEqual(@as(u32, 1), (try second.cachedTextTermSummary(a, 0, "body", "common", 2, .{})).?.frequency);
+    try std.testing.expect(try second.cachedTextTermSummary(a, 0, "body", "common", 3, .{}) == null);
+    try std.testing.expect(try second.cachedTextTermSummary(a, 0, "body", "common", 2, .{ .k1 = 2 }) == null);
     // Publishing a changed corpus must not inherit the old frequency cache.
     try writer.addSegment(bytes);
     const changed = try writer.acquireSnapshotWithReadContext(&context);
     defer changed.release();
     try std.testing.expect(changed.scoringCache() != owner);
+    try std.testing.expect(try changed.cachedTextTermSummary(a, 0, "body", "common", 2, .{}) == null);
     try std.testing.expectEqual(@as(u32, 2), try changed.termDocFreq(a, "body", "common"));
     try std.testing.expectEqual(@as(u32, 1), try first.termDocFreq(a, "body", "common"));
 }

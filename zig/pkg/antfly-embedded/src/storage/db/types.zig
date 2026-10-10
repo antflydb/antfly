@@ -16,6 +16,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 pub const SparseOrdinalSelection = @import("../../sparse/ordinal_lookup.zig").Selection;
+pub const SparseOrdinalWorkBudget = @import("../../sparse/ordinal_lookup.zig").WorkBudget;
+pub const SparseOrdinalKeyFilter = @import("../../sparse/ordinal_lookup.zig").KeyFilter;
 pub const SparseOrdinalLookup = @import("../../sparse/ordinal_lookup.zig").Lookup;
 const graph_mod = @import("../../graph/graph.zig");
 const traversal_mod = @import("../../graph/traversal.zig");
@@ -1942,7 +1944,10 @@ pub const SearchRequest = struct {
     native_key_predicate: ?struct {
         ptr: *anyopaque,
         allows: *const fn (*anyopaque, []const u8) anyerror!bool,
+        /// Changes only when exact query-owned constraints become materialized.
+        constraint_revision: ?*const fn (*anyopaque) u64 = null,
         select_constraints: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?SparseOrdinalSelection = null,
+        select_range: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup, u32, u32) anyerror!?SparseOrdinalSelection = null,
         select_ordinals: ?*const fn (*anyopaque, Allocator, SparseOrdinalLookup) anyerror!?@import("../../encoding/roaring.zig").RoaringBitmap = null,
     } = null,
     resolved_doc_filter_owned: bool = false,
@@ -4837,6 +4842,7 @@ pub const AsyncIndexingStats = struct {
 
 pub const DerivedWorkerStats = struct {
     workers: u64 = 0,
+    failed_workers: u64 = 0,
     workers_with_replay_debt: u64 = 0,
     max_replay_lag_sequences: u64 = 0,
     recoverable_retries: u64 = 0,
@@ -4994,6 +5000,7 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     dst.derived_workers.workers += src.derived_workers.workers;
     dst.derived_workers.workers_with_replay_debt += src.derived_workers.workers_with_replay_debt;
     dst.derived_workers.max_replay_lag_sequences = @max(dst.derived_workers.max_replay_lag_sequences, src.derived_workers.max_replay_lag_sequences);
+    dst.derived_workers.failed_workers += src.derived_workers.failed_workers;
     dst.derived_workers.recoverable_retries += src.derived_workers.recoverable_retries;
     dst.derived_workers.writer_locked_retries += src.derived_workers.writer_locked_retries;
     dst.derived_workers.resource_budget_retries += src.derived_workers.resource_budget_retries;

@@ -264,6 +264,165 @@ fn PredicateResolver(comptime Set: type) type {
         pinned: ?rows.PredicateContext = null,
         allow_partial: bool = true,
 
+        /// Query-owned exact physical membership, adaptive between point probes
+        /// and the existing whole-predicate index/scan planner.
+        pub const Membership = struct {
+            a: A,
+            resolver: Self,
+            arena: std.heap.ArenaAllocator,
+            json: []const u8,
+            predicates: std.ArrayList(rows.Predicate) = .empty,
+            complete: ?PhysicalSet = null,
+            spent: u64 = 0,
+            budget: u64 = 0,
+            pub fn deinit(self: *@This()) void {
+                self.closePredicates();
+                if (self.complete) |*set| set.deinit();
+                self.arena.deinit();
+            }
+            fn closePredicates(self: *@This()) void {
+                for (self.predicates.items) |*predicate| predicate.deinit();
+                self.predicates.clearRetainingCapacity();
+            }
+            fn materialize(self: *@This()) !void {
+                if (self.complete != null) return;
+                // A selective exact driver is cheaper than walking a broad
+                // second index or scanning its Parquet column. Probe remaining
+                // exact predicates only over these bounded physical candidates.
+                if (self.predicates.items.len != 0 and self.predicates.items[0].estimatedRows() <= 4096) {
+                    try self.materializeSelective();
+                    self.closePredicates();
+                    return;
+                }
+                const resolved = (try self.resolver.resolve(self.a, self.json)) orelse return error.UnsupportedQueryRequest;
+                self.complete = resolved.bitmap;
+                self.closePredicates();
+            }
+            fn materializeSelective(self: *@This()) !void {
+                var candidates = try self.resolver.consume(self.a, &self.predicates.items[0]);
+                errdefer candidates.deinit();
+                for (self.predicates.items[1..]) |*predicate| {
+                    const count = candidates.boundedCardinality(4096) orelse return error.InvalidNativeLakeRowIndex;
+                    if (count == 0) break;
+                    if (64 *| count >= predicate.work or !predicate.canProbeMembership()) {
+                        var next = try self.resolver.consume(self.a, predicate);
+                        defer next.deinit();
+                        candidates.andWith(&next);
+                        continue;
+                    }
+                    var selected = PhysicalSet.init(self.a);
+                    defer selected.deinit();
+                    var exhausted = false;
+                    var files = candidates.files.iterator();
+                    outer: while (files.next()) |file| {
+                        var blocks = file.value_ptr.iterator();
+                        while (blocks.next()) |block| {
+                            var rows_it = block.value_ptr.iterator();
+                            while (rows_it.next()) |low| {
+                                try self.resolver.context.ensureActive();
+                                try self.resolver.read_context.ensureActive();
+                                if (!predicate.canProbeMembership()) {
+                                    exhausted = true;
+                                    break :outer;
+                                }
+                                const ref: local.storage_rowsource_types.RowRef = .{ .external = .{ .source_id = self.resolver.source.inventory.source_id, .snapshot_id = self.resolver.source.inventory.snapshot_id, .file_id = file.key_ptr.*, .row_group_ordinal = block.key_ptr.group, .row_ordinal = (@as(u64, block.key_ptr.high) << 32) | low } };
+                                if (try predicate.contains(ref)) try selected.addRow(ref.external.file_id, ref.external.row_group_ordinal, ref.external.row_ordinal);
+                            }
+                        }
+                    }
+                    if (exhausted) {
+                        // Point and tuple walks have independent read budgets;
+                        // discard partial probe output before an exact index walk.
+                        var next = try self.resolver.consume(self.a, predicate);
+                        defer next.deinit();
+                        candidates.andWith(&next);
+                    } else {
+                        candidates.deinit();
+                        candidates = selected;
+                        selected = PhysicalSet.init(self.a);
+                    }
+                }
+                self.complete = candidates;
+            }
+            pub fn allows(self: *@This(), ref: local.storage_rowsource_types.RowRef) !bool {
+                try self.resolver.context.ensureActive();
+                try self.resolver.read_context.ensureActive();
+                if (self.complete == null) {
+                    const cost = std.math.mul(u64, 64, self.predicates.items.len) catch std.math.maxInt(u64);
+                    var probe = self.predicates.items.len != 0 and cost <= self.budget -| self.spent;
+                    for (self.predicates.items) |predicate| probe = probe and predicate.canProbeMembership();
+                    if (probe) {
+                        // Reserve the complete conjunction's work before probing;
+                        // short circuiting can only spend less than this budget.
+                        self.spent +|= cost;
+                        for (self.predicates.items) |*predicate| if (!try predicate.contains(ref)) return false;
+                        return true;
+                    }
+                    try self.materialize();
+                }
+                if (ref != .external) return error.InvalidNativeLakeRowIndex;
+                const row = ref.external;
+                return self.complete.?.contains(row.file_id, row.row_group_ordinal, row.row_ordinal);
+            }
+        };
+        pub fn openMembership(self: Self, a: A, json: []const u8) !Membership {
+            if (Set != PhysicalSet) @compileError("adaptive physical membership requires physical coordinates");
+            var result: Membership = .{ .a = a, .resolver = self, .arena = .init(a), .json = undefined };
+            errdefer result.deinit();
+            const ca = result.arena.allocator();
+            result.json = try ca.dupe(u8, json);
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, ca, json, .{});
+            const compiled = try Graph.compilePatternFilter(ca, parsed);
+            var conditions: std.ArrayList(Condition) = .empty;
+            if (try collectConditions(ca, compiled, &conditions, 0)) {
+                if (try rows.tryOpenPredicateWithContext(a, self.server, self.table, conditions.items, self.context, self.source, self.pinned)) |predicate| {
+                    var owned = predicate;
+                    result.predicates.append(ca, owned) catch |err| {
+                        owned.deinit();
+                        return err;
+                    };
+                } else {
+                    // Independent exact column predicates together prove the
+                    // entire conjunction. No residual/superset becomes membership.
+                    var names: std.StringHashMapUnmanaged(void) = .empty;
+                    for (conditions.items) |condition| {
+                        const entry = try names.getOrPut(ca, condition.column);
+                        if (entry.found_existing) continue;
+                        var subset: std.ArrayList(Condition) = .empty;
+                        for (conditions.items) |other| if (std.mem.eql(u8, condition.column, other.column)) try subset.append(ca, other);
+                        var predicate = (try rows.tryOpenPredicateWithContext(a, self.server, self.table, subset.items, self.context, self.source, self.pinned)) orelse {
+                            result.closePredicates();
+                            break;
+                        };
+                        result.predicates.append(ca, predicate) catch |err| {
+                            predicate.deinit();
+                            return err;
+                        };
+                    }
+                }
+                // Cardinality governs selective ordinal masks independently of
+                // cold metadata setup cost. Cheapest predicates short circuit first.
+                std.mem.sort(rows.Predicate, result.predicates.items, {}, struct {
+                    fn less(_: void, left: rows.Predicate, right: rows.Predicate) bool {
+                        return left.estimatedRows() < right.estimatedRows();
+                    }
+                }.less);
+                var work: u64 = 0;
+                var probe = result.predicates.items.len != 0;
+                for (result.predicates.items) |predicate| {
+                    work +|= predicate.work;
+                    probe = probe and predicate.hasMembership() and predicate.canProbeMembership();
+                }
+                result.budget = @min(work, rows.predicateScanWork(self.source, conditions.items) orelse std.math.maxInt(u64));
+                const selective = result.predicates.items.len != 0 and result.predicates.items[0].estimatedRows() <= 4096;
+                if (probe and !selective and result.budget > 64 *| result.predicates.items.len) return result;
+            }
+            // Selective, unsupported or exhausted plans use the authoritative
+            // exact planner. Small selections are ready before sparse navigation.
+            try result.materialize();
+            return result;
+        }
+
         pub fn resolve(self: Self, a: A, json: []const u8) !?if (Set == Bitmap) Result else PredicateResult {
             var arena = std.heap.ArenaAllocator.init(a);
             defer arena.deinit();

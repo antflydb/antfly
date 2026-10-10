@@ -540,7 +540,9 @@ pub fn execute(
     snap: *const index_mod.IndexSnapshot,
     request: SearchRequest,
 ) !SearchResult {
-    var result = if (request.sort != null)
+    var result = if (request.sort == null and request.search_after != null and request.aggregations.len == 0 and canStreamBool(request.query, 0))
+        (try executeStreamingTextBool(alloc, snap, if (request.query == .bool_query) request.query.bool_query else .{ .should = &.{request.query}, .min_should = 1, .pure_should_optional = true }, request, .{})).?
+    else if (request.sort != null)
         try executeSort(alloc, snap, request)
     else switch (request.query) {
         .match_none => try executeMatchNone(alloc, request),
@@ -670,6 +672,7 @@ fn executeMatch(
     mq: MatchQuery,
     request: SearchRequest,
 ) !SearchResult {
+    if (preferParallelText(snap) and mq.boost == 1) if (try executeStreamingTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request, .{})) |result| return result;
     if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) {
         if (try executeSimpleTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request)) |result| return result;
     }
@@ -710,6 +713,7 @@ fn executeTerm(
     tq: TermQuery,
     request: SearchRequest,
 ) !SearchResult {
+    if (preferParallelText(snap) and tq.boost == 1) if (try executeStreamingTextBool(alloc, snap, .{ .should = &.{.{ .term = tq }} }, request, .{})) |result| return result;
     if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) {
         if (try executeSimpleTextBool(alloc, snap, .{ .should = &.{.{ .term = tq }} }, request)) |result| return result;
     }
@@ -779,6 +783,10 @@ fn buildPhraseFilter(
     const tokens = try analyzer.analyze(alloc, text);
     defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
 
+    return buildPhraseFilterFromTokens(alloc, field, tokens, max_edits, auto_fuzzy);
+}
+
+fn buildPhraseFilterFromTokens(alloc: Allocator, field: []const u8, tokens: []const analysis_mod.Token, max_edits: u8, auto_fuzzy: bool) !?query_mod.Filter {
     if (tokens.len == 0) return null;
 
     var distinct_positions: usize = 0;
@@ -1672,7 +1680,7 @@ const FastTopK = struct {
     exclude_doc_nums: []const u32 = &.{},
     hits: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty,
     total_count: u32 = 0,
-    worst_index: usize = 0,
+    after: ?SearchCursor = null,
     pruned: bool = false,
     producers: ProducerConstraints = .{},
     segment_offset: u32 = 0,
@@ -1749,16 +1757,8 @@ const FastTopK = struct {
     }
     fn collectAdmitted(self: *FastTopK, hit: scorer_mod.ScoredHit) !void {
         self.total_count += 1;
-        if (self.k == 0) return;
-        if (self.hits.items.len < self.k) {
-            try self.hits.append(self.alloc, hit);
-            if (self.hits.items.len == self.k) self.refreshWorst();
-            return;
-        }
-        if (fastHitBetter(hit, self.hits.items[self.worst_index])) {
-            self.hits.items[self.worst_index] = hit;
-            self.refreshWorst();
-        }
+        if (self.after) |cursor| if (!(hit.score < cursor.score or (hit.score == cursor.score and hit.doc_id > cursor.doc_id))) return;
+        try scorer_mod.offerTopK(self.alloc, &self.hits, self.k, hit);
     }
 
     fn allows(self: *const FastTopK, doc_id: u32) bool {
@@ -1778,31 +1778,14 @@ const FastTopK = struct {
 
     fn minCompetitiveScore(self: *const FastTopK) f32 {
         if (self.k == 0 or self.hits.items.len < self.k) return 0;
-        return self.hits.items[self.worst_index].score;
+        return self.hits.items[0].score;
     }
 
     fn worstCompetitiveDocId(self: *const FastTopK) ?u32 {
         if (self.k == 0 or self.hits.items.len < self.k) return null;
-        return self.hits.items[self.worst_index].doc_id;
-    }
-
-    fn refreshWorst(self: *FastTopK) void {
-        self.worst_index = 0;
-        for (self.hits.items[1..], 1..) |candidate, i| {
-            if (fastHitWorse(candidate, self.hits.items[self.worst_index])) self.worst_index = i;
-        }
+        return self.hits.items[0].doc_id;
     }
 };
-
-fn fastHitBetter(left: scorer_mod.ScoredHit, right: scorer_mod.ScoredHit) bool {
-    if (left.score != right.score) return left.score > right.score;
-    return left.doc_id < right.doc_id;
-}
-
-fn fastHitWorse(left: scorer_mod.ScoredHit, right: scorer_mod.ScoredHit) bool {
-    if (left.score != right.score) return left.score < right.score;
-    return left.doc_id > right.doc_id;
-}
 
 fn containsSortedU32(items: []const u32, value: u32) bool {
     return std.sort.binarySearch(u32, items, value, compareU32) != null;
@@ -2615,12 +2598,1419 @@ fn executeSimpleTextBoolWithProducers(
     return try buildResult(alloc, snap, scored, collector.total_count, if (collector.pruned) .gte else .exact, request);
 }
 
+/// Per-segment monotone scorer tree. Each clause owns only its current posting;
+/// Boolean nodes retain current child hits instead of all-hit arrays/score maps.
+const StreamingBoolNode = struct {
+    const Hit = struct { doc: u32, score: f32 };
+    kind: enum { none, all, term, boolean, bitmap, phrase } = .none,
+    segment: *const index_mod.SegmentEntry,
+    steps: usize = 0,
+    group_optional: bool = false,
+    term: ?FastTermState = null,
+    prepared_term: ?struct { lookup: inverted.LookupResult, frequency: u32, idf: f32 } = null,
+    term_started: bool = false,
+    scorer: inverted.BM25TermScorer = undefined,
+    legacy_norm: bool = false,
+    positions: bool = false,
+    positions_decoded: bool = false,
+    segment_upper: f32 = std.math.inf(f32),
+    summary: ?index_mod.IndexSnapshot.TextTermSummary = null,
+    phrase_groups: []const []const *StreamingBoolNode = &.{},
+    phrase_scored: bool = false,
+    phrase_slop: u32 = 0,
+    phrase_idf: f32 = 0,
+    diagnostics: ?*SearchDiagnostics = null,
+    average: f32 = 0,
+    config: inverted.BM25Config = .{},
+    bitmap: ?*const roaring.RoaringBitmap = null,
+    offset: u32 = 0,
+    count: u32 = 0,
+    must: []const *StreamingBoolNode = &.{},
+    should: []const *StreamingBoolNode = &.{},
+    must_not: []const *StreamingBoolNode = &.{},
+    minimum: u32 = 0,
+    pivots: []u32 = &.{},
+    baseline: ?f32 = null,
+    boost: f32 = 1,
+    current: ?Hit = null,
+    exhausted: bool = false,
+    verified: ?bool = null,
+    requires_positions: bool = false,
+
+    fn check(self: *@This()) !void {
+        if (self.steps % 256 == 0) if (self.segment.query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check_context| try check_context(source.ranges.ptr);
+        self.steps +%= 1;
+    }
+
+    const PostingBound = struct { frequency: u32, norm: u32, last: u32 };
+    /// Position decoding is unnecessary for these authenticated posting limits.
+    fn postingBound(self: *@This(), first: u32) !PostingBound {
+        const state = &self.term.?;
+        const empty: PostingBound = .{ .frequency = 0, .norm = 0, .last = self.count - 1 };
+        if (!self.term_started) return .{ .frequency = std.math.maxInt(u32), .norm = 0, .last = self.count - 1 };
+        const posting = state.current orelse return empty;
+        if (posting.doc_id > first) return .{ .frequency = 0, .norm = 0, .last = posting.doc_id - 1 };
+        const unbounded: PostingBound = .{ .frequency = std.math.maxInt(u32), .norm = 0, .last = self.count - 1 };
+        const blocks = state.block_max orelse return unbounded;
+        var cursor = state.block_cursor orelse state.iter.currentBlockCursor() orelse return unbounded;
+        while (cursor.max_doc < first) {
+            try self.check();
+            if (!try state.iter.advanceBlockCursor(&cursor)) return empty;
+        }
+        state.block_cursor = cursor;
+        if (cursor.min_doc > first) return .{ .frequency = 0, .norm = 0, .last = cursor.min_doc - 1 };
+        const limits = blocks.frequencyNormAtOrdinal(cursor.ordinal) orelse return unbounded;
+        return .{ .frequency = limits.frequency, .norm = limits.norm, .last = @min(self.count - 1, cursor.max_doc) };
+    }
+
+    const Bound = struct { upper: f32, last: u32 };
+    /// A ceiling valid through the earliest child block boundary. Unsupported
+    /// signed subtrees disable pruning rather than borrowing another field's
+    /// statistics. Addition follows the scorer's clause/group order.
+    fn bound(self: *@This(), first: u32) anyerror!Bound {
+        try self.check();
+        var result: Bound = .{ .upper = std.math.inf(f32), .last = self.count - 1 };
+        if (self.boost < 0) return result;
+        switch (self.kind) {
+            .none => result.upper = 0,
+            .all => result.upper = 1,
+            .bitmap => result.upper = self.boost,
+            .phrase => {
+                if (!self.phrase_scored) {
+                    result.upper = self.boost;
+                } else if (validStreamingBounds(self.config, self.average) and self.phrase_idf >= 0) {
+                    var frequency: u32 = std.math.maxInt(u32);
+                    var norm: u32 = 0;
+                    for (self.phrase_groups, 0..) |group, i| {
+                        // Scored exact phrases have one term per position.
+                        const limit = try group[0].postingBound(first);
+                        result.last = @min(result.last, limit.last);
+                        if (limit.frequency == 0) frequency = 0;
+                        if (i == 0) {
+                            frequency = limit.frequency;
+                            norm = limit.norm;
+                        }
+                    }
+                    // Phrase frequency counts starts in the first term. Other
+                    // terms bound presence/range only: stacked duplicate starts
+                    // need not have distinct occurrences in every later term.
+                    result.upper = if (frequency == 0) 0 else inverted.bm25ScoreWithIdf(frequency, norm, self.average, self.phrase_idf, self.config) * self.boost;
+                }
+            },
+            .term => {
+                const state = &self.term.?;
+                if (state.idf < 0 or self.config.k1 < 0 or !std.math.isFinite(self.config.k1) or self.config.b < 0 or self.config.b > 1 or !std.math.isFinite(self.config.b) or !(self.average > 0)) return result;
+                if (!self.term_started) return result;
+                const posting = state.current orelse {
+                    result.upper = 0;
+                    return result;
+                };
+                if (posting.doc_id > first) return .{ .upper = 0, .last = posting.doc_id - 1 };
+                const blocks = state.block_max orelse return result;
+                var cursor = state.block_cursor orelse state.iter.currentBlockCursor() orelse return result;
+                // Walk authenticated block metadata without decoding rejected
+                // posting payloads. A later seek loads only the competitive block.
+                while (cursor.max_doc < first) {
+                    try self.check();
+                    if (!try state.iter.advanceBlockCursor(&cursor)) {
+                        result.upper = 0;
+                        return result;
+                    }
+                }
+                state.block_cursor = cursor;
+                if (cursor.min_doc > first) return .{ .upper = 0, .last = cursor.min_doc - 1 };
+                result.last = @min(result.last, cursor.max_doc);
+                result.upper = state.iter.blockCursorImpactWithIdf(blocks, cursor, self.average, state.idf, self.config) * self.boost;
+            },
+            .boolean => {
+                result.upper = self.baseline orelse 0;
+                for (self.must) |child| {
+                    const value = try child.bound(first);
+                    result.upper += value.upper;
+                    result.last = @min(result.last, value.last);
+                }
+                var optional: f32 = 0;
+                for (self.should) |child| {
+                    const value = try child.bound(first);
+                    if (self.group_optional) optional += @max(0, value.upper) else result.upper += @max(0, value.upper);
+                    result.last = @min(result.last, value.last);
+                }
+                if (self.group_optional) result.upper += optional;
+                result.upper *= self.boost;
+            },
+        }
+        // Cover legacy/precomputed BM25 and final multiplication rounding.
+        if (std.math.isFinite(result.upper) and result.upper > 0) result.upper = std.math.nextAfter(f32, result.upper * 1.000001, std.math.inf(f32));
+        return result;
+    }
+
+    fn segmentBound(self: *@This()) anyerror!f32 {
+        try self.check();
+        if (self.boost < 0) return std.math.inf(f32);
+        var upper: f32 = switch (self.kind) {
+            .none => 0,
+            .all => 1,
+            .bitmap => self.boost,
+            .term, .phrase => self.segment_upper,
+            .boolean => blk: {
+                var sum: f32 = self.baseline orelse 0;
+                for (self.must) |child| sum += try child.segmentBound();
+                var optional: f32 = 0;
+                for (self.should) |child| {
+                    const value = @max(0, try child.segmentBound());
+                    if (self.group_optional) optional += value else sum += value;
+                }
+                if (self.group_optional) sum += optional;
+                break :blk sum * self.boost;
+            },
+        };
+        if (!std.math.isFinite(upper)) return std.math.inf(f32);
+        if (upper > 0) upper = std.math.nextAfter(f32, upper * 1.000001, std.math.inf(f32));
+        return upper;
+    }
+
+    /// The approximation keeps only posting heads. Positions are unpacked only
+    /// after every phrase position has a term at the same document. Alternative
+    /// terms keep independent iterators, so repeated terms/positions are exact.
+    fn phraseFrequency(self: *@This(), doc: u32) !u32 {
+        if (self.diagnostics) |diagnostics| diagnostics.phrase_candidates_verified +|= 1;
+        if (self.phrase_scored and self.phrase_groups.len == 2) {
+            const first = self.phrase_groups[0][0];
+            const second = self.phrase_groups[1][0];
+            if (first.term.?.iter.canTakeDeferredPackedPositions() and second.term.?.iter.canTakeDeferredPackedPositions()) {
+                const left = try first.term.?.iter.takeDeferredPackedPositions();
+                const right = try second.term.?.iter.takeDeferredPackedPositions();
+                first.positions_decoded = true;
+                second.positions_decoded = true;
+                if (self.diagnostics) |diagnostics| diagnostics.phrase_position_records_decoded +|= 2;
+                return exactTwoTermPackedPhraseFrequency(left, right);
+            }
+        }
+        for (self.phrase_groups) |group| for (group) |term| {
+            if (term.current == null or term.current.?.doc != doc or term.positions_decoded) continue;
+            term.term.?.current = try term.term.?.iter.decodeDeferredPositions();
+            term.positions_decoded = true;
+            if (self.diagnostics) |diagnostics| diagnostics.phrase_position_records_decoded +|= 1;
+        };
+        var frequency: u32 = 0;
+        for (self.phrase_groups[0]) |first| {
+            if (first.current == null or first.current.?.doc != doc) continue;
+            for (first.term.?.current.?.positions) |start| {
+                var matches = true;
+                for (self.phrase_groups[1..], 1..) |group, offset| {
+                    const expected = start +| @as(u32, @intCast(offset));
+                    var found = false;
+                    for (group) |term| {
+                        if (term.current == null or term.current.?.doc != doc) continue;
+                        if (query_mod.positionWithinSlopForScoring(term.term.?.current.?.positions, expected, self.phrase_slop)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        matches = false;
+                        break;
+                    }
+                }
+                if (matches) {
+                    if (!self.phrase_scored) return 1;
+                    frequency +|= 1;
+                }
+            }
+        }
+        return frequency;
+    }
+
+    // Approximation is independent of verification. A selective sibling or
+    // native bitmap can advance every positional head before any positions are read.
+    fn shouldCandidate(self: *@This(), first: u32) anyerror!?u32 {
+        var target = first;
+        while (true) {
+            var live: usize = 0;
+            for (self.should) |child| if (try child.approximate(target)) |hit| {
+                self.pivots[live] = hit.doc;
+                live += 1;
+            };
+            const required = @max(self.minimum, 1);
+            if (live < required) return null;
+            var minimum = self.pivots[0];
+            var maximum = minimum;
+            for (self.pivots[1..live]) |doc| {
+                minimum = @min(minimum, doc);
+                maximum = @max(maximum, doc);
+            }
+            const pivot = if (required == 1) minimum else if (required == live) maximum else blk: {
+                std.mem.sort(u32, self.pivots[0..live], {}, std.sort.asc(u32));
+                break :blk self.pivots[required - 1];
+            };
+            if (minimum == pivot) return pivot;
+            target = pivot;
+        }
+    }
+    fn approximate(self: *@This(), first: u32) anyerror!?Hit {
+        if (self.exhausted) return null;
+        if (self.current) |hit| if (hit.doc >= first) return hit;
+        self.verified = null;
+        var target = first;
+        while (target < self.count) {
+            try self.check();
+            const hit: ?Hit = switch (self.kind) {
+                .none => null,
+                .all => .{ .doc = target, .score = 1 },
+                .bitmap => blk: {
+                    var iterator = self.bitmap.?.iterator();
+                    const global = iterator.seekTo(self.offset + target) orelse break :blk null;
+                    if (@as(u64, global) >= @as(u64, self.offset) + self.count) break :blk null;
+                    break :blk .{ .doc = global - self.offset, .score = self.boost };
+                },
+                .term => blk: {
+                    const state = &self.term.?;
+                    if (!self.term_started) {
+                        state.current = if (self.positions) try state.iter.advanceToDeferredPositions(target) else try state.iter.advanceTo(target);
+                        state.exhausted = state.current == null;
+                        self.term_started = true;
+                    } else if (self.positions) {
+                        if (!state.exhausted and state.current.?.doc_id < target) {
+                            state.current = try state.iter.advanceToDeferredPositions(target);
+                            state.exhausted = state.current == null;
+                            self.positions_decoded = false;
+                        }
+                    } else try state.advanceTo(target);
+                    state.block_cursor = null;
+                    const posting = state.current orelse break :blk null;
+                    const score = if (self.legacy_norm) inverted.bm25ScoreWithIdf(posting.freq, posting.norm, self.average, state.idf, self.config) else self.scorer.score(posting.freq, posting.norm);
+                    break :blk .{ .doc = posting.doc_id, .score = score * self.boost };
+                },
+                .phrase, .boolean => blk: {
+                    if (self.must.len != 0) {
+                        var aligned = false;
+                        while (!aligned) {
+                            aligned = true;
+                            for (self.must) |child| {
+                                const candidate = (try child.approximate(target)) orelse break :blk null;
+                                if (candidate.doc > target) {
+                                    target = candidate.doc;
+                                    aligned = false;
+                                }
+                            }
+                        }
+                    }
+                    if (self.kind == .boolean and (self.minimum > 0 or (self.must.len == 0 and self.baseline == null))) {
+                        const next = (try self.shouldCandidate(target)) orelse break :blk null;
+                        if (next > target and self.must.len != 0) {
+                            target = next;
+                            continue;
+                        }
+                        target = next;
+                    }
+                    break :blk .{ .doc = target, .score = 0 };
+                },
+            };
+            self.current = hit;
+            self.exhausted = hit == null;
+            return hit;
+        }
+        self.current = null;
+        self.exhausted = true;
+        return null;
+    }
+    fn verify(self: *@This()) anyerror!bool {
+        if (self.verified) |matched| return matched;
+        const hit = self.current orelse return false;
+        self.verified = false;
+        switch (self.kind) {
+            .none => return false,
+            .all, .bitmap, .term => {},
+            .phrase => {
+                const frequency = try self.phraseFrequency(hit.doc);
+                if (frequency == 0) return false;
+                const score = if (self.phrase_scored) inverted.bm25ScoreWithIdf(frequency, self.phrase_groups[0][0].term.?.current.?.norm, self.average, self.phrase_idf, self.config) else 1;
+                self.current.?.score = score * self.boost;
+                if (self.diagnostics) |diagnostics| diagnostics.phrase_matches_scored +|= 1;
+            },
+            .boolean => {
+                // Cheap exact clauses can reject an approximation before any
+                // positional verification. Score addition retains clause order.
+                for (self.must) |child| if (!child.requires_positions and !try child.verify()) return false;
+                for (self.must_not) |child| if (!child.requires_positions) {
+                    if (try child.approximate(hit.doc)) |candidate| if (candidate.doc == hit.doc and try child.verify()) return false;
+                };
+                var score: f32 = self.baseline orelse 0;
+                for (self.must) |child| {
+                    if (!try child.verify()) return false;
+                    score += child.current.?.score;
+                }
+                var matching: u32 = 0;
+                var optional: f32 = 0;
+                for (self.should) |child| if (try child.approximate(hit.doc)) |candidate| {
+                    if (candidate.doc == hit.doc and try child.verify()) {
+                        matching += 1;
+                        if (self.group_optional) optional += child.current.?.score else score += child.current.?.score;
+                    }
+                };
+                if (matching < self.minimum) return false;
+                if (self.group_optional) score += optional;
+                for (self.must_not) |child| if (child.requires_positions) {
+                    if (try child.approximate(hit.doc)) |candidate| if (candidate.doc == hit.doc and try child.verify()) return false;
+                };
+                self.current.?.score = score * self.boost;
+            },
+        }
+        self.verified = true;
+        return true;
+    }
+    fn seek(self: *@This(), first: u32) anyerror!?Hit {
+        var next = first;
+        while (try self.approximate(next)) |hit| {
+            if (try self.verify()) return self.current;
+            if (hit.doc == std.math.maxInt(u32)) break;
+            next = hit.doc + 1;
+        }
+        return null;
+    }
+};
+
+const StreamingBoolStats = struct {
+    const Frequency = struct { value: u32 = 0, local: bool = false };
+    const Field = struct { average: f32, frequencies: std.StringHashMapUnmanaged(Frequency) = .empty };
+    a: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    count: u32,
+    fields: std.StringHashMapUnmanaged(Field) = .empty,
+    overrides: []const distributed_stats_mod.TextFieldStats = &.{},
+    sealed: bool = false,
+    analyses: std.ArrayListUnmanaged(struct { text: []const u8, analyzer: *const analysis_mod.Analyzer, tokens: []const analysis_mod.Token }) = .empty,
+    phrases: std.ArrayListUnmanaged(struct { field: []const u8, text: []const u8, analyzer: *const analysis_mod.Analyzer, filter: ?query_mod.Filter }) = .empty,
+    fn analyzed(self: *@This(), text: []const u8, analyzer: *const analysis_mod.Analyzer) ![]const analysis_mod.Token {
+        for (self.analyses.items) |entry| if (entry.analyzer == analyzer and std.mem.eql(u8, entry.text, text)) return entry.tokens;
+        if (self.sealed) return error.InvalidArgument;
+        const tokens = try analyzer.analyze(self.a, text);
+        try self.analyses.append(self.a, .{ .text = text, .analyzer = analyzer, .tokens = tokens });
+        return tokens;
+    }
+    fn phraseFilter(self: *@This(), q: PhraseQuery) !?query_mod.Filter {
+        const analyzer = q.analyzer orelse &analysis_mod.default_analyzer;
+        for (self.phrases.items) |entry| if (entry.analyzer == analyzer and std.mem.eql(u8, entry.field, q.field) and std.mem.eql(u8, entry.text, q.text)) return entry.filter;
+        if (self.sealed) return error.InvalidArgument;
+        const filter = try buildPhraseFilterFromTokens(self.a, q.field, try self.analyzed(q.text, analyzer), 0, false);
+        try self.phrases.append(self.a, .{ .field = q.field, .text = q.text, .analyzer = analyzer, .filter = filter });
+        return filter;
+    }
+    fn add(self: *@This(), field: []const u8, term: []const u8, local: bool) !void {
+        const entry = try self.fields.getOrPut(self.a, field);
+        if (!entry.found_existing) entry.value_ptr.* = .{ .average = self.snap.textAvgDocLen(field) };
+        const value = try entry.value_ptr.frequencies.getOrPut(self.a, term);
+        if (!value.found_existing) {
+            value.key_ptr.* = try self.a.dupe(u8, term);
+            value.value_ptr.* = .{};
+        }
+        value.value_ptr.local = value.value_ptr.local or local;
+    }
+    fn collect(self: *@This(), query: SearchQuery) anyerror!void {
+        switch (query) {
+            .term => |t| try self.add(t.field, t.term, matchingFieldStats(self.overrides, t.field, &.{t.term}) == null),
+            .match => |m| {
+                const analyzer = m.analyzer orelse &analysis_mod.default_analyzer;
+                const tokens = try self.analyzed(m.text, analyzer);
+                const names = try self.a.alloc([]const u8, tokens.len);
+                for (tokens, names) |token, *name| name.* = token.term;
+                const local = matchingFieldStats(self.overrides, m.field, names) == null;
+                for (tokens) |token| try self.add(m.field, token.term, local);
+            },
+            .phrase => |q| {
+                const filter = (try self.phraseFilter(q)) orelse return;
+                switch (filter) {
+                    .phrase => |pf| for (pf.terms) |term| {
+                        try self.add(q.field, term, self.overrides.len == 0 and pf.slop == 0);
+                    },
+                    .multi_phrase => |pf| for (pf.term_alternatives) |group| {
+                        for (group) |term| try self.add(q.field, term, false);
+                    },
+                    else => unreachable,
+                }
+            },
+            .term_phrase => |q| for (q.terms) |term| {
+                try self.add(q.field, term, self.overrides.len == 0);
+            },
+            .multi_phrase => |q| for (q.terms) |group| {
+                for (group) |term| try self.add(q.field, term, false);
+            },
+            .bool_query => |b| for ([_][]const SearchQuery{ b.must, b.should, b.must_not }) |children| {
+                for (children) |child| try self.collect(child);
+            },
+            else => {},
+        }
+    }
+    fn load(self: *@This()) !void {
+        defer self.sealed = true;
+        var fields = self.fields.iterator();
+        while (fields.next()) |field| {
+            const frequencies = &field.value_ptr.frequencies;
+            var count: usize = 0;
+            var entries = frequencies.iterator();
+            while (entries.next()) |entry| if (entry.value_ptr.local) {
+                count += 1;
+            };
+            if (count == 0) continue;
+            const names = try self.a.alloc([]const u8, count);
+            const values = try self.a.alloc(u32, names.len);
+            entries = frequencies.iterator();
+            var i: usize = 0;
+            while (entries.next()) |entry| if (entry.value_ptr.local) {
+                names[i] = entry.key_ptr.*;
+                i += 1;
+            };
+            try self.snap.termDocFreqs(self.a, field.key_ptr.*, names, values);
+            for (names, values) |name, value| frequencies.getPtr(name).?.value = value;
+        }
+    }
+    fn get(self: *@This(), field: []const u8, term: []const u8) !struct { frequency: u32, known: bool, average: f32 } {
+        const value = self.fields.get(field) orelse return error.InvalidArgument;
+        const frequency = value.frequencies.get(term) orelse return error.InvalidArgument;
+        return .{ .frequency = frequency.value, .known = frequency.local, .average = value.average };
+    }
+    fn average(self: *@This(), field: []const u8) !f32 {
+        return (self.fields.get(field) orelse return error.InvalidArgument).average;
+    }
+};
+
+const StreamingBoolBuilder = struct {
+    a: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    segment: *const index_mod.SegmentEntry,
+    offset: u32,
+    config: inverted.BM25Config,
+    stats: *StreamingBoolStats,
+    constrained: bool,
+    bitmap_constraints: bool,
+    planning: bool = false,
+    compute_bounds: bool = true,
+    summaries_only: bool = false,
+    shared_readers: bool = false,
+    shared_cache_allocator: ?Allocator = null,
+    position_mode: bool = false,
+    force_local_stats: bool = false,
+    stats_override: ?distributed_stats_mod.TextFieldStats = null,
+    diagnostics: ?*SearchDiagnostics = null,
+    nodes: std.ArrayListUnmanaged(*StreamingBoolNode) = .empty,
+    readers: std.StringHashMapUnmanaged(?*inverted.ScopedInvertedIndexReader) = .empty,
+    lookups: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged(?inverted.LookupResult)) = .empty,
+    fn deinit(self: *@This()) void {
+        for (self.nodes.items) |node| {
+            if (node.term) |*term| term.deinit();
+        }
+        var readers = self.readers.valueIterator();
+        while (readers.next()) |reader| if (reader.*) |value| value.deinit();
+    }
+    fn openTerm(self: *@This(), value: *StreamingBoolNode) !void {
+        const prepared = value.prepared_term.?;
+        var iterator = try prepared.lookup.iterator(self.a);
+        iterator.decode_positions = false;
+        value.term = .{ .iter = iterator, .doc_freq = prepared.frequency, .idf = prepared.idf, .boost = value.boost, .block_max = switch (prepared.lookup) {
+            .postings => |postings| postings.block_max,
+            .one_hit => null,
+        }, .chunk_size = switch (prepared.lookup) {
+            .postings => |postings| postings.scoringChunkSize(),
+            .one_hit => 0,
+        } };
+        // Payloads remain unopened until approximation has an actual target.
+        value.term_started = false;
+    }
+    const CloneMap = std.AutoHashMapUnmanaged(*const StreamingBoolNode, *StreamingBoolNode);
+    fn cloneChildren(self: *@This(), source: []const *StreamingBoolNode, map: *CloneMap) anyerror![]const *StreamingBoolNode {
+        const result = try self.a.alloc(*StreamingBoolNode, source.len);
+        for (source, result) |child, *out| out.* = try self.cloneNode(child, map);
+        return result;
+    }
+    fn cloneNode(self: *@This(), source: *const StreamingBoolNode, map: *CloneMap) anyerror!*StreamingBoolNode {
+        if (map.get(source)) |node| return node;
+        const node = try self.allocateNode();
+        node.* = source.*;
+        node.diagnostics = self.diagnostics;
+        node.steps = 0;
+        try map.put(self.a, source, node);
+        node.must = try self.cloneChildren(source.must, map);
+        node.should = try self.cloneChildren(source.should, map);
+        node.must_not = try self.cloneChildren(source.must_not, map);
+        node.pivots = try self.a.alloc(u32, source.pivots.len);
+        const groups = try self.a.alloc([]const *StreamingBoolNode, source.phrase_groups.len);
+        for (source.phrase_groups, groups) |group, *out| out.* = try self.cloneChildren(group, map);
+        node.phrase_groups = groups;
+        if (node.prepared_term != null) try self.openTerm(node);
+        return node;
+    }
+    fn instantiate(self: *@This(), root: *const StreamingBoolNode) !*StreamingBoolNode {
+        var map: CloneMap = .empty;
+        defer map.deinit(self.a);
+        return self.cloneNode(root, &map);
+    }
+    fn fieldReader(self: *@This(), field: []const u8) !?*inverted.ScopedInvertedIndexReader {
+        const entry = try self.readers.getOrPut(self.a, field);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = null;
+            // Four 64 KiB hot slabs plus four concurrent fill slabs preserve the native I/O
+            // grain while sharing cache storage between scoring lanes.
+            const reader = (try self.segment.reader.invertedIndexScopedWithOptions(self.a, field, .{ .concurrent = self.shared_readers, .cache_bytes = if (self.shared_readers) 512 * 1024 else 256 * 1024, .cache_allocator = self.shared_cache_allocator })) orelse return null;
+            const value = self.a.create(inverted.ScopedInvertedIndexReader) catch |err| {
+                var owned = reader;
+                owned.deinit();
+                return err;
+            };
+            value.* = reader;
+            entry.value_ptr.* = value;
+        }
+        return entry.value_ptr.*;
+    }
+    fn summaryTerm(self: *@This(), field: []const u8, term: []const u8, average: f32) !index_mod.IndexSnapshot.TextTermSummary {
+        const index = (@intFromPtr(self.segment) - @intFromPtr(self.snap.segments.ptr)) / @sizeOf(index_mod.SegmentEntry);
+        if (try self.snap.cachedTextTermSummary(self.a, index, field, term, average, self.config)) |summary| {
+            if (self.diagnostics) |d| d.boolean_summary_hits += 1;
+            return summary;
+        }
+        const lookup = try self.lookupTerm(field, term);
+        const summary: index_mod.IndexSnapshot.TextTermSummary = if (lookup) |found| .{
+            .frequency = found.docFreq(),
+            .tf_upper = if (!validStreamingBounds(self.config, average)) std.math.inf(f32) else switch (found) {
+                .postings => |postings| if (postings.block_max) |blocks| blocks.maxImpactAllWithIdf(average, 1, self.config) else inverted.BM25TermScorer.init(average, 1, self.config).maxScore(),
+                .one_hit => |hit| inverted.bm25ScoreWithIdf(1, hit.norm_bits, average, 1, self.config),
+            },
+        } else .{ .frequency = 0, .tf_upper = 0 };
+        try self.snap.rememberTextTermSummary(index, field, term, average, self.config, summary);
+        if (self.diagnostics) |d| d.boolean_summary_loads += 1;
+        return summary;
+    }
+    fn lookupTerm(self: *@This(), field: []const u8, term: []const u8) !?inverted.LookupResult {
+        const field_entry = try self.lookups.getOrPut(self.a, field);
+        if (!field_entry.found_existing) field_entry.value_ptr.* = .empty;
+        const entry = try field_entry.value_ptr.getOrPut(self.a, term);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = null;
+            const reader = (try self.fieldReader(field)) orelse return null;
+            var lookup = (try reader.lookup(term)) orelse return null;
+            if (self.shared_readers and lookup == .postings and lookup.postings.impact_chunk_count != 0) {
+                lookup.postings.prepared_impact_chunk_ids = try lookup.postings.decodedImpactChunkIds(self.a);
+            }
+            entry.value_ptr.* = lookup;
+        }
+        return entry.value_ptr.*;
+    }
+    fn allocateNode(self: *@This()) !*StreamingBoolNode {
+        const value = try self.a.create(StreamingBoolNode);
+        value.* = .{ .segment = self.segment, .count = self.segment.reader.doc_count, .offset = self.offset };
+        try self.nodes.append(self.a, value);
+        return value;
+    }
+    fn children(self: *@This(), queries: []const SearchQuery) anyerror![]const *StreamingBoolNode {
+        const values = try self.a.alloc(*StreamingBoolNode, queries.len);
+        for (queries, values) |query, *value| value.* = try self.build(query);
+        return values;
+    }
+    fn simpleTerms(self: *@This(), terms: []const SimpleTextTerm, legacy: bool) anyerror![]const *StreamingBoolNode {
+        const values = try self.a.alloc(*StreamingBoolNode, terms.len);
+        for (terms, values) |term, *value| {
+            value.* = try self.build(.{ .term = .{ .field = term.field, .term = term.term, .boost = term.boost } });
+            value.*.legacy_norm = legacy;
+        }
+        return values;
+    }
+    /// Nested nodes retain the established simple-Boolean lowering and its
+    /// arithmetic order. Mixed/nested shapes use the general clause tree.
+    fn simple(self: *@This(), bq: BoolQuery) anyerror!?*StreamingBoolNode {
+        if (self.stats.overrides.len != 0 or (bq.pure_should_optional and bq.must.len == 0)) return null;
+        var must: std.ArrayListUnmanaged(SimpleTextTerm) = .empty;
+        var should: std.ArrayListUnmanaged(SimpleTextTerm) = .empty;
+        var prohibited: std.ArrayListUnmanaged(SimpleTextTerm) = .empty;
+        for (bq.must) |child| if (!try appendSimpleTextTerms(self.a, &must, child)) return null;
+        for (bq.should) |child| if (!try appendSimpleTextTerms(self.a, &should, child)) return null;
+        for (bq.must_not) |child| if (!try appendSimpleTextTerms(self.a, &prohibited, child)) return null;
+        if (must.items.len == 0 and should.items.len == 0) return null;
+        var field: ?[]const u8 = null;
+        for ([_][]const SimpleTextTerm{ must.items, should.items, prohibited.items }) |terms| {
+            if (terms.len != 0) field = simpleTermsField(terms, field) orelse return null;
+        }
+        const minimum = if (should.items.len != 0 and bq.min_should == 0 and must.items.len == 0) 1 else bq.min_should;
+        const value = try self.allocateNode();
+        if (minimum > should.items.len) return value;
+        var wand = must.items.len == 0 and prohibited.items.len == 0 and minimum == 1 and (!self.constrained or bq.boost == 1);
+        for (should.items) |term| if (term.boost != 1) {
+            wand = false;
+        };
+        value.kind = .boolean;
+        value.boost = bq.boost;
+        value.minimum = minimum;
+        value.group_optional = must.items.len != 0;
+        value.must = try self.simpleTerms(must.items, !wand);
+        value.should = try self.simpleTerms(should.items, !wand);
+        value.must_not = try self.simpleTerms(prohibited.items, !wand);
+        value.pivots = try self.a.alloc(u32, value.should.len);
+        return value;
+    }
+    fn phrase(self: *@This(), field: []const u8, terms: []const []const []const u8, slop: u32, scored: bool, boost: f32) anyerror!*StreamingBoolNode {
+        const value = try self.allocateNode();
+        if (terms.len == 0) return value;
+        for (terms) |alternatives| if (alternatives.len == 0) return value;
+        value.boost = boost;
+        value.phrase_scored = scored and self.stats.overrides.len == 0;
+        value.phrase_slop = slop;
+        value.config = self.config;
+        value.average = try self.stats.average(field);
+        value.diagnostics = self.diagnostics;
+        const groups = try self.a.alloc([]const *StreamingBoolNode, terms.len);
+        const heads = try self.a.alloc(*StreamingBoolNode, terms.len);
+        const previous_mode = self.position_mode;
+        const previous_local = self.force_local_stats;
+        self.position_mode = true;
+        self.force_local_stats = true;
+        defer self.position_mode = previous_mode;
+        defer self.force_local_stats = previous_local;
+        for (terms, 0..) |alternatives, i| {
+            var nodes: std.ArrayListUnmanaged(*StreamingBoolNode) = .empty;
+            for (alternatives, 0..) |term, j| {
+                var duplicate = false;
+                for (alternatives[0..j]) |prior| if (std.mem.eql(u8, prior, term)) {
+                    duplicate = true;
+                    break;
+                };
+                if (duplicate) continue;
+                const node = try self.build(.{ .term = .{ .field = field, .term = term } });
+                if (node.kind == .none) continue;
+                try nodes.append(self.a, node);
+                if (value.phrase_scored) value.phrase_idf += inverted.bm25Idf(self.stats.count, (try self.stats.get(field, term)).frequency);
+            }
+            if (nodes.items.len == 0) return value;
+            groups[i] = try nodes.toOwnedSlice(self.a);
+            if (groups[i].len == 1) heads[i] = groups[i][0] else {
+                const head = try self.allocateNode();
+                head.kind = .boolean;
+                head.should = groups[i];
+                head.minimum = 1;
+                head.pivots = try self.a.alloc(u32, groups[i].len);
+                heads[i] = head;
+            }
+        }
+        value.kind = .phrase;
+        value.requires_positions = true;
+        value.phrase_groups = groups;
+        value.must = heads;
+        value.segment_upper = if (!self.planning or !self.compute_bounds) std.math.inf(f32) else if (!value.phrase_scored) boost else if (validStreamingBounds(self.config, value.average)) blk: {
+            if (groups[0][0].summary) |summary| break :blk summary.tf_upper * value.phrase_idf * boost;
+            const lookup = groups[0][0].prepared_term.?.lookup;
+            const ceiling = switch (lookup) {
+                .postings => |postings| if (postings.block_max) |blocks| blocks.maxImpactAllWithIdf(value.average, value.phrase_idf, self.config) else inverted.BM25TermScorer.init(value.average, value.phrase_idf, self.config).maxScore(),
+                .one_hit => |hit| inverted.bm25ScoreWithIdf(1, hit.norm_bits, value.average, value.phrase_idf, self.config),
+            };
+            break :blk ceiling * boost;
+        } else std.math.inf(f32);
+        return value;
+    }
+    fn build(self: *@This(), query: SearchQuery) anyerror!*StreamingBoolNode {
+        if (query == .bool_query) if (try self.simple(query.bool_query)) |value| return value;
+        switch (query) {
+            .term_phrase => |q| {
+                const groups = try self.a.alloc([]const []const u8, q.terms.len);
+                for (groups, 0..) |*group, i| group.* = q.terms[i..][0..1];
+                return self.phrase(q.field, groups, 0, true, q.boost);
+            },
+            .multi_phrase => |q| return self.phrase(q.field, q.terms, 0, false, q.boost),
+            .phrase => |q| {
+                const filter = (try self.stats.phraseFilter(q)) orelse return self.allocateNode();
+                switch (filter) {
+                    .phrase => |pf| {
+                        const groups = try self.a.alloc([]const []const u8, pf.terms.len);
+                        for (groups, 0..) |*group, i| group.* = pf.terms[i..][0..1];
+                        return self.phrase(q.field, groups, pf.slop, pf.slop == 0, q.boost);
+                    },
+                    .multi_phrase => |pf| return self.phrase(q.field, pf.term_alternatives, pf.slop, false, q.boost),
+                    else => unreachable,
+                }
+            },
+            else => {},
+        }
+        const value = try self.allocateNode();
+        switch (query) {
+            .match_none => {},
+            .match_all => value.kind = .all,
+            .doc_num => |dq| {
+                if (dq.bitmap) |bitmap| {
+                    value.kind = .bitmap;
+                    value.bitmap = bitmap;
+                    value.boost = dq.boost;
+                }
+            },
+            .term => |tq| {
+                value.boost = tq.boost;
+                value.legacy_norm = self.stats.overrides.len == 0 and self.bitmap_constraints and tq.boost != 1;
+                const local = try self.stats.get(tq.field, tq.term);
+                const override = if (self.force_local_stats) null else self.stats_override orelse matchingFieldStats(self.stats.overrides, tq.field, &.{tq.term});
+                const frequency_hint = if (override) |global| global.termDocFreq(tq.term).? else local.frequency;
+                const average = if (override) |global| global.avgDocLen() else local.average;
+                const count = if (override) |global| global.global_doc_count else self.stats.count;
+                if (count == 0 or (local.known and local.frequency == 0)) return value;
+                if (self.summaries_only) {
+                    const summary = try self.summaryTerm(tq.field, tq.term, average);
+                    if (summary.frequency == 0) return value;
+                    const frequency = @min(count, if (frequency_hint != 0) frequency_hint else summary.frequency);
+                    value.kind = .term;
+                    value.summary = summary;
+                    value.segment_upper = summary.tf_upper * inverted.bm25Idf(count, frequency) * tq.boost;
+                    return value;
+                }
+                const lookup = (try self.lookupTerm(tq.field, tq.term)) orelse return value;
+                // Match the authoritative WAND context: zero overrides use the
+                // segment frequency and counts above the corpus are clamped.
+                const frequency = @min(count, if (frequency_hint != 0) frequency_hint else lookup.docFreq());
+                value.positions = self.position_mode;
+                value.average = average;
+                value.config = self.config;
+                value.scorer = .init(average, inverted.bm25Idf(count, frequency), self.config);
+                value.prepared_term = .{ .lookup = lookup, .frequency = frequency, .idf = inverted.bm25Idf(count, frequency) };
+                if (self.planning) {
+                    value.kind = .term;
+                    if (self.compute_bounds and validStreamingBounds(self.config, average) and inverted.bm25Idf(count, frequency) >= 0) {
+                        const ceiling = switch (lookup) {
+                            .postings => |postings| if (postings.block_max) |blocks| blocks.maxImpactAllWithIdf(average, inverted.bm25Idf(count, frequency), self.config) else inverted.bm25MaxScore(count, frequency, self.config),
+                            .one_hit => |hit| inverted.bm25Score(1, hit.norm_bits, count, frequency, average, self.config),
+                        };
+                        value.segment_upper = ceiling * tq.boost;
+                    }
+                    return value;
+                }
+                try self.openTerm(value);
+                value.kind = .term;
+            },
+            .match => |mq| {
+                const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
+                const tokens = try self.stats.analyzed(mq.text, analyzer);
+                var names: std.ArrayListUnmanaged([]const u8) = .empty;
+                for (tokens) |token| try names.append(self.a, token.term);
+                const previous_override = self.stats_override;
+                const previous_local = self.force_local_stats;
+                self.stats_override = matchingFieldStats(self.stats.overrides, mq.field, names.items);
+                self.force_local_stats = self.stats_override == null;
+                defer self.stats_override = previous_override;
+                defer self.force_local_stats = previous_local;
+                const legacy = self.stats.overrides.len == 0 and self.bitmap_constraints and mq.boost != 1;
+                var unique: std.ArrayListUnmanaged(*StreamingBoolNode) = .empty;
+                for (tokens, 0..) |token, i| {
+                    var duplicate = false;
+                    for (tokens[0..i]) |previous| if (std.mem.eql(u8, previous.term, token.term)) {
+                        duplicate = true;
+                        break;
+                    };
+                    if (!duplicate) try unique.append(self.a, try self.build(.{ .term = .{ .field = mq.field, .term = token.term, .boost = if (legacy) mq.boost else 1 } }));
+                }
+                value.kind = .boolean;
+                value.should = try unique.toOwnedSlice(self.a);
+                value.minimum = 1;
+                value.boost = if (legacy) 1 else mq.boost;
+            },
+            .bool_query => |bq| {
+                value.kind = .boolean;
+                value.boost = bq.boost;
+                value.must = try self.children(bq.must);
+                value.should = try self.children(bq.should);
+                value.must_not = try self.children(bq.must_not);
+                value.minimum = if (bq.should.len == 0) 0 else if (bq.min_should == 0 and bq.must.len == 0 and !bq.pure_should_optional) 1 else bq.min_should;
+                if (bq.must.len == 0 and (bq.should.len == 0 or bq.pure_should_optional)) value.baseline = if (bq.pure_should_optional) 0 else 1;
+            },
+            .phrase, .term_phrase, .multi_phrase => unreachable,
+            else => unreachable,
+        }
+        if (value.kind == .boolean) {
+            value.pivots = try self.a.alloc(u32, value.should.len);
+            for ([_][]const *StreamingBoolNode{ value.must, value.should, value.must_not }) |children_| for (children_) |child| {
+                value.requires_positions = value.requires_positions or child.requires_positions;
+            };
+        }
+        return value;
+    }
+};
+
+fn canStreamBool(query: SearchQuery, depth: usize) bool {
+    if (depth > 32) return false;
+    return switch (query) {
+        .term => |t| std.math.isFinite(t.boost),
+        .match => |m| std.math.isFinite(m.boost),
+        .phrase => |q| !q.auto_fuzzy and q.max_edits == 0 and std.math.isFinite(q.boost),
+        .term_phrase => |q| !q.auto_fuzzy and q.max_edits == 0 and std.math.isFinite(q.boost),
+        .multi_phrase => |q| !q.auto_fuzzy and q.max_edits == 0 and std.math.isFinite(q.boost),
+        .match_none, .match_all => true,
+        .doc_num => |d| d.producer == null and d.ids.len == 0 and std.math.isFinite(d.boost),
+        .bool_query => |b| blk: {
+            if (!std.math.isFinite(b.boost)) break :blk false;
+            for ([_][]const SearchQuery{ b.must, b.should, b.must_not }) |children| for (children) |child| if (!canStreamBool(child, depth + 1)) break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn validStreamingBounds(config: inverted.BM25Config, average: f32) bool {
+    return config.k1 >= 0 and std.math.isFinite(config.k1) and config.b >= 0 and config.b <= 1 and std.math.isFinite(config.b) and average > 0;
+}
+
+/// Query-scoped immutable segment lowering. Scoped readers own navigation and
+/// concurrent backing caches; range nodes own only mutable decoder state.
+const StreamingBoolPrepared = struct {
+    const Budget = @import("../sparse/ordinal_lookup.zig").MaskBudget;
+    const Locked = @import("../sql/parallel_scheduler.zig").LockedAllocator;
+    budget: Budget,
+    locked: Locked,
+    arena: std.heap.ArenaAllocator,
+    builder: StreamingBoolBuilder,
+    root: *StreamingBoolNode = undefined,
+    upper: f32 = std.math.inf(f32),
+
+    fn create(cache: *StreamingBoolPreparedCache, plan: index_mod.IndexSnapshot.TextSegmentPlan) !?*StreamingBoolPrepared {
+        const self = try cache.backing.create(StreamingBoolPrepared);
+        self.budget = .{ .backing = cache.backing, .limit = cache.entry_bytes };
+        self.locked = .{ .backing = self.budget.allocator() };
+        self.arena = std.heap.ArenaAllocator.init(self.locked.allocator());
+        const segment = &cache.snap.segments[plan.segment_idx];
+        self.builder = .{ .a = self.arena.allocator(), .snap = cache.snap, .segment = segment, .offset = plan.doc_offset, .config = cache.request.bm25_config, .stats = cache.stats, .constrained = requestHasDocNumConstraints(cache.request) or cache.producers.present(), .bitmap_constraints = cache.request.filter_doc_bitmap != null or cache.request.exclude_doc_bitmap != null, .planning = true, .compute_bounds = false, .shared_readers = true, .shared_cache_allocator = self.locked.allocator() };
+        segment.beginAccess();
+        defer segment.endAccess();
+        self.prepare(cache.bq) catch |err| {
+            const capped = (err == error.OutOfMemory and self.budget.exhausted) or err == error.CacheBudgetExceeded or err == error.SegmentReadBudgetExceeded;
+            self.destroy();
+            if (capped) return null;
+            return err;
+        };
+        return self;
+    }
+    fn prepare(self: *@This(), bq: BoolQuery) !void {
+        self.root = try self.builder.build(.{ .bool_query = bq });
+        self.upper = try self.root.segmentBound();
+    }
+    fn destroy(self: *@This()) void {
+        self.builder.deinit();
+        self.arena.deinit();
+        std.debug.assert(self.budget.live == 0);
+        self.budget.backing.destroy(self);
+    }
+};
+
+/// Four bounded resident entries cover the scoring lanes. Construction is
+/// singleflight per segment and runs outside the coordinator lock. References
+/// pin readers through iterator destruction; only idle entries can be evicted.
+const StreamingBoolPreparedCache = struct {
+    const Slot = struct { segment: ?usize = null, owner: ?*StreamingBoolPrepared = null, users: usize = 0, building: bool = false, age: u64 = 0 };
+    const Lease = struct {
+        cache: *StreamingBoolPreparedCache,
+        slot: *Slot,
+        owner: *StreamingBoolPrepared,
+        fn release(self: *@This()) void {
+            self.cache.mutex.lockUncancelable(self.cache.io);
+            defer self.cache.mutex.unlock(self.cache.io);
+            std.debug.assert(self.slot.users != 0 and self.slot.owner == self.owner);
+            self.slot.users -= 1;
+            self.cache.changed.broadcast(self.cache.io);
+        }
+    };
+    io: std.Io,
+    snap: *const index_mod.IndexSnapshot,
+    bq: BoolQuery,
+    request: SearchRequest,
+    stats: *StreamingBoolStats,
+    producers: ProducerConstraints,
+    entry_bytes: usize = 8 * 1024 * 1024,
+    backing: Allocator = std.heap.page_allocator,
+    slots: [4]Slot = @splat(.{}),
+    mutex: std.Io.Mutex = .init,
+    changed: std.Io.Condition = .init,
+    clock: u64 = 0,
+    preparations: std.atomic.Value(u64) = .init(0),
+    reuses: std.atomic.Value(u64) = .init(0),
+    fn deinit(self: *@This()) void {
+        for (&self.slots) |*slot| {
+            std.debug.assert(slot.users == 0 and !slot.building);
+            if (slot.owner) |owner| owner.destroy();
+        }
+    }
+    fn get(self: *@This(), plan: index_mod.IndexSnapshot.TextSegmentPlan) !?Lease {
+        const segment = &self.snap.segments[plan.segment_idx];
+        if (segment.query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check_context| try check_context(source.ranges.ptr);
+        try self.mutex.lock(self.io);
+        while (true) {
+            var found: ?*Slot = null;
+            var victim: ?*Slot = null;
+            for (&self.slots) |*slot| {
+                if (slot.segment == plan.segment_idx) found = slot;
+                if (slot.users == 0 and !slot.building and (victim == null or slot.segment == null or slot.age < victim.?.age)) victim = slot;
+            }
+            if (found) |slot| {
+                if (!slot.building) {
+                    self.clock +%= 1;
+                    slot.age = self.clock;
+                    const owner = slot.owner orelse {
+                        self.mutex.unlock(self.io);
+                        return null;
+                    };
+                    slot.users += 1;
+                    _ = self.reuses.fetchAdd(1, .monotonic);
+                    self.mutex.unlock(self.io);
+                    return .{ .cache = self, .slot = slot, .owner = owner };
+                }
+            } else if (victim) |slot| {
+                const old = slot.owner;
+                self.clock +%= 1;
+                slot.* = .{ .segment = plan.segment_idx, .building = true, .users = 1, .age = self.clock };
+                self.mutex.unlock(self.io);
+                if (old) |owner| owner.destroy();
+                const prepared = StreamingBoolPrepared.create(self, plan) catch |err| {
+                    self.mutex.lockUncancelable(self.io);
+                    slot.* = .{};
+                    self.changed.broadcast(self.io);
+                    self.mutex.unlock(self.io);
+                    return err;
+                };
+                self.mutex.lockUncancelable(self.io);
+                slot.owner = prepared;
+                slot.building = false;
+                if (prepared == null) slot.users = 0;
+                self.changed.broadcast(self.io);
+                self.mutex.unlock(self.io);
+                if (prepared) |owner| {
+                    _ = self.preparations.fetchAdd(1, .monotonic);
+                    return .{ .cache = self, .slot = slot, .owner = owner };
+                }
+                return null;
+            }
+            self.changed.wait(self.io, &self.mutex) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            };
+        }
+    }
+};
+
+const StreamingBoolPlanning = struct {
+    cache: *StreamingBoolPreparedCache,
+    plans: []index_mod.IndexSnapshot.TextSegmentPlan,
+    next: std.atomic.Value(usize) = .init(0),
+    loads: std.atomic.Value(u64) = .init(0),
+    hits: std.atomic.Value(u64) = .init(0),
+    fn run(self: *@This()) anyerror!void {
+        var budget: StreamingBoolPrepared.Budget = .{ .backing = std.heap.page_allocator, .limit = self.cache.entry_bytes };
+        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        defer arena.deinit();
+        while (true) {
+            const index = self.next.fetchAdd(1, .monotonic);
+            if (index >= self.plans.len) return;
+            const plan = &self.plans[index];
+            const segment = &self.cache.snap.segments[plan.segment_idx];
+            if (segment.reader.doc_count == 0) continue;
+            _ = arena.reset(.free_all);
+            var diagnostics: SearchDiagnostics = .{};
+            var builder: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = self.cache.snap, .segment = segment, .offset = plan.doc_offset, .config = self.cache.request.bm25_config, .stats = self.cache.stats, .constrained = requestHasDocNumConstraints(self.cache.request) or self.cache.producers.present(), .bitmap_constraints = self.cache.request.filter_doc_bitmap != null or self.cache.request.exclude_doc_bitmap != null, .planning = true, .summaries_only = true, .diagnostics = &diagnostics };
+            defer builder.deinit();
+            segment.beginAccess();
+            defer segment.endAccess();
+            const root = builder.build(.{ .bool_query = self.cache.bq }) catch |err| {
+                if ((err == error.OutOfMemory and budget.exhausted) or err == error.SegmentReadBudgetExceeded or err == error.CacheBudgetExceeded) continue;
+                return err;
+            };
+            plan.score_upper_bound = try root.segmentBound();
+            _ = self.loads.fetchAdd(diagnostics.boolean_summary_loads, .monotonic);
+            _ = self.hits.fetchAdd(diagnostics.boolean_summary_hits, .monotonic);
+        }
+    }
+
+    fn execute(self: *@This()) !u64 {
+        const scheduler = StreamingBoolParallel.scheduler;
+        const lanes = @min(4, scheduler.global().fanout(self.plans.len, 32 * 1024 * 1024, self.cache.entry_bytes));
+        var tasks: [3]?scheduler.Task(anyerror!void) = @splat(null);
+        defer for (&tasks) |*slot| if (slot.*) |*task| if (task.future != null) {
+            task.cancel(self.cache.io) catch {};
+        };
+        var submitted: u64 = 0;
+        for (tasks[0 .. lanes - 1]) |*slot| {
+            slot.* = scheduler.global().submit(self.cache.io, self.cache.entry_bytes, run, .{self});
+            if (slot.* == null) try self.run() else submitted += 1;
+        }
+        try self.run();
+        for (&tasks) |*slot| if (slot.*) |*task| try task.await(self.cache.io);
+        return submitted;
+    }
+};
+
+/// Fragmented snapshots amortize this metadata-only prepass. The same lowering
+/// and field statistics as scoring compose safe ceilings, while original global
+/// offsets preserve tie ordering after promising segments are visited first.
+fn planStreamingBoolSegments(a: Allocator, scratch: *std.heap.ArenaAllocator, snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, stats: *StreamingBoolStats, producers: ProducerConstraints) ![]index_mod.IndexSnapshot.TextSegmentPlan {
+    return planStreamingBoolSegmentsCached(a, scratch, snap, bq, request, stats, producers, null);
+}
+fn planStreamingBoolSegmentsCached(a: Allocator, scratch: *std.heap.ArenaAllocator, snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, stats: *StreamingBoolStats, producers: ProducerConstraints, cache: ?*StreamingBoolPreparedCache) ![]index_mod.IndexSnapshot.TextSegmentPlan {
+    const plans = try a.alloc(index_mod.IndexSnapshot.TextSegmentPlan, snap.segments.len);
+    errdefer a.free(plans);
+    const enabled = snap.segments.len > 16;
+    var offset: u32 = 0;
+    for (snap.segments, plans, 0..) |*segment, *plan, i| {
+        var upper = std.math.inf(f32);
+        if (enabled and cache == null and segment.reader.doc_count != 0) {
+            segment.beginAccess();
+            defer segment.endAccess();
+            _ = scratch.reset(.retain_capacity);
+            var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .bitmap_constraints = request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null, .planning = true, .summaries_only = true, .diagnostics = request.diagnostics };
+            defer builder.deinit();
+            upper = try (try builder.build(.{ .bool_query = bq })).segmentBound();
+        }
+        plan.* = .{ .segment_idx = i, .doc_offset = offset, .score_upper_bound = upper };
+        offset = try std.math.add(u32, offset, segment.reader.doc_count);
+    }
+    if (enabled) if (cache) |shared| {
+        var planning: StreamingBoolPlanning = .{ .cache = shared, .plans = plans };
+        const submitted = try planning.execute();
+        if (request.diagnostics) |diagnostics| {
+            diagnostics.boolean_plan_tasks += submitted;
+            diagnostics.boolean_summary_loads += planning.loads.load(.monotonic);
+            diagnostics.boolean_summary_hits += planning.hits.load(.monotonic);
+        }
+    };
+    if (enabled) std.mem.sort(index_mod.IndexSnapshot.TextSegmentPlan, plans, {}, struct {
+        fn less(_: void, left: index_mod.IndexSnapshot.TextSegmentPlan, right: index_mod.IndexSnapshot.TextSegmentPlan) bool {
+            if (left.score_upper_bound == right.score_upper_bound) return left.doc_offset < right.doc_offset;
+            return left.score_upper_bound > right.score_upper_bound;
+        }
+    }.less);
+    return plans;
+}
+
+fn streamingCutoff(collector: *const FastTopK, shared: ?*StreamingBoolParallel) ?scorer_mod.ScoredHit {
+    var result: ?scorer_mod.ScoredHit = if (collector.worstCompetitiveDocId()) |doc| .{ .doc_id = doc, .score = collector.minCompetitiveScore() } else null;
+    if (shared) |owner| if (owner.cutoff_valid.load(.acquire)) {
+        const cutoff_bits = owner.cutoff.load(.acquire);
+        const global: scorer_mod.ScoredHit = .{ .doc_id = @truncate(cutoff_bits), .score = @bitCast(@as(u32, @truncate(cutoff_bits >> 32))) };
+        if (result == null or scorer_mod.scoredHitBetterThan(global, result.?)) result = global;
+    };
+    return result;
+}
+fn scoreStreamingBoolSegment(snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, stats: *StreamingBoolStats, producers: ProducerConstraints, plan: index_mod.IndexSnapshot.TextSegmentPlan, arena: *std.heap.ArenaAllocator, collector: *FastTopK, shared: ?*StreamingBoolParallel) !void {
+    return scoreStreamingBoolRange(snap, bq, request, stats, producers, .{ .plan = plan, .first = 0, .end = snap.segments[plan.segment_idx].reader.doc_count }, arena, collector, shared);
+}
+
+fn scoreStreamingBoolRange(snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, stats: *StreamingBoolStats, producers: ProducerConstraints, work: StreamingBoolParallel.Work, arena: *std.heap.ArenaAllocator, collector: *FastTopK, shared: ?*StreamingBoolParallel) !void {
+    return scoreStreamingBoolRangeCached(snap, bq, request, stats, producers, work, arena, collector, shared, if (shared) |owner| owner.prepared else null);
+}
+fn scoreStreamingBoolRangeCached(snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, stats: *StreamingBoolStats, producers: ProducerConstraints, work: StreamingBoolParallel.Work, arena: *std.heap.ArenaAllocator, collector: *FastTopK, shared: ?*StreamingBoolParallel, cache: ?*StreamingBoolPreparedCache) !void {
+    const plan = work.plan;
+    try collector.flushPending();
+    if (streamingCutoff(collector, shared)) |cutoff| {
+        const worst = cutoff.doc_id;
+        const threshold = cutoff.score;
+        if (std.math.isFinite(plan.score_upper_bound) and (plan.score_upper_bound < threshold or (plan.score_upper_bound == threshold and @as(u64, plan.doc_offset) + work.first > worst))) {
+            collector.pruned = true;
+            if (request.diagnostics) |diagnostics| diagnostics.segments_pruned +|= 1;
+            return;
+        }
+    }
+    const segment = &snap.segments[plan.segment_idx];
+    const offset = plan.doc_offset;
+    try collector.beginSegment(offset, segment.reader.doc_count);
+    segment.beginAccess();
+    defer segment.endAccess();
+    _ = arena.reset(.retain_capacity);
+    var lease = if (cache) |prepared| try prepared.get(plan) else null;
+    defer if (lease) |*selected| selected.release();
+    var builder: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = snap, .segment = segment, .offset = offset, .config = request.bm25_config, .stats = stats, .constrained = requestHasDocNumConstraints(request) or producers.present(), .bitmap_constraints = request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null, .diagnostics = request.diagnostics };
+    defer builder.deinit();
+    const root = if (lease) |selected| try builder.instantiate(selected.owner.root) else try builder.build(.{ .bool_query = bq });
+    if (request.diagnostics) |diagnostics| {
+        diagnostics.segments_searched += 1;
+        for (builder.nodes.items) |node| if (node.term != null) {
+            diagnostics.postings_iterators_opened += 1;
+        };
+    }
+    segment.shared.lockDeletionShared();
+    defer segment.shared.unlockDeletionShared();
+    var gate: BitmapGate = .init(request.filter_doc_bitmap, offset, segment.reader.doc_count);
+    gate.end = @min(gate.end, @as(u64, offset) + work.end);
+    var first: u32 = work.first;
+    var candidates: usize = 0;
+    var ceiling_cache: ?StreamingBoolNode.Bound = null;
+    while (first < work.end) {
+        const allowed = collector.nextAllowed(&gate, offset + first);
+        if (allowed >= gate.end) break;
+        const target: u32 = @intCast(allowed - offset);
+        if (streamingCutoff(collector, shared)) |cutoff| {
+            const worst = cutoff.doc_id;
+            const ceiling = if (ceiling_cache) |cached| if (target <= cached.last) cached else try root.bound(target) else try root.bound(target);
+            ceiling_cache = ceiling;
+            const threshold = cutoff.score;
+            if (std.math.isFinite(ceiling.upper) and (ceiling.upper < threshold or (ceiling.upper == threshold and allowed > worst))) {
+                collector.pruned = true;
+                if (request.diagnostics) |diagnostics| diagnostics.boolean_chunks_skipped += 1;
+                first = ceiling.last + 1;
+                continue;
+            }
+        }
+        const hit = (try root.approximate(target)) orelse break;
+        if (hit.doc >= work.end) break;
+        const selected = collector.nextAllowed(&gate, offset + hit.doc);
+        if (selected >= gate.end) break;
+        if (selected > offset + hit.doc) {
+            first = @intCast(selected - offset);
+            continue;
+        }
+        if (!isSegmentDocDeleted(segment, hit.doc) and try root.verify()) try collector.collect(offset + hit.doc, root.current.?.score);
+        first = hit.doc + 1;
+        candidates += 1;
+        if (candidates % 128 == 0 and collector.worstCompetitiveDocId() != null) if (shared) |owner| {
+            try collector.flushPending();
+            try owner.publishLocal(collector);
+        };
+    }
+    try collector.flushPending();
+}
+
+// Workers own bounded page-backed scratch and heaps; query-owned provider state
+// and result admission share one coordinator. No worker touches a caller arena
+// concurrently with an adaptive provider's stored allocator.
+const StreamingBoolParallel = struct {
+    const scheduler = @import("../sql/parallel_scheduler.zig");
+    const workspace_bytes = 8 * 1024 * 1024;
+    const Work = struct { plan: index_mod.IndexSnapshot.TextSegmentPlan, first: u32, end: u32 };
+    /// At most one extra range per segment plus 4096 ranges for the corpus.
+    /// Large single segments can share lanes without a serial whole-file seed.
+    fn rangeGrain(snap: *const index_mod.IndexSnapshot) u32 {
+        return @max(4096, @as(u32, @intCast((@as(u64, snap.scoringDocCount()) + 4095) / 4096)));
+    }
+    fn reusesSegments(snap: *const index_mod.IndexSnapshot) bool {
+        const grain = rangeGrain(snap);
+        for (snap.segments) |segment| if (segment.reader.doc_count > grain) return true;
+        return false;
+    }
+    fn partition(a: Allocator, snap: *const index_mod.IndexSnapshot, plans: []const index_mod.IndexSnapshot.TextSegmentPlan) ![]Work {
+        const grain = rangeGrain(snap);
+        var count: usize = 0;
+        for (plans) |plan| count += @intCast((@as(u64, snap.segments[plan.segment_idx].reader.doc_count) + grain - 1) / grain);
+        const work = try a.alloc(Work, count);
+        var i: usize = 0;
+        for (plans) |plan| {
+            const total = snap.segments[plan.segment_idx].reader.doc_count;
+            var first: u32 = 0;
+            while (first < total) {
+                const end = @min(total, first +| grain);
+                work[i] = .{ .plan = plan, .first = first, .end = end };
+                i += 1;
+                first = end;
+            }
+        }
+        return work;
+    }
+    const Adapter = struct {
+        owner: *StreamingBoolParallel,
+        producer: query_mod.DocNumProducer,
+        complete: std.atomic.Value(?*const roaring.RoaringBitmap) = .init(null),
+        fn produce(raw: *anyopaque, a: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.complete.load(.acquire)) |bitmap| return fromComplete(bitmap, a, offset, count, candidates);
+            try self.owner.lock();
+            defer self.owner.mutex.unlock(self.owner.io);
+            // Another lane may have completed membership while this batch
+            // waited for the coordinator. Refine only its bounded candidates.
+            if (self.complete.load(.acquire)) |bitmap| return fromComplete(bitmap, a, offset, count, candidates);
+            const selected = try self.producer.produce(self.producer.ptr, a, offset, count, candidates);
+            self.owner.refreshProviders();
+            return selected;
+        }
+        fn fromComplete(bitmap: *const roaring.RoaringBitmap, a: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const input = candidates orelse return bitmap.sliceRebased(a, offset, @as(u64, offset) + count);
+            var result = roaring.RoaringBitmap.init(a);
+            errdefer result.deinit();
+            var it = input.iterator();
+            while (it.next()) |doc| {
+                if (doc >= count) return error.InvalidArgument;
+                if (bitmap.contains(offset + doc)) try result.add(doc);
+            }
+            return result;
+        }
+        fn materialized(raw: *anyopaque) ?*const roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.complete.load(.acquire);
+        }
+        fn wrapped(self: *@This()) query_mod.DocNumProducer {
+            return .{ .ptr = self, .produce = produce, .materialized = if (self.producer.materialized != null) materialized else null };
+        }
+    };
+    io: std.Io,
+    snap: *const index_mod.IndexSnapshot,
+    bq: BoolQuery,
+    request: SearchRequest,
+    stats: *StreamingBoolStats,
+    work: []const Work,
+    next_work: std.atomic.Value(usize) = .init(0),
+    retries: []bool,
+    collector: *FastTopK,
+    prepared: ?*StreamingBoolPreparedCache = null,
+    include: ?Adapter = null,
+    exclude: ?Adapter = null,
+    mutex: std.Io.Mutex = .init,
+    cutoff_valid: std.atomic.Value(bool) = .init(false),
+    cutoff: std.atomic.Value(u64) = .init(0),
+    fn lock(self: *@This()) !void {
+        try self.mutex.lock(self.io);
+    }
+    // Completion is one-way and its bitmap is immutable. Publish it once;
+    // posting navigation then borrows it without a coordinator lock per doc.
+    fn refreshProviders(self: *@This()) void {
+        for ([_]?*Adapter{ if (self.include) |*value| value else null, if (self.exclude) |*value| value else null }) |maybe| if (maybe) |adapter| {
+            if (adapter.complete.load(.acquire) == null) if (adapter.producer.materialized) |get| if (get(adapter.producer.ptr)) |bitmap| adapter.complete.store(bitmap, .release);
+        };
+    }
+    fn publish(self: *@This()) void {
+        self.publishCutoff(self.collector);
+    }
+    fn publishCutoff(self: *@This(), collector: *const FastTopK) void {
+        if (collector.worstCompetitiveDocId()) |doc| {
+            const next: scorer_mod.ScoredHit = .{ .doc_id = doc, .score = collector.minCompetitiveScore() };
+            if (self.cutoff_valid.load(.acquire)) {
+                const bits = self.cutoff.load(.acquire);
+                const prior: scorer_mod.ScoredHit = .{ .doc_id = @truncate(bits), .score = @bitCast(@as(u32, @truncate(bits >> 32))) };
+                if (!scorer_mod.scoredHitBetterThan(next, prior)) return;
+            }
+            self.cutoff.store((@as(u64, @as(u32, @bitCast(next.score))) << 32) | doc, .release);
+            self.cutoff_valid.store(true, .release);
+            if (self.request.diagnostics) |diagnostics| diagnostics.boolean_cutoff_publications +|= 1;
+        }
+    }
+    fn publishLocal(self: *@This(), collector: *const FastTopK) !void {
+        try self.lock();
+        defer self.mutex.unlock(self.io);
+        // This lane has k unique admitted winners. Publish their safe cutoff
+        // without merging duplicate hits. A cap retry rescans its full range
+        // using only retained global winners after every worker has joined.
+        self.publishCutoff(collector);
+    }
+    fn merge(self: *@This(), local: *FastTopK, diagnostics: SearchDiagnostics) !void {
+        try self.lock();
+        defer self.mutex.unlock(self.io);
+        // Global heap storage was reserved before tasks started. Admission never
+        // allocates from the request allocator while providers may use it.
+        for (local.hits.items) |hit| try scorer_mod.offerTopK(self.collector.alloc, &self.collector.hits, self.collector.k, hit);
+        self.collector.total_count += local.total_count;
+        self.collector.pruned = self.collector.pruned or local.pruned;
+        if (self.request.diagnostics) |target| inline for (@typeInfo(SearchDiagnostics).@"struct".field_names) |name| {
+            @field(target, name) +|= @field(diagnostics, name);
+        };
+        self.publish();
+    }
+    fn run(self: *@This(), limit: usize) anyerror!void {
+        var budget: @import("../sparse/ordinal_lookup.zig").MaskBudget = .{ .backing = std.heap.page_allocator, .limit = limit };
+        const a = budget.allocator();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const producers: ProducerConstraints = .{ .include = if (self.include) |*adapter| adapter.wrapped() else null, .exclude = if (self.exclude) |*adapter| adapter.wrapped() else null };
+        var local: FastTopK = .{ .alloc = a, .k = self.collector.k, .after = self.request.search_after, .producers = producers, .filter_doc_bitmap = self.request.filter_doc_bitmap, .exclude_doc_bitmap = self.request.exclude_doc_bitmap, .filter_doc_nums = self.request.filter_doc_nums, .filter_doc_nums_positive = self.request.filter_doc_nums_positive, .exclude_doc_nums = self.request.exclude_doc_nums };
+        defer local.deinit();
+        while (true) {
+            const index = self.next_work.fetchAdd(1, .monotonic);
+            if (index >= self.work.len) break;
+            local.hits.clearRetainingCapacity();
+            local.total_count = 0;
+            local.pruned = false;
+            local.pending_count = 0;
+            var diagnostics: SearchDiagnostics = .{};
+            var request = self.request;
+            request.diagnostics = &diagnostics;
+            scoreStreamingBoolRange(self.snap, self.bq, request, self.stats, producers, self.work[index], &arena, &local, self) catch |err| {
+                if (err == error.OutOfMemory and budget.exhausted) {
+                    self.retries[index] = true;
+                    local.pending_count = 0;
+                    budget.exhausted = false;
+                    continue;
+                }
+                return err;
+            };
+            diagnostics.boolean_range_tasks += 1;
+            try self.merge(&local, diagnostics);
+        }
+    }
+};
+
+fn preferParallelText(snap: *const index_mod.IndexSnapshot) bool {
+    if (snap.scoringDocCount() < 4096) return false;
+    for (snap.segments) |segment| if (segment.query_source) |source| if (source == .ranges and source.ranges.read_io != null) return true;
+    return false;
+}
+
+fn executeStreamingTextBool(alloc: Allocator, snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest, producers: ProducerConstraints) !?SearchResult {
+    if (request.aggregations.len != 0 or !canStreamBool(.{ .bool_query = bq }, 0)) return null;
+    var collector: FastTopK = .{ .alloc = alloc, .k = @min(snap.liveDocCount(), request.k +| request.offset), .after = request.search_after, .producers = producers, .filter_doc_bitmap = request.filter_doc_bitmap, .exclude_doc_bitmap = request.exclude_doc_bitmap, .filter_doc_nums = request.filter_doc_nums, .filter_doc_nums_positive = request.filter_doc_nums_positive, .exclude_doc_nums = request.exclude_doc_nums };
+    defer collector.deinit();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var stats_arena = std.heap.ArenaAllocator.init(alloc);
+    defer stats_arena.deinit();
+    var stats: StreamingBoolStats = .{ .a = stats_arena.allocator(), .snap = snap, .count = snap.scoringDocCount(), .overrides = request.distributed_text_stats };
+    try stats.collect(.{ .bool_query = bq });
+    try stats.load();
+    var io: ?std.Io = null;
+    for (snap.segments) |segment| if (segment.query_source) |source| if (source == .ranges and source.ranges.read_io != null) {
+        io = source.ranges.read_io;
+        break;
+    };
+    const reuse_preparation = snap.segments.len > 16 or StreamingBoolParallel.reusesSegments(snap);
+    var prepared: ?StreamingBoolPreparedCache = if (io != null and reuse_preparation) .{ .io = io.?, .snap = snap, .bq = bq, .request = request, .stats = &stats, .producers = producers } else null;
+    defer if (prepared) |*cache| cache.deinit();
+    const cache = if (prepared) |*value| value else null;
+    const plans = try planStreamingBoolSegmentsCached(alloc, &arena, snap, bq, request, &stats, producers, cache);
+    defer alloc.free(plans);
+    if (request.diagnostics) |diagnostics| diagnostics.segments_considered +|= @intCast(plans.len);
+    const scheduler = StreamingBoolParallel.scheduler;
+    const work = if (io != null and snap.scoringDocCount() >= 4096) try StreamingBoolParallel.partition(alloc, snap, plans) else try alloc.alloc(StreamingBoolParallel.Work, 0);
+    defer alloc.free(work);
+    const lanes = if (work.len > 1) @min(4, scheduler.global().fanout(work.len - 1, 32 * 1024 * 1024, StreamingBoolParallel.workspace_bytes)) else 1;
+    const scoring_cache = if (lanes > 1 or snap.segments.len > 16) cache else null;
+    if (lanes == 1) {
+        for (plans) |plan| try scoreStreamingBoolRangeCached(snap, bq, request, &stats, producers, .{ .plan = plan, .first = 0, .end = snap.segments[plan.segment_idx].reader.doc_count }, &arena, &collector, null, scoring_cache);
+    } else {
+        // A bounded first range seeds the cutoff; its entire segment need not
+        // finish before other lanes start scoring disjoint ranges.
+        try scoreStreamingBoolRangeCached(snap, bq, request, &stats, producers, work[0], &arena, &collector, null, cache);
+        try collector.hits.ensureTotalCapacity(alloc, collector.k);
+        const retries = try alloc.alloc(bool, work.len - 1);
+        defer alloc.free(retries);
+        @memset(retries, false);
+        var shared: StreamingBoolParallel = .{ .io = io.?, .snap = snap, .bq = bq, .request = request, .stats = &stats, .work = work[1..], .retries = retries, .collector = &collector, .prepared = cache };
+        if (producers.include) |producer| shared.include = .{ .owner = &shared, .producer = producer };
+        if (producers.exclude) |producer| shared.exclude = .{ .owner = &shared, .producer = producer };
+        shared.refreshProviders();
+        shared.publish();
+        var tasks: [4]?scheduler.Task(anyerror!void) = @splat(null);
+        defer for (&tasks) |*slot| if (slot.*) |*task| if (task.future != null) {
+            task.cancel(io.?) catch {};
+        };
+        var submitted: u64 = 0;
+        for (1..lanes) |lane| {
+            tasks[lane] = scheduler.global().submit(io.?, StreamingBoolParallel.workspace_bytes, StreamingBoolParallel.run, .{ &shared, StreamingBoolParallel.workspace_bytes });
+            if (tasks[lane] == null) try shared.run(StreamingBoolParallel.workspace_bytes) else submitted += 1;
+        }
+        try shared.run(StreamingBoolParallel.workspace_bytes);
+        for (&tasks) |*slot| if (slot.*) |*task| try task.await(io.?);
+        if (request.diagnostics) |diagnostics| diagnostics.boolean_parallel_tasks += submitted;
+        for (shared.work, retries) |range, retry| if (retry) {
+            if (request.diagnostics) |diagnostics| diagnostics.boolean_workspace_retries += 1;
+            try scoreStreamingBoolRangeCached(snap, bq, request, &stats, producers, range, &arena, &collector, null, cache);
+        };
+    }
+    if (request.diagnostics) |diagnostics| if (cache) |value| {
+        diagnostics.boolean_segment_preparations += value.preparations.load(.monotonic);
+        diagnostics.boolean_prepared_reuses += value.reuses.load(.monotonic);
+    };
+    const hits = try collector.finish();
+    defer alloc.free(hits);
+    if (request.diagnostics) |diagnostics| diagnostics.boolean_candidates_scored += collector.total_count;
+    return try buildResult(alloc, snap, hits, collector.total_count, if (collector.pruned) .gte else .exact, request);
+}
+
 fn executeBool(
     alloc: Allocator,
     snap: *const index_mod.IndexSnapshot,
     bq: BoolQuery,
     request: SearchRequest,
 ) anyerror!SearchResult {
+    if (preferParallelText(snap)) if (try executeStreamingTextBool(alloc, snap, bq, request, .{})) |result| return result;
     if (bq.boost == 1 and bq.should.len == 0 and bq.must.len >= 1 and bq.must.len <= 2 and bq.must_not.len <= 1 and
         request.filter_doc_bitmap == null and request.exclude_doc_bitmap == null)
     {
@@ -2638,11 +4028,15 @@ fn executeBool(
             };
             const base = bq.must[0];
             const simple: ?BoolQuery = switch (base) {
-                .term, .match => .{ .should = &.{base} },
+                .term, .match, .phrase, .term_phrase, .multi_phrase => .{ .should = &.{base} },
                 .bool_query => |query| query,
                 else => null,
             };
-            if (simple) |query| if (try executeSimpleTextBoolWithProducers(alloc, snap, query, constrained, producers)) |result| return result;
+            if (simple) |query| {
+                if (preferParallelText(snap)) if (try executeStreamingTextBool(alloc, snap, query, constrained, producers)) |result| return result;
+                if (try executeSimpleTextBoolWithProducers(alloc, snap, query, constrained, producers)) |result| return result;
+                if (try executeStreamingTextBool(alloc, snap, query, constrained, producers)) |result| return result;
+            }
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const filter = try searchQueryToFilterArena(arena.allocator(), .{ .bool_query = bq });
@@ -2676,6 +4070,7 @@ fn executeBool(
         }
     }
     if (try executeSimpleTextBool(alloc, snap, bq, request)) |result| return result;
+    if (try executeStreamingTextBool(alloc, snap, bq, request, .{})) |result| return result;
     return executeBoolAllHit(alloc, snap, bq, request);
 }
 
@@ -6297,4 +7692,1221 @@ test "external lake producer top k shares segment bound planning across fragment
     try std.testing.expectEqual(@as(u64, 20), diagnostics.segments_considered);
     try std.testing.expect(diagnostics.segments_pruned > 0);
     try std.testing.expect(diagnostics.segments_searched < 20);
+}
+
+test "streaming boolean nested mixed fields match all hit reference" {
+    const a = std.testing.allocator;
+    var title = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 16 });
+    defer title.deinit();
+    var body = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 16 });
+    defer body.deinit();
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for (0..64) |i| {
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        try title.addDocument(@intCast(i), &.{ .{ .term = "common", .freq = 1, .norm = 40 }, .{ .term = if (i % 2 == 0) "a" else "b", .freq = @intCast(1 + i % 5), .norm = 40 } });
+        try body.addDocument(@intCast(i), &.{ .{ .term = "common", .freq = 2, .norm = 20 }, .{ .term = if (i % 3 == 0) "x" else "y", .freq = @intCast(1 + i % 7), .norm = 20 } });
+    }
+    const title_bytes = try title.build();
+    defer a.free(title_bytes);
+    const body_bytes = try body.build();
+    defer a.free(body_bytes);
+    try segment.addSection(try segment.addField("title"), .inverted_text, title_bytes);
+    try segment.addSection(try segment.addField("body"), .inverted_text, body_bytes);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    const deletes = try writer.deleteAllByIdsTracked(a, &.{"row-5"});
+    defer index_mod.IndexWriter.freeDeleteInfos(a, deletes);
+    const ta: SearchQuery = .{ .term = .{ .field = "title", .term = "a" } };
+    const tx: SearchQuery = .{ .term = .{ .field = "body", .term = "x" } };
+    const missing: SearchQuery = .{ .term = .{ .field = "body", .term = "missing" } };
+    const nested: SearchQuery = .{ .bool_query = .{ .should = &.{ ta, tx }, .min_should = 1, .boost = -0.75 } };
+    const same_field: SearchQuery = .{ .bool_query = .{ .must = &.{ ta, .{ .term = .{ .field = "title", .term = "common" } } }, .should = &.{ ta, .{ .match = .{ .field = "title", .text = "common a", .boost = 1.3 } } }, .boost = 0.7 } };
+    const leaves = [_]SearchQuery{ ta, tx, missing, nested, same_field, .{ .match_all = {} }, .{ .match_none = {} }, .{ .match = .{ .field = "body", .text = "x common x", .boost = 0.25 } } };
+    var filter = roaring.RoaringBitmap.init(a);
+    defer filter.deinit();
+    for (0..128) |i| if (i % 5 != 0) {
+        try filter.add(@intCast(i));
+    };
+    const Producer = struct {
+        fn produce(_: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            var selected = roaring.RoaringBitmap.init(alloc);
+            errdefer selected.deinit();
+            var iterator = (candidates orelse return error.ExpectedTextCandidates).iterator();
+            while (iterator.next()) |doc| {
+                if (doc >= count) return error.InvalidArgument;
+                if ((offset + doc) % 5 != 0) try selected.add(doc);
+            }
+            return selected;
+        }
+    };
+    var marker: u8 = 0;
+    const producer: query_mod.DocNumProducer = .{ .ptr = &marker, .produce = Producer.produce };
+    var selected_ids: std.ArrayListUnmanaged(u32) = .empty;
+    defer selected_ids.deinit(a);
+    var selected_iterator = filter.iterator();
+    while (selected_iterator.next()) |id| try selected_ids.append(a, id);
+    var prng = std.Random.DefaultPrng.init(0x1046_1051);
+    const random = prng.random();
+    for (0..1000) |iteration| {
+        const must = [_]SearchQuery{ leaves[random.uintLessThan(usize, leaves.len)], leaves[random.uintLessThan(usize, leaves.len)] };
+        const should = [_]SearchQuery{ leaves[random.uintLessThan(usize, leaves.len)], leaves[random.uintLessThan(usize, leaves.len)], leaves[random.uintLessThan(usize, leaves.len)] };
+        const prohibited = [_]SearchQuery{leaves[random.uintLessThan(usize, leaves.len)]};
+        const bq: BoolQuery = .{ .must = must[0..random.uintLessThan(usize, 3)], .should = &should, .must_not = prohibited[0 .. iteration % 2], .min_should = random.uintLessThan(u32, 5), .pure_should_optional = iteration % 4 == 0, .boost = if (iteration % 3 == 0) -1 else if (iteration % 3 == 1) 0 else 1.25 };
+        const request: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 7, .offset = @intCast(iteration % 3), .include_stored = false, .filter_doc_bitmap = if (iteration % 2 == 0) &filter else null };
+        if (iteration >= 100) {
+            // A full-window tree is an unpruned oracle with exactly the same
+            // established lowering/f32 grouping. Exercise bounds across more
+            // shapes without conflating preexisting same-field lowering policies.
+            var full_request = request;
+            full_request.k = writer.snapshot().scoringDocCount();
+            full_request.offset = 0;
+            var full = (try executeStreamingTextBool(a, writer.snapshot(), bq, full_request, .{})).?;
+            defer full.deinit();
+            var bounded = (try executeStreamingTextBool(a, writer.snapshot(), bq, request, .{})).?;
+            defer bounded.deinit();
+            try std.testing.expectEqual(TotalHitsRelation.exact, full.total_hits_relation);
+            if (bounded.total_hits_relation == .exact) try std.testing.expectEqual(full.total_hits, bounded.total_hits) else try std.testing.expect(bounded.total_hits <= full.total_hits);
+            const lower = @min(request.offset, full.hits.len);
+            const upper = @min(lower + request.k, full.hits.len);
+            try std.testing.expectEqual(upper - lower, bounded.hits.len);
+            for (full.hits[lower..upper], bounded.hits) |expected, actual| {
+                try std.testing.expectEqual(expected.doc_id, actual.doc_id);
+                try std.testing.expectEqual(expected.score, actual.score);
+            }
+            continue;
+        }
+        var reference = try executeBoolAllHit(a, writer.snapshot(), bq, request);
+        defer reference.deinit();
+        var result = (try executeStreamingTextBool(a, writer.snapshot(), bq, request, .{})).?;
+        defer result.deinit();
+        if (result.total_hits_relation == .exact) try std.testing.expectEqual(reference.total_hits, result.total_hits) else try std.testing.expect(result.total_hits <= reference.total_hits);
+        try std.testing.expectEqual(reference.hits.len, result.hits.len);
+        for (reference.hits, result.hits) |expected, actual| {
+            try std.testing.expectEqual(expected.doc_id, actual.doc_id);
+            try std.testing.expectEqual(expected.score, actual.score);
+        }
+        // Candidate producers preserve exact count/score semantics across
+        // segment boundaries, for independent includes and exclusions.
+        for ([_]bool{ false, true }) |exclude| {
+            var constrained = request;
+            constrained.filter_doc_bitmap = null;
+            constrained.filter_doc_nums = if (exclude) &.{} else selected_ids.items;
+            constrained.filter_doc_nums_positive = !exclude;
+            constrained.exclude_doc_nums = if (exclude) selected_ids.items else &.{};
+            var expected = try executeBoolAllHit(a, writer.snapshot(), bq, constrained);
+            defer expected.deinit();
+            constrained.filter_doc_nums = &.{};
+            constrained.filter_doc_nums_positive = false;
+            constrained.exclude_doc_nums = &.{};
+            var actual = (try executeStreamingTextBool(a, writer.snapshot(), bq, constrained, if (exclude) .{ .exclude = producer } else .{ .include = producer })).?;
+            defer actual.deinit();
+            if (actual.total_hits_relation == .exact) try std.testing.expectEqual(expected.total_hits, actual.total_hits) else try std.testing.expect(actual.total_hits <= expected.total_hits);
+            try std.testing.expectEqual(expected.hits.len, actual.hits.len);
+            for (expected.hits, actual.hits) |left, right| {
+                try std.testing.expectEqual(left.doc_id, right.doc_id);
+                try std.testing.expectEqual(left.score, right.score);
+            }
+        }
+    }
+    const FailureCheck = struct {
+        fn run(allocator: Allocator, snap: *const index_mod.IndexSnapshot) !void {
+            var token: u8 = 0;
+            const bq: BoolQuery = .{ .must = &.{ .{ .term = .{ .field = "title", .term = "common" } }, .{ .bool_query = .{ .should = &.{ .{ .term = .{ .field = "title", .term = "a" } }, .{ .match = .{ .field = "body", .text = "common x", .boost = 0.7 } } } } } } };
+            var result = (try executeStreamingTextBool(allocator, snap, bq, .{ .query = .{ .bool_query = bq }, .k = 7, .include_stored = true }, .{ .include = .{ .ptr = &token, .produce = Producer.produce } })).?;
+            defer result.deinit();
+        }
+    };
+    // Arena growth must take the same allocation path on every injected run;
+    // backing allocator remaps otherwise depend on prior heap layout.
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), FailureCheck.run, .{writer.snapshot()});
+    try std.testing.expect(canStreamBool(.{ .phrase = .{ .field = "body", .text = "common x" } }, 0));
+    try std.testing.expect(!canStreamBool(.{ .phrase = .{ .field = "body", .text = "common x", .max_edits = 1 } }, 0));
+}
+
+test "streaming boolean native segment scratch and shared readers remain bounded" {
+    const a = std.testing.allocator;
+    var inverted_builder = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 64 });
+    defer inverted_builder.deinit();
+    var segment_builder = segment_mod.SegmentWriter.init(a);
+    defer segment_builder.deinit();
+    for (0..1000) |i| {
+        var id: [32]u8 = undefined;
+        try segment_builder.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        try inverted_builder.addDocument(@intCast(i), &.{ .{ .term = "alpha", .freq = 2, .norm = 40 }, .{ .term = "beta", .freq = 3, .norm = 40 } });
+    }
+    const inverted_bytes = try inverted_builder.build();
+    defer a.free(inverted_bytes);
+    try segment_builder.addSection(try segment_builder.addField("title"), .inverted_text, inverted_bytes);
+    const bytes = try segment_builder.build();
+    defer a.free(bytes);
+    var first_capacity: usize = 0;
+    for ([_]usize{ 1, 8, 32 }) |segments| {
+        var writer = try index_mod.IndexWriter.init(a);
+        defer writer.deinit();
+        for (0..segments) |i| try writer.addSegmentWithIdData(i + 1, .fromNative(.{ .contiguous = bytes }));
+        var request_arena = std.heap.ArenaAllocator.init(a);
+        defer request_arena.deinit();
+        const bq: BoolQuery = .{ .must = &.{ .{ .term = .{ .field = "title", .term = "alpha" } }, .{ .bool_query = .{ .should = &.{ .{ .term = .{ .field = "title", .term = "beta" } }, .{ .term = .{ .field = "absent", .term = "missing" } } } } } } };
+        var result = (try executeStreamingTextBool(request_arena.allocator(), writer.snapshot(), bq, .{ .query = .{ .bool_query = bq }, .k = 10, .include_stored = false }, .{})).?;
+        defer result.deinit();
+        const capacity = request_arena.queryCapacity();
+        if (segments == 1) first_capacity = capacity;
+        try std.testing.expect(capacity <= first_capacity * 3);
+        try std.testing.expectEqual(@as(usize, 10), result.hits.len);
+        // Two terms in one field share a single native reader.
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        var stats: StreamingBoolStats = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .count = writer.snapshot().scoringDocCount() };
+        try stats.collect(.{ .bool_query = bq });
+        try stats.load();
+        var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+        defer builder.deinit();
+        _ = try builder.build(.{ .bool_query = bq });
+        try std.testing.expectEqual(@as(u32, 1), builder.readers.count());
+    }
+}
+
+test "streaming boolean minimum should pivot and mixed field block bounds" {
+    const a = std.testing.allocator;
+    var title = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 16 });
+    defer title.deinit();
+    var body = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 16 });
+    defer body.deinit();
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for (0..2000) |i| {
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        const frequency: u32 = if (i < 16) 100 else 1;
+        try title.addDocument(@intCast(i), &.{.{ .term = "common", .freq = frequency, .norm = 40 }});
+        if (i == 1999) try body.addDocument(@intCast(i), &.{.{ .term = "rare", .freq = 1, .norm = 40 }});
+        try body.addDocument(@intCast(i), &.{.{ .term = "ranked", .freq = frequency, .norm = 40 }});
+    }
+    const title_bytes = try title.build();
+    defer a.free(title_bytes);
+    const body_bytes = try body.build();
+    defer a.free(body_bytes);
+    try segment.addSection(try segment.addField("title"), .inverted_text, title_bytes);
+    try segment.addSection(try segment.addField("body"), .inverted_text, body_bytes);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const pivot: BoolQuery = .{ .should = &.{ .{ .term = .{ .field = "title", .term = "common" } }, .{ .term = .{ .field = "body", .term = "rare" } } }, .min_should = 2 };
+    var stats: StreamingBoolStats = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .count = writer.snapshot().scoringDocCount() };
+    try stats.collect(.{ .bool_query = pivot });
+    try stats.load();
+    var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+    defer builder.deinit();
+    const root = try builder.build(.{ .bool_query = pivot });
+    try std.testing.expectEqual(@as(u32, 1999), (try root.seek(0)).?.doc);
+    try std.testing.expect(root.should[0].steps <= 2);
+    try std.testing.expect(root.should[1].steps <= 2);
+    const ranked: BoolQuery = .{ .must = &.{ .{ .term = .{ .field = "title", .term = "common" } }, .{ .term = .{ .field = "body", .term = "ranked" } } } };
+    try stats.collect(.{ .bool_query = ranked });
+    try stats.load();
+    var ranked_builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+    defer ranked_builder.deinit();
+    const ranked_root = try ranked_builder.build(.{ .bool_query = ranked });
+    const first_score = (try ranked_root.seek(0)).?.score;
+    const original_block = ranked_root.must[0].term.?.iter.currentBlockCursor().?.ordinal;
+    const ceiling = try ranked_root.bound(1536);
+    try std.testing.expect(ceiling.upper < first_score);
+    try std.testing.expect(ranked_root.must[0].term.?.block_cursor.?.ordinal > original_block);
+    try std.testing.expectEqual(original_block, ranked_root.must[0].term.?.iter.currentBlockCursor().?.ordinal);
+    // Required clauses also jump to the optional N-of-M candidate, rather
+    // than walking a dense must clause one document at a time.
+    const required: BoolQuery = .{ .must = pivot.should[0..1], .should = pivot.should, .min_should = 2 };
+    const required_root = try builder.build(.{ .bool_query = required });
+    try std.testing.expectEqual(@as(u32, 1999), (try required_root.seek(0)).?.doc);
+    try std.testing.expect(required_root.must[0].steps <= 2);
+    var diagnostics: SearchDiagnostics = .{};
+    const request: SearchRequest = .{ .query = .{ .bool_query = ranked }, .k = 3, .include_stored = false, .diagnostics = &diagnostics };
+    var expected = try executeBoolAllHit(a, writer.snapshot(), ranked, request);
+    defer expected.deinit();
+    var actual = (try executeStreamingTextBool(a, writer.snapshot(), ranked, request, .{})).?;
+    defer actual.deinit();
+    try std.testing.expect(diagnostics.boolean_chunks_skipped > 0);
+    try std.testing.expectEqual(TotalHitsRelation.gte, actual.total_hits_relation);
+    try std.testing.expect(actual.total_hits < expected.total_hits);
+    try std.testing.expectEqual(expected.hits.len, actual.hits.len);
+    for (expected.hits, actual.hits) |left, right| {
+        try std.testing.expectEqual(left.doc_id, right.doc_id);
+        try std.testing.expectEqual(left.score, right.score);
+    }
+}
+
+test "streaming boolean segment bounds prune fragmented mixed fields with stable ties" {
+    const a = std.testing.allocator;
+    var storage = std.heap.ArenaAllocator.init(a);
+    defer storage.deinit();
+    const ca = storage.allocator();
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    for (0..20) |i| {
+        var segment = segment_mod.SegmentWriter.init(ca);
+        defer segment.deinit();
+        var title = inverted.InvertedIndexBuilder.init(ca, .{});
+        defer title.deinit();
+        var body = inverted.InvertedIndexBuilder.init(ca, .{});
+        defer body.deinit();
+        for (0..32) |doc| {
+            try segment.addStoredDoc(try std.fmt.allocPrint(ca, "segment-{d}-row-{d}", .{ i, doc }), "{}");
+            const terms = [_]inverted.InvertedIndexBuilder.TermHit{.{ .term = "ranked", .freq = if (i == 19) 100 else 1, .norm = 40 }};
+            try title.addDocument(@intCast(doc), &terms);
+            try body.addDocument(@intCast(doc), &terms);
+        }
+        try segment.addSection(try segment.addField("title"), .inverted_text, try title.build());
+        try segment.addSection(try segment.addField("body"), .inverted_text, try body.build());
+        try writer.addSegmentWithIdData(i + 1, .fromNative(.{ .contiguous = try segment.build() }));
+    }
+    const clauses = [_]SearchQuery{ .{ .term = .{ .field = "title", .term = "ranked" } }, .{ .term = .{ .field = "body", .term = "ranked" } } };
+    for ([_]f32{ 1, 0, -1 }) |boost| {
+        const bq: BoolQuery = .{ .must = &clauses, .boost = boost };
+        var diagnostics: SearchDiagnostics = .{};
+        const request: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 3, .offset = 1, .include_stored = false, .diagnostics = &diagnostics };
+        var reference = try executeBoolAllHit(a, writer.snapshot(), bq, request);
+        defer reference.deinit();
+        diagnostics = .{};
+        var actual = try execute(a, writer.snapshot(), request);
+        defer actual.deinit();
+        try std.testing.expectEqual(reference.hits.len, actual.hits.len);
+        for (reference.hits, actual.hits) |left, right| {
+            try std.testing.expectEqual(left.doc_id, right.doc_id);
+            try std.testing.expectEqual(left.score, right.score);
+        }
+        try std.testing.expectEqual(@as(u64, 20), diagnostics.segments_considered);
+        if (boost == 1) {
+            try std.testing.expectEqual(@as(u64, 19), diagnostics.segments_pruned);
+            try std.testing.expectEqual(@as(u64, 1), diagnostics.segments_searched);
+            try std.testing.expectEqual(@as(u64, 2), diagnostics.postings_iterators_opened);
+            try std.testing.expectEqual(TotalHitsRelation.gte, actual.total_hits_relation);
+        } else if (boost < 0) {
+            try std.testing.expectEqual(@as(u64, 0), diagnostics.segments_pruned);
+            try std.testing.expectEqual(reference.total_hits, actual.total_hits);
+        }
+    }
+}
+
+test "streaming boolean positional leaves match phrase references and bounded producers" {
+    const a = std.testing.allocator;
+    var title = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 16 });
+    defer title.deinit();
+    var body = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 16 });
+    defer body.deinit();
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    var random_state = std.Random.DefaultPrng.init(0x1051_706f73);
+    const random = random_state.random();
+    const words = [_][]const u8{ "alpha", "beta", "gamma" };
+    for (0..64) |i| {
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        var positions: [3][16]u32 = undefined;
+        var counts: [3]usize = @splat(0);
+        for (0..16) |position| {
+            const word = random.uintLessThan(usize, 3);
+            positions[word][counts[word]] = @intCast(position);
+            counts[word] += 1;
+        }
+        var terms: std.ArrayListUnmanaged(inverted.InvertedIndexBuilder.TermHit) = .empty;
+        defer terms.deinit(a);
+        for (words, counts, 0..) |word, count, j| if (count != 0) {
+            try terms.append(a, .{ .term = word, .freq = @intCast(count), .norm = 16, .positions = positions[j][0..count] });
+        };
+        try title.addDocument(@intCast(i), terms.items);
+        try body.addDocument(@intCast(i), &.{.{ .term = "common", .freq = 1, .norm = 20 }});
+        if (i % 4 == 0) try body.addDocument(@intCast(i), &.{.{ .term = "blocked", .freq = 1, .norm = 20 }});
+    }
+    const title_bytes = try title.build();
+    defer a.free(title_bytes);
+    const body_bytes = try body.build();
+    defer a.free(body_bytes);
+    try segment.addSection(try segment.addField("title"), .inverted_text, title_bytes);
+    try segment.addSection(try segment.addField("body"), .inverted_text, body_bytes);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(output, self.bytes[@intCast(offset)..][0..output.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var source: State = .{ .bytes = bytes };
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    try writer.addSegmentWithIdData(2, .fromNative(.{ .ranges = .{ .ptr = &source, .length = bytes.len, .read_into = State.read, .close = State.close, .read_io = std.testing.io } }));
+    const deleted = try writer.deleteAllByIdsTracked(a, &.{"row-5"});
+    defer index_mod.IndexWriter.freeDeleteInfos(a, deleted);
+    const phrases = [_]SearchQuery{
+        .{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta" } } },
+        .{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "alpha" } } },
+        .{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta", "gamma" }, .boost = -0.7 } },
+        .{ .phrase = .{ .field = "title", .text = "alpha beta" } },
+        .{ .phrase = .{ .field = "title", .text = "alpha the beta" } },
+        .{ .multi_phrase = .{ .field = "title", .terms = &.{ &.{ "alpha", "gamma", "alpha" }, &.{"beta"}, &.{ "alpha", "beta" } }, .boost = 0.25 } },
+        .{ .multi_phrase = .{ .field = "title", .terms = &.{ &.{ "absent", "gamma" }, &.{ "beta", "alpha" } } } },
+        .{ .multi_phrase = .{ .field = "title", .terms = &.{ &.{"alpha"}, &.{} } } },
+        .{ .term_phrase = .{ .field = "title", .terms = &.{"missing"} } },
+        .{ .term_phrase = .{ .field = "title", .terms = &.{} } },
+    };
+    const common: SearchQuery = .{ .term = .{ .field = "body", .term = "common" } };
+    const blocked: SearchQuery = .{ .term = .{ .field = "body", .term = "blocked" } };
+    var mask = roaring.RoaringBitmap.init(a);
+    defer mask.deinit();
+    for (0..128) |i| if (i % 3 != 0) {
+        try mask.add(@intCast(i));
+    };
+    for (0..200) |i| {
+        const must = [_]SearchQuery{ phrases[i % phrases.len], common };
+        const should = [_]SearchQuery{ phrases[(i * 3 + 1) % phrases.len], phrases[(i * 7 + 4) % phrases.len] };
+        const prohibited = [_]SearchQuery{ blocked, phrases[(i + 3) % phrases.len] };
+        const bq: BoolQuery = .{ .must = must[0 .. i % 3], .should = &should, .must_not = prohibited[0 .. i % 3], .min_should = @intCast(i % 3), .pure_should_optional = i % 4 == 0, .boost = if (i % 3 == 0) -1 else if (i % 3 == 1) 0 else 1.25 };
+        const request: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 7, .offset = @intCast(i % 3), .include_stored = false, .filter_doc_bitmap = if (i % 2 == 0) &mask else null };
+        var expected = try executeBoolAllHit(a, writer.snapshot(), bq, request);
+        defer expected.deinit();
+        var actual = try execute(a, writer.snapshot(), request);
+        defer actual.deinit();
+        try std.testing.expectEqual(expected.hits.len, actual.hits.len);
+        if (actual.total_hits_relation == .exact) try std.testing.expectEqual(expected.total_hits, actual.total_hits) else try std.testing.expect(actual.total_hits <= expected.total_hits);
+        for (expected.hits, actual.hits) |left, right| {
+            try std.testing.expectEqual(left.doc_id, right.doc_id);
+            try std.testing.expectEqual(left.score, right.score);
+        }
+    }
+    const Producer = struct {
+        calls: usize = 0,
+        fn produce(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            var selected = roaring.RoaringBitmap.init(alloc);
+            errdefer selected.deinit();
+            var it = (candidates orelse return error.ExpectedBoundedCandidates).iterator();
+            while (it.next()) |doc| {
+                if (doc >= count) return error.InvalidArgument;
+                if ((offset + doc) % 3 != 0) try selected.add(doc);
+            }
+            return selected;
+        }
+    };
+    for (phrases) |leaf| for ([_]bool{ false, true }) |exclude| {
+        var state: Producer = .{};
+        const producer: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .boost = 0, .producer = .{ .ptr = &state, .produce = Producer.produce } } };
+        const fixed: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .bitmap = &mask, .boost = 0 } };
+        const bq: BoolQuery = if (exclude) .{ .must = &.{leaf}, .must_not = &.{producer} } else .{ .must = &.{ leaf, producer } };
+        const reference_query: SearchQuery = .{ .bool_query = if (exclude) .{ .must = &.{leaf}, .must_not = &.{fixed} } else .{ .must = &.{ leaf, fixed } } };
+        var expected = try execute(a, writer.snapshot(), .{ .query = reference_query, .k = 7, .include_stored = false });
+        defer expected.deinit();
+        var actual = try execute(a, writer.snapshot(), .{ .query = .{ .bool_query = bq }, .k = 7, .include_stored = false });
+        defer actual.deinit();
+        try std.testing.expectEqual(expected.hits.len, actual.hits.len);
+        for (expected.hits, actual.hits) |left, right| {
+            try std.testing.expectEqual(left.doc_id, right.doc_id);
+            try std.testing.expectEqual(left.score, right.score);
+        }
+    };
+    const Failure = struct {
+        fn run(alloc: Allocator, snap: *const index_mod.IndexSnapshot) !void {
+            const bq: BoolQuery = .{ .must = &.{.{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta" } } }}, .should = &.{.{ .multi_phrase = .{ .field = "title", .terms = &.{ &.{ "alpha", "gamma" }, &.{"beta"} } } }} };
+            var result = try execute(alloc, snap, .{ .query = .{ .bool_query = bq }, .k = 3, .include_stored = true });
+            defer result.deinit();
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Failure.run, .{writer.snapshot()});
+}
+
+test "streaming boolean approximation delays positions until conjunction and masks align" {
+    const a = std.testing.allocator;
+    var text = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 64 });
+    defer text.deinit();
+    var metadata = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 64 });
+    defer metadata.deinit();
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for (0..10000) |i| {
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        try text.addDocument(@intCast(i), &.{ .{ .term = "alpha", .freq = 1, .norm = 8, .positions = &.{0} }, .{ .term = "beta", .freq = 1, .norm = 8, .positions = &.{if (i == 9999) 1 else 2} } });
+        if (i == 9999) try metadata.addDocument(@intCast(i), &.{.{ .term = "rare", .freq = 1, .norm = 8 }});
+    }
+    const text_bytes = try text.build();
+    defer a.free(text_bytes);
+    const metadata_bytes = try metadata.build();
+    defer a.free(metadata_bytes);
+    try segment.addSection(try segment.addField("title"), .inverted_text, text_bytes);
+    try segment.addSection(try segment.addField("metadata"), .inverted_text, metadata_bytes);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    const phrase: SearchQuery = .{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta" } } };
+    const rare: SearchQuery = .{ .term = .{ .field = "metadata", .term = "rare" } };
+    var mask = roaring.RoaringBitmap.init(a);
+    defer mask.deinit();
+    try mask.add(9999);
+    for (0..3) |mode| {
+        const must = [_]SearchQuery{ if (mode == 1) rare else phrase, if (mode == 1) phrase else rare };
+        const bq: BoolQuery = .{ .must = must[0..if (mode == 2) @as(usize, 1) else 2] };
+        var diagnostics: SearchDiagnostics = .{};
+        var result = (try executeStreamingTextBool(a, writer.snapshot(), bq, .{ .query = .{ .bool_query = bq }, .k = 10, .include_stored = false, .filter_doc_bitmap = if (mode == 2) &mask else null, .diagnostics = &diagnostics }, .{})).?;
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+        try std.testing.expectEqual(@as(u32, 9999), result.hits[0].doc_id);
+        try std.testing.expectEqual(@as(u64, 1), diagnostics.phrase_candidates_verified);
+        try std.testing.expectEqual(@as(u64, 2), diagnostics.phrase_position_records_decoded);
+    }
+}
+
+test "streaming boolean ranked cursors preserve distributed and partial stats with bounded heaps" {
+    const a = std.testing.allocator;
+    var text = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 32 });
+    defer text.deinit();
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for (0..1000) |i| {
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        try text.addDocument(@intCast(i), &.{ .{ .term = "alpha", .freq = 1, .norm = @intCast(8 + i % 31), .positions = &.{0} }, .{ .term = "beta", .freq = 1, .norm = @intCast(8 + i % 31), .positions = &.{1} } });
+    }
+    const text_bytes = try text.build();
+    defer a.free(text_bytes);
+    try segment.addSection(try segment.addField("title"), .inverted_text, text_bytes);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    const complete = [_]distributed_stats_mod.TextFieldStats{.{ .field = "title", .global_doc_count = 5000, .global_total_field_len = 200000, .term_doc_freqs = &.{ .{ .term = "alpha", .doc_freq = 2000 }, .{ .term = "beta", .doc_freq = 3000 } } }};
+    const partial = [_]distributed_stats_mod.TextFieldStats{.{ .field = "title", .global_doc_count = 5000, .global_total_field_len = 200000, .term_doc_freqs = &.{.{ .term = "alpha", .doc_freq = 2000 }} }};
+    // Cursor admission counts the complete query but retains only the page
+    // window, including a cursor that excludes almost the whole corpus.
+    var collector: FastTopK = .{ .alloc = a, .k = 13, .after = .{ .doc_id = 980, .score = 1 } };
+    defer collector.deinit();
+    for (0..1000) |i| {
+        try collector.collectAdmitted(.{ .doc_id = @intCast(i), .score = 1 });
+        try std.testing.expect(collector.hits.items.len <= 13);
+    }
+    try std.testing.expectEqual(@as(u32, 1000), collector.total_count);
+    const cursor_hits = try collector.finish();
+    defer a.free(cursor_hits);
+    try std.testing.expectEqual(@as(usize, 13), cursor_hits.len);
+    for (cursor_hits, 981..) |hit, id| try std.testing.expectEqual(@as(u32, @intCast(id)), hit.doc_id);
+    const zero_stats = [_]distributed_stats_mod.TextFieldStats{.{ .field = "title", .global_doc_count = 5000, .global_total_field_len = 200000, .term_doc_freqs = &.{ .{ .term = "alpha", .doc_freq = 0 }, .{ .term = "beta", .doc_freq = 0 } } }};
+    const overcount_stats = [_]distributed_stats_mod.TextFieldStats{.{ .field = "title", .global_doc_count = 5000, .global_total_field_len = 200000, .term_doc_freqs = &.{ .{ .term = "alpha", .doc_freq = 7000 }, .{ .term = "beta", .doc_freq = 7000 } } }};
+    const stats_options = [_][]const distributed_stats_mod.TextFieldStats{ &.{}, &complete, &partial, &zero_stats, &overcount_stats };
+    const leaves = [_]SearchQuery{ .{ .match = .{ .field = "title", .text = "alpha beta alpha", .boost = 0.7 } }, .{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta" }, .boost = 1.3 } } };
+    // A standalone boosted match preserves sum-then-boost arithmetic; wrapping
+    // it for cursor navigation must not select simple-Boolean term lowering.
+    for (stats_options) |overrides| for (leaves) |leaf| {
+        var request: SearchRequest = .{ .query = leaf, .k = 1000, .include_stored = false, .distributed_text_stats = overrides };
+        var reference = try execute(a, writer.snapshot(), request);
+        defer reference.deinit();
+        for ([_]usize{ 0, 801 }) |cursor_index| {
+            request.k = 11;
+            request.offset = 2;
+            request.search_after = .{ .score = reference.hits[cursor_index].score, .doc_id = reference.hits[cursor_index].doc_id };
+            var actual = try execute(a, writer.snapshot(), request);
+            defer actual.deinit();
+            for (reference.hits[cursor_index + 3 ..][0..11], actual.hits) |left, right| {
+                try std.testing.expectEqual(left.doc_id, right.doc_id);
+                try std.testing.expectEqual(left.score, right.score);
+            }
+        }
+    };
+    for (stats_options) |overrides| for (leaves) |leaf| for ([_]f32{ 1, -1, 0 }) |boost| {
+        const bq: BoolQuery = .{ .must = &.{leaf}, .should = &.{.{ .term = .{ .field = "title", .term = "alpha", .boost = 0.25 } }}, .boost = boost };
+        var request: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 1000, .include_stored = false, .distributed_text_stats = overrides };
+        // Without overrides, the established simple-Boolean lowering is the
+        // scoring contract (including its f32 grouping of match boosts).
+        var reference = if (overrides.len == 0) try execute(a, writer.snapshot(), request) else try executeBoolAllHit(a, writer.snapshot(), bq, request);
+        defer reference.deinit();
+        // Page across both score boundaries and equal-score doc-id ties. The
+        // offset applies after the cursor, and total hits still covers the query.
+        for ([_]usize{ 0, 37, 801 }) |cursor_index| {
+            request.k = 11;
+            request.offset = 2;
+            request.search_after = .{ .score = reference.hits[cursor_index].score, .doc_id = reference.hits[cursor_index].doc_id };
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            var actual = try execute(arena.allocator(), writer.snapshot(), request);
+            defer actual.deinit();
+            const expected = reference.hits[cursor_index + 3 ..][0..11];
+            try std.testing.expectEqual(expected.len, actual.hits.len);
+            for (expected, actual.hits) |left, right| {
+                try std.testing.expectEqual(left.doc_id, right.doc_id);
+                try std.testing.expectEqual(left.score, right.score);
+            }
+            if (actual.total_hits_relation == .exact) try std.testing.expectEqual(reference.total_hits, actual.total_hits);
+        }
+    };
+}
+
+test "streaming boolean shared parallel scoring coordinates providers errors and workspace retries" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var text = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 64 });
+    defer text.deinit();
+    var body = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 64 });
+    defer body.deinit();
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for (0..1200) |i| {
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        try text.addDocument(@intCast(i), &.{ .{ .term = "alpha", .freq = 1, .norm = 20, .positions = &.{0} }, .{ .term = "beta", .freq = 1, .norm = 20, .positions = &.{if (i % 3 == 0) 2 else 1} } });
+        try body.addDocument(@intCast(i), &.{.{ .term = "common", .freq = @intCast(1 + i % 7), .norm = 30 }});
+    }
+    const text_bytes = try text.build();
+    defer a.free(text_bytes);
+    const body_bytes = try body.build();
+    defer a.free(body_bytes);
+    try segment.addSection(try segment.addField("title"), .inverted_text, text_bytes);
+    try segment.addSection(try segment.addField("body"), .inverted_text, body_bytes);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    const Source = struct {
+        bytes: []const u8,
+        io: std.Io,
+        fail: std.atomic.Value(bool) = .init(false),
+        canceled: std.atomic.Value(bool) = .init(false),
+        fn bind(raw: *anyopaque, _: Allocator, _: *anyopaque) !index_mod.SegmentSource {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.source();
+        }
+        fn source(self: *@This()) index_mod.SegmentSource {
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .read_io = self.io, .check_read_context = check, .bind_read_context = bind } };
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.canceled.load(.acquire)) return error.Canceled;
+        }
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail.load(.acquire)) return error.TestReadFailed;
+            @memcpy(output, self.bytes[@intCast(offset)..][0..output.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var source: Source = .{ .bytes = bytes, .io = io };
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    for (0..5) |i| try writer.addSegmentWithIdData(i + 1, .fromNative(source.source()));
+    const snapshot = try writer.acquireSnapshotWithReadContext(&source);
+    defer snapshot.release();
+    const Producer = struct {
+        calls: usize = 0,
+        fail_at: ?usize = null,
+        cancel: ?*std.atomic.Value(bool) = null,
+        all: ?*const roaring.RoaringBitmap = null,
+        complete_after: usize = 3,
+        fn materialized(raw: *anyopaque) ?*const roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return if (self.calls >= self.complete_after) self.all else null;
+        }
+        fn produce(raw: *anyopaque, alloc: Allocator, offset: u32, count: u32, candidates: ?*const roaring.RoaringBitmap) !roaring.RoaringBitmap {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 20) if (self.cancel) |token| token.store(true, .release);
+            if (self.fail_at) |n| if (self.calls >= n) return error.TestProviderFailed;
+            var bitmap = roaring.RoaringBitmap.init(alloc);
+            errdefer bitmap.deinit();
+            var it = (candidates orelse return error.ExpectedCandidates).iterator();
+            while (it.next()) |doc| {
+                if (doc >= count) return error.InvalidArgument;
+                if ((offset + doc) % 5 != 0) try bitmap.add(doc);
+            }
+            return bitmap;
+        }
+    };
+    var selected = roaring.RoaringBitmap.init(a);
+    defer selected.deinit();
+    for (0..6000) |i| if (i % 5 != 0) {
+        try selected.add(@intCast(i));
+    };
+    const scheduler = StreamingBoolParallel.scheduler.global();
+    for ([_]f32{ 1, -1, 0 }) |boost| {
+        const bq: BoolQuery = .{ .must = &.{ .{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta" } } }, .{ .term = .{ .field = "body", .term = "common" } } }, .boost = boost };
+        var request: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 17, .include_stored = false, .filter_doc_bitmap = &selected };
+        var expected = try executeBoolAllHit(a, snapshot, bq, request);
+        defer expected.deinit();
+        request.filter_doc_bitmap = null;
+        var producer: Producer = .{ .all = &selected, .complete_after = if (boost == 0) 1 else 20 };
+        var diagnostics: SearchDiagnostics = .{};
+        request.diagnostics = &diagnostics;
+        const producers: ProducerConstraints = .{ .include = .{ .ptr = &producer, .produce = Producer.produce, .materialized = Producer.materialized } };
+        var actual = (try executeStreamingTextBool(a, snapshot, bq, request, producers)).?;
+        defer actual.deinit();
+        try std.testing.expect(diagnostics.boolean_parallel_tasks > 0);
+        try std.testing.expectEqual(producer.complete_after, producer.calls);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+        try std.testing.expectEqual(expected.hits.len, actual.hits.len);
+        for (expected.hits, actual.hits) |left, right| {
+            try std.testing.expectEqual(left.doc_id, right.doc_id);
+            try std.testing.expectEqual(left.score, right.score);
+        }
+        // Explicit worker cap exhaustion discards partial local winners. The
+        // coordinator then retries exactly those segments on the caller lane.
+        var stats_arena = std.heap.ArenaAllocator.init(a);
+        defer stats_arena.deinit();
+        var stats: StreamingBoolStats = .{ .a = stats_arena.allocator(), .snap = snapshot, .count = 6000 };
+        try stats.collect(request.query);
+        try stats.load();
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const plans = try planStreamingBoolSegments(a, &scratch, snapshot, bq, request, &stats, producers);
+        defer a.free(plans);
+        const work = try StreamingBoolParallel.partition(a, snapshot, plans);
+        defer a.free(work);
+        const retries = try a.alloc(bool, work.len);
+        defer a.free(retries);
+        @memset(retries, false);
+        var collector: FastTopK = .{ .alloc = a, .k = 17, .filter_doc_bitmap = &selected };
+        defer collector.deinit();
+        try collector.hits.ensureTotalCapacity(a, 17);
+        var shared: StreamingBoolParallel = .{ .io = io, .snap = snapshot, .bq = bq, .request = request, .stats = &stats, .work = work, .retries = retries, .collector = &collector };
+        try shared.run(64);
+        for (retries) |retry| try std.testing.expect(retry);
+        try std.testing.expectEqual(@as(usize, 0), collector.hits.items.len);
+        var retry_request = request;
+        retry_request.filter_doc_bitmap = &selected;
+        for (work) |range| try scoreStreamingBoolRange(snapshot, bq, retry_request, &stats, .{}, range, &scratch, &collector, null);
+        const recovered = try collector.finish();
+        defer a.free(recovered);
+        for (expected.hits, recovered) |left, right| {
+            try std.testing.expectEqual(left.doc_id, right.doc_id);
+            try std.testing.expectEqual(left.score, right.score);
+        }
+        // Saturation retains the same required work on the caller.
+        const old_max = scheduler.max_workers;
+        scheduler.max_workers = 0;
+        defer scheduler.max_workers = old_max;
+        var inline_result = (try executeStreamingTextBool(a, snapshot, bq, request, producers)).?;
+        defer inline_result.deinit();
+        for (expected.hits, inline_result.hits) |left, right| try std.testing.expectEqual(left.doc_id, right.doc_id);
+    }
+    const bq: BoolQuery = .{ .must = &.{ .{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta" } } }, .{ .term = .{ .field = "body", .term = "common" } } }, .boost = -1 };
+    var failing: Producer = .{ .fail_at = 20 };
+    try std.testing.expectError(error.TestProviderFailed, executeStreamingTextBool(a, snapshot, bq, .{ .query = .{ .bool_query = bq }, .k = 17, .include_stored = false }, .{ .include = .{ .ptr = &failing, .produce = Producer.produce } }));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    var canceling: Producer = .{ .cancel = &source.canceled };
+    try std.testing.expectError(error.Canceled, executeStreamingTextBool(a, snapshot, bq, .{ .query = .{ .bool_query = bq }, .k = 17, .include_stored = false }, .{ .include = .{ .ptr = &canceling, .produce = Producer.produce } }));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    source.canceled.store(false, .release);
+    source.fail.store(true, .release);
+    try std.testing.expectError(error.TestReadFailed, executeStreamingTextBool(a, snapshot, bq, .{ .query = .{ .bool_query = bq }, .k = 17 }, .{}));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+}
+
+test "streaming boolean phrase block ceilings prune positions and retain stacked starts" {
+    const a = std.testing.allocator;
+    var text = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 32 });
+    defer text.deinit();
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for (0..8192) |i| {
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        // Duplicate first-term starts may share a single later-term occurrence.
+        const rich = i < 32;
+        try text.addDocument(@intCast(i), &.{
+            .{ .term = "alpha", .freq = if (rich) 8 else 1, .norm = if (rich) 8 else 100, .positions = if (rich) &.{ 0, 0, 2, 2, 4, 4, 6, 6 } else &.{0} },
+            .{ .term = "beta", .freq = if (rich) 4 else 1, .norm = if (rich) 80 else 100, .positions = if (rich) &.{ 1, 3, 5, 7 } else &.{1} },
+            .{ .term = "gamma", .freq = if (rich) 4 else 1, .norm = if (rich) 80 else 100, .positions = if (rich) &.{ 2, 4, 6, 8 } else &.{2} },
+        });
+    }
+    const text_bytes = try text.build();
+    defer a.free(text_bytes);
+    try segment.addSection(try segment.addField("title"), .inverted_text, text_bytes);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    for ([_]f32{ 1, -1, 0 }) |boost| {
+        const bq: BoolQuery = .{ .must = &.{.{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta", "gamma" }, .boost = boost } }} };
+        var diagnostics: SearchDiagnostics = .{};
+        const request: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 9, .include_stored = false, .diagnostics = &diagnostics };
+        var expected = try executeBoolAllHit(a, writer.snapshot(), bq, request);
+        defer expected.deinit();
+        diagnostics = .{};
+        var actual = (try executeStreamingTextBool(a, writer.snapshot(), bq, request, .{})).?;
+        defer actual.deinit();
+        try std.testing.expectEqual(expected.hits.len, actual.hits.len);
+        for (expected.hits, actual.hits) |left, right| {
+            try std.testing.expectEqual(left.doc_id, right.doc_id);
+            try std.testing.expectEqual(left.score, right.score);
+        }
+        if (boost > 0) {
+            try std.testing.expect(diagnostics.boolean_chunks_skipped > 0);
+            // Current authenticated impact ranges cover 1024 document IDs,
+            // independently of the 32-posting payload blocks used here.
+            try std.testing.expect(diagnostics.phrase_position_records_decoded <= 3 * 1024);
+        }
+    }
+    // Missing block metadata disables the positional ceiling, retaining the
+    // exact verifier for legacy postings instead of inventing a tight bound.
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const bq: BoolQuery = .{ .must = &.{.{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta", "gamma" } } }} };
+    var stats: StreamingBoolStats = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .count = 8192 };
+    try stats.collect(.{ .bool_query = bq });
+    try stats.load();
+    var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = writer.snapshot(), .segment = &writer.snapshot().segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+    defer builder.deinit();
+    const root = try builder.build(.{ .bool_query = bq });
+    _ = try root.approximate(0);
+    const authenticated = try root.bound(0);
+    try std.testing.expect(try root.verify());
+    try std.testing.expect(authenticated.upper >= root.current.?.score);
+    for (builder.nodes.items) |node| if (node.term) |*term| {
+        term.block_max = null;
+    };
+    const ceiling = try root.bound(0);
+    try std.testing.expect(try root.verify());
+    try std.testing.expect(ceiling.upper >= root.current.?.score);
+}
+
+test "streaming boolean complete distributed statistics avoid cold local frequency reads" {
+    const a = std.testing.allocator;
+    var text = inverted.InvertedIndexBuilder.init(a, .{});
+    defer text.deinit();
+    try text.addDocument(0, &.{ .{ .term = "alpha", .freq = 1, .norm = 2, .positions = &.{0} }, .{ .term = "beta", .freq = 1, .norm = 2, .positions = &.{1} } });
+    const text_bytes = try text.build();
+    defer a.free(text_bytes);
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    try segment.addStoredDoc("row", "{}");
+    try segment.addSection(try segment.addField("title"), .inverted_text, text_bytes);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    const Source = struct {
+        bytes: []const u8,
+        fail: bool = false,
+        fn bind(raw: *anyopaque, _: Allocator, _: *anyopaque) !index_mod.SegmentSource {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.source();
+        }
+        fn source(self: *@This()) index_mod.SegmentSource {
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .check_read_context = check, .bind_read_context = bind } };
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.TestReadFailed;
+        }
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.TestReadFailed;
+            @memcpy(output, self.bytes[@intCast(offset)..][0..output.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var source: Source = .{ .bytes = bytes };
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(source.source()));
+    const snapshot = try writer.acquireSnapshotWithReadContext(&source);
+    defer snapshot.release();
+    source.fail = true;
+    const overrides = [_]distributed_stats_mod.TextFieldStats{.{ .field = "title", .global_doc_count = 100, .global_total_field_len = 200, .term_doc_freqs = &.{ .{ .term = "alpha", .doc_freq = 30 }, .{ .term = "beta", .doc_freq = 20 } } }};
+    const query: SearchQuery = .{ .bool_query = .{ .must = &.{ .{ .match = .{ .field = "title", .text = "alpha beta alpha" } }, .{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta" } } } } } };
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    var stats: StreamingBoolStats = .{ .a = scratch.allocator(), .snap = snapshot, .count = 1, .overrides = &overrides };
+    try stats.collect(query);
+    try stats.load();
+    try std.testing.expect(!(try stats.get("title", "alpha")).known);
+    try std.testing.expect(!(try stats.get("title", "beta")).known);
+    // Constant positional alternatives do not need local BM25 frequencies,
+    // even without distributed overrides.
+    var constant: StreamingBoolStats = .{ .a = scratch.allocator(), .snap = snapshot, .count = 1 };
+    try constant.collect(.{ .multi_phrase = .{ .field = "title", .terms = &.{ &.{ "alpha", "beta" }, &.{"beta"} } } });
+    try constant.load();
+    try std.testing.expect(!(try constant.get("title", "alpha")).known);
+    // Partial match overrides retain the all-local fallback as one context.
+    const partial = [_]distributed_stats_mod.TextFieldStats{.{ .field = "title", .global_doc_count = 100, .global_total_field_len = 200, .term_doc_freqs = &.{.{ .term = "alpha", .doc_freq = 30 }} }};
+    var fallback: StreamingBoolStats = .{ .a = scratch.allocator(), .snap = snapshot, .count = 1, .overrides = &partial };
+    try fallback.collect(query);
+    try std.testing.expectError(error.TestReadFailed, fallback.load());
+}
+
+test "streaming boolean single large segment shares bounded ranges and live cutoffs" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    var text = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 64 });
+    defer text.deinit();
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for (0..12288) |i| {
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        const norm: u32 = if (i < 4096) 100 else @intCast(8 + i % 31);
+        try text.addDocument(@intCast(i), &.{ .{ .term = "alpha", .freq = 1, .norm = norm, .positions = &.{0} }, .{ .term = "beta", .freq = 1, .norm = norm, .positions = &.{1} } });
+    }
+    const text_bytes = try text.build();
+    defer a.free(text_bytes);
+    try segment.addSection(try segment.addField("title"), .inverted_text, text_bytes);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    const Source = struct {
+        bytes: []const u8,
+        io: std.Io,
+        fn bind(raw: *anyopaque, _: Allocator, _: *anyopaque) !index_mod.SegmentSource {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.source();
+        }
+        fn source(self: *@This()) index_mod.SegmentSource {
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .read_io = self.io, .bind_read_context = bind } };
+        }
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(output, self.bytes[@intCast(offset)..][0..output.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var source: Source = .{ .bytes = bytes, .io = threaded.io() };
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(source.source()));
+    const removed = try writer.deleteAllByIdsTracked(a, &.{ "row-4100", "row-9000" });
+    defer index_mod.IndexWriter.freeDeleteInfos(a, removed);
+    const snapshot = try writer.acquireSnapshotWithReadContext(&source);
+    defer snapshot.release();
+    for ([_]f32{ 1, -1, 0 }) |boost| {
+        const bq: BoolQuery = .{ .must = &.{.{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta" } } }}, .boost = boost };
+        var diagnostics: SearchDiagnostics = .{};
+        var request: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 17, .offset = 2, .include_stored = false, .diagnostics = &diagnostics };
+        var expected = try executeBoolAllHit(a, snapshot, bq, request);
+        defer expected.deinit();
+        diagnostics = .{};
+        var actual = (try executeStreamingTextBool(a, snapshot, bq, request, .{})).?;
+        defer actual.deinit();
+        try std.testing.expect(diagnostics.boolean_parallel_tasks > 0);
+        try std.testing.expectEqual(@as(u64, 2), diagnostics.boolean_range_tasks);
+        try std.testing.expectEqual(@as(u64, 1), diagnostics.boolean_segment_preparations);
+        try std.testing.expect(diagnostics.boolean_prepared_reuses >= 2);
+        if (boost > 0) try std.testing.expect(diagnostics.boolean_cutoff_publications >= 2);
+        for (expected.hits, actual.hits) |left, right| {
+            try std.testing.expectEqual(left.doc_id, right.doc_id);
+            try std.testing.expectEqual(left.score, right.score);
+        }
+        request.search_after = .{ .score = expected.hits[5].score, .doc_id = expected.hits[5].doc_id };
+        var expected_page = try executeBoolAllHit(a, snapshot, bq, request);
+        defer expected_page.deinit();
+        var actual_page = (try executeStreamingTextBool(a, snapshot, bq, request, .{})).?;
+        defer actual_page.deinit();
+        for (expected_page.hits, actual_page.hits) |left, right| {
+            try std.testing.expectEqual(left.doc_id, right.doc_id);
+            try std.testing.expectEqual(left.score, right.score);
+        }
+    }
+    // Publish from a running lane without merging its hits. This proves cutoff
+    // updates need not wait for range completion/global winner admission.
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const serial_segments = try a.dupe(index_mod.SegmentEntry, snapshot.segments);
+    defer a.free(serial_segments);
+    for (serial_segments) |*serial| serial.query_source = null;
+    var serial_snapshot = snapshot.*;
+    serial_snapshot.segments = serial_segments;
+    for ([_]SearchQuery{
+        .{ .term = .{ .field = "title", .term = "alpha" } },
+        .{ .match = .{ .field = "title", .text = "alpha beta" } },
+        .{ .bool_query = .{ .should = &.{ .{ .term = .{ .field = "title", .term = "alpha" } }, .{ .term = .{ .field = "title", .term = "beta" } } } } },
+    }) |simple| {
+        const reference_query: BoolQuery = if (simple == .bool_query) simple.bool_query else .{ .should = &.{simple} };
+        var diagnostics: SearchDiagnostics = .{};
+        const req: SearchRequest = .{ .query = simple, .k = 7, .include_stored = false, .diagnostics = &diagnostics };
+        var expected = try executeBoolAllHit(a, &serial_snapshot, reference_query, req);
+        defer expected.deinit();
+        diagnostics = .{};
+        var actual = try execute(a, snapshot, req);
+        defer actual.deinit();
+        for (expected.hits, actual.hits) |left, right| {
+            try std.testing.expectEqual(left.doc_id, right.doc_id);
+            try std.testing.expectEqual(left.score, right.score);
+        }
+        try std.testing.expect(diagnostics.boolean_parallel_tasks > 0);
+    }
+    const bq: BoolQuery = .{ .must = &.{.{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta" } } }} };
+    var stats: StreamingBoolStats = .{ .a = scratch.allocator(), .snap = snapshot, .count = 12288 };
+    try stats.collect(.{ .bool_query = bq });
+    try stats.load();
+    const request: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 17, .include_stored = false };
+    const plans = try planStreamingBoolSegments(a, &scratch, snapshot, bq, request, &stats, .{});
+    defer a.free(plans);
+    const work = try StreamingBoolParallel.partition(a, snapshot, plans);
+    defer a.free(work);
+    try std.testing.expectEqual(@as(usize, 3), work.len);
+    var prepared: StreamingBoolPreparedCache = .{ .io = threaded.io(), .snap = snapshot, .bq = bq, .request = request, .stats = &stats, .producers = .{} };
+    defer prepared.deinit();
+    var lease = (try prepared.get(work[2].plan)).?;
+    {
+        defer lease.release();
+        var clones = std.heap.ArenaAllocator.init(a);
+        defer clones.deinit();
+        var builder: StreamingBoolBuilder = .{ .a = clones.allocator(), .snap = snapshot, .segment = &snapshot.segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+        defer builder.deinit();
+        const root = try builder.instantiate(lease.owner.root);
+        for (builder.nodes.items) |node| if (node.term) |term| {
+            try std.testing.expect(!node.term_started);
+            try std.testing.expectEqual(std.math.maxInt(usize), term.iter.current_chunk_index);
+            try std.testing.expectEqual(@as(usize, 0), term.iter.impact_chunk_ids.capacity);
+            try std.testing.expect(term.iter.borrowed_impact_chunk_ids.?.ptr == node.prepared_term.?.lookup.postings.prepared_impact_chunk_ids.?.ptr);
+        };
+        try std.testing.expectEqual(work[2].first, (try root.approximate(work[2].first)).?.doc);
+        for (builder.nodes.items) |node| if (node.term) |term| {
+            try std.testing.expect(node.term_started);
+            try std.testing.expect(term.current.?.doc_id >= work[2].first);
+            try std.testing.expect(term.iter.current_chunk_index >= 128);
+        };
+    }
+    var global: FastTopK = .{ .alloc = a, .k = 17 };
+    defer global.deinit();
+    var local: FastTopK = .{ .alloc = a, .k = 17 };
+    defer local.deinit();
+    var shared: StreamingBoolParallel = .{ .io = threaded.io(), .snap = snapshot, .bq = bq, .request = request, .stats = &stats, .work = &.{}, .retries = &.{}, .collector = &global };
+    var lane_scratch = std.heap.ArenaAllocator.init(a);
+    defer lane_scratch.deinit();
+    try scoreStreamingBoolRange(snapshot, bq, request, &stats, .{}, work[1], &lane_scratch, &local, &shared);
+    try std.testing.expect(shared.cutoff_valid.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), global.hits.items.len);
+    // A workspace retry can discard these unpublished winners after their
+    // cutoff helped another range prune. Retrying without that cutoff recovers
+    // them; the retained global heap alone controls the serial retry.
+    local.hits.clearRetainingCapacity();
+    try global.hits.ensureTotalCapacity(a, 17);
+    var retries = [_]bool{false};
+    shared.work = work[2..];
+    shared.retries = &retries;
+    try shared.run(StreamingBoolParallel.workspace_bytes);
+    try std.testing.expect(!retries[0]);
+    for (work[0..2]) |range| try scoreStreamingBoolRange(snapshot, bq, request, &stats, .{}, range, &lane_scratch, &global, null);
+    const recovered = try global.finish();
+    defer a.free(recovered);
+    var reference = try executeBoolAllHit(a, snapshot, bq, request);
+    defer reference.deinit();
+    try std.testing.expectEqual(reference.hits.len, recovered.len);
+    for (reference.hits, recovered) |left, right| {
+        try std.testing.expectEqual(left.doc_id, right.doc_id);
+        try std.testing.expectEqual(left.score, right.score);
+    }
+}
+
+test "streaming boolean parallel metadata planning tightens phrase ceilings and pins prepared readers" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    var storage = std.heap.ArenaAllocator.init(a);
+    defer storage.deinit();
+    const ca = storage.allocator();
+    const Source = struct {
+        bytes: []const u8,
+        io: std.Io,
+        fail: bool = false,
+        fn bind(raw: *anyopaque, _: Allocator, _: *anyopaque) !index_mod.SegmentSource {
+            return @as(*@This(), @ptrCast(@alignCast(raw))).source();
+        }
+        fn source(self: *@This()) index_mod.SegmentSource {
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .read_io = self.io, .bind_read_context = bind, .check_read_context = check } };
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.TestReadFailed;
+        }
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    var sources: [20]*Source = undefined;
+    for (0..20) |i| {
+        var segment = segment_mod.SegmentWriter.init(ca);
+        defer segment.deinit();
+        var title = inverted.InvertedIndexBuilder.init(ca, .{});
+        defer title.deinit();
+        var body = inverted.InvertedIndexBuilder.init(ca, .{});
+        defer body.deinit();
+        for (0..64) |doc| {
+            try segment.addStoredDoc(try std.fmt.allocPrint(ca, "segment-{d}-row-{d}", .{ i, doc }), "{}");
+            const high = i == 19;
+            try title.addDocument(@intCast(doc), &.{ .{ .term = "alpha", .freq = if (high) 8 else 1, .norm = 40, .positions = if (high) &.{ 0, 2, 4, 6, 8, 10, 12, 14 } else &.{0} }, .{ .term = "beta", .freq = if (high) 8 else 1, .norm = 40, .positions = if (high) &.{ 1, 3, 5, 7, 9, 11, 13, 15 } else &.{1} } });
+            try body.addDocument(@intCast(doc), &.{.{ .term = "common", .freq = 1, .norm = 40 }});
+        }
+        try segment.addSection(try segment.addField("title"), .inverted_text, try title.build());
+        try segment.addSection(try segment.addField("body"), .inverted_text, try body.build());
+        const source = try ca.create(Source);
+        source.* = .{ .bytes = try segment.build(), .io = threaded.io() };
+        sources[i] = source;
+        try writer.addSegmentWithIdData(i + 1, .fromNative(source.source()));
+    }
+    const snapshot = try writer.acquireSnapshotWithReadContext(&writer);
+    defer snapshot.release();
+    for ([_]f32{ 1, 0, -1 }) |boost| {
+        const bq: BoolQuery = .{ .must = &.{ .{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta" } } }, .{ .term = .{ .field = "body", .term = "common" } } }, .boost = boost };
+        var diagnostics: SearchDiagnostics = .{};
+        const request: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 3, .offset = 1, .include_stored = false, .diagnostics = &diagnostics };
+        var expected = try executeBoolAllHit(a, snapshot, bq, request);
+        defer expected.deinit();
+        diagnostics = .{};
+        var actual = (try executeStreamingTextBool(a, snapshot, bq, request, .{})).?;
+        defer actual.deinit();
+        try std.testing.expectEqual(expected.hits.len, actual.hits.len);
+        for (expected.hits, actual.hits) |left, right| {
+            try std.testing.expectEqual(left.doc_id, right.doc_id);
+            try std.testing.expectEqual(left.score, right.score);
+        }
+        try std.testing.expect(diagnostics.boolean_plan_tasks > 0);
+        try std.testing.expectEqual(@as(u64, if (boost >= 0) 1 else 20), diagnostics.boolean_segment_preparations);
+        if (boost == 1) try std.testing.expectEqual(@as(u64, 60), diagnostics.boolean_summary_loads) else {
+            try std.testing.expectEqual(@as(u64, 0), diagnostics.boolean_summary_loads);
+            try std.testing.expectEqual(@as(u64, 60), diagnostics.boolean_summary_hits);
+        }
+        if (boost > 0) {
+            try std.testing.expectEqual(@as(u64, 19), diagnostics.segments_pruned);
+            try std.testing.expectEqual(@as(u64, 1), diagnostics.segments_searched);
+        } else if (boost < 0) try std.testing.expectEqual(expected.total_hits, actual.total_hits);
+    }
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const bq: BoolQuery = .{ .must = &.{.{ .term_phrase = .{ .field = "title", .terms = &.{ "alpha", "beta" } } }} };
+    const request: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 3, .include_stored = false };
+    var stats: StreamingBoolStats = .{ .a = scratch.allocator(), .snap = snapshot, .count = snapshot.scoringDocCount() };
+    try stats.collect(request.query);
+    try stats.load();
+    var cache: StreamingBoolPreparedCache = .{ .io = threaded.io(), .snap = snapshot, .bq = bq, .request = request, .stats = &stats, .producers = .{} };
+    defer cache.deinit();
+    // Hold the first reader while traversing more segments than the cache can
+    // retain. An active reader must survive every eviction.
+    var held = (try cache.get(.{ .segment_idx = 0, .doc_offset = 0, .score_upper_bound = std.math.inf(f32) })).?;
+    defer held.release();
+    for (1..20) |i| {
+        var lease = (try cache.get(.{ .segment_idx = i, .doc_offset = @intCast(i * 64), .score_upper_bound = std.math.inf(f32) })).?;
+        lease.release();
+    }
+    var again = (try cache.get(.{ .segment_idx = 0, .doc_offset = 0, .score_upper_bound = std.math.inf(f32) })).?;
+    defer again.release();
+    try std.testing.expect(held.owner == again.owner);
+    sources[0].fail = true;
+    try std.testing.expectError(error.TestReadFailed, cache.get(.{ .segment_idx = 0, .doc_offset = 0, .score_upper_bound = std.math.inf(f32) }));
+    sources[0].fail = false;
+    var builder: StreamingBoolBuilder = .{ .a = scratch.allocator(), .snap = snapshot, .segment = &snapshot.segments[0], .offset = 0, .config = .{}, .stats = &stats, .constrained = false, .bitmap_constraints = false };
+    defer builder.deinit();
+    const root = try builder.instantiate(held.owner.root);
+    try std.testing.expect(try root.seek(0) != null);
+    // Explicit cache caps are memoized as unavailable, preserving the exact
+    // per-range builder rather than failing the query or retrying preparation.
+    var capped: StreamingBoolPreparedCache = .{ .io = threaded.io(), .snap = snapshot, .bq = bq, .request = request, .stats = &stats, .producers = .{}, .entry_bytes = 1 };
+    defer capped.deinit();
+    const plan: index_mod.IndexSnapshot.TextSegmentPlan = .{ .segment_idx = 0, .doc_offset = 0, .score_upper_bound = std.math.inf(f32) };
+    try std.testing.expect(try capped.get(plan) == null);
+    try std.testing.expect(try capped.get(plan) == null);
+    var collector: FastTopK = .{ .alloc = a, .k = 3 };
+    defer collector.deinit();
+    var range_arena = std.heap.ArenaAllocator.init(a);
+    defer range_arena.deinit();
+    try scoreStreamingBoolRangeCached(snapshot, bq, request, &stats, .{}, .{ .plan = plan, .first = 32, .end = 64 }, &range_arena, &collector, null, &capped);
+    const hits = try collector.finish();
+    defer a.free(hits);
+    try std.testing.expectEqual(@as(usize, 3), hits.len);
+    for (hits, 32..) |hit, doc| try std.testing.expectEqual(@as(u32, @intCast(doc)), hit.doc_id);
+    const Failure = struct {
+        fn run(alloc: Allocator, snap: *const index_mod.IndexSnapshot, query: BoolQuery, req: SearchRequest, context: *StreamingBoolStats) !void {
+            var owned: StreamingBoolPreparedCache = .{ .io = std.testing.io, .snap = snap, .bq = query, .request = req, .stats = context, .producers = .{}, .backing = alloc };
+            defer owned.deinit();
+            var lease = (try owned.get(.{ .segment_idx = 0, .doc_offset = 0, .score_upper_bound = std.math.inf(f32) })).?;
+            defer lease.release();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            var clone: StreamingBoolBuilder = .{ .a = arena.allocator(), .snap = snap, .segment = &snap.segments[0], .offset = 0, .config = .{}, .stats = context, .constrained = false, .bitmap_constraints = false };
+            defer clone.deinit();
+            const node = try clone.instantiate(lease.owner.root);
+            try std.testing.expect(try node.seek(32) != null);
+        }
+    };
+    var no_resize = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), Failure.run, .{ snapshot, bq, request, &stats });
+    // A canceled singleflight waiter releases the coordinator mutex without
+    // taking the constructor's reference or poisoning its in-progress slot.
+    const Waiter = struct {
+        fn run(owner: *StreamingBoolPreparedCache, waiting: *std.Io.Event, selected: index_mod.IndexSnapshot.TextSegmentPlan) anyerror!void {
+            waiting.set(owner.io);
+            if (try owner.get(selected)) |value| {
+                var lease = value;
+                lease.release();
+            }
+        }
+    };
+    capped.slots = @splat(.{});
+    capped.slots[0] = .{ .segment = 0, .users = 1, .building = true };
+    defer capped.slots[0] = .{};
+    var waiting: std.Io.Event = .unset;
+    var waiter = try threaded.io().concurrent(Waiter.run, .{ &capped, &waiting, plan });
+    try waiting.wait(threaded.io());
+    try std.testing.expectError(error.Canceled, waiter.cancel(threaded.io()));
+    try std.testing.expect(capped.slots[0].building and capped.slots[0].users == 1);
+    capped.slots[0] = .{};
+}
+
+test "streaming boolean saturated term bounds preserve high frequency winners" {
+    const a = std.testing.allocator;
+    var title = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 16 });
+    defer title.deinit();
+    var body = inverted.InvertedIndexBuilder.init(a, .{ .chunk_size = 16 });
+    defer body.deinit();
+    var segment = segment_mod.SegmentWriter.init(a);
+    defer segment.deinit();
+    for (0..2048) |i| {
+        var id: [32]u8 = undefined;
+        try segment.addStoredDoc(try std.fmt.bufPrint(&id, "row-{d}", .{i}), "{}");
+        const frequency: u32 = if (i == 0) 80000 else if (i == 1024) 100000 else 1;
+        try title.addDocument(@intCast(i), &.{.{ .term = "common", .freq = frequency, .norm = 40 }});
+        try body.addDocument(@intCast(i), &.{.{ .term = "required", .freq = 1, .norm = 40 }});
+    }
+    const title_bytes = try title.build();
+    defer a.free(title_bytes);
+    const body_bytes = try body.build();
+    defer a.free(body_bytes);
+    try segment.addSection(try segment.addField("title"), .inverted_text, title_bytes);
+    try segment.addSection(try segment.addField("body"), .inverted_text, body_bytes);
+    const bytes = try segment.build();
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .contiguous = bytes }));
+    const bq: BoolQuery = .{ .must = &.{ .{ .term = .{ .field = "title", .term = "common" } }, .{ .term = .{ .field = "body", .term = "required", .boost = 0 } } } };
+    for ([_]inverted.BM25Config{ .{}, .{ .k1 = 100, .b = 0 } }) |config| {
+        const req: SearchRequest = .{ .query = .{ .bool_query = bq }, .k = 1, .include_stored = false, .bm25_config = config };
+        var expected = try executeBoolAllHit(a, writer.snapshot(), bq, req);
+        defer expected.deinit();
+        var actual = (try executeStreamingTextBool(a, writer.snapshot(), bq, req, .{})).?;
+        defer actual.deinit();
+        try std.testing.expectEqual(@as(u32, 1024), expected.hits[0].doc_id);
+        try std.testing.expectEqual(expected.hits[0].doc_id, actual.hits[0].doc_id);
+        try std.testing.expectEqual(expected.hits[0].score, actual.hits[0].score);
+    }
 }
