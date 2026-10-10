@@ -3447,7 +3447,7 @@ const Evaluator = struct {
                     .to_jsonb => {
                         // JSON scalar null is a value, unlike a SQL NULL cell.
                         const input = try self.runDatum(call.args[0], depth + 1);
-                        break :blk if (input.numeric != null) Datum.json(try self.numericJson(input)) else input;
+                        break :blk if (input.sql_null) input else Datum.json(try self.sqlJson(input, self.program.instructions[call.args[0]].type));
                     },
                     .jsonb_build_object => {
                         var object: std.json.ObjectMap = .empty;
@@ -3455,12 +3455,13 @@ const Evaluator = struct {
                         var i: usize = 0;
                         while (i < call.args.len) : (i += 2) {
                             var key = try self.runDatum(call.args[i], depth + 1);
-                            if (key.numeric != null) key = Datum.json(try self.numericJson(key));
-                            if (key.sql_null or key.value == .null or key.value == .object or key.value == .array) return error.InvalidSqlParameters;
+                            if (key.sql_null) return error.InvalidSqlParameters;
+                            key.value = try self.sqlJson(key, self.program.instructions[call.args[i]].type);
+                            if (key.value == .null or key.value == .object or key.value == .array) return error.InvalidSqlParameters;
                             const name = try self.formatText(key.value);
                             try self.charge(name.len + @sizeOf(Json) + @sizeOf([]const u8));
                             const value = try self.runDatum(call.args[i + 1], depth + 1);
-                            try object.put(self.alloc, name, if (value.sql_null) .null else if (value.numeric != null) try self.numericJson(value) else value.value);
+                            try object.put(self.alloc, name, try self.sqlJson(value, self.program.instructions[call.args[i + 1]].type));
                         }
                         break :blk Datum.json(.{ .object = object });
                     },
@@ -3810,6 +3811,34 @@ const Evaluator = struct {
             .max_groups = (self.limits.output_bytes -| self.bytes) / 2,
             .parent = self.workOwner(),
         };
+    }
+
+    /// SQL floating values enter JSONB through their declared output format,
+    /// then exact decimal parsing. JSON numbers have neither a float width
+    /// nor NaN/infinity payloads; PostgreSQL represents specials as strings.
+    fn sqlJson(self: *Evaluator, datum: Datum, descriptor: Type) !Json {
+        if (datum.sql_null) return .null;
+        if (datum.numeric != null) return self.numericJson(datum);
+        if (descriptor.kind == .number and datum.value == .float) {
+            const number = datum.value.float;
+            var buffer: [64]u8 = undefined;
+            const text = if (descriptor.element_type == .float32)
+                try builtin_cast.floatText(f32, @floatCast(number), &buffer)
+            else
+                try builtin_cast.floatText(f64, number, &buffer);
+            if (!std.math.isFinite(number)) {
+                try self.charge(text.len);
+                return .{ .string = try self.alloc.dupe(u8, text) };
+            }
+            const exact = @import("numeric_value.zig");
+            var context = self.numericContext();
+            var decimal = try exact.parse(&context, text);
+            defer decimal.deinit();
+            const output = try exact.format(&context, decimal.value);
+            try self.charge(output.len);
+            return .{ .number_string = output };
+        }
+        return datum.value;
     }
 
     fn numericJson(self: *Evaluator, datum: Datum) !Json {

@@ -465,6 +465,18 @@ pub const Context = struct {
                     output.complete = false;
                     return;
                 }
+                // A declared NUMERIC parameter carries exact limbs, not a
+                // native condition value. Mixed comparisons use the bound
+                // scalar program's floating domain (including REAL/NUMERIC
+                // comparisons in double precision), without narrowing the
+                // operand to the physical column width.
+                if (column.type == .number and comparison.value == .parameter) {
+                    const datum = try self.parameterDatum(comparison.value.parameter - 1);
+                    if (datum.numeric != null) {
+                        output.complete = false;
+                        return;
+                    }
+                }
                 // Row identity has a separate native key boundary; never
                 // pretend it is a document property in a storage predicate.
                 const bound_value = try self.value(comparison.value, column);
@@ -1755,6 +1767,129 @@ test "SQL NUMERIC predicates preserve inferred and explicit parameters for reads
         try std.testing.expectEqual(@as(usize, 0), null_result.output.rows.len);
         try std.testing.expectEqual(@as(usize, @intFromBool(index != 0)), fixture.mutations);
     };
+}
+
+test "SQL floating predicates retain declared NUMERIC parameters for reads and mutations" {
+    const Fixture = struct {
+        element: @import("array_value.zig").ElementType,
+        sample: f64 = 1.25,
+        mutations: usize = 0,
+        fn resolve(raw: *anyopaque, a: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = try a.dupe(catalog.Column, &.{.{ .name = "x", .path = "x", .type = .number, .element_type = self.element }}) };
+        }
+        fn scan(raw: *anyopaque, a: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 0), request.conditions.len);
+            const rows = try a.alloc(catalog.Row, 2);
+            for (rows, [_]f64{ self.sample, 2.5 }, [_][]const u8{ "match", "other" }) |*row, number, key| {
+                var object: std.json.ObjectMap = .empty;
+                try object.put(a, "x", .{ .float = number });
+                row.* = .{ .id = key, .version = 7, .value = .{ .object = object } };
+            }
+            return .{ .rows = rows };
+        }
+        fn mutate(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), mutations.len);
+            try std.testing.expectEqualStrings("match", mutations[0].key);
+            self.mutations += mutations.len;
+            return .committed;
+        }
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) ![]const catalog.Mutation {
+            return mutations;
+        }
+        fn open(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            try std.testing.expectEqual(@as(usize, 0), request.conditions.len);
+            return .{ .ptr = raw, .next = next, .close = close };
+        }
+        fn next(raw: *anyopaque, a: std.mem.Allocator, _: u32) !catalog.Page {
+            return scan(raw, a, undefined, .{ .fields = &.{"x"}, .limit = 32 });
+        }
+        fn close(_: *anyopaque) void {}
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    for ([_]@import("array_value.zig").ElementType{ .float32, .float64 }) |element| for ([_]bool{ false, true }) |rounded| for ([_][]const u8{
+        "SELECT x FROM docs WHERE x = $1",
+        "UPDATE docs SET x = x + 1 WHERE x = $1 RETURNING x",
+        "DELETE FROM docs WHERE x = $1 RETURNING x",
+    }, 0..) |sql, index| {
+        var fixture: Fixture = .{ .element = element, .sample = if (rounded) (if (element == .float32) @as(f64, @as(f32, 1.1)) else 1.1) else 1.25 };
+        const expected: usize = @intFromBool(!rounded or element == .float64);
+        const backend: catalog.Backend = .{ .ptr = &fixture, .parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = .numeric }}, .vtable = &.{ .resolve = Fixture.resolve, .scan = Fixture.scan, .checkpoint = Fixture.checkpoint, .mutate = Fixture.mutate, .mutate_prepared = Fixture.mutate, .prepare_mutations = Fixture.prepare } };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        const parameters = [_]Json{.{ .string = if (rounded) "1.1" else "1.25000000000000000000" }};
+        var result = try execute(a, backend, &compiled, &parameters, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(expected, result.output.rows.len);
+        try std.testing.expectEqual(expected * @intFromBool(index != 0), fixture.mutations);
+        if (index == 0) {
+            var stream_backend = backend;
+            var vtable = backend.vtable.*;
+            vtable.open_scan = Fixture.open;
+            stream_backend.vtable = &vtable;
+            const stream = (try @import("read_stream.zig").Stream.open(a, stream_backend, &compiled, &parameters, .{})).?;
+            defer stream.close();
+            var page = try stream.next(32);
+            defer page.deinit();
+            try std.testing.expect(page.exhausted);
+            try std.testing.expectEqual(expected, page.output.rows.len);
+        }
+        var null_result = try execute(a, backend, &compiled, &.{.null}, .{});
+        defer null_result.deinit();
+        try std.testing.expectEqual(@as(usize, 0), null_result.output.rows.len);
+        try std.testing.expectEqual(expected * @intFromBool(index != 0), fixture.mutations);
+    };
+}
+
+test "SQL JSONB converts declared floating output to exact decimals and special strings" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { expression: []const u8, expected: []const u8 }{
+        .{ .expression = "to_jsonb(1.1::real)", .expected = "1.1" },
+        .{ .expression = "to_jsonb(1.1::double precision)", .expected = "1.1" },
+        .{ .expression = "to_jsonb('0.00001'::double precision)", .expected = "0.00001" },
+        .{ .expression = "to_jsonb('1e20'::double precision)", .expected = "100000000000000000000" },
+        .{ .expression = "to_jsonb('-0'::real)", .expected = "0" },
+        .{ .expression = "to_jsonb('NaN'::real)", .expected = "\"NaN\"" },
+        .{ .expression = "to_jsonb('NaN'::double precision)", .expected = "\"NaN\"" },
+        .{ .expression = "to_jsonb('Infinity'::real)", .expected = "\"Infinity\"" },
+        .{ .expression = "to_jsonb('-Infinity'::double precision)", .expected = "\"-Infinity\"" },
+        .{ .expression = "jsonb_build_object('x',1.1::real)", .expected = "{\"x\":1.1}" },
+        .{ .expression = "jsonb_build_object(1.1::real,2.2::real)", .expected = "{\"1.1\":2.2}" },
+        .{ .expression = "jsonb_build_object(1.20::numeric,'Infinity'::double precision)", .expected = "{\"1.20\":\"Infinity\"}" },
+        .{ .expression = "jsonb_typeof(to_jsonb('NaN'::real))", .expected = "\"string\"" },
+        .{ .expression = "to_jsonb(1.1::real) = '1.1'::jsonb", .expected = "true" },
+        .{ .expression = "to_jsonb(NULL::real)", .expected = "null" },
+        .{ .expression = "jsonb_build_object('x',NULL::real)", .expected = "{\"x\":null}" },
+    };
+    for (cases) |case| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        const sql = try std.fmt.allocPrint(a, "SELECT {s}", .{case.expression});
+        defer a.free(sql);
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        const json = try std.json.Stringify.valueAlloc(a, result.output.rows[0][0], .{});
+        defer a.free(json);
+        try std.testing.expectEqualStrings(case.expected, json);
+    }
+}
+
+test "SQL floating JSONB conversion unwinds every allocation failure" {
+    const Harness = struct {
+        fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var fixture: TestBackend = .{ .row_count = 0 };
+            var result = try execute(a, fixture.iface(), compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT jsonb_build_object(1.20::numeric,1.1::real),to_jsonb('NaN'::real),to_jsonb('1e20'::double precision)", .{});
+    defer compiled.deinit();
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{&compiled});
 }
 
 test "SQL typed windows preserve NUMERIC and REAL semantics in memory and spill" {

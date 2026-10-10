@@ -159,7 +159,7 @@ pub const Prepared = struct {
 pub fn needsResidual(table: ?catalog.Table, predicate: ?*const ast.Predicate) bool {
     const node = predicate orelse return false;
     return switch (node.*) {
-        .comparison => |comparison| typedComparisonColumn(table, comparison.field) or (std.mem.eql(u8, comparison.field, "_id") and comparison.op != .eq) or
+        .comparison => |comparison| typedComparisonColumn(table, comparison.field) or (comparison.value == .parameter and numberColumn(table, comparison.field)) or (std.mem.eql(u8, comparison.field, "_id") and comparison.op != .eq) or
             (comparison.value == .string and std.mem.eql(u8, std.mem.trim(u8, comparison.value.string, " \t\r\n"), "null")),
         .is_null => |condition| jsonColumn(table, condition.field),
         .conjunction => |pair| needsResidual(table, pair.left) or needsResidual(table, pair.right),
@@ -171,6 +171,15 @@ fn typedComparisonColumn(table: ?catalog.Table, name: []const u8) bool {
     const definition = table orelse return false;
     const column = definition.column(name) catch return false;
     return column.type == .json or column.type == .array or column.element_type == .numeric;
+}
+
+// Floating native columns may receive an explicitly typed NUMERIC parameter.
+// Bind a residual before its execution frame exists; native pushdown can still
+// handle ordinary floating inputs, while exact limbs use the scalar program.
+fn numberColumn(table: ?catalog.Table, name: []const u8) bool {
+    const definition = table orelse return false;
+    const column = definition.column(name) catch return false;
+    return column.type == .number;
 }
 
 fn jsonColumn(table: ?catalog.Table, name: []const u8) bool {
