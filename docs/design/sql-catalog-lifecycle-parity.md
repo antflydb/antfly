@@ -452,3 +452,32 @@ The next delivery is mounted catalog activation/recovery evidence for the
 original index and constraint cohort, including real ownership and readiness
 checks. This checkpoint does not close the larger SQL goal or its remaining
 distributed, lifecycle and public execution requirements.
+
+### PostgreSQL naming phases and occupancy policy
+
+The shared bounded formatter now covers PRIMARY, UNIQUE, CHECK and FK names.
+CHECK includes a column only for exactly one distinct referenced column;
+constant and multi-column checks use `table_check`. FK names retain ordered
+local columns. Full numeric suffixes and UTF-8 boundaries remain intact,
+including the maximum suffix for the longer `check` label. Selection passes
+the naming kind to the occupancy callback: PRIMARY/UNIQUE consult relations
+and constraint memberships, whereas CHECK/FK consult memberships only.
+
+The PostgreSQL 19 oracle establishes that final-name admission must be phased,
+not a blanket pre-reservation of all explicit names. Anonymous PRIMARY plus
+an explicit `t_pkey` UNIQUE fails with `42P07` in either textual order. An
+anonymous CHECK followed by an explicit duplicate fails with `42710`; the
+reverse order lets the anonymous CHECK choose a suffix. Explicit CHECK names
+are already visible to generated UNIQUE naming irrespective of textual order.
+Plain relations do not force CHECK/FK suffixes, but constraint memberships on
+other tables do. Compiler temporary-label disambiguation is intentionally
+separate from these final-name rules.
+
+Required integration remains: one pinned covered namespace cut; staged CHECK,
+primary/unique-index and FK naming in PostgreSQL visibility order; exact
+selected-name predicates revalidated inside the atomic native mutation; and
+the same fences in hidden FK CREATE and ALTER publication. A legacy or absent
+occupancy root is not evidence that a name is free. Concurrent conflicts must
+produce definite nonadmission or a retained uncertain receipt, never ambiguous
+automatic replay. The new oracle/component tests do not establish that this
+public native integration or distributed activation is complete.

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! PostgreSQL-compatible generated PRIMARY/UNIQUE index names.
+//! PostgreSQL-compatible generated constraint names.
 //! The admission owner supplies a captured namespace occupancy view. This
 //! module does not scan a catalog, publish a name, or rename explicit names.
 const std = @import("std");
@@ -25,18 +25,49 @@ pub const max_name_bytes = 63;
 // every constraint in a large DDL statement.
 pub const max_source_name_bytes = 256;
 
+/// Internal naming policy, not a public schema resource kind or wire enum.
+pub const Kind = enum {
+    primary,
+    unique,
+    check,
+    foreign_key,
+
+    pub fn includesRelationNames(self: Kind) bool {
+        return self == .primary or self == .unique;
+    }
+};
+
 /// Borrows the table name; owns a bounded prefix of the joined key names.
 /// Initialize once per constraint, not once per collision probe.
 pub const Candidate = struct {
     table: []const u8,
-    primary: bool,
+    kind: Kind,
     addition: [max_name_bytes * 2 + 1]u8 = undefined,
     addition_len: usize = 0,
 
     pub fn init(table: []const u8, columns: []const []const u8, primary: bool) !Candidate {
+        return initKind(table, columns, if (primary) .primary else .unique);
+    }
+
+    /// CHECK takes referenced column names, possibly repeated. PostgreSQL
+    /// includes a column only when the expression refers to exactly one
+    /// distinct column; zero/multiple columns produce table_check.
+    pub fn initKind(table: []const u8, columns: []const []const u8, kind: Kind) !Candidate {
         try validate(table);
-        var self: Candidate = .{ .table = table, .primary = primary };
-        if (primary) return self;
+        var self: Candidate = .{ .table = table, .kind = kind };
+        if (kind == .primary) return self;
+        if (kind == .check) {
+            if (columns.len == 0) return self;
+            try validate(columns[0]);
+            for (columns[1..]) |column| {
+                try validate(column);
+                if (!std.mem.eql(u8, columns[0], column)) return self;
+            }
+            const part = clip(columns[0], max_name_bytes);
+            @memcpy(self.addition[0..part.len], part);
+            self.addition_len = part.len;
+            return self;
+        }
         if (columns.len == 0) return error.InvalidCatalogName;
         // Only a bounded prefix can contribute to a 63-byte name. Joining
         // every key would allocate proportional to the complete schema.
@@ -57,11 +88,16 @@ pub const Candidate = struct {
     /// Zero selects the unsuffixed name; later attempts preserve the complete
     /// numeric label and shorten table/key prefixes at UTF-8 boundaries.
     pub fn format(self: *const Candidate, attempt: u32, output: *[max_name_bytes]u8) ![]const u8 {
-        var label_buffer: [14]u8 = undefined;
-        const stem = if (self.primary) "pkey" else "key";
+        var label_buffer: [15]u8 = undefined;
+        const stem = switch (self.kind) {
+            .primary => "pkey",
+            .unique => "key",
+            .check => "check",
+            .foreign_key => "fkey",
+        };
         const label = if (attempt == 0) stem else try std.fmt.bufPrint(&label_buffer, "{s}{d}", .{ stem, attempt });
         const right = self.addition[0..self.addition_len];
-        const overhead = label.len + 1 + @as(usize, if (self.primary) 0 else 1);
+        const overhead = label.len + 1 + @intFromBool(right.len != 0);
         const available = max_name_bytes - overhead;
         var left_len = self.table.len;
         var right_len = right.len;
@@ -83,7 +119,7 @@ pub const Candidate = struct {
         var length: usize = 0;
         @memcpy(output[length..][0..left_part.len], left_part);
         length += left_part.len;
-        if (!self.primary) {
+        if (right.len != 0) {
             output[length] = '_';
             length += 1;
             @memcpy(output[length..][0..right_part.len], right_part);
@@ -107,16 +143,18 @@ fn clip(bytes: []const u8, limit: usize) []const u8 {
     return bytes[0..end];
 }
 
-/// The occupancy callback must include relation names, constraint names
-/// (including non-index CHECK/FK constraints), and this statement's reserved
-/// names. It must check cancellation/deadlines during admission.
+/// The occupancy callback receives the naming kind: PRIMARY/UNIQUE check
+/// relation and constraint names; CHECK/FK check constraint memberships only.
+/// It must include names already visible at this statement's PostgreSQL DDL
+/// phase, not blindly reserve every future explicit name. It must also check
+/// cancellation/deadlines during admission.
 /// Allocate only the chosen name. Exhaustion is definite nonadmission, not a
 /// reason to overwrite a conflicting relation or replay an uncertain write.
 pub fn choose(alloc: std.mem.Allocator, candidate: *const Candidate, namespace: anytype, max_attempts: u32) ![]const u8 {
     var output: [max_name_bytes]u8 = undefined;
     for (0..max_attempts) |attempt| {
         const name = try candidate.format(@intCast(attempt), &output);
-        if (!try namespace.occupied(name)) return alloc.dupe(u8, name);
+        if (!try namespace.occupied(name, candidate.kind)) return alloc.dupe(u8, name);
     }
     return error.ProgramLimitExceeded;
 }
@@ -159,10 +197,35 @@ test "generated unique constraint names preserve PostgreSQL prefixes suffixes an
     try std.testing.expectError(error.InvalidCatalogName, Candidate.init("items", &.{&oversized}, false));
 }
 
+test "generated CHECK and FK names use PostgreSQL distinct-column and complete suffix policies" {
+    var output: [max_name_bytes]u8 = undefined;
+    const cases = [_]struct { kind: Kind, columns: []const []const u8, expected: []const u8 }{
+        .{ .kind = .check, .columns = &.{}, .expected = "items_check" },
+        .{ .kind = .check, .columns = &.{"id"}, .expected = "items_id_check" },
+        .{ .kind = .check, .columns = &.{ "id", "id", "id" }, .expected = "items_id_check" },
+        .{ .kind = .check, .columns = &.{ "id", "tenant" }, .expected = "items_check" },
+        .{ .kind = .foreign_key, .columns = &.{"id"}, .expected = "items_id_fkey" },
+        .{ .kind = .foreign_key, .columns = &.{ "tenant", "id" }, .expected = "items_tenant_id_fkey" },
+    };
+    for (cases) |case| {
+        const candidate = try Candidate.initKind("items", case.columns, case.kind);
+        try std.testing.expectEqualStrings(case.expected, try candidate.format(0, &output));
+    }
+    const check = try Candidate.initKind("items", &.{"id"}, .check);
+    try std.testing.expectEqualStrings("items_id_check4294967295", try check.format(std.math.maxInt(u32), &output));
+    const left = repeated("a", 63);
+    const right = repeated("b", 63);
+    const long_check = try Candidate.initKind(&left, &.{&right}, .check);
+    try std.testing.expectEqualStrings(comptime std.fmt.comptimePrint("{s}_{s}_check", .{ repeated("a", 28), repeated("b", 28) }), try long_check.format(0, &output));
+    const long_fk = try Candidate.initKind(&left, &.{&right}, .foreign_key);
+    try std.testing.expectEqualStrings(comptime std.fmt.comptimePrint("{s}_{s}_fkey", .{ repeated("a", 29), repeated("b", 28) }), try long_fk.format(0, &output));
+    try std.testing.expectError(error.InvalidCatalogName, Candidate.initKind("items", &.{}, .foreign_key));
+}
+
 const Namespace = struct {
     calls: usize = 0,
     fail: bool = false,
-    pub fn occupied(self: *Namespace, name: []const u8) !bool {
+    pub fn occupied(self: *Namespace, name: []const u8, _: Kind) !bool {
         self.calls += 1;
         if (self.fail) return error.DeadlineExceeded;
         return std.mem.eql(u8, name, "items_email_key") or std.mem.eql(u8, name, "items_email_key1");
@@ -187,4 +250,37 @@ test "generated unique constraint name selection is bounded cancellable and allo
     try std.testing.expectEqual(@as(usize, 2), namespace.calls);
     namespace.fail = true;
     try std.testing.expectError(error.DeadlineExceeded, choose(std.testing.allocator, &candidate, &namespace, 3));
+}
+
+fn chooseKindsAllocationCase(alloc: std.mem.Allocator) !void {
+    const Occupancy = struct {
+        first: []const u8,
+        relation: bool,
+        membership: bool,
+        calls: usize = 0,
+        pub fn occupied(self: *@This(), label: []const u8, kind: Kind) !bool {
+            self.calls += 1;
+            return std.mem.eql(u8, label, self.first) and
+                (self.membership or (self.relation and kind.includesRelationNames()));
+        }
+    };
+    for ([_]Kind{ .primary, .unique, .check, .foreign_key }) |kind| {
+        const candidate = try Candidate.initKind("items", &.{"id"}, kind);
+        var first_buffer: [max_name_bytes]u8 = undefined;
+        const first = try candidate.format(0, &first_buffer);
+        for ([_]bool{ false, true }) |membership| {
+            var occupancy: Occupancy = .{ .first = first, .relation = true, .membership = membership };
+            const result = try choose(alloc, &candidate, &occupancy, 2);
+            defer alloc.free(result);
+            const collided = membership or kind.includesRelationNames();
+            var expected_buffer: [max_name_bytes]u8 = undefined;
+            try std.testing.expectEqualStrings(try candidate.format(@intFromBool(collided), &expected_buffer), result);
+            try std.testing.expectEqual(@as(usize, if (collided) 2 else 1), occupancy.calls);
+        }
+    }
+}
+
+test "generated constraint selection distinguishes relation collisions from constraint membership" {
+    try chooseKindsAllocationCase(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, chooseKindsAllocationCase, .{});
 }

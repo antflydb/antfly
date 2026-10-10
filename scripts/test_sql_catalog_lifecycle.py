@@ -203,6 +203,125 @@ class IndexLifecycleTest(unittest.TestCase):
                 db.execute("SELECT to_regclass('public.t')").fetchone()[0]
             )
 
+    def test_generated_check_and_fk_names_use_distinct_columns_and_ordered_keys(self):
+        cases = (
+            ("CHECK (true)", "items_check"),
+            ("CHECK (id > 0)", "items_id_check"),
+            ("CHECK (id + id > 0)", "items_id_check"),
+            ("CHECK (id > tenant)", "items_check"),
+            ("FOREIGN KEY (id) REFERENCES parent (id)", "items_id_fkey"),
+            (
+                "FOREIGN KEY (tenant, id) REFERENCES parent (tenant, id)",
+                "items_tenant_id_fkey",
+            ),
+        )
+        with postgres() as db:
+            db.execute(
+                "CREATE TABLE public.parent (tenant BIGINT, id BIGINT UNIQUE, "
+                "PRIMARY KEY (tenant, id))"
+            )
+            # CHECK/FK default names consult constraint memberships, not the
+            # relation namespace used by PRIMARY/UNIQUE index names.
+            for label in (
+                "items_check",
+                "items_id_check",
+                "items_id_fkey",
+                "items_tenant_id_fkey",
+            ):
+                db.execute(
+                    pgsql.SQL("CREATE TABLE public.{} (spare BIGINT)").format(
+                        pgsql.Identifier(label)
+                    )
+                )
+            for rule, expected in cases:
+                with self.subTest(rule=rule):
+                    db.execute(
+                        "CREATE TABLE public.items (tenant BIGINT, id BIGINT, "
+                        + rule
+                        + ")"
+                    )
+                    try:
+                        self.assertEqual(
+                            [(expected,)],
+                            db.execute(
+                                "SELECT conname FROM pg_constraint "
+                                "WHERE conrelid='public.items'::regclass "
+                                "AND contype IN ('c', 'f')"
+                            ).fetchall(),
+                        )
+                    finally:
+                        db.execute("DROP TABLE public.items")
+            db.execute(
+                "CREATE TABLE public.reservations (id BIGINT, "
+                "CONSTRAINT items_id_check CHECK (id > 0), "
+                "CONSTRAINT items_id_fkey CHECK (id < 100))"
+            )
+            for rule, expected in (
+                ("CHECK (id > 0)", "items_id_check1"),
+                ("FOREIGN KEY (id) REFERENCES parent (id)", "items_id_fkey1"),
+            ):
+                with self.subTest(membership_collision=rule):
+                    db.execute("CREATE TABLE public.items (id BIGINT, " + rule + ")")
+                    try:
+                        self.assertEqual(
+                            [(expected,)],
+                            db.execute(
+                                "SELECT conname FROM pg_constraint "
+                                "WHERE conrelid='public.items'::regclass AND contype IN ('c', 'f')"
+                            ).fetchall(),
+                        )
+                    finally:
+                        db.execute("DROP TABLE public.items")
+
+    def test_same_statement_generated_names_follow_ddl_phases_not_global_prereservation(
+        self,
+    ):
+        rejected = (
+            ("id BIGINT PRIMARY KEY, x BIGINT CONSTRAINT t_pkey UNIQUE", "42P07"),
+            ("x BIGINT CONSTRAINT t_pkey UNIQUE, id BIGINT PRIMARY KEY", "42P07"),
+            (
+                "id BIGINT CHECK (id > 0), CONSTRAINT t_id_check CHECK (id < 100)",
+                "42710",
+            ),
+        )
+        accepted = (
+            (
+                "id BIGINT CONSTRAINT t_id_check CHECK (id < 100), CHECK (id > 0)",
+                [("t_id_check", "c"), ("t_id_check1", "c")],
+            ),
+            (
+                "id BIGINT UNIQUE, CONSTRAINT t_id_key CHECK (id > 0)",
+                [("t_id_key", "c"), ("t_id_key1", "u")],
+            ),
+            (
+                "id BIGINT CONSTRAINT t_id_key CHECK (id > 0), UNIQUE (id)",
+                [("t_id_key", "c"), ("t_id_key1", "u")],
+            ),
+        )
+        with postgres() as db:
+            for definition, state in rejected:
+                with self.subTest(rejected=definition):
+                    with self.assertRaises(psycopg.Error) as failure:
+                        db.execute("CREATE TABLE public.t (" + definition + ")")
+                    self.assertEqual(state, failure.exception.sqlstate)
+                    self.assertIsNone(
+                        db.execute("SELECT to_regclass('public.t')").fetchone()[0]
+                    )
+            for definition, expected in accepted:
+                with self.subTest(accepted=definition):
+                    db.execute("CREATE TABLE public.t (" + definition + ")")
+                    try:
+                        self.assertEqual(
+                            expected,
+                            db.execute(
+                                "SELECT conname, contype FROM pg_constraint "
+                                "WHERE conrelid='public.t'::regclass "
+                                "AND contype IN ('p', 'u', 'c', 'f') ORDER BY conname"
+                            ).fetchall(),
+                        )
+                    finally:
+                        db.execute("DROP TABLE public.t")
+
     def test_alter_table_pins_first_search_path_relation_and_qualified_names_bypass_it(
         self,
     ):
