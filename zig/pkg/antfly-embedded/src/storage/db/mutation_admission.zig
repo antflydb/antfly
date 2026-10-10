@@ -53,6 +53,31 @@ pub fn checkLifetime(controls: ?lock.ApplyRwLock.Acquisition) !void {
     if (controls) |original| try original.lifetime.check();
 }
 
+pub const IntentCollection = struct {
+    const read = @import("../../common/read_admission.zig");
+    original: ?lock.ApplyRwLock.Acquisition = null,
+    io: ?@import("std").Io = null,
+    payload: read.Payload = undefined,
+    pub fn bind(self: *@This(), controls: ?lock.ApplyRwLock.Acquisition, io: ?@import("std").Io) ?read.Port {
+        self.original = retainedLeaseControls(controls);
+        self.io = io;
+        if (self.original == null) return null;
+        self.payload = .{ .ptr = self, .vtable = &.{ .checkpoint = check, .wait_for_progress = wait } };
+        return read.Port.init(&self.payload);
+    }
+    fn check(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try checkLifetime(self.original);
+    }
+    fn wait(raw: *anyopaque) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try checkLifetime(self.original);
+        const io = self.io orelse return error.MissingBackendRuntimeIo;
+        try io.sleep(.fromMilliseconds(1), .awake);
+        try checkLifetime(self.original);
+    }
+};
+
 test "mutation apply admission rechecks activation after original CPU resumption" {
     const std = @import("std");
     const native = @import("../../common/runnable_scheduler.zig");
@@ -405,4 +430,28 @@ test "mutation apply admission retained resolution lease checks original lifetim
     held = false;
     try std.testing.expect(owner.core.apply_mutex.tryLockExclusive());
     owner.core.apply_mutex.unlockExclusive();
+}
+
+test "mutation apply admission intent collection borrows original lifetime and prohibits CPU transfer" {
+    const std = @import("std");
+    const State = struct {
+        checks: usize = 0,
+        fn life(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            if (self.checks >= 3) return error.DeadlineExceeded;
+        }
+        fn transfer(_: *anyopaque) !void {
+            @panic("intent collection retains its service lease and CPU class");
+        }
+    };
+    var state: State = .{};
+    const original: lock.ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &state, .check_fn = State.life }, .execution_wait = .{ .ptr = &state, .begin = State.transfer, .end = State.transfer } };
+    var collection: IntentCollection = .{};
+    const scope = collection.bind(original, std.testing.io).?;
+    try scope.checkpoint();
+    try std.testing.expect(try scope.executionWait() == null);
+    try std.testing.expect(original.execution_wait != null);
+    try std.testing.expectError(error.DeadlineExceeded, scope.waitForProgress());
+    try std.testing.expectEqual(@as(usize, 3), state.checks);
 }

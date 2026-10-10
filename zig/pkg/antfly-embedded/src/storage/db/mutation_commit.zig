@@ -3632,6 +3632,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             const admission = @import("mutation_admission.zig");
             try admission.checkLifetime(controls);
             const retained = admission.retainedLeaseControls(controls);
+            var collection: admission.IntentCollection = .{};
+            const collection_control = collection.bind(retained, self.core.apply_mutex.io);
             const alloc = preparation.allocator();
             var staging_progress = if (self.local_execution.restore_staging_required.load(.acquire)) try self.restoreStagingStatus(alloc) else null;
             defer if (staging_progress) |*progress| progress.deinit();
@@ -3673,7 +3675,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             while (attempts < 8) : (attempts += 1) {
                 try admission.checkLifetime(retained);
                 const schema_namespace = self.core.schemaNamespaceGeneration();
-                var intents = try self.core.collectTransactionIntentBatch(alloc, txn_id);
+                var intents = try self.core.collectTransactionIntentBatchWithAdmission(alloc, txn_id, collection_control);
                 defer intents.deinit(alloc);
                 try admission.checkLifetime(retained);
                 const intent_keys = try alloc.alloc([]const u8, intents.writes.len + intents.deletes.len);

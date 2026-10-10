@@ -2467,6 +2467,25 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-text-filter-controls-test", "Verify controlled postings scans preserve exact results and retire rejected partial scans")
         .dependOn(&b.addRunArtifact(text_filter_controls_tests).step);
 
+    const intent_collection_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/intent_collection_controls_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, intent_collection_root, true, true);
+    intent_collection_root.addImport("antfly_source_root", intent_collection_root);
+    const intent_collection_tests = b.addTest(.{
+        .name = "intent-collection-controls-tests",
+        .root_module = intent_collection_root,
+        .filters = &.{ "transaction intent collection original admission", "transaction intent snapshot owns one payload copy" },
+        .max_rss = 3 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const intent_collection_run = b.addRunArtifact(intent_collection_tests);
+    intent_collection_run.addArg("--require-no-skips");
+    b.step("antfly-intent-collection-controls-test", "Verify physical transaction snapshot original admission and rejection retirement")
+        .dependOn(&intent_collection_run.step);
+
     const storage_read_admission_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/storage_read_admission_test_root.zig"),
         .target = target,

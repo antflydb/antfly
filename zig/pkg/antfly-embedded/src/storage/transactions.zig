@@ -25,6 +25,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
+const read_control = @import("../common/read_admission.zig");
 const docstore = @import("docstore.zig");
 const DocStore = docstore.DocStore;
 const internal_keys = @import("internal_keys.zig");
@@ -1216,6 +1217,11 @@ pub const TxnManager = struct {
     }
 
     pub fn collectIntentBatch(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !IntentBatch {
+        return self.collectIntentBatchWithAdmission(alloc, txn_id, null);
+    }
+
+    pub fn collectIntentBatchWithAdmission(self: *TxnManager, alloc: Allocator, txn_id: TxnId, control: ?read_control.Port) !IntentBatch {
+        if (control) |owner| try owner.checkpoint();
         // Read the revision before scanning. Intent writes publish the record
         // revision and intent rows in one backend batch, so validation under
         // the DB apply lock detects any prepare that raced with this snapshot.
@@ -1227,11 +1233,12 @@ pub const TxnManager = struct {
         intent_prefix_buf[intents_prefix.len + 16] = ':';
         const scan_prefix = intent_prefix_buf[0 .. intents_prefix.len + 17];
 
-        const intent_entries = try self.loadIntentEntries(alloc, txn_id, scan_prefix);
+        const intent_entries = try self.loadIntentEntriesWithAdmission(alloc, txn_id, scan_prefix, control);
         errdefer backend_scan.freeResults(alloc, intent_entries);
 
         var write_count: usize = 0;
         for (intent_entries) |entry| {
+            if (control) |owner| try owner.checkpoint();
             if ((try IntentValue.decode(entry.value)).value != null) write_count += 1;
         }
         const writes = try alloc.alloc(docstore.KVPair, write_count);
@@ -1244,6 +1251,7 @@ pub const TxnManager = struct {
         var deletes_initialized: usize = 0;
 
         for (intent_entries) |entry| {
+            if (control) |owner| try owner.checkpoint();
             const user_key = entry.key[intents_prefix.len + 17 ..];
             const intent = try IntentValue.decode(entry.value);
             if (intent.value == null) {
@@ -1255,6 +1263,7 @@ pub const TxnManager = struct {
                 writes_initialized += 1;
             }
         }
+        if (control) |owner| try owner.checkpoint();
         return .{ .writes = writes, .deletes = deletes, .prepared_rows = prepared_rows, .revision = record.intent_revision, .schema_binding = schema_binding, .owned_entries = intent_entries };
     }
 
@@ -2376,6 +2385,11 @@ pub const TxnManager = struct {
     }
 
     fn loadIntentKeysOptional(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?[][]u8 {
+        return self.loadIntentKeysOptionalWithAdmission(alloc, txn_id, null);
+    }
+
+    fn loadIntentKeysOptionalWithAdmission(self: *TxnManager, alloc: Allocator, txn_id: TxnId, control: ?read_control.Port) !?[][]u8 {
+        if (control) |owner| try owner.checkpoint();
         if (try self.loadIntentAdmission(alloc, txn_id)) |admission| {
             const prefix = try makeIntentMemberKey(alloc, txn_id, "");
             defer alloc.free(prefix);
@@ -2388,12 +2402,19 @@ pub const TxnManager = struct {
             defer scan.abort();
             var cursor = try scan.openCursor();
             defer cursor.close();
+            // Current scans retain live backend read ownership; their adapters
+            // do not yet support a physical admission port. Keep the original
+            // lifetime around every cursor step without retrying a rejected read.
+            if (control) |owner| try owner.checkpoint();
             var entry = try cursor.seekAtOrAfter(prefix);
             while (entry) |item| {
                 if (!std.mem.startsWith(u8, item.key, prefix)) break;
-                const key = try alloc.dupe(u8, item.key[prefix.len..]);
-                errdefer alloc.free(key);
-                try keys.append(alloc, key);
+                {
+                    const key = try backend_scan.dupeWithAdmission(alloc, item.key[prefix.len..], control);
+                    errdefer alloc.free(key);
+                    try keys.append(alloc, key);
+                }
+                if (control) |owner| try owner.checkpoint();
                 entry = try cursor.next();
             }
             if (keys.items.len != admission.count) return error.IntentSnapshotChanged;
@@ -2405,7 +2426,7 @@ pub const TxnManager = struct {
             else => return err,
         };
         defer alloc.free(raw);
-        return try decodeParticipantList(alloc, raw);
+        return try decodeParticipantListWithAdmission(alloc, raw, control);
     }
 
     fn loadIntentAdmission(self: *TxnManager, alloc: Allocator, txn_id: TxnId) !?IntentAdmission {
@@ -2429,10 +2450,21 @@ pub const TxnManager = struct {
         txn_id: TxnId,
         scan_prefix: []const u8,
     ) ![]backend_scan.OwnedKVPair {
-        const intent_keys = (try self.loadIntentKeysOptional(alloc, txn_id)) orelse
-            return try self.scanPrefix(alloc, scan_prefix);
+        return self.loadIntentEntriesWithAdmission(alloc, txn_id, scan_prefix, null);
+    }
+
+    fn loadIntentEntriesWithAdmission(
+        self: *TxnManager,
+        alloc: Allocator,
+        txn_id: TxnId,
+        scan_prefix: []const u8,
+        control: ?read_control.Port,
+    ) ![]backend_scan.OwnedKVPair {
+        if (control) |owner| try owner.checkpoint();
+        const intent_keys = (try self.loadIntentKeysOptionalWithAdmission(alloc, txn_id, control)) orelse
+            return try backend_scan.scanPrefixWithAdmission(alloc, &self.store, scan_prefix, control);
         defer freeParticipantList(alloc, intent_keys);
-        return try self.loadIntentEntriesByKeys(alloc, scan_prefix, intent_keys);
+        return try self.loadIntentEntriesByKeysWithAdmission(alloc, scan_prefix, intent_keys, control);
     }
 
     fn loadIntentRetirementEntries(self: *TxnManager, alloc: Allocator, txn_id: TxnId, prefix: []const u8) ![]backend_scan.OwnedKVPair {
@@ -2449,6 +2481,17 @@ pub const TxnManager = struct {
         scan_prefix: []const u8,
         user_keys: []const []const u8,
     ) ![]backend_scan.OwnedKVPair {
+        return self.loadIntentEntriesByKeysWithAdmission(alloc, scan_prefix, user_keys, null);
+    }
+
+    fn loadIntentEntriesByKeysWithAdmission(
+        self: *TxnManager,
+        alloc: Allocator,
+        scan_prefix: []const u8,
+        user_keys: []const []const u8,
+        control: ?read_control.Port,
+    ) ![]backend_scan.OwnedKVPair {
+        if (control) |owner| try owner.checkpoint();
         if (user_keys.len == 0) return try alloc.alloc(backend_scan.OwnedKVPair, 0);
 
         const full_keys = try alloc.alloc([]u8, user_keys.len);
@@ -2458,24 +2501,38 @@ pub const TxnManager = struct {
             alloc.free(full_keys);
         }
         for (user_keys, 0..) |user_key, i| {
-            full_keys[i] = try std.mem.concat(alloc, u8, &.{ scan_prefix, user_key });
+            if (control) |owner| try owner.checkpoint();
+            const combined = try alloc.alloc(u8, try std.math.add(usize, scan_prefix.len, user_key.len));
+            errdefer alloc.free(combined);
+            @memcpy(combined[0..scan_prefix.len], scan_prefix);
+            var offset: usize = 0;
+            while (offset < user_key.len) {
+                if (control) |owner| try owner.checkpoint();
+                const end = offset + @min(user_key.len - offset, 64 * 1024);
+                @memcpy(combined[scan_prefix.len + offset ..][0 .. end - offset], user_key[offset..end]);
+                offset = end;
+            }
+            full_keys[i] = combined;
             full_keys_initialized += 1;
         }
-        std.mem.sort([]u8, full_keys, {}, struct {
+        try read_control.sort([]u8, full_keys, {}, struct {
             fn lessThan(_: void, left: []u8, right: []u8) bool {
                 return std.mem.order(u8, left, right) == .lt;
             }
-        }.lessThan);
+        }.lessThan, control);
 
         const key_refs = try alloc.alloc([]const u8, full_keys.len);
         defer alloc.free(key_refs);
-        for (full_keys, 0..) |key, i| key_refs[i] = key;
+        for (full_keys, 0..) |key, i| {
+            if (i % 64 == 0) if (control) |owner| try owner.checkpoint();
+            key_refs[i] = key;
+        }
         const values = try alloc.alloc(?[]const u8, full_keys.len);
         defer alloc.free(values);
         @memset(values, null);
         var probe = try self.store.beginProbe();
         defer probe.abort();
-        try probe.getManySorted(key_refs, values);
+        if (control == null) try probe.getManySorted(key_refs, values);
 
         const entries = try alloc.alloc(backend_scan.OwnedKVPair, full_keys.len);
         var initialized: usize = 0;
@@ -2486,17 +2543,29 @@ pub const TxnManager = struct {
             }
             alloc.free(entries);
         }
-        for (values, 0..) |maybe_value, i| {
-            const value = maybe_value orelse return error.IntentSnapshotChanged;
-            const owned_key = try alloc.dupe(u8, key_refs[i]);
-            errdefer alloc.free(owned_key);
-            const owned_value = try alloc.dupe(u8, value);
-            entries[i] = .{
-                .key = owned_key,
-                .value = owned_value,
-            };
-            initialized += 1;
+        var start: usize = 0;
+        while (start < values.len) {
+            const end = if (control != null) start + @min(values.len - start, 64) else values.len;
+            if (control) |owner| {
+                try owner.checkpoint();
+                try probe.getManySorted(key_refs[start..end], values[start..end]);
+                try owner.checkpoint();
+            }
+            // Copy each probe batch before another probe can reuse scratch.
+            for (values[start..end], start..) |maybe_value, i| {
+                const value = maybe_value orelse return error.IntentSnapshotChanged;
+                const owned_key = try backend_scan.dupeWithAdmission(alloc, key_refs[i], control);
+                errdefer alloc.free(owned_key);
+                const owned_value = try backend_scan.dupeWithAdmission(alloc, value, control);
+                entries[i] = .{
+                    .key = owned_key,
+                    .value = owned_value,
+                };
+                initialized += 1;
+            }
+            start = end;
         }
+        if (control) |owner| try owner.checkpoint();
         return entries;
     }
 
@@ -3109,6 +3178,11 @@ fn encodeParticipantList(alloc: Allocator, participants: []const []const u8) ![]
 }
 
 fn decodeParticipantList(alloc: Allocator, raw: []const u8) ![][]u8 {
+    return decodeParticipantListWithAdmission(alloc, raw, null);
+}
+
+fn decodeParticipantListWithAdmission(alloc: Allocator, raw: []const u8, control: ?read_control.Port) ![][]u8 {
+    if (control) |owner| try owner.checkpoint();
     if (raw.len < 4) return TxnError.InvalidTxnRecord;
     var count_buf: [4]u8 = undefined;
     @memcpy(&count_buf, raw[0..4]);
@@ -3123,13 +3197,14 @@ fn decodeParticipantList(alloc: Allocator, raw: []const u8) ![][]u8 {
     var offset: usize = 4;
     var i: usize = 0;
     while (i < count) : (i += 1) {
+        if (control) |owner| try owner.checkpoint();
         if (offset + 4 > raw.len) return TxnError.InvalidTxnRecord;
         var len_buf: [4]u8 = undefined;
         @memcpy(&len_buf, raw[offset .. offset + 4]);
         const len = std.mem.readInt(u32, &len_buf, .little);
         offset += 4;
         if (offset + len > raw.len) return TxnError.InvalidTxnRecord;
-        result[i] = try alloc.dupe(u8, raw[offset .. offset + len]);
+        result[i] = try backend_scan.dupeWithAdmission(alloc, raw[offset .. offset + len], control);
         initialized += 1;
         offset += len;
     }
@@ -5166,4 +5241,118 @@ test "transaction participant batch releases migration allocations on every fail
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "transaction intent collection original admission rejects every phase and retries exact owned data" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-collection-controls");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const id: TxnId = @splat(0x87);
+    try manager.initTransaction(id, 100);
+    const payload = try alloc.alloc(u8, 192 * 1024);
+    defer alloc.free(payload);
+    @memset(payload, 'q');
+    var writes: [71]WriteIntent = undefined;
+    var keys: [70][8]u8 = undefined;
+    for (writes[0..70], &keys, 0..) |*write, *buffer, i| {
+        const key = try std.fmt.bufPrint(buffer, "k{d:0>4}", .{i});
+        write.* = .{ .key = key, .value = if (i == 0) payload else "small" };
+    }
+    writes[70] = .{ .key = "deleted", .value = null };
+    try manager.writeIntents(id, &writes, &.{});
+    const State = struct {
+        checks: usize = 0,
+        stop_at: usize,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks >= self.stop_at) return error.DeadlineExceeded;
+        }
+    };
+    var completed: State = .{ .stop_at = std.math.maxInt(usize) };
+    var source: read_control.Payload = .{ .ptr = &completed, .vtable = &.{ .checkpoint = State.check } };
+    var snapshot = try manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source));
+    const checks = completed.checks;
+    try std.testing.expect(checks > 70);
+    try std.testing.expectEqual(@as(usize, 70), snapshot.writes.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.deletes.len);
+    try std.testing.expectEqualSlices(u8, payload, snapshot.writes[0].value);
+    try std.testing.expectEqual(snapshot.owned_entries.?[1].value.ptr + 1, snapshot.writes[0].value.ptr);
+    const revision = snapshot.revision;
+    snapshot.deinit(alloc);
+    // Fail at every reachable lifetime check, including after probe batches
+    // and partial large copies. TestingAllocator proves exact rollback ownership.
+    for (1..checks + 1) |stop_at| {
+        var stopped: State = .{ .stop_at = stop_at };
+        source.ptr = &stopped;
+        try std.testing.expectError(error.DeadlineExceeded, manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source)));
+        try std.testing.expectEqual(stop_at, stopped.checks);
+    }
+    completed.checks = 0;
+    source.ptr = &completed;
+    var retry = try manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source));
+    defer retry.deinit(alloc);
+    try std.testing.expectEqual(revision, retry.revision);
+    try std.testing.expectEqualSlices(u8, payload, retry.writes[0].value);
+    try std.testing.expectEqualSlices(u8, "deleted", retry.deletes[0]);
+}
+
+test "transaction intent collection original admission retains legacy sidecars and prefix scan ownership" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "txn-legacy-collection-controls");
+    defer alloc.free(path);
+    defer cleanupTestDir(path);
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try TxnManager.init(alloc, &store);
+    defer manager.deinit();
+    const id: TxnId = @splat(0x88);
+    try manager.initTransaction(id, 100);
+    try manager.writeIntents(id, &.{ .{ .key = "a", .value = "value-a" }, .{ .key = "b", .value = "value-b" }, .{ .key = "deleted", .value = null } }, &.{});
+    const admission_key = makeSidecarKey(intent_admission_prefix, id);
+    const legacy_key = makeSidecarKey(intent_keys_prefix, id);
+    const legacy = try encodeParticipantList(alloc, &.{ "a", "b", "deleted" });
+    defer alloc.free(legacy);
+    try manager.applyBatch(&.{.{ .key = &legacy_key, .value = legacy }}, &.{&admission_key}, null);
+    const State = struct {
+        checks: usize = 0,
+        stop_at: usize = std.math.maxInt(usize),
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            if (self.checks >= self.stop_at) return error.DeadlineExceeded;
+        }
+    };
+    // Both pre-admission-format key lists and databases without a sidecar
+    // preserve the same intent revision and payload ownership.
+    for (0..2) |mode| {
+        if (mode == 1) try manager.applyBatch(&.{}, &.{&legacy_key}, null);
+        var state: State = .{};
+        var source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check } };
+        var snapshot = try manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source));
+        const checks = state.checks;
+        try std.testing.expectEqual(@as(usize, 2), snapshot.writes.len);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.deletes.len);
+        try std.testing.expectEqualSlices(u8, "value-a", snapshot.writes[0].value);
+        snapshot.deinit(alloc);
+        for (1..checks + 1) |stop_at| {
+            var stopped: State = .{ .stop_at = stop_at };
+            source.ptr = &stopped;
+            try std.testing.expectError(error.DeadlineExceeded, manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source)));
+        }
+        const Allocation = struct {
+            fn run(failing: Allocator, owner: *TxnManager, txn: TxnId, control: read_control.Port) !void {
+                var owned = try owner.collectIntentBatchWithAdmission(failing, txn, control);
+                defer owned.deinit(failing);
+            }
+        };
+        state.checks = 0;
+        source.ptr = &state;
+        try std.testing.checkAllAllocationFailures(alloc, Allocation.run, .{ &manager, id, read_control.Port.init(&source) });
+    }
 }

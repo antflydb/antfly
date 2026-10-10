@@ -1681,3 +1681,22 @@ open. Focused native controls/participant/private-ABI coverage passes 108 tests;
 the new physical prepared-intent rejection/retry fixture is selected for full
 integration and has not yet run. Physical integration and default qualification
 are still required.
+
+Native resolution now passes its original non-yielding read admission through
+transaction intent collection. Indexed membership walks, legacy sidecar decoding,
+key sorting, intent decoding and owned payload copying check that admission.
+Controlled point probing uses batches of at most 64 keys and copies their values
+before the next probe can reuse scratch; large owned copies check every 64 KiB.
+The legacy prefix path carries admission into supported cursor operations and
+retires partial key/value ownership on any rejection or allocation failure.
+
+An independent physical transaction root covers indexed, legacy sidecar and
+prefix collection, rejects at each reachable checkpoint, retries the same
+revision/data, checks allocation failures and preserves one owned payload copy.
+It remains separate from the complete DB/API implementation. New checks also
+prove the native collection adapter retains original lifetime and cannot transfer
+CPU under retained service leases. Four physical collector checks and 88 native
+controlled-service checks pass; the source ownership/accounting audit is separate.
+Current-scan and probe interior waits still require complete physical admission
+transport. Full native resolution integration, capture/Raft/backend service graph,
+resource/performance measurements and automatic defaults remain unqualified.
