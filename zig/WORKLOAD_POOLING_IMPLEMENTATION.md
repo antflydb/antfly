@@ -1421,3 +1421,32 @@ run; it has not yet qualified production wiring. Guarded and explicit transactio
 admission, provisioned/Raft writer paths, durable completion waits and the remaining
 lock dependency graph still need adoption. Lock-held query CPU yielding and
 automatic defaults remain unqualified.
+
+Guarded and explicit bound transaction commits now keep one original admission
+budget through BEGIN, intent preparation and preparation retries. Native DB
+entry points accept borrowed controls for those pre-decision apply waits; batches
+and transaction admission share the same portable-runtime gate recheck after
+CPU resumption. Bound preparation checks the retained budget again after intent
+acceptance, so rejection still enters the existing durable abort and participant
+acknowledgement path. Replicated replay, commit decisions, abort and resolution
+retain their existing independent completion behavior.
+
+Group-local BEGIN/prepare callbacks now retain their supplied pre-decision clock
+and cancellation while acquiring apply. Those callback contracts do not carry a
+runnable borrow, so their CPU-owner transport remains unfinished. This change
+also does not qualify CPU yielding inside transaction preparation or pinned
+queries, provider/storage I/O, other row-policy/replication/catalog waits or
+mandatory completion waits.
+
+The shared apply-admission tests use a real single ordinary CPU slot, observe
+unchanged operations/retained bytes while parked, and prove a late activation
+gate rejection releases the acquired fence. Original cancellation/expiry/closed
+rejections and missing-Io admission preserve reusable legacy fences. Together
+with the prior adapter, snapshot/lock and text tests, 61 native focused tests
+passed within the 3 GiB bound. Physical tests cover every observed BEGIN/prepare
+admission checkpoint and a bound transaction whose original lifetime rejects
+after durable BEGIN but must still abort and release intents; those tests remain
+queued in `antfly-mutation-service-admission-test` and
+`antfly-local-commit-control-test`, not yet production qualification. The full
+storage/ABI integration, real overload/resource/performance matrix and automatic
+defaults remain unqualified.

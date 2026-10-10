@@ -760,7 +760,7 @@ pub const BoundTableWriteSource = struct {
         const txn_source: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         const txn_io: ?Io = txn_source.db.backend_runtime.io();
         const txn_id = nextTxnId(txn_io);
-        return try commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, pre_decision);
+        return try commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, nextTxnTimestamp(txn_io), tables, sync_level, false, cancellation, pre_decision, borrow);
     }
 
     pub fn commitTransactionWithId(
@@ -813,7 +813,7 @@ pub const BoundTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         try team.reserve(0);
         defer team.finish();
-        return commitTransactionWithIdAndCancellation(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, cancellation);
+        return commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation, .{}, team.borrow);
     }
 
     fn commitBatchWithControl(
@@ -841,7 +841,7 @@ pub const BoundTableWriteSource = struct {
     ) !?distributed_txn.CommitOutcome {
         if (control.team) |team| try team.reserve(0);
         defer if (control.team) |team| team.finish();
-        return commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation, control.pre_decision);
+        return commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, true, cancellation, control.pre_decision, if (control.team) |team| team.borrow else null);
     }
 
     pub fn acknowledgeTransactionCommit(
@@ -869,7 +869,7 @@ pub const BoundTableWriteSource = struct {
         retain_terminal: bool,
         cancellation: db_mod.types.CancellationToken,
     ) !?distributed_txn.CommitOutcome {
-        return commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, retain_terminal, cancellation, .{});
+        return commitBoundTransactionWithPreDecisionContext(ptr, alloc, txn_id, begin_timestamp, tables, sync_level, retain_terminal, cancellation, .{}, null);
     }
 
     fn commitBoundTransactionWithPreDecisionContext(
@@ -882,6 +882,7 @@ pub const BoundTableWriteSource = struct {
         retain_terminal: bool,
         cancellation: db_mod.types.CancellationToken,
         pre_decision: distributed_txn.PreDecisionContext,
+        borrow: ?runnable_abi.Borrowed,
     ) !?distributed_txn.CommitOutcome {
         try ensurePreDecisionContextActive(pre_decision);
         if (pre_decision.route_fence != null) return error.CatalogRouteFenceUnsupported;
@@ -900,14 +901,17 @@ pub const BoundTableWriteSource = struct {
         defer alloc.free(local_participant);
         const participants = [_][]const u8{local_participant};
 
-        try ensurePreDecisionContextActive(pre_decision);
-        _ = db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+        const admission = @import("mutation_admission_controls.zig");
+        var admission_budget = admission.init(pre_decision, borrow, db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
+        try admission_budget.checkpoint();
+        _ = db.beginTransactionWithAdmissionControls(
             txn_id,
             begin_timestamp,
             nextTxnTimestamp(db.backend_runtime.io()),
             &participants,
             true,
             retain_terminal,
+            admission.acquisition(&admission_budget),
         ) catch |err| switch (err) {
             error.DecisionConflict => switch (try db.getTransactionStatus(txn_id)) {
                 .committed => {
@@ -956,7 +960,7 @@ pub const BoundTableWriteSource = struct {
             },
             else => return err,
         };
-        prepareBoundTransactionWithPreDecisionContext(db, txn_id, .{
+        prepareBoundTransactionWithAdmissionControls(db, txn_id, .{
             .writes = table.writes,
             .deletes = table.deletes,
             .transforms = table.transforms,
@@ -972,7 +976,7 @@ pub const BoundTableWriteSource = struct {
             .restore_staging_scope = table.restore_staging_scope,
             .restore_staging_plan_id = table.restore_staging_plan_id,
             .relational_repair = table.relational_repair,
-        }, pre_decision) catch |err| {
+        }, &admission_budget) catch |err| {
             // A begun local transaction must reach a terminal state on every
             // rejected write. In particular, graph transform validation is
             // performed by DB.writeTransaction after begin, so returning the
@@ -1041,12 +1045,13 @@ pub const BoundTableWriteSource = struct {
         } };
     }
 
-    fn prepareBoundTransactionWithPreDecisionContext(db: *db_mod.DB, txn_id: db_mod.types.TxnId, req: db_mod.types.TransactionIntentRequest, context: distributed_txn.PreDecisionContext) !void {
-        try ensurePreDecisionContextActive(context);
-        try db.writeTransaction(txn_id, req);
+    fn prepareBoundTransactionWithAdmissionControls(db: *db_mod.DB, txn_id: db_mod.types.TxnId, req: db_mod.types.TransactionIntentRequest, budget: *@import("mutation_admission_controls.zig").Budget) !void {
+        const admission = @import("mutation_admission_controls.zig");
+        try budget.checkpoint();
+        try db.writeTransactionWithAdmissionControls(txn_id, req, admission.acquisition(budget));
         // Once preparation is accepted, caller rejection must still drive the
         // transaction's independent durable abort and acknowledgement path.
-        try ensurePreDecisionContextActive(context);
+        try budget.checkpoint();
     }
 
     pub fn createIndex(
@@ -1188,13 +1193,17 @@ pub const BoundTableWriteSource = struct {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try ensurePreDecisionContextActive(context);
-        _ = try (try self.activeDb()).beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+        const db = try self.activeDb();
+        const admission = @import("mutation_admission_controls.zig");
+        var budget = admission.init(context, null, db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
+        _ = try db.beginTransactionWithAdmissionControls(
             txn_id,
             begin_timestamp,
             nextTxnTimestamp(self.db.backend_runtime.io()),
             participants,
             true,
             retain_terminal,
+            admission.acquisition(&budget),
         );
     }
 
@@ -1227,8 +1236,9 @@ pub const BoundTableWriteSource = struct {
         if (context.route_fence != null) return error.CatalogRouteFenceUnsupported;
         try validateTransactionAgainstLocalSchema(alloc, db, txn_id, req.writes, req.deletes, req.transforms);
         if (req.relational_index_maintenance) |command| if (command.owner_group_id != (self.owner_group_id orelse return error.UnsupportedOperation)) return error.PreparedGenerationChanged;
-        try ensurePreDecisionContextActive(context);
-        try db.writeTransaction(txn_id, req);
+        const admission = @import("mutation_admission_controls.zig");
+        var budget = admission.init(context, null, db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
+        try prepareBoundTransactionWithAdmissionControls(db, txn_id, req, &budget);
     }
 
     pub fn txnResolveGroupLocal(

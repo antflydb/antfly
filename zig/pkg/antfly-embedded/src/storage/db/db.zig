@@ -22848,13 +22848,22 @@ pub const DB = struct {
         return self.beginTransactionScoped(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, null);
     }
 
+    pub fn beginTransactionWithAdmissionControls(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !transactions_mod.TxnId {
+        return self.beginTransactionScopedInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, null, controls);
+    }
+
     pub fn beginTransactionScoped(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8) !transactions_mod.TxnId {
+        return self.beginTransactionScopedInternal(txn_id, timestamp_ns, created_at_ns, participants, coordinator, retain_terminal, scope, null);
+    }
+
+    fn beginTransactionScopedInternal(self: *DB, txn_id: transactions_mod.TxnId, timestamp_ns: u64, created_at_ns: u64, participants: []const []const u8, coordinator: bool, retain_terminal: bool, scope: ?[32]u8, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !transactions_mod.TxnId {
+        if (controls) |original| try original.lifetime.check();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.lockApplyForPortableRuntime();
+        try @import("mutation_admission.zig").lockApply(self, controls);
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (self.local_execution.restore_staging_required.load(.acquire) or scope != null) {
@@ -22997,12 +23006,23 @@ pub const DB = struct {
     }
 
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
+        return self.writeTransactionWithOptionalAdmissionControls(txn_id, req, null);
+    }
+
+    /// Borrowed original owner governs pre-decision intent admission. A caller
+    /// which has accepted BEGIN still owns mandatory abort on any rejection.
+    pub fn writeTransactionWithAdmissionControls(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+        return self.writeTransactionWithOptionalAdmissionControls(txn_id, req, controls);
+    }
+
+    fn writeTransactionWithOptionalAdmissionControls(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest, controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition) !void {
+        if (controls) |original| try original.lifetime.check();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.writeTransactionInternal(txn_id, req, null);
+        try self.writeTransactionInternal(txn_id, req, null, controls);
     }
 
     pub fn writeReplicatedTransactionAtOrderedReceipt(
@@ -23012,7 +23032,7 @@ pub const DB = struct {
         identity: OrderedApplyReceipt,
     ) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        try self.writeTransactionInternal(txn_id, req, identity);
+        try self.writeTransactionInternal(txn_id, req, identity, null);
     }
 
     fn writeTransactionInternal(
@@ -23020,6 +23040,7 @@ pub const DB = struct {
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
         ordered_receipt: ?OrderedApplyReceipt,
+        controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
     ) !void {
         if (ordered_receipt == null) try self.maybeFinalizePendingRowPolicyPublication();
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
@@ -23050,7 +23071,8 @@ pub const DB = struct {
         const max_prepared_retries = 2;
         var retries: usize = 0;
         while (true) {
-            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
+            if (controls) |original| try original.lifetime.check();
+            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null, controls) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
@@ -23070,6 +23092,7 @@ pub const DB = struct {
         preparation_alloc: Allocator,
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
+        controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition,
     ) !void {
         if (req.relational_index_maintenance != null and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
@@ -23267,7 +23290,7 @@ pub const DB = struct {
             }
         }
 
-        try self.lockApplyForPortableRuntime();
+        try @import("mutation_admission.zig").lockApply(self, controls);
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
@@ -58848,6 +58871,76 @@ test "db split modeled sim workloads stay green" {
     const alloc = std.testing.allocator;
     try runModeledDbSplitReplayCase(alloc, "db-split-modeled-default", 0xA17F_E301, 8);
     try runModeledDbSplitReplayCase(alloc, "db-split-modeled-reopen-heavy", 0xA17F_E302, 10);
+}
+
+test "db controlled mutation admission BEGIN and prepare preserve terminal cleanup" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db-controlled-txn-admission");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    const State = struct {
+        checks: usize = 0,
+        fail_at: usize = std.math.maxInt(usize),
+        cause: anyerror = error.DeadlineExceeded,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            if (self.checks >= self.fail_at) return self.cause;
+        }
+    };
+    var state: State = .{};
+    const controls: @import("apply_rw_lock.zig").ApplyRwLock.Acquisition = .{ .lifetime = .{ .context = &state, .check_fn = State.check } };
+    const created_at_ns = platform_time.monotonicNs();
+    const baseline: types.TxnId = @splat(1);
+    _ = try db.beginTransactionWithAdmissionControls(baseline, 1, created_at_ns, &.{}, true, true, controls);
+    const begin_checks = state.checks;
+    try std.testing.expect(begin_checks >= 4);
+    try db.resolveTransactionIntents(baseline, .aborted, 2);
+    var ordinal: u8 = 2;
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+        for (1..begin_checks + 1) |fail_at| {
+            const id: types.TxnId = @splat(ordinal);
+            ordinal += 1;
+            state = .{ .cause = cause, .fail_at = fail_at };
+            try std.testing.expectError(cause, db.beginTransactionWithAdmissionControls(id, 1, created_at_ns, &.{}, true, true, controls));
+            try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(id));
+            try std.testing.expect(db.core.tryLockApplyExclusive());
+            db.core.unlockApply();
+        }
+    }
+    const request: types.TransactionIntentRequest = .{ .writes = &.{.{ .key = "prepared", .value = "{}" }} };
+    const prepared_baseline: types.TxnId = @splat(ordinal);
+    ordinal += 1;
+    _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(prepared_baseline, 1, created_at_ns, &.{}, true, true);
+    state = .{};
+    try db.writeTransactionWithAdmissionControls(prepared_baseline, request, controls);
+    const prepare_checks = state.checks;
+    try std.testing.expect(prepare_checks >= 5);
+    try db.resolveTransactionIntents(prepared_baseline, .aborted, 2);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+        for (1..prepare_checks + 1) |fail_at| {
+            const id: types.TxnId = @splat(ordinal);
+            ordinal += 1;
+            _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(id, 1, created_at_ns, &.{}, true, true);
+            state = .{ .cause = cause, .fail_at = fail_at };
+            try std.testing.expectError(cause, db.writeTransactionWithAdmissionControls(id, request, controls));
+            try std.testing.expectEqual(types.TxnStatus.pending, try db.getTransactionStatus(id));
+            // The foreground authority remains rejected. Mandatory terminal
+            // cleanup must still complete under its independent ownership.
+            try db.resolveTransactionIntents(id, .aborted, 2);
+            try std.testing.expectEqual(types.TxnStatus.aborted, try db.getTransactionStatus(id));
+            try std.testing.expect(db.core.tryLockApplyExclusive());
+            db.core.unlockApply();
+            try std.testing.expect(try db.get(alloc, "prepared") == null);
+        }
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "prepared", .value = "{}" }} });
+    const recovered = (try db.get(alloc, "prepared")).?;
+    defer alloc.free(recovered);
+    try std.testing.expectEqualStrings("{}", recovered);
 }
 
 test "db controlled mutation admission rejects before effects and releases service fences" {

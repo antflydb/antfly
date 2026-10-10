@@ -43753,6 +43753,62 @@ fn implementationTests() type {
             try std.testing.expect(try db.lookup(alloc, "doc:budget", .{}) == null);
         }
 
+        test "bound transaction original lifetime rejection after BEGIN durably aborts" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-bound-txn-original-lifetime");
+            defer path_tmp.cleanup();
+            var db = try db_mod.DB.open(alloc, path_tmp.path(), .{});
+            defer db.close();
+            var source = BoundTableWriteSource.init("docs", &db);
+            const errors = @import("antfly_runtime_abi").error_abi;
+            const State = struct {
+                db: *db_mod.DB,
+                id: db_mod.types.TxnId,
+                observed_begin: bool = false,
+                checkpoints: usize = 0,
+                fn lifetime(raw: *anyopaque) callconv(.c) errors.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    const status = self.db.getTransactionStatus(self.id) catch |err| switch (err) {
+                        error.TxnNotFound => return .ok,
+                        else => return errors.statusFromError(err),
+                    };
+                    if (status == .pending) {
+                        self.observed_begin = true;
+                        return errors.statusFromError(error.DeadlineExceeded);
+                    }
+                    return .ok;
+                }
+                fn checkpoint(raw: *anyopaque) callconv(.c) errors.Status {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.checkpoints += 1;
+                    return errors.statusFromError(error.InvalidRunnableTransition);
+                }
+                fn phase(_: *anyopaque, _: c_int) callconv(.c) errors.Status {
+                    return errors.statusFromError(error.InvalidRunnableTransition);
+                }
+                fn resize(_: *anyopaque, slots: usize) callconv(.c) errors.Status {
+                    return if (slots == 1) .ok else errors.statusFromError(error.InvalidRunnableDemand);
+                }
+            };
+            const id: db_mod.types.TxnId = @splat(0x73);
+            var state: State = .{ .db = &db, .id = id };
+            var team: runnable_abi.Team = .{
+                .borrow = .{ .context = &state, .cpu_slots = 1, .parent_class = @backingInt(runnable_abi.Class.write), .checkpoint = State.checkpoint, .park = State.phase, .enter = State.phase, .resize_team = State.resize, .check_lifetime = State.lifetime },
+                .maximum_slots = 1,
+                .allocator = alloc,
+            };
+            const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:expired", .value = "{}" }} }};
+            try std.testing.expectError(error.DeadlineExceeded, source.source().commitTransactionWithIdAndControl(alloc, id, 1, &tables, .write, .none, .{ .team = &team }));
+            try std.testing.expect(state.observed_begin);
+            try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, try db.getTransactionStatus(id));
+            try std.testing.expect(try db.lookup(alloc, "doc:expired", .{}) == null);
+            try std.testing.expect(team.state == .joined);
+            try std.testing.expectEqual(@as(usize, 0), state.checkpoints);
+            try db.batch(.{ .writes = &.{.{ .key = "doc:expired", .value = "{}" }} });
+            var row = (try db.lookup(alloc, "doc:expired", .{})).?;
+            defer row.deinit(alloc);
+        }
+
         test "bound batch controls retain original owner through native snapshot admission" {
             const alloc = std.testing.allocator;
             var path_tmp = try TestDirectory.init("antfly-bound-batch-admission");

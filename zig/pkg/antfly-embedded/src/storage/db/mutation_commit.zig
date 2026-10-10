@@ -802,19 +802,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var prepared_artifacts = try self.prepareMergeArtifactEffects(preparation_alloc, req);
             defer prepared_artifacts.deinit();
             const apply_lock_wait_start_ns = monotonicTimeNs();
-            if (opts.admission_controls) |controls| {
-                try self.enforcePortableRuntimeGate();
-                try self.core.apply_mutex.lockExclusiveControlledIo(
-                    self.core.apply_mutex.io orelse return error.MissingBackendRuntimeIo,
-                    controls,
-                );
-                self.enforcePortableRuntimeGate() catch |err| {
-                    self.core.unlockApply();
-                    return err;
-                };
-            } else {
-                try self.lockApplyForPortableRuntime();
-            }
+            try @import("mutation_admission.zig").lockApply(self, opts.admission_controls);
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
             if (self.local_execution.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
             var filtered_cleanup_edges: ?[]types.GraphEdgeDelete = null;
