@@ -4119,6 +4119,7 @@ pub const ModelManager = struct {
     keep_alive_ms: u64 = 0,
     max_loaded_models: usize = 0,
     eviction_group: std.Io.Group = .init,
+    eviction_stop: std.Io.Event = .unset,
     eviction_io: ?std.Io = null,
     eviction_loop_started: bool = false,
     /// Cold initialization is owned by the manager rather than whichever
@@ -5280,10 +5281,14 @@ pub const ModelManager = struct {
             @min(@max(self.keep_alive_ms / 4, 1), @as(u64, 30_000)),
         );
         while (true) {
-            try io.sleep(
-                std.Io.Duration.fromMilliseconds(@intCast(interval_ms)),
-                .awake,
-            );
+            self.eviction_stop.waitTimeout(io, .{ .duration = .{
+                .raw = .fromMilliseconds(@intCast(interval_ms)),
+                .clock = .awake,
+            } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return error.Canceled,
+            };
+            if (self.eviction_stop.isSet()) return;
             self.evictExpired();
         }
     }
@@ -6002,7 +6007,10 @@ pub const ModelManager = struct {
         // IO until their final close scope, even after the cache owner exits.
         defer if (self.teardown_domain) |domain| domain.release();
         if (self.load_io) |io| self.load_group.cancel(io);
-        if (self.eviction_io) |io| self.eviction_group.cancel(io);
+        if (self.eviction_io) |io| {
+            self.eviction_stop.set(io);
+            self.eviction_group.cancel(io);
+        }
         std.debug.assert(self.in_flight_loads.count() == 0);
         std.debug.assert(self.in_flight_composite_assets.count() == 0);
         self.in_flight_loads.deinit(self.allocator);
@@ -6047,7 +6055,7 @@ pub const ModelManager = struct {
         const start_eviction_loop = self.keep_alive_ms > 0 and
             !self.eviction_loop_started;
         if (start_eviction_loop) {
-            // This loop only ends on cancellation. async may execute inline
+            // This loop waits for shutdown. async may execute inline
             // when the CPU-bound worker limit is zero or exhausted, hanging
             // startup. concurrent must either spawn it or report failure.
             try self.eviction_group.concurrent(io, evictionLoop, .{ self, io });
