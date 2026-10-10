@@ -152,7 +152,7 @@ test "external lake overlapping text generations share every physical segment on
         }
     };
     var dummy: u8 = 0;
-    const published = try publication.build(ca, &store, table, &source, @splat(7), .{}, .none, .{ .ptr = &dummy, .now_ms = Clock.now });
+    const published = try publication.build(ca, &store, table, &source, @splat(7), .{ .io = std.testing.io }, .none, .{ .ptr = &dummy, .now_ms = Clock.now });
     var parsed = try local.metadata_lake_index_catalog.parse(a, published);
     defer parsed.deinit();
     try @import("lake_index_directory.zig").hydrate(parsed.arena.allocator(), store, &parsed.value.published.?, .none, null);

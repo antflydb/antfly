@@ -27,6 +27,7 @@ const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
+pub const statistics = @import("lake_index_text_statistics.zig");
 // Includes v8 ordered producer identities and stored projection coverage.
 // Never reuse a v8 source-free segment as a covered stored-text sidecar.
 pub const metadata_version: u16 = 9;
@@ -66,8 +67,11 @@ pub const FileGroup = struct {
     file: state.File,
     segments: []const artifacts.ChunkRef,
     rows: []const physical.Block = &.{},
+    summaries: []const ?statistics.Ref = &.{},
     pub fn validate(self: FileGroup, domain: [32]u8) !void {
         if (self.segments.len > max_segments) return error.InvalidNativeLakeTextCorpus;
+        if (self.summaries.len != 0 and self.summaries.len != self.segments.len) return error.InvalidNativeLakeTextCorpus;
+        for (self.summaries) |summary| if (summary) |ref| try ref.validate();
         try state.validate(&.{self.file}, domain);
         _ = try physical.validate(self.rows);
         for (self.rows) |block| if (block.bitmap) |ref| {
@@ -95,8 +99,12 @@ pub const Root = struct {
     recipe: [32]u8 = @splat(0),
     file_groups: []const FileGroup = &.{},
     manifests: []const artifacts.ChunkRef = &.{},
+    statistics_version: u8 = 0,
+    term_statistics: ?statistics.Ref = null,
     pub fn validate(self: Root) !void {
         if (self.version != metadata_version or self.segments.len > max_segments or std.mem.allEqual(u8, &self.domain, 0) or self.config_json.len > 256 * 1024) return error.InvalidNativeLakeTextCorpus;
+        if (self.statistics_version > 1 or (self.statistics_version == 0 and self.term_statistics != null)) return error.InvalidNativeLakeTextCorpus;
+        if (self.term_statistics) |ref| try ref.validate();
         try self.binding.validate();
         if (self.binding.sidecar_kind != .text) return error.InvalidNativeLakeTextCorpus;
         if (self.file_groups.len > 16384) return error.InvalidNativeLakeTextCorpus;
@@ -109,6 +117,7 @@ pub const Root = struct {
         var segment_position: usize = 0;
         for (self.file_groups) |group| {
             try group.validate(self.domain);
+            if (self.statistics_version == 1 and group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
             for (group.segments) |segment| {
                 if (segment_position >= self.segments.len or (!std.mem.eql(u8, segment.artifact_id, self.segments[segment_position].artifact_id) or !std.mem.eql(u8, segment.checksum, self.segments[segment_position].checksum) or segment.byte_len != self.segments[segment_position].byte_len)) return error.InvalidNativeLakeTextCorpus;
                 segment_position += 1;
@@ -290,7 +299,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         } else null;
         if (prior) |declaration| {
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
-            if (std.mem.eql(u8, &root.recipe, &recipe)) {
+            if (root.statistics_version == 1 and std.mem.eql(u8, &root.recipe, &recipe)) {
                 try declarations.append(out, declaration);
                 continue;
             }
@@ -301,7 +310,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             old.snapshot_id = binding.snapshot_id;
             if (!rebuild.bindingsEqual(old, binding)) continue;
             const root = try loadRoot(ca, store.*, declaration.artifact, cancellation, null);
-            if (!std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) continue;
+            if (root.statistics_version != 1 or !std.mem.eql(u8, &root.recipe, &recipe) or !std.mem.eql(u8, &root.domain, &store.upload_scope.?.domain)) continue;
             break root;
         } else null;
         var previous_groups: std.StringHashMapUnmanaged(FileGroup) = .empty;
@@ -320,6 +329,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         defer batch_arena.deinit();
         var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
         var segments: std.ArrayList(artifacts.ChunkRef) = .empty;
+        var summaries: std.ArrayList(?statistics.Ref) = .empty;
         var input_bytes: usize = 0;
         for (groups, plan.files, plan.changed, 0..) |*group, file, changed, file_ordinal| {
             group.* = .{ .file = file, .segments = &.{} };
@@ -327,6 +337,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const previous_group = previous_groups.get(file.id) orelse return error.InvalidNativeLakeTextCorpus;
                 group.segments = previous_group.segments;
                 group.rows = previous_group.rows;
+                group.summaries = previous_group.summaries;
+                if (group.summaries.len != group.segments.len) return error.InvalidNativeLakeTextCorpus;
+                try summaries.appendSlice(ca, group.summaries);
                 try segments.appendSlice(ca, group.segments);
                 continue;
             }
@@ -367,22 +380,43 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                         try ordinals.add(ref.external.row_group_ordinal, ref.external.row_ordinal);
                     }
                     if (builder.batch().docs.len >= 65536 or input_bytes >= 8 * 1024 * 1024 or batch_arena.queryCapacity() >= 24 * 1024 * 1024) {
-                        try flush(a, ca, store, builder.batch(), analysis, &segments, cancellation, store_source);
+                        try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source);
                         _ = batch_arena.reset(.free_all);
                         builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
                         input_bytes = 0;
                     }
                 }
             }
-            try flush(a, ca, store, builder.batch(), analysis, &segments, cancellation, store_source);
+            try flush(a, ca, store, builder.batch(), analysis, &segments, &summaries, cancellation, store_source);
             try ordinals.flush();
             group.rows = ordinals.blocks.items;
             group.segments = try ca.dupe(artifacts.ChunkRef, segments.items[first_segment..]);
+            group.summaries = try ca.dupe(?statistics.Ref, summaries.items[first_segment..]);
             _ = batch_arena.reset(.free_all);
             builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(batch_arena.allocator(), analysis, runtime, null, selected_field);
             input_bytes = 0;
         }
-        var root: Root = .{ .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
+        // Global DF touches only changed file contributions. The spill manager
+        // bounds disk independently of the sort's 4 MiB resident working set.
+        var checkpoint: StatisticsCheckpoint = .{ .provider = provider, .cancellation = cancellation };
+        var spill_manager: local.sql_spill.Manager = .{ .alloc = a, .io = provider.context.io orelse return error.UnsupportedSqlExecution, .context = &checkpoint, .checkpoint = StatisticsCheckpoint.check };
+        defer spill_manager.deinit();
+        var stats_builder = statistics.Builder.init(a, &spill_manager);
+        defer stats_builder.deinit();
+        var stats_reads: u64 = 512 * 1024 * 1024;
+        var stats_writes: u64 = 512 * 1024 * 1024;
+        const scope = store.upload_scope.?;
+        var stats_pages: @import("../serverless/graph_segment/page_store.zig").PageStore = .{ .domain = scope.domain, .attempt = scope.attempt, .artifacts = store, .cancellation = cancellation, .remaining_read_bytes = &stats_reads, .remaining_write_bytes = &stats_writes };
+        if (seed) |old| for (old.file_groups) |group| {
+            const current = plan.by_id.get(group.file.id);
+            if (current != null and !plan.changed[current.?]) continue;
+            for (group.summaries) |ref| try stats_builder.add(stats_pages.store(), ref, -1);
+        };
+        for (groups, plan.changed) |group, changed| if (changed) {
+            for (group.summaries) |ref| try stats_builder.add(stats_pages.store(), ref, 1);
+        };
+        const global_statistics = try stats_builder.finish(stats_pages.store(), if (seed) |old| old.term_statistics else null);
+        var root: Root = .{ .statistics_version = 1, .term_statistics = global_statistics, .seekable = true, .stored_projection = store_source, .domain = store.upload_scope.?.domain, .binding = binding, .config_json = spec.config_json, .segments = segments.items, .recipe = recipe, .file_groups = groups };
         try root.validate();
         // Publish one immutable manifest per file. Large corpora do not put
         // every native segment reference (twice) into the root artifact.
@@ -411,7 +445,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
     }
     return declarations.toOwnedSlice(out);
 }
-fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), cancellation: Cancellation, store_source: bool) !void {
+fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectionBatch, analysis: local.introducer.TextAnalysisConfig, segments: *std.ArrayList(artifacts.ChunkRef), summaries: *std.ArrayList(?statistics.Ref), cancellation: Cancellation, store_source: bool) !void {
     try cancellation.check();
     // Version 8 attests ascending producer identities inside each file group.
     // Segment construction preserves input order; the predicate consumer may seek.
@@ -426,6 +460,7 @@ fn flush(a: A, out: A, store: *stores.ArtifactStore, batch: mapper.TextProjectio
         var upload = store.*;
         upload.allocator = out;
         const ref = try @import("lake_index_seekable_text.zig").publish(a, out, &upload, bytes, cancellation);
+        try summaries.append(out, try statistics.publishSegment(a, store, bytes, cancellation));
         try segments.append(out, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len });
     }
 }
@@ -438,3 +473,13 @@ fn putPath(a: A, root: *std.json.Value, path: []const u8, value: std.json.Value)
         try putPath(a, child, path[dot + 1 ..], value);
     } else try root.object.put(a, path, value);
 }
+
+const StatisticsCheckpoint = struct {
+    provider: *@import("lake_index_row_source.zig").Provider,
+    cancellation: Cancellation,
+    fn check(raw: *anyopaque) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.provider.context.ensureActive();
+        try self.cancellation.check();
+    }
+};

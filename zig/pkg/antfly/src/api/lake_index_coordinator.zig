@@ -59,6 +59,7 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     var lease: Renewal = .{ .a = a, .io = io, .record = pending, .authority = authority, .clock = clock, .lease_ms = options.lease_ms, .parent_context = context };
     defer if (lease.owned) |bytes| a.free(bytes);
     var build_context = context;
+    build_context.io = io;
     build_context.checkpoint = .{ .ptr = &lease, .check = Renewal.check };
     // Provider callbacks share the renewing fence, including speculative I/O.
     const old_source_context = source.scanner.shared_reader;
