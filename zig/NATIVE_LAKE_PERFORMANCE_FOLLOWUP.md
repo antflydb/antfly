@@ -1297,3 +1297,126 @@ Qualification for these refinements with Zig 0.17.0:
   signed/zero sparse ranking, positional filters, sorted cursor pages and
   persistence; quantized sparse score/ranking preservation. The entire
   `e2e-full` suite was not run; the Iceberg fixtures remain registered there.
+
+## Next phase: persisted statistics and request-wide planning
+
+Status: planned follow-up to #1051. The work below is not implemented by this
+design change. It preserves the native engine, existing query syntax, exact
+ranking and snapshot/cursor contracts.
+
+### Persist authenticated text statistics and segment summaries
+
+Cold `IndexSnapshot.termDocFreqs` currently opens each segment's dictionary for
+uncached terms. The bounded snapshot summary cache helps later queries, but does
+not remove the first dictionary pass or cache churn across large corpora.
+
+Publish a seekable term-statistics directory with each immutable native text
+corpus. Store global field totals and term document frequencies separately from
+segment-local document frequencies and conservative frequency/norm envelopes.
+Lookups must read only the requested term pages and relevant segment summaries;
+they must not deserialize every term or every segment's dictionary. Keep scoring
+parameters out of durable summary identities: derive BM25 ceilings from the raw
+envelope using the request's average field length, k1 and b. Saturated frequency
+escapes retain their open-ended asymptotic bound. Persisted global statistics must
+match the existing scorer's deletion and distributed-statistics semantics exactly.
+
+Build the directory from bounded sorted runs and merge incrementally at file
+publication boundaries. Reuse unchanged authenticated per-file contributions;
+remove replaced/deleted contributions before publishing the new corpus totals.
+Repeated occurrences in one document count once toward term document frequency.
+Bound builder memory and temporary disk independently of vocabulary and segment
+count.
+
+References belong to the authenticated corpus/file manifests and publication
+reachability graph. Add format/recipe compatibility checks, domain and checksum
+validation, and reader-safe GC reachability for every referenced page. Cached
+statistics retain only immutable values; each read uses the current request's
+credential capability, publication lease and cancellation context. A legacy
+publication with no directory uses the exact dictionary path. Invalid referenced
+statistics fail validation rather than silently changing scores. Interrupted
+publication cannot expose partial totals.
+
+Acceptance checks:
+
+- Cold term queries read bounded statistics pages without opening all segment
+  dictionaries; warm queries preserve current authority checks.
+- Differential ranking covers changed/deleted files, custom BM25, saturated
+  frequencies, negative/zero boosts, complete/partial distributed overrides and
+  reopened/restarted publications.
+- Corrupt/missing pages, credential changes, cancellation, allocation failures
+  and GC concurrent with pinned readers preserve integrity and ownership.
+- A real Parquet/Iceberg publication test exercises rebuild, incremental refresh,
+  restart and ranking against the authoritative path.
+
+### Build sparse tasks from active stream incidence
+
+Range coverage already skips proved ordinal holes. However, each parallel lane
+still allocates space for the full stream inventory and scans that inventory for
+every claimed range. Large inventories can consume a lane's 16 MiB allowance even
+when only a handful of streams overlap any task.
+
+Build one immutable range-to-stream plan under a separately bounded planning
+budget. Use sorted interval events or an interval directory to enumerate only
+streams overlapping each disjoint task. Emit stream indices in their original
+canonical order, preserving signed f32 addition and ordinal tie ordering. Unknown
+legacy bounds conservatively overlap the whole pinned domain. Include/exclude
+mask pruning, the exclusive 2^32 endpoint and segment boundary overlaps retain
+current semantics.
+
+Lane decoder storage scales with the maximum active set of its claimed task,
+not total archive streams. Shared routing metadata must have a byte cap; do not
+replace lane inventory scans with an unbounded ranges-times-streams matrix.
+Use compact interval references or bounded task batches when incidence is large.
+Planning budget exhaustion selects the exact existing serial/spill path before
+publishing a cutoff. Errors and cancellation join all workers before releasing
+shared routing or transaction pins.
+
+Acceptance checks:
+
+- A fragmented large inventory with a small active set proves decoder allocation
+  follows active streams and routing visits avoid ranges-times-inventory work.
+- Differential IDs and score bits cover signed/zero weights, overlapping streams,
+  unknown legacy bounds, masks, deletes, u32 endpoints, forced budget fallback and
+  provider errors.
+- Allocation-failure and cancellation tests release every routing and lane owner.
+
+### Analyze and lower text queries once per request
+
+`StreamingBoolStats` caches tokenization and phrase filters, but simple Boolean
+lowering still calls `appendSimpleTextTerms` again for segment metadata planning
+and full reader preparation. Segment-bound mutable scorer trees should not own
+query-wide analysis decisions.
+
+Create a request-owned immutable lowered query representation before parallel
+planning. Preserve deduplication, minimum-should-match rules, pure optional
+clauses, legacy normalization, grouping and exact arithmetic order. Represent
+phrase positions, alternatives, repeated terms and analyzed gaps explicitly.
+Bind segment readers, local/distributed scoring constants and independent mutable
+iterators to that representation in each prepared segment. Required normalization
+choices that depend on filters or distributed-statistics availability must be
+resolved from request context before sharing the representation.
+
+Reuse the lowered representation for scalar summary planning and full reader
+preparation. Reader/source capabilities remain query-bound; reusable snapshot
+caches never retain the lowered request or its borrowed buffers. Unsupported
+shapes and explicit workspace caps retain the current authoritative fallback.
+
+Acceptance checks:
+
+- Instrumented analyzers run once per unique text/analyzer pair regardless of
+  segment count, metadata tasks, prepared cache eviction or range count.
+- Differential ranking covers nested/simple/mixed-field Boolean clauses,
+  positional alternatives and gaps, duplicates, negative/zero boosts, cursors,
+  filters and complete/partial distributed statistics.
+- Lowering allocation failures, worker cancellation and prepared-reader eviction
+  preserve ownership and request lifetimes.
+
+### Qualification and delivery
+
+Implement and measure each work package independently in the follow-up. Add
+work-count regressions before drawing performance conclusions. Run focused Debug
+and ReleaseFast suites, the production build, and the real Parquet and Iceberg
+fixtures; keep Iceberg in `e2e-full`. Record cold/warm throughput, bytes fetched,
+dictionary opens, analyzer calls, active stream counts, planning bytes, lane peak
+memory and process RSS on a representative fragmented archive. The 50-million-row
+archive remains a measurement target, not a speedup claim.
