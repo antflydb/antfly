@@ -9,9 +9,10 @@
     }
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p test/tsconfig.json",
     "test": "pnpm run build && node --test test/*.test.mjs",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/bundle-runtime.mjs",
+    "prepare:runtime": "node scripts/prepare-runtime.mjs",
     "prepack": "pnpm run build",
     "test:browser": "pnpm run build && node --test --test-concurrency=1 test/browser/*.test.mjs"
   },
@@ -23,10 +24,15 @@
   "license": "Apache-2.0",
   "files": [
     "dist",
+    "scripts/prepare-runtime.mjs",
+    "scripts/runtime-support.mjs",
     "README.md"
   ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "antfly-inference-prepare": "./scripts/prepare-runtime.mjs"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/antflydb/antfly.git",

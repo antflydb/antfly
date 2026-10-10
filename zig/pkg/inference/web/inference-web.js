@@ -137,6 +137,9 @@ function toStreamResponse(source) {
   return null;
 }
 
+// Replaced with a content identity when preparing the npm runtime assets.
+export const INFERENCE_RUNTIME_ID = '__ANTFLY_RUNTIME_ID__';
+
 export class InferenceWeb {
   constructor() {
     this.wasm = null;
@@ -223,11 +226,19 @@ export class InferenceWeb {
         : candidate.href,
     );
 
-    await this._workerCall('init', {
+    const initialized = await this._workerCall('init', {
       wasmUrls: absWasmUrls,
       sharedBuffer: this._sab,
       hasGpu: !!this.gpu,
+      expectedRuntimeId: options.expectedRuntimeId,
     });
+    // Older workers may ignore expectedRuntimeId. Require an affirmative
+    // identity in the reply so they cannot silently accept a newer client.
+    if (options.expectedRuntimeId && initialized.runtimeId !== options.expectedRuntimeId) {
+      const error = Object.assign(new Error('Inference worker JavaScript is incompatible; prepare matching runtime assets'), { code: 'RUNTIME_INCOMPATIBLE', fatal: true });
+      this.destroy(error);
+      throw error;
+    }
   }
 
   _onWorkerMessage(e) {
@@ -253,7 +264,7 @@ export class InferenceWeb {
       const pending = this._pendingCalls.get(id);
       if (pending) {
         this._pendingCalls.delete(id);
-        pending.reject(Object.assign(new Error(e.data.message), { fatal: e.data.fatal === true }));
+        pending.reject(Object.assign(new Error(e.data.message), { fatal: e.data.fatal === true, code: e.data.code }));
       }
       return;
     }

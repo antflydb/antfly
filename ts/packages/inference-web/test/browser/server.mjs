@@ -28,7 +28,7 @@ export async function startRuntimeServer() {
           ? "ts/packages/inference-web/dist"
           : name.endsWith(".wasm")
             ? "zig/zig-out"
-            : "zig/pkg/inference/web"
+            : "ts/packages/inference-web/dist/runtime-assets"
       );
       const file = resolve(dir, name);
       if (!file.startsWith(dir + sep)) throw new Error("Invalid path");

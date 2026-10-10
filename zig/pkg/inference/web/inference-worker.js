@@ -18,6 +18,9 @@ import { streamRegisterSafetensors } from './runtime/safetensors-stream.js';
 import { streamRegisterGguf } from './runtime/gguf-stream.js';
 import { ExtractionSession } from './runtime/extraction-session.js';
 
+// Replaced with a content identity when preparing the npm runtime assets.
+const INFERENCE_RUNTIME_ID = '__ANTFLY_RUNTIME_ID__';
+
 // Inference Worker: runs Antfly inference WASM module in a dedicated Web Worker.
 //
 // GPU operations are proxied to the main thread (which owns the WebGPU device)
@@ -517,6 +520,10 @@ self.onmessage = async (e) => {
   try {
     switch (type) {
       case 'init': {
+        if (e.data.expectedRuntimeId && e.data.expectedRuntimeId !== INFERENCE_RUNTIME_ID) {
+          self.postMessage({ type: 'error', id, message: 'Inference worker JavaScript is incompatible; prepare matching runtime assets', code: 'RUNTIME_INCOMPATIBLE', fatal: true });
+          return;
+        }
         sab = e.data.sharedBuffer;
         ctrl = sab ? new Int32Array(sab, 0, 16) : null;
 
@@ -645,7 +652,7 @@ self.onmessage = async (e) => {
         wasm.init();
         extraction = new ExtractionSession(wasm, abi);
 
-        self.postMessage({ type: 'init-done', id });
+        self.postMessage({ type: 'init-done', id, runtimeId: INFERENCE_RUNTIME_ID });
         break;
       }
 
