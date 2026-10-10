@@ -8912,18 +8912,25 @@ fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_
     backend.recordLocalBlockCacheMiss();
     // Release decoder admission before taking the writer mutex to publish.
     // A writer may wait for a workspace, but never for a cache publisher.
-    var read_credit: ?@import("../resource_manager.zig").Reservation = if (backend.options.resource_manager) |manager|
-        try manager.reserveWithoutReclaim(.lsm_read_working_set, @as(usize, window.len) + @sizeOf(SharedBytes))
-    else
-        null;
+    const resources = @import("../resource_manager.zig");
+    var construction: ?resources.ConstructionCredit = null;
+    // Declared before decoded allocations: failure destroys physical bytes
+    // before accounting retirement, independently of a rejected read scope.
+    defer if (construction) |*credit| credit.retire();
+    var read_credit: ?resources.Reservation = if (backend.options.resource_manager) |manager| blk: {
+        const bytes = @as(usize, window.len) + @sizeOf(SharedBytes);
+        if (control) |budget| {
+            construction = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, bytes, budget);
+            break :blk null;
+        }
+        break :blk try manager.reserveWithoutReclaim(.lsm_read_working_set, bytes);
+    } else null;
     defer if (read_credit) |*credit| credit.release();
     const lease = blk: {
         const bytes = try loadDecodedLocalBlockWithAdmission(backend, backend.allocator, path, offset, window, control);
         errdefer backend.allocator.free(bytes);
         break :blk try SharedBytes.create(backend.allocator, bytes);
     };
-    lease.reservation = read_credit;
-    read_credit = null;
     lease.result_pins_allowed = backend.options.resource_manager == null;
     errdefer lease.release();
     const locked = if (backend_locked) false else if (control) |budget| try lockBackendWithAdmission(@TypeOf(backend.*), backend, budget) else lockBackend(@TypeOf(backend.*), backend);
@@ -8932,6 +8939,11 @@ fn loadLocalBlockCandidate(backend: anytype, run: *Run, index: *const lsm_table_
         lease.release();
         return winner;
     }
+    // Publish credit only after every fallible scope check. A rejected lock
+    // or losing duplicate destroys the lease before its construction token
+    // retires, without falling back to blocking reservation.release().
+    lease.reservation = if (construction) |*credit| credit.transfer() else read_credit;
+    read_credit = null;
     if (admit) _ = backend.cacheRunBlockLease(path, run.id, offset, len, lease);
     return lease;
 }
@@ -13646,6 +13658,14 @@ pub fn qualifyControlledNativeReadBatch(control: read_admission.Port, use_scope:
 }
 
 pub fn qualifyControlledUncachedReadBatch(control: read_admission.Port, local_cache: bool, use_scope: bool) !void {
+    return qualifyUncachedReadBatch(control, local_cache, use_scope, false);
+}
+
+pub fn qualifyControlledManagedUncachedReadBatch(control: read_admission.Port, local_cache: bool, use_scope: bool) !void {
+    return qualifyUncachedReadBatch(control, local_cache, use_scope, true);
+}
+
+fn qualifyUncachedReadBatch(control: read_admission.Port, local_cache: bool, use_scope: bool, managed: bool) !void {
     if (!builtin.is_test) @compileError("test fixture only");
     const B = @import("../lsm_backend.zig").Backend;
     const a = std.testing.allocator;
@@ -13655,7 +13675,9 @@ pub fn qualifyControlledUncachedReadBatch(control: read_admission.Port, local_ca
     defer a.free(path);
     var storage = try storage_io.NativeStorage.init(a, .threaded);
     defer storage.deinit();
-    var backend = try B.open(a, path, .{ .storage = storage.storage(), .flush_threshold = 1, .local_block_cache_enabled = local_cache });
+    var resources = @import("../resource_manager.zig").ResourceManager.init(.{ .identity_allocator = a });
+    defer resources.deinit(a);
+    var backend = try B.open(a, path, .{ .resource_manager = if (managed) &resources else null, .storage = storage.storage(), .flush_threshold = 1, .local_block_cache_enabled = local_cache });
     defer backend.close();
     var store = try backend.runtimeStore(a, .{ .name = "docs" });
     defer store.deinit();

@@ -1082,6 +1082,9 @@ test "dense aggregate resource manager bounds callers and helpers together" {
 pub const ResourceManager = struct {
     pub const MemoryParent = @import("runtime_memory_abi").Parent;
     memory_parent: ?MemoryParent = null,
+    // Construction claims are admitted before a local decoder starts. Slots
+    // hold only accounting credit after physical failure, never a read scope.
+    construction_cleanup: [64]ConstructionCleanup = @splat(.{}),
 
     dense_checkpoint_ready: @import("maintenance_signal.zig").Signal = .{},
     mutex: std.atomic.Mutex = .unlocked,
@@ -2070,6 +2073,18 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        // Quiescent teardown: producers and admitted cleanup have joined.
+        for (&self.construction_cleanup) |*slot| {
+            switch (slot.state.load(.acquire)) {
+                .free => {},
+                .ready => {
+                    slot.credit.?.release();
+                    slot.credit = null;
+                    slot.state.store(.free, .release);
+                },
+                else => @panic("resource manager closed with live construction cleanup"),
+            }
+        }
         std.debug.assert(self.memory.external_bytes == 0);
         self.dense_checkpoint_ready.assertUnbound();
         self.dense_rerank_admission.assertIdle();
@@ -2755,6 +2770,61 @@ pub const ResourceManager = struct {
                 try control.waitForProgress();
                 continue;
             };
+        }
+    }
+
+    /// Reserve an independent retirement owner before reserving decoder bytes.
+    /// Saturation refuses construction before allocation or physical work.
+    pub fn reserveConstructionWithAdmission(self: *ResourceManager, slice: Slice, bytes: u64, control: read_admission.Port) !ConstructionCredit {
+        // Visit all completed slots before electing a free one. Returning at
+        // the first free slot would indefinitely strand later retirement debt
+        // under a steady stream of low-concurrency reads.
+        for (&self.construction_cleanup) |*slot| {
+            try control.checkpoint();
+            _ = self.tryDrainConstructionSlot(slot);
+        }
+        for (&self.construction_cleanup) |*slot| {
+            try control.checkpoint();
+            if (slot.state.cmpxchgStrong(.free, .active, .acquire, .monotonic) != null) continue;
+            errdefer slot.state.store(.free, .release);
+            slot.credit = try self.reserveWithoutReclaimWithAdmission(slice, bytes, control);
+            // No fallible checkpoint after credit publication and before the
+            // caller can install its mandatory retirement defer.
+            return .{ .manager = self, .slot = slot };
+        }
+        return error.ResourceBudgetExceeded;
+    }
+
+    fn tryDrainConstructionSlot(self: *ResourceManager, slot: *ConstructionCleanup) bool {
+        if (slot.state.cmpxchgStrong(.ready, .draining, .acquire, .monotonic) != null) return slot.state.load(.acquire) == .free;
+        switch (self.tryReleaseReservation(&slot.credit.?)) {
+            .released => {
+                slot.credit = null;
+                slot.state.store(.free, .release);
+                return true;
+            },
+            .mismatch => @panic("construction cleanup lost reservation ownership"),
+            .busy, .unsupported => {
+                slot.state.store(.ready, .release);
+                return false;
+            },
+        }
+    }
+
+    /// Borrow a fresh cleanup admission for each synchronous drain. A rejected
+    /// cleanup leaves every unretired identity charged in manager-owned slots.
+    pub fn drainConstructionCleanupWithAdmission(self: *ResourceManager, control: read_admission.Port) !void {
+        while (true) {
+            var pending = false;
+            for (&self.construction_cleanup) |*slot| {
+                try control.checkpoint();
+                if (!self.tryDrainConstructionSlot(slot)) {
+                    const state = slot.state.load(.acquire);
+                    pending = pending or state == .ready or state == .draining;
+                }
+            }
+            if (!pending) return;
+            try control.waitForProgress();
         }
     }
 
@@ -4225,6 +4295,38 @@ fn hbcClockEntries(budget_bytes: u64, estimated_entry_bytes: u64) usize {
     const entries = @min(hbc_max_clock_entries, @max(@as(u64, 1), budget_bytes / estimated_entry_bytes));
     return @intCast(entries);
 }
+
+const ConstructionCleanup = struct {
+    const State = enum(u8) { free, active, ready, draining };
+    state: std.atomic.Value(State) = .init(.free),
+    credit: ?Reservation = null,
+};
+
+/// The manager outlives the construction attempt and any retained retirement
+/// debt. This token contains no borrowed admission or allocator callback.
+pub const ConstructionCredit = struct {
+    manager: *ResourceManager,
+    slot: ?*ConstructionCleanup,
+
+    /// Transfer successful construction credit to the published physical owner.
+    pub fn transfer(self: *ConstructionCredit) Reservation {
+        const slot = self.slot orelse @panic("construction credit already consumed");
+        const credit = slot.credit.?;
+        slot.credit = null;
+        self.slot = null;
+        slot.state.store(.free, .release);
+        return credit;
+    }
+
+    /// Call after failed physical work has joined and its allocations are gone.
+    /// One finite accounting attempt; contention retains the exact charge.
+    pub fn retire(self: *ConstructionCredit) void {
+        const slot = self.slot orelse return;
+        self.slot = null;
+        slot.state.store(.ready, .release);
+        _ = self.manager.tryDrainConstructionSlot(slot);
+    }
+};
 
 pub const Reservation = struct {
     manager: *ResourceManager,
@@ -7227,4 +7329,66 @@ test "resource manager adopts construction credit preserves ownership on identit
     credit.release();
     try manager.adjustUsage(.lsm_block_table_cache, &retained, 0);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
+}
+
+pub fn qualifyConstructionRetirement(control: read_admission.Port, parent_busy: bool) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    var parent = ResourceManager.init(.{ .identity_allocator = a });
+    defer parent.deinit(a);
+    var manager = ResourceManager.init(.{ .identity_allocator = a });
+    defer manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var claims: [64]?ConstructionCredit = @splat(null);
+    defer for (&claims) |*claim| if (claim.*) |*credit| credit.retire();
+    for (&claims) |*claim| claim.* = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, 8, control);
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserveConstructionWithAdmission(.lsm_read_working_set, 8, control));
+    const before = parent.snapshot().memory.used_bytes;
+    try std.testing.expectEqual(@as(u64, 512), before);
+    // Completion cannot enter either held ledger. Rejecting the original
+    // scope still leaves a live accounting owner, never an uncharged buffer.
+    const result = blk: {
+        const mutex = if (parent_busy) &parent.mutex else &manager.mutex;
+        std.debug.assert(mutex.tryLock());
+        defer mutex.unlock();
+        const checkpoint = control.checkpoint();
+        for (&claims) |*claim| if (claim.*) |*credit| {
+            credit.retire();
+            credit.retire();
+        };
+        for (&manager.construction_cleanup) |*slot| try std.testing.expectEqual(ConstructionCleanup.State.ready, slot.state.load(.acquire));
+        break :blk checkpoint;
+    };
+    try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(before, parent.snapshot().memory.used_bytes);
+    // Independent cleanup admission does not retain or reenter the caller.
+    const Cleanup = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn wait(_: *anyopaque) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    var context: u8 = 0;
+    const payload: read_admission.Payload = .{ .ptr = &context, .vtable = &.{ .checkpoint = Cleanup.checkpoint, .wait_for_progress = Cleanup.wait } };
+    const cleanup = read_admission.Port.init(&payload);
+    // Ordinary construction must visit and release every completed slot before
+    // taking the first free slot; later debt cannot be starved by slot zero.
+    var retry = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, 8, cleanup);
+    try std.testing.expectEqual(@as(u64, 8), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 8), parent.snapshot().memory.used_bytes);
+    // Reuse and successful ownership transfer free the slot without releasing
+    // the payload's reservation; stale consumed tokens cannot retire it.
+    var published = retry.transfer();
+    retry.retire();
+    try std.testing.expectEqual(@as(u64, 8), manager.snapshot().memory.used_bytes);
+    published.release();
+    var final = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, 8, cleanup);
+    std.debug.assert(manager.mutex.tryLock());
+    final.retire();
+    manager.mutex.unlock();
+    try std.testing.expectEqual(@as(u64, 8), manager.snapshot().memory.used_bytes);
+    try manager.drainConstructionCleanupWithAdmission(cleanup);
+    try qualifyNoLiveReservations(&manager);
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+    try result;
 }
