@@ -149,6 +149,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--reference-url", help="llama.cpp /v1/embeddings endpoint")
     parser.add_argument("--model", default="Qwen/Qwen3-Embedding-0.6B-GGUF")
     parser.add_argument("--reference-model")
+    parser.add_argument(
+        "--task-type", choices=("document", "query"), default="document"
+    )
+    parser.add_argument(
+        "--query-prefix",
+        help="exact rendered query prefix already present in each fixture text",
+    )
+    parser.add_argument("--instruction", help="Antfly query instruction override")
+    parser.add_argument(
+        "--reference-slots-url",
+        help="owned llama /slots endpoint; erase all idle slots before each query outside timing",
+    )
     parser.add_argument("--corpus", choices=sorted(CORPUS_PROFILES), default="mixed")
     parser.add_argument(
         "--fixture", type=Path, help=f"exact-token {FIXTURE_SCHEMA} JSON"
@@ -207,6 +219,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="preserve absolute local paths in the persisted report",
     )
     args = parser.parse_args(argv)
+    if args.task_type == "query" and (
+        not args.fixture or not args.query_prefix or not args.reference_slots_url
+    ):
+        parser.error(
+            "query mode requires a rendered exact-token fixture, query-prefix and reference-slots-url"
+        )
+    if args.task_type != "query" and (
+        args.query_prefix or args.instruction or args.reference_slots_url
+    ):
+        parser.error(
+            "query-prefix, instruction and reference-slots-url require task-type=query"
+        )
     args.batch_sizes = [
         int(value) for value in args.batch_sizes.split(",") if value.strip()
     ]
@@ -472,7 +496,10 @@ def select_fixture_token_count(
 
 
 def validate_cache_neutral_cases(
-    cases: list[dict[str, Any]], needed_cases: int
+    cases: list[dict[str, Any]],
+    needed_cases: int,
+    *,
+    erased_reference_slots: bool = False,
 ) -> None:
     """Fail closed unless every consumed prompt defeats active-slot LCP reuse."""
     if len(cases) < needed_cases:
@@ -485,8 +512,9 @@ def validate_cache_neutral_cases(
         "case ids": [case["id"] for case in consumed],
         "texts": [case["text"] for case in consumed],
         "token sequences": [tuple(case["token_ids"]) for case in consumed],
-        "first token ids": [case["token_ids"][0] for case in consumed],
     }
+    if not erased_reference_slots:
+        identities["first token ids"] = [case["token_ids"][0] for case in consumed]
     duplicates = [
         label for label, values in identities.items() if len(set(values)) != len(values)
     ]
@@ -680,9 +708,16 @@ def process_provenance(
 
 
 def request_embeddings(
-    url: str, model: str, texts: list[str], timeout: float
+    url: str,
+    model: str,
+    texts: list[str],
+    timeout: float,
+    *,
+    request_options: dict[str, Any] | None = None,
 ) -> tuple[float, list[list[float]], str, int | None]:
-    body = json.dumps({"model": model, "input": texts}).encode()
+    body = json.dumps(
+        {"model": model, "input": texts, **(request_options or {})}
+    ).encode()
     request = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"}, method="POST"
     )
@@ -695,11 +730,23 @@ def request_embeddings(
         raise RuntimeError(
             f"expected {len(texts)} embeddings, got {len(data) if isinstance(data, list) else 'none'}"
         )
+    if [item.get("index") if isinstance(item, dict) else None for item in data] != list(
+        range(len(texts))
+    ):
+        raise RuntimeError("response embedding indices do not preserve request order")
     embeddings = [
         item.get("embedding") if isinstance(item, dict) else None for item in data
     ]
     if any(not isinstance(vector, list) or not vector for vector in embeddings):
         raise RuntimeError("response contains an empty embedding vector")
+    if any(
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        for vector in embeddings
+        for value in vector
+    ):
+        raise RuntimeError("response contains a non-finite or non-numeric embedding")
     dimensions = {len(vector) for vector in embeddings}
     if len(dimensions) != 1:
         raise RuntimeError(f"inconsistent embedding dimensions: {sorted(dimensions)}")
@@ -712,6 +759,44 @@ def request_embeddings(
     ):
         prompt_tokens = None
     return elapsed_ms, embeddings, str(payload.get("model", "")), prompt_tokens
+
+
+def erase_reference_slots(url: str, timeout: float) -> list[int]:
+    """Only use on an owned, isolated reference; fail closed on active slots."""
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        slots = json.loads(response.read())
+    if not isinstance(slots, list) or not slots:
+        raise ValueError("reference slots endpoint returned no slots")
+    erased = []
+    for slot in slots:
+        if not isinstance(slot, dict) or slot.get("is_processing") is not False:
+            raise ValueError("reference slot is active or has an unknown state")
+        slot_id = slot.get("id")
+        if (
+            not isinstance(slot_id, int)
+            or isinstance(slot_id, bool)
+            or slot_id < 0
+            or slot_id in erased
+        ):
+            raise ValueError("reference returned an invalid slot identity")
+        request = urllib.request.Request(
+            f"{url.rstrip('/')}/{slot_id}?action=erase",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read())
+        if (
+            not isinstance(payload, dict)
+            or type(payload.get("id_slot")) is not int
+            or payload["id_slot"] != slot_id
+            or type(payload.get("n_erased")) is not int
+            or payload["n_erased"] < 0
+        ):
+            raise ValueError("reference did not acknowledge prompt-cache erasure")
+        erased.append(slot_id)
+    return erased
 
 
 def result_for_target(
@@ -758,6 +843,32 @@ def run_cell(
     observed_models: dict[str, list[str]] = {label: [] for label in targets}
     reported: dict[str, str] = {}
     samples: dict[str, list[float]] = {label: [] for label in targets}
+
+    def request_target(label: str, texts: list[str]):
+        if getattr(args, "task_type", "document") != "query":
+            return request_embeddings(
+                targets[label][0], targets[label][1], texts, args.timeout
+            )
+        if any(not text.startswith(args.query_prefix) for text in texts):
+            raise ValueError(
+                "query fixture text does not contain its declared rendered prefix"
+            )
+        if label == "reference":
+            erase_reference_slots(args.reference_slots_url, args.timeout)
+            return request_embeddings(
+                targets[label][0], targets[label][1], texts, args.timeout
+            )
+        options = {"task_type": "RETRIEVAL_QUERY"}
+        if args.instruction is not None:
+            options["instruction"] = args.instruction
+        return request_embeddings(
+            targets[label][0],
+            targets[label][1],
+            [text[len(args.query_prefix) :] for text in texts],
+            args.timeout,
+            request_options=options,
+        )
+
     for iteration, (texts, _) in enumerate(precondition_batches or []):
         order = (
             ("antfly", "reference") if iteration % 2 == 0 else ("reference", "antfly")
@@ -766,9 +877,7 @@ def run_cell(
             order = ("antfly",)
         for label in order:
             (_, last_embeddings[label], reported[label], last_prompt_tokens[label]) = (
-                request_embeddings(
-                    targets[label][0], targets[label][1], texts, args.timeout
-                )
+                request_target(label, texts)
             )
             observed_prompt_tokens[label].append(last_prompt_tokens[label])
             observed_models[label].append(reported[label])
@@ -781,9 +890,7 @@ def run_cell(
             order = ("antfly",)
         for label in order:
             (_, last_embeddings[label], reported[label], last_prompt_tokens[label]) = (
-                request_embeddings(
-                    targets[label][0], targets[label][1], texts, args.timeout
-                )
+                request_target(label, texts)
             )
             observed_prompt_tokens[label].append(last_prompt_tokens[label])
             observed_models[label].append(reported[label])
@@ -803,9 +910,7 @@ def run_cell(
                 last_embeddings[label],
                 reported[label],
                 last_prompt_tokens[label],
-            ) = request_embeddings(
-                targets[label][0], targets[label][1], texts, args.timeout
-            )
+            ) = request_target(label, texts)
             observed_prompt_tokens[label].append(last_prompt_tokens[label])
             observed_models[label].append(reported[label])
             samples[label].append(elapsed)
@@ -955,6 +1060,12 @@ def main(argv: list[str] | None = None) -> int:
         },
         "comparison_contract": {
             "strict": args.require_comparable,
+            "query_rendering": "fixture contains complete rendered input; Antfly receives stripped body"
+            if args.task_type == "query"
+            else None,
+            "reference_cache_control": "erase every idle slot before each request, outside timing"
+            if args.task_type == "query"
+            else "unique first tokens checked in strict fixture mode",
             "sample_order": "alternating AB/BA"
             if args.reference_url
             else "single target",
@@ -994,7 +1105,11 @@ def main(argv: list[str] | None = None) -> int:
             reserve_cases = 2 * batch if args.precondition_iters else 0
             if args.require_comparable:
                 try:
-                    validate_cache_neutral_cases(fixture, needed_cases + reserve_cases)
+                    validate_cache_neutral_cases(
+                        fixture,
+                        needed_cases + reserve_cases,
+                        erased_reference_slots=args.task_type == "query",
+                    )
                 except ValueError as exc:
                     print(f"benchmark configuration failed: {exc}", file=sys.stderr)
                     return 2

@@ -1,0 +1,403 @@
+{
+  "model": {
+    "model_id": "fastino/GLiNER2.5-multi-Decide",
+    "revision": "a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f",
+    "files": {
+      "config.json": {
+        "size_bytes": 3152,
+        "sha256": "be5123080c0f3f01b938bc46a5dd0d7a2e515a34f6df798dfd70ed04c277c8bf"
+      },
+      "encoder_config/config.json": {
+        "size_bytes": 858,
+        "sha256": "d0ebbcb8b458e285a39e12cc315cbaf3d1c6f631e7281e6b22dd5b4071183f83"
+      },
+      "model.safetensors": {
+        "size_bytes": 1149461028,
+        "sha256": "9efe0f88c99f2aa794452e9559dc60e98d60d9fa2bf1b60cf2710411b6da5b4e"
+      },
+      "tokenizer.json": {
+        "size_bytes": 16035853,
+        "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a"
+      },
+      "tokenizer_config.json": {
+        "size_bytes": 646,
+        "sha256": "fd4a31dc2f1f17e31638c5f0e783b81cdb2fbe6bddd116a8d9e5d50d78148cf1"
+      }
+    },
+    "architecture": "boundary",
+    "tasks": [
+      "classification",
+      "typed_decisions",
+      "windowing"
+    ]
+  },
+  "qualification": false,
+  "scope": "loaded_classification_fixtures",
+  "native_binary_sha256": "9f70a8c2e620aef814fda682f3988e2aa7f9b8130b829ef338a273823d0c245d",
+  "cases_sha256": "b9b2d37785d6cf2f9d6c45c6280e7d3645df07af435c37acb2bf008a1f563be9",
+  "oracle_sha256": "2b2aa91a0a91d4dfc09709357c1be6c4bf02fb7c2eb13150f4885435553b4478",
+  "precision": "fp16",
+  "attention_only": false,
+  "reference_dtype": "fp16",
+  "reference_weight_dtype": "fp16",
+  "attention": "flashdeberta",
+  "pairs": 30,
+  "tail_samples": 200,
+  "warmup": 5,
+  "cells": [
+    {
+      "id": "tokens_128_batch_1",
+      "batch_size": 1,
+      "max_confidence_error": 3.814697265625e-06,
+      "native_ns": {
+        "min": 3116221.0,
+        "median": 3344973.0,
+        "mean": 3317847.715,
+        "p95": 3508027.25,
+        "max": 3678630.0,
+        "cv": 0.03554384232870904
+      },
+      "python_ns": {
+        "min": 20427159.0,
+        "median": 21464532.5,
+        "mean": 21627946.845,
+        "p95": 23011786.45,
+        "max": 24192390.0,
+        "cv": 0.03189925544620251
+      },
+      "native_over_python": {
+        "lower_95": 0.14978328946209785,
+        "median": 0.15466297338828497,
+        "upper_95": 0.15748000105387167,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    },
+    {
+      "id": "tokens_128_batch_8",
+      "batch_size": 8,
+      "max_confidence_error": 0.000164031982421875,
+      "native_ns": {
+        "min": 10919447.0,
+        "median": 11184749.5,
+        "mean": 11206077.52,
+        "p95": 11402223.15,
+        "max": 12603470.0,
+        "cv": 0.018639471562695874
+      },
+      "python_ns": {
+        "min": 25134261.0,
+        "median": 26850087.5,
+        "mean": 27108630.08,
+        "p95": 29131426.649999995,
+        "max": 36874066.0,
+        "cv": 0.05086857168603947
+      },
+      "native_over_python": {
+        "lower_95": 0.3991545321873742,
+        "median": 0.40326906670226964,
+        "upper_95": 0.40950540552549813,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    },
+    {
+      "id": "tokens_512_batch_1",
+      "batch_size": 1,
+      "max_confidence_error": 4.076957702636719e-05,
+      "native_ns": {
+        "min": 6787309.0,
+        "median": 6976863.0,
+        "mean": 7030364.875,
+        "p95": 7547104.449999999,
+        "max": 8106758.0,
+        "cv": 0.030467887935702247
+      },
+      "python_ns": {
+        "min": 20557291.0,
+        "median": 22086107.5,
+        "mean": 22323928.835,
+        "p95": 24341552.599999998,
+        "max": 25683475.0,
+        "cv": 0.048077367176233864
+      },
+      "native_over_python": {
+        "lower_95": 0.2990952812516226,
+        "median": 0.3046803558507587,
+        "upper_95": 0.3183580710312557,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    },
+    {
+      "id": "tokens_512_batch_8",
+      "batch_size": 8,
+      "max_confidence_error": 0.0003674030303955078,
+      "native_ns": {
+        "min": 60864571.0,
+        "median": 62330411.5,
+        "mean": 62419733.925,
+        "p95": 63526031.099999994,
+        "max": 64314116.0,
+        "cv": 0.010274459974039108
+      },
+      "python_ns": {
+        "min": 49491581.0,
+        "median": 51024595.0,
+        "mean": 51138380.765,
+        "p95": 52425694.24999999,
+        "max": 55493072.0,
+        "cv": 0.017804688612691324
+      },
+      "native_over_python": {
+        "lower_95": 1.2132617527262064,
+        "median": 1.2223121750738803,
+        "upper_95": 1.2305500187767962,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": false
+    },
+    {
+      "id": "tokens_2048_batch_1",
+      "batch_size": 1,
+      "max_confidence_error": 0.0006176233291625977,
+      "native_ns": {
+        "min": 46271878.0,
+        "median": 47839662.0,
+        "mean": 47904483.275,
+        "p95": 49392819.8,
+        "max": 50160598.0,
+        "cv": 0.01711760016231744
+      },
+      "python_ns": {
+        "min": 37667573.0,
+        "median": 39379072.5,
+        "mean": 39476137.365,
+        "p95": 41317384.199999996,
+        "max": 42557935.0,
+        "cv": 0.022439663578150422
+      },
+      "native_over_python": {
+        "lower_95": 1.2065742066262015,
+        "median": 1.217625532565747,
+        "upper_95": 1.2242874276255746,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": false
+    },
+    {
+      "id": "tokens_2048_batch_8",
+      "batch_size": 8,
+      "max_confidence_error": 0.0006181597709655762,
+      "native_ns": {
+        "min": 435576806.0,
+        "median": 439406204.0,
+        "mean": 439463260.85,
+        "p95": 442517841.95,
+        "max": 446100885.0,
+        "cv": 0.004552730617740897
+      },
+      "python_ns": {
+        "min": 290561700.0,
+        "median": 296198125.5,
+        "mean": 296339839.755,
+        "p95": 300964938.15000004,
+        "max": 303663676.0,
+        "cv": 0.009014765104215243
+      },
+      "native_over_python": {
+        "lower_95": 1.4901382082038153,
+        "median": 1.492967813349432,
+        "upper_95": 1.496045534702991,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": false
+    },
+    {
+      "id": "tokens_128_batch_32",
+      "batch_size": 32,
+      "max_confidence_error": 0.00044590234756469727,
+      "native_ns": {
+        "min": 53368579.0,
+        "median": 54534208.0,
+        "mean": 54638320.82,
+        "p95": 56069291.400000006,
+        "max": 57295523.0,
+        "cv": 0.015904588821122466
+      },
+      "python_ns": {
+        "min": 60354999.0,
+        "median": 62647888.5,
+        "mean": 63657091.935,
+        "p95": 64625011.9,
+        "max": 257955664.0,
+        "cv": 0.21723627688344865
+      },
+      "native_over_python": {
+        "lower_95": 0.8633656511571639,
+        "median": 0.867010907603607,
+        "upper_95": 0.8762194902872262,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    },
+    {
+      "id": "tokens_128_batch_64",
+      "batch_size": 64,
+      "max_confidence_error": 0.0004457235336303711,
+      "native_ns": {
+        "min": 118130633.0,
+        "median": 119674512.0,
+        "mean": 119635168.795,
+        "p95": 120913733.2,
+        "max": 123585957.0,
+        "cv": 0.0068596130378294085
+      },
+      "python_ns": {
+        "min": 126845797.0,
+        "median": 130699520.0,
+        "mean": 132819894.405,
+        "p95": 134744569.65,
+        "max": 326375472.0,
+        "cv": 0.14208000971146606
+      },
+      "native_over_python": {
+        "lower_95": 0.9155180214901545,
+        "median": 0.9189502071995764,
+        "upper_95": 0.9229925060077515,
+        "samples": 10000,
+        "seed": 20260730,
+        "estimator": "median_paired_log_ratio"
+      },
+      "regression_guard_passed": true
+    }
+  ],
+  "python": {
+    "event": "ready",
+    "arm": "fastino_cuda",
+    "model_id": "fastino/GLiNER2.5-multi-Decide",
+    "revision": "a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f",
+    "model_files": {
+      "config.json": {
+        "size_bytes": 3152,
+        "sha256": "be5123080c0f3f01b938bc46a5dd0d7a2e515a34f6df798dfd70ed04c277c8bf"
+      },
+      "encoder_config/config.json": {
+        "size_bytes": 858,
+        "sha256": "d0ebbcb8b458e285a39e12cc315cbaf3d1c6f631e7281e6b22dd5b4071183f83"
+      },
+      "model.safetensors": {
+        "size_bytes": 1149461028,
+        "sha256": "9efe0f88c99f2aa794452e9559dc60e98d60d9fa2bf1b60cf2710411b6da5b4e"
+      },
+      "tokenizer.json": {
+        "size_bytes": 16035853,
+        "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a"
+      },
+      "tokenizer_config.json": {
+        "size_bytes": 646,
+        "sha256": "fd4a31dc2f1f17e31638c5f0e783b81cdb2fbe6bddd116a8d9e5d50d78148cf1"
+      }
+    },
+    "packages": {
+      "gliner2": "2.0.0",
+      "torch": "2.14.0",
+      "transformers": "5.17.0",
+      "tokenizers": "0.23.2",
+      "safetensors": "0.8.0",
+      "flashdeberta": "0.0.8",
+      "triton": "3.8.0"
+    },
+    "dtype": "fp16",
+    "weight_dtype": "fp16",
+    "attention": "flashdeberta",
+    "device": "NVIDIA L4",
+    "cuda": "13.0",
+    "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+    "timing_boundary": "public_batch_api_loaded_model",
+    "qualification": false
+  },
+  "native": {
+    "event": "ready",
+    "batch_size": 1,
+    "arm": "native",
+    "scope": "gliner25_direct_core_cuda_comparison_v1",
+    "cuda_runtime": {
+      "device_name": "NVIDIA L4",
+      "driver_version": 13000,
+      "compute_major": 8,
+      "compute_minor": 9
+    },
+    "backend": "cuda",
+    "synchronization_policy": "cuda_stream_before_start_and_after_extract_v1",
+    "timing_boundary": "schema_parse_compile+processor+encoder+heads+decode+temporary_cleanup",
+    "model": "multi",
+    "model_id": "fastino/GLiNER2.5-multi-Decide",
+    "revision": "a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f",
+    "model_files": {
+      "config.json": {
+        "sha256": "be5123080c0f3f01b938bc46a5dd0d7a2e515a34f6df798dfd70ed04c277c8bf",
+        "size_bytes": 3152
+      },
+      "encoder_config/config.json": {
+        "sha256": "d0ebbcb8b458e285a39e12cc315cbaf3d1c6f631e7281e6b22dd5b4071183f83",
+        "size_bytes": 858
+      },
+      "model.safetensors": {
+        "sha256": "9efe0f88c99f2aa794452e9559dc60e98d60d9fa2bf1b60cf2710411b6da5b4e",
+        "size_bytes": 1149461028
+      },
+      "tokenizer.json": {
+        "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+        "size_bytes": 16035853
+      },
+      "tokenizer_config.json": {
+        "sha256": "fd4a31dc2f1f17e31638c5f0e783b81cdb2fbe6bddd116a8d9e5d50d78148cf1",
+        "size_bytes": 646
+      }
+    },
+    "cases_sha256": "e9695bc64faf84825a45001a23139f460b82a2dcfad12cacd931755cba5757bc",
+    "build_mode": "fast",
+    "zig_version": "0.17.0",
+    "threads": 1,
+    "scheduler": "serial_io",
+    "x86_kernel": "avx2",
+    "effective_cpu_threads": 4,
+    "system_blas": false,
+    "openblas_threads": null,
+    "dtype": "float32",
+    "precision": "fp16",
+    "compute_policy": "fp16_encoder_matrices_and_attention",
+    "qualification": false
+  },
+  "aggregate_speedup": {
+    "geomean": 1.528054788909136,
+    "lower_95": 1.5183675619853916,
+    "upper_95": 1.536636561782078,
+    "estimator": "equal_weight_cells_median_paired_log_speedup"
+  },
+  "measured_cells_passed": false,
+  "peak_worker_rss_bytes": 3693723648,
+  "status": "complete",
+  "raw_capture": {
+    "path": "raw.jsonl.gz",
+    "encoding": "gzip",
+    "uncompressed_sha256": "ac58fec2dafcdb4ab9436d667070aa87c7d852053fb807b893cf870c0a718cc1",
+    "uncompressed_size_bytes": 782359
+  },
+  "note": "Isolated L4 measurement after wide/compact attention changes and removal of the rejected bias epilogue. Native and resident-FP16 FlashDeBERTa baseline independently pass all fixture and public classification gates; performance fails three cells."
+}

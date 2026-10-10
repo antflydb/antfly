@@ -24,9 +24,9 @@ const native_abi = @import("antfly_runtime_abi").native_abi;
 pub const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 const antfly_image = @import("antfly_image");
 
-// Includes raster asset pins and dimensions alongside runnable execution control.
-// Mixed runtime versions must fail closed.
-pub const abi_version: u32 = 34;
+// Includes runnable execution control, CUDA preload precision, and raster
+// embedding asset pins/output dimensions. Mixed runtime versions fail closed.
+pub const abi_version: u32 = 35;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -70,6 +70,7 @@ pub const A4bResidencyMode = enum(u8) {
 };
 
 pub const WarmModel = extern struct {
+    cuda_precision: OptionalString = .{},
     kind: String,
     name: String,
     backend: OptionalString = .{},

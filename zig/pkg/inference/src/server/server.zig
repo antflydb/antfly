@@ -51,6 +51,7 @@ const gpt_model_mod = @import("../models/gpt.zig");
 const model_compatibility = @import("../models/compatibility.zig");
 const chunking_mod = @import("../pipelines/chunking.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
+const metal_runtime = @import("../backends/metal_runtime.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
 const extraction_v2 = @import("../extractors/extraction_v2.zig");
 const boundary_executor = @import("../extractors/gliner_boundary_executor.zig");
@@ -1427,6 +1428,7 @@ pub const WarmModel = struct {
     kind: WarmModelKind = .generator,
     name: []const u8,
     backend: ?backends_mod.BackendType = null,
+    cuda_precision: ?session_factory.GlinerCudaPrecision = null,
     format: ?[]const u8 = null,
     quantization: ?[]const u8 = null,
     residency_mode: ?ops.A4bResidencyMode = null,
@@ -1462,6 +1464,18 @@ pub const WarmModel = struct {
         };
     }
 };
+
+fn validateWarmModelCudaPrecision(model: WarmModel) !void {
+    if (model.cuda_precision == null) return;
+    if (model.kind != .extractor or (model.backend != null and model.backend.? != .cuda) or model.a4bRequest() != null)
+        return error.InvalidGlinerCudaPrecisionPolicy;
+}
+
+test "GLiNER preload precision requires a CUDA extractor" {
+    try validateWarmModelCudaPrecision(.{ .name = "decide", .kind = .extractor, .cuda_precision = .fp32 });
+    try std.testing.expectError(error.InvalidGlinerCudaPrecisionPolicy, validateWarmModelCudaPrecision(.{ .name = "decide", .kind = .extractor, .backend = .native, .cuda_precision = .auto }));
+    try std.testing.expectError(error.InvalidGlinerCudaPrecisionPolicy, validateWarmModelCudaPrecision(.{ .name = "generator", .cuda_precision = .fp32 }));
+}
 
 fn validatedWarmModelA4bRequest(model: WarmModel) !?ops.A4bInferenceRequest {
     const request = model.a4bRequest();
@@ -2308,6 +2322,27 @@ fn countParsedDenseEmbedTextTokens(
     return total;
 }
 
+fn maxParsedDenseEmbedTextTokens(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    tokenizer: anytype,
+    inputs: *const ParsedDenseEmbedInputs,
+    text_prefix: []const u8,
+) !usize {
+    var maximum: usize = 0;
+    for (inputs.texts.items) |item| {
+        // Tokenize the complete rendered input: BPE can merge across the
+        // prefix/body boundary, so counting the two independently is unsafe.
+        const rendered = if (text_prefix.len > 0)
+            try std.fmt.allocPrint(allocator, "{s}{s}", .{ text_prefix, item.text })
+        else
+            item.text;
+        defer if (text_prefix.len > 0) allocator.free(rendered);
+        maximum = @max(maximum, try countTokenizerTokens(allocator, io, tokenizer, rendered));
+    }
+    return maximum;
+}
+
 test "token counting uses the attached std.Io tokenizer path" {
     const ProbeTokenizer = struct {
         serial_calls: *usize,
@@ -2403,6 +2438,37 @@ test "dense embedding token usage includes the applied text prefix" {
             "query: ",
         ),
     );
+    try std.testing.expectEqual(@as(usize, 4), try maxParsedDenseEmbedTextTokens(std.testing.allocator, null, ByteTokenizer{}, &inputs, ""));
+    try std.testing.expectEqual(@as(usize, 11), try maxParsedDenseEmbedTextTokens(std.testing.allocator, null, ByteTokenizer{}, &inputs, "query: "));
+
+    const manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    var contract = ResolvedInferenceExecutorContract{
+        .task = "embed",
+        .batch = .{
+            .mode = .native,
+            .preferred_items = 1,
+            .max_items = 2,
+            .max_encoded_media_bytes = 0,
+            .max_decoded_pixels = null,
+            .max_media_parts_per_item = 0,
+            .per_item_failures = true,
+            .max_input_tokens_per_item = 4,
+        },
+        .accepts_text = true,
+        .accepts_image = false,
+        .accepts_audio = false,
+        .accepts_document = false,
+    };
+    try validateDenseEmbedExecutorInvocation(contract, &manifest, &inputs, 4, 0);
+    try std.testing.expectError(error.InferenceInputTokensExceeded, validateDenseEmbedExecutorInvocation(contract, &manifest, &inputs, 11, 7));
+    contract.batch.max_input_tokens_per_item = null;
+    contract.batch.max_text_bytes_per_item = 4;
+    try validateDenseEmbedExecutorInvocation(contract, &manifest, &inputs, 4, 0);
+    try std.testing.expectError(error.InferenceTextBytesExceeded, validateDenseEmbedExecutorInvocation(contract, &manifest, &inputs, 11, 7));
+    // The prefix is not a text input when a request contains only media.
+    inputs.texts.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), try maxParsedDenseEmbedTextTokens(std.testing.allocator, null, ByteTokenizer{}, &inputs, "query: "));
+    try validateDenseEmbedExecutorInvocation(contract, &manifest, &inputs, 0, 7);
 }
 
 fn estimateParsedDenseEmbedPromptTokens(inputs: *const ParsedDenseEmbedInputs) usize {
@@ -5851,6 +5917,14 @@ pub const Node = struct {
         };
         const debug_metal_timing = timing != null and use_metal_whole_model and platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
         if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
+        // SSE returns through streamGenerate before the ordinary response
+        // path. Keep diagnostics at this common exit so streaming benchmarks
+        // observe the same completed-frame counters as non-streaming calls.
+        defer if (debug_metal_timing) {
+            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
+                runtime_model.printDebugTiming();
+            }
+        };
         const setup_at_ns = embedTimingNowNs();
         if (timing != null) {
             std.log.info("direct generator starting generation model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
@@ -5894,11 +5968,6 @@ pub const Node = struct {
                     std.log.info("{s}", .{session_factory.formatCudaDecodeProfileLine(&cuda_profile_line_buf, profile_delta)});
                     std.log.info("{s}", .{session_factory.formatCudaPrefillProfileLine(&cuda_profile_line_buf, profile_delta)});
                 }
-            }
-        }
-        if (debug_metal_timing) {
-            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
-                runtime_model.printDebugTiming();
             }
         }
         if (timing) |t| {
@@ -5994,6 +6063,7 @@ pub const Node = struct {
     }
 
     pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        try validateWarmModelCudaPrecision(model);
         if (model.startup_strategy == .prefetch)
             return self.prefetchWarmModel(allocator, model);
         const a4b_request = try validatedWarmModelA4bRequest(model);
@@ -6136,11 +6206,13 @@ pub const Node = struct {
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model_name, "embedders");
         defer self.allocator.free(model_path);
+        const control = self.bindExecutionControl(io, .{});
         const Attempt = struct {
             allocator: std.mem.Allocator,
             texts: []const []const u8,
             materialize_optional_sessions: bool,
             fail_closed: bool,
+            control: InferenceExecutionControl,
 
             fn run(ctx: *anyopaque, loaded: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
@@ -6151,6 +6223,7 @@ pub const Node = struct {
                         .tok = loaded.getTokenizer(),
                         .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&loaded.manifest),
                         .execution_lock = loaded.embeddingExecutionLock(),
+                        .execution_control = attempt.control,
                     };
                     const sparse = try pipeline.embed(attempt.texts);
                     defer {
@@ -6162,6 +6235,7 @@ pub const Node = struct {
                     defer asset_lease.release();
                     try loaded.ensureEmbeddingAssets(true, false, false);
                     var pipeline = loaded.embeddingPipeline(attempt.allocator);
+                    pipeline.execution_control = attempt.control;
                     const embeddings = try pipeline.embed(attempt.texts);
                     defer {
                         for (embeddings) |embedding| attempt.allocator.free(embedding);
@@ -6181,11 +6255,13 @@ pub const Node = struct {
             .texts = &texts,
             .materialize_optional_sessions = materialize_optional_sessions,
             .fail_closed = self.config.kernel_jit.mode.failClosed(),
+            .control = control,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
             .preferred_backends = if (backend) |value| singleBackendPreference(value) else null,
             .cache_default_alias = false,
             .pin_on_success = true,
+            .execution_control = control,
         }, &attempt, Attempt.run);
         std.log.info("warmed inference embedder model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
@@ -6221,7 +6297,10 @@ pub const Node = struct {
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model.name, task_dir);
-        var model_handle = if (model.backend) |backend|
+        defer self.allocator.free(model_path);
+        var model_handle = if (model.cuda_precision) |precision|
+            try self.model_manager.acquireFromDirWithGlinerCudaPrecision(model_path, precision)
+        else if (model.backend) |backend|
             try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), false)
         else
             try self.model_manager.acquireFromDir(model_path);
@@ -7223,7 +7302,7 @@ pub const Node = struct {
 
         // Preserve the generic request-security errors above, then apply any
         // narrower model-specific media and item ceilings before acquisition.
-        try validateDenseEmbedExecutorInvocation(executor_contract, admission_manifest, parsed, 0);
+        try validateDenseEmbedExecutorInvocation(executor_contract, admission_manifest, parsed, 0, 0);
 
         const Attempt = struct {
             allocator: std.mem.Allocator,
@@ -7241,23 +7320,15 @@ pub const Node = struct {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
                 try model.verifyEmbeddingIdentity();
-                var max_input_tokens: usize = 0;
-                for (attempt.parsed.texts.items) |item| {
-                    max_input_tokens = @max(
-                        max_input_tokens,
-                        try countTokenizerTokens(
-                            attempt.allocator,
-                            attempt.io,
-                            model.getTokenizer(),
-                            item.text,
-                        ),
-                    );
-                }
+                const request_prefix = try denseEmbeddingTextPrefix(attempt.allocator, model, attempt.task_type, attempt.instruction);
+                defer if (request_prefix.owned) |owned| attempt.allocator.free(owned);
+                const max_input_tokens = try maxParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.parsed, request_prefix.prefix);
                 try validateDenseEmbedExecutorInvocation(
                     attempt.executor_contract,
                     &model.manifest,
                     attempt.parsed,
                     max_input_tokens,
+                    request_prefix.prefix.len,
                 );
                 if (attempt.parsed.parse_errors.items.len == 0) {
                     if (try attempt.node.tryEmbedParsedViaBroker(attempt.allocator, attempt.io, model, attempt.parsed, attempt.control, attempt.task_type, attempt.instruction, attempt.audio_decode_working_bytes)) |vectors| {
@@ -9436,6 +9507,7 @@ pub const Node = struct {
         // Reject unqualified bundles at the model gate before the boundary
         // schema preflight reports a feature error for a model we cannot run.
         if (!test_qualification and !manifest.mayLoadQualifiedGlinerBoundaryRuntime()) return error.UnsupportedGlinerBoundaryRuntime;
+        if (manifest.isGlinerDecisionModel()) try decision_executor.preflightClassification(&request, true);
         try boundary_executor.preflight(&request, execution_options);
         // The model manager owns a separate allocator and resource lifetime.
         // A previous recoverable request-heap failure cannot label its OOM as
@@ -9449,7 +9521,7 @@ pub const Node = struct {
         defer handle.release();
         const loaded = handle.get();
         const backend = loaded.session.backend();
-        if (backend != .native and backend != .metal) return error.UnsupportedExtractionBackend;
+        if (backend != .native and backend != .metal and backend != .cuda) return error.UnsupportedExtractionBackend;
         const config = try session_factory.getGlinerBoundaryConfig(loaded.session);
         execution_options.identity = try session_factory.getGlinerBoundaryIdentity(loaded.session);
         if (backend == .metal and session_factory.isGlinerBoundaryResidentReady(loaded.session))
@@ -9457,7 +9529,11 @@ pub const Node = struct {
         if (!test_qualification) {
             // Reject exact artifact/backend/features before creating request
             // device state. Geometry is mandatory in executeQualified below.
-            _ = try @import("../extractors/gliner_boundary_qualification.zig").Gate.init(execution_options.identity.?, if (backend == .metal) .metal else .native, &request, control);
+            _ = try @import("../extractors/gliner_boundary_qualification.zig").Gate.init(execution_options.identity.?, switch (backend) {
+                .metal => .metal,
+                .cuda => .cuda,
+                else => .native,
+            }, &request, control);
         }
         // This pass uses the held immutable tokenizer and exact prepared items
         // and windows under the existing request heap. Observe its real CPU
@@ -9475,6 +9551,15 @@ pub const Node = struct {
         } else 0;
         const execution_mutex = loaded.targetInferenceExecutionMutex();
         const effective = control orelse InferenceExecutionControl{};
+        // A waiting CUDA boundary request cannot use the session workspace
+        // yet. Admit its device ceiling only when it reaches the front of the
+        // model queue; otherwise concurrent waiters reserve duplicate device
+        // capacity and fail before the already-serialized execution can drain.
+        // This is distinct from the execution/provider lock: admission may
+        // evict other models and must remain outside those locks.
+        const admission_mutex = if (backend == .cuda) &loaded.gliner_boundary_admission_lock else null;
+        if (admission_mutex) |mutex| try effective.lock(mutex);
+        defer if (admission_mutex) |mutex| mutex.unlock();
         while (true) {
             try effective.check();
             var workspace_plan: ?session_factory.GlinerBoundaryWorkspacePlan = null;
@@ -9490,7 +9575,7 @@ pub const Node = struct {
             defer if (workspace_permit) |*owned| owned.release();
             var device_lease: ?runtime.tier.memory.AdmissionLease = null;
             defer if (device_lease) |*owned| owned.release();
-            if (backend == .metal) {
+            if (backend == .metal or backend == .cuda) {
                 const device_limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu));
                 const full_device_bytes = try boundary_executor.deviceScratchUpperBound(execution_options);
                 if (workspace_plan) |plan| {
@@ -11008,9 +11093,24 @@ pub const Node = struct {
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
 
-        var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+        // Copy the warm publication's small metadata while briefly pinning it.
+        // Request validation never scans its GGUF tokenizer arrays, and the
+        // failed runtime can be reclaimed before a recovery replacement loads.
+        const cached_manifest = if (metal_runtime.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
+            self.model_manager.copyCachedQwenEmbeddingManifest(ctx.allocator, model_path) catch |err|
+                return modelLoadFailureResponse(ctx, err)
+        else
+            null;
+        var admission_manifest = cached_manifest orelse
+            manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer admission_manifest.deinit();
+        validateQwen3EmbeddingDimensions(&admission_manifest, requested_dimensions) catch |err| {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = embedRequestOptionErrorMessage(err),
+            });
+        };
         const executor_contract = resolvedInferenceExecutorContract(self, "embed", &admission_manifest) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
         const trace_resolve_finished = if (tracing) embedding_trace.now() else 0;
@@ -11180,7 +11280,7 @@ pub const Node = struct {
             audio_decode_working_bytes = audio_admission.max_decode_working_bytes;
         }
 
-        validateDenseEmbedExecutorInvocation(executor_contract, &admission_manifest, &inputs, 0) catch |err|
+        validateDenseEmbedExecutorInvocation(executor_contract, &admission_manifest, &inputs, 0, 0) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
 
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
@@ -11260,11 +11360,8 @@ pub const Node = struct {
                     )
                 else
                     estimateParsedDenseEmbedPromptTokens(attempt.inputs);
-                var max_input_tokens: usize = 0;
-                for (attempt.inputs.texts.items) |item| {
-                    max_input_tokens = @max(max_input_tokens, try countTokenizerTokens(attempt.allocator, attempt.io, model.getTokenizer(), item.text));
-                }
-                try validateDenseEmbedExecutorInvocation(attempt.executor_contract, attempt.admission_manifest, attempt.inputs, max_input_tokens);
+                const max_input_tokens = try maxParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.inputs, pipeline.config.text_prefix);
+                try validateDenseEmbedExecutorInvocation(attempt.executor_contract, attempt.admission_manifest, attempt.inputs, max_input_tokens, pipeline.config.text_prefix.len);
 
                 var result: ExecutionResult = switch (attempt.request.error_policy) {
                     .fail_fast => .{ .fail_fast = try embedDenseInputs(
@@ -13422,6 +13519,14 @@ pub const Node = struct {
             use_model_graph_cache and
             platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
         if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
+        // Streaming returns through streamGenerate below, before the ordinary
+        // response path. Emit diagnostics from this common scope so both
+        // streaming and buffered OpenAI requests report completed counters.
+        defer if (debug_metal_timing) {
+            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
+                runtime_model.printDebugTiming();
+            }
+        };
 
         var pipeline = generation.NativeGenerationPipeline{
             .allocator = execution_allocator,
@@ -13485,12 +13590,6 @@ pub const Node = struct {
             return generationErrorResponse(ctx, err);
         };
         defer result.deinit();
-        if (debug_metal_timing) {
-            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
-                runtime_model.printDebugTiming();
-            }
-        }
-
         var response_text = result.text;
         var tool_response_text: ?[]u8 = null;
         defer if (tool_response_text) |text| ctx.allocator.free(text);
@@ -19774,7 +19873,10 @@ pub const Node = struct {
         };
         var manifest = try manifest_mod.loadListingFromDir(a, path);
         defer manifest.deinit();
-        if (manifest.embedding_style == .embedding_gemma2) return self.decideEmbeddingSimilarity(allocator, a, path, public_request, control);
+        if (manifest.embedding_style == .embedding_gemma2) {
+            if (request.long_document.mode == .window) return error.UnsupportedDecisionWindowing;
+            return self.decideEmbeddingSimilarity(allocator, a, path, public_request, control);
+        }
         if (request.model_identity != null) return error.UnsupportedDecideModel;
         for (public_request.policies) |policy| if (policy.embedding_configured or policy.kind == .multi_choice) return error.UnsupportedDecideModel;
         for (request.questions) |question| for (question.examples) |examples| if (examples.len != 0) return error.UnsupportedDecideModel;
@@ -20106,7 +20208,11 @@ pub const Node = struct {
             error.EmbeddingIdentityMismatch => ctx.status(409).json(.{ .@"error" = "MODEL_IDENTITY_MISMATCH", .message = @errorName(err) }),
             error.InvalidEmbeddingCalibration, error.EmbeddingCalibrationMismatch, error.UnqualifiedEmbeddingCalibration => ctx.status(400).json(.{ .@"error" = "INVALID_CALIBRATION", .message = @errorName(err) }),
             error.DecideRequestLimitExceeded => ctx.status(413).json(.{ .@"error" = "REQUEST_TOO_LARGE", .message = @errorName(err) }),
-            error.InvalidDecideRequest, error.UnsupportedEmbeddingDecisionKind, error.EmbeddingMultiLabelThresholdRequired => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+            error.InvalidDecideRequest,
+            error.UnsupportedDecisionWindowing,
+            error.UnsupportedEmbeddingDecisionKind,
+            error.EmbeddingMultiLabelThresholdRequired,
+            => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
             error.ModelNotFound => ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = @errorName(err) }),
             error.InvalidModelIdentifier,
             error.ModelOutsideModelsDir,
@@ -21670,6 +21776,7 @@ test {
     _ = @import("gliner_boundary_socket_test.zig");
     _ = @import("gliner_boundary_concurrency_test.zig");
     _ = @import("gliner_boundary_metal_socket_test.zig");
+    _ = @import("gliner_family_cuda_socket_test.zig");
     _ = @import("gliner_boundary_queued_cancellation_test.zig");
     _ = @import("embed_direct_vs_http_bench_test.zig");
 }
@@ -30875,6 +30982,13 @@ fn parseRequestedEmbeddingDimensions(dimensions: ?i64) !?usize {
     return @intCast(value);
 }
 
+fn validateQwen3EmbeddingDimensions(manifest: *const manifest_mod.ModelManifest, dimensions: ?usize) !void {
+    if (manifest.embedding_style != .qwen3_embedding) return;
+    const requested = dimensions orelse return;
+    if (requested < 32 or requested > manifest.hidden_size)
+        return error.InvalidQwen3EmbeddingDimensions;
+}
+
 const ParsedEmbedRequest = struct {
     model_identity: ?[]const u8 = null,
     model: []const u8,
@@ -30983,11 +31097,16 @@ fn validateDenseEmbedExecutorInvocation(
     manifest: *const manifest_mod.ModelManifest,
     inputs: *const ParsedDenseEmbedInputs,
     max_input_tokens: usize,
+    text_prefix_bytes: usize,
 ) !void {
     var encoded_media_bytes: usize = 0;
     var decoded_pixels: u64 = 0;
     var max_text_bytes: usize = 0;
     for (inputs.texts.items) |item| max_text_bytes = @max(max_text_bytes, item.text.len);
+    if (inputs.texts.items.len > 0) {
+        max_text_bytes = std.math.add(usize, max_text_bytes, text_prefix_bytes) catch
+            return error.InferenceTextBytesExceeded;
+    }
     for (inputs.images.items) |item| {
         encoded_media_bytes = std.math.add(usize, encoded_media_bytes, item.bytes.len) catch
             return error.InferenceEncodedBytesExceeded;
@@ -31450,6 +31569,7 @@ fn embedRequestOptionErrorMessage(err: anyerror) []const u8 {
         error.InstructionNotSupportedForModel => "instruction is only supported for instruction-aware embedding models",
         error.InstructionRequiredForEmbeddingTask => "instruction is required for this embedding task_type because the model has no task-specific default",
         error.InstructionRequiresQueryTask => "instruction requires a query-side task_type (documents are embedded without instructions)",
+        error.InvalidQwen3EmbeddingDimensions => "Qwen3-Embedding dimensions must be between 32 and the model embedding size",
         error.InvalidEmbeddingDimensions => "EmbeddingGemma 2 dimensions must be 768, 512, 256, or 128",
         error.EmbeddingInputTooLong => "EmbeddingGemma 2 inputs must fit in 8192 tokens including task prompts and special tokens",
         error.InvalidEmbeddingGroup => "embedding groups require 1 to 64 supported, ordered content parts",
@@ -32798,6 +32918,26 @@ test "Antfly inference embeddings validates encoding format and dimensions" {
     try std.testing.expectEqual(@as(?usize, 128), try parseRequestedEmbeddingDimensions(128));
     try std.testing.expectError(error.InvalidEmbeddingDimensions, parseRequestedEmbeddingDimensions(0));
     try std.testing.expectError(error.InvalidEmbeddingDimensions, parseRequestedEmbeddingDimensions(-1));
+}
+
+test "qwen3 embedding dimensions enforce the published model range before execution" {
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .embedding_style = .qwen3_embedding,
+        .hidden_size = 1024,
+    };
+    try validateQwen3EmbeddingDimensions(&manifest, null);
+    for ([_]usize{ 32, 256, 1024 }) |dimensions|
+        try validateQwen3EmbeddingDimensions(&manifest, dimensions);
+    for ([_]usize{ 1, 31, 1025 }) |dimensions|
+        try std.testing.expectError(error.InvalidQwen3EmbeddingDimensions, validateQwen3EmbeddingDimensions(&manifest, dimensions));
+    // Larger Qwen models use their own output width; other embedding families
+    // retain their existing dimension contracts.
+    manifest.hidden_size = 2560;
+    try validateQwen3EmbeddingDimensions(&manifest, 2560);
+    try std.testing.expectError(error.InvalidQwen3EmbeddingDimensions, validateQwen3EmbeddingDimensions(&manifest, 2561));
+    manifest.embedding_style = .none;
+    try validateQwen3EmbeddingDimensions(&manifest, 1);
 }
 
 /// Test shim: applies request options and asserts no owned prefix escaped

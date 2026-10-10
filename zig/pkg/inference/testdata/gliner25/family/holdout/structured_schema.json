@@ -1,0 +1,22 @@
+{
+  "entities": ["person", "organization", "location", "date", "time", "product"],
+  "entity_attributes": {
+    "context": {
+      "labels": ["mentioned", "requested"],
+      "qualify_labels": true
+    }
+  },
+  "relations": ["located in", "works for", "scheduled for"],
+  "structures": {
+    "request": {
+      "mode": "natural",
+      "anchor": "action",
+      "fields": [
+        {"name": "action", "dtype": "str", "cardinality": "required_one"},
+        {"name": "object", "dtype": "str"},
+        {"name": "location", "dtype": "list"},
+        {"name": "date", "dtype": "list"}
+      ]
+    }
+  }
+}

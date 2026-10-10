@@ -10,6 +10,7 @@ from ..models.inference_model_backend import InferenceModelBackend
 from ..models.inference_model_format import InferenceModelFormat
 from ..models.inference_model_kind import InferenceModelKind
 from ..models.inference_model_quantization import InferenceModelQuantization
+from ..models.inference_model_ref_cuda_precision import InferenceModelRefCudaPrecision
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="InferenceModelRef")
@@ -30,6 +31,11 @@ class InferenceModelRef:
             `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
             `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
             `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
+        cuda_precision (InferenceModelRefCudaPrecision | Unset): Per-model GLiNER CUDA inference precision for extractor
+            preloads. Requires
+            CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests
+            fail closed until the exact model/profile has release qualification.
+            Precision is part of the loaded-session cache identity.
         format_ (InferenceModelFormat | Unset): Optional artifact format preference for loading a model.
         quantization (InferenceModelQuantization | Unset): Optional quantization preference for loading a model.
         residency_mode (InferenceA4BResidencyMode | Unset): Load-time residency policy for the qualified Gemma 4 26B-A4B
@@ -43,6 +49,7 @@ class InferenceModelRef:
     kind: InferenceModelKind
     name: str
     backend: InferenceModelBackend | Unset = UNSET
+    cuda_precision: InferenceModelRefCudaPrecision | Unset = UNSET
     format_: InferenceModelFormat | Unset = UNSET
     quantization: InferenceModelQuantization | Unset = UNSET
     residency_mode: InferenceA4BResidencyMode | Unset = UNSET
@@ -56,6 +63,10 @@ class InferenceModelRef:
         backend: str | Unset = UNSET
         if not isinstance(self.backend, Unset):
             backend = self.backend.value
+
+        cuda_precision: str | Unset = UNSET
+        if not isinstance(self.cuda_precision, Unset):
+            cuda_precision = self.cuda_precision.value
 
         format_: str | Unset = UNSET
         if not isinstance(self.format_, Unset):
@@ -81,6 +92,8 @@ class InferenceModelRef:
         )
         if backend is not UNSET:
             field_dict["backend"] = backend
+        if cuda_precision is not UNSET:
+            field_dict["cuda_precision"] = cuda_precision
         if format_ is not UNSET:
             field_dict["format"] = format_
         if quantization is not UNSET:
@@ -105,6 +118,13 @@ class InferenceModelRef:
             backend = UNSET
         else:
             backend = InferenceModelBackend(_backend)
+
+        _cuda_precision = d.pop("cuda_precision", UNSET)
+        cuda_precision: InferenceModelRefCudaPrecision | Unset
+        if isinstance(_cuda_precision, Unset):
+            cuda_precision = UNSET
+        else:
+            cuda_precision = InferenceModelRefCudaPrecision(_cuda_precision)
 
         _format_ = d.pop("format", UNSET)
         format_: InferenceModelFormat | Unset
@@ -133,6 +153,7 @@ class InferenceModelRef:
             kind=kind,
             name=name,
             backend=backend,
+            cuda_precision=cuda_precision,
             format_=format_,
             quantization=quantization,
             residency_mode=residency_mode,
