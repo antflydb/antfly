@@ -974,6 +974,7 @@ const RecordReadWindow = struct {
     file: ?*NativeFile = null,
     first: u64 = 0,
     count: usize = 0,
+    growth_failed: bool = false,
 
     fn deinit(self: *RecordReadWindow, allocator: Allocator) void {
         if (self.bytes) |bytes| allocator.free(bytes);
@@ -991,12 +992,13 @@ const RecordReadWindow = struct {
         self.count = 0;
         var count: usize = @intCast(@min(if (bypass) 1 else ahead, 16, (64 * 1024) / size, checkpoint.page_count - page));
         // Single-page requests need only page-sized scratch until a run appears.
-        const needed = if (count > 1) 64 * 1024 else size;
-        if (self.bytes == null or self.bytes.?.len < needed) {
+        const needed = count * size;
+        if (self.bytes == null or (!self.growth_failed and self.bytes.?.len < needed)) {
             if (allocator.alloc(u8, needed)) |bytes| {
                 if (self.bytes) |old| allocator.free(old);
                 self.bytes = bytes;
             } else |_| {
+                self.growth_failed = true;
                 // Read-ahead is optional. Keep existing page-sized storage or
                 // fall back to it when the larger window cannot be allocated.
                 if (self.bytes == null) self.bytes = try allocator.alloc(u8, size);
@@ -5802,22 +5804,31 @@ pub const NativeFile = struct {
     /// only into children containing requested keys. Each returned value is
     /// independently owned; errors release and clear every output.
     pub fn getDocumentsAtCheckpointAlloc(self: *NativeFile, allocator: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, values: []?[]const u8) !void {
+        // Working storage must not be retained in a caller's result arena.
+        return self.getDocumentsAtCheckpointWithScratch(allocator, self.allocator, checkpoint, keys, null, values);
+    }
+
+    /// Output buffers must not overlap each other or the input keys.
+    /// Temporary allocations never escape this call. Caller buffers, when
+    /// supplied, own every returned slice; partial output is cleared on errors.
+    pub fn getDocumentsAtCheckpointWithScratch(self: *NativeFile, allocator: Allocator, temporary: Allocator, checkpoint: CheckpointSlot, keys: []const []const u8, buffers: ?[]const []u8, values: []?[]const u8) !void {
+        if (buffers) |out| if (out.len != keys.len) return error.InvalidBatch;
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
         for (keys, 0..) |key, i| {
             if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
         }
         errdefer {
-            for (values) |value| if (value) |bytes| allocator.free(bytes);
+            if (buffers == null) for (values) |value| if (value) |bytes| allocator.free(bytes);
             @memset(values, null);
         }
         if (keys.len == 0 or checkpoint.document_index_root_page == 0) return;
-        const references = try allocator.alloc(u64, keys.len);
-        defer allocator.free(references);
+        const references = try temporary.alloc(u64, keys.len);
+        defer temporary.free(references);
         @memset(references, 0);
         try self.readDocumentBatchNode(checkpoint, checkpoint.document_index_root_page, keys, references);
-        const order = try allocator.alloc(usize, keys.len);
-        defer allocator.free(order);
+        const order = try temporary.alloc(usize, keys.len);
+        defer temporary.free(order);
         for (order, 0..) |*position, i| position.* = i;
         std.mem.sort(usize, order, references, struct {
             fn less(refs: []const u64, lhs: usize, rhs: usize) bool {
@@ -5825,17 +5836,25 @@ pub const NativeFile = struct {
             }
         }.less);
         var reader = RecordPageReader{};
-        defer reader.deinit(allocator);
+        defer reader.deinit(temporary);
         var window = RecordReadWindow{};
-        defer window.deinit(allocator);
+        defer window.deinit(temporary);
         for (order, 0..) |i, position| {
             const reference = references[i];
             if (reference == 0) continue;
             const ahead = if (reader.page_id == physicalPage(reference) or window.contains(self, physicalPage(reference))) 1 else recordRunAhead(references, order, position);
-            const bytes = try reader.readWithWindow(true, &window, self, allocator, checkpoint, reference, .document, ahead);
+            const bytes = try reader.readWithWindow(true, &window, self, temporary, checkpoint, reference, .document, ahead);
             const entry = try decodeDocumentEntry(bytes);
             if (!std.mem.eql(u8, entry.key, keys[i])) return error.InvalidDocumentIndex;
-            if (!entry.is_delete) values[i] = if (entry.external_value_root_page != 0)
+            if (entry.is_delete) continue;
+            if (buffers) |out| {
+                const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
+                if (length > out[i].len) return error.BufferTooSmall;
+                if (entry.external_value_root_page != 0) {
+                    try self.readValuePagesRangeInto(entry.external_value_root_page, length, 0, out[i][0..length], checkpoint);
+                } else @memcpy(out[i][0..length], entry.value);
+                values[i] = out[i][0..length];
+            } else values[i] = if (entry.external_value_root_page != 0)
                 try self.readValuePagesAtCheckpointAlloc(allocator, entry.external_value_root_page, entry.external_value_len, checkpoint)
             else
                 try allocator.dupe(u8, entry.value);
@@ -5920,7 +5939,7 @@ pub const NativeFile = struct {
             docs.deinit(allocator);
         }
         var references = std.ArrayListUnmanaged(u64).empty;
-        defer references.deinit(allocator);
+        defer references.deinit(self.allocator);
         var cursor = DocumentIndexCursor.initWithKeyAllocator(self, checkpoint, allocator);
         defer cursor.deinit();
         var current = if (prefix.len == 0) try cursor.first() else try cursor.seekAtOrAfter(prefix, false);
@@ -5929,7 +5948,7 @@ pub const NativeFile = struct {
             defer owned.deinit(allocator);
             if (!std.mem.startsWith(u8, indexed.key, prefix)) break;
             try docs.ensureUnusedCapacity(allocator, 1);
-            try references.ensureUnusedCapacity(allocator, 1);
+            try references.ensureUnusedCapacity(self.allocator, 1);
             docs.appendAssumeCapacity(.{ .key = owned.key, .value = &.{} });
             references.appendAssumeCapacity(indexed.document_page_id);
             owned.key = &.{}; // Transfer caller-allocated ownership exactly once.
@@ -5951,12 +5970,12 @@ pub const NativeFile = struct {
         };
         std.sort.pdqContext(0, docs.items.len, PhysicalOrder{ .docs = docs.items, .references = references.items });
         var records = RecordPageReader{};
-        defer records.deinit(allocator);
+        defer records.deinit(self.allocator);
         var window = RecordReadWindow{};
-        defer window.deinit(allocator);
+        defer window.deinit(self.allocator);
         for (docs.items, references.items, 0..) |*doc, *reference, position| {
             const ahead = if (records.page_id == physicalPage(reference.*) or window.contains(self, physicalPage(reference.*))) 1 else recordRunAhead(references.items, null, position);
-            const entry = try decodeDocumentEntry(try records.readWithWindow(true, &window, self, allocator, checkpoint, reference.*, .document, ahead));
+            const entry = try decodeDocumentEntry(try records.readWithWindow(true, &window, self, self.allocator, checkpoint, reference.*, .document, ahead));
             if (!std.mem.eql(u8, entry.key, doc.key)) return error.InvalidDocumentIndex;
             if (entry.is_delete) {
                 // Legacy revision-3 indexes may retain their latest tombstones.
@@ -16969,6 +16988,13 @@ test "lite cold record windows coalesce only proven runs and authenticate every 
     _ = try decodePagePayload(limited_raw, .record_bundle);
     try std.testing.expectEqual(@as(usize, file.header.page_size), limited.bytes.?.len);
     try std.testing.expectEqual(@as(usize, 1), limited.count);
+    for (1..16) |i| _ = try limited.read(&file, budget.allocator(), checkpoint, physicalPage(refs[0]) + i, 16);
+    try std.testing.expectEqual(@as(usize, 2), budget.alloc_attempts);
+    var small_window = RecordReadWindow{};
+    defer small_window.deinit(a);
+    _ = try small_window.read(&file, a, checkpoint, physicalPage(refs[0]), 2);
+    try std.testing.expectEqual(@as(usize, 2 * file.header.page_size), small_window.bytes.?.len);
+    _ = try limited.read(&file, budget.allocator(), checkpoint, physicalPage(refs[0]), 1);
     {
         // A cached page remains usable when the budget cannot admit an owner.
         const old_limit = file.page_cache.limit_bytes;
@@ -17007,6 +17033,30 @@ test "lite cold record windows coalesce only proven runs and authenticate every 
         try std.testing.expectEqualStrings(expected.key, doc.key);
         try std.testing.expectEqualSlices(u8, &payload, doc.value);
     }
+    // Sixteen result batches must retain values, not sixteen read windows.
+    var result_budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var results = std.heap.ArenaAllocator.init(result_budget.allocator());
+    defer results.deinit();
+    for (0..16) |_| {
+        var retained: [65]?[]const u8 = undefined;
+        try file.getDocumentsAtCheckpointAlloc(results.allocator(), checkpoint, &requested, &retained);
+        for (retained[0..64]) |value| try std.testing.expectEqualSlices(u8, &payload, value.?);
+    }
+    var control = std.heap.ArenaAllocator.init(a);
+    defer control.deinit();
+    for (0..16 * 64) |_| _ = try control.allocator().dupe(u8, &payload);
+    try std.testing.expectEqual(control.queryCapacity(), results.queryCapacity());
+    std.debug.print("LITE_BATCH_RESULT retained_bytes={d} output_bytes=2048000 growth_attempts={d} small_window={d}\n", .{ result_budget.live, budget.alloc_attempts, small_window.bytes.?.len });
+    var output: [65][2000]u8 = undefined;
+    var buffers: [65][]u8 = undefined;
+    for (&output, &buffers) |*buffer, *out| out.* = buffer;
+    var into_values: [65]?[]const u8 = undefined;
+    try file.getDocumentsAtCheckpointWithScratch(a, a, checkpoint, &requested, &buffers, &into_values);
+    for (into_values[0..64], buffers[0..64]) |value, out| {
+        try std.testing.expectEqualSlices(u8, &payload, value.?);
+        try std.testing.expectEqual(out.ptr, value.?.ptr);
+    }
+    try std.testing.expect(into_values[64] == null);
     // A malformed prefetched neighbor must fail when requested, even though
     // the first record in its physical run is valid.
     var damaged = RecordPageReader{};

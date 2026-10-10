@@ -239,6 +239,7 @@ pub const ReadScope = struct {
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         close: *const fn (Allocator, *anyopaque) void,
         reset: ?*const fn (*anyopaque) anyerror!void = null,
+        get_many_sorted_into: ?*const fn (*anyopaque, []const []const u8, []const []u8, []?[]const u8) anyerror!void = null,
         get_into: ?*const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 = null,
     };
     pub fn get(self: *@This(), key: []const u8) ![]const u8 {
@@ -267,6 +268,26 @@ pub const ReadScope = struct {
             else => return err,
         };
     }
+    /// Slices belong to caller buffers, independently of reset or close.
+    /// Output buffers must not overlap each other or the input keys.
+    /// Contents may be partially written on errors; result slots are cleared.
+    pub fn getManySortedInto(self: *@This(), keys: []const []const u8, buffers: []const []u8, values: []?[]const u8) !void {
+        if (keys.len != values.len or keys.len != buffers.len) return error.InvalidBatch;
+        @memset(values, null);
+        errdefer @memset(values, null);
+        for (keys, 0..) |key, i| {
+            if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
+        }
+        if (self.vtable.get_many_sorted_into) |read| return read(self.ptr, keys, buffers, values);
+        // Preserve a backend's batched lookup when it lacks direct delivery.
+        try self.getManySorted(keys, values);
+        for (buffers, values) |buffer, *value| if (value.*) |bytes| {
+            if (bytes.len > buffer.len) return error.BufferTooSmall;
+            @memcpy(buffer[0..bytes.len], bytes);
+            value.* = buffer[0..bytes.len];
+        };
+    }
+
     /// Invalidates scope values and releases pins; keeps bounded reusable scratch.
     pub fn reset(self: *@This()) !void {
         const reset_scope = self.vtable.reset orelse return error.ReadScopeResetUnsupported;
@@ -295,6 +316,10 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getManySorted(keys, values);
         }
+        fn getManySortedInto(ptr: *anyopaque, keys: []const []const u8, buffers: []const []u8, values: []?[]const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.getManySortedInto(keys, buffers, values);
+        }
         fn getInto(ptr: *anyopaque, key: []const u8, out: []u8) anyerror![]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getInto(key, out);
@@ -314,7 +339,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try alloc.create(State);
     state.* = .{ .handle = handle, .parent = parent };
-    return .{ .allocator = alloc, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
+    return .{ .allocator = alloc, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .get_many_sorted_into = if (@hasDecl(@TypeOf(handle), "getManySortedInto")) State.getManySortedInto else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies
