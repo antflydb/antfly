@@ -2366,3 +2366,30 @@ its old 3 GiB declaration; Linux retains its existing compile reservation. This
 is compiler scheduling metadata, not a relaxation of statement resource limits.
 Full SQL corpus/independent consumer integration, production physical I/O bounds
 and enforced runtime resource envelopes remain required.
+
+
+### Original graph cleanup pass lifetime
+
+Recurring graph endpoint cleanup previously supplied no original lifetime to
+its callback, backfill apply acquisition or mutation pipeline. Each scheduled
+pass now owns a shutdown flag and one finite ten-second deadline from callback
+entry. The callback borrows a non-yielding lifetime authority; backfill apply
+and queued mutation admission use that same authority, without a refreshed
+clock or deadline. Entry/return fences preserve the exact expiry cause through
+boolean/provider errors and reject swallowed expiry. Accepted mutations retain
+the existing mandatory durability and cleanup path.
+
+The focused owner fixture holds a real apply reader, rejects cleanup's queued
+writer for original expiry/shutdown, verifies reader ownership and reusable
+writer admission, and checks callback entry, provider error and return fences.
+A physical DB fixture separately checks retained durable cleanup obligations
+after apply rejection and exactly-once healthy retry. That DB fixture requires
+the cumulative producer-maintenance gate; the focused owner gate does not
+instantiate a DB or prove production mutation completion.
+
+This extends bounded pre-decision waiting. It does not admit callback CPU stages
+or make provider reads, graph backfill transactions and durable commits
+physically interruptible. Metadata/authority reads before apply still require
+controlled reader adoption; the retained service-holder graph still requires
+mandatory CPU reentry before capacity transfer. Full integration, physical
+envelopes, performance and default sizing remain incomplete.

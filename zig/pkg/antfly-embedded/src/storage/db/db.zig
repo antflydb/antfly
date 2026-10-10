@@ -6889,9 +6889,9 @@ pub const DB = struct {
     fn graphCleanupPort(self: *DB) @import("graph_cleanup_owner.zig").Owner.Port {
         return .{ .ptr = self, .runtime = self.backend_runtime, .run = graphCleanupPage };
     }
-    fn graphCleanupPage(ptr: *anyopaque) !bool {
+    fn graphCleanupPage(ptr: *anyopaque, pass: *const @import("graph_cleanup_owner.zig").Pass) !bool {
         const self: *DB = @ptrCast(@alignCast(ptr));
-        return self.runStandaloneGraphEndpointCleanupStep();
+        return self.runStandaloneGraphEndpointCleanupStepWithLifetime(pass.lifetime());
     }
     fn stopGraphEndpointCleanupWorker(self: *DB) void {
         self.graph_cleanup_owner.stop(self.backend_runtime.io());
@@ -6903,19 +6903,28 @@ pub const DB = struct {
     /// Every enqueue path is serviced independently of subsequent foreground
     /// writes. Each scheduler turn commits at most one bounded page.
     fn runStandaloneGraphEndpointCleanupStep(self: *DB) !bool {
+        return self.runStandaloneGraphEndpointCleanupStepWithLifetime(null);
+    }
+    fn runStandaloneGraphEndpointCleanupStepWithLifetime(self: *DB, lifetime: ?@import("../../search/work_authority.zig").Authority) !bool {
+        const controls: ?@import("apply_rw_lock.zig").ApplyRwLock.Acquisition = if (lifetime) |original| .{ .lifetime = original } else null;
+        if (lifetime) |original| try original.check();
         if (!try self.canRunLocalGraphEndpointCleanup()) return false;
         if (!try self.core.store.hasGraphEndpointCleanup()) {
             // A ready directory needs no work. Idle owners must not contend
             // with user mutations for the apply lock every scheduler turn.
             if (try self.core.store.graphIncomingDirectoryReady()) return false;
-            try self.lockApplyForPortableRuntime();
+            try @import("mutation_admission.zig").lockApply(self, controls);
             defer self.core.unlockApply();
+            if (lifetime) |original| try original.check();
             if (!try self.canRunLocalGraphEndpointCleanup()) return false;
             if (self.core.index_manager.hasGraphIndexes() and !try self.core.store.graphIncomingDirectoryReady())
                 return !try self.core.store.backfillGraphIncomingDirectoryPage();
             return false;
         }
-        try self.batchInternal(.{ .graph_endpoint_cleanup = true, .sync_level = .write }, null, .{});
+        // Admission restrictions stop only pre-decision work. The existing
+        // mutation pipeline retains accepted durability and mandatory cleanup.
+        if (lifetime) |original| try original.check();
+        try self.batchInternal(.{ .graph_endpoint_cleanup = true, .sync_level = .write }, null, .{ .admission_controls = controls });
         return true;
     }
 
@@ -131545,6 +131554,55 @@ test "db graph endpoint cleanup pages batch unrelated deletes without blocking g
         try graphTestApplyOrdered(&db, page.request(), .{ .term = 1, .index = 3 + i });
     }
     try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+}
+
+test "db graph endpoint cleanup pages preserve original pass through rejected apply and healthy retry" {
+    const GraphPass = @import("graph_cleanup_owner.zig").Pass;
+    const Clock = struct {
+        var apply: *@import("apply_rw_lock.zig").ApplyRwLock = undefined;
+        var stopping: *std.atomic.Value(bool) = undefined;
+        var reject: bool = true;
+        var cancel: bool = false;
+        fn now() u64 {
+            if (reject and apply.exclusive_waiters.load(.acquire) != 0) {
+                if (cancel) stopping.store(true, .release) else return 10;
+            }
+            return 0;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]bool{ false, true }) |cancel| {
+        var directory = try TestDirectory.init("graph-cleanup-pass-lifetime");
+        defer directory.cleanup();
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
+        defer alloc.free(job);
+        try db.core.store.put(job, "hub");
+        var stopping: std.atomic.Value(bool) = .init(false);
+        Clock.apply = &db.core.apply_mutex;
+        Clock.stopping = &stopping;
+        Clock.cancel = cancel;
+        Clock.reject = true;
+        const pass: GraphPass = .{ .stopping = &stopping, .deadline_ns = 10, .now_ns = Clock.now };
+        db.core.apply_mutex.lockShared();
+        var held = true;
+        defer if (held) db.core.apply_mutex.unlockShared();
+        try std.testing.expectError(if (cancel) error.Canceled else error.DeadlineExceeded, db.runStandaloneGraphEndpointCleanupStepWithLifetime(pass.lifetime()));
+        try std.testing.expectEqual(@as(u64, 10), pass.deadline_ns);
+        try std.testing.expectEqual(@as(u64, 0), db.core.apply_mutex.exclusive_waiters.load(.acquire));
+        try std.testing.expect(!db.core.apply_mutex.tryLockExclusive());
+        try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
+        // An original rejected pass publishes nothing and preserves its durable
+        // cleanup obligation. A fresh healthy pass can complete it exactly once.
+        db.core.apply_mutex.unlockShared();
+        held = false;
+        Clock.reject = false;
+        stopping.store(false, .release);
+        try std.testing.expect(try db.runStandaloneGraphEndpointCleanupStepWithLifetime(pass.lifetime()));
+        try std.testing.expect(!try db.core.store.hasGraphEndpointCleanup());
+        try std.testing.expect(!try db.runStandaloneGraphEndpointCleanupStepWithLifetime(pass.lifetime()));
+    }
 }
 
 test "db graph endpoint cleanup pages respect raft ownership before first applied marker" {
