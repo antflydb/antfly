@@ -79,7 +79,7 @@ def main() -> None:
         parser.error(f"{args.output} exists")
     cases = skipped = written = 0
     with args.output.open("x") as out:
-        for line in args.cases.read_text().splitlines():
+        for line in args.cases.read_text().split("\n"):
             if not line.strip():
                 continue
             try:
