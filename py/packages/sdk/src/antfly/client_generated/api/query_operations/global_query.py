@@ -410,8 +410,8 @@ def sync_detailed(
     ```
 
     Args:
-        body (GlobalStatefulQueryRequest): A stateful global query. The target table is required
-            on this route.
+        body (GlobalStatefulQueryRequest): A stateful global query. Specify a table target or a
+            composed source.
         body (File):
 
     Raises:
@@ -519,8 +519,8 @@ def sync(
     ```
 
     Args:
-        body (GlobalStatefulQueryRequest): A stateful global query. The target table is required
-            on this route.
+        body (GlobalStatefulQueryRequest): A stateful global query. Specify a table target or a
+            composed source.
         body (File):
 
     Raises:
@@ -622,8 +622,8 @@ async def asyncio_detailed(
     ```
 
     Args:
-        body (GlobalStatefulQueryRequest): A stateful global query. The target table is required
-            on this route.
+        body (GlobalStatefulQueryRequest): A stateful global query. Specify a table target or a
+            composed source.
         body (File):
 
     Raises:
@@ -729,8 +729,8 @@ async def asyncio(
     ```
 
     Args:
-        body (GlobalStatefulQueryRequest): A stateful global query. The target table is required
-            on this route.
+        body (GlobalStatefulQueryRequest): A stateful global query. Specify a table target or a
+            composed source.
         body (File):
 
     Raises:

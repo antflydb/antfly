@@ -159,7 +159,7 @@ pub fn planFromBindingAndInventoryAlloc(
     inventory: external_source.Inventory,
     file_inventory: PublishedArtifact,
 ) !Plan {
-    try binding.validateReadOnlyMvp();
+    try binding.validateSupported();
     try inventory.validate();
     try validateBindingMatchesInventory(binding, inventory);
 

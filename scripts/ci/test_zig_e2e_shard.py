@@ -240,7 +240,10 @@ class ShardTests(unittest.TestCase):
         self.assertIn("/failure-diagnostics.json", low_fd)
         self.assertIn("*.log", low_fd)
         gate = workflow.split("  e2e-base:\n")[1].split("  e2e-full-build:\n")[0]
-        self.assertIn("e2e-base-plan, e2e-base-tests, e2e-base-low-fd]", gate)
+        self.assertIn(
+            "e2e-base-plan, e2e-base-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]",
+            gate,
+        )
         self.assertIn('test "$LOW_FD_RESULT" = "success"', gate)
         self.assertIn('test "$PLAN_RESULT" = "success"', gate)
         for block in workflow.split('if ! "$helper"')[1:3]:

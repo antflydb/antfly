@@ -438,6 +438,8 @@ pub fn reshapeChunkBackedResult(
 ) !types.SearchResult {
     if (req.return_mode == .member or req.return_mode == .chunk) return try hydrateDirectChunkAncestors(alloc, req, raw, shaper);
 
+    var input = raw;
+    defer input.deinit();
     const group_by_unit = req.return_mode == .unit or req.return_mode == .unit_with_chunks;
     const loaded_unit_chunk_payloads = if (group_by_unit)
         try loadMissingUnitChunkPayloads(alloc, raw.hits, shaper)
@@ -558,8 +560,6 @@ pub fn reshapeChunkBackedResult(
 
     const source = raw;
     const original_hits_len = raw.hits.len;
-    var out = raw;
-    defer out.deinit();
     const parent_count: u32 = @intCast(parents.items.len);
     const owned_hits = try paginateParentChunkHits(alloc, &parents, req.offset, req.limit);
     return .{
@@ -1664,7 +1664,8 @@ pub fn postprocessTextSearchResult(
         .filter_many = processor.filter_visible_many,
         .filter_many_ctx = processor.filter_visible_many_ctx,
     });
-    errdefer filtered.deinit();
+    var owns_filtered = true;
+    errdefer if (owns_filtered) filtered.deinit();
     filtered = try applyStoredSearchPatternFilters(alloc, req, filtered, .{
         .ctx = processor.ctx,
         .load_stored = processor.load_stored,
@@ -1683,6 +1684,7 @@ pub fn postprocessTextSearchResult(
         try dedupeSearchHitsById(alloc, &filtered);
     }
     if (chunk_backed) {
+        owns_filtered = false;
         const reshaped = try reshapeChunkBackedResult(alloc, req, filtered, .{
             .ctx = processor.ctx,
             .resolve_parent_id = processor.resolve_parent_id,
@@ -1718,7 +1720,8 @@ pub fn postprocessVectorSearchResult(
         .filter_many = processor.filter_visible_many,
         .filter_many_ctx = processor.filter_visible_many_ctx,
     });
-    errdefer filtered.deinit();
+    var owns_filtered = true;
+    errdefer if (owns_filtered) filtered.deinit();
     // Preserve complete member identity before hierarchy grouping. Raw modes
     // expose each member; source/unit modes subsequently fold all members
     // sharing that hierarchy identity and keep the best relevance score.
@@ -1728,6 +1731,7 @@ pub fn postprocessVectorSearchResult(
         try dedupeSearchHitsById(alloc, &filtered);
     }
     if (chunk_backed) {
+        owns_filtered = false;
         filtered = try reshapeChunkBackedResult(alloc, req, filtered, .{
             .ctx = processor.ctx,
             .resolve_parent_id = processor.resolve_parent_id,
@@ -1738,6 +1742,7 @@ pub fn postprocessVectorSearchResult(
             .load_projected_stored = processor.load_projected_stored,
             .load_many_projected_stored = processor.load_many_projected_stored,
         });
+        owns_filtered = true;
     }
     return try applyStoredSearchPatternFilters(alloc, req, filtered, .{
         .ctx = processor.ctx,
@@ -3406,4 +3411,33 @@ test "parent field filter cache owns allocation failures and preserves input" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "external lake chunk postprocessing owns parent and member hydration failures exactly once" {
+    const a = std.testing.allocator;
+    const Failure = struct {
+        fn parent(_: ?*anyopaque, alloc: Allocator, _: types.SearchHit) ![]u8 {
+            return alloc.dupe(u8, "doc:a");
+        }
+        fn stored(_: ?*anyopaque, _: Allocator, _: []const u8) !?[]u8 {
+            return error.TestStoredLoadFailure;
+        }
+        fn parentStored(_: ?*anyopaque, _: Allocator, _: types.SearchRequest, _: []const u8) !?[]u8 {
+            return error.TestStoredLoadFailure;
+        }
+    };
+    const processor: SearchResultPostprocessor = .{
+        .ctx = null,
+        .is_visible = TestPostprocessor.isVisible,
+        .resolve_parent_id = Failure.parent,
+        .load_parent_stored = Failure.parentStored,
+        .load_stored = Failure.stored,
+    };
+    for ([_]bool{ false, true }) |vector| for ([_]types.ReturnMode{ .parent, .member }) |mode| {
+        const hits = try a.alloc(types.SearchHit, 1);
+        hits[0] = .{ .id = try internal_keys.chunkArtifactKeyAlloc(a, "doc:a", "chunks", 0) };
+        const raw: types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = 1 };
+        const req: types.SearchRequest = .{ .return_mode = mode, .include_stored = true };
+        if (vector) try std.testing.expectError(error.TestStoredLoadFailure, postprocessVectorSearchResult(a, req, raw, true, processor)) else try std.testing.expectError(error.TestStoredLoadFailure, postprocessTextSearchResult(a, req, raw, true, processor));
+    };
 }

@@ -7361,7 +7361,7 @@ pub const HostedProvisionedTableReadSource = struct {
         defer route_snapshot.deinit(alloc);
         var lookup_groups: ?[]u64 = null;
         defer if (lookup_groups) |groups| alloc.free(groups);
-        if (isDocumentLookupBatch(req)) {
+        if (isDocumentLookupBatch(req) and (req.native_query_cut == null or req.native_query_cut.?.cover.len == 0)) {
             var keyed = try routing_session.documentKeyRoutes(alloc, table_name, req.filter_doc_ids, queryRoutingDeadline(self.catalog, req));
             defer keyed.span.deinit(alloc);
             lookup_groups = keyed.key_groups;
@@ -7382,6 +7382,12 @@ pub const HostedProvisionedTableReadSource = struct {
 
             if (route == .local)
                 return try (try self.groupLocalSourceForGroup(alloc, group_ids[0], table_name, .{ .deadline_ns = req.execution_deadline_ns }, req.cancellation)).queryGroupLocal(alloc, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name), consistency);
+            // A retained cover is executed completely by its current carrier.
+            // Preserve its finalized response when the carrier is remote too;
+            // remerging a cursor page cannot infer exhaustion from total_hits,
+            // which deliberately counts matches before the cursor.
+            if (req.native_query_cut != null and !req.native_query_cut.?.create)
+                return try queryResponseRemote(self.internalExecutor(), alloc, route.remote.base_uri, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name));
         }
 
         if (requiresDistributedGraphCoordinator(group_ids.len, req)) {
@@ -7467,7 +7473,7 @@ pub const HostedProvisionedTableReadSource = struct {
         var routed_source = hosted.*;
         routed_source.catalog = routing_session.catalog();
         const self = &routed_source;
-        var route_snapshot = try table_catalog.routedSpanSnapshotUntil(alloc, self.catalog, table_name, "", "", queryRoutingDeadline(self.catalog, req));
+        var route_snapshot = try requestRoutedSpanSnapshot(alloc, self.catalog, table_name, "", "", .{ .search = req }, queryRoutingDeadline(self.catalog, req));
         defer route_snapshot.deinit(alloc);
         const group_ids = route_snapshot.group_ids;
         if (group_ids.len == 0) return null;
@@ -10538,6 +10544,33 @@ fn isDocumentLookupBatch(req: db_mod.types.SearchRequest) bool {
 }
 
 fn requestRoutedSpanSnapshot(alloc: std.mem.Allocator, catalog: table_catalog.CatalogSource, table_name: []const u8, from: []const u8, to: []const u8, request: ProvisionedConsistencyRequest, deadline: ?u64) !table_catalog.RoutedSpanSnapshot {
+    if (request == .search) if (request.search.native_query_cut) |cut| if (cut.cover.len != 0) {
+        var current = try table_catalog.routedSpanSnapshotUntil(alloc, catalog, table_name, "", "", deadline);
+        errdefer current.deinit(alloc);
+        if (current.table_id != cut.table_id or current.group_ids.len == 0) return error.CatalogGenerationChanged;
+        if (cut.create) {
+            // A topology race during capture must not yield a partial original
+            // cover. Every physical owner additionally validates its namespace.
+            if (current.routes.len != cut.cover.len) return error.CatalogGenerationChanged;
+            for (current.routes) |route| {
+                const original = for (cut.cover) |candidate| {
+                    if (candidate.group_id == route.group_id) break candidate;
+                } else return error.CatalogGenerationChanged;
+                if (route.group_id != original.group_id or route.identity_namespace.table_id != original.namespace.table_id or route.identity_namespace.shard_id != original.namespace.shard_id or route.identity_namespace.range_id != original.namespace.range_id) return error.CatalogGenerationChanged;
+            }
+        } else {
+            // One current fenced carrier serves the immutable original cover.
+            // Current child ranges must never each replay an entire old range.
+            const routes = try alloc.dupe(table_catalog.CatalogGroupRoute, current.routes[0..1]);
+            errdefer alloc.free(routes);
+            const groups = try alloc.dupe(u64, current.group_ids[0..1]);
+            alloc.free(current.routes);
+            alloc.free(current.group_ids);
+            current.routes = routes;
+            current.group_ids = groups;
+        }
+        return current;
+    };
     if (request == .search and from.len == 0 and to.len == 0 and isDocumentLookupBatch(request.search))
         return table_catalog.routedDocumentKeysSnapshotUntil(alloc, catalog, table_name, request.search.filter_doc_ids, deadline);
     return table_catalog.routedSpanSnapshotUntil(alloc, catalog, table_name, from, to, deadline);
@@ -11839,9 +11872,15 @@ fn queryDbDetailed(
 ) !LocalQueryExecution {
     var owner = db_owner;
     errdefer owner.deinit();
-    const db = owner.db();
+    var db = owner.db();
     var reads = raft_mod.FeatureDBReads.init(group_id, read_safety_barrier);
     try reads.reads.prepareSearchWithConsistency(group_id, req, consistency);
+    if (req.native_query_cut) |cut| {
+        const retained = try db.openQueryCut(cut, req.cancellation orelse .none);
+        owner.deinit();
+        owner = .{ .owned = retained };
+        db = owner.db();
+    }
     if (req.aggregations_json.len != 0) {
         var lease = try db.beginQueryReadLease();
         errdefer lease.release();
@@ -13014,7 +13053,7 @@ fn collectProvisionedAlgebraicDistributedPartials(
     for (group_ids, 0..) |group_id, group_index| {
         var group_req = req;
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[group_index].?;
-        const body = try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, group_req.index_name orelse selected_index_name, group_req.identity_read_generation, access_paths, &.{}, tensor_program);
+        const body = try withNativeCutEnvelope(alloc, group_req, try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, group_req.index_name orelse selected_index_name, group_req.identity_read_generation, access_paths, &.{}, tensor_program));
         defer alloc.free(body);
         var db_owner: ?LocalQueryDbOwner = null;
         defer if (db_owner) |*owner| owner.deinit();
@@ -14136,7 +14175,7 @@ fn collectHostedAlgebraicDistributedPartials(
     for (group_ids, 0..) |group_id, group_index| {
         var group_req = req;
         if (required_identity_generations) |generations| group_req.identity_read_generation = generations[group_index].?;
-        const body = try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, group_req.index_name orelse selected_index_name, group_req.identity_read_generation, access_paths, &.{}, tensor_program);
+        const body = try withNativeCutEnvelope(alloc, group_req, try encodeAlgebraicPartialsRequestWithProgramAtGeneration(alloc, group_req.index_name orelse selected_index_name, group_req.identity_read_generation, access_paths, &.{}, tensor_program));
         defer alloc.free(body);
         const route = routes[group_index];
         const shard_partials = switch (route) {
@@ -14165,6 +14204,17 @@ fn queryNeedsDistributedTextStats(req: db_mod.types.SearchRequest) bool {
     if (req.full_text != null) return true;
     if (db_query_search.isTextQuery(req.query) and !db_query_search.isDefaultMatchAll(req.query)) return true;
     return req.full_text_queries.len > 0;
+}
+
+fn withNativeCutEnvelope(a: std.mem.Allocator, req: db_mod.types.SearchRequest, owned: []u8) ![]u8 {
+    const cut = req.native_query_cut orelse return owned;
+    defer a.free(owned);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, owned, .{});
+    defer parsed.deinit();
+    const pa = parsed.arena.allocator();
+    const encoded = try std.json.Stringify.valueAlloc(pa, cut.forDeadline(req.execution_deadline_ns), .{});
+    try parsed.value.object.put(pa, "_native_cut", try std.json.parseFromSliceLeaky(std.json.Value, pa, encoded, .{}));
+    return std.json.Stringify.valueAlloc(a, parsed.value, .{});
 }
 
 fn encodeQueryTextStatsRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
@@ -14198,6 +14248,12 @@ fn encodeExplicitTextStatsRequestForSearchRequest(
     defer out.deinit(alloc);
     try out.append(alloc, '{');
     var top_first = true;
+    if (req.native_query_cut) |cut| {
+        try appendJsonFieldName(alloc, &out, &top_first, "_native_cut");
+        const encoded_cut = try std.json.Stringify.valueAlloc(alloc, cut.forDeadline(req.execution_deadline_ns), .{});
+        defer alloc.free(encoded_cut);
+        try out.appendSlice(alloc, encoded_cut);
+    }
     if (req.identity_read_generation) |generation| try appendJsonFieldU64(alloc, &out, &top_first, "_identity_read_generation", generation);
     try db_mod.doc_filter_wire.appendSearchRequestFieldAlloc(alloc, &out, &top_first, req);
     try appendJsonFieldName(alloc, &out, &top_first, "fields");
@@ -14239,6 +14295,12 @@ fn encodeBackgroundTextStatsRequestForSearchRequest(
     defer out.deinit(alloc);
     try out.append(alloc, '{');
     var top_first = true;
+    if (req.native_query_cut) |cut| {
+        try appendJsonFieldName(alloc, &out, &top_first, "_native_cut");
+        const encoded_cut = try std.json.Stringify.valueAlloc(alloc, cut.forDeadline(req.execution_deadline_ns), .{});
+        defer alloc.free(encoded_cut);
+        try out.appendSlice(alloc, encoded_cut);
+    }
     if (req.identity_read_generation) |generation| try appendJsonFieldU64(alloc, &out, &top_first, "_identity_read_generation", generation);
     try db_mod.doc_filter_wire.appendSearchRequestFieldAlloc(alloc, &out, &top_first, req);
     try appendJsonFieldName(alloc, &out, &top_first, "background_fields");
@@ -15478,8 +15540,12 @@ fn queryResponseRemote(
     base_uri: []const u8,
     group_id: u64,
     table_name: []const u8,
-    req: db_mod.types.SearchRequest,
+    input: db_mod.types.SearchRequest,
 ) !query_api.QueryResponse {
+    var req = input;
+    if (req.native_query_cut) |cut| if (cut.create) {
+        req.native_query_cut = try cut.forGroup(group_id);
+    };
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const prepared = try @import("prepared_query_routing.zig").encode(alloc, table_name, req);
     defer if (prepared) |value| alloc.free(value);
@@ -15511,9 +15577,13 @@ fn preflightRemote(
     base_uri: []const u8,
     group_id: u64,
     table_name: []const u8,
-    req: db_mod.types.SearchRequest,
+    input: db_mod.types.SearchRequest,
     max_work: u32,
 ) !db_mod.RuntimePreflightSummary {
+    var req = input;
+    if (req.native_query_cut) |cut| if (cut.create) {
+        req.native_query_cut = try cut.forGroup(group_id);
+    };
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const prepared = try @import("prepared_query_routing.zig").encode(alloc, table_name, req);
     defer if (prepared) |value| alloc.free(value);
@@ -15535,9 +15605,12 @@ fn textStatsRemote(
     base_uri: []const u8,
     group_id: u64,
     table_name: []const u8,
-    body: []const u8,
+    input: []const u8,
     req: db_mod.types.SearchRequest,
 ) !?query_api.QueryResponse {
+    const bound = try @import("antfly_local_sources").api_table_read_source.bindNativeCutBodyAlloc(alloc, input, group_id);
+    defer if (bound) |bytes| alloc.free(bytes);
+    const body = bound orelse input;
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const timeout_ms = try queryRemainingTimeoutMs(req);
     var cancellation = queryRequestCancellation(req);
@@ -15553,9 +15626,12 @@ fn algebraicPartialsRemote(
     base_uri: []const u8,
     group_id: u64,
     table_name: []const u8,
-    body: []const u8,
+    input: []const u8,
     req: db_mod.types.SearchRequest,
 ) !?query_api.QueryResponse {
+    const bound = try @import("antfly_local_sources").api_table_read_source.bindNativeCutBodyAlloc(alloc, input, group_id);
+    defer if (bound) |bytes| alloc.free(bytes);
+    const body = bound orelse input;
     var client = http_client.ApiHttpClient.init(alloc, executor);
     const timeout_ms = try queryRemainingTimeoutMs(req);
     var cancellation = queryRequestCancellation(req);
@@ -34332,4 +34408,50 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "native retained routing chooses one carrier after split merge and rejects capture races" {
+    const a = std.testing.allocator;
+    const Cut = @typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child;
+    const Range = @typeInfo(@FieldType(Cut, "cover")).pointer.child;
+    const Fixture = struct {
+        tables: [1]metadata_table_manager.TableRecord = .{.{ .table_id = 7, .name = "docs" }},
+        ranges: []metadata_table_manager.RangeRecord,
+        fn snapshot(raw: *anyopaque, _: ?u64) !metadata_api.CatalogRoutingSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .tables = &self.tables, .ranges = self.ranges };
+        }
+        fn free(_: *anyopaque, _: *metadata_api.CatalogRoutingSnapshot) void {}
+        fn admin(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminRead;
+        }
+        fn freeAdmin(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const origins: [1]Range = .{.{ .group_id = 10, .namespace = .{ .table_id = 7, .shard_id = 10, .range_id = 11 }, .start_key = "" }};
+    var split: [2]metadata_table_manager.RangeRecord = .{
+        .{ .table_id = 7, .group_id = 30, .range_id = 31, .start_key = "", .end_key = "m" },
+        .{ .table_id = 7, .group_id = 40, .range_id = 41, .start_key = "m" },
+    };
+    var fixture: Fixture = .{ .ranges = &split };
+    const source: table_catalog.CatalogSource = .{ .ptr = &fixture, .vtable = &.{ .admin_snapshot = Fixture.admin, .free_admin_snapshot = Fixture.freeAdmin, .routing_snapshot = Fixture.snapshot, .linearizable_routing_snapshot = Fixture.snapshot, .free_routing_snapshot = Fixture.free } };
+    const id: [64]u8 = @splat('a');
+    var req: db_mod.types.SearchRequest = .{ .native_query_cut = .{ .id = &id, .table_id = 7, .expires_ms = 1000, .cover = &origins, .recipe = .{ .schema_json = "", .read_schema_json = "", .indexes_json = "{}" } } };
+    {
+        var selected = try requestRoutedSpanSnapshot(a, source, "docs", "", "", .{ .search = req }, null);
+        defer selected.deinit(a);
+        try std.testing.expectEqualSlices(u64, &.{30}, selected.group_ids);
+    }
+    req.native_query_cut.?.create = true;
+    try std.testing.expectError(error.CatalogGenerationChanged, requestRoutedSpanSnapshot(a, source, "docs", "", "", .{ .search = req }, null));
+    req.native_query_cut.?.create = false;
+    var merged: [1]metadata_table_manager.RangeRecord = .{.{ .table_id = 7, .group_id = 50, .range_id = 51, .start_key = "" }};
+    fixture.ranges = &merged;
+    {
+        var selected = try requestRoutedSpanSnapshot(a, source, "docs", "", "", .{ .search = req }, null);
+        defer selected.deinit(a);
+        try std.testing.expectEqualSlices(u64, &.{50}, selected.group_ids);
+    }
+    fixture.tables[0].table_id = 8;
+    merged[0].table_id = 8;
+    try std.testing.expectError(error.CatalogGenerationChanged, requestRoutedSpanSnapshot(a, source, "docs", "", "", .{ .search = req }, null));
 }
