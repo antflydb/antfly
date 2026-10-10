@@ -108,7 +108,7 @@ _DESCRIPTIONS: dict[int, str] = {
         "inspect the destination and do not retry automatically"
     ),
     UNSUPPORTED: "the operation requires a capability that is not supported by this platform or filesystem",
-    STALLED: "a bounded drain made no forward progress for its configured stall window and gave up",
+    STALLED: "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
     CANCELLED: "the caller cancelled the operation",
     INTERNAL: "an internal error occurred",
 }

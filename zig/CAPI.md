@@ -490,3 +490,24 @@ and nesting limits independently bound syntax. Embedded SQL sessions admit
 intent admission additionally counts retained payload and metadata, with its
 configured transaction-byte limit (128 MiB by default). Nested OFFSET queries and derived-table
 window functions grow retained storage with observed rows and may spill to disk.
+
+## Native SDK validation
+
+The Zig validation workflow installs `libantfly` alongside the E2E binary and
+shares its complete `lib/` and `include/` installation with the Go, Rust, Python,
+and TypeScript native SDK jobs. SDK source changes also admit this build. The
+E2E aggregate gates require those jobs to pass; the fast SDK checks remain
+available independently. Native jobs require the installed library and cannot
+pass by skipping tests when it is missing.
+
+Run the same checks locally with:
+
+```sh
+scripts/ci/test-embedded-sdk-native.sh /path/to/libantfly-install all
+```
+
+The optional final argument selects `go`, `rust`, `python`, or `typescript`.
+The runner includes Rust's embedded SQLx integration. Model-dependent inference
+suites are excluded by default; set `ANTFLY_SDK_NATIVE_INFERENCE=1` to include
+them after installing their required models. This is separate from the remote
+PostgreSQL driver matrix in `scripts/test_pgwire_drivers.py`.

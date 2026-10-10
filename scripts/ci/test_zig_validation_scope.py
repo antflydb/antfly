@@ -139,16 +139,18 @@ class ZigValidationScopeTests(unittest.TestCase):
         # Evaluate the actual aggregate shell, including independent low-FD
         # coverage. Full validation must not hide a failed specialized lane.
         aggregate = blocks["e2e-full"]
-        self.assertIn("e2e-base-low-fd]", aggregate)
+        self.assertIn("e2e-base-low-fd, embedded-sdk-native]", aggregate)
         self.assertIn("LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}", aggregate)
         command = textwrap.dedent(aggregate.split("run: |\n", 1)[1])
-        for build, tests, low_fd, required, success in (
-            ("success", "success", "success", "true", True),
-            ("success", "success", "failure", "true", False),
-            ("success", "success", "skipped", "true", False),
-            ("success", "success", "skipped", "false", True),
-            ("failure", "success", "success", "true", False),
-            ("success", "failure", "success", "true", False),
+        for build, tests, low_fd, required, native, success in (
+            ("success", "success", "success", "true", "success", True),
+            ("success", "success", "failure", "true", "success", False),
+            ("success", "success", "skipped", "true", "success", False),
+            ("success", "success", "skipped", "false", "success", True),
+            ("failure", "success", "success", "true", "success", False),
+            ("success", "failure", "success", "true", "success", False),
+            ("success", "success", "skipped", "false", "failure", False),
+            ("success", "success", "success", "true", "skipped", False),
         ):
             with self.subTest(
                 build=build, tests=tests, low_fd=low_fd, required=required
@@ -161,10 +163,25 @@ class ZigValidationScopeTests(unittest.TestCase):
                         "TEST_RESULT": tests,
                         "LOW_FD_RESULT": low_fd,
                         "REQUIRE_LOW_FD": required,
+                        "NATIVE_SDK_RESULT": native,
                     },
+                    check=False,
                     capture_output=True,
                 )
                 self.assertEqual(result.returncode == 0, success, result.stderr)
+
+        self.assertTrue(selected("embedded-sdk-native"))
+        self.assertTrue(selected("embedded-sdk-native", full=True))
+        self.assertTrue(selected("embedded-sdk-native", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "embedded-sdk-native",
+                **{
+                    "needs.e2e-base-build.result": "failure",
+                    "needs.e2e-full-build.result": "skipped",
+                },
+            )
+        )
 
     def test_codegen_and_laya_inputs_select_zig_validation(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
@@ -203,6 +220,46 @@ class ZigValidationScopeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             subprocess.run(["git", "init", "-q", temporary], check=True)
+            for name in inputs | unrelated:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            selected = subprocess.check_output(
+                ["git", "ls-files", "-z", "--", *pathspecs], cwd=root
+            )
+        self.assertEqual(
+            {path.decode() for path in selected.split(b"\0") if path}, inputs
+        )
+
+    def test_embedded_sdk_and_driver_inputs_select_the_capi_producer(self):
+        workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()
+        command = workflow.split('if ! "$helper"')[2].split("\n          then", 1)[0]
+        pathspecs = shlex.split(command.split(" -- ", 1)[1].replace("\\\n", " "))
+        inputs = {
+            "go/pkg/embedded/sql_driver.go",
+            "rs/crates/embedded/src/sqlx.rs",
+            "rs/crates/embedded-sys/build.rs",
+            "rs/Cargo.lock",
+            "py/packages/embedded/tests/test_sql.py",
+            "ts/packages/embedded/src/kysely.ts",
+            "ts/packages/embedded-linux-x64/package.json",
+            "ts/pnpm-lock.yaml",
+            "zig/pkg/antfly-embedded/include/antfly.h",
+            "zig/pkg/antfly-embedded/src/capi/sql.zig",
+            "scripts/ci/test-embedded-sdk-native.sh",
+            "scripts/ci/test_embedded_sdk_native.py",
+            "scripts/pgwire_drivers/rust/src/main.rs",
+            "scripts/test_pgwire_drivers.py",
+        }
+        unrelated = {
+            "go/pkg/sdk/client.go",
+            "py/packages/sdk/src/client.py",
+            "docs/guide.md",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q", tmp], check=True)
             for name in inputs | unrelated:
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
