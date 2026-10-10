@@ -1844,6 +1844,47 @@ test "SQL floating predicates retain declared NUMERIC parameters for reads and m
     };
 }
 
+test "SQL floating text consumers preserve declared width exponents and signed zero" {
+    const a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, expected: []const u8 }{
+        .{ .sql = "SELECT concat(1.1::real)", .expected = "1.1" },
+        .{ .sql = "SELECT concat(1.1::double precision)", .expected = "1.1" },
+        .{ .sql = "SELECT concat('0.00001'::real)", .expected = "1e-05" },
+        .{ .sql = "SELECT concat('-0'::real)", .expected = "-0" },
+        .{ .sql = "SELECT concat(NULL::real)", .expected = "" },
+        .{ .sql = "SELECT concat_ws(',',NULL::real)", .expected = "" },
+        .{ .sql = "SELECT concat('NaN'::real,'Infinity'::double precision,'-Infinity'::real)", .expected = "NaNInfinity-Infinity" },
+        .{ .sql = "SELECT concat_ws(',',NULL,1.1::real,'1e20'::double precision,'-0'::real)", .expected = "1.1,1e+20,-0" },
+        .{ .sql = "SELECT concat(1.20::numeric,9007199254740993::bigint)", .expected = "1.209007199254740993" },
+        .{ .sql = "SELECT concat_ws(',',1.20::numeric,'1'::jsonb)", .expected = "1.20,1" },
+        .{ .sql = "SELECT concat(x) FROM (VALUES (1.1::real)) t(x)", .expected = "1.1" },
+    }) |case| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, fixture.iface(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings(case.expected, result.output.rows[0][0].string);
+    }
+    for ([_]@import("array_value.zig").ElementType{ .float32, .float64 }) |kind| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var backend = fixture.iface();
+        backend.parameter_descriptor_hints = &.{.{ .kind = .number, .element_type = kind }};
+        var compiled = try compiler.compile(a, "SELECT concat($1),concat_ws(',',$1),jsonb_build_object($1,1)", .{});
+        defer compiled.deinit();
+        const number: f64 = @as(f32, 1.1);
+        var result = try execute(a, backend, &compiled, &.{.{ .float = number }}, .{});
+        defer result.deinit();
+        const expected = if (kind == .float32) "1.1" else "1.100000023841858";
+        try std.testing.expectEqualStrings(expected, result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings(expected, result.output.rows[0][1].string);
+        const object = result.output.rows[0][2].object;
+        try std.testing.expectEqual(@as(usize, 1), object.count());
+        try std.testing.expectEqual(@as(i64, 1), object.get(expected).?.integer);
+        try std.testing.expectError(error.InvalidSqlParameters, execute(a, backend, &compiled, &.{.null}, .{}));
+    }
+}
+
 test "SQL JSONB object keys reject JSON domains and retain ordinary SQL scalar keys" {
     const a = std.testing.allocator;
     for ([_][]const u8{
@@ -1894,6 +1935,10 @@ test "SQL JSONB converts declared floating output to exact decimals and special 
         .{ .expression = "jsonb_build_object('x',1.1::real)", .expected = "{\"x\":1.1}" },
         .{ .expression = "jsonb_build_object(1.1::real,2.2::real)", .expected = "{\"1.1\":2.2}" },
         .{ .expression = "jsonb_build_object(1.20::numeric,'Infinity'::double precision)", .expected = "{\"1.20\":\"Infinity\"}" },
+        .{ .expression = "jsonb_build_object('1e20'::double precision,1)", .expected = "{\"1e+20\":1}" },
+        .{ .expression = "jsonb_build_object('0.00001'::real,1)", .expected = "{\"1e-05\":1}" },
+        .{ .expression = "jsonb_build_object('-0'::real,1)", .expected = "{\"-0\":1}" },
+        .{ .expression = "jsonb_build_object('NaN'::real,1,'Infinity'::double precision,2)", .expected = "{\"NaN\":1,\"Infinity\":2}" },
         .{ .expression = "jsonb_typeof(to_jsonb('NaN'::real))", .expected = "\"string\"" },
         .{ .expression = "to_jsonb(1.1::real) = '1.1'::jsonb", .expected = "true" },
         .{ .expression = "to_jsonb(NULL::real)", .expected = "null" },
@@ -1913,7 +1958,7 @@ test "SQL JSONB converts declared floating output to exact decimals and special 
     }
 }
 
-test "SQL floating JSONB conversion unwinds every allocation failure" {
+test "SQL floating text and JSONB conversion unwinds every allocation failure" {
     const Harness = struct {
         fn run(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
             var fixture: TestBackend = .{ .row_count = 0 };
@@ -1922,7 +1967,7 @@ test "SQL floating JSONB conversion unwinds every allocation failure" {
             try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
         }
     };
-    var compiled = try compiler.compile(std.testing.allocator, "SELECT jsonb_build_object(1.20::numeric,1.1::real),to_jsonb('NaN'::real),to_jsonb('1e20'::double precision)", .{});
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT jsonb_build_object(1.20::numeric,1.1::real,'1e20'::double precision,1),to_jsonb('NaN'::real),to_jsonb('1e20'::double precision),concat(1.1::real),concat_ws(',','-0'::real,1.20::numeric)", .{});
     defer compiled.deinit();
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{&compiled});
 }

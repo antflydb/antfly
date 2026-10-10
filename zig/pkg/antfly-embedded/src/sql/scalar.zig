@@ -3433,7 +3433,7 @@ const Evaluator = struct {
                         for (call.args[1..]) |arg| {
                             const datum = try self.runDatum(arg, depth + 1);
                             if (datum.sql_null) continue;
-                            const string = if (self.program.instructions[arg].type.kind == .json) try self.jsonText(datum.value) else try self.formatText(if (datum.numeric != null) try self.numericJson(datum) else datum.value);
+                            const string = try self.sqlText(datum, self.program.instructions[arg].type);
                             if (emitted) {
                                 try self.charge(separator.value.string.len);
                                 try output.appendSlice(self.alloc, separator.value.string);
@@ -3454,15 +3454,14 @@ const Evaluator = struct {
                         errdefer object.deinit(self.alloc);
                         var i: usize = 0;
                         while (i < call.args.len) : (i += 2) {
-                            var key = try self.runDatum(call.args[i], depth + 1);
+                            const key = try self.runDatum(call.args[i], depth + 1);
                             if (key.sql_null) return error.InvalidSqlParameters;
                             const key_type = self.program.instructions[call.args[i]].type;
                             // PostgreSQL rejects the JSON input domain even
                             // when its payload is a scalar string or number.
-                            if (key_type.kind == .json) return error.InvalidSqlParameters;
-                            key.value = try self.sqlJson(key, key_type);
-                            if (key.value == .null or key.value == .object or key.value == .array) return error.InvalidSqlParameters;
-                            const name = try self.formatText(key.value);
+                            if (key_type.kind == .json or key.array != null) return error.InvalidSqlParameters;
+                            if (key.numeric == null and (key.value == .null or key.value == .object or key.value == .array)) return error.InvalidSqlParameters;
+                            const name = try self.sqlText(key, key_type);
                             try self.charge(name.len + @sizeOf(Json) + @sizeOf([]const u8));
                             const value = try self.runDatum(call.args[i + 1], depth + 1);
                             try object.put(self.alloc, name, try self.sqlJson(value, self.program.instructions[call.args[i + 1]].type));
@@ -3550,7 +3549,7 @@ const Evaluator = struct {
                         for (call.args) |arg| {
                             const datum = try self.runDatum(arg, depth + 1);
                             if (datum.sql_null) continue;
-                            const string = if (self.program.instructions[arg].type.kind == .json) try self.jsonText(datum.value) else try self.formatText(if (datum.numeric != null) try self.numericJson(datum) else datum.value);
+                            const string = try self.sqlText(datum, self.program.instructions[arg].type);
                             try self.charge(string.len);
                             try output.appendSlice(self.alloc, string);
                         }
@@ -4039,6 +4038,17 @@ const Evaluator = struct {
             .jsonb => if (source == .jsonb) value else try self.convert(value, .json),
             .uuid => try self.convert(value, .uuid),
         };
+    }
+
+    /// Text consumers preserve the SQL domain's output spelling. In particular,
+    /// floating object keys are text, so JSON numeric canonicalization would
+    /// incorrectly expand exponents and discard the sign of negative zero.
+    fn sqlText(self: *Evaluator, datum: Datum, descriptor: Type) ![]const u8 {
+        if (datum.numeric != null) return self.formatText(try self.numericJson(datum));
+        if (descriptor.kind == .json) return self.jsonText(datum.value);
+        if (descriptor.kind == .number and datum.value == .float)
+            return (try self.castBuiltin(datum.value, descriptor.element_type orelse .float64, .text)).string;
+        return self.formatText(datum.value);
     }
 
     fn formatText(self: *Evaluator, value: Json) ![]const u8 {
