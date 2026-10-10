@@ -262,6 +262,22 @@ pub const SegmentShared = struct {
         }
     }
 
+    /// Lifetime polling is non-yielding with respect to the execution owner.
+    /// The surrounding snapshot holders are not yet safe CPU-return boundaries.
+    pub fn lockDeletionSharedWithAuthority(self: *SegmentShared, authority: ?scorer_mod.WorkAuthority) !void {
+        const owner = authority orelse {
+            self.lockDeletionShared();
+            return;
+        };
+        try owner.check();
+        while (!self.tryLockDeletionShared()) {
+            try owner.check();
+            spinOrYield();
+        }
+        errdefer self.unlockDeletionShared();
+        try owner.check();
+    }
+
     fn tryLockDeletionShared(self: *SegmentShared) bool {
         const state = self.deletion_lock.load(.acquire);
         if ((state & deletion_writer_bit) != 0 or state >= deletion_writer_bit - 1) return false;
@@ -1297,7 +1313,7 @@ pub const IndexSnapshot = struct {
             defer inv_reader.deinit();
 
             {
-                seg.shared.lockDeletionShared();
+                try seg.shared.lockDeletionSharedWithAuthority(authority);
                 defer seg.shared.unlockDeletionShared();
                 var wand = scorer_mod.WANDScorer.init(alloc, k, global_doc_count, avg_dl, bm25_config);
                 defer wand.deinit();
@@ -4218,4 +4234,88 @@ test "external lake overlays reject private masks outside the physical corpus" {
     try joined.shareMaskedImmutableSegments(&.{.{ .snapshot = base, .ordinal = 0, .target_id = 1 }}, &.{mask});
     try std.testing.expectEqual(@as(u32, 0), joined.snapshot().liveDocCount());
     try std.testing.expectEqual(@as(u32, 1), base.liveDocCount());
+}
+
+test "native text deletion wait retains original failure and physical writer ownership" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegment(a, &.{.{ .terms = &.{.{ .term = "hello", .freq = 1, .norm = 1 }} }});
+    defer a.free(bytes);
+    var index = try IndexWriter.init(a);
+    defer index.deinit();
+    try index.addSegment(bytes);
+    const snapshot = index.snapshot();
+    const Writer = struct {
+        shared: *SegmentShared,
+        ready: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.shared.lockDeletionExclusive();
+            self.ready.store(true, .release);
+            // A finite watchdog also makes the old unchecked-wait counterfactual
+            // terminate. Rejection must happen while this writer still owns it.
+            const deadline = platform_time.monotonicNs() + 150 * std.time.ns_per_ms;
+            while (!self.release.load(.acquire) and platform_time.monotonicNs() < deadline)
+                std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            self.shared.unlockDeletionExclusive();
+            self.done.store(true, .release);
+        }
+    };
+    const State = struct {
+        shared: *SegmentShared,
+        failure: anyerror,
+        calls: usize = 0,
+        rejected_while_writer_owned: bool = false,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls >= 5) {
+                self.rejected_while_writer_owned = self.shared.deletion_lock.load(.acquire) == SegmentShared.deletion_writer_bit;
+                return self.failure;
+            }
+        }
+        fn search(snap: *const IndexSnapshot, authority: scorer_mod.WorkAuthority) !void {
+            const result = try snap.searchWithAuthority(std.testing.allocator, "body", &.{"hello"}, 1, null, .{}, null, authority);
+            defer std.testing.allocator.free(result.hits);
+        }
+    };
+    for ([_]anyerror{ error.DeadlineExceeded, error.Canceled, error.SchedulerClosed, error.Forbidden }) |failure| {
+        var writer: Writer = .{ .shared = snapshot.segments[0].shared };
+        var task = try std.testing.io.concurrent(Writer.run, .{&writer});
+        defer {
+            writer.release.store(true, .release);
+            task.await(std.testing.io);
+        }
+        while (!writer.ready.load(.acquire)) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        var state: State = .{ .shared = writer.shared, .failure = failure };
+        try std.testing.expectError(failure, State.search(snapshot, .{ .context = &state, .check_fn = State.check }));
+        try std.testing.expect(state.rejected_while_writer_owned);
+        try std.testing.expect(!writer.done.load(.acquire));
+        try std.testing.expectEqual(SegmentShared.deletion_writer_bit, writer.shared.deletion_lock.load(.acquire));
+        writer.release.store(true, .release);
+        task.await(std.testing.io);
+        const healthy = try snapshot.searchWithAuthority(a, "body", &.{"hello"}, 1, null, .{}, null, null);
+        defer a.free(healthy.hits);
+        try std.testing.expectEqual(@as(usize, 1), healthy.hits.len);
+    }
+}
+
+test "native text deletion wait rolls back only newly acquired reader on final rejection" {
+    var shared: SegmentShared = .{ .ref_count = 1 };
+    shared.lockDeletionShared();
+    defer shared.unlockDeletionShared();
+    const State = struct {
+        calls: usize = 0,
+        fn check(raw: *const anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (self.calls == 2) return error.Canceled;
+        }
+    };
+    var state: State = .{};
+    try std.testing.expectError(error.Canceled, shared.lockDeletionSharedWithAuthority(.{ .context = &state, .check_fn = State.check }));
+    try std.testing.expectEqual(@as(u32, 1), shared.deletion_lock.load(.acquire));
+    try shared.lockDeletionSharedWithAuthority(null);
+    try std.testing.expectEqual(@as(u32, 2), shared.deletion_lock.load(.acquire));
+    shared.unlockDeletionShared();
 }

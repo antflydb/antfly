@@ -2471,3 +2471,27 @@ Harness checks cover all five comparison pairs across four rotated repetitions
 and reject policy changes on either side. Real Linux pressure runs, whole-node
 resource envelopes and per-class fairness remain required; these unit checks
 are not performance evidence and do not qualify default enablement.
+
+### Admitted scorer deletion-lock lifetime
+
+The native WAND snapshot scorer now checks the original non-yielding lifetime
+authority while acquiring its deletion read lock, including entry and a final
+check after acquisition. A final rejection releases only the newly acquired
+reader. Uncontrolled callers retain their ordinary acquisition path. No fresh
+deadline or replacement authority is introduced.
+
+The physical fixture runs the actual snapshot scorer against another worker
+holding the deletion writer lock. DeadlineExceeded, Canceled, SchedulerClosed
+and Forbidden return while that worker remains the owner; after its physical
+join the same snapshot returns the healthy result. A finite writer watchdog
+allows an unchecked-call counterfactual to terminate as well. A separate rollback
+fixture retains another reader across post-acquisition rejection. Native scoring
+qualification passes 47 checks with one existing skip. Linux, counterfactual and
+independent archive/consumer integration are pending at this commit.
+
+This is original lifetime polling, not CPU lending while retaining deletion or
+outer snapshot holders. Healthy authority without a deadline can still wait;
+complete holder adoption and finite operation policy remain necessary. Managed
+streaming workers still require independent capsules and safe CPU-return points,
+and whole-request memory, resource/fairness measurements and defaults remain
+unqualified.
