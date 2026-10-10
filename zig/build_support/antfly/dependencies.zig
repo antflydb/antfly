@@ -343,7 +343,9 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const run_sql_tests = addFilteredTestRunArtifact(b, sql_tests);
     // The native SQL contract corpus is larger than the parser-only owner but
     // remains below the full database compilation and integration test roots.
-    sql_tests.step.max_rss = 3072 * 1024 * 1024;
+    // The macOS cumulative SQL partition peaked at 3.68 GB after the lake
+    // merge. Reserve 4 GiB for compilation; statement runtime limits stay separate.
+    sql_tests.step.max_rss = @as(usize, if (target.result.os.tag == .macos) 4096 else 3072) * 1024 * 1024;
     // The complete compiler/executor corpus includes exhaustive allocation-fault
     // runs and parallel partition lifecycle checks. This scheduling estimate
     // is independent of the executor's per-statement memory admission tests.

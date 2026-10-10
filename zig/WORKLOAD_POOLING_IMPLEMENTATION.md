@@ -2346,3 +2346,23 @@ non-yielding lifetime checks while retaining CPU. Legacy shared leases retain
 thread-local nesting and same-thread release requirements. Production background
 holder adoption, physical syscall bounds, full archive/API/DB integration,
 resource envelopes, performance and default sizing remain open requirements.
+
+
+### Spill cleanup after rejected resource creation
+
+The cumulative SQL runner crashed in the physical spill-creation fixture after
+its directory-resume rejection. The manager's memory-only cleanup branch freed
+its pattern-list storage but left the list poisoned, so a later owning cleanup
+dereferenced invalid list state. This branch now resets the list to empty, just
+as the directory/pattern-owner cleanup path already does.
+
+A focused gate runs the existing physical spill cases, including successful
+unlinked file creation, directory/file return rejection, authority rejection,
+pre-wait rejection and missing-directory failure. The fixtures inspect actual
+file/dir closes, empty directories, spill quota and retained execution bytes,
+and repeat manager cleanup. No weaker replacement fixture was introduced.
+The macOS SQL compile reservation is 4 GiB after an observed 3.68 GB peak exceeded
+its old 3 GiB declaration; Linux retains its existing compile reservation. This
+is compiler scheduling metadata, not a relaxation of statement resource limits.
+Full SQL corpus/independent consumer integration, production physical I/O bounds
+and enforced runtime resource envelopes remain required.

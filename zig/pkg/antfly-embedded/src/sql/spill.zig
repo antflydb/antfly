@@ -274,6 +274,7 @@ pub const Manager = struct {
         // below this boundary can exist without a directory or pattern owner.
         if (self.dir == null and self.pattern_file == null and self.patterns.items.len == 0) {
             self.patterns.deinit(self.allocator());
+            self.patterns = .empty;
             return;
         }
         const protection = self.io.swapCancelProtection(.blocked);

@@ -2522,6 +2522,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-replication-startup-admission-test", "Verify original lifetime through startup flush and apply admission")
         .dependOn(&b.addRunArtifact(replication_startup_admission_tests).step);
 
+    const sql_spill_retirement_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/sql_spill_retirement_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, sql_spill_retirement_root, true, true);
+    sql_spill_retirement_root.addImport("antfly_source_root", sql_spill_retirement_root);
+    const sql_spill_retirement_tests = b.addTest(.{
+        .name = "sql-spill-retirement-tests",
+        .root_module = sql_spill_retirement_root,
+        .filters = &.{ "SQL spill", "SQL buffered spill" },
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-sql-spill-retirement-test", "Verify physical SQL spill admission, quotas and owned cleanup")
+        .dependOn(&b.addRunArtifact(sql_spill_retirement_tests).step);
+
     const shared_sql_worker_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/shared_sql_workers_test_root.zig"),
         .target = target,
