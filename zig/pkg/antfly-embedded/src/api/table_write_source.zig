@@ -1668,6 +1668,12 @@ fn consumerTests() type {
                     if (self.advance_other) |other| other.current += 25;
                     return .{ .nanoseconds = self.current };
                 }
+                fn checkpoint(_: *anyopaque) callconv(.c) runtime_error_abi.Status {
+                    return runtime_error_abi.statusFromError(error.InvalidRunnableTransition);
+                }
+                fn park(_: *anyopaque, _: c_int) callconv(.c) runtime_error_abi.Status {
+                    return runtime_error_abi.statusFromError(error.InvalidRunnableTransition);
+                }
                 const vtable = blk: {
                     var value = std.Io.failing.vtable.*;
                     value.now = now;
@@ -1683,6 +1689,14 @@ fn consumerTests() type {
             var canceled = std.atomic.Value(bool).init(false);
             const original: distributed_txn.PreDecisionContext = .{
                 .route_fence = .{ .metadata_group_id = 1, .metadata_incarnation = @splat(1), .catalog_revision = 2, .table_id = 7, .topology_epoch = 3, .route = .{ .group_id = 9, .range_id = 10, .identity_namespace = .{ .table_id = 7, .shard_id = 9, .range_id = 10 } } },
+                .execution_runnable = .{
+                    .context = &origin,
+                    .cpu_slots = 1,
+                    .parent_class = @backingInt(runnable_abi.Class.write),
+                    .checkpoint = Clock.checkpoint,
+                    .park = Clock.park,
+                    .enter = Clock.park,
+                },
                 .deadline_ns = 180,
                 .deadline_io = origin.borrow(),
                 .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled),
@@ -1694,6 +1708,7 @@ fn consumerTests() type {
             // latency cannot be added to the remaining 80-nanosecond budget.
             try std.testing.expectEqual(@as(?u64, 10_080), translated.deadline_ns);
             try std.testing.expectEqual(@as(i96, 55), @as(i96, @intCast(translated.deadline_ns.?)) - target.current);
+            try std.testing.expectEqualDeep(original.execution_runnable, translated.execution_runnable);
             try std.testing.expectEqualDeep(original.route_fence, translated.route_fence);
             try std.testing.expectEqualDeep(original.cancellation, translated.cancellation);
             try std.testing.expectEqualDeep(original.restore_staging_scope, translated.restore_staging_scope);
@@ -1745,6 +1760,12 @@ fn consumerTests() type {
                 fn fence(_: *const anyopaque) anyerror!void {
                     return error.DeadlineExceeded;
                 }
+                fn checkpoint(_: *anyopaque) callconv(.c) runtime_error_abi.Status {
+                    return runtime_error_abi.statusFromError(error.InvalidRunnableTransition);
+                }
+                fn park(_: *anyopaque, _: c_int) callconv(.c) runtime_error_abi.Status {
+                    return runtime_error_abi.statusFromError(error.InvalidRunnableTransition);
+                }
                 fn foreignDispatch(contract: *const runtime_native_abi.CallContract, callback: *const anyopaque, args: *const anyopaque, output: ?*anyopaque) callconv(.c) runtime_error_abi.Status {
                     return TableWriteSource.BoundaryAbi.local_dispatch(contract, callback, args, output);
                 }
@@ -1753,11 +1774,24 @@ fn consumerTests() type {
             var canceled = std.atomic.Value(bool).init(false);
             const io = std.testing.io;
             const clock = runtime_native_abi.IoBorrow.init(&io);
+            const runnable: runnable_abi.Borrowed = .{
+                .context = &fake,
+                .cpu_slots = 1,
+                .parent_class = @backingInt(runnable_abi.Class.write),
+                .checkpoint = Fake.checkpoint,
+                .park = Fake.park,
+                .enter = Fake.park,
+            };
             const contexts = [_]distributed_txn.PreDecisionContext{
-                .{ .deadline_ns = 123 },                                                   .{ .deadline_io = clock },
-                .{ .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled) }, .{ .cancellation = .{ .ptr = &canceled } },
-                .{ .cancellation = .{ .check_fn = Fake.fence } },                          .{ .cancellation = .{ .ptr = &canceled, .check_fn = Fake.fence } },
-                .{ .restore_staging_scope = @splat(1) },                                   .{ .restore_staging_plan_id = @splat(2) },
+                .{ .execution_runnable = runnable },
+                .{ .deadline_ns = 123 },
+                .{ .deadline_io = clock },
+                .{ .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled) },
+                .{ .cancellation = .{ .ptr = &canceled } },
+                .{ .cancellation = .{ .check_fn = Fake.fence } },
+                .{ .cancellation = .{ .ptr = &canceled, .check_fn = Fake.fence } },
+                .{ .restore_staging_scope = @splat(1) },
+                .{ .restore_staging_plan_id = @splat(2) },
             };
             const id = std.mem.zeroes(db_mod.types.TxnId);
             inline for (.{ TableWriteSource.BoundaryAbi.local_dispatch, Fake.foreignDispatch }) |dispatch| {
@@ -1788,7 +1822,7 @@ fn consumerTests() type {
                 try std.testing.expectError(error.Canceled, source.txnPrepareGroupLocalWithPreDecisionContext(std.testing.allocator, 7, "docs", id, 2, .{}, fake.expected));
                 canceled.store(false, .release);
             }
-            try std.testing.expectEqual(@as(usize, 36), fake.aware_calls);
+            try std.testing.expectEqual(@as(usize, 40), fake.aware_calls);
         }
 
         test "compiled table write boundary forwards original commit controls and rejects incapable fallback" {

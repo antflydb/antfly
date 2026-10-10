@@ -23415,7 +23415,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const owner = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            return try owner.txnBeginGroupLocal(
+            return try owner.txnBeginGroupLocalWithPreDecisionContext(
                 alloc,
                 group_id,
                 table_name,
@@ -23424,10 +23424,11 @@ pub const ProvisionedTableWriteSource = struct {
                 topology_epoch,
                 retain_terminal,
                 participants,
+                context,
             );
         }
         if (self.groupLocalWriteSource()) |owner|
-            return try owner.txnBeginGroupLocal(
+            return try owner.txnBeginGroupLocalWithPreDecisionContext(
                 alloc,
                 group_id,
                 table_name,
@@ -23436,7 +23437,9 @@ pub const ProvisionedTableWriteSource = struct {
                 topology_epoch,
                 retain_terminal,
                 participants,
+                context,
             );
+        if (context.execution_runnable != null) return error.UnsupportedOperation;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {
@@ -23563,24 +23566,27 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const owner = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            return try owner.txnPrepareGroupLocal(
+            return try owner.txnPrepareGroupLocalWithPreDecisionContext(
                 alloc,
                 group_id,
                 table_name,
                 txn_id,
                 topology_epoch,
                 req,
+                context,
             );
         }
         if (self.groupLocalWriteSource()) |owner|
-            return try owner.txnPrepareGroupLocal(
+            return try owner.txnPrepareGroupLocalWithPreDecisionContext(
                 alloc,
                 group_id,
                 table_name,
                 txn_id,
                 topology_epoch,
                 req,
+                context,
             );
+        if (context.execution_runnable != null) return error.UnsupportedOperation;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         if (self.write_cache) |cache| {

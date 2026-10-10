@@ -11,6 +11,7 @@ const routing = @import("routing_budget.zig");
 const lock = @import("../storage/db/apply_rw_lock.zig");
 
 pub fn checkPreDecision(context: transaction.PreDecisionContext) !void {
+    if (context.execution_runnable) |borrow| try borrow.checkLifetime();
     try context.cancellation.check();
     if (context.deadline_ns) |deadline| {
         // Keep the caller's clock domain and the proven pre-proposal error.
@@ -34,6 +35,12 @@ pub const Budget = @import("../common/read_execution_budget.zig").Budget(Control
 
 pub fn init(pre_decision: transaction.PreDecisionContext, borrow: ?runtime.runnable_abi.Borrowed, io: std.Io) Budget {
     return .{ .controls = .{ .execution_runnable = borrow, .pre_decision = pre_decision }, .io = io };
+}
+
+/// Group-local admission receives one independently owned worker token in its
+/// process-local context. Its original clock/cancellation remain authoritative.
+pub fn initParticipant(context: transaction.PreDecisionContext, io: std.Io) Budget {
+    return init(context, context.execution_runnable, io);
 }
 
 pub fn acquisition(budget: *Budget) lock.ApplyRwLock.Acquisition {
@@ -127,7 +134,7 @@ test "mutation admission controls preserve borrowed class and reacquire before r
             .check_lifetime = Fixture.lifetime,
             .current_class = Fixture.current,
         };
-        var budget = init(.{ .cancellation = @import("../storage/db/types.zig").CancellationToken.fromAtomic(&canceled) }, borrow, std.testing.io);
+        var budget = initParticipant(.{ .cancellation = @import("../storage/db/types.zig").CancellationToken.fromAtomic(&canceled), .execution_runnable = borrow }, std.testing.io);
         if (scenario == 0) {
             try mutex.lockExclusiveControlledIo(std.testing.io, acquisition(&budget));
             mutex.unlockExclusive();
@@ -146,16 +153,57 @@ test "mutation admission controls preserve borrowed class and reacquire before r
     var canceled = std.atomic.Value(bool).init(false);
     var fixture: Fixture = .{ .mutex = &mutex, .canceled = &canceled, .held = false };
     var borrow: runtime.runnable_abi.Borrowed = .{ .context = &fixture, .cpu_slots = 1, .parent_class = @backingInt(runtime.runnable_abi.Class.write), .checkpoint = Fixture.checkpoint, .park = Fixture.park, .enter = Fixture.enter };
-    var budget = init(.{}, borrow, std.testing.io);
+    var budget = initParticipant(.{ .execution_runnable = borrow }, std.testing.io);
     try std.testing.expectError(error.UnsupportedOperation, mutex.lockExclusiveControlledIo(std.testing.io, acquisition(&budget)));
     borrow.check_lifetime = Fixture.lifetime;
     for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
         fixture.lifetime_failure = cause;
-        budget = init(.{}, borrow, std.testing.io);
+        budget = initParticipant(.{ .execution_runnable = borrow }, std.testing.io);
         try std.testing.expectError(cause, mutex.lockExclusiveControlledIo(std.testing.io, acquisition(&budget)));
         try std.testing.expect(mutex.tryLockExclusive());
         mutex.unlockExclusive();
     }
     try std.testing.expectEqual(@as(usize, 0), fixture.parks);
     try std.testing.expectEqual(@as(usize, 0), fixture.checkpoints);
+}
+
+test "mutation admission controls reject stopped participant authority before setup without CPU acquisition" {
+    const Fixture = struct {
+        cause: ?anyerror = null,
+        checks: usize = 0,
+        fn lifetime(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            return if (self.cause) |cause| runtime.error_abi.statusFromError(cause) else .ok;
+        }
+        fn checkpoint(_: *anyopaque) callconv(.c) runtime.error_abi.Status {
+            @panic("participant setup lifetime must not acquire or yield CPU");
+        }
+        fn transition(_: *anyopaque, _: c_int) callconv(.c) runtime.error_abi.Status {
+            @panic("participant setup lifetime must not transfer execution");
+        }
+    };
+    var fixture: Fixture = .{};
+    var context: transaction.PreDecisionContext = .{ .execution_runnable = .{
+        .context = &fixture,
+        .cpu_slots = 1,
+        .parent_class = @backingInt(runtime.runnable_abi.Class.write),
+        .checkpoint = Fixture.checkpoint,
+        .park = Fixture.transition,
+        .enter = Fixture.transition,
+    } };
+    try std.testing.expectError(error.UnsupportedOperation, checkPreDecision(context));
+    try std.testing.expectEqual(@as(usize, 0), fixture.checks);
+    context.execution_runnable.?.check_lifetime = Fixture.lifetime;
+    try checkPreDecision(context);
+    for ([_]anyerror{ error.Canceled, error.DeadlineExceeded, error.SchedulerClosed }) |cause| {
+        fixture.cause = cause;
+        // Owner rejection remains the original cause even when a portable
+        // deadline has also expired; no setup or fresh authority may follow.
+        context.deadline_ns = 0;
+        try std.testing.expectError(cause, checkPreDecision(context));
+    }
+    fixture.cause = null;
+    try std.testing.expectError(error.PreDecisionDeadlineExceeded, checkPreDecision(context));
+    try std.testing.expectEqual(@as(usize, 5), fixture.checks);
 }

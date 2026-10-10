@@ -1478,3 +1478,30 @@ for this revision. Participant fanout still needs independently owned children,
 per-call group control transport and mandatory joins; shared coordinator borrows
 must not be forwarded into concurrent workers. Broad wait/body coverage, real
 resource/overload/performance gates and automatic defaults remain unfinished.
+
+Participant pre-decision contexts now carry an optional process-local runnable
+borrow. It belongs to one participant call and must remain alive through that
+call and its physical consumers; parallel calls must receive independent child
+owners. Deadline translation preserves this token. The compiled table-write
+boundary forwards it through aware BEGIN/prepare callbacks and rejects legacy
+fallback even when the token lacks a lifetime callback. Native bound BEGIN and
+prepare construct their controlled admission budget from this token, releasing
+and reacquiring its captured write class at service-lock waits while retaining
+the original portable deadline/cancellation. Initial setup gates consult its
+non-yielding lifetime callback and preserve the original rejection cause.
+
+Provisioned group-local owner forwarding now preserves the entire pre-decision
+context rather than invoking legacy BEGIN/prepare callbacks. The direct-open
+fallback rejects a supplied token until its physical wait graph is controlled.
+This does not yet enable participant fanout: the coordinator must still reserve
+independent children, park across physical joins, and pass each child's borrow
+through per-call worker contexts and remote waits. Restore/Raft and other
+provisioned service waits still need complete dependency coverage.
+
+Native focused qualification covers 128 tests across scheduler/service admission,
+text authority, completion teams and compiled table-write contracts. The final
+run executed 92 tests and reused 36 unchanged successful tests; earlier runs and
+an environmental NoSpaceLeft failure are preserved with its receipt. Pinned
+Nix/glibc Linux and cumulative physical storage/serving validation are queued
+separately. These focused results do not qualify automatic defaults or the
+resource/performance matrix.

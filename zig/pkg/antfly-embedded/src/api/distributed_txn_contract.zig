@@ -46,6 +46,10 @@ pub const PreDecisionContext = struct {
     deadline_ns: ?u64 = null,
     deadline_io: ?@import("antfly_runtime_abi").io_abi.Borrow = null,
     cancellation: db_types.CancellationToken = .none,
+    /// Per-call worker authority retained through this synchronous participant
+    /// operation. Concurrent participants require independently owned children;
+    /// never forward the coordinator token to multiple workers or serialize it.
+    execution_runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
 
     /// Clamp an existing budget into the destination clock domain. Sampling
     /// that clock first prevents translation from extending the caller's
@@ -64,7 +68,7 @@ pub const PreDecisionContext = struct {
     /// discarded: its caller requires this context-aware operation contract.
     pub fn requiresAwareCallback(self: PreDecisionContext) bool {
         return self.route_fence != null or self.restore_staging_scope != null or self.restore_staging_plan_id != null or
-            self.deadline_ns != null or self.deadline_io != null or self.cancellation.ptr != null or
+            self.deadline_ns != null or self.deadline_io != null or self.execution_runnable != null or self.cancellation.ptr != null or
             self.cancellation.is_cancelled_fn != null or self.cancellation.check_fn != null;
     }
 };

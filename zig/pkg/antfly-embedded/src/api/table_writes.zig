@@ -1195,7 +1195,7 @@ pub const BoundTableWriteSource = struct {
         try ensurePreDecisionContextActive(context);
         const db = try self.activeDb();
         const admission = @import("mutation_admission_controls.zig");
-        var budget = admission.init(context, null, db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
+        var budget = admission.initParticipant(context, db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
         _ = try db.beginTransactionWithAdmissionControls(
             txn_id,
             begin_timestamp,
@@ -1237,7 +1237,7 @@ pub const BoundTableWriteSource = struct {
         try validateTransactionAgainstLocalSchema(alloc, db, txn_id, req.writes, req.deletes, req.transforms);
         if (req.relational_index_maintenance) |command| if (command.owner_group_id != (self.owner_group_id orelse return error.UnsupportedOperation)) return error.PreparedGenerationChanged;
         const admission = @import("mutation_admission_controls.zig");
-        var budget = admission.init(context, null, db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
+        var budget = admission.initParticipant(context, db.backend_runtime.io() orelse return error.MissingBackendRuntimeIo);
         try prepareBoundTransactionWithAdmissionControls(db, txn_id, req, &budget);
     }
 
