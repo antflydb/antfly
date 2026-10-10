@@ -48,6 +48,12 @@ pub fn prefix(a: A, base: []const u8, binding: Binding, options: Options) ![]u8 
     defer a.free(identity);
     return std.fmt.allocPrint(a, "{s}{s}lake-ingestion/{d}/{d}/{s}", .{ base, if (base.len == 0) "" else "/", options.catalog_table_id, options.catalog_generation, catalog.types.digestHex(identity) });
 }
+/// Filesystem ingestion publishes object URIs through its bucket adapter.
+/// Maintenance must use the same URI namespace when reading those artifacts.
+pub fn destinationFiles(a: A, files: local.serverless_object_store_support.OpenedObjectStore, source_uri: []const u8, context: Context) !catalog.row_commit.Files {
+    const uri = if (files.fs_client != null) try std.fmt.allocPrint(a, "object://{s}/{s}", .{ files.bucket, files.prefix }) else source_uri;
+    return .{ .client = files.client, .bucket = files.bucket, .prefix = files.prefix, .uri = uri, .context = context };
+}
 pub fn coverage(a: A, table: catalog.types.Table) !u64 {
     var p = try std.json.parseFromSlice(V, a, table.metadata_json, .{});
     defer p.deinit();
@@ -143,8 +149,8 @@ pub fn drain(a: A, binding: Binding, options: Options, context: Context) !bool {
         var files = try configured.openBindingObjectStoreAlloc(a, binding, source_options);
         defer files.deinit();
         const timestamp: i64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
-        const files_uri = if (files.fs_client != null) try std.fmt.allocPrint(scratch, "object://{s}/{s}", .{ files.bucket, files.prefix }) else binding.source_uri;
-        const built = try catalog.row_commit.prepare(scratch, current.table, .{ .client = files.client, .bucket = files.bucket, .prefix = files.prefix, .uri = files_uri, .context = context }, parsed.value, record.lsn, timestamp);
+        const destination = try destinationFiles(scratch, files, binding.source_uri, context);
+        const built = try catalog.row_commit.prepare(scratch, current.table, destination, parsed.value, record.lsn, timestamp);
         attempt = .{ .id = try std.fmt.allocPrint(scratch, "wal-{d}-{s}", .{ record.lsn, catalog.types.digestHex(current.table.metadata_location) }), .expected = current.table.metadata_location, .body = built.body, .timestamp_ms = timestamp };
         const bytes = try std.json.Stringify.valueAlloc(scratch, attempt, .{});
         var stored = client.putObject(opened.bucket, intent_key, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&context) }) catch |err| switch (err) {
@@ -212,4 +218,21 @@ pub fn pending(a: A, binding: Binding, options: Options, context: Context, cut: 
         }
     }
     return .{ .lsn = suffix.lsn, .key_fields = keys, .changes = changes.items };
+}
+
+test "external lake filesystem maintenance reads ingestion artifacts in the same namespace" {
+    const alloc = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("lake-artifact-namespace");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const uri = try std.fmt.allocPrint(a, "file://{s}", .{directory.path()});
+    var opened = try local.serverless_object_store_support.OpenedObjectStore.initFileUriWithOptions(alloc, uri, "archive", .{ .ensure_bucket = true });
+    defer opened.deinit();
+    const writer = try destinationFiles(a, opened, uri, .{});
+    const artifact = try catalog.row_commit.upload(a, writer, "metadata/manifest.avro", "manifest-content");
+    try std.testing.expect(std.mem.startsWith(u8, artifact, "object://archive/"));
+    const maintenance = try destinationFiles(a, opened, uri, .{});
+    try std.testing.expectEqualStrings("manifest-content", try catalog.row_commit.read(a, maintenance, artifact));
 }

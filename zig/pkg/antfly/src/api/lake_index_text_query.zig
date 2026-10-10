@@ -188,7 +188,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, current_table: local.c
         if (declaration.artifact.kind == .text_segment) break true;
     } else false;
     if (has_vectors) if (owner.overlay) |pending_overlay| {
-        owner.recent_declarations = if (retained) |cut| cut.recent else @import("lake_recent_vectors.zig").prepare(ca, current_table, selected.publication(), pending_overlay, owner.declarations, &store, context, .{ .antfly_provider = server.antfly_provider, .io = server.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = normalized.deadline_ns, .cancellation = retained_cancellation, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content, .inference_api_url = server.configuredInferenceAPIURL(), .inference_api_key = server.cfg.inference_api_key, .provider_runtime = &server.embedding_provider_runtime, .source_table = table.name }, build_recent) catch |err| {
+        owner.recent_declarations = if (retained) |cut| cut.recent else @import("lake_recent_vectors.zig").prepare(ca, current_table, selected.publication(), pending_overlay, owner.declarations, &store, context, .{ .antfly_provider = server.antfly_provider, .io = server.embedding_provider_runtime.io, .bounded_http_request = true, .deadline_ns = normalized.deadline_ns, .cancellation = retained_cancellation, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content, .inference_api_url = server.configuredInferenceAPIURL(), .inference_api_key = server.cfg.inference_api_key, .provider_runtime = &server.embedding_provider_runtime, .source_table = table.name }, build_recent, cut_expires_ms) catch |err| {
             server.notifyLakeCommit(table.name) catch {};
             return err;
         };
