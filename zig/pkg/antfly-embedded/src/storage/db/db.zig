@@ -22860,10 +22860,14 @@ pub const DB = struct {
         if (controls) |original| try original.lifetime.check();
         var row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         defer row_policy_lease.release();
-        var replication_mutation = self.acquireReplicationMutationShared();
+        const admission = @import("mutation_admission.zig");
+        // Publication may need CPU to retire this policy lease. Keep the
+        // original lifetime without transferring CPU inside that dependency.
+        const retained_controls = admission.retainedLeaseControls(controls);
+        var replication_mutation = try admission.acquireReplicationMutationShared(self, retained_controls);
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try @import("mutation_admission.zig").lockApply(self, controls);
+        try admission.lockApply(self, retained_controls);
         defer self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (self.local_execution.restore_staging_required.load(.acquire) or scope != null) {
@@ -23019,10 +23023,11 @@ pub const DB = struct {
         if (controls) |original| try original.lifetime.check();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        var replication_mutation = self.acquireReplicationMutationShared();
+        const admission = @import("mutation_admission.zig");
+        var replication_mutation = try admission.acquireReplicationMutationShared(self, controls);
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.writeTransactionInternal(txn_id, req, null, controls);
+        try self.writeTransactionInternal(txn_id, req, null, if (replication_mutation != null) admission.retainedLeaseControls(controls) else controls);
     }
 
     pub fn writeReplicatedTransactionAtOrderedReceipt(
@@ -23072,7 +23077,11 @@ pub const DB = struct {
         var retries: usize = 0;
         while (true) {
             if (controls) |original| try original.lifetime.check();
-            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null, controls) catch |err| switch (err) {
+            const prepared_controls = if (row_policy_lease != null)
+                @import("mutation_admission.zig").retainedLeaseControls(controls)
+            else
+                controls;
+            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null, prepared_controls) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;

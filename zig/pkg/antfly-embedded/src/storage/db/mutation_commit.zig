@@ -252,7 +252,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (schema_namespace != self.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
             if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
             if (!opts.bypass_replication_write_gate and self.denseRepairWriteBackpressured()) return error.DenseRepairBackpressure;
-            var replication_mutation = if (opts.bypass_replication_write_gate) null else try @import("mutation_admission.zig").acquireReplicationMutationShared(self, opts.admission_controls);
+            const mutation_admission = @import("mutation_admission.zig");
+            // A supplied snapshot or policy lease is retained before the
+            // initial replication wait. Keep its original lifetime, with CPU
+            // authority retained until capture holders adopt mandatory reentry.
+            const initial_controls = if (opts.snapshot_mutation != null or opts.row_policy_lease != null)
+                mutation_admission.retainedLeaseControls(opts.admission_controls)
+            else
+                opts.admission_controls;
+            var replication_mutation = if (opts.bypass_replication_write_gate) null else try mutation_admission.acquireReplicationMutationShared(self, initial_controls);
             defer if (replication_mutation) |*lease| lease.release();
             if (!opts.bypass_replication_write_gate) try self.ensureDurableReplicationStartupBarrier();
             if (!opts.bypass_replication_write_gate) try self.enforceReplicationWriteGate();
@@ -780,7 +788,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 );
             }
 
-            var snapshot_mutation = if (opts.admission_controls) |controls|
+            const snapshot_controls = if (replication_mutation != null)
+                mutation_admission.retainedLeaseControls(initial_controls)
+            else
+                initial_controls;
+            var snapshot_mutation = if (snapshot_controls) |controls|
                 try self.core.snapshot_admission.acquireMutationControlledIo(
                     self.core.apply_mutex.io orelse return error.MissingBackendRuntimeIo,
                     controls,
@@ -802,7 +814,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var prepared_artifacts = try self.prepareMergeArtifactEffects(preparation_alloc, req);
             defer prepared_artifacts.deinit();
             const apply_lock_wait_start_ns = monotonicTimeNs();
-            try @import("mutation_admission.zig").lockApply(self, opts.admission_controls);
+            try mutation_admission.lockApply(self, mutation_admission.retainedLeaseControls(snapshot_controls));
             if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - apply_lock_wait_start_ns;
             if (self.local_execution.source_vectors.load(.acquire)) |source| source.recordBatchLockWait(monotonicTimeNs() -| apply_lock_wait_start_ns);
             var filtered_cleanup_edges: ?[]types.GraphEdgeDelete = null;

@@ -43964,7 +43964,10 @@ fn implementationTests() type {
             const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
             const Capture = @TypeOf(db.core.snapshot_admission.*).CaptureLease;
             const State = struct {
+                db: *db_mod.DB,
                 capture: *Capture,
+                released_capture: bool = false,
+                retained_checks: usize = 0,
                 canceled: *std.atomic.Value(bool),
                 scenario: usize,
                 parks: usize = 0,
@@ -43974,6 +43977,18 @@ fn implementationTests() type {
                 fn lifetime(raw: *anyopaque) callconv(.c) runtime_error_abi.Status {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     self.lifetimes += 1;
+                    // The policy lease is retained while snapshot admission
+                    // waits. Progress/rejection uses the original lifetime,
+                    // without a CPU handoff to an unadmitted capture holder.
+                    if (!self.released_capture and self.db.local_execution.row_policy_gate.readers.load(.acquire) != 0) {
+                        self.retained_checks += 1;
+                        if (self.retained_checks >= 32) {
+                            self.capture.release();
+                            self.released_capture = true;
+                            if (self.scenario == 1) return runtime_error_abi.statusFromError(error.SchedulerClosed);
+                            if (self.scenario == 2) self.canceled.store(true, .release);
+                        }
+                    }
                     return .ok;
                 }
                 fn checkpoint(raw: *anyopaque) callconv(.c) runtime_error_abi.Status {
@@ -43992,15 +44007,13 @@ fn implementationTests() type {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     if (phase != @backingInt(runnable_abi.Wait.resource)) return runtime_error_abi.statusFromError(error.InvalidArgument);
                     self.parks += 1;
-                    self.capture.release();
-                    if (self.scenario == 2) self.canceled.store(true, .release);
-                    return .ok;
+                    return runtime_error_abi.statusFromError(error.InvalidRunnableTransition);
                 }
                 fn enter(raw: *anyopaque, phase: c_int) callconv(.c) runtime_error_abi.Status {
                     const self: *@This() = @ptrCast(@alignCast(raw));
                     if (phase != @backingInt(runnable_abi.Class.write)) return runtime_error_abi.statusFromError(error.InvalidArgument);
                     self.resumes += 1;
-                    return if (self.scenario == 1) runtime_error_abi.statusFromError(error.SchedulerClosed) else .ok;
+                    return runtime_error_abi.statusFromError(error.InvalidRunnableTransition);
                 }
             };
             const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:admission", .value = "{}" }} }};
@@ -44009,7 +44022,7 @@ fn implementationTests() type {
                 var capture = db.core.snapshot_admission.acquireCapture();
                 defer capture.release();
                 var canceled = std.atomic.Value(bool).init(false);
-                var state: State = .{ .capture = &capture, .canceled = &canceled, .scenario = scenario };
+                var state: State = .{ .db = &db, .capture = &capture, .canceled = &canceled, .scenario = scenario };
                 var team: runnable_abi.Team = .{
                     .borrow = .{ .context = &state, .cpu_slots = 1, .parent_class = @backingInt(runnable_abi.Class.query), .checkpoint = State.checkpoint, .park = State.park, .enter = State.enter, .resize_team = State.resize, .check_lifetime = State.lifetime, .current_class = State.current },
                     .maximum_slots = 1,
@@ -44025,13 +44038,116 @@ fn implementationTests() type {
                     try std.testing.expectError(if (scenario == 1) error.SchedulerClosed else error.Canceled, source.source().commitBatchWithControl(alloc, &tables, .write, .none, control));
                     try std.testing.expect(try db.lookup(alloc, "doc:admission", .{}) == null);
                 }
-                try std.testing.expectEqual(@as(usize, 1), state.parks);
+                try std.testing.expect(state.released_capture);
+                try std.testing.expectEqual(@as(usize, 32), state.retained_checks);
+                try std.testing.expectEqual(@as(usize, 0), state.parks);
                 try std.testing.expectEqual(state.parks, state.resumes);
                 try std.testing.expect(state.lifetimes > 1);
                 try std.testing.expectEqual(@as(usize, 0), state.checkpoints);
                 try std.testing.expect(team.state == .joined);
                 var next_capture = db.core.snapshot_admission.tryAcquireCapture() orelse return error.LeakedMutationAdmission;
                 next_capture.release();
+                try std.testing.expect(db.core.tryLockApplyExclusive());
+                db.core.unlockApply();
+            }
+        }
+
+        test "bound batch controls retain CPU through snapshot-owned apply rejection" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-bound-batch-retained-cpu");
+            defer path_tmp.cleanup();
+            var db = try db_mod.DB.open(alloc, path_tmp.path(), .{});
+            defer db.close();
+            const State = struct {
+                db: *db_mod.DB,
+                retained_checks: usize = 0,
+                transitions: usize = 0,
+                fn lifetime(raw: *const anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                    if (self.db.core.snapshot_admission.lock.state.load(.acquire) != 0) {
+                        self.retained_checks += 1;
+                        if (self.retained_checks >= 8) return error.DeadlineExceeded;
+                    }
+                }
+                fn transition(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.transitions += 1;
+                    return error.InvalidRunnableTransition;
+                }
+            };
+            var state: State = .{ .db = &db };
+            db.core.lockApply();
+            var held = true;
+            defer if (held) db.core.unlockApply();
+            try std.testing.expectError(error.DeadlineExceeded, db.batchWithAdmissionControls(.{ .writes = &.{.{ .key = "doc:retained-cpu", .value = "{}" }} }, .{
+                .lifetime = .{ .context = &state, .check_fn = State.lifetime },
+                .execution_wait = .{ .ptr = &state, .begin = State.transition, .end = State.transition },
+            }, .none));
+            try std.testing.expectEqual(@as(usize, 8), state.retained_checks);
+            try std.testing.expectEqual(@as(usize, 0), state.transitions);
+            db.core.unlockApply();
+            held = false;
+            try std.testing.expect(try db.lookup(alloc, "doc:retained-cpu", .{}) == null);
+            var next_capture = db.core.snapshot_admission.tryAcquireCapture() orelse return error.LeakedMutationAdmission;
+            next_capture.release();
+            try std.testing.expect(db.core.tryLockApplyExclusive());
+            db.core.unlockApply();
+        }
+
+        test "bound BEGIN and prepare retain CPU through policy-owned apply rejection" {
+            const alloc = std.testing.allocator;
+            var path_tmp = try TestDirectory.init("antfly-bound-txn-retained-cpu");
+            defer path_tmp.cleanup();
+            var db = try db_mod.DB.open(alloc, path_tmp.path(), .{});
+            defer db.close();
+            const State = struct {
+                db: *db_mod.DB,
+                retained_checks: usize = 0,
+                transitions: usize = 0,
+                fn lifetime(raw: *const anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+                    if (self.db.local_execution.row_policy_gate.readers.load(.acquire) != 0) {
+                        self.retained_checks += 1;
+                        if (self.retained_checks >= 32) return error.DeadlineExceeded;
+                    }
+                }
+                fn transition(raw: *anyopaque) !void {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    self.transitions += 1;
+                    return error.InvalidRunnableTransition;
+                }
+            };
+            for ([_]bool{ false, true }) |prepare| {
+                const id: db_mod.types.TxnId = @splat(if (prepare) @as(u8, 2) else @as(u8, 1));
+                if (prepare) _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(id, 1, 1, &.{}, true, true);
+                var state: State = .{ .db = &db };
+                db.core.lockApply();
+                var held = true;
+                defer if (held) db.core.unlockApply();
+                if (prepare) {
+                    try std.testing.expectError(error.DeadlineExceeded, db.writeTransactionWithAdmissionControls(id, .{ .writes = &.{.{ .key = "doc:retained-prepare", .value = "{}" }} }, .{
+                        .lifetime = .{ .context = &state, .check_fn = State.lifetime },
+                        .execution_wait = .{ .ptr = &state, .begin = State.transition, .end = State.transition },
+                    }));
+                } else {
+                    try std.testing.expectError(error.DeadlineExceeded, db.beginTransactionWithAdmissionControls(id, 1, 1, &.{}, true, true, .{
+                        .lifetime = .{ .context = &state, .check_fn = State.lifetime },
+                        .execution_wait = .{ .ptr = &state, .begin = State.transition, .end = State.transition },
+                    }));
+                }
+                try std.testing.expectEqual(@as(usize, 32), state.retained_checks);
+                try std.testing.expectEqual(@as(usize, 0), state.transitions);
+                try std.testing.expectEqual(@as(usize, 0), db.local_execution.row_policy_gate.readers.load(.acquire));
+                db.core.unlockApply();
+                held = false;
+                if (prepare) {
+                    try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try db.getTransactionStatus(id));
+                    try db.resolveTransactionIntents(id, .aborted, 2);
+                    try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, try db.getTransactionStatus(id));
+                } else {
+                    try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(id));
+                }
+                try std.testing.expect(try db.lookup(alloc, "doc:retained-prepare", .{}) == null);
                 try std.testing.expect(db.core.tryLockApplyExclusive());
                 db.core.unlockApply();
             }

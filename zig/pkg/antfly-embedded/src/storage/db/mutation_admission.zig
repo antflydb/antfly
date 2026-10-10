@@ -40,7 +40,7 @@ pub fn acquireReplicationMutationShared(owner: anytype, controls: ?lock.ApplyRwL
     return barrier.acquireShared();
 }
 
-/// While a durable resolution retains replication/snapshot service leases,
+/// While native mutation or resolution retains replication/snapshot service leases,
 /// dependent capture holders have not all adopted mandatory CPU reentry yet.
 /// Keep the original lifetime, but prohibit CPU transfer inside that graph.
 pub fn retainedLeaseControls(controls: ?lock.ApplyRwLock.Acquisition) ?lock.ApplyRwLock.Acquisition {

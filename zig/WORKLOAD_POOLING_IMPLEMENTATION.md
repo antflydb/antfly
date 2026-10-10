@@ -1783,3 +1783,9 @@ source ownership checks. Mandatory cleanup wait bounds, broader builder/capture
 caller adoption, metadata-key comparison byte quanta, bulk clone/rotation and
 artifact transport, full native/HTTP integration, resource/performance gates and
 automatic defaults remain unqualified.
+
+### Native mutation waits while retaining service leases
+
+Batch, BEGIN and intent prepare now carry their original admission through the replication barrier and apply/snapshot waits. A supplied snapshot or row-policy lease suppresses CPU transfer before the first wait; an acquired replication, policy or snapshot lease suppresses transfer in dependent waits. The original lifetime remains authoritative, including bounded rejection and mandatory terminal abort after accepted BEGIN. This prevents a CPU reentry dependency on capture/publication holders which have not yet adopted mandatory reentry; it does not complete that holder transport or qualify fair scheduling by default.
+
+The existing snapshot-admission fixture now drives progress and rejection through the original lifetime while retaining CPU. Two new physical bound-source fixtures hold apply admission and check original rejection without CPU transfer, lease retirement, absence of published batch effects, and independent abort of prepared transactions. They are selected by `antfly-local-commit-control-test` and require the cumulative physical integration run. The focused collector/service regression targets do not instantiate these changed native DB bodies or those fixtures. Broader capture holders, row-policy wait transport, mandatory cleanup bounds, whole integration and Linux runtime/performance/default gates remain open.
