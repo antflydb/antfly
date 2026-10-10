@@ -24,6 +24,7 @@ pub const Context = struct {
     deadline_ns: ?u64 = null,
     cancellation: ?storage.CancellationToken = null,
     checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
+    additional_checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
     /// Original read authority is independent of CPU ownership and may be
     /// polled while parked. Its callback must not acquire a runnable grant.
     authority: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
@@ -48,12 +49,18 @@ pub const Context = struct {
     pub fn ensureActive(self: Context) !void {
         try self.checkLifetime();
         if (self.checkpoint) |hook| try hook.check(hook.ptr);
+        if (self.additional_checkpoint) |hook| try hook.check(hook.ptr);
     }
 };
 
 pub const Store = struct {
     base: storage.ObjectStorage,
     context: Context,
+    extra_checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
+    pub fn ensureActive(self: *const Store) !void {
+        try self.context.ensureActive();
+        if (self.extra_checkpoint) |hook| try hook.check(hook.ptr);
+    }
     pub fn client(self: *Store, alloc: Allocator) storage.ObjectStorage {
         return .{ .allocator = alloc, .ptr = self, .vtable = &vtable };
     }
@@ -97,20 +104,20 @@ pub const Store = struct {
     }
     fn bucketExists(raw: *anyopaque, bucket: []const u8, options: storage.BucketOptions) !bool {
         const self = from(raw);
-        try self.context.ensureActive();
+        try self.ensureActive();
         var opts = options;
         const cancellation: Cancellation = .{ .store = self, .parent = options.cancellation };
         opts.cancellation = cancellation.token();
         const result = @import("../../sql/execution_wait.zig").run(self.context.wait, storage.ObjectStorage.bucketExistsWithOptions, .{ &self.base, bucket, opts }) catch |err| {
-            try self.context.ensureActive();
+            try self.ensureActive();
             return err;
         };
-        try self.context.ensureActive();
+        try self.ensureActive();
         return result;
     }
     fn getObject(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
         const self = from(raw);
-        try self.context.ensureActive();
+        try self.ensureActive();
         var opts = options;
         const cancellation: Cancellation = .{ .store = self, .parent = options.cancellation };
         opts.cancellation = cancellation.token();
@@ -118,11 +125,11 @@ pub const Store = struct {
         var base = self.base;
         base.allocator = alloc;
         var result = @import("../../sql/execution_wait.zig").runOwned(self.context.wait, storage.ObjectStorage.getObject, .{ &base, bucket, key, opts }, discard, .{alloc}) catch |err| {
-            try self.context.ensureActive();
+            try self.ensureActive();
             return err;
         };
         errdefer result.deinit(alloc);
-        try self.context.ensureActive();
+        try self.ensureActive();
         return result;
     }
     fn statObject(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8) !storage.ObjectMetadata {
@@ -130,44 +137,44 @@ pub const Store = struct {
     }
     fn statObjectWithOptions(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: @import("objectstore").StatOptions) !storage.ObjectMetadata {
         const self = from(raw);
-        try self.context.ensureActive();
+        try self.ensureActive();
         var opts = options;
         const cancellation: Cancellation = .{ .store = self, .parent = options.cancellation };
         opts.cancellation = cancellation.token();
         var base = self.base;
         base.allocator = alloc;
         var result = @import("../../sql/execution_wait.zig").runOwned(self.context.wait, storage.ObjectStorage.statObjectWithOptions, .{ &base, bucket, key, opts }, discard, .{alloc}) catch |err| {
-            try self.context.ensureActive();
+            try self.ensureActive();
             return err;
         };
         errdefer result.deinit(alloc);
-        try self.context.ensureActive();
+        try self.ensureActive();
         return result;
     }
     fn attributes(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8) !storage.ObjectAttributes {
         const self = from(raw);
-        try self.context.ensureActive();
+        try self.ensureActive();
         var base = self.base;
         base.allocator = alloc;
         var result = try @import("../../sql/execution_wait.zig").runOwned(self.context.wait, storage.ObjectStorage.getObjectAttributes, .{ &base, bucket, key }, discard, .{alloc});
         errdefer result.deinit(alloc);
-        try self.context.ensureActive();
+        try self.ensureActive();
         return result;
     }
     fn listObjects(raw: *anyopaque, alloc: Allocator, bucket: []const u8, options: storage.ListOptions) !storage.ListResult {
         const self = from(raw);
-        try self.context.ensureActive();
+        try self.ensureActive();
         var opts = options;
         const cancellation: Cancellation = .{ .store = self, .parent = options.cancellation };
         opts.cancellation = cancellation.token();
         var base = self.base;
         base.allocator = alloc;
         var result = @import("../../sql/execution_wait.zig").runOwned(self.context.wait, storage.ObjectStorage.listObjects, .{ &base, bucket, opts }, discard, .{alloc}) catch |err| {
-            try self.context.ensureActive();
+            try self.ensureActive();
             return err;
         };
         errdefer result.deinit(alloc);
-        try self.context.ensureActive();
+        try self.ensureActive();
         return result;
     }
 };

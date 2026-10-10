@@ -1,0 +1,14 @@
+# Privileged fixture driver only: never use this override in a shared deployment.
+services:
+  s3:
+    ports: ['127.0.0.1:29700:9000']
+  nessie:
+    ports: ['127.0.0.1:29720:19120']
+    environment:
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_EXTERNAL_ENDPOINT: http://127.0.0.1:29700
+  polaris:
+    ports: ['127.0.0.1:29710:8181', '127.0.0.1:29711:8182']
+
+networks:
+  backend:
+    internal: false

@@ -52,7 +52,7 @@ pub fn publishInventoryAlloc(
     try options.cancellation.check();
     var operation_artifacts = artifacts.*;
     operation_artifacts.allocator = alloc;
-    try binding.validateReadOnlyMvp();
+    try binding.validateSupported();
     try inventory.validate();
 
     const encoded = try external_source_codec.encodeAlloc(alloc, inventory);

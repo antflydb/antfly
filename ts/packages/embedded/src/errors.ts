@@ -80,7 +80,7 @@ const ERROR_CODE_DESCRIPTIONS: Readonly<Record<number, string>> = {
   [ErrorCode.Unsupported]:
     "the operation requires a capability that is not supported by this platform or filesystem",
   [ErrorCode.Stalled]:
-    "a bounded drain made no forward progress for its configured stall window and gave up",
+    "derived work stalled or failed; inspect pending-work diagnostics and repair or reopen the database",
   [ErrorCode.Cancelled]: "the caller cancelled the operation",
   [ErrorCode.Internal]: "an internal error occurred",
 };

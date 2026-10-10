@@ -19,6 +19,7 @@
 const std = @import("std");
 pub const backend = @import("backend.zig");
 const values = @import("values.zig");
+const formatting = @import("formatting.zig");
 const commands = @import("session_commands.zig");
 const settings_catalog = @import("antfly_local_sources").sql_setting_catalog;
 const Spool = @import("cursor_spool.zig").Store;
@@ -136,7 +137,9 @@ pub const Session = struct {
     status: backend.TransactionStatus = .idle,
     completion_drain: bool = false,
     prepared: std.StringHashMapUnmanaged(Prepared) = .empty,
-    portals: std.StringHashMapUnmanaged(Portal) = .empty,
+    // Results borrow their portal allocator until release. Registry growth and
+    // removal must never move that allocator.
+    portals: std.StringHashMapUnmanaged(*Portal) = .empty,
     sql_cursors: std.StringHashMapUnmanaged(SqlCursor) = .empty,
     cursor_budget: ?*Budget = null,
     retained_shared: ?*@import("budget.zig").Shared = null,
@@ -145,13 +148,14 @@ pub const Session = struct {
     cursor_epoch: u64 = 0,
     statement_timeout: ?u32 = null,
     application_name: commands.ApplicationName = .{},
+    lake_visibility: commands.LakeVisibility = .committed,
     namespace_setting: ?commands.SearchPath = null,
     catalog_settings: ?settings_catalog.OverlayState = null,
     request_namespace: ?[]const u8 = null,
     request_search_path: ?commands.SearchPath = null,
     transaction_namespace: ?commands.Namespace = null,
-    timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.SearchPath, namespace_committed: ?commands.SearchPath, application_before: commands.ApplicationName, application_committed: commands.ApplicationName } = null,
-    savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.SearchPath, committed_namespace: ?commands.SearchPath, application: commands.ApplicationName, committed_application: commands.ApplicationName, catalog: ?settings_catalog.OverlayState.Savepoint = null }) = .empty,
+    timeout_transaction: ?struct { before: ?u32, committed: ?u32, namespace_before: ?commands.SearchPath, namespace_committed: ?commands.SearchPath, application_before: commands.ApplicationName, application_committed: commands.ApplicationName, lake_before: commands.LakeVisibility, lake_committed: commands.LakeVisibility } = null,
+    savepoints: std.ArrayList(struct { name: []const u8, epoch: u64, timeout: ?u32, committed_timeout: ?u32, namespace: ?commands.SearchPath, committed_namespace: ?commands.SearchPath, application: commands.ApplicationName, committed_application: commands.ApplicationName, lake: commands.LakeVisibility, committed_lake: commands.LakeVisibility, catalog: ?settings_catalog.OverlayState.Savepoint = null }) = .empty,
     skip_until_sync: bool = false,
     backend_pid: i32 = 0,
     cancel_key: i32 = 0,
@@ -309,7 +313,7 @@ pub const Session = struct {
         self.setDeadline(self.limits.startup_timeout_ms);
         const started = self.startup() catch |err| {
             if (err == error.Canceled) return err;
-            try self.sendError(sqlstate(err), @errorName(err));
+            if (self.diagnostic.code != null) try self.sendDiagnostic('E', self.diagnostic, null) else try self.sendError(sqlstate(err), @errorName(err));
             try self.writer.flush();
             return err;
         };
@@ -344,6 +348,7 @@ pub const Session = struct {
                             self.statement_timeout = settings.before;
                             self.namespace_setting = settings.namespace_before;
                             self.application_name = settings.application_before;
+                            self.lake_visibility = settings.lake_before;
                         }
                         self.timeout_transaction = null;
                         self.transaction_namespace = null;
@@ -398,10 +403,23 @@ pub const Session = struct {
                             if (database != null) return error.ProtocolViolation;
                             database = value;
                         } else if (std.mem.eql(u8, key, "client_encoding")) {
-                            if (!std.ascii.eqlIgnoreCase(value, "UTF8") and !std.ascii.eqlIgnoreCase(value, "UTF-8")) return error.UnsupportedEncoding;
+                            formatting.validateEncoding(value) catch |err| {
+                                self.diagnostic.set("22021", "unsupported startup parameter client_encoding; only UTF8 is supported", null, null);
+                                return err;
+                            };
                         } else if (std.mem.eql(u8, key, "application_name")) {
                             self.application_name = try commands.ApplicationName.init(value);
+                        } else if (formatting.lookup(key)) |setting| {
+                            setting.validate(value) catch |err| {
+                                var buffer: [256]u8 = undefined;
+                                const startup_message = std.fmt.bufPrint(&buffer, "unsupported value for startup parameter {s}; effective value is {s}", .{ setting.name(), setting.value() }) catch "unsupported startup parameter value";
+                                self.diagnostic.set("0A000", startup_message, null, null);
+                                return err;
+                            };
                         } else {
+                            var buffer: [256]u8 = undefined;
+                            const startup_message = std.fmt.bufPrint(&buffer, "unsupported startup parameter: {s}", .{key}) catch "unsupported startup parameter";
+                            self.diagnostic.set("0A000", startup_message, null, null);
                             // Never accept unchecked search_path/options that
                             // could silently change resolution or permissions.
                             return error.UnsupportedStartupOption;
@@ -434,10 +452,8 @@ pub const Session = struct {
                     try self.parameterStatus("server_version", "16.0-antfly");
                     try self.parameterStatus("server_encoding", "UTF8");
                     try self.parameterStatus("client_encoding", "UTF8");
-                    try self.parameterStatus("DateStyle", "ISO, MDY");
-                    try self.parameterStatus("TimeZone", "UTC");
+                    inline for (std.meta.tags(formatting.Setting)) |setting| try self.parameterStatus(setting.name(), setting.value());
                     try self.parameterStatus("integer_datetimes", "on");
-                    try self.parameterStatus("standard_conforming_strings", "on");
                     var key: [8]u8 = undefined;
                     std.mem.writeInt(i32, key[0..4], self.backend_pid, .big);
                     std.mem.writeInt(i32, key[4..8], self.cancel_key, .big);
@@ -492,6 +508,7 @@ pub const Session = struct {
             .search_path = self.effectiveSearchPath(),
             .session_namespace = if (self.transaction_namespace) |*value| value.slice() else null,
             .session_id = self.session_id,
+            .lake_visibility = self.lake_visibility,
             .setting_overlay = if (self.catalog_settings) |*state| state.values() else &.{},
             .limit = self.limits.result_rows,
             .io = self.io,
@@ -511,7 +528,9 @@ pub const Session = struct {
             return .{ .columns = switch (setting) {
                 .search_path => |value| if (value == .show) &.{.{ .name = "search_path", .type = .string }} else &.{},
                 .statement_timeout => |value| if (value == .show) &.{.{ .name = "statement_timeout", .type = .string }} else &.{},
+                .lake_visibility => |value| if (value == .show) &.{.{ .name = "antfly.lake_visibility", .type = .string }} else &.{},
                 .application_name => |value| if (value == .show) &.{.{ .name = "application_name", .type = .string }} else &.{},
+                .formatting => |value| if (value.action == .show) try alloc.dupe(backend.Column, &.{.{ .name = value.kind.name(), .type = .string }}) else &.{},
                 .client_encoding => |value| if (value == .show) &.{.{ .name = "client_encoding", .type = .string }} else &.{},
                 .catalog => |value| if (value == .show) &.{.{ .name = value.show, .type = .string }} else &.{},
                 .reset_all => &.{},
@@ -548,7 +567,9 @@ pub const Session = struct {
             return switch (setting) {
                 .search_path => |value| self.executeSearchPathSetting(alloc, statement, value),
                 .statement_timeout => |value| self.executeTimeoutSetting(alloc, value),
+                .lake_visibility => |value| self.executeLakeVisibilitySetting(alloc, value),
                 .application_name => |value| self.executeApplicationNameSetting(alloc, value),
+                .formatting => |value| self.executeFormattingSetting(alloc, value),
                 .client_encoding => |value| self.executeEncodingSetting(alloc, value),
                 .catalog => |value| self.executeCatalogSetting(alloc, statement, value),
                 .reset_all => self.executeResetAll(),
@@ -591,12 +612,12 @@ pub const Session = struct {
         self.status = result.transaction_status;
         if (previous_status == .idle and self.status == .in_transaction) {
             try (try self.settingsState()).begin();
-            self.timeout_transaction = .{ .before = self.statement_timeout, .committed = self.statement_timeout, .namespace_before = self.namespace_setting, .namespace_committed = self.namespace_setting, .application_before = self.application_name, .application_committed = self.application_name };
+            self.timeout_transaction = .{ .before = self.statement_timeout, .committed = self.statement_timeout, .namespace_before = self.namespace_setting, .namespace_committed = self.namespace_setting, .application_before = self.application_name, .application_committed = self.application_name, .lake_before = self.lake_visibility, .lake_committed = self.lake_visibility };
             self.transaction_namespace = try commands.Namespace.init(req.namespace orelse "public");
         }
         if (control) |value| switch (value) {
             .savepoint => {
-                self.savepoints.appendAssumeCapacity(.{ .name = savepoint_name.?, .epoch = self.cursor_epoch, .timeout = self.statement_timeout, .committed_timeout = if (self.timeout_transaction) |settings| settings.committed else self.statement_timeout, .namespace = self.namespace_setting, .committed_namespace = if (self.timeout_transaction) |settings| settings.namespace_committed else self.namespace_setting, .application = self.application_name, .committed_application = if (self.timeout_transaction) |settings| settings.application_committed else self.application_name, .catalog = if (self.catalog_settings) |*state| try state.savepoint() else null });
+                self.savepoints.appendAssumeCapacity(.{ .name = savepoint_name.?, .epoch = self.cursor_epoch, .timeout = self.statement_timeout, .committed_timeout = if (self.timeout_transaction) |settings| settings.committed else self.statement_timeout, .namespace = self.namespace_setting, .committed_namespace = if (self.timeout_transaction) |settings| settings.namespace_committed else self.namespace_setting, .application = self.application_name, .committed_application = if (self.timeout_transaction) |settings| settings.application_committed else self.application_name, .lake = self.lake_visibility, .committed_lake = if (self.timeout_transaction) |settings| settings.lake_committed else self.lake_visibility, .catalog = if (self.catalog_settings) |*state| try state.savepoint() else null });
                 savepoint_name = null;
             },
             .release, .rollback_to => |name| {
@@ -610,10 +631,12 @@ pub const Session = struct {
                             self.statement_timeout = self.savepoints.items[index].timeout;
                             self.namespace_setting = self.savepoints.items[index].namespace;
                             self.application_name = self.savepoints.items[index].application;
+                            self.lake_visibility = self.savepoints.items[index].lake;
                             if (self.timeout_transaction) |*settings| {
                                 settings.committed = self.savepoints.items[index].committed_timeout;
                                 settings.namespace_committed = self.savepoints.items[index].committed_namespace;
                                 settings.application_committed = self.savepoints.items[index].committed_application;
+                                settings.lake_committed = self.savepoints.items[index].committed_lake;
                             }
                         }
                         const keep = index + @as(usize, if (value == .rollback_to) 1 else 0);
@@ -635,6 +658,7 @@ pub const Session = struct {
             self.statement_timeout = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.committed else settings.before;
             self.namespace_setting = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.namespace_committed else settings.namespace_before;
             self.application_name = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.application_committed else settings.application_before;
+            self.lake_visibility = if (std.ascii.eqlIgnoreCase(result.command_tag, "COMMIT")) settings.lake_committed else settings.lake_before;
             self.timeout_transaction = null;
             self.transaction_namespace = null;
         };
@@ -700,6 +724,27 @@ pub const Session = struct {
         return result;
     }
 
+    fn executeLakeVisibilitySetting(self: *Session, alloc: std.mem.Allocator, setting: commands.LakeVisibilitySetting) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
+        if (setting == .show) {
+            result.columns = &.{.{ .name = "antfly.lake_visibility", .type = .string }};
+            const row = try alloc.alloc(std.json.Value, 1);
+            row[0] = .{ .string = try alloc.dupe(u8, @tagName(self.lake_visibility)) };
+            const rows = try alloc.alloc([]const std.json.Value, 1);
+            rows[0] = row;
+            result.rows = rows;
+            return result;
+        }
+        const update = if (setting == .reset) (commands.LakeVisibilitySetting{ .set = .{ .local = false, .value = .committed } }).set else setting.set;
+        if (update.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        self.lake_visibility = update.value;
+        if (!update.local) if (self.timeout_transaction) |*settings| {
+            settings.lake_committed = update.value;
+        };
+        return result;
+    }
+
     fn executeApplicationNameSetting(self: *Session, alloc: std.mem.Allocator, setting: commands.ApplicationNameSetting) !backend.Result {
         if (self.status == .failed) return error.InFailedSqlTransaction;
         var result: backend.Result = .{ .command_tag = if (setting == .show) "SHOW" else if (setting == .reset) "RESET" else "SET", .transaction_status = self.status, .session_id = self.session_id };
@@ -732,6 +777,22 @@ pub const Session = struct {
             rows[0] = row;
             result.rows = rows;
         } else if (setting == .set and setting.set.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        return result;
+    }
+
+    fn executeFormattingSetting(self: *Session, alloc: std.mem.Allocator, setting: commands.FormattingSetting) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        if (setting.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        var result: backend.Result = .{ .command_tag = switch (setting.action) {
+            .show => "SHOW",
+            .set => "SET",
+            .reset => "RESET",
+        }, .transaction_status = self.status, .session_id = self.session_id };
+        if (setting.action == .show) {
+            result.columns = try alloc.dupe(backend.Column, &.{.{ .name = setting.kind.name(), .type = .string }});
+            const row = try alloc.dupe(std.json.Value, &.{.{ .string = setting.kind.value() }});
+            result.rows = try alloc.dupe([]const std.json.Value, &.{row});
+        }
         return result;
     }
 
@@ -793,6 +854,7 @@ pub const Session = struct {
         self.statement_timeout = null;
         self.namespace_setting = null;
         self.application_name = .{};
+        self.lake_visibility = .committed;
         if (self.catalog_settings) |*state| state.resetAll();
         // RESET ALL is a session-level change even inside a transaction.
         // Savepoint snapshots can still roll it back locally; a committed
@@ -801,6 +863,7 @@ pub const Session = struct {
             settings.committed = null;
             settings.namespace_committed = null;
             settings.application_committed = .{};
+            settings.lake_committed = .committed;
         }
         return .{ .command_tag = "RESET", .transaction_status = self.status, .session_id = self.session_id };
     }
@@ -831,7 +894,7 @@ pub const Session = struct {
                 try cursor.finish();
                 self.removePortal("");
                 self.removePrepared("");
-                if (std.mem.trim(u8, statement, " \t\r\n;").len == 0) {
+                if (try commands.isEmptyQuery(statement)) {
                     try self.message('I', "");
                 } else {
                     const protected = self.protectedControl(statement);
@@ -951,7 +1014,10 @@ pub const Session = struct {
                 errdefer if (!transferred) self.retainedAlloc().free(owned_name);
                 self.removePortal(name);
                 const namespace = try a.dupe(u8, statement.namespace);
-                try self.portals.put(try self.retainedAllocator(), owned_name, .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path });
+                const portal = try (try self.retainedAllocator()).create(Portal);
+                errdefer if (!transferred) self.retainedAlloc().destroy(portal);
+                portal.* = .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path };
+                try self.portals.put(try self.retainedAllocator(), owned_name, portal);
                 transferred = true;
                 try self.message('2', "");
             },
@@ -981,7 +1047,7 @@ pub const Session = struct {
                 const requested = try cursor.int(i32);
                 if (requested < 0) return error.ProtocolViolation;
                 try cursor.finish();
-                const portal = self.portals.getPtr(name) orelse return error.InvalidPortalName;
+                const portal = self.portals.get(name) orelse return error.InvalidPortalName;
                 const previous_namespace = self.request_namespace;
                 const previous_search_path = self.request_search_path;
                 self.request_namespace = portal.namespace;
@@ -1460,10 +1526,11 @@ pub const Session = struct {
     fn removePortal(self: *Session, name: []const u8) void {
         if (self.portals.fetchRemove(name)) |entry| {
             self.retainedAlloc().free(entry.key);
-            var value = entry.value;
+            const value = entry.value;
             if (value.stream) |stream| stream.close(stream.context);
             if (value.result) |*result| result.deinit();
             self.destroyRetainedArena(value.arena);
+            self.retainedAlloc().destroy(value);
         }
     }
 
@@ -1471,9 +1538,11 @@ pub const Session = struct {
         var it = self.portals.iterator();
         while (it.next()) |entry| {
             self.retainedAlloc().free(entry.key_ptr.*);
-            if (entry.value_ptr.stream) |stream| stream.close(stream.context);
-            if (entry.value_ptr.result) |*result| result.deinit();
-            self.destroyRetainedArena(entry.value_ptr.arena);
+            const portal = entry.value_ptr.*;
+            if (portal.stream) |stream| stream.close(stream.context);
+            if (portal.result) |*result| result.deinit();
+            self.destroyRetainedArena(portal.arena);
+            self.retainedAlloc().destroy(portal);
         }
         self.portals.clearRetainingCapacity();
     }
@@ -1823,7 +1892,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.UnknownColumn => "42703",
         error.UnknownTable => "42P01",
         error.UnsupportedSqlExecution, error.UnsupportedSqlShape, error.SqlStatementSnapshotRequired => "0A000",
-        error.UnsupportedStartupOption => "0A000",
+        error.UnsupportedStartupOption, error.UnsupportedFormattingSetting => "0A000",
         error.UnsupportedEncoding => "22021",
         error.PortalExecutionFailed => "55000",
         error.TooManyConnections, error.SqlWriteCapacityUnavailable => "53300",
@@ -1877,7 +1946,8 @@ test "workload envelope pgwire authenticated startup retires partitioned frames 
             ready = true;
         }
     }
-    try std.testing.expectEqual(@as(usize, 7), parameters);
+    // Driver-compatible startup now includes extra_float_digits and IntervalStyle.
+    try std.testing.expectEqual(@as(usize, 9), parameters);
     try std.testing.expect(ready);
     try std.testing.expectEqual(@as(usize, 0), memory.foreground.stats().used_bytes);
     try std.testing.expectEqual(@as(usize, 0), memory.control.stats().used_bytes);
@@ -2029,14 +2099,16 @@ test "pgwire retained portal lease fences session teardown after stream failure"
     const arena = try session.newRetainedArena();
     const statement = try arena.allocator().dupe(u8, "SELECT 1");
     const key = try session.retainedAlloc().dupe(u8, "");
-    try session.portals.put(session.retainedAlloc(), key, .{
+    const portal = try session.retainedAlloc().create(Portal);
+    portal.* = .{
         .arena = arena,
         .statement = statement,
         .parameters = &.{},
         .types = &.{},
         .formats = &.{},
         .description = .{ .columns = &.{}, .parameter_types = &.{} },
-    });
+    };
+    try session.portals.put(session.retainedAlloc(), key, portal);
     session.setDeadline(5000);
     try std.testing.expectError(error.QueryCanceled, session.dispatch('E', "\x00\x00\x00\x00\x01"));
     try std.testing.expect(fixture.closed);
@@ -2133,7 +2205,7 @@ test "pgwire simple stream lease owns request after input frame and namespace ch
         parameters[1] = .{ .number_string = try alloc.dupe(u8, "12345678901234567890") };
         const types = try alloc.dupe(backend.Type, &.{ .json, .number });
         const guard = try alloc.dupe(u8, "bound-to-schema-1");
-        try std.testing.expectError(error.QueryCanceled, session.simpleStreamParameters(statement, parameters, types, guard, 17));
+        try std.testing.expectError(error.QueryCanceled, session.simpleStreamParameters(statement, parameters, types, &.{}, guard, 17));
         try std.testing.expect(fixture.closed);
         @memset(@constCast(statement), 'x');
         @memset(@constCast(guard), 'x');

@@ -244,7 +244,7 @@ pub fn pinnedExternalBaseSourceFromSchemaJsonAlloc(
     var owned_binding = (try externalBindingFromSchemaJsonAlloc(alloc, schema_json)) orelse return null;
     defer owned_binding.deinit(alloc);
     const binding = owned_binding.binding;
-    try binding.validateReadOnlyMvp();
+    try binding.validateSupported();
     const pinned_snapshot_id = binding.snapshot_mode.pinnedSnapshotId() orelse return null;
     const descriptor = try binding.toManifestBaseSource(pinned_snapshot_id, null);
     return try manifest_base_source.cloneDescriptorAlloc(alloc, descriptor);

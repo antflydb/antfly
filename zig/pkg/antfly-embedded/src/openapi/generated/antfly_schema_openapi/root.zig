@@ -15,6 +15,7 @@ pub const FieldMappingType = types.FieldMappingType;
 pub const ForeignKeyAction = types.ForeignKeyAction;
 pub const ForeignKeyMatch = types.ForeignKeyMatch;
 pub const ForeignKeyTiming = types.ForeignKeyTiming;
+pub const LakeCatalogConfig = types.LakeCatalogConfig;
 pub const RelationalCheckConstraint = types.RelationalCheckConstraint;
 pub const RelationalColumnExpression = types.RelationalColumnExpression;
 pub const RelationalComparisonOp = types.RelationalComparisonOp;

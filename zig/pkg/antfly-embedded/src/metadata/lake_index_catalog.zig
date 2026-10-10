@@ -457,7 +457,7 @@ test "metadata.lake index publication preserves ready roots and fences changed d
 
 fn cloneQueryDefinitionFaultCase(a: A) !void {
     const domain = @import("../system_catalog/domain.zig");
-    const table: @import("../common/topology_records.zig").TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = "schema", .read_schema_json = "read schema", .indexes_json = "indexes", .lake_index_catalog_json = "{\"generation\":7}" };
+    const table: @import("../common/topology_records.zig").TableRecord = .{ .table_id = 4, .name = "lake", .storage = .{ .engine = .object }, .object_storage_generation = 11, .schema_json = "schema", .read_schema_json = "read schema", .indexes_json = "indexes", .lake_index_catalog_json = "{\"generation\":7}" };
     const copy = try domain.QueryDefinition.fromTable(table).clone(a);
     defer copy.deinit(a);
     try std.testing.expectEqualStrings(table.lake_index_catalog_json, copy.lake_index_catalog_json);
@@ -467,6 +467,8 @@ fn cloneQueryDefinitionFaultCase(a: A) !void {
     var decoded = try std.json.parseFromSlice(domain.QueryDefinition, a, encoded, .{ .allocate = .alloc_always });
     defer decoded.deinit();
     try std.testing.expectEqualStrings(table.lake_index_catalog_json, decoded.value.lake_index_catalog_json);
+    try std.testing.expectEqual(table.table_id, decoded.value.table_id);
+    try std.testing.expectEqual(table.object_storage_generation, decoded.value.object_storage_generation);
 }
 
 test "metadata.lake index query definitions own publication bytes under allocation failures" {
@@ -476,6 +478,7 @@ test "metadata.lake index query definitions own publication bytes under allocati
     const bytes = try std.json.Stringify.valueAlloc(a, @import("../system_catalog/domain.zig").QueryDefinition.fromTable(table), .{});
     defer a.free(bytes);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "lake_index_catalog_json") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, "object_storage_generation") == null);
     const table_bytes = try std.json.Stringify.valueAlloc(a, table, .{});
     defer a.free(table_bytes);
     try std.testing.expect(std.mem.indexOf(u8, table_bytes, "lake_index_catalog_json") == null);

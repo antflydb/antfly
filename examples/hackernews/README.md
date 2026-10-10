@@ -24,10 +24,10 @@ encoding and plain fallback pages. Its dictionary headers use the deprecated
 The untouched export passed this check after the compatibility fix.
 
 `normalize.py` is optional: it decodes HTML/entities and writes DataPageV2
-Parquet. This converter materializes the sample in memory; larger backfills need
-a streaming converter. Keep `hn_id` for HN links. `parent_id` identifies the
-immediate parent, which may be another comment; root-story resolution is future
-ingestion work.
+Parquet. This converter iterates batches and writes bounded row groups instead of
+materializing the whole export. Keep `hn_id` for HN links. `parent_id` identifies the
+immediate parent, which may be another comment; `ingest.py` resolves root stories through its durable on-disk
+ancestry graph, including parents arriving after their children.
 
 ## Run the check
 
@@ -228,3 +228,370 @@ its first search. These are 10k-row measurements, not archive capacity results.
 - Define durable buckets and service identities through Colony's infra workflow.
 - Stream backfills, resolve parent stories, and reconcile edits/deletions.
 - Build Recent/Historical routing and the public search interface.
+
+
+## Million-row qualification
+
+`export-scale.sql` exports the newest million live story/comment rows between
+January and September 2025. Use a fresh prefix and a BigQuery dry run before
+execution. October 8's export processed 19,753,352,019 bytes, produced exactly
+1,000,000 rows, and wrote 449,870,756 compressed bytes. The job was capped at
+21,474,836,480 billed bytes; LIMIT does not reduce the scan.
+
+The runner accepts explicit scale, build and resource budgets:
+
+```sh
+python3 examples/hackernews/regional.py \
+  --binary /path/to/linux-antfly --revision EXACT-SOURCE-REVISION \
+  --source-prefix hn-poc/20261008-scale --expected-rows 1000000 \
+  --run-prefix hn-poc/NEW-UNIQUE-SCALE-RUN --output /tmp/hn-scale-results \
+  --build-timeout 1800 --lifetime 7200 --cpu 4 --memory 16Gi --disk 16Gi
+```
+
+Reports include readiness time, server peak RSS during construction, construction
+CPU/network deltas, cold/warm/restart timings, filter-oracle comparisons,
+pagination and concurrency. RSS is the Antfly process high-water mark, not a
+sum of all pod processes; network counters include control/background traffic.
+Use identical resources and source when comparing binaries. Increasing the build
+budget does not change the existing 15-second unordered-filter regression budget.
+
+## Durable historical ingestion
+
+Antfly serves search from GCS Parquet/Iceberg data and its own indexes. The
+Python example ingestor uses Antfly Lite: one `ingestion.aflite` file holds the
+item map, retry queues, ancestry key ranges, progress checkpoints, and PyIceberg
+writer catalog. The embedded `antfly-embedded` Python binding drives native synced
+batches and bounded key scans. There is no SQLite database or SQL catalog.
+The Lite writer runs outside the public search request path and needs a
+persistent volume plus stable-snapshot backups.
+
+Build `zig build capi` and set `ANTFLY_LIBRARY` to the built shared library
+when running from this source checkout. Published embedded platform wheels bundle
+the library. Use a dedicated Iceberg warehouse and a persistent state volume. The ingestor
+uses synced atomic Lite batches, streams Parquet input batches,
+deduplicates by HN ID, checkpoints source content hashes and offsets, and retains
+retry work before advancing its API cursor. Export full records (including
+`dead` and `deleted`) for a durable backfill; the qualification SQL intentionally
+contains only live rows. Its retained item map preserves tombstone ancestry.
+
+```sh
+uv run --project examples/hackernews python examples/hackernews/ingest.py \
+  --state /data/hackernews --warehouse gs://hackernews-archive-antfly-dev-01/items \
+  backfill /data/imports/part-*.parquet
+uv run --project examples/hackernews python examples/hackernews/ingest.py \
+  --state /data/hackernews --warehouse gs://hackernews-archive-antfly-dev-01/items \
+  run
+```
+
+Polls fetch new IDs, the official HN API's recent updates and a bounded rolling
+reconciliation sweep. [`updates.json`](https://github.com/HackerNews/API) is a
+recent-changes feed, not a durable log; the sweep catches missed moderation and
+edits after downtime. Catch-up time depends on the sweep budget and archive size.
+Null responses remain queued for retry. Missing ancestors are fetched in bounded
+batches; unresolved parents/cycles produce a null `root_story_id`, never an
+invented root. Complete live records can clear earlier moderation flags.
+
+Affected months are replaced using bounded Parquet writes and one Iceberg
+transaction. Publication creates immutable metadata and uses a generation-match
+CAS for `metadata/version-hint.text`. A persisted publication journal recovers
+failed/lost pointer writes. Attach Antfly to the **warehouse directory**, with
+`format: iceberg`, to follow commits; an explicit metadata-file attachment pins
+that one metadata file. Existing native index reconciliation detects a changed
+snapshot and publishes matching sidecars; queries cannot reuse a mismatched
+publication. Declare `object_mutability: immutable` for this writer's data objects: each
+Parquet file has a new immutable URI, so Antfly can reuse authenticated data-file
+version proofs while it still reads the fresh Iceberg commit pointer. The pointer
+changes; existing data files do not.
+
+Archive publication defaults to hourly, separately from one-minute API polling.
+This initial implementation replaces changed months and retains old snapshot
+objects, so it has write/storage amplification. It is suitable for a batched
+historical tier; a high-frequency whole-archive service needs file-level upserts,
+compaction and a reviewed retention policy. Recent native-table ingestion and
+the public UI remain separate work. No automatic snapshot deletion is included.
+
+The single Lite state file must live on a persistent volume owned by
+one writer. Take a streamed, consistent off-volume checkpoint after publication:
+
+```sh
+uv run --project examples/hackernews python examples/hackernews/ingest.py \
+  --state /data/hackernews --warehouse gs://hackernews-archive-antfly-dev-01/items \
+  --backup-root gs://hackernews-state-antfly-dev-01/ingestion backup
+```
+
+`restore` uses the same arguments and requires an empty state directory. It
+checks file digests/Lite integrity and refuses an older checkpoint if the
+archive has advanced: reconcile the current catalog and source state before
+recovery in that case. Backups are explicit, not automatically scheduled.
+Native serving requires Parquet Iceberg field IDs; the writer emits those IDs
+from the Iceberg schema on every batch. GCS uses application default credentials; GKE uses the dedicated ingestor
+Workload Identity. Keep credentials out of state, image layers and reports.
+
+Run local correctness tests with the existing lake/iceberg E2E environment:
+
+```sh
+uv run --project zig/e2e/antfly --extra lake --extra iceberg pytest -q examples/hackernews/tests
+```
+
+## Native managed or REST catalog
+
+The native table's `base_source.catalog` selects either `{"type":"managed"}`
+or an external REST catalog. Configuration and durability tradeoffs are described
+in [Native Iceberg catalog authorities](../../docs/design/lake-catalogs.md).
+Generate a complete HN table definition with
+`configure_catalog.py --warehouse gs://BUCKET/hackernews --source-connection hn_source --mode managed`.
+For REST, use `--mode rest --rest-connection hn_catalog --rest-uri https://catalog.example.com`
+and optionally set `--rest-namespace`, `--rest-name`, and `--rest-warehouse`.
+POST the resulting JSON to `/db/v1/tables/hackernews`.
+
+Create the Antfly table first with explicit HN document columns,
+`write_policy: iceberg_writer`, a table-root URI and an `auto` schema fingerprint.
+The first native catalog initialization finalizes that fingerprint.
+
+```sh
+uv run --project examples/hackernews python examples/hackernews/ingest.py \
+  --state /private/tmp/hackernews-writer \
+  --warehouse gs://YOUR-DURABLE-BUCKET/hackernews \
+  --native-endpoint http://localhost:8080/db/v1 \
+  --native-table hackernews run
+```
+
+Set `ANTFLY_API_KEY` in the worker environment when API authentication is enabled.
+Both modes use PyIceberg to produce bounded Parquet files and manifests, then
+commit through Antfly. The worker retains exact pending requests in Antfly Lite
+before sending them. A lost response is recovered before another plan is built.
+Native mode does not write `version-hint.text`; the selected native catalog is
+the sole authority. Backup and restore compare its immutable metadata location
+and table UUID, and reject a checkpoint after the archive advances.
+
+Catalog commitment and searchable text/predicate publication are separate
+recoverable steps. Native commits wake the supervised publication worker. The
+`--native-rows` mode below additionally uses Antfly's WAL-to-Parquet writer;
+additional vendor-specific CDC adapters remain extensions of the ingestion design.
+
+Native catalog wire qualification (local S3 protocol fixture and independent
+PyIceberg REST authority, with real manifests/Parquet and daemon restarts):
+
+```sh
+ANTFLY_NATIVE_BINARY=/path/to/antfly ANTFLY_LIBRARY=/path/to/libantfly.dylib \
+  uv run --project examples/hackernews pytest -q examples/hackernews/tests/test_catalog_http.py
+```
+
+Native row ingestion is available with `--native-rows --native-endpoint
+http://localhost:8080/db/v1 --native-table hackernews`. For a continuously
+running producer, also set `--publish-interval 60`; each pass sends a bounded
+transaction instead of replacing affected months. Antfly handles the durable
+WAL, Parquet and Iceberg equality deletes, the configured managed or REST
+catalog commit, and automatic text/predicate index publication. The local
+Antfly Lite state keeps the exact pending request and per-item changes across
+restarts. Acknowledged rows are removed from that queue only if no newer local
+version has replaced them.
+
+The native table must use the generated writable catalog binding and the node
+must configure an independent artifact storage lane. The first publication
+initializes an absent catalog with the HN schema. The producer persists one
+source epoch and chains opaque checkpoints. Switching a pending request to a
+different endpoint/table is rejected. Durable acceptance is distinct from
+search visibility; use catalog coverage and index readiness to observe progress.
+
+## Native recent search and maintenance
+
+Each worker targets one logical table. Separate current/history workers can use
+the fixed creation-time cohorts described below; rolling cutoff migration is
+not automatic. The recent overlay below is bounded pending publication work.
+JSON source composition, SQL/vector visibility and automated maintenance are described in
+[Composed query sources and recent/archive visibility](../../docs/plans/composed-query-sources.md).
+
+`--native-rows` sends complete transactions to Antfly's durable lake WAL. Once a
+baseline text/predicate index is published, native text search also includes the
+accepted WAL suffix while Parquet/catalog/index publication catches up. Stable
+keys hide replaced/deleted archive rows before ranking. The overlay survives
+restart; direct SQL SELECT can opt into accepted WAL visibility. Search cursors
+expire explicitly if their archive/WAL cut changes.
+
+Use the table admin maintenance endpoint for bounded jobs. Dry runs are the
+default; reuse an operation ID to resume the exact operation after interruption.
+Compaction commits automatically wake searchable publication. Compaction now
+resumes large files across bounded turns; repeat the same request until
+`complete: true`. `scanned_rows` counts physical input progress, including deleted
+rows. `conflicted: true` means the parent changed and no rewrite was published;
+start a fresh operation ID so it rereads the current parent.
+
+```sh
+ANTFLY_URL=http://localhost:8080/db/v1
+curl -fsS -X POST "$ANTFLY_URL/tables/hackernews/lake/maintenance" \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"compact","operation_id":"hn-compact-001","dry_run":false}'
+
+curl -fsS -X POST "$ANTFLY_URL/tables/hackernews/lake/maintenance" \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"wal_gc","operation_id":"hn-wal-gc-001","dry_run":false,"max_deleted":128}'
+
+curl -fsS -X POST "$ANTFLY_URL/tables/hackernews/lake/maintenance" \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"vacuum","operation_id":"hn-vacuum-plan-001"}'
+```
+
+File vacuum requires an explicit native-owned storage lifecycle and retention
+agreement for external readers before setting `exclusive_ownership: true` and
+`dry_run: false`. Antfly pins its own active readers and deletes only unreachable
+files with native ownership proofs. External/unmarked files remain untouched.
+The example bucket's eight-day lifecycle is independent of those pins, so it is
+unsuitable for durable deployment. See the
+[design's maintenance contracts](../../docs/plans/lake-ingestion-and-publication.md#compaction-and-garbage-collection)
+for bounds, snapshot retention and restart recovery.
+
+
+## Composed current and historical search
+
+The global query endpoint can combine two existing tables in one result set:
+
+```sh
+curl -fsS -X POST "$ANTFLY_URL/query" -H 'Content-Type: application/json' -d '{
+  "source":{"union":[{"table":"hackernews_current"},{"table":"hackernews_history"}]},
+  "source_ranking":"rrf",
+  "full_text_search":{"match":"distributed databases","field":"body"},
+  "limit":20
+}'
+```
+
+Union preserves both copies of overlapping records and includes `_table` provenance.
+Use disjoint creation-time cohorts, routing edits and deletes to the owning table,
+or explicitly configure `source.overlay` with retained latest rows/tombstones in
+the changes table. Run separate ingestion workers with separate state directories and immutable
+`--created-before CUTOVER_EPOCH` (history) / `--created-after CUTOVER_EPOCH` (current)
+boundaries, together with `--native-rows`, separate `--native-table` values and
+separate warehouse roots. `configure_catalog.py --table-id` gives each source its
+own identity. Both workers retain normalized source rows so partial moderation
+responses preserve original creation time. Missing creation time fails until
+reconciled. Cohort changes on a used state directory are rejected; the worker
+does not provision a rolling date boundary or migrate rows automatically.
+The HTTP fixtures exercise an independent historical/current pair and keyed
+precedence, including a newer nonmatching edit and a retained deleted record.
+
+RRF uses independent visible source ranks, not shared BM25 statistics. Union and
+keyed overlays stream bounded 128-hit source pages; result pages allow up to 4096
+hits without a fixed archive-position horizon. Large overlay totals are lower
+bounds unless `count: true` explicitly streams an exact count. Pass
+`next_source_cursor` as `source_cursor` on the next request. Lake cuts retain the
+same archive publication and accepted WAL images across publication and restart
+for the configured cursor retention period; authorization and incarnation are always rechecked. Read the
+[composition contracts](../../docs/plans/composed-query-sources.md#implemented-contracts)
+before exposing all-time search over a full archive.
+
+Save the logical source once in the native Antfly catalog:
+
+```sh
+curl -fsS -X POST "$ANTFLY_URL/sources/hackernews" \
+  -H 'Content-Type: application/json' -d '{
+    "source":{"union":[{"table":"hackernews_current"},{"table":"hackernews_history"}]}
+  }'
+curl -fsS -X POST "$ANTFLY_URL/query" -H 'Content-Type: application/json' -d '{
+  "source":{"saved":"hackernews"},"source_ranking":"rrf",
+  "full_text_search":{"match":"distributed databases","field":"body"},"limit":20
+}'
+```
+
+Saved definitions are immutable; drop/recreate to change an expression. Reads need
+permission on the saved source and each underlying table. For overlapping edits,
+save an overlay instead and retain tombstones in its changes table.
+
+Direct HTTP SQL SELECT can use `"lake_visibility":"accepted"` to include the
+bounded durable WAL suffix after restart; committed visibility remains the default.
+Search can use `"lake_read":{"visibility":"published"}` to explicitly select a
+published archive, or add a `through` receipt from `/lake/changes` and `wait_ms`
+to require minimum coverage. Accepted vector queries use coherent recent native
+dense/sparse segments; managed text embeddings are computed by a durable retrying background job before Parquet
+publication. Check `{"action":"enrichment_status"}` on the maintenance endpoint
+for the completed WAL cut or retry/error state.
+
+Set the Iceberg string property `antfly.maintenance.policy` to a JSON policy such
+as `{"enabled":true,"compact":true,"wal_gc":true,"vacuum":false}` to enable
+bounded supervised maintenance. Query durable policy/progress with:
+
+```sh
+curl -fsS -X POST "$ANTFLY_URL/tables/hackernews/lake/maintenance" \
+  -H 'Content-Type: application/json' -d '{"action":"status"}'
+```
+
+Scheduling resumes saved operation requests after restart. It retains the existing
+job limits and ownership/reader protections; automatic REST-catalog vacuum remains
+disabled because external metadata writers need a separate retirement protocol.
+
+The generated full-text index consumes the row schema so its declared sortable
+columns have native doc values. Searching with `field: "body"` still restricts
+text matching to that field. A field-specific text index consumes only that field
+and cannot sort by an unrelated column merely because a predicate index exists.
+
+
+### Chunk enrichment and native current-table cursors
+
+The archive and accepted-WAL builders also accept managed embedding indexes with
+`template` and `chunker` configurations. They use Antfly's native multimodal and
+chunking providers and store independently addressable chunk vectors, original
+source units and offsets in the published checkpoint. HN's text fixture remains
+text-only; it does not require a paid media model. Sparse indexes support text
+chunks; media embeddings require a compatible dense provider.
+
+A mutable native current table can participate in the same saved union/overlay
+source. Ordered native queries return a `native2:` `remote_snapshot`; echo it with
+`_sort` as `search_after`/`search_before`. Composed continuation stores each native
+leaf capability automatically. Later writes/deletes and a daemon restart preserve
+that generation until its configured expiry (five minutes by default). Both `primary_lsm` and `vector_store`
+source-vector ownership are supported on filesystem-managed LSM owners. Missing
+authoritative artifacts, expiry or catalog/recipe changes produce a conflict.
+`tests/test_native_cursor_http.py` qualifies mutations and restart against the real
+standalone daemon for both storage settings. Full historical HN deployment and
+archive-scale latency still need operational qualification.
+
+
+### Native snapshot portability qualification
+
+Native ordered queries publish their complete retained document/vector generation
+through the artifact provider before admitting a cursor. Replacement owners can
+restore missing local cuts from filesystem, S3 or GCS artifacts while preserving
+the original query view. Version-2 capabilities retain the original ordered range
+cover; continuation uses one current carrier and separately reads each original
+range once after a split or merge. Version-1 capabilities without the cover require
+a new query. Routing and two-origin storage tests cover this contract; real
+multi-node topology-change qualification remains outstanding.
+Missing authoritative data returns 409. Local cut files
+are a read cache, and credentials can rotate without changing native cursor scope.
+Set `lake_indexes.query_cursors.retention_ms` (default 300000, maximum 3600000),
+`max_native_cuts` (default 64) and `max_native_retained_bytes` (default 64 GiB).
+Shared immutable local extents count once; immutable remote chunks are reused
+across captures. Retention does not renew on pagination.
+
+The native HTTP fixture also supports opt-in qualification through a real GCS
+bucket. Each test uses a fresh prefix and removes its artifacts afterward:
+
+```sh
+ANTFLY_NATIVE_BINARY=/path/to/antfly \
+ANTFLY_NATIVE_CURSOR_GCS_BUCKET=colony-import-sources-antfly-dev-01 \
+  .venv/bin/python -m pytest -q tests/test_native_cursor_http.py
+```
+
+It uses the caller's existing `gcloud` credentials. The token is passed to the
+daemon through its environment and is never written to configuration or results.
+
+`export-full.sql` prepares full-archive search qualification in `antfly-dev-01`.
+The authorized incremental budget is $150; the dry run estimated 19,372,806,880
+bytes. The pinned October 9 export completed with 47,717,307 live story/comment
+rows in 334 Parquet objects (21,195,813,507 compressed bytes). Full-archive index
+and latency qualification and an HN public deployment are still outstanding.
+The first regional full-archive attempt registered the source in 51.7 seconds,
+then repeatedly hit `PoolExhaustedForHost` during publication; both temporary
+pods were stopped. HTTP/1 request admission now waits for released capacity with
+the original request deadline and cancellation, instead of failing immediately
+when lake coverage submits more checks than the per-host pool limit. Full-archive
+qualification must be repeated with that change before reporting capacity or latency.
+For a full archive, use `regional.py --modes indexed --cycles 1` to give the
+metadata-index build its own bounded pod lifetime. Run `--modes text-only` with
+a separate artifact prefix afterward. The default runs both modes in one pod;
+its lifetime must cover both builds and their queries. Single-mode reports mark
+`cross_mode_comparison` false, so they do not establish agreement between modes.
+Use `--cursor-retention-ms 3600000` when archive-scale filter checks need more
+than five minutes before the retained restart-pagination check. Reports include
+the configured retention window.
+The first durable generation's transfer latency and automatic background warming
+must be qualified separately from ordinary unordered search latency.

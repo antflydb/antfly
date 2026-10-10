@@ -260,6 +260,16 @@ jobs:
             scripts/ci/zig_e2e_shard.py \
             scripts/ci/test_zig_e2e_shard.py scripts/ci/merge_e2e_durations.py scripts/ci/summarize_e2e_timings.py scripts/ci/antfly_e2e_durations.json \
             scripts/ci/toolchain-policy.json \
+            ':(glob)go/pkg/embedded/**' \
+            ':(glob)rs/crates/embedded*/**' \
+            rs/Cargo.toml rs/Cargo.lock \
+            ':(glob)py/packages/embedded/**' \
+            ':(glob)ts/packages/embedded*/**' \
+            ts/package.json ts/pnpm-lock.yaml ts/pnpm-workspace.yaml \
+            scripts/ci/test-embedded-sdk-native.sh \
+            scripts/ci/test_embedded_sdk_native.py \
+            scripts/test_pgwire_drivers.py \
+            ':(glob)scripts/pgwire_drivers/**' \
             ':(glob)go/pkg/operator/**' \
             ':(glob)go/pkg/sdk/admin/**' \
             go/pkg/sdk/go.mod \
@@ -1447,6 +1457,136 @@ jobs:
           overwrite: true
           retention-days: 1
 
+      - name: Package native SDK library installation
+        run: tar -C zig/zig-out -czf "${RUNNER_TEMP}/libantfly-e2e-base.tar.gz" lib include
+
+      - name: Upload native SDK library installation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: libantfly-e2e-base-${{ github.run_id }}
+          path: ${{ runner.temp }}/libantfly-e2e-base.tar.gz
+          compression-level: 0
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 1
+
+  embedded-sdk-native:
+    if: >-
+      ${{ always() && !cancelled() && needs.admission.result == 'success' &&
+      (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
+    name: embedded-sdk-native / ${{ matrix.sdk }}
+    needs: [admission, e2e-base-build, e2e-full-build]
+    runs-on: arc-antfly-standard-runtime
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk: [go, rust, python, typescript]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Install native test tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
+      - name: Download native SDK library installation
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: libantfly-e2e-${{ needs.e2e-base-build.result == 'success' && 'base' || 'full' }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/native-sdk-artifact
+      - name: Extract native SDK library installation
+        run: |
+          mkdir -p "${RUNNER_TEMP}/native-sdk"
+          tar -xzf "${RUNNER_TEMP}/native-sdk-artifact/"*.tar.gz -C "${RUNNER_TEMP}/native-sdk"
+      - name: Set up Go
+        if: matrix.sdk == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.toolchain.outputs.go_version }}
+          cache: false
+      - name: Set up Rust
+        if: matrix.sdk == 'rust'
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ steps.toolchain.outputs.rust_version }}
+      - name: Set up Python
+        if: matrix.sdk == 'python'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ steps.toolchain.outputs.python_build }}
+      - name: Set up uv
+        if: matrix.sdk == 'python'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Set up Node
+        if: matrix.sdk == 'typescript'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ts/package.json
+      - name: Set up pnpm
+        if: matrix.sdk == 'typescript'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: ts/package.json
+      - name: Test embedded SDK against the installed C ABI
+        env:
+          ANTFLY_INFERENCE_MODELS_DIR: ${{ runner.temp }}/embedded-sdk-native-models
+        run: scripts/ci/test-embedded-sdk-native.sh "${RUNNER_TEMP}/native-sdk" "${{ matrix.sdk }}"
+
+  pgwire-driver-conformance:
+    if: >-
+      ${{ always() && !cancelled() && needs.admission.result == 'success' &&
+      (needs.e2e-base-build.result == 'success' || needs.e2e-full-build.result == 'success') }}
+    name: pgwire-driver-conformance
+    needs: [admission, e2e-base-build, e2e-full-build]
+    runs-on: arc-antfly-standard-runtime
+    timeout-minutes: 30
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.head_sha || github.sha }}
+          persist-credentials: false
+      - name: Load pinned toolchain policy
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - name: Install driver build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
+      - name: Download candidate E2E executable
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: antfly-e2e-${{ needs.e2e-base-build.result == 'success' && 'base' || 'full' }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/pgwire-driver-artifact
+      - name: Install candidate E2E executable
+        run: tar -xzf "${RUNNER_TEMP}/pgwire-driver-artifact/"*.tar.gz -C zig
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ steps.toolchain.outputs.go_version }}
+          cache: false
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ts/package.json
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ steps.toolchain.outputs.rust_version }}
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ steps.toolchain.outputs.python_build }}
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - name: Test standard PostgreSQL drivers against candidate runtime
+        run: >-
+          uv run --no-project --with requests --with pytest
+          --with 'psycopg[binary]==3.3.6' --with asyncpg==0.31.0
+          python scripts/test_pgwire_drivers.py --binary zig/zig-out/bin/antfly
+
   e2e-base-plan:
     if: >-
       ${{ !cancelled() && success() && !inputs.full_validation && needs.admission.result == 'success' &&
@@ -1833,7 +1973,7 @@ jobs:
       inputs.pr_number != '' &&
       needs.changes.outputs.e2e == 'true') }}
     name: e2e-base
-    needs: [admission, changes, e2e-base-build, e2e-base-plan, e2e-base-tests, e2e-base-low-fd]
+    needs: [admission, changes, e2e-base-build, e2e-base-plan, e2e-base-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]
     runs-on: arc-antfly-standard-runtime
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -1846,12 +1986,16 @@ jobs:
           TEST_RESULT: ${{ needs.e2e-base-tests.result }}
           PLAN_RESULT: ${{ needs.e2e-base-plan.result }}
           LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}
+          NATIVE_SDK_RESULT: ${{ needs.embedded-sdk-native.result }}
+          PGWIRE_DRIVER_RESULT: ${{ needs.pgwire-driver-conformance.result }}
         run: |
           set -euo pipefail
           test "$BUILD_RESULT" = "success"
           test "$TEST_RESULT" = "success"
           test "$PLAN_RESULT" = "success"
           test "$LOW_FD_RESULT" = "success"
+          test "$NATIVE_SDK_RESULT" = "success"
+          test "$PGWIRE_DRIVER_RESULT" = "success"
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
@@ -1898,6 +2042,7 @@ jobs:
       # Match release artifact symbol handling without disabling safe
       # checks or std.debug.assert invariants.
       ANTFLY_CI_ZIG_STRIP: "true"
+      ANTFLY_CI_BUILD_CAPI: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1941,6 +2086,19 @@ jobs:
           path: ${{ runner.temp }}/antfly-e2e-full.tar.gz
           compression-level: 0
           overwrite: true
+          retention-days: 1
+
+      - name: Package native SDK library installation
+        run: tar -C zig/zig-out -czf "${RUNNER_TEMP}/libantfly-e2e-full.tar.gz" lib include
+
+      - name: Upload native SDK library installation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: libantfly-e2e-full-${{ github.run_id }}
+          path: ${{ runner.temp }}/libantfly-e2e-full.tar.gz
+          compression-level: 0
+          overwrite: true
+          if-no-files-found: error
           retention-days: 1
 
   e2e-full-tests:
@@ -2179,7 +2337,7 @@ jobs:
       github.event_name == 'workflow_dispatch') ||
       github.event.schedule == '0 8 * * *')) }}
     name: e2e-full
-    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-full-tests, e2e-base-low-fd]
+    needs: [admission, changes, e2e-base-build, e2e-full-build, e2e-full-tests, e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]
     runs-on: arc-antfly-standard-runtime
     steps:
       - name: Verify full E2E suites
@@ -2187,11 +2345,15 @@ jobs:
           BUILD_RESULT: ${{ inputs.full_validation && needs.e2e-base-build.result || needs.e2e-full-build.result }}
           TEST_RESULT: ${{ needs.e2e-full-tests.result }}
           LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}
+          NATIVE_SDK_RESULT: ${{ needs.embedded-sdk-native.result }}
+          PGWIRE_DRIVER_RESULT: ${{ needs.pgwire-driver-conformance.result }}
           REQUIRE_LOW_FD: ${{ inputs.full_validation && inputs.pr_number != '' }}
         run: |
           set -euo pipefail
           test "$BUILD_RESULT" = "success"
           test "$TEST_RESULT" = "success"
+          test "$NATIVE_SDK_RESULT" = "success"
+          test "$PGWIRE_DRIVER_RESULT" = "success"
           if [[ "$REQUIRE_LOW_FD" == "true" ]]; then
             test "$LOW_FD_RESULT" = "success"
           fi

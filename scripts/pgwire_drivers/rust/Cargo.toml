@@ -1,0 +1,8 @@
+[package]
+name = "antfly-pgwire-driver-test"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+[dependencies]
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "postgres"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

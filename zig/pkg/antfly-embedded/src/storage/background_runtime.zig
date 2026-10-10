@@ -965,6 +965,8 @@ const OwnerRegistry = struct {
 
 pub const BackendRuntime = struct {
     runnable_owner_lease: ?runnable_abi.Lease = null,
+    /// Borrowed until every physical owner and retained reader has closed.
+    query_cut_repository: ?@import("db/native_query_cut_repository.zig").Port = null,
     alloc: Allocator,
     backend: Backend,
     lane_limits: threaded_io_limits.BackendRuntimeLaneLimits,

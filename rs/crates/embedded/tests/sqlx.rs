@@ -29,6 +29,10 @@ use sqlx_core::{
 
 #[test]
 fn sqlx_conformance_and_streaming() {
+    run_with_stack(sqlx_conformance_and_streaming_on_native_stack);
+}
+
+fn sqlx_conformance_and_streaming_on_native_stack() {
     let directory = std::env::temp_dir().join(format!(
         "antfly-sqlx-{}-{}",
         std::process::id(),
@@ -236,6 +240,10 @@ fn sqlx_conformance_and_streaming() {
 
 #[test]
 fn sqlx_pool_uses_independent_native_connections() {
+    run_with_stack(sqlx_pool_uses_independent_native_connections_on_native_stack);
+}
+
+fn sqlx_pool_uses_independent_native_connections_on_native_stack() {
     let directory = std::env::temp_dir().join(format!(
         "antfly-sqlx-pool-{}-{}",
         std::process::id(),
@@ -300,6 +308,10 @@ fn sqlx_pool_uses_independent_native_connections() {
 
 #[test]
 fn sqlx_shares_an_open_database_with_the_document_api() {
+    run_with_stack(sqlx_shares_an_open_database_with_the_document_api_on_native_stack);
+}
+
+fn sqlx_shares_an_open_database_with_the_document_api_on_native_stack() {
     let directory = std::env::temp_dir().join(format!(
         "antfly-sqlx-shared-{}-{}",
         std::process::id(),
@@ -383,6 +395,10 @@ fn sqlx_shares_an_open_database_with_the_document_api() {
 
 #[test]
 fn sqlx_external_commit_and_document_read_close_inference_promptly() {
+    run_with_stack(sqlx_external_commit_and_document_read_close_inference_promptly_on_native_stack);
+}
+
+fn sqlx_external_commit_and_document_read_close_inference_promptly_on_native_stack() {
     fn on_executor<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
         std::thread::Builder::new()
             .stack_size(antfly_embedded::MIN_THREAD_STACK_SIZE)
@@ -452,4 +468,13 @@ fn sqlx_external_commit_and_document_read_close_inference_promptly() {
     });
     drop(runtime);
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+fn run_with_stack<F: FnOnce() + Send + 'static>(task: F) {
+    std::thread::Builder::new()
+        .stack_size(antfly_embedded::MIN_THREAD_STACK_SIZE)
+        .spawn(task)
+        .expect("spawn native test thread")
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
 }
