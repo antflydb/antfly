@@ -1042,3 +1042,21 @@ Physical fixtures require that detaching a stalled callback does not admit a
 replacement, that capacity becomes reusable only after its join, and that task
 and registry allocation failures restore the reservation without leaks. A
 runtime fixture verifies the birth configuration is actually applied.
+
+
+### Fanout CPU accounting under protected control
+
+Scheduler `runnable_slots` includes ordinary and protected control grants.
+Hosted fanout checks ordinary occupancy after subtracting `control_slots`,
+while checking protected occupancy against its own configured reserve. A
+peer's protected callback may overlap this child's ordinary grant at C1.
+The previous total-versus-ordinary assertion rejected that valid overlap.
+
+A deterministic production capsule/transport-boundary fixture reserves both
+children before parking the coordinator, parks one child, then holds protected
+control while the second owns the sole ordinary CPU. It restores each child's
+original query phase without retiring the result capsules, checks unchanged
+retained bytes including capsule metadata, and retires both before restoring
+the coordinator. The actual hosted-table-read fixture remains subject to the
+cumulative independently compiled consumer gate. This fixture correction does
+not qualify default pooling or the wider overload/performance matrix.

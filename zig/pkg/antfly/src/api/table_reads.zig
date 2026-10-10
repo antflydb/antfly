@@ -17697,7 +17697,10 @@ fn consumerTests() type {
                         const stats = scheduler.stats();
                         const fanout = self.phase != .algebraic;
                         try std.testing.expect(stats.operations >= @as(usize, if (fanout) 3 else 1));
-                        try std.testing.expect(stats.runnable_slots <= scheduler.config.slots - scheduler.config.control_slots);
+                        // Other workers may use protected control while this
+                        // child owns ordinary CPU. Stats includes both lanes.
+                        try std.testing.expect(stats.control_slots <= scheduler.config.control_slots);
+                        try std.testing.expect(stats.runnable_slots - stats.control_slots <= scheduler.config.slots - scheduler.config.control_slots);
                         if (fanout) try std.testing.expect(stats.resource_blocked >= 1);
                         const wait = req.execution_wait orelse return error.TestUnexpectedResult;
                         try wait.beginWait();

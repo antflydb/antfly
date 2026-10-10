@@ -368,3 +368,67 @@ test "owner transition sleep releases CPU and preserves original authority befor
         try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     };
 }
+
+test "remote wait restores the original request phase with overlapping protected control" {
+    const native = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+    const io = std.testing.io;
+    var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer scheduler.close();
+    var root: native.Execution = .{};
+    defer root.finish();
+    try root.start(&scheduler, .{ .io = io, .retained_bytes = 23 }, .query);
+    var read = @import("runnable_local_read.zig").Read{ .execution = &root, .allocator = std.testing.allocator };
+    const team = try read.team();
+    var children: [2]Owner = @splat(.{});
+    defer for (&children) |*child| child.retire();
+    try children[0].reserve(team.borrow, io, 5);
+    try children[1].reserve(team.borrow, io, 11);
+    const retained_fanout_bytes = scheduler.stats().retained_bytes;
+    try std.testing.expect(retained_fanout_bytes >= 23 + 5 + 11);
+    const phase = try parkCoordinator(team.borrow);
+    var first = RemoteWait{ .borrow = try children[0].activate() };
+    const first_wait = first.boundary().?;
+    try first_wait.beginWait();
+    var second = RemoteWait{ .borrow = try children[1].activate() };
+    const second_wait = second.boundary().?;
+    var control: native.Execution = .{};
+    defer control.finish();
+    try control.start(&scheduler, .{ .io = io, .retained_bytes = 7, .allow_wait = false }, .control);
+    try control.checkpoint();
+
+    // Force the grant overlap that can occur between two real transport
+    // callbacks. One ordinary CPU and one control CPU are both legal at C1.
+    const overlap = scheduler.stats();
+    try std.testing.expectEqual(@as(usize, 4), overlap.operations);
+    try std.testing.expectEqual(@as(usize, 2), overlap.child_operations);
+    try std.testing.expectEqual(retained_fanout_bytes + 7, overlap.retained_bytes);
+    try std.testing.expectEqual(@as(usize, 2), overlap.runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), overlap.control_slots);
+    try std.testing.expectEqual(@as(usize, 1), overlap.runnable_slots - overlap.control_slots);
+    try std.testing.expect(overlap.runnable_slots - overlap.control_slots <= scheduler.config.slots - scheduler.config.control_slots);
+    try std.testing.expectEqual(@as(usize, 2), overlap.resource_blocked);
+
+    try second_wait.beginWait();
+    try first_wait.endWait();
+    const resumed = scheduler.stats();
+    try std.testing.expectEqual(@as(usize, 2), resumed.runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), resumed.control_slots);
+    try std.testing.expectEqual(@as(usize, 2), resumed.resource_blocked);
+    try std.testing.expectEqual(abi.Class.query, try first.borrow.?.currentClass());
+    children[0].park();
+    try second_wait.endWait();
+    try std.testing.expectEqual(abi.Class.query, try second.borrow.?.currentClass());
+    children[1].park();
+    control.finish();
+    // Result capsules remain charged through joining, even after their CPU
+    // and transport work complete. Retire only after the coordinator joins.
+    try std.testing.expectEqual(@as(usize, 3), scheduler.stats().operations);
+    try std.testing.expectEqual(retained_fanout_bytes, scheduler.stats().retained_bytes);
+    for (&children) |*child| child.retire();
+    try resumeCoordinator(team.borrow, phase);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+    root.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
