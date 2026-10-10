@@ -96,11 +96,22 @@ pub const Client = struct {
     }
 
     pub fn getObject(self: *Client, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
-        if (opts.cancellation) |token| try token.check();
-        var result = try self.vtable.get_object(self.ptr, self.allocator, bucket, key, opts);
-        errdefer result.deinit(self.allocator);
-        if (opts.cancellation) |token| try token.check();
-        return result;
+        // Providers may pin GET to an ETag obtained by their metadata probe.
+        // Mutable catalog/WAL heads can change between those requests. A fresh
+        // probe is safe only when the caller did not bind an object version;
+        // explicit snapshot conditions must never be weakened by a retry.
+        var attempts: usize = 0;
+        while (true) {
+            if (opts.cancellation) |token| try token.check();
+            var result = self.vtable.get_object(self.ptr, self.allocator, bucket, key, opts) catch |err| {
+                attempts += 1;
+                if (err == error.PreconditionFailed and opts.version_id == null and opts.if_match_etag == null and attempts < 4) continue;
+                return err;
+            };
+            errdefer result.deinit(self.allocator);
+            if (opts.cancellation) |token| try token.check();
+            return result;
+        }
     }
 
     pub fn getFile(self: *Client, bucket: []const u8, key: []const u8, dest_path: []const u8, opts: types.GetOptions) !void {
@@ -247,6 +258,52 @@ pub fn readPositionalAllWithCancellation(
         copied += chunk_len;
     }
     if (cancellation) |token| try token.check();
+}
+
+test "objectstore unpinned reads retry metadata races but preserve explicit versions and cancellation" {
+    const a = std.testing.allocator;
+    var memory = @import("memory.zig").MemoryClient.init(a);
+    defer memory.deinit();
+    var base = memory.client();
+    try base.makeBucket("test");
+    var written = try base.putObject("test", "head", "latest", .{});
+    defer written.deinit(a);
+    const Probe = struct {
+        base: *Client,
+        calls: usize = 0,
+        failures: usize = 1,
+        fn read(raw: *anyopaque, _: Allocator, bucket: []const u8, key: []const u8, opts: types.GetOptions) !types.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls <= self.failures) return error.PreconditionFailed;
+            return self.base.getObject(bucket, key, opts);
+        }
+        fn cancelled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.calls != 0;
+        }
+    };
+    var probe = Probe{ .base = &base };
+    var vtable = base.vtable.*;
+    vtable.get_object = Probe.read;
+    var client = Client{ .allocator = a, .ptr = &probe, .vtable = &vtable };
+    var read = try client.getObject("test", "head", .{});
+    defer read.deinit(a);
+    try std.testing.expectEqualStrings("latest", read.body);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    probe.calls = 0;
+    try std.testing.expectError(error.PreconditionFailed, client.getObject("test", "head", .{ .if_match_etag = written.etag }));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    probe.calls = 0;
+    try std.testing.expectError(error.PreconditionFailed, client.getObject("test", "head", .{ .version_id = "pinned" }));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    probe.calls = 0;
+    probe.failures = 10;
+    try std.testing.expectError(error.PreconditionFailed, client.getObject("test", "head", .{}));
+    try std.testing.expectEqual(@as(usize, 4), probe.calls);
+    probe.calls = 0;
+    try std.testing.expectError(error.Canceled, client.getObject("test", "head", .{ .cancellation = .{ .ptr = &probe, .is_cancelled_fn = Probe.cancelled } }));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
 }
 
 test "objectstore file reads observe cancellation between bounded chunks" {

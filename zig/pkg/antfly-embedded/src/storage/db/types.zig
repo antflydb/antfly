@@ -1852,6 +1852,12 @@ pub const SearchRequest = struct {
     index_name: ?[]const u8 = null,
     primary_text_index_name: ?[]const u8 = null,
     remote_snapshot: ?[]const u8 = null,
+    /// Borrowed, trusted coordinator control; never accepted from public JSON.
+    native_query_cut: ?@import("native_query_cut_contract.zig").Request = null,
+    lake_read: ?struct {
+        visibility: enum { accepted, published } = .accepted,
+        through: ?struct { table_id: u64, object_generation: u64, wal_lsn: u64 } = null,
+    } = null,
     aggregations_json: []const u8 = "",
     count_only: bool = false,
     profile: bool = false,
@@ -1997,6 +2003,7 @@ const hierarchy_children_validated_fields = [_][]const u8{
 const hierarchy_children_supported_internal_fields = [_][]const u8{
     "response_table_name",
     "prepared_read_table_id",
+    "native_query_cut",
     "document_lookup_groups",
     "filter_query_json",
     "exclusion_query_json",
@@ -2028,6 +2035,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "index_name",
     "primary_text_index_name",
     "remote_snapshot",
+    "lake_read",
     "aggregations_json",
     "count_only",
     "profile",
@@ -2842,6 +2850,10 @@ pub const SearchResult = struct {
     hits: []SearchHit,
     total_hits: u32,
     total_hits_relation: TotalHitsRelation = .exact,
+    /// Trusted in-process proof that the native exact sorter exhausted this
+    /// cursor window or filled its requested limit. Corpus totals alone cannot
+    /// prove exhaustion after search_after/search_before. Not a public wire flag.
+    ordered_window_complete: bool = false,
     identity_read_generation: ?u64 = null,
     /// Snapshot vector for a distributed result. Shard generations are
     /// independent, so a multi-shard replay must use these tokens rather than

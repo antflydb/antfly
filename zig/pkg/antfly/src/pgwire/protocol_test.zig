@@ -20,6 +20,8 @@ const backend = @import("backend.zig");
 const Mock = struct {
     describes: usize = 0,
     executions: usize = 0,
+    lake_log: [32]@import("session_commands.zig").LakeVisibility = undefined,
+    lake_count: usize = 0,
     authentications: usize = 0,
     disconnects: usize = 0,
     releases: usize = 0,
@@ -35,6 +37,7 @@ const Mock = struct {
     unknown_outcome: bool = false,
     mutation_outcome: ?backend.MutationOutcome = null,
     owned_results: bool = false,
+    nested_owned_results: bool = false,
     result_releases: usize = 0,
     saw_binding_guard: bool = false,
     seen_parameter: ?i64 = null,
@@ -112,6 +115,8 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         if (std.mem.indexOf(u8, request.statement, "application_name") != null or std.mem.indexOf(u8, request.statement, "client_encoding") != null) self.setting_stream_opens += 1;
         if (self.stream_rows == 0 or !std.mem.startsWith(u8, std.mem.trimStart(u8, request.statement, " \t\r\n"), "SELECT")) return null;
+        self.lake_log[self.lake_count] = request.lake_visibility;
+        self.lake_count += 1;
         if (self.expected_stream_statement) |expected| try std.testing.expectEqualStrings(expected, request.statement);
         try request.check();
         if (request.parameters.len > 0) self.seen_parameter = request.parameters[0].integer;
@@ -193,6 +198,10 @@ const Mock = struct {
         self.observed_setting = if (request.setting_overlay.len == 0) null else request.setting_overlay[0].value.integer;
         self.observed_setting_epoch = request.setting_epoch;
         self.executions += 1;
+        if (std.mem.startsWith(u8, request.statement, "SELECT")) {
+            self.lake_log[self.lake_count] = request.lake_visibility;
+            self.lake_count += 1;
+        }
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "begin")) return .{ .command_tag = "BEGIN", .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "commit")) {
             if (self.unknown_commit) {
@@ -269,6 +278,13 @@ const Mock = struct {
             } else self.seen_parameter = request.parameters[0].integer;
         }
         if (self.expected_result_tag) |tag| return .{ .command_tag = tag, .mutation_outcome = .committed };
+        if (self.nested_owned_results) {
+            const owner = try alloc.create(NestedResult);
+            owner.* = .{ .arena = std.heap.ArenaAllocator.init(alloc), .mock = self };
+            const a = owner.arena.allocator();
+            const row = try a.dupe(std.json.Value, &.{.{ .integer = 1 }});
+            return .{ .columns = &.{.{ .name = "n", .type = .integer }}, .rows = try a.dupe([]const std.json.Value, &.{row}), .command_tag = "SELECT 1", .transaction_status = .in_transaction, .session_id = request.session_id, .owner = .{ .context = owner, .release = NestedResult.release } };
+        }
         const rows = try alloc.alloc([]const std.json.Value, 2);
         rows[0] = try alloc.dupe(std.json.Value, &.{.{ .integer = self.seen_parameter orelse 9007199254740993 }});
         rows[1] = try alloc.dupe(std.json.Value, &.{.{ .integer = 2 }});
@@ -284,6 +300,17 @@ const Mock = struct {
             .owner = if (self.owned_results) .{ .context = self, .release = releaseResult } else null,
         };
     }
+    const NestedResult = struct {
+        arena: std.heap.ArenaAllocator,
+        mock: *Mock,
+        fn release(raw: *anyopaque) void {
+            const self: *NestedResult = @ptrCast(@alignCast(raw));
+            const backing = self.arena.child_allocator;
+            self.mock.result_releases += 1;
+            self.arena.deinit();
+            backing.destroy(self);
+        }
+    };
     fn resultCell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) !backend.Cell {
         const self: *Mock = @ptrCast(@alignCast(raw));
         std.debug.assert(row < 2 and column == 0);
@@ -2063,4 +2090,165 @@ test "pgwire separate cancel authenticates secret and works at connection capaci
     defer std.testing.allocator.free(payload);
     try std.testing.expect(std.mem.indexOf(u8, payload, "57014") != null);
     try std.testing.expect(mock.canceled.load(.acquire));
+}
+
+test "pgwire accepted lake visibility follows transaction savepoint and prepared execution scope" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SET antfly.lake_visibility = accepted\x00",        "SELECT n FROM t\x00",
+        "BEGIN\x00",                                        "SAVEPOINT saved\x00",
+        "SET LOCAL antfly.lake_visibility = committed\x00", "SELECT n FROM t\x00",
+        "ROLLBACK TO saved\x00",                            "SELECT n FROM t\x00",
+        "COMMIT\x00",                                       "RESET antfly.lake_visibility\x00",
+        "SELECT n FROM t\x00",                              "BEGIN\x00",
+        "SET antfly.lake_visibility = accepted\x00",        "ROLLBACK\x00",
+        "SELECT n FROM t\x00",                              "SET antfly.lake_visibility = accepted\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try parse(&input.writer, "pinned", "SELECT n FROM t", false);
+    try bind(&input.writer, "portal", "pinned", null);
+    try execute(&input.writer, "portal", 0);
+    try frame(&input.writer, 'X', "");
+    for ([_]usize{ 0, 5 }) |stream_rows| {
+        var mock: Mock = .{ .stream_rows = stream_rows };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') == null);
+        const expected: []const @import("session_commands.zig").LakeVisibility = &.{ .accepted, .committed, .accepted, .committed, .committed, .accepted };
+        try std.testing.expectEqualSlices(@import("session_commands.zig").LakeVisibility, expected, mock.lake_log[0..mock.lake_count]);
+    }
+}
+
+fn startupOptions(out: *std.Io.Writer, options: []const u8) !void {
+    const prefix = "user\x00tester\x00database\x00db\x00";
+    try out.writeInt(u32, @intCast(prefix.len + options.len + 9), .big);
+    try out.writeInt(u32, 196608, .big);
+    try out.writeAll(prefix);
+    try out.writeAll(options);
+    try out.writeByte(0);
+    try frame(out, 'p', "secret\x00");
+}
+
+test "pgwire standard driver startup and simple extended SHOW share effective formatting" {
+    for ([_][]const u8{
+        "DateStyle\x00ISO, MDY\x00TimeZone\x00UTC\x00extra_float_digits\x003\x00client_encoding\x00UTF8\x00",
+        "DateStyle\x00ISO\x00TimeZone\x00Etc/UTC\x00extra_float_digits\x003\x00application_name\x00PostgreSQL JDBC Driver\x00",
+        "client_encoding\x00'utf-8'\x00datestyle\x00ISO, DMY\x00timezone\x00GMT\x00extra_float_digits\x00-15\x00IntervalStyle\x00postgres\x00standard_conforming_strings\x00on\x00",
+    }) |options| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, options);
+        try frame(&input.writer, 'Q', "SET extra_float_digits = 2\x00");
+        try frame(&input.writer, 'Q', "SHOW DateStyle\x00");
+        try frame(&input.writer, 'Q', "SHOW TimeZone\x00");
+        try parse(&input.writer, "format", "SHOW extra_float_digits", false);
+        try bind(&input.writer, "format_portal", "format", null);
+        try execute(&input.writer, "format_portal", 0);
+        try frame(&input.writer, 'S', "");
+        try frame(&input.writer, 'X', "");
+        var mock: Mock = .{};
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        var cursor: protocol.Cursor = .{ .bytes = output.written() };
+        var rows: usize = 0;
+        var statuses: usize = 0;
+        const expected = [_][]const u8{ "ISO, MDY", "UTC", "3" };
+        while (cursor.offset < cursor.bytes.len) {
+            const tag = try cursor.int(u8);
+            const length = try cursor.int(u32);
+            var payload: protocol.Cursor = .{ .bytes = try cursor.take(length - 4) };
+            try std.testing.expect(tag != 'E');
+            if (tag == 'S') {
+                const name = try payload.string();
+                const value = try payload.string();
+                if (@import("formatting.zig").lookup(name)) |setting| {
+                    try std.testing.expectEqualStrings(setting.value(), value);
+                    statuses += 1;
+                }
+            } else if (tag == 'D') {
+                try std.testing.expectEqual(@as(u16, 1), try payload.int(u16));
+                const n = try payload.int(u32);
+                try std.testing.expect(rows < expected.len);
+                try std.testing.expectEqualStrings(expected[rows], try payload.take(n));
+                rows += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 5), statuses);
+        try std.testing.expectEqual(@as(usize, 3), rows);
+        try std.testing.expectEqual(@as(usize, 0), mock.executions);
+        try std.testing.expectEqual(@as(usize, 0), mock.describes);
+    }
+}
+
+test "pgwire unsupported startup diagnostics name parameters before authentication" {
+    for ([_]struct { options: []const u8, name: []const u8, err: anyerror }{
+        .{ .options = "DateStyle\x00SQL\x00", .name = "DateStyle", .err = error.UnsupportedFormattingSetting },
+        .{ .options = "TimeZone\x00America/New_York\x00", .name = "TimeZone", .err = error.UnsupportedFormattingSetting },
+        .{ .options = "extra_float_digits\x004\x00", .name = "extra_float_digits", .err = error.UnsupportedFormattingSetting },
+        .{ .options = "options\x00-c search_path=secret\x00", .name = "options", .err = error.UnsupportedStartupOption },
+        .{ .options = "role\x00admin\x00", .name = "role", .err = error.UnsupportedStartupOption },
+        .{ .options = "search_path\x00secret\x00", .name = "search_path", .err = error.UnsupportedStartupOption },
+    }) |case| {
+        var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer input.deinit();
+        try startupOptions(&input.writer, case.options);
+        var reader = std.Io.Reader.fixed(input.written());
+        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        var mock: Mock = .{};
+        var session: protocol.Session = .{ .alloc = std.testing.allocator, .io = std.testing.io, .source = mock.source(), .reader = &reader, .writer = &output.writer };
+        defer session.deinit();
+        try std.testing.expectError(case.err, session.run());
+        try std.testing.expectEqual(@as(usize, 0), mock.authentications);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), "0A000") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output.written(), case.name) != null);
+    }
+}
+
+test "pgwire retained native result allocator survives portal growth removal and replacement" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "BEGIN\x00");
+    try parse(&input.writer, "q", "SELECT 1", false);
+    for (0..12) |i| {
+        var name_buffer: [16]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "p{d}", .{i});
+        try bind(&input.writer, name, "q", null);
+        try execute(&input.writer, name, 0);
+    }
+    try frame(&input.writer, 'C', "Pp0\x00");
+    try bind(&input.writer, "", "q", null);
+    try execute(&input.writer, "", 0);
+    try bind(&input.writer, "", "q", null);
+    try execute(&input.writer, "", 0);
+    try frame(&input.writer, 'Q', "COMMIT\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{ .nested_owned_results = true };
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    try std.testing.expectEqual(@as(usize, 14), mock.result_releases);
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') == null);
+}
+
+test "pgwire driver comment-only ping returns EmptyQueryResponse without backend execution" {
+    var input: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    try frame(&input.writer, 'Q', "-- ping\x00");
+    try frame(&input.writer, 'Q', "/* outer /* nested */ */;\x00");
+    try frame(&input.writer, 'X', "");
+    var mock: Mock = .{};
+    var output = try run(&mock, input.written(), .{});
+    defer output.deinit();
+    const observed = try tags(std.testing.allocator, output.written());
+    defer std.testing.allocator.free(observed);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, observed, "I"));
+    try std.testing.expectEqual(@as(usize, 0), mock.executions);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, observed, "E"));
 }

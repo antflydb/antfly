@@ -116,11 +116,16 @@ pub const Binding = struct {
     schema_fingerprint: []const u8,
     write_policy: WritePolicy = .read_only,
     object_mutability: ObjectMutability = .mutable,
+    catalog: ?@import("lake_catalog/types.zig").Config = null,
 
     pub fn validate(self: Binding) !void {
         if (self.table_id.len == 0) return error.InvalidExternalTableBinding;
         if (self.source_uri.len == 0) return error.InvalidExternalTableBinding;
         if (self.schema_fingerprint.len == 0) return error.InvalidExternalTableBinding;
+        if (self.catalog) |catalog| {
+            try catalog.validate();
+            if (self.format != .iceberg or std.mem.endsWith(u8, self.source_uri, ".metadata.json")) return error.InvalidLakeCatalog;
+        }
         if (self.credential_ref) |credential| {
             try credential.validate();
             if (credential.scope.len != 0) {
@@ -136,6 +141,12 @@ pub const Binding = struct {
     pub fn validateReadOnlyMvp(self: Binding) !void {
         try self.validate();
         if (self.write_policy != .read_only) return error.UnsupportedExternalTableWritePolicy;
+    }
+
+    pub fn validateSupported(self: Binding) !void {
+        try self.validate();
+        if (self.write_policy == .read_only) return;
+        if (self.write_policy != .iceberg_writer or self.catalog == null or self.snapshot_mode != .current) return error.UnsupportedExternalTableWritePolicy;
     }
 
     pub fn rowSourceKind(self: Binding) rowsource.SourceKind {

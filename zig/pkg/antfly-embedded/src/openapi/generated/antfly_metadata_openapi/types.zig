@@ -2634,6 +2634,90 @@ pub const CommittedMutationOutcome = struct {
     status: []const u8,
 };
 
+/// Specify exactly one of saved, union or overlay. Union preserves duplicates and table provenance. Overlay suppresses replaced base keys and tombstones before ranking using indexed unfiltered change lookups. Inputs are streamed in bounded pages; result pages allow at most 4096 hits. Large overlay totals are lower bounds unless count is explicitly requested; exact count streams the full visible relation within the request deadline.
+pub const ComposedQuerySource = struct {
+    /// Immutable source name from the Antfly catalog. Saved definitions contain literal table leaves, preventing recursive expansion.
+    saved: ?[]const u8 = null,
+    @"union": ?[]const ComposedTableSource = null,
+    overlay: ?ComposedSourceOverlay = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "saved", "saved", true },
+        .{ "union", "union", true },
+        .{ "overlay", "overlay", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.saved) |value| {
+            try jw.objectField("saved");
+            try jw.write(value);
+        }
+        if (self.@"union") |value| {
+            try jw.objectField("union");
+            try jw.write(value);
+        }
+        if (self.overlay) |value| {
+            try jw.objectField("overlay");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ComposedSourceOverlay = struct {
+    base: ComposedTableSource,
+    changes: ComposedTableSource,
+    key: []const []const u8,
+    /// Boolean field on change rows; true hides the base row. Changes must retain one latest row/tombstone per stable key. Row-policy identities are currently unsupported for keyed composition.
+    tombstone_field: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "base", "base", false },
+        .{ "changes", "changes", false },
+        .{ "key", "key", false },
+        .{ "tombstone_field", "tombstone_field", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("base");
+        try jw.write(self.base);
+        try jw.objectField("changes");
+        try jw.write(self.changes);
+        try jw.objectField("key");
+        try jw.write(self.key);
+        if (self.tombstone_field) |value| {
+            try jw.objectField("tombstone_field");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ComposedTableSource = struct {
+    /// Literal native table name. Each source is independently authorized.
+    table: []const u8,
+};
+
 pub const ConnectedModel = struct {
     /// Model identifier as reported by the provider.
     name: []const u8,
@@ -4270,9 +4354,10 @@ pub const ForeignSource = struct {
     }
 };
 
-/// A stateful global query. The target table is required on this route.
+/// A stateful global query. Specify a table target or a composed source.
 pub const GlobalStatefulQueryRequest = struct {
-    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    lake_read: ?LakeReadRequirement = null,
+    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
     remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
@@ -4349,13 +4434,19 @@ pub const GlobalStatefulQueryRequest = struct {
     graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.LegacyGraphQuery) = null,
     /// Deprecated compatibility behavior for `graph_searches`. Canonical `graph_queries` return independently typed, potentially table-qualified identities and cannot be combined with this field. Strategy for merging legacy graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
     expand_strategy: ?[]const u8 = null,
+    source: ?ComposedQuerySource = null,
+    /// Explicit reciprocal rank scoring across source lists after visibility resolution. Required for score ordering; shared corpus BM25 is not implemented. Constant 60, equal source weights.
+    source_ranking: ?[]const u8 = null,
+    /// Opaque composed continuation retaining per-leaf native generations or archive publications and accepted WAL cuts for the configured retention period from their creation (default five minutes; maximum one hour). Publication and restart preserve the cut. Authorization, policy, recipe, source and table incarnation changes invalidate it. Leaf search_after/search_before tuples are unsupported.
+    source_cursor: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
-        .{ "table", "table", false },
+        .{ "table", "table", true },
         .{ "query", "query", true },
         .{ "full_text_search", "full_text_search", true },
         .{ "full_text_index", "full_text_index", true },
@@ -4393,6 +4484,9 @@ pub const GlobalStatefulQueryRequest = struct {
         .{ "foreign_sources", "foreign_sources", true },
         .{ "graph_searches", "graph_searches", true },
         .{ "expand_strategy", "expand_strategy", true },
+        .{ "source", "source", true },
+        .{ "source_ranking", "source_ranking", true },
+        .{ "source_cursor", "source_cursor", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -4405,6 +4499,10 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.lake_read) |value| {
+            try jw.objectField("lake_read");
+            try jw.write(value);
+        }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
             try jw.write(value);
@@ -4417,8 +4515,10 @@ pub const GlobalStatefulQueryRequest = struct {
             try jw.objectField("table_target");
             try jw.write(value);
         }
-        try jw.objectField("table");
-        try jw.write(self.table);
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
         if (self.query) |value| {
             try jw.objectField("query");
             try jw.write(value);
@@ -4583,6 +4683,18 @@ pub const GlobalStatefulQueryRequest = struct {
         }
         if (self.expand_strategy) |value| {
             try jw.objectField("expand_strategy");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.source_ranking) |value| {
+            try jw.objectField("source_ranking");
+            try jw.write(value);
+        }
+        if (self.source_cursor) |value| {
+            try jw.objectField("source_cursor");
             try jw.write(value);
         }
         try jw.endObject();
@@ -5983,6 +6095,172 @@ pub const KeyRange = struct {
         }
         if (self.to) |value| {
             try jw.objectField("to");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const LakeCatalogCommitRequest = struct {
+    commit_id: []const u8,
+    expected_metadata_location: []const u8,
+    /// Standard Iceberg REST table requirements, validated against the authoritative state.
+    requirements: []const std.json.ArrayHashMap(std.json.Value),
+    /// Standard Iceberg REST metadata updates. Upload data/delete/manifest files before committing. A lake commit does not establish Antfly index visibility.
+    updates: []const std.json.ArrayHashMap(std.json.Value),
+};
+
+pub const LakeCatalogCreateRequest = struct {
+    /// Stable identifier reused with exactly the same request after timeout or restart.
+    commit_id: []const u8,
+    /// Iceberg schema including schema-id and persistent field IDs.
+    schema: std.json.ArrayHashMap(std.json.Value),
+    partition_spec: ?std.json.ArrayHashMap(std.json.Value) = null,
+    write_order: ?std.json.ArrayHashMap(std.json.Value) = null,
+    properties: ?std.json.ArrayHashMap([]const u8) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "commit_id", "commit_id", false },
+        .{ "schema", "schema", false },
+        .{ "partition-spec", "partition_spec", true },
+        .{ "write-order", "write_order", true },
+        .{ "properties", "properties", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("commit_id");
+        try jw.write(self.commit_id);
+        try jw.objectField("schema");
+        try jw.write(self.schema);
+        if (self.partition_spec) |value| {
+            try jw.objectField("partition-spec");
+            try jw.write(value);
+        }
+        if (self.write_order) |value| {
+            try jw.objectField("write-order");
+            try jw.write(value);
+        }
+        if (self.properties) |value| {
+            try jw.objectField("properties");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const LakeCatalogResponse = struct {
+    state: []const u8,
+    commit_id: ?[]const u8 = null,
+    /// Opaque request digest for outcome resolution.
+    request_hash: ?[]const u8 = null,
+    metadata_location: ?[]const u8 = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// False if lake creation committed but native schema binding still needs the same initialization request replayed.
+    binding_ready: ?bool = null,
+    /// A catalog commit alone does not make a matching index publication searchable.
+    searchable: ?bool = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "state", "state", false },
+        .{ "commit_id", "commit_id", true },
+        .{ "request_hash", "request_hash", true },
+        .{ "metadata_location", "metadata_location", true },
+        .{ "metadata", "metadata", true },
+        .{ "binding_ready", "binding_ready", true },
+        .{ "searchable", "searchable", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("state");
+        try jw.write(self.state);
+        if (self.commit_id) |value| {
+            try jw.objectField("commit_id");
+            try jw.write(value);
+        }
+        if (self.request_hash) |value| {
+            try jw.objectField("request_hash");
+            try jw.write(value);
+        }
+        if (self.metadata_location) |value| {
+            try jw.objectField("metadata_location");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        if (self.binding_ready) |value| {
+            try jw.objectField("binding_ready");
+            try jw.write(value);
+        }
+        if (self.searchable) |value| {
+            try jw.objectField("searchable");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const LakeReadReceipt = struct {
+    table_id: u64,
+    object_generation: u64,
+    wal_lsn: u64,
+};
+
+pub const LakeReadRequirement = struct {
+    /// Accepted requires current WAL visibility; vector/hybrid reads wait for matching publication. Published explicitly permits the retained archive generation. Applies to native writable Iceberg reads.
+    visibility: ?[]const u8 = null,
+    through: ?LakeReadReceipt = null,
+    /// Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded by query timeout and cancellation.
+    wait_ms: ?u32 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "visibility", "visibility", true },
+        .{ "through", "through", true },
+        .{ "wait_ms", "wait_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.visibility) |value| {
+            try jw.objectField("visibility");
+            try jw.write(value);
+        }
+        if (self.through) |value| {
+            try jw.objectField("through");
+            try jw.write(value);
+        }
+        if (self.wait_ms) |value| {
+            try jw.objectField("wait_ms");
             try jw.write(value);
         }
         try jw.endObject();
@@ -7468,6 +7746,8 @@ pub const QueryHighlight = struct {
 
 /// A single query result hit
 pub const QueryHit = struct {
+    /// Source table provenance for composed query hits; equal IDs from union inputs remain distinct.
+    _table: ?[]const u8 = null,
     /// Named query-time computed values, separate from stored source.
     _computed: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// ID of the record.
@@ -7490,6 +7770,7 @@ pub const QueryHit = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "_table", "_table", true },
         .{ "_computed", "_computed", true },
         .{ "_id", "_id", false },
         .{ "_score", "_score", false },
@@ -7512,6 +7793,10 @@ pub const QueryHit = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self._table) |value| {
+            try jw.objectField("_table");
+            try jw.write(value);
+        }
         if (self._computed) |value| {
             try jw.objectField("_computed");
             try jw.write(value);
@@ -7826,7 +8111,8 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
-    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    lake_read: ?LakeReadRequirement = null,
+    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
     remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
@@ -7902,6 +8188,7 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
@@ -7953,6 +8240,10 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.lake_read) |value| {
+            try jw.objectField("lake_read");
+            try jw.write(value);
+        }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
             try jw.write(value);
@@ -8160,7 +8451,11 @@ pub const QueryResponses = struct {
 
 /// Result of a canonical query operation.
 pub const QueryResult = struct {
-    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    /// Ranking contract for a composed result.
+    source_ranking: ?[]const u8 = null,
+    /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
+    next_source_cursor: ?[]const u8 = null,
+    /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -8185,6 +8480,8 @@ pub const QueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "source_ranking", "source_ranking", true },
+        .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
@@ -8209,6 +8506,14 @@ pub const QueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.source_ranking) |value| {
+            try jw.objectField("source_ranking");
+            try jw.write(value);
+        }
+        if (self.next_source_cursor) |value| {
+            try jw.objectField("next_source_cursor");
+            try jw.write(value);
+        }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
             try jw.write(value);
@@ -8262,7 +8567,11 @@ pub const QueryResult = struct {
 
 /// Fields shared by canonical and stateful query result envelopes.
 pub const QueryResultBase = struct {
-    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    /// Ranking contract for a composed result.
+    source_ranking: ?[]const u8 = null,
+    /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
+    next_source_cursor: ?[]const u8 = null,
+    /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -8286,6 +8595,8 @@ pub const QueryResultBase = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "source_ranking", "source_ranking", true },
+        .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
@@ -8309,6 +8620,14 @@ pub const QueryResultBase = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.source_ranking) |value| {
+            try jw.objectField("source_ranking");
+            try jw.write(value);
+        }
+        if (self.next_source_cursor) |value| {
+            try jw.objectField("next_source_cursor");
+            try jw.write(value);
+        }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
             try jw.write(value);
@@ -12671,6 +12990,8 @@ pub const SQLPreparedResponse = struct {
 
 /// Execute one SQL statement. Parameters are positional (`$1`, `$2`, ...), never interpolated into SQL text. To preserve integer precision in JavaScript clients, supply integers outside the exact JSON number range as decimal strings; binding coerces parameters to the expected type. The result limit is an admission bound, not an implicit SQL LIMIT: statements whose results exceed it fail instead of silently truncating. Request bodies are limited to 4 MiB, preparation to 8 MiB of allocated memory, and encoded results to a 16 MiB allocation budget.
 pub const SQLRequest = struct {
+    /// Read visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. HTTP sessions and prepared executions inside a transaction retain the first accepted read cut for each table, including across savepoint rollback. Cuts expire after one hour. Serializable external reads and accepted pgwire execution are not supported.
+    lake_visibility: ?[]const u8 = null,
     /// A single SQL statement.
     statement: []const u8,
     /// Positional JSON parameter values, including null.
@@ -12688,6 +13009,7 @@ pub const SQLRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "lake_visibility", "lake_visibility", true },
         .{ "statement", "statement", false },
         .{ "parameters", "parameters", true },
         .{ "database", "database", true },
@@ -12707,6 +13029,10 @@ pub const SQLRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.lake_visibility) |value| {
+            try jw.objectField("lake_visibility");
+            try jw.write(value);
+        }
         try jw.objectField("statement");
         try jw.write(self.statement);
         if (self.parameters) |value| {
@@ -13034,6 +13360,12 @@ pub const SSEToolMode = struct {
         }
         try jw.endObject();
     }
+};
+
+pub const SavedQuerySource = struct {
+    source_id: u64,
+    name: []const u8,
+    source: ComposedQuerySource,
 };
 
 /// Request to scan keys in a table within a key range. If no range is specified, scans all keys in the table.
@@ -13709,7 +14041,8 @@ pub const SqlSettingValue = std.json.Value;
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
-    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    lake_read: ?LakeReadRequirement = null,
+    /// Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409.
     remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
@@ -13789,6 +14122,7 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "lake_read", "lake_read", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
@@ -13842,6 +14176,10 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.lake_read) |value| {
+            try jw.objectField("lake_read");
+            try jw.write(value);
+        }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
             try jw.write(value);
@@ -14057,7 +14395,11 @@ pub const StatefulQueryResponses = struct {
 
 /// Result emitted by the stateful compatibility transport.
 pub const StatefulQueryResult = struct {
-    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    /// Ranking contract for a composed result.
+    source_ranking: ?[]const u8 = null,
+    /// Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced.
+    next_source_cursor: ?[]const u8 = null,
+    /// Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
     remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
@@ -14082,6 +14424,8 @@ pub const StatefulQueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "source_ranking", "source_ranking", true },
+        .{ "next_source_cursor", "next_source_cursor", true },
         .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
@@ -14106,6 +14450,14 @@ pub const StatefulQueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.source_ranking) |value| {
+            try jw.objectField("source_ranking");
+            try jw.write(value);
+        }
+        if (self.next_source_cursor) |value| {
+            try jw.objectField("next_source_cursor");
+            try jw.write(value);
+        }
         if (self.remote_snapshot) |value| {
             try jw.objectField("remote_snapshot");
             try jw.write(value);

@@ -57,7 +57,11 @@ pub fn execute(source: anytype, alloc: std.mem.Allocator, request: operation.Req
     if (action) |mutation_action| {
         var mutation: domain.Mutation = .{ .action = mutation_action, .kind = route.kind, .name = route.name orelse return failure(alloc, error.InvalidCatalogName), .database = route.database, .namespace = route.namespace };
         switch (mutation_action) {
-            .create => if (route.kind == .tablespace and body.len > 0) {
+            .create => if (route.kind == .query_source) {
+                const Input = struct { source: std.json.Value };
+                const input = std.json.parseFromSliceLeaky(Input, a, body, .{}) catch return failure(alloc, error.InvalidCatalogMutation);
+                mutation.source_json = try std.json.Stringify.valueAlloc(a, input.source, .{});
+            } else if (route.kind == .tablespace and body.len > 0) {
                 const Create = struct { location_json: ?[]const u8 = null, placement_policy_json: ?[]const u8 = null };
                 const input = std.json.parseFromSliceLeaky(Create, a, body, .{}) catch return failure(alloc, error.InvalidCatalogMutation);
                 mutation.location_json = input.location_json orelse "null";
@@ -100,6 +104,7 @@ fn projectMutation(alloc: std.mem.Allocator, a: std.mem.Allocator, kind: domain.
         .database => response(alloc, status, Database{ .database_id = resource.id, .name = resource.name, .tablespace_name = result.tablespace_name }),
         .namespace => response(alloc, status, Namespace{ .namespace_id = resource.id, .database_id = resource.parent_id, .database_name = result.database_name orelse return error.InvalidCatalogRecord, .name = resource.name, .tablespace_name = result.tablespace_name }),
         .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
+        .query_source => response(alloc, status, try sourceValue(a, resource)),
         .table => error.InvalidCatalogMutation,
     };
 }
@@ -127,6 +132,7 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
             .database => response(alloc, status, databaseValue(&index, resource)),
             .namespace => response(alloc, status, try namespaceValue(&index, resource)),
             .tablespace => response(alloc, status, try tablespaceValue(a, resource)),
+            .query_source => response(alloc, status, try sourceValue(a, resource)),
             .table => failure(alloc, error.InvalidCatalogMutation),
         };
     }
@@ -159,6 +165,11 @@ fn projectSnapshot(alloc: std.mem.Allocator, a: std.mem.Allocator, route: routes
                     return std.mem.lessThan(u8, l.name, r.name);
                 }
             }.less);
+            return response(alloc, status, out.items);
+        },
+        .query_source => {
+            var out: std.ArrayList(std.json.Value) = .empty;
+            for (state.resources) |r| if (r.kind == .query_source) try out.append(a, try sourceValue(a, r));
             return response(alloc, status, out.items);
         },
         .table => return failure(alloc, error.InvalidCatalogMutation),
@@ -243,4 +254,9 @@ test "system catalog mutation preserves non-admission proof without marking read
         defer read.deinit(std.testing.allocator);
         try std.testing.expect(!read.metadata_mutation_not_admitted);
     }
+}
+
+fn sourceValue(a: std.mem.Allocator, resource: domain.Resource) !std.json.Value {
+    const source = try std.json.parseFromSliceLeaky(std.json.Value, a, resource.source_json, .{});
+    return std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .source_id = resource.id, .name = resource.name, .source = source }, .{}), .{});
 }

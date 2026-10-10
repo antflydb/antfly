@@ -37,8 +37,9 @@ class TableSchema:
             enforce_types; explicitly setting enforce_types to false is invalid.
             Existing JSON document write and read APIs remain available. This
             setting alone does not declare primary keys or unique constraints.
-        base_source (ExternalLakeTableSource | Unset): Read-only authoritative Parquet or Iceberg source. A serving
-            statement pins its inventory and object versions before returning rows.
+        base_source (ExternalLakeTableSource | Unset): Authoritative Parquet or Iceberg source. A serving statement pins
+            its inventory and object versions before returning rows. Iceberg catalog commits require an explicit writable
+            catalog binding; ordinary row mutations remain unsupported.
         column_defaults (list[RelationalColumnExpression] | Unset): Immutable typed expressions applied only to absent
             columns on new
             writes, never explicit null. Defaults cannot reference columns.

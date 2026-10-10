@@ -66,6 +66,9 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
         binding.index_config_hash = try std.fmt.allocPrint(ca, "native-sparse-checkpoint-v8:{s}", .{binding.index_config_hash});
         const public_config = try std.json.Stringify.valueAlloc(ca, configs.object.get(wanted.name) orelse return error.InvalidTableIndexMetadata, .{});
         const recipe = state.recipe(table, public_config);
+        var producer = try @import("lake_vector_enrichment.zig").Producer.init(a, wanted.name, wanted.build_spec.?.sparse.sparse_column, configs.object.get(wanted.name).?, provider.embedding_options);
+        defer producer.deinit();
+        producer.memo = provider.vector_memo;
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .sparse_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, wanted.name) and rebuild.bindingsEqual(binding, declaration.binding)) break declaration;
         } else null;
@@ -109,14 +112,42 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             var deletes: state.Deletes = .{ .files = root.file_states, .current = &plan };
             while (try deletes.next(a, store.*, cancellation)) |keys| {
                 defer a.free(keys);
-                const ids = try a.alloc([]const u8, keys.len / 96);
+                const ids = try a.alloc([]const u8, keys.len / deletes.key_width);
                 defer a.free(ids);
-                for (ids, 0..) |*id, row| id.* = keys[row * 96 ..][0..96];
+                for (ids, 0..) |*id, row| id.* = keys[row * deletes.key_width ..][0..deletes.key_width];
                 try index.batchWithOptions(&.{}, ids, .{});
+                if (deletes.key_width == 108) {
+                    var source_keys: std.ArrayList([]u8) = .empty;
+                    defer {
+                        for (source_keys.items) |key| a.free(key);
+                        source_keys.deinit(a);
+                    }
+                    {
+                        var read = try index.beginReadTxn();
+                        defer read.abort();
+                        for (ids) |key| {
+                            const record_key = try std.fmt.allocPrint(a, "lake-unit:{s}", .{key});
+                            defer a.free(record_key);
+                            const source_key = try @import("lake_enrichment_units.zig").sourceKeyFromRecord(a, key, try read.get(record_key));
+                            defer a.free(source_key);
+                            try source_keys.append(a, try std.fmt.allocPrint(a, "lake-unit:{s}", .{source_key}));
+                        }
+                    }
+                    var transaction = try index.backendStore().beginBatch();
+                    errdefer transaction.abort();
+                    for (source_keys.items) |key| try transaction.delete(key);
+                    for (ids) |key| {
+                        const record_key = try std.fmt.allocPrint(a, "lake-unit:{s}", .{key});
+                        defer a.free(record_key);
+                        try transaction.delete(record_key);
+                    }
+                    try transaction.commit();
+                }
             }
         }
         var input_provider = provider.*;
         input_provider.only_files = plan.changed;
+        input_provider.enrichment_columns = @import("lake_enrichment_units.zig").configured(producer.config, "template") != null;
         const rows = try input_provider.provider().open_with_cancellation_fn.?(input_provider.provider().ptr, a, binding, cancellation);
         defer rows.deinit(a);
         var input: u64 = 512 * 1024 * 1024;
@@ -125,18 +156,31 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             defer page_arena.deinit();
             const pa = page_arena.allocator();
             var writes: std.ArrayList(local.sparse_sparse.SparseWrite) = .empty;
+            var unit_records: std.StringHashMapUnmanaged([]const u8) = .empty;
             for (batch.row_refs, 0..) |ref, ordinal| {
                 try cancellation.check();
                 try provider.context.ensureActive();
                 const page: local.sql_catalog.ColumnPage = .{ .batch = batch, .selection = &.{ordinal} };
-                var value = (try page.cell(pa, 0, wanted.build_spec.?.sparse.sparse_column)).value;
-                if (value == .null) continue;
-                if (value == .string) value = try std.json.parseFromSliceLeaky(std.json.Value, pa, value.string, .{});
-                const vector = try local.storage_db_document_mapper.parseSparseValue(pa, value);
-                try stores.chargeReadBudget(&input, @as(u64, @intCast(vector.indices.len)) * 8 + 128);
-                const key = try plan.privateKey(pa, ref);
-                try tracker.append(ref, key);
-                try writes.append(pa, .{ .doc_id = key, .vec = .{ .indices = vector.indices, .values = vector.values } });
+                const row = try @import("lake_enrichment_units.zig").rowValue(pa, page);
+                const parent_key = try plan.privateKey(pa, ref);
+                for (try producer.units(pa, row)) |unit| {
+                    const vector = (try producer.sparseUnit(pa, unit)) orelse continue;
+                    try stores.chargeReadBudget(&input, @as(u64, @intCast(vector.indices.len)) * 8 + 128);
+                    const key = try @import("lake_enrichment_units.zig").identity(pa, parent_key, unit);
+                    try tracker.append(ref, key);
+                    if (unit.chunked) {
+                        try unit_records.put(pa, key, try @import("lake_enrichment_units.zig").recordJson(pa, unit));
+                        try unit_records.put(pa, try @import("lake_enrichment_units.zig").sourceKey(pa, parent_key, unit.source_ordinal), try @import("lake_enrichment_units.zig").sourceJson(pa, unit));
+                    }
+                    try writes.append(pa, .{ .doc_id = key, .vec = .{ .indices = vector.indices, .values = vector.values } });
+                }
+            }
+            if (unit_records.count() != 0) {
+                var transaction = try index.backendStore().beginBatch();
+                errdefer transaction.abort();
+                var records = unit_records.iterator();
+                while (records.next()) |record| try transaction.put(try std.fmt.allocPrint(pa, "lake-unit:{s}", .{record.key_ptr.*}), record.value_ptr.*);
+                try transaction.commit();
             }
             try index.batchWithOptions(writes.items, &.{}, .{ .prefer_bulk_build = seed == null, .assume_new_doc_ids = true, .backend_batch_options = .{ .mode = if (seed == null) .bulk_ingest else .default } });
         }

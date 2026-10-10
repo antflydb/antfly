@@ -395,6 +395,7 @@ pub const SqlMetadata = struct {
     isolation: @import("antfly_local_sources").sql_session.Isolation,
     mode: @import("antfly_local_sources").sql_session.ReadMode,
     failed: bool = false,
+    accepted_lake_reads: bool = false,
 
     pub fn clone(self: SqlMetadata, alloc: std.mem.Allocator) !SqlMetadata {
         const database = try alloc.dupe(u8, self.database);
@@ -966,6 +967,9 @@ pub const Session = struct {
     /// Definite post-proposal conflict/abort, retained until any owning
     /// HTTP connection has detached. Never report it as a committed result.
     terminal_abort: bool = false,
+    /// Private immutable accepted-lake cuts. Savepoint rollback deliberately
+    /// leaves these transaction read cuts intact.
+    lake_cuts: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
     setting_active: SettingEntries = .empty,
     setting_committed: SettingEntries = .empty,
@@ -986,6 +990,7 @@ pub const Session = struct {
         if (self.staged) |*staged| staged.deinit(alloc);
         if (self.execution_plan) |bytes| alloc.free(bytes);
         if (self.terminal_commit) |*terminal| terminal.deinit(alloc);
+        deinitReadSnapshotMap(alloc, &self.lake_cuts);
         deinitReadSnapshotMap(alloc, &self.read_snapshots);
         deinitSettingEntries(alloc, &self.setting_active);
         deinitSettingEntries(alloc, &self.setting_committed);
@@ -1014,6 +1019,7 @@ pub const Session = struct {
         if (self.staged) |staged| out.staged = try staged.clone(alloc);
         if (self.execution_plan) |bytes| out.execution_plan = try alloc.dupe(u8, bytes);
         if (self.terminal_commit) |terminal| out.terminal_commit = try terminal.clone(alloc);
+        out.lake_cuts = try cloneReadSnapshotMap(alloc, self.lake_cuts);
         out.read_snapshots = try cloneReadSnapshotMap(alloc, self.read_snapshots);
         out.setting_active = try cloneSettingEntries(alloc, self.setting_active.items);
         out.setting_committed = try cloneSettingEntries(alloc, self.setting_committed.items);
@@ -2200,6 +2206,58 @@ pub const SessionRegistry = struct {
         const publish_target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
         self.publishCandidateLocked(alloc, publish_target, &candidate);
         return publish_target.info();
+    }
+
+    pub fn getLakeCut(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, table: []const u8) !?SessionReadSnapshot {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var session = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        defer session.deinit(alloc);
+        return cloneReadSnapshotForKey(alloc, &session.lake_cuts, table, "accepted");
+    }
+    pub fn cloneLakeCuts(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) ![]SessionReadSnapshot {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var session = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        defer session.deinit(alloc);
+        const result = try alloc.alloc(SessionReadSnapshot, session.lake_cuts.count());
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |*entry| entry.deinit(alloc);
+            alloc.free(result);
+        }
+        for (session.lake_cuts.values(), result) |entry, *out| {
+            out.* = try entry.clone(alloc);
+            initialized += 1;
+        }
+        return result;
+    }
+    pub fn bindLakeCut(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, table: []const u8, table_id: u64, token_json: []const u8) !void {
+        const session_lock = self.sessionLock(txn_id);
+        session_lock.lock();
+        defer session_lock.unlock();
+        var candidate = (try self.loadSessionCloneAssumeStripe(alloc, txn_id)) orelse return error.SqlTransactionNotActive;
+        errdefer candidate.deinit(alloc);
+        if (candidate.commit_body_digest != null or candidate.commit_execution_started or candidate.terminal_abort or candidate.terminal_commit != null) return error.TransactionCommitSealed;
+        if (try cloneReadSnapshotForKey(alloc, &candidate.lake_cuts, table, "accepted")) |value| {
+            var old = value;
+            defer old.deinit(alloc);
+            if (old.version != table_id or old.document_json == null or !std.mem.eql(u8, old.document_json.?, token_json)) return error.CatalogGenerationChanged;
+            candidate.deinit(alloc);
+            return;
+        }
+        if (candidate.lake_cuts.count() >= 64) return error.SqlProgramLimitExceeded;
+        if (candidate.sql) |*metadata| metadata.accepted_lake_reads = true;
+        try upsertReadSnapshot(alloc, &candidate.lake_cuts, .{ .table_name = table, .key = "accepted", .version = table_id, .document_json = token_json });
+        touchSession(&candidate);
+        try self.renewLeaseLocked(txn_id, candidate.owner_node_id);
+        try self.persistLocked(candidate);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const target = self.sessions.getPtr(txn_id) orelse return error.SessionRemovedDuringMutation;
+        self.publishCandidateLocked(alloc, target, &candidate);
     }
 
     pub fn getReadSnapshot(
@@ -5214,6 +5272,15 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     } else {
         try out.appendSlice(alloc, "null");
     }
+    try out.appendSlice(alloc, ",\"lake_cuts\":[");
+    var lake_cuts_it = session.lake_cuts.iterator();
+    var first_lake_cut = true;
+    while (lake_cuts_it.next()) |entry| {
+        if (!first_lake_cut) try out.append(alloc, ',');
+        first_lake_cut = false;
+        try appendReadSnapshotJson(alloc, &out, entry.value_ptr.*);
+    }
+    try out.append(alloc, ']');
     try out.appendSlice(alloc, ",\"read_snapshots\":[");
     var snapshots_it = session.read_snapshots.iterator();
     var first_snapshot = true;
@@ -5412,6 +5479,7 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
         }
     }
     if (session.terminal_abort and session.terminal_commit != null) return error.InvalidTransactionSessionRecord;
+    if (obj.get("lake_cuts")) |cuts| try decodeReadSnapshotsInto(alloc, cuts, &session.lake_cuts);
     if (obj.get("read_snapshots")) |snapshots_value| {
         try decodeReadSnapshotsInto(alloc, snapshots_value, &session.read_snapshots);
     }
@@ -7284,4 +7352,28 @@ test "distributed txn session observed predicates survive private persistence wi
     try std.testing.expectEqual(std.math.maxInt(u64), predicates[0].expected_version);
     try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(255)), &predicates[0].expected_content_digest.?);
     try std.testing.expectEqual(@as(u64, 0), predicates[1].expected_version);
+}
+
+test "lake SQL session cuts survive savepoint rollback and durable record recovery" {
+    const a = std.testing.allocator;
+    var registry = SessionRegistry.init(null);
+    defer registry.deinit(a);
+    const begun = try registry.beginForPrincipal(a, .{ .sql = .{ .database = "main", .namespace = "public", .isolation = .read_committed, .mode = .read_only } }, 7, "alice");
+    const point = (try registry.createSavepoint(a, begun.txn_id)).?;
+    try registry.bindLakeCut(a, begun.txn_id, "events", 19, "\"sql-lake1:original\"");
+    _ = try registry.rollbackToSavepoint(a, begun.txn_id, point.savepoint_id);
+    var held = (try registry.getLakeCut(a, begun.txn_id, "events")).?;
+    defer held.deinit(a);
+    try std.testing.expectEqualStrings("\"sql-lake1:original\"", held.document_json.?);
+    try std.testing.expectError(error.CatalogGenerationChanged, registry.bindLakeCut(a, begun.txn_id, "events", 19, "\"sql-lake1:new\""));
+    var session = (try registry.loadSessionCloneAssumeStripe(a, begun.txn_id)).?;
+    defer session.deinit(a);
+    const bytes = try encodeSessionRecord(a, session);
+    defer a.free(bytes);
+    var restored = try decodeSessionRecord(a, begun.txn_id, bytes);
+    defer restored.deinit(a);
+    try std.testing.expect(restored.sql.?.accepted_lake_reads);
+    var recovered = (try cloneReadSnapshotForKey(a, &restored.lake_cuts, "events", "accepted")).?;
+    defer recovered.deinit(a);
+    try std.testing.expectEqualStrings(held.document_json.?, recovered.document_json.?);
 }

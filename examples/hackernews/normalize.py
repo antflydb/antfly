@@ -56,37 +56,45 @@ def main():
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
     args = parser.parse_args()
-    source = pq.read_table(args.input)
-    records = source.to_pylist()
-    for row in records:
-        row["title"] = plain(row["title"])
-        row["body"] = "\n".join(filter(None, (row["title"], plain(row["text_html"]))))
-    normalized = pa.Table.from_pylist(records, schema=source.schema)
-    pq.write_table(
-        normalized,
+    source = pq.ParquetFile(args.input)
+    count = 0
+    kinds = {}
+    date_min = date_max = None
+    with pq.ParquetWriter(
         args.output,
+        source.schema_arrow,
         compression="snappy",
         use_dictionary=True,
-        row_group_size=1024,
         data_page_size=16384,
         write_batch_size=256,
         data_page_version="2.0",
         write_page_index=True,
-    )
+    ) as writer:
+        for batch in source.iter_batches(batch_size=4096):
+            records = batch.to_pylist()
+            for row in records:
+                row["title"] = plain(row["title"])
+                row["body"] = "\n".join(
+                    filter(None, (row["title"], plain(row["text_html"])))
+                )
+                epoch = row["created_at"]
+                date_min = epoch if date_min is None else min(date_min, epoch)
+                date_max = epoch if date_max is None else max(date_max, epoch)
+                kind = row["item_type"]
+                kinds[kind] = kinds.get(kind, 0) + 1
+            writer.write_table(
+                pa.Table.from_pylist(records, schema=source.schema_arrow),
+                row_group_size=1024,
+            )
+            count += len(records)
     print(
         json.dumps(
             {
-                "rows": len(records),
+                "rows": count,
                 "input_bytes": args.input.stat().st_size,
                 "output_bytes": args.output.stat().st_size,
-                "date_range_epoch": [
-                    min(r["created_at"] for r in records),
-                    max(r["created_at"] for r in records),
-                ],
-                "item_types": {
-                    kind: sum(r["item_type"] == kind for r in records)
-                    for kind in sorted({r["item_type"] for r in records})
-                },
+                "date_range_epoch": [date_min, date_max],
+                "item_types": kinds,
             },
             indent=2,
         )

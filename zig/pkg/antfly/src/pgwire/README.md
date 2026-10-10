@@ -158,3 +158,32 @@ parameters/results, statement/portal ownership, authentication ordering,
 extended error recovery, allocation bounds, protected transport, active-backend
 shutdown, and authenticated cancellation at connection capacity. The network
 cases use local loopback sockets and need socket access in sandboxed runners.
+
+## Driver formatting contract and conformance
+
+Startup also accepts asyncpg's quoted UTF-8 encoding and UTF8/UTF-8/UTF_8
+aliases; the effective client_encoding stays UTF8. Startup accepts case-insensitive `DateStyle` (ISO with optional MDY/DMY/YMD),
+`TimeZone` (UTC, Etc/UTC, GMT, +00, Z, GMT+00:00, UTC+00:00),
+`extra_float_digits` (-15 through 3), `IntervalStyle=postgres`, and
+`standard_conforming_strings=on` (also true/1). These negotiate the fixed native
+output contract: ISO, MDY; UTC; round-trippable floats (reported as 3);
+PostgreSQL intervals; standard strings. They do not install alternative input
+parsers or lossy float renderers. `SHOW`, `SET`, and `RESET` use that same
+contract in simple and extended queries. ParameterStatus reports the effective
+values, including IntervalStyle and extra_float_digits. Unsupported startup
+settings fail with SQLSTATE 0A000 and identify the parameter; `options`, `role`,
+and startup `search_path` remain rejected. Non-UTC clients, including JDBC JVMs,
+must select UTC explicitly until native session time zones are supported.
+
+Run `zig build pgwire-test` for framing, JDBC-style startup, settings, and
+rejection tests. Run `scripts/test_pgwire_drivers.py --binary <antfly>` using the
+uv command in its docstring for real SQLx 0.9, pgx, node-postgres, psycopg/libpq,
+and asyncpg clients against an isolated authenticated standalone process. Each
+client exercises pool/connection setup, SELECT 1, typed bound parameters, SHOW,
+and a transaction. Go also exercises database/sql and its comment-only ping.
+Portal arenas have stable addresses through registry growth and removal, so
+retained native results release before their allocator is destroyed. The Python client also verifies unsupported startup values
+through a real connection. Go, Node.js, and Rust (at least 1.94 for SQLx 0.9) toolchains are required.
+Both base and full E2E CI gates require the driver conformance job, which reuses
+the corresponding candidate binary. Use
+`--url` to target an existing node or `--drivers` to select individual clients.
