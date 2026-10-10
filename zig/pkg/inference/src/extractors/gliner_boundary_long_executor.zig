@@ -109,7 +109,7 @@ fn hashOptions(hash: *std.crypto.hash.sha2.Sha256, value: anytype) void {
             // These carry ownership/cancellation/validator execution, not
             // semantics. Compiled validator expressions live in schema IDs.
             if (comptime !std.mem.eql(u8, reflected_name, "control") and !std.mem.eql(u8, reflected_name, "check_context") and !std.mem.eql(u8, reflected_name, "check_fn") and
-                !std.mem.eql(u8, reflected_name, "regex_context") and !std.mem.eql(u8, reflected_name, "validate_value_fn"))
+                !std.mem.eql(u8, reflected_name, "regex_context") and !std.mem.eql(u8, reflected_name, "validate_value_fn") and !std.mem.eql(u8, reflected_name, "scope"))
             {
                 hash.update(reflected_name);
                 hash.update("\x00");
@@ -473,6 +473,11 @@ pub fn executeNative(cb: *const compute.ComputeBackend, allocator: Allocator, co
     return execute(cb, allocator, config, tokenizer, item, supplied);
 }
 
+pub fn executeBrowser(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options) !Result {
+    if (cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryBackend;
+    return execute(cb, allocator, config, tokenizer, item, supplied);
+}
+
 pub fn executeDevice(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options) !Result {
     if ((cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     if (cb.decoderRuntimeHasActiveFrame()) return error.GlinerBoundaryExternalFrame;
@@ -536,7 +541,7 @@ fn admitWindows(backend: compute.BackendKind, allocator: Allocator, config: *con
         defer prepared.deinit();
         try receiver.observe(item.text.len, document.words.len, document.windows.len, &prepared);
         const attention_per_layer = switch (backend) {
-            .native => (try engine.plan(config, &prepared, engine_options)).attention_work_items,
+            .native, .wasm => (try engine.plan(config, &prepared, engine_options)).attention_work_items,
             .metal, .cuda => (try device_request.plan(config, &prepared, &.{&item.compiled}, device_options)).encoder.native.attention_work_items,
             else => return error.UnsupportedGlinerBoundaryBackend,
         };
@@ -561,7 +566,7 @@ pub fn qualifyGeometry(cb: *const compute.ComputeBackend, allocator: Allocator, 
 /// Host planning can run before acquiring an accelerator execution mutex.
 /// This explicit backend tag permits no dispatch or backend construction.
 pub fn planGeometry(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, item: *const wire.Item, supplied: Options, receiver: anytype) !GeometryUsage {
-    if (backend != .native and (backend != .metal and backend != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
+    if (backend != .native and backend != .wasm and (backend != .metal and backend != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     var quiet = supplied;
     quiet.observer = null;
     var planned = try prepareDocument(backend, allocator, config, item, quiet);
@@ -605,7 +610,7 @@ fn encodeGroup(
     head_limits: head.Limits,
 ) !pipeline.WindowResult {
     return switch (cb.kind()) {
-        .native => native: {
+        .native, .wasm => native: {
             var encoded = try engine.encodeNative(cb, allocator, config, prepared, engine_options);
             defer encoded.deinit();
             var headed: ?head.Result = if (prepared.query_width > 0) try head.forwardNative(cb, allocator, config, encoded.asHeadInput(control), head_limits) else null;
@@ -756,6 +761,20 @@ test "gliner boundary long executor profile includes effective caps and excludes
     hashOptions(&fourth, left);
     const fourth_digest = fourth.finalResult();
     try std.testing.expect(!std.mem.eql(u8, &third_digest, &fourth_digest));
+}
+
+test "gliner boundary long executor profile excludes browser encoder execution scope" {
+    const Host = struct {
+        fn enter(_: *anyopaque) void {}
+    };
+    var context: u8 = 0;
+    var options = engine.Options{};
+    var cpu = std.crypto.hash.sha2.Sha256.init(.{});
+    hashOptions(&cpu, options);
+    options.scope = .{ .ptr = &context, .enter = Host.enter, .leave = Host.enter };
+    var gpu = std.crypto.hash.sha2.Sha256.init(.{});
+    hashOptions(&gpu, options);
+    try std.testing.expectEqualSlices(u8, &cpu.finalResult(), &gpu.finalResult());
 }
 
 test "gliner boundary long executor profile preserves declared policy across workspace growth" {

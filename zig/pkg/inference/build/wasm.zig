@@ -60,6 +60,7 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
     wasm_lib.root_module.addOptions("build_options", runtime_build.addBuildOptions(b, wasmBackend(ctx.backend)));
     wasm_lib.entry = .disabled;
     wasm_lib.rdynamic = true;
+    if (!is_wasm64) wasm_lib.max_memory = 2 * 1024 * 1024 * 1024;
     // ReleaseSafe: works around LLVM WASM backend miscompilation at -Os/-O3
     // that produces NaN in BERT encoder FFN linear ops. 1.2 MB binary.
 
@@ -135,6 +136,13 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
     wasm_lib.root_module.addImport("inference_linalg", wasm_linalg_mod);
     wasm_lib.root_module.addImport("antfly_image", wasm_image_mod);
     wasm_lib.root_module.addImport("antfly_platform", wasm_platform_mod);
+    const wasm_decisions_mod = b.createModule(.{
+        .root_source_file = b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, "lib/decisions/root.zig" })),
+        .target = wasm_target,
+        .optimize = .safe,
+        .single_threaded = true,
+    });
+    wasm_lib.root_module.addImport("antfly_decisions", wasm_decisions_mod);
     wasm_lib.root_module.addImport("ml", wasm_ml_mod);
     wasm_lib.root_module.addImport("onnx_graph", wasm_onnx.graph);
     wasm_lib.root_module.addImport("onnx_data", wasm_onnx.data);
@@ -145,6 +153,11 @@ pub fn addWasm(ctx: Context, wasm_jinja_mod: *std.Build.Module, wasm_platform_mo
 
     const wasm_step = ctx.step("wasm", "Build WASM module for browser inference");
     wasm_step.dependOn(&wasm_install.step);
+    const browser_name = if (ctx.backend.enable_webgpu) "antfly-extraction-webgpu.wasm" else "antfly-extraction-cpu.wasm";
+    if (!is_wasm64) {
+        const browser_install = b.addInstallFile(wasm_lib.getEmittedBin(), browser_name);
+        wasm_step.dependOn(&browser_install.step);
+    }
     wasm_step.dependOn(ctx.install_apache_licenses(
         b,
         b.path(b.pathJoin(&.{ ctx.paths.shared_lib_root, ".." })),

@@ -574,68 +574,72 @@ fn classificationFamilyLengths(min_tokens: u64, max_tokens: u64) LengthContract 
 }
 
 const family_options = [_]Feature{ .word_whitespace, .overlap_flat, .offset_codepoints, .offset_utf8, .decoder_auto, .single_window, .confidence, .spans };
-const family_profiles = [_]struct { features: Features, lengths: LengthContract }{
-    .{
-        .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions })),
-        .lengths = .{
-            .request_items = Range.exact(1),
-            .document_bytes = .{ .min = 52, .max = 74 },
-            // Japanese has 8 source words; Spanish and Arabic each have 9.
-            // All three prepared body windows contain 9 processor words.
-            .document_words = .{ .min = 8, .max = 9 },
-            .window_count = Range.exact(1),
-            .window_words = Range.exact(9),
-            .padded_sequence_tokens = Range.exact(61),
+const family_profiles = blk: {
+    // WASM can construct these feature sets before the validation block runs.
+    @setEvalBranchQuota(1 << 14);
+    break :blk [_]struct { features: Features, lengths: LengthContract }{
+        .{
+            .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions })),
+            .lengths = .{
+                .request_items = Range.exact(1),
+                .document_bytes = .{ .min = 52, .max = 74 },
+                // Japanese has 8 source words; Spanish and Arabic each have 9.
+                // All three prepared body windows contain 9 processor words.
+                .document_words = .{ .min = 8, .max = 9 },
+                .window_count = Range.exact(1),
+                .window_words = Range.exact(9),
+                .padded_sequence_tokens = Range.exact(61),
+            },
         },
-    },
-    .{ .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions, .classification_single, .legacy_structures, .relations })), .lengths = familyLengths(Range.exact(63), Range.exact(11), Range.exact(107)) },
-    .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured })), .lengths = .{
-        .request_items = Range.exact(1),
-        .document_bytes = .{ .min = 40, .max = 73 },
-        .document_words = .{ .min = 2, .max = 14 },
-        .window_count = Range.exact(1),
-        .window_words = .{ .min = 3, .max = 14 },
-        .padded_sequence_tokens = .{ .min = 27, .max = 39 },
-    } },
-    .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured, .schema_descriptions })), .lengths = familyLengths(Range.exact(69), Range.exact(16), Range.exact(92)) },
-    .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured, .classification_context })), .lengths = familyLengths(Range.exact(61), Range.exact(13), Range.exact(41)) },
-    // The same mixed schema exercises every listed learned feature together
-    // at one character and a real 658-byte document. ASCII endpoint
-    // parity is checked with both offset units. No long-window, batch, or
-    // public mode=multi permission is inferred from these observations.
-    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .entities, .relations, .legacy_structures, .classification_single, .classification_structured, .classification_context, .schema_descriptions })), .lengths = .{
-        .request_items = Range.exact(1),
-        .document_bytes = .{ .min = 1, .max = 658 },
-        .document_words = .{ .min = 1, .max = 114 },
-        .window_count = Range.exact(1),
-        .window_words = .{ .min = 2, .max = 114 },
-        .padded_sequence_tokens = .{ .min = 135, .max = 298 },
-    } },
-    // Each classifier feature combination has its own short and long
-    // captures. A bare 18-token prompt cannot widen a mixed-task row or a
-    // described/instructed classifier's measured sequence floor.
-    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured })), .lengths = classificationFamilyLengths(18, 183) },
-    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .schema_descriptions })), .lengths = classificationFamilyLengths(55, 218) },
-    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .schema_descriptions, .classification_context })), .lengths = classificationFamilyLengths(66, 229) },
-    .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .classification_context })), .lengths = classificationFamilyLengths(31, 194) },
-    // Bare and described entity rows bind their own short one-source-word,
-    // clean two-byte, and realistic long captures on both public offset units.
-    .{ .features = Features.initMany(&(family_options ++ .{.entities})), .lengths = .{
-        .request_items = Range.exact(1),
-        .document_bytes = .{ .min = 2, .max = 663 },
-        .document_words = .{ .min = 1, .max = 114 },
-        .window_count = Range.exact(1),
-        .window_words = .{ .min = 2, .max = 114 },
-        .padded_sequence_tokens = .{ .min = 17, .max = 181 },
-    } },
-    .{ .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions })), .lengths = .{
-        .request_items = Range.exact(1),
-        .document_bytes = .{ .min = 2, .max = 663 },
-        .document_words = .{ .min = 1, .max = 114 },
-        .window_count = Range.exact(1),
-        .window_words = .{ .min = 2, .max = 114 },
-        .padded_sequence_tokens = .{ .min = 22, .max = 202 },
-    } },
+        .{ .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions, .classification_single, .legacy_structures, .relations })), .lengths = familyLengths(Range.exact(63), Range.exact(11), Range.exact(107)) },
+        .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured })), .lengths = .{
+            .request_items = Range.exact(1),
+            .document_bytes = .{ .min = 40, .max = 73 },
+            .document_words = .{ .min = 2, .max = 14 },
+            .window_count = Range.exact(1),
+            .window_words = .{ .min = 3, .max = 14 },
+            .padded_sequence_tokens = .{ .min = 27, .max = 39 },
+        } },
+        .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured, .schema_descriptions })), .lengths = familyLengths(Range.exact(69), Range.exact(16), Range.exact(92)) },
+        .{ .features = Features.initMany(&(family_options ++ .{ .classification_single, .classification_structured, .classification_context })), .lengths = familyLengths(Range.exact(61), Range.exact(13), Range.exact(41)) },
+        // The same mixed schema exercises every listed learned feature together
+        // at one character and a real 658-byte document. ASCII endpoint
+        // parity is checked with both offset units. No long-window, batch, or
+        // public mode=multi permission is inferred from these observations.
+        .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .entities, .relations, .legacy_structures, .classification_single, .classification_structured, .classification_context, .schema_descriptions })), .lengths = .{
+            .request_items = Range.exact(1),
+            .document_bytes = .{ .min = 1, .max = 658 },
+            .document_words = .{ .min = 1, .max = 114 },
+            .window_count = Range.exact(1),
+            .window_words = .{ .min = 2, .max = 114 },
+            .padded_sequence_tokens = .{ .min = 135, .max = 298 },
+        } },
+        // Each classifier feature combination has its own short and long
+        // captures. A bare 18-token prompt cannot widen a mixed-task row or a
+        // described/instructed classifier's measured sequence floor.
+        .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured })), .lengths = classificationFamilyLengths(18, 183) },
+        .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .schema_descriptions })), .lengths = classificationFamilyLengths(55, 218) },
+        .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .schema_descriptions, .classification_context })), .lengths = classificationFamilyLengths(66, 229) },
+        .{ .features = Features.initMany(&(family_options ++ .{ .offset_utf8, .classification_single, .classification_structured, .classification_context })), .lengths = classificationFamilyLengths(31, 194) },
+        // Bare and described entity rows bind their own short one-source-word,
+        // clean two-byte, and realistic long captures on both public offset units.
+        .{ .features = Features.initMany(&(family_options ++ .{.entities})), .lengths = .{
+            .request_items = Range.exact(1),
+            .document_bytes = .{ .min = 2, .max = 663 },
+            .document_words = .{ .min = 1, .max = 114 },
+            .window_count = Range.exact(1),
+            .window_words = .{ .min = 2, .max = 114 },
+            .padded_sequence_tokens = .{ .min = 17, .max = 181 },
+        } },
+        .{ .features = Features.initMany(&(family_options ++ .{ .entities, .schema_descriptions })), .lengths = .{
+            .request_items = Range.exact(1),
+            .document_bytes = .{ .min = 2, .max = 663 },
+            .document_words = .{ .min = 1, .max = 114 },
+            .window_count = Range.exact(1),
+            .window_words = .{ .min = 2, .max = 114 },
+            .padded_sequence_tokens = .{ .min = 22, .max = 202 },
+        } },
+    };
 };
 const family_decide_features = Features.initMany(&.{ .classification_single, .classification_context, .schema_descriptions, .word_whitespace, .overlap_flat, .offset_utf8, .decoder_auto, .single_window, .confidence });
 const family_decide_lengths = familyLengths(.{ .min = 74, .max = 81 }, .{ .min = 14, .max = 17 }, .{ .min = 97, .max = 167 });

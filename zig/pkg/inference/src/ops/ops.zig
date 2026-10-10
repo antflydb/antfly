@@ -2318,6 +2318,8 @@ pub const ComputeBackend = struct {
         /// attn_bias: optional [num_heads, seq_len, seq_len] additive bias (e.g. T5 relative position bias), or null.
         /// Returns: [batch*seq_len, num_heads*head_dim].
         scaledDotProductAttention: *const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, attn_bias: ?CT, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize) anyerror!CT,
+        /// Inclusive local half-window, without materializing a dense bias mask.
+        slidingWindowAttention: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, half_window: usize) anyerror!?CT = null,
 
         /// Inclusive symmetric window; padding masks keys, never introduces causality.
         /// Token-major Q/K/V and output: [batch*seq_len, num_heads*head_dim].

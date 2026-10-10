@@ -761,6 +761,15 @@ importers:
 
   packages/embedded-linux-x64: {}
 
+  packages/inference-web:
+    devDependencies:
+      '@playwright/test':
+        specifier: ^1.61.0
+        version: 1.61.0
+      typescript:
+        specifier: ~5.9.3
+        version: 5.9.3
+
   packages/sdk:
     dependencies:
       openapi-fetch:

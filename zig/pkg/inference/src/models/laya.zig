@@ -388,6 +388,11 @@ pub fn validateWeights(store: @import("tensor_store.zig").TensorStore, cfg: Conf
 }
 
 pub fn validateReader(reader: *const @import("safetensors.zig").MMapReader, cfg: Config, encoder: anytype) !void {
+    return validateTensorInventory(reader, cfg, encoder);
+}
+
+/// Shared inventory checks for native readers and browser-owned tensor metadata.
+pub fn validateTensorInventory(reader: anytype, cfg: Config, encoder: anytype) !void {
     const Check = struct {
         fn tensor(r: @TypeOf(reader), name: []const u8, shape: []const i64) !void {
             const meta = r.header.tensors.get(name) orelse return error.InvalidLayaWeights;

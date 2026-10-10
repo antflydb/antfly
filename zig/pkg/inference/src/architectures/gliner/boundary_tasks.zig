@@ -56,7 +56,7 @@ const Storage = struct {
 };
 
 fn validateConfig(cb: *const compute.ComputeBackend, config: *const boundary.Config) !void {
-    if (cb.kind() != .native) return error.UnsupportedGlinerBoundaryBackend;
+    if (cb.kind() != .native and cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryBackend;
     if (config.version != boundary.config_version or config.architecture_version != boundary.architecture_version)
         return error.UnsupportedGlinerBoundaryVersion;
     if (config.encoder.hidden_size == 0) return error.InvalidInputShape;

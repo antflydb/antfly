@@ -317,19 +317,23 @@ pub fn main(init: std.process.Init) !void {
 // Phase 3A: LoRA pre-merge helpers
 // ---------------------------------------------------------------------------
 
+const OriginalLoRAWeight = struct {
+    data: []u8,
+    alignment: std.mem.Alignment,
+    allocator: std.mem.Allocator,
+    owns_data: bool,
+    merged: []f32,
+};
+
 /// Merge LoRA delta into WeightStore base weights before encoder forward.
-/// Returns a map of original weight byte slices that must be passed to restoreLoRAWeights.
+/// Returns the original allocations so restoreLoRAWeights can put them back.
 fn mergeLoRAIntoWeights(
     allocator: std.mem.Allocator,
     weight_store: *native_compute.WeightStore,
     la: *const fused_chunker_lora.LoRAAdapterSet,
-) !std.StringHashMapUnmanaged([]u8) {
-    var originals = std.StringHashMapUnmanaged([]u8).empty;
-    errdefer {
-        var it = originals.iterator();
-        while (it.next()) |e| allocator.free(e.value_ptr.*);
-        originals.deinit(allocator);
-    }
+) !std.StringHashMapUnmanaged(OriginalLoRAWeight) {
+    var originals = std.StringHashMapUnmanaged(OriginalLoRAWeight).empty;
+    errdefer restoreLoRAWeights(allocator, weight_store, &originals);
 
     for (la.layers) |*ll| {
         // Weight key follows modern_bert.zig's getLayerWeight convention:
@@ -365,12 +369,21 @@ fn mergeLoRAIntoWeights(
         };
         lora.mergeInto(base_mat, ll.asMatrixA(), ll.asMatrixB(), la.config.alpha, merged);
 
-        // Save original data bytes before replacing
-        const orig_bytes = try allocator.dupe(u8, lw.tensor.data);
-        try originals.put(allocator, try allocator.dupe(u8, key), orig_bytes);
-
-        // Replace tensor data with merged (as bytes)
+        // Keep the original allocation and its alignment while the merged
+        // weight is installed. A byte copy would lose typed alignment and
+        // leak the original allocation on every forward pass.
+        const owned_key = try allocator.dupe(u8, key);
+        errdefer allocator.free(owned_key);
+        try originals.put(allocator, owned_key, .{
+            .data = lw.tensor.data,
+            .alignment = lw.tensor.data_alignment,
+            .allocator = lw.tensor.allocator,
+            .owns_data = lw.tensor.owns_data,
+            .merged = merged,
+        });
         lw.tensor.data = std.mem.sliceAsBytes(merged);
+        lw.tensor.data_alignment = .of(f32);
+        lw.tensor.owns_data = true;
     }
     return originals;
 }
@@ -379,19 +392,18 @@ fn mergeLoRAIntoWeights(
 fn restoreLoRAWeights(
     allocator: std.mem.Allocator,
     weight_store: *native_compute.WeightStore,
-    originals: *std.StringHashMapUnmanaged([]u8),
+    originals: *std.StringHashMapUnmanaged(OriginalLoRAWeight),
 ) void {
     var it = originals.iterator();
     while (it.next()) |e| {
+        const original = e.value_ptr.*;
+        allocator.free(original.merged);
         if (weight_store.resident_weights.getPtr(e.key_ptr.*)) |lw| {
-            // Free the merged buffer (the current tensor.data)
-            const merged_aligned: []align(@alignOf(f32)) const u8 = @alignCast(lw.tensor.data);
-            const merged_f32 = std.mem.bytesAsSlice(f32, merged_aligned);
-            allocator.free(merged_f32);
-            // Restore original
-            lw.tensor.data = e.value_ptr.*;
-        } else {
-            allocator.free(e.value_ptr.*);
+            lw.tensor.data = original.data;
+            lw.tensor.data_alignment = original.alignment;
+            lw.tensor.owns_data = original.owns_data;
+        } else if (original.owns_data and original.data.len > 0) {
+            original.allocator.rawFree(original.data, original.alignment, @returnAddress());
         }
         allocator.free(e.key_ptr.*);
     }
@@ -412,12 +424,13 @@ fn insertLoRAIntoNativeStore(
 ) !void {
     const shape = [2]i64{ @intCast(rows), @intCast(cols) };
     if (weight_store.resident_weights.getPtr(key)) |existing| {
-        // Update the data in place: free old bytes, copy fresh data.
-        const new_bytes = try existing.tensor.allocator.dupe(u8, std.mem.sliceAsBytes(data));
-        if (existing.tensor.owns_data) {
-            existing.tensor.allocator.free(existing.tensor.data);
+        // Preserve typed alignment for asFloat32 and the allocator's free contract.
+        const new_data = try existing.tensor.allocator.dupe(f32, data);
+        if (existing.tensor.owns_data and existing.tensor.data.len > 0) {
+            existing.tensor.allocator.rawFree(existing.tensor.data, existing.tensor.data_alignment, @returnAddress());
         }
-        existing.tensor.data = new_bytes;
+        existing.tensor.data = std.mem.sliceAsBytes(new_data);
+        existing.tensor.data_alignment = .of(f32);
         existing.tensor.owns_data = true;
         return;
     }
@@ -847,7 +860,7 @@ fn run(allocator: std.mem.Allocator, opts: Options) !void {
             // Skip when linearLoRA is available: it applies the LoRA delta inline
             // without needing the base weights mutated (Fix 3).
             // ------------------------------------------------------------------
-            var lora_originals = std.StringHashMapUnmanaged([]u8).empty;
+            var lora_originals = std.StringHashMapUnmanaged(OriginalLoRAWeight).empty;
             var lora_merged = false;
             if (cb.vtable.linearLoRA == null) {
                 if (lora_adapters_opt) |*la| {

@@ -554,8 +554,12 @@ jobs:
       - name: Build and test Apache WASM artifacts
         working-directory: zig
         run: |
+          # The inference-web package contract suite runs from its built ESM
+          # artifact in the TypeScript SDK gate.
           node pkg/antfly-embedded/wasm_client_test.mjs
           zig build wasm-test inference-wasm -Dmetal=false -j1 -freference-trace=30 --summary all
+          EXTRACTION_WASM=zig-out/antfly-extraction-cpu.wasm node --test pkg/inference/web/test-extraction-runtime.mjs pkg/inference/web/test-laya-runtime.mjs pkg/inference/web/test-decide-runtime.mjs
+          zig build inference-wasm -Dwebgpu=true -Dmetal=false -j1 -freference-trace=30 --summary all
           zig build inference-wasm -Dwasm-memory-model=wasm64 -Dmetal=false -j1 -freference-trace=30 --summary all
           cd pkg/inference
           zig build wasm -Dwasm=true -j1 --summary all

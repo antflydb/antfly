@@ -127,6 +127,13 @@ pub fn executeDevice(cb: *const compute.ComputeBackend, allocator: Allocator, co
     return execute(cb, allocator, config, tokenizer, request, options);
 }
 
+/// Browser-owned, bounded session. This does not widen the native serving
+/// qualification table: browser catalog artifacts are qualified separately.
+pub fn executeBrowser(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) ![]u8 {
+    if (cb.kind() != .wasm) return error.UnsupportedGlinerBoundaryBackend;
+    return executeChecked(cb, allocator, config, tokenizer, request, options, null);
+}
+
 /// The caller owns the managed backend, model lock and host/device admission
 /// for the complete execution, including serialization and cleanup.
 pub fn execute(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) ![]u8 {
@@ -161,6 +168,14 @@ fn qualifyRequestGeometry(cb: *const compute.ComputeBackend, allocator: Allocato
 /// the same bounded processor/planning path as qualification, before the
 /// accelerator mutex or any eviction-capable workspace admission is held.
 pub fn workspaceGeometry(allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !usize {
+    return workspaceGeometryFor(.metal, allocator, config, tokenizer, request, options);
+}
+
+pub fn browserGeometry(allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !usize {
+    return workspaceGeometryFor(.wasm, allocator, config, tokenizer, request, options);
+}
+
+fn workspaceGeometryFor(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) !usize {
     if (options.identity == null) return error.MissingGlinerBoundaryIdentity;
     const Receiver = struct {
         peak_tokens: usize = 0,
@@ -172,13 +187,13 @@ pub fn workspaceGeometry(allocator: Allocator, config: *const model.Config, toke
         }
     };
     var receiver = Receiver{};
-    try planRequestGeometry(.metal, allocator, config, tokenizer, request, options, &receiver);
+    try planRequestGeometry(backend, allocator, config, tokenizer, request, options, &receiver);
     if (receiver.peak_tokens == 0) return error.InvalidBoundaryPipelineInput;
     return receiver.peak_tokens;
 }
 
 fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options, gate: anytype) !void {
-    if (backend != .native and (backend != .metal and backend != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
+    if (backend != .native and backend != .wasm and (backend != .metal and backend != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     var quiet = options;
     quiet.observer = null;
     try preflight(request, quiet);
@@ -223,7 +238,7 @@ fn planRequestGeometry(backend: compute.BackendKind, allocator: Allocator, confi
 }
 
 fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, config: *const model.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options, gate: ?*qualification.Gate) ![]u8 {
-    if (cb.kind() != .native and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
+    if (cb.kind() != .native and cb.kind() != .wasm and (cb.kind() != .metal and cb.kind() != .cuda)) return error.UnsupportedGlinerBoundaryBackend;
     if (cb.kind() != .native and options.identity == null) return error.MissingGlinerBoundaryIdentity;
     if (options.identity) |identity| if (identity.backbone != config.backbone) return error.GlinerBoundaryArtifactMismatch;
     try preflight(request, options);
@@ -265,6 +280,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
                 try long_executor.executeQualified(cb, allocator, config, tokenizer, &item, long_options, active)
             else switch (cb.kind()) {
                 .native => try long_executor.executeNative(cb, allocator, config, tokenizer, &item, long_options),
+                .wasm => try long_executor.executeBrowser(cb, allocator, config, tokenizer, &item, long_options),
                 .metal, .cuda => try long_executor.executeDevice(cb, allocator, config, tokenizer, &item, long_options),
                 else => return error.UnsupportedGlinerBoundaryBackend,
             };
@@ -294,7 +310,7 @@ fn executeChecked(cb: *const compute.ComputeBackend, allocator: Allocator, confi
         pipeline_options.control = options.control;
         pipeline_options.max_output_values = remaining_values;
         var result = switch (cb.kind()) {
-            .native => native: {
+            .native, .wasm => native: {
                 var encoded = try engine.encodeNative(cb, allocator, config, &prepared, engine_options);
                 defer encoded.deinit();
                 try progress(options, index, "decoding");

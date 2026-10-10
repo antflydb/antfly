@@ -137,6 +137,9 @@ function toStreamResponse(source) {
   return null;
 }
 
+// Replaced with a content identity when preparing the npm runtime assets.
+export const INFERENCE_RUNTIME_ID = '__ANTFLY_RUNTIME_ID__';
+
 export class InferenceWeb {
   constructor() {
     this.wasm = null;
@@ -201,7 +204,7 @@ export class InferenceWeb {
 
   async _initWorker(wasmCandidates, options) {
     const sabSize = options.sabSize ?? DEFAULT_SAB_SIZE;
-    this._sab = new SharedArrayBuffer(sabSize);
+    this._sab = this.gpu ? new SharedArrayBuffer(sabSize) : null;
     this._pendingCalls = new Map();
 
     const baseWasmUrl = wasmCandidates[0];
@@ -213,6 +216,8 @@ export class InferenceWeb {
     this._worker = new Worker(workerUrl, { type: 'module' });
 
     this._worker.onmessage = (e) => this._onWorkerMessage(e);
+    this._worker.onerror = (event) => this._rejectPending(Object.assign(new Error(event.message || 'Inference worker failed'), { fatal: true }));
+    this._worker.onmessageerror = () => this._rejectPending(Object.assign(new Error('Invalid inference worker message'), { fatal: true }));
 
     // Resolve wasm candidates to absolute URLs for the worker's fetch() fallback chain.
     const absWasmUrls = wasmCandidates.map((candidate) =>
@@ -221,11 +226,19 @@ export class InferenceWeb {
         : candidate.href,
     );
 
-    await this._workerCall('init', {
+    const initialized = await this._workerCall('init', {
       wasmUrls: absWasmUrls,
       sharedBuffer: this._sab,
       hasGpu: !!this.gpu,
+      expectedRuntimeId: options.expectedRuntimeId,
     });
+    // Older workers may ignore expectedRuntimeId. Require an affirmative
+    // identity in the reply so they cannot silently accept a newer client.
+    if (options.expectedRuntimeId && initialized.runtimeId !== options.expectedRuntimeId) {
+      const error = Object.assign(new Error('Inference worker JavaScript is incompatible; prepare matching runtime assets'), { code: 'RUNTIME_INCOMPATIBLE', fatal: true });
+      this.destroy(error);
+      throw error;
+    }
   }
 
   _onWorkerMessage(e) {
@@ -237,7 +250,11 @@ export class InferenceWeb {
         // For gpu-sync, handleWorkerCommand signals the worker when done
         // For gpu (fire-and-forget), we still process it through the handler
         // but the worker isn't blocking
-        this.gpu.handleWorkerCommand(e.data, this._sab);
+        Promise.resolve(this.gpu.handleWorkerCommand(e.data, this._sab)).catch(error => {
+          this._rejectPending(error);
+          this.gpu?.onFatalError?.(error);
+          this.destroy();
+        });
       }
       return;
     }
@@ -247,7 +264,7 @@ export class InferenceWeb {
       const pending = this._pendingCalls.get(id);
       if (pending) {
         this._pendingCalls.delete(id);
-        pending.reject(new Error(e.data.message));
+        pending.reject(Object.assign(new Error(e.data.message), { fatal: e.data.fatal === true, code: e.data.code }));
       }
       return;
     }
@@ -278,11 +295,28 @@ export class InferenceWeb {
 
   _workerCall(type, extra = {}, transfer = [], callbacks = {}) {
     return new Promise((resolve, reject) => {
+      if (!this._worker || !this._pendingCalls) { reject(new Error('Inference worker is not running')); return; }
       const id = this._nextCallId++;
       this._pendingCalls.set(id, { resolve, reject, ...callbacks });
-      this._worker.postMessage({ type, id, ...extra }, transfer);
+      try { this._worker.postMessage({ type, id, ...extra }, transfer); }
+      catch (error) { this._pendingCalls.delete(id); reject(error); }
     });
   }
+
+  _rejectPending(error) {
+    for (const call of this._pendingCalls?.values() ?? []) call.reject(error);
+    this._pendingCalls?.clear();
+  }
+
+  loadExtractionBundle(files, precision, onProgress) {
+    return this._workerCall('extraction-load', { files, precision }, [], { onProgress }).then(r => r.model);
+  }
+
+  runExtraction(request, validateOnly = false) {
+    return this._workerCall('extraction-run', { request, validateOnly }).then(r => r.result);
+  }
+
+  unloadExtraction() { return this._workerCall('extraction-unload'); }
 
   _getAbi() {
     if (!this.abi || !this.wasm) {
@@ -2018,8 +2052,9 @@ export class InferenceWeb {
   /**
    * Terminate the inference worker (worker mode only).
    */
-  destroy() {
+  destroy(reason) {
     this.abi = null;
+    this._rejectPending(reason ?? new DOMException('Inference worker terminated; reload the model to continue', 'AbortError'));
     if (this._worker) {
       this._worker.terminate();
       this._worker = null;
@@ -3801,6 +3836,10 @@ function _gpuStubs() {
     gpu_reduce_mean: () => {},
     gpu_broadcast_in_dim: () => {},
     gpu_attention: () => {},
+    gpu_attention_local: () => {},
+    gpu_matmul_transb_f16: () => {},
+    gpu_modern_op: () => {},
+    gpu_deberta_disentangled_attention: () => {},
     gpu_causal_attention: () => {},
     gpu_gqa_causal_attention: () => {},
     gpu_gqa_cached_attention: () => {},

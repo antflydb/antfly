@@ -29,6 +29,10 @@ struct Params {
     num_heads: u32,
     head_dim: u32,
     scale: f32,       // 1.0 / sqrt(head_dim), precomputed on host
+    window: u32,     // zero = global; otherwise inclusive local half-window + 1
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 };
 
 @group(0) @binding(0) var<storage, read> Q: array<f32>;
@@ -71,7 +75,7 @@ fn attention(
         }
         dot *= params.scale;
 
-        if (mask[b * S + ki] == 0u) {
+        if (mask[b * S + ki] == 0u || (params.window != 0u && max(qi, ki) - min(qi, ki) >= params.window)) {
             dot = -3.402823466e+38;
         }
 
@@ -90,6 +94,9 @@ fn attention(
         workgroupBarrier();
     }
     let row_max = reduce_buf[0];
+    // Every invocation must capture the max before any invocation reuses
+    // reduce_buf for the sum. Different SIMD groups need not run in lockstep.
+    workgroupBarrier();
 
     // ---- Step 3: exp(score - max) and partial sum ----
     var local_sum: f32 = 0.0;

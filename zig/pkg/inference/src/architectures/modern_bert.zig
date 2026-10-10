@@ -930,7 +930,11 @@ fn encoderLayer(
         // Shape: [num_heads * seq_len * seq_len] (shared across the batch).
         // The BLAS sdpaOp detects len == num_heads*seq_len*seq_len and applies it
         // as a per-head shared bias added to raw dot-product scores before softmax.
-        const window_bias: ?CT = if (!is_global) blk: {
+        const local_attn: ?CT = if (!is_global and cb.vtable.slidingWindowAttention != null)
+            try cb.vtable.slidingWindowAttention.?(cb.ptr, Q, K, qkv.v, attention_mask, batch, seq_len, num_heads, head_dim, config.local_attention_window / 2)
+        else
+            null;
+        const window_bias: ?CT = if (!is_global and local_attn == null) blk: {
             const half: usize = @intCast(config.local_attention_window / 2);
             break :blk try buildSlidingWindowBias(cb, allocator, seq_len, num_heads, half);
         } else null;
@@ -939,7 +943,7 @@ fn encoderLayer(
         // Bidirectional scaled dot-product attention (encoder, no causal mask).
         // The padding mask (attention_mask) is consumed by the backend: positions
         // where mask[b*seq_len + ki] == 0 are set to -inf before softmax.
-        break :fallback try cb.scaledDotProductAttention(
+        break :fallback local_attn orelse try cb.scaledDotProductAttention(
             Q,
             K,
             qkv.v,

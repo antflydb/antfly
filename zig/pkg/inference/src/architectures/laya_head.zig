@@ -65,9 +65,9 @@ pub fn forward(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, ma
     const tokens = try a.alloc(i64, markers.len);
     defer a.free(tokens);
     for (markers, tokens, 0..) |pos, *token, i| token.* = if (pos < 0) -1 else @intCast((i / count) * seq + @as(usize, @intCast(pos)));
-    // Metal keeps the hidden states on the device: reading back every row of
+    // Metal and WebGPU keep the hidden states on the device: reading back every row of
     // a padded batch to score a few markers dominated the decision's time.
-    if (cb.kind() == .metal and cfg.decision_head == .scorer) {
+    if ((cb.kind() == .metal or cb.kind() == .wasm) and cfg.decision_head == .scorer) {
         const rows = try a.alloc(i64, batch);
         defer a.free(rows);
         for (rows, 0..) |*row, i| row.* = @intCast(i * seq);
@@ -152,6 +152,15 @@ fn scoreHost(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32
     return actionHead(cb, a, cfg, f, logits, batch, count, dim);
 }
 
+/// Gather activations through the backend's device row operation.
+fn gatherRows(cb: *const CB, a: std.mem.Allocator, hidden: CT, rows: []const i64, dim: usize) !CT {
+    if (cb.kind() != .wasm) return cb.embeddingLookup(hidden, rows, rows.len, dim);
+    const ids = try a.alloc(u32, rows.len);
+    defer a.free(ids);
+    for (rows, ids) |row, *id| id.* = std.math.cast(u32, row) orelse return error.InvalidLayaInputs;
+    return (try cb.takeRows(hidden, ids, ids.len, dim)) orelse return error.UnsupportedLayaBackend;
+}
+
 /// `scoreHost` with the hidden states left on the device: marker and anchor
 /// rows are gathered there, so only the scorer logits (for the action
 /// statistics) and the action logits are read back. `markers` indexes rows
@@ -162,7 +171,7 @@ fn scoreDevice(cb: *const CB, a: std.mem.Allocator, cfg: Config, hidden: CT, mar
     const rows = try a.alloc(i64, markers.len);
     defer a.free(rows);
     for (markers, rows) |marker, *row| row.* = @max(marker, 0);
-    const gathered = try cb.embeddingLookup(hidden, rows, rows.len, dim);
+    const gathered = try gatherRows(cb, a, hidden, rows, dim);
     defer cb.free(gathered);
     const logits = try scorerLogits(cb, a, cfg, gathered, batch * count, dim);
     defer a.free(logits);
@@ -174,7 +183,7 @@ fn scoreDevice(cb: *const CB, a: std.mem.Allocator, cfg: Config, hidden: CT, mar
     const stats = try a.alloc(f32, batch * 4);
     defer a.free(stats);
     for (0..batch) |row| actionStats(logits[row * count ..][0..count], markers[row * count ..][0..count], stats[row * 4 ..][0..4]);
-    const anchored = try cb.embeddingLookup(hidden, anchors, batch, dim);
+    const anchored = try gatherRows(cb, a, hidden, anchors, dim);
     defer cb.free(anchored);
     const stats_ct = try cb.fromFloat32Shape(stats, &.{ @intCast(batch), 4 });
     defer cb.free(stats_ct);
@@ -350,7 +359,7 @@ fn packedHead(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, seg
     // Metal keeps the hidden states on the device; a full readback would
     // synchronize the frame and copy every row to score a few of them. The
     // pointer head scores on the host.
-    if (cb.kind() == .metal and cfg.decision_head == .scorer) {
+    if ((cb.kind() == .metal or cb.kind() == .wasm) and cfg.decision_head == .scorer) {
         for (anchors) |anchor| if (anchor < 0 or anchor >= rows) return error.InvalidLayaInputs;
         for (markers) |marker| if (marker >= rows) return error.InvalidLayaInputs;
         return scoreDevice(cb, a, cfg, hidden, markers, anchors, width, dim);
