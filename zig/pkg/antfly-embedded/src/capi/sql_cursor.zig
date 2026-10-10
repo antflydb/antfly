@@ -64,6 +64,7 @@ fn open(handle: *h.Handle, table_name: []const u8, request_json: []const u8) !u6
     if (request_json.len > 2 * 1024 * 1024 or table_name.len > 1024 or handle.sql_cursors.count() >= 64) return error.SqlProgramLimitExceeded;
     try @import("tables.zig").load(handle);
     try @import("sql_commit.zig").recover(handle);
+    try @import("sql_ddl.zig").recover(handle);
     const cursor = try handle.alloc.create(Cursor);
     errdefer handle.alloc.destroy(cursor);
     cursor.alloc = handle.alloc;

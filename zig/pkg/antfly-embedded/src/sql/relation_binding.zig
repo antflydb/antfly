@@ -146,7 +146,7 @@ pub const TargetResolveAdapter = struct {
     cache_sources: bool = false,
     source_tables: std.StringHashMapUnmanaged(catalog.Table) = .empty,
     pub fn iface(self: *@This()) catalog.Backend {
-        return .{ .ptr = self, .settings_view = self.backend.settings_view, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+        return .{ .ptr = self, .supports_search_relations = self.backend.supports_search_relations, .settings_view = self.backend.settings_view, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
     }
     fn resolve(ptr: *anyopaque, alloc: Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         // This adapter is only used while binding the read side of a mutation.
@@ -861,7 +861,7 @@ const Builder = struct {
         try self.backend.vtable.checkpoint(self.backend.ptr);
         return switch (input.*) {
             .table => |reference| blk: {
-                if (!reference.mutation_target and reference.name.database == null and reference.name.namespace == null) {
+                if (reference.search == null and !reference.mutation_target and reference.name.database == null and reference.name.namespace == null) {
                     var i = scope.len;
                     while (i != 0) {
                         i -= 1;
@@ -889,7 +889,36 @@ const Builder = struct {
                 const identity = try std.fmt.allocPrint(self.alloc, "{s}\x00{s}\x00{s}", .{ reference.name.database orelse "", reference.name.namespace orelse "", reference.name.table });
                 const entry = try self.identities.getOrPut(self.alloc, identity);
                 if (!entry.found_existing) entry.value_ptr.* = try self.backend.vtable.resolve(self.backend.ptr, self.alloc, reference.name, .read);
-                const table = entry.value_ptr.*;
+                var table = entry.value_ptr.*;
+                if (reference.search) |search| {
+                    if (!self.backend.supports_search_relations) return error.UnsupportedSqlExecution;
+                    if (reference.mutation_target) return error.UnsupportedSqlShape;
+                    const extra = [_]catalog.Column{
+                        .{ .name = "score", .path = "score", .type = .number },
+                        .{ .name = "_highlights", .path = "_highlights", .type = .json },
+                    };
+                    const augmented = try self.alloc.alloc(catalog.Column, table.columns.len + extra.len);
+                    @memcpy(augmented[0..table.columns.len], table.columns);
+                    for (extra) |column| for (table.columns) |existing| if (std.mem.eql(u8, column.name, existing.name)) return error.DuplicateSqlColumn;
+                    @memcpy(augmented[table.columns.len..], &extra);
+                    table.columns = augmented;
+                    if (search.request == .parameter) {
+                        const slot = search.request.parameter - 1;
+                        if (self.parameters[slot]) |kind| {
+                            if (kind != .string) return error.ConflictingSqlParameterTypes;
+                        }
+                        self.parameters[slot] = .string;
+                    }
+                    if (search.limit) |limit| {
+                        if (limit == .parameter) {
+                            const slot = limit.parameter - 1;
+                            if (self.parameters[slot]) |kind| {
+                                if (kind != .integer) return error.ConflictingSqlParameterTypes;
+                            }
+                            self.parameters[slot] = .integer;
+                        } else if (limit != .integer or limit.integer < 1 or limit.integer > 10000) return error.InvalidSqlParameters;
+                    }
+                }
                 if (reference.mutation_presence and !reference.mutation_target) return error.InvalidSqlBackendResponse;
                 const metadata_count: usize = if (!reference.mutation_target) 0 else if (reference.mutation_presence) 4 else 3;
                 const columns = try self.alloc.alloc(Column, table.columns.len + 1 + metadata_count);
@@ -900,7 +929,7 @@ const Builder = struct {
                     source_name.* = column.name;
                     field_name.* = column.path;
                 }
-                columns[table.columns.len] = .{ .name = "_id", .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = .string, .nullable = false, .visible = false };
+                columns[table.columns.len] = .{ .name = "_id", .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = .string, .nullable = false, .visible = reference.search != null };
                 for (@import("joined_mutation.zig").metadata_fields[0..metadata_count], 0..) |name, i| {
                     columns[table.columns.len + 1 + i] = .{ .name = name, .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = if (i == 2) .json else .string, .nullable = i == 2, .visible = false };
                     source_columns[table.columns.len + 1 + i] = name;
@@ -909,7 +938,12 @@ const Builder = struct {
                 source_columns[table.columns.len] = "_id";
                 const index = self.scans.items.len;
                 if (index >= 64) return error.SqlProgramLimitExceeded;
-                try self.scans.append(self.alloc, .{ .table = table, .request = .{ .fields = fields, .limit = 256, .include_primary_digest = reference.mutation_target, .include_document = reference.mutation_document and table.storage_mode == .document } });
+                const search_request = if (reference.search) |search| search_request: {
+                    const request = try self.alloc.create(catalog.Scan.Search);
+                    request.* = .{ .expression = search.* };
+                    break :search_request request;
+                } else null;
+                try self.scans.append(self.alloc, .{ .table = table, .request = .{ .search = search_request, .fields = fields, .limit = 256, .include_primary_digest = reference.mutation_target, .include_document = reference.mutation_document and table.storage_mode == .document } });
                 break :blk try self.node(columns, .{ .scan = .{ .index = index, .source_columns = source_columns } });
             },
             .derived => |query| blk: {

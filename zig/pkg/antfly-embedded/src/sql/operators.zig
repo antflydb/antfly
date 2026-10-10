@@ -662,6 +662,8 @@ pub const HashJoin = struct {
             if (row.len > 256 or (self.key_count != null and row.len != self.key_count.?)) return error.InvalidSqlBackendResponse;
             for (row) |value| needed +|= (try datumBytes(value)) *| 4;
         }
+        needed +|= self.value_columns.dictionaryGrowthBytes(batch.len()) *| 2;
+        needed +|= self.key_columns.dictionaryGrowthBytes(keys.len) *| 2;
         if (needed > self.budget.limit / 2 -| self.budget.live) return false;
         const hashes = try @import("batch_hash.zig").rows(a, keys, false);
         defer a.free(hashes);

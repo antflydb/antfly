@@ -54,7 +54,7 @@ fn predicateReferences(value: *const ast.Predicate, name: []const u8, depth: usi
 fn relationReferences(value: *const ast.Relation, name: []const u8, depth: usize) anyerror!usize {
     if (depth > 64) return error.SqlProgramLimitExceeded;
     return switch (value.*) {
-        .table => |table| @intFromBool(table.name.database == null and table.name.namespace == null and std.mem.eql(u8, table.name.table, name)),
+        .table => |table| @intFromBool(table.search == null and table.name.database == null and table.name.namespace == null and std.mem.eql(u8, table.name.table, name)),
         .derived => |derived| references(derived.query.*, name, depth + 1),
         .join => |join| try relationReferences(join.left, name, depth + 1) + try relationReferences(join.right, name, depth + 1) + if (join.condition) |condition| try scalarReferences(condition, name, depth + 1) else @as(usize, 0),
     };
