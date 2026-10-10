@@ -4352,7 +4352,9 @@ test "opaque context rejects invalid runtime contracts before allocation" {
     var context = client.Context{};
     try std.testing.expectError(error.InvalidAbiVersion, context.ensureWithRuntime(.{ .version = services.abi_version + 1 }));
     // Reject the old request prefix before inspecting its appended owner port.
-    try std.testing.expectError(error.InvalidAbiVersion, context.ensureWithRuntime(.{ .version = 1, .runnable_owner = @ptrFromInt(1) }));
+    const Owner = @import("antfly_runtime_abi").runnable_abi.Owner;
+    // An aligned, inaccessible sentinel can compile but must never be read.
+    try std.testing.expectError(error.InvalidAbiVersion, context.ensureWithRuntime(.{ .version = 1, .runnable_owner = @ptrFromInt(@alignOf(Owner)) }));
     try std.testing.expect(context.handle == null);
     const alloc = std.testing.allocator;
     var bridge = services.memory.Allocator.fromStd(&alloc);

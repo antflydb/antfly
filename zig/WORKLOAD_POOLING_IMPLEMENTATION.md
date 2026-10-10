@@ -2423,3 +2423,14 @@ qualification evidence despite its passing test summary. The Linux compiler
 reservation is now 4 GiB; native retains 3 GiB. Validation keeps the resource
 check and Linux cgroup limit enabled. Request memory accounting and runtime
 resource envelopes are independent outstanding requirements.
+
+### Storage runtime old-prefix rejection fixture
+
+Cumulative storage-owner compilation exposed a misaligned `@ptrFromInt(1)`
+fixture after the appended runnable owner became a typed pointer. The old-prefix
+rejection fixture now uses the owner type alignment as its inaccessible sentinel.
+It still requires `InvalidAbiVersion` before inspecting the appended owner, with
+no context created. This changes only the fixture; separately linked storage
+execution remains a cumulative integration gate. The observed streaming boolean
+score mismatch also remains unresolved and must not be hidden by loosening its
+exact score assertions.
