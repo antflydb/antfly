@@ -245,6 +245,26 @@ const AdaptiveOrdinalConstraints = struct {
     range: ?@import("ordinal_lookup.zig").Selection = null,
     range_first: u32 = 0,
     range_last: u32 = 0,
+    probe_window: ?u32 = null,
+    last_probe: ?u32 = null,
+    probes: usize = 0,
+    /// A point seek costs roughly a directory path; amortize a 1024-row
+    /// sequential translation only after enough competitive candidates arrive.
+    fn refineRange(self: *@This(), doc: u32) !void {
+        try self.refresh();
+        if (!self.deferred or (self.range != null and doc >= self.range_first and doc <= self.range_last)) return;
+        const base = doc & ~@as(u32, 1023);
+        if (self.probe_window == null or self.probe_window.? != base) {
+            self.probe_window = base;
+            self.last_probe = null;
+            self.probes = 0;
+        }
+        if (self.last_probe == null or self.last_probe.? != doc) {
+            self.probes += 1;
+            self.last_probe = doc;
+        }
+        if (self.probes > 16) try self.ensureRange(doc);
+    }
     fn clear(self: *@This()) void {
         if (self.include) |*bitmap| bitmap.deinit();
         if (self.exclude) |*bitmap| bitmap.deinit();
@@ -286,8 +306,8 @@ const AdaptiveOrdinalConstraints = struct {
         try self.refresh();
         if (self.include) |*bitmap| if (!bitmap.contains(doc)) return false;
         if (self.exclude) |*bitmap| if (bitmap.contains(doc)) return false;
-        try self.ensureRange(doc);
-        if (self.range) |*selection| {
+        if (self.range != null and doc >= self.range_first and doc <= self.range_last) {
+            const selection = &self.range.?;
             if (selection.include) |*bitmap| if (!bitmap.contains(doc)) return false;
             if (selection.exclude) |*bitmap| if (bitmap.contains(doc)) return false;
         }
@@ -312,6 +332,9 @@ const AdaptiveOrdinalConstraints = struct {
         self.budget = selected.budget;
         self.resolved = !selected.residual and !selected.deferred;
         self.deferred = selected.deferred;
+        self.probe_window = null;
+        self.last_probe = null;
+        self.probes = 0;
         self.revision = if (predicate.constraint_revision) |get| get(predicate.ptr) else 0;
     }
     fn refresh(self: *@This()) !void {
@@ -4911,7 +4934,6 @@ pub const SparseIndex = struct {
             }
             pub fn nextCandidate(ctx: *@This(), first: u32) !u64 {
                 try ctx.ordinals.refresh();
-                try ctx.ordinals.ensureRange(first);
                 const Bitmap = @import("../encoding/roaring.zig").RoaringBitmap;
                 var includes: [2]*const Bitmap = undefined;
                 var excludes: [2]*const Bitmap = undefined;
@@ -4926,7 +4948,8 @@ pub const SparseIndex = struct {
                     ne = 1;
                 }
                 var end: u64 = 0x1_0000_0000;
-                if (ctx.ordinals.range) |*selection| {
+                if (ctx.ordinals.range != null and first >= ctx.ordinals.range_first and first <= ctx.ordinals.range_last) {
+                    const selection = &ctx.ordinals.range.?;
                     end = @as(u64, ctx.ordinals.range_last) + 1;
                     if (selection.include) |*bitmap| {
                         includes[ni] = bitmap;
@@ -4938,6 +4961,12 @@ pub const SparseIndex = struct {
                     }
                 }
                 return Bitmap.candidateLowerBound(first, end, includes[0..ni], excludes[0..ne]);
+            }
+            /// Called only after score bounds admit the candidate. Sparse
+            /// winners may need just a few exact points, never an eager window.
+            pub fn refineCandidate(ctx: *@This(), first: u32) !u64 {
+                try ctx.ordinals.refineRange(first);
+                return ctx.nextCandidate(first);
             }
             pub fn mayMatch(ctx: *@This(), first: u32, last: u32) bool {
                 if (ctx.ordinals.include) |*bitmap| if (bitmap.rangeCardinality(first, @as(u64, last) + 1) == 0) return false;
@@ -4992,6 +5021,7 @@ pub const SparseIndex = struct {
                 for (decoded.doc_nums, 0..) |doc_num, di| {
                     try ctx.ordinals.refresh();
                     if (di % 256 == 0) try checkSearchCancellation(ctx.cancellation);
+                    try ctx.ordinals.refineRange(doc_num);
                     if (!try ctx.ordinals.allowsOrdinal(doc_num)) continue;
                     if (ctx.filter_doc_nums.count() > 0 and !ctx.filter_doc_nums.contains(doc_num)) continue;
                     if (ctx.direct_filter_doc_nums.count() > 0 and !ctx.direct_filter_doc_nums.contains(doc_num)) continue;
@@ -8290,6 +8320,7 @@ test "sparse lazy native windows intersect reached postings and preserve spill l
         rows: usize = 0,
         fallback: usize = 0,
         fail: bool = false,
+        all: bool = false,
         fn selected(key: []const u8) !bool {
             const row = try std.fmt.parseInt(u32, key[4..], 10);
             return row >= 9900 and row % 7 != 0;
@@ -8297,13 +8328,13 @@ test "sparse lazy native windows intersect reached postings and preserve spill l
         fn allows(raw: *anyopaque, key: []const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.fallback += 1;
-            return selected(key);
+            return self.all or try selected(key);
         }
         fn windowKey(raw: *anyopaque, value: []const u8) !bool {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.rows += 1;
             if (self.fail) return error.TestWindowFailed;
-            return selected(value);
+            return self.all or try selected(value);
         }
         fn select(_: *anyopaque, _: Allocator, _: OrdinalLookup) !?ordinals.Selection {
             return .{ .residual = true, .deferred = true };
@@ -8340,7 +8371,7 @@ test "sparse lazy native windows intersect reached postings and preserve spill l
         defer SparseIndex.freeResults(a, actual);
         try std.testing.expect(predicate.ranges <= 2);
         try std.testing.expect(predicate.rows <= 2048);
-        try std.testing.expectEqual(@as(usize, 0), predicate.fallback);
+        try std.testing.expect(predicate.fallback <= 32);
         try std.testing.expectEqual(expected.len, actual.len);
         for (expected, actual) |left, right| {
             try std.testing.expectEqualStrings(left.doc_id, right.doc_id);
@@ -8355,7 +8386,7 @@ test "sparse lazy native windows intersect reached postings and preserve spill l
     var predicate: Predicate = .{};
     const actual = try idx.searchConstrained(a, &query, 9, .{ .max_score_docs = 1, .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_constraints = Predicate.select, .select_range = Predicate.range } });
     defer SparseIndex.freeResults(a, actual);
-    try std.testing.expectEqual(@as(usize, 0), predicate.fallback);
+    try std.testing.expect(predicate.fallback <= 16 * 10);
     try std.testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |left, right| {
         try std.testing.expectEqualStrings(left.doc_id, right.doc_id);
@@ -8363,6 +8394,17 @@ test "sparse lazy native windows intersect reached postings and preserve spill l
     }
     predicate = .{ .fail = true };
     try std.testing.expectError(error.TestWindowFailed, idx.searchConstrained(a, &query, 9, .{ .key_predicate = .{ .ptr = &predicate, .allows = Predicate.allows, .select_constraints = Predicate.select, .select_range = Predicate.range } }));
+    // Once these nine equal-score winners fill top-k, every later block is
+    // noncompetitive. No 1024-row window may be translated before that proof.
+    const broad_query: SparseVector = .{ .indices = &.{1}, .values = &.{1} };
+    var broad: Predicate = .{ .all = true };
+    const ranked = try idx.searchConstrained(a, &broad_query, 9, .{ .key_predicate = .{ .ptr = &broad, .allows = Predicate.allows, .select_constraints = Predicate.select, .select_range = Predicate.range } });
+    defer SparseIndex.freeResults(a, ranked);
+    try std.testing.expectEqual(@as(usize, 9), ranked.len);
+    for (ranked, 0..) |hit, i| try std.testing.expectEqualStrings(writes[i].doc_id, hit.doc_id);
+    try std.testing.expectEqual(@as(usize, 9), broad.fallback);
+    try std.testing.expectEqual(@as(usize, 0), broad.rows);
+    try std.testing.expectEqual(@as(usize, 0), broad.ranges);
     // Old generations without a complete directory proof retain exact keys.
     // Disabling DAAT also forces spill with a one-score memory allowance.
     var txn = try idx.beginWriteTxn();

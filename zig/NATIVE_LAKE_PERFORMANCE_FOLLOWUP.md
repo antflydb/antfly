@@ -968,10 +968,13 @@ clause order; a one-document native mask has the same work bound.
 Sparse planning retains the existing 4 MiB compressed-mask allowance. Generations
 with native ordinal-window support eagerly translate at most 64 physical directory
 blocks; legacy generations retain their 4,096-block/point planning allowance.
-Exhaustion discards every partial mask. Complete memberships then translate only
-reached 1,024-ordinal windows using a sequential reverse-identity cursor in the same
-pinned read transaction. Include/exclude membership is applied together and the
-window is prepared for bitmap seeks. The query retains one reusable window arena;
+Exhaustion discards every partial mask. Score bounds run before deferred identity
+refinement. The first 16 distinct competitive candidates in each aligned window
+use exact borrowed-cursor point checks; only denser competitive work triggers a
+1,024-ordinal translation using a sequential reverse-identity cursor in the same
+pinned read transaction. The threshold is a bounded cost heuristic, not an
+archive-specific throughput claim. Include/exclude membership is applied together,
+and the window is prepared for bitmap seeks. The query retains one reusable window arena;
 changing windows and membership revisions invalidate its mask. An empty window
 advances posting navigation to its boundary, allowing a rare posting to jump over
 intervening directory windows. No archive-wide complement or matching-ID list is
@@ -979,34 +982,51 @@ built. Missing completeness proofs retain exact per-candidate predicates; storag
 cancellation and allocation errors propagate. Streaming and bounded spill scoring
 share this constraint state and preserve canonical quantized signed arithmetic.
 
-Supported Boolean scoring on query-bound remote snapshots with multiple segments
-and at least 4,096 documents uses the shared CPU/I/O scheduler. The most promising
-segment seeds the global cutoff. At most four lanes own separate field readers,
-position buffers and heaps bounded by the requested page window. Each lane has an 8 MiB live scratch
+Supported Boolean scoring on query-bound remote snapshots with at least 4,096
+documents uses the shared CPU/I/O scheduler when there are multiple admitted work
+ranges. A corpus-scaled grain creates at most 4,096 ranges plus one per segment,
+with a minimum grain of 4,096 rows; a single large segment can use multiple lanes.
+The first planned range seeds the global cutoff. Workers claim disjoint ranges from one atomic queue, so uneven segments do not strand work
+on fixed lanes. At most four lanes own separate field readers, position buffers
+and heaps bounded by the requested page window. Each lane has an 8 MiB live scratch
 allowance; scheduler admission accounts concurrent lanes within a 32 MiB operator
 allowance for lane workspaces. Request-owned planning/statistics, seed scratch,
 the global result heap and independently bounded read caches are separate. A
 cancellation-aware blocking coordinator serializes adaptive producer calls and
 winner admission, so query-owned providers and their stored request allocators
-are never accessed concurrently. The global winner heap is reserved before workers start, and its
-atomic score/document-ID cutoff lets other lanes prune conservatively. Completed
-provider masks also publish once through atomics, avoiding per-document coordinator
+are never accessed concurrently. The global winner heap is reserved before workers
+start, and its atomic score/document-ID cutoff lets other lanes prune
+conservatively. Running lanes check for a stronger cutoff every 128 candidate
+visits after flushing adaptive membership batches, without merging duplicate
+winners. Cutoffs only improve and always represent at least `k + offset` unique
+admitted hits. Completed provider masks also publish once through atomics, avoiding per-document coordinator
 locks during posting navigation. Local counts and diagnostics merge only after a
-segment succeeds. Explicit worker cap
-exhaustion discards partial local results and retries that segment on the caller;
-ordinary allocation errors propagate. Saturation runs required work inline. Every
+range succeeds. Explicit worker cap exhaustion discards partial local results and
+retries that entire range on the caller after all workers join. A retry uses only
+retained global winners, so it recovers discarded local winners even when their
+published cutoff pruned other ranges. Ordinary allocation errors propagate. Saturation runs required work inline. Every
 exit joins or cancels outstanding tasks before releasing snapshot/statistics state
 and scheduler leases. Small or unbound snapshots retain serial scoring.
 
 Ranked native search-after requests admit only hits strictly following the cursor
 into a heap of at most `k + offset`; matching hits before the cursor still contribute
 to total-hit accounting. Supported leaves compose with the Boolean scorer instead
-of requesting an all-hit window. Distributed BM25 field/term statistics are loaded
-once, shared read-only by workers and used for both scores and bounds. An analyzed
+of requesting an all-hit window. Distributed BM25 field/term statistics are shared
+read-only by workers and used for both scores and bounds. Complete distributed
+contexts skip redundant local document-frequency requests, including cold
+segment dictionary reads; only contexts requiring authoritative local fallback
+load local frequencies. Constant-score positional alternatives do not load local
+BM25 frequencies. Phrase nodes reuse the query's cached field average. An analyzed
 match uses an override only when it covers every analyzed term, preserving the
 previous partial-statistics fallback, zero-frequency segment fallback and corpus
 frequency clamping. Existing distributed phrase constant-score semantics remain
-unchanged. Aggregations and fuzzy positional expansion retain
+unchanged. Locally scored exact phrases compose authenticated posting-block
+frequency/norm ceilings through the earliest constituent block fence, skipping
+noncompetitive position records. The first term bounds the number of starts and
+supplies the scoring norm; later terms bound presence and range only, preserving
+stacked duplicate positions. Saturated frequency metadata is widened
+conservatively. Missing legacy metadata and signed subtrees retain conservative
+bounds. Aggregations and fuzzy positional expansion retain
 the established authoritative paths. Competitive pruning continues reporting
 lower-bound totals.
 
@@ -1019,34 +1039,48 @@ threaded scoring, scheduler saturation, worker cap retries, provider/read errors
 cancellation and allocation-failure ownership. Representative 50-million-row
 throughput and peak process RSS still require separate measurement.
 
-### Qualification of the two-phase/lazy-window/parallel refinement
+### Qualification of competitive refinement and shared range scheduling
 
-`origin/main` at `f599f36da5` is included; a fresh fetch found no newer main
-commits. The generated control source catalog matches the current ownership
-graph. Qualification uses Zig 0.17.0.
+`origin/main` at `551b8b3895` is included through merge commit `a31e0cf0e3`,
+without conflicts. A fresh fetch after qualification found no newer main commits.
+The generated control source catalog matches the current ownership graph.
+Qualification uses Zig 0.17.0.
 
-- Debug: 67 sparse, 26 focused text/scorer and six API tests passed with no
+- Debug: 67 sparse, 29 focused text/scorer and six API tests passed with no
   failures or leaks; one optimized-only benchmark skipped.
-- ReleaseFast: 67 sparse, 394 bounded-reader, 27 text/scorer and six API tests
-  passed with no failures or leaks. The sparse regression explicitly removes
-  the complete-map proof and supplies a one-score memory allowance plus spill
-  I/O to exercise the legacy disk-spill path.
-- The phrase fixture contains 9,999 documents with the right terms in the wrong
-  positions, followed by one exact match. Both required-clause orders and native
-  bitmap gating verify only that final document and read two position records.
-- Threaded native scoring preserves exact winners/scores and publishes completed
-  masks after the twentieth producer batch, without stale extra producer calls.
-  Scheduler saturation runs inline; injected cap exhaustion retries every
-  uncommitted segment. Read/provider errors and cancellation release all worker
-  and byte leases. Cursor regressions preserve standalone and nested score
-  arithmetic, ties and offsets across complete, partial, zero and overcount
-  distributed statistics.
+- ReleaseFast: 67 sparse, 397 bounded-reader, 30 focused text/scorer and six API
+  tests passed with no failures or leaks (500 checks across these suites).
+- The forced-deferred 10,000-row broad sparse regression returns nine exact
+  winners with nine identity checks and zero translated rows/windows. Dense
+  competitive candidates still amortize window translation. Rare postings,
+  includes/exclusions, signed/zero scores, deleted rows and legacy proofs retain
+  differential checks. Removing the complete-map proof and supplying a one-score
+  allowance plus spill I/O exercises the legacy disk-spill path.
+- An 8,192-row phrase regression preserves exact IDs/scores while decoding at
+  most 3,072 position records, one 1,024-row impact range across three terms.
+  Duplicate first-term starts can share later-term occurrences; the authenticated
+  ceiling remains conservative. Negative/zero boosts and missing block metadata
+  retain exact reference results. Saturated frequency tests cover legacy,
+  byte-ID and packed metadata. The earlier selective-conjunction fixture still
+  verifies one document and reads two position records in either clause order.
+- A single 12,288-row query-bound segment splits into three ranges and uses
+  parallel lanes after its bounded seed. Differential checks cover deleted rows,
+  signed/zero boosts, ties and cursor offsets. A lane publishes a cutoff before
+  global winner admission; discarding its local winners, scoring another range,
+  and retrying serially recovers the exact reference ranking. Explicit cap
+  exhaustion, scheduler saturation, provider/read errors and cancellation retain
+  lease/ownership checks. Completed provider masks publish without stale batches.
+- A failing cold read context proves complete distributed statistics and
+  constant positional alternatives skip local frequency requests. Partial match
+  overrides still request authoritative local statistics. Cursor regressions
+  cover complete, partial, zero and overcount statistics and preserve standalone
+  and nested f32 score arithmetic.
 - The production Debug server builds. All four real-data E2Es passed against it
-  in 183.78 seconds: independent Iceberg snapshots/schema IDs/partitions/deletes
+  in 185.03 seconds: independent Iceberg snapshots/schema IDs/partitions/deletes
   and restart; 70,003-row Parquet and Iceberg indexed includes/exclusions,
   signed/zero sparse ranking, positional conjunctions, sorting/cursor pages and
   persistence; quantized sparse score/ranking preservation. Iceberg remains in
   `e2e-full`; the entire suite was not run.
-- Zig formatting, Python lint/formatting, generated catalog equality and
-  `git diff --check` passed. Archive-scale throughput and peak process RSS remain
-  unmeasured.
+- Zig formatting, generated catalog equality and `git diff --check` passed.
+  Representative 50-million-row cold/warm throughput and peak process RSS remain
+  unmeasured; work-count regressions do not replace archive-scale benchmarks.

@@ -3004,6 +3004,15 @@ pub const BlockMaxInfo = struct {
         return null;
     }
 
+    /// Authenticated scalar ceilings for composing positional score bounds.
+    /// A saturated frequency is widened because postings can exceed u16.
+    pub fn frequencyNormAtOrdinal(self: BlockMaxInfo, ordinal: usize) ?struct { frequency: u32, norm: u32 } {
+        if (ordinal >= self.chunkCount()) return null;
+        const offset = if (self.packed_impact_frequency) ordinal else ordinal * self.recordSize();
+        const frequency = self.maxFreqAt(offset);
+        return .{ .frequency = if (frequency == std.math.maxInt(u16)) std.math.maxInt(u32) else frequency, .norm = self.minNormAt(offset) };
+    }
+
     /// Compute the maximum possible BM25 impact for a chunk.
     /// Uses the most favorable values in the chunk: max_freq and min_norm (shortest doc).
     pub fn maxImpact(self: BlockMaxInfo, chunk_idx: u32, doc_count: u32, doc_freq: u32, avg_dl: f32, config: BM25Config) f32 {
@@ -7811,6 +7820,17 @@ test "v29 impact frequency escape remains a conservative upper bound" {
     try std.testing.expectEqual(std.math.maxInt(u8), impactMaxFreqToId(4096));
     try std.testing.expectEqual(@as(u16, 254), impactMaxFreqFromId(254));
     try std.testing.expectEqual(std.math.maxInt(u16), impactMaxFreqFromId(std.math.maxInt(u8)));
+    // Positional frequencies use u32. Escapes must cover values beyond the
+    // legacy u16 scoring domain, for every supported metadata representation.
+    const legacy: BlockMaxInfo = .{ .meta = &.{ 255, 255, 37, 0, 61, 0 }, .chunk_size = 128, .chunk_meta_data = &.{}, .chunk_meta_count = 1, .version = wire_version_legacy };
+    const byte_ids: BlockMaxInfo = .{ .meta = &.{ 255, 7 }, .chunk_size = 128, .chunk_meta_data = &.{}, .chunk_meta_count = 1, .version = wire_version_separate_impact_ranges };
+    const packed_limits: BlockMaxInfo = .{ .meta = &.{ 31, 7 }, .chunk_size = 128, .chunk_meta_data = &.{}, .chunk_meta_count = 1, .version = wire_version_packed_impact_frequency, .packed_impact_frequency = true };
+    for ([_]BlockMaxInfo{ legacy, byte_ids, packed_limits }) |metadata| {
+        const limits = metadata.frequencyNormAtOrdinal(0).?;
+        try std.testing.expectEqual(std.math.maxInt(u32), limits.frequency);
+        try std.testing.expectEqual(if (metadata.version == wire_version_legacy) @as(u32, 37) else fieldNormFromId(7), limits.norm);
+        try std.testing.expect(metadata.frequencyNormAtOrdinal(1) == null);
+    }
 }
 
 test "v29 adaptive impact IDs use runs and round-trip" {

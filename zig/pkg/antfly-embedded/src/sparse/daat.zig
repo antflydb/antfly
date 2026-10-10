@@ -317,6 +317,17 @@ pub fn collect(a: A, streams: []Stream, k: usize, context: anytype, stats: *Stat
                 continue;
             }
         }
+        // Expensive identity windows are a second phase: rejected score
+        // ranges never cause directory reads or candidate predicate probes.
+        if (comptime @hasDecl(@typeInfo(@TypeOf(context)).pointer.child, "refineCandidate")) {
+            const candidate = try context.refineCandidate(doc);
+            if (candidate > doc) {
+                _ = queue.pop();
+                try streams[first].seek(candidate);
+                if (streams[first].doc != null) try queue.push(a, first);
+                continue;
+            }
+        }
         var score: f32 = 0;
         var matched = false;
         while (queue.peek()) |i| {
