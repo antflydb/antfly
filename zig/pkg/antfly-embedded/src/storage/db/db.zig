@@ -59028,6 +59028,10 @@ test "db controlled mutation admission rejects before effects and releases servi
     defer cleanupTempDir(path);
     var db = try DB.open(alloc, std.mem.span(path), .{});
     defer db.close();
+    // Measure per-mutation checkpoints after one-time startup recovery. Cold
+    // startup admission has its own physical fixture; counting its checks here
+    // would make later warm mutations appear to miss a lifetime inspection.
+    try db.ensureDurableReplicationStartupBarrier();
     const State = struct {
         checks: usize = 0,
         fail_at: usize = std.math.maxInt(usize),
