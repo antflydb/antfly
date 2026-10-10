@@ -163,10 +163,20 @@ test "mutation root lease explicit nested admission bypasses writer gate and joi
     try std.testing.expect(barrier.reader_gate.tryLock());
     var gate_held = true;
     defer if (gate_held) barrier.reader_gate.unlock();
-    var first = (try admission.acquireReplicationMutationShared(&owner, null)).?;
+    const Original = struct {
+        fn check(_: *const anyopaque) !void {}
+        fn rejectWait(_: *anyopaque) !void {
+            return error.UnexpectedMutationRootWait;
+        }
+    };
+    const original: Apply.Acquisition = .{
+        .lifetime = .{ .context = &controls, .check_fn = Original.check },
+        .execution_wait = .{ .ptr = &controls, .begin = Original.rejectWait, .end = Original.rejectWait },
+    };
+    var first = (try admission.acquireReplicationMutationShared(&owner, original)).?;
     var first_held = true;
     defer if (first_held) first.release();
-    var second = (try admission.acquireReplicationMutationSharedScoped(&owner, null, &root)).?;
+    var second = (try admission.acquireReplicationMutationSharedScoped(&owner, original, &root)).?;
     var second_held = true;
     defer if (second_held) second.release();
     try std.testing.expectEqual(@as(usize, 1), barrier.reader_count);
