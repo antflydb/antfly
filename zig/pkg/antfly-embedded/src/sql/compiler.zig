@@ -1901,8 +1901,74 @@ const Parser = struct {
                 } else return self.fail(error.InvalidSqlSyntax, "primary key references an unknown column");
             }
         };
+        try self.normalizeUniqueConstraints(&constraints);
         try self.disambiguateGeneratedConstraintLabels(constraints.items);
         return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .constraints = try constraints.toOwnedSlice(self.alloc), .if_not_exists = if_not_exists, .tablespace = tablespace };
+    }
+
+    /// Match PostgreSQL's CREATE index-constraint normalization before name
+    /// selection: PRIMARY wins equivalent UNIQUE declarations; otherwise the
+    /// first equivalent index wins. A named duplicate can supply an anonymous
+    /// survivor's name. Policy differences and ordered keys remain distinct.
+    fn normalizeUniqueConstraints(self: *Parser, constraints: *std.ArrayList(ast.SchemaChange)) Error!void {
+        const Rule = @FieldType(ast.SchemaChange, "add_unique");
+        const Context = struct {
+            pub fn hash(_: @This(), rule: Rule) u64 {
+                var digest = std.hash.Wyhash.init(0);
+                digest.update(&.{ @intFromBool(rule.nulls_not_distinct), @intFromBool(rule.deferrable) });
+                digest.update(rule.timing);
+                var length: [8]u8 = undefined;
+                for (rule.columns) |column| {
+                    std.mem.writeInt(u64, &length, column.len, .little);
+                    digest.update(&length);
+                    digest.update(column);
+                }
+                return digest.final();
+            }
+            pub fn eql(_: @This(), left: Rule, right: Rule) bool {
+                if (left.nulls_not_distinct != right.nulls_not_distinct or left.deferrable != right.deferrable or
+                    !std.mem.eql(u8, left.timing, right.timing) or left.columns.len != right.columns.len) return false;
+                for (left.columns, right.columns) |l, r| if (!std.mem.eql(u8, l, r)) return false;
+                return true;
+            }
+        };
+        var count: usize = 0;
+        for (constraints.items) |constraint| if (constraint == .add_unique) {
+            count += 1;
+        };
+        if (count < 2) return;
+        var indexes: std.HashMapUnmanaged(Rule, usize, Context, 80) = .empty;
+        defer indexes.deinit(self.alloc);
+        // Grow with distinct indexes, not redundant declarations. Thousands
+        // of equivalent clauses should not preallocate thousands of entries.
+        try indexes.ensureTotalCapacity(self.alloc, @intCast(@min(count, 16)));
+        const keep = try self.alloc.alloc(bool, constraints.items.len);
+        defer self.alloc.free(keep);
+        @memset(keep, true);
+        // Seed PRIMARY first even if it was declared after a UNIQUE.
+        for (constraints.items, 0..) |constraint, index| if (constraint == .add_unique and constraint.add_unique.primary) {
+            indexes.putAssumeCapacity(constraint.add_unique, index);
+        };
+        for (constraints.items, 0..) |constraint, index| {
+            if (constraint != .add_unique or constraint.add_unique.primary) continue;
+            const slot = try indexes.getOrPut(self.alloc, constraint.add_unique);
+            if (!slot.found_existing) {
+                slot.value_ptr.* = index;
+                continue;
+            }
+            const survivor = &constraints.items[slot.value_ptr.*].add_unique;
+            if (survivor.name_generated and !constraint.add_unique.name_generated) {
+                survivor.name = constraint.add_unique.name;
+                survivor.name_generated = false;
+            }
+            keep[index] = false;
+        }
+        var length: usize = 0;
+        for (constraints.items, keep) |constraint, retained| if (retained) {
+            constraints.items[length] = constraint;
+            length += 1;
+        };
+        constraints.items.len = length;
     }
 
     /// These are compiler identities, not final catalog names. Reserve every

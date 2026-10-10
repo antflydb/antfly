@@ -341,6 +341,102 @@ test "SQL DDL duplicate explicit constraint names remain definite rejection" {
     try std.testing.expectError(error.SqlConstraintAlreadyExists, createSchemaAlloc(std.testing.allocator, compiled.statement.create_table));
 }
 
+test "SQL DDL normalizes equivalent index constraints without merging different policies" {
+    const cases = [_]struct { sql: []const u8, count: usize, primary: bool = false, explicit: ?[]const u8 = null }{
+        .{ .sql = "CREATE TABLE t (id BIGINT PRIMARY KEY UNIQUE)", .count = 1, .primary = true },
+        .{ .sql = "CREATE TABLE t (id BIGINT UNIQUE PRIMARY KEY)", .count = 1, .primary = true },
+        .{ .sql = "CREATE TABLE t (id BIGINT PRIMARY KEY CONSTRAINT named UNIQUE)", .count = 1, .primary = true, .explicit = "named" },
+        .{ .sql = "CREATE TABLE t (id BIGINT CONSTRAINT named UNIQUE PRIMARY KEY)", .count = 1, .primary = true, .explicit = "named" },
+        .{ .sql = "CREATE TABLE t (id BIGINT CONSTRAINT first UNIQUE CONSTRAINT second UNIQUE)", .count = 1, .explicit = "first" },
+        .{ .sql = "CREATE TABLE t (id BIGINT UNIQUE CONSTRAINT named UNIQUE)", .count = 1, .explicit = "named" },
+        .{ .sql = "CREATE TABLE t (a BIGINT, b BIGINT, UNIQUE (a, b), UNIQUE (b, a))", .count = 2 },
+        .{ .sql = "CREATE TABLE t (id BIGINT UNIQUE NULLS DISTINCT UNIQUE NULLS NOT DISTINCT)", .count = 2 },
+        .{ .sql = "CREATE TABLE t (id BIGINT UNIQUE DEFERRABLE INITIALLY IMMEDIATE UNIQUE DEFERRABLE INITIALLY DEFERRED)", .count = 2 },
+        .{ .sql = "CREATE TABLE t (id BIGINT UNIQUE UNIQUE DEFERRABLE)", .count = 2 },
+    };
+    for (cases) |case| {
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        const create = compiled.statement.create_table;
+        try std.testing.expectEqual(case.count, create.constraints.len);
+        if (case.count == 1) {
+            try std.testing.expectEqual(case.primary, create.constraints[0].add_unique.primary);
+            if (case.explicit) |explicit| {
+                try std.testing.expectEqualStrings(explicit, create.constraints[0].add_unique.name);
+                try std.testing.expect(create.constraints[0].generatedConstraintName() == null);
+            }
+        }
+        const bytes = try createSchemaAlloc(std.testing.allocator, create);
+        defer std.testing.allocator.free(bytes);
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.count, parsed.value.object.get("unique_constraints").?.array.items.len);
+    }
+}
+
+test "SQL DDL equivalent index normalization transfers explicit provenance with allocation safety" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var compiled = try @import("compiler.zig").compile(a, "CREATE TABLE t (id BIGINT UNIQUE CONSTRAINT selected UNIQUE PRIMARY KEY, CHECK (id > 0))", .{});
+            defer compiled.deinit();
+            const create = compiled.statement.create_table;
+            try std.testing.expectEqual(@as(usize, 2), create.constraints.len);
+            try std.testing.expect(create.constraints[0].add_unique.primary);
+            try std.testing.expectEqualStrings("selected", create.constraints[0].add_unique.name);
+            try std.testing.expect(create.constraints[0].generatedConstraintName() == null);
+            const bytes = try createSchemaAlloc(a, create);
+            defer a.free(bytes);
+            const names = try generatedConstraintNamesAlloc(a, create);
+            defer a.free(names);
+            try std.testing.expectEqual(@as(usize, 1), names.len);
+            try std.testing.expectEqualStrings(create.constraints[1].generatedConstraintName().?, names[0]);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL DDL redundant declarations do not amplify published constraint schemas" {
+    const a = std.testing.allocator;
+    var baseline: ?[]u8 = null;
+    defer if (baseline) |bytes| a.free(bytes);
+    for ([_]usize{ 64, 1024 }) |count| {
+        var sql = std.Io.Writer.Allocating.init(a);
+        defer sql.deinit();
+        try sql.writer.writeAll("CREATE TABLE t (id BIGINT PRIMARY KEY");
+        for (0..count) |index| try sql.writer.print(" CONSTRAINT u{d} UNIQUE", .{index});
+        try sql.writer.writeAll(")");
+        var compiled = try @import("compiler.zig").compile(a, sql.written(), .{});
+        defer compiled.deinit();
+        const create = compiled.statement.create_table;
+        try std.testing.expectEqual(@as(usize, 1), create.constraints.len);
+        try std.testing.expect(create.constraints[0].add_unique.primary);
+        try std.testing.expectEqualStrings("u0", create.constraints[0].add_unique.name);
+        const bytes = try createSchemaAlloc(a, create);
+        if (baseline) |expected| {
+            defer a.free(bytes);
+            try std.testing.expectEqualStrings(expected, bytes);
+        } else baseline = bytes;
+    }
+}
+
+test "SQL DDL distinct-index normalization growth is allocation safe" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator, source: []const u8) !void {
+            var compiled = try @import("compiler.zig").compile(a, source, .{});
+            defer compiled.deinit();
+            try std.testing.expectEqual(@as(usize, 32), compiled.statement.create_table.constraints.len);
+        }
+    };
+    var sql = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer sql.deinit();
+    try sql.writer.writeAll("CREATE TABLE t (");
+    for (0..32) |index| try sql.writer.print("{s}c{d} BIGINT UNIQUE", .{ if (index == 0) "" else ", ", index });
+    try sql.writer.writeAll(")");
+    try Fixture.run(std.testing.allocator, sql.written());
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{sql.written()});
+}
+
 test "SQL TRUNCATE lowers complete table set and honest durable admission receipt" {
     const Fake = struct {
         fn ddl(_: *anyopaque, _: std.mem.Allocator, request: catalog.Ddl) !catalog.DdlOutcome {

@@ -481,3 +481,31 @@ occupancy root is not evidence that a name is free. Concurrent conflicts must
 produce definite nonadmission or a retained uncertain receipt, never ambiguous
 automatic replay. The new oracle/component tests do not establish that this
 public native integration or distributed activation is complete.
+
+### Normalize index declarations before catalog naming
+
+CREATE now collapses equivalent PRIMARY/UNIQUE declarations before schema
+lowering, following PostgreSQL's index-constraint normalization. PRIMARY is
+the preferred survivor even if textually later; otherwise the first equivalent
+declaration survives. An explicit duplicate can supply an anonymous survivor's
+name and clears its generated-name provenance. Ordered keys, NULL-distinct
+policy, deferrability and initial timing are part of equivalence, so differing
+enforcement domains never collapse. This concerns CREATE declarations only,
+not reuse of pre-existing indexes during ALTER.
+
+The normalizer uses hashed structural keys and grows its scratch index with
+distinct declarations, not total duplicates. Compaction preserves unrelated
+CHECK/FK declarations. Native tests cover explicit-name transfer and allocation
+faults, 32 distinct indexes, and identical single-constraint schema output from
+64 versus 1,024 redundant declarations. The focused SQL DDL gate passes ten
+tests in both Debug and ReleaseFast. These are schema-shape/access-bound tests,
+not measured native write-throughput or physical-disk benchmarks.
+
+PostgreSQL 18 passes all twelve catalog oracle tests, including independent
+constraint/index counts and policy/name-transfer checks for ten normalization
+profiles. The prior temporary PostgreSQL 19 installation is missing; no new
+19 certification is claimed for this checkpoint. An earlier broad optimized
+SQL gate passes 701 local and 226 native tests; a fresh broad gate for the final
+distinct-key growth change is running. The separate mounted catalog campaign
+and coordinator CPU-backed gates remain pending. Original dispositions and
+production occupancy activation remain unchanged.

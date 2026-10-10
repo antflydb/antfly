@@ -28,6 +28,80 @@ from psycopg import sql as pgsql
 
 
 class IndexLifecycleTest(unittest.TestCase):
+    def test_equivalent_index_constraints_normalize_before_final_name_selection(self):
+        # Name, kind, deferrable, initially deferred, NULLS NOT DISTINCT.
+        cases = (
+            ("id BIGINT PRIMARY KEY UNIQUE", [("t_pkey", "p", False, False, False)]),
+            ("id BIGINT UNIQUE PRIMARY KEY", [("t_pkey", "p", False, False, False)]),
+            (
+                "id BIGINT PRIMARY KEY CONSTRAINT named UNIQUE",
+                [("named", "p", False, False, False)],
+            ),
+            (
+                "id BIGINT CONSTRAINT named UNIQUE PRIMARY KEY",
+                [("named", "p", False, False, False)],
+            ),
+            (
+                "id BIGINT CONSTRAINT first UNIQUE CONSTRAINT second UNIQUE",
+                [("first", "u", False, False, False)],
+            ),
+            (
+                "id BIGINT UNIQUE CONSTRAINT named UNIQUE",
+                [("named", "u", False, False, False)],
+            ),
+            (
+                "a BIGINT, b BIGINT, UNIQUE (a, b), UNIQUE (b, a)",
+                [
+                    ("t_a_b_key", "u", False, False, False),
+                    ("t_b_a_key", "u", False, False, False),
+                ],
+            ),
+            (
+                "id BIGINT UNIQUE NULLS DISTINCT UNIQUE NULLS NOT DISTINCT",
+                [
+                    ("t_id_key", "u", False, False, False),
+                    ("t_id_key1", "u", False, False, True),
+                ],
+            ),
+            (
+                "id BIGINT UNIQUE DEFERRABLE INITIALLY IMMEDIATE UNIQUE DEFERRABLE INITIALLY DEFERRED",
+                [
+                    ("t_id_key", "u", True, False, False),
+                    ("t_id_key1", "u", True, True, False),
+                ],
+            ),
+            (
+                "id BIGINT UNIQUE UNIQUE DEFERRABLE",
+                [
+                    ("t_id_key", "u", False, False, False),
+                    ("t_id_key1", "u", True, False, False),
+                ],
+            ),
+        )
+        with postgres() as db:
+            for definition, expected in cases:
+                with self.subTest(definition=definition):
+                    db.execute("CREATE TABLE public.t (" + definition + ")")
+                    try:
+                        self.assertEqual(
+                            expected,
+                            db.execute(
+                                "SELECT c.conname, c.contype, c.condeferrable, c.condeferred, "
+                                "i.indnullsnotdistinct FROM pg_constraint c "
+                                "JOIN pg_index i ON i.indexrelid=c.conindid "
+                                "WHERE c.conrelid='public.t'::regclass "
+                                "AND c.contype IN ('p', 'u') ORDER BY c.conname"
+                            ).fetchall(),
+                        )
+                        self.assertEqual(
+                            len(expected),
+                            db.execute(
+                                "SELECT count(*) FROM pg_index WHERE indrelid='public.t'::regclass"
+                            ).fetchone()[0],
+                        )
+                    finally:
+                        db.execute("DROP TABLE public.t")
+
     def test_generated_unique_names_clip_balanced_utf8_and_composite_prefixes(self):
         cases = (
             ("a" * 63, ("b" * 63,), False, False, "a" * 29 + "_" + "b" * 29 + "_key"),
