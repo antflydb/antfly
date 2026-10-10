@@ -1000,3 +1000,21 @@ maintenance-lifetime and shared SQL-worker regressions do not execute distribute
 CLI startup. The exact descendant executable, linked archive, startup failure
 and physical shutdown gates remain required before this wiring or defaults are
 qualified. Recurring callback CPU adoption remains a separate incomplete gate.
+
+### Shared recurring owner shutdown joins
+
+Graph cleanup and quarantine recovery now publish one terminal join event after
+the detached scheduler registration has physically joined. A second concurrent
+shutdown caller waits for that event rather than treating the empty registration
+as completed retirement. Admission remains permanently fenced, and the joining
+caller releases the lifecycle mutex before waiting so callbacks can complete
+their final ownership handshake. No-work/manual-runtime shutdown also publishes
+the event before unlocking admission.
+
+Two physical recurring callback fixtures hold the callback open while two stop
+callers run concurrently. They require both callers to remain pending, scheduler
+active accounting to remain retained, and both callers to finish only after the
+callback resumes, takes its lifecycle lock and physically joins. These lifetime
+checks are prerequisites for shared CPU adoption; neither callback has yet been
+migrated to explicit runnable stage authority. Defaults and full integration
+remain unqualified.

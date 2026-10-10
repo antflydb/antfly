@@ -6,4 +6,6 @@ pub const consumer_tests_only = true;
 test {
     _ = @import("storage/db/independent_maintenance.zig");
     _ = @import("common/maintenance_scheduler.zig");
+    _ = @import("storage/db/graph_cleanup_owner.zig");
+    _ = @import("storage/db/quarantine_recovery.zig");
 }

@@ -22,6 +22,8 @@ pub const Owner = struct {
     mutex: std.atomic.Mutex = .unlocked,
     registration: ?runtime.MaintenanceScheduler.Handle = null,
     stopping: std.atomic.Value(bool) = .init(false),
+    stop_started: bool = false,
+    joined: std.Io.Event = .unset,
     fn lock(self: *Owner) void {
         while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
     }
@@ -41,14 +43,29 @@ pub const Owner = struct {
     }
     pub fn stop(self: *Owner, io: ?std.Io) void {
         self.lock();
+        if (self.stop_started) {
+            self.mutex.unlock();
+            // Detachment transfers join ownership; it does not retire the
+            // callback. Every shutdown caller waits for the same physical join.
+            if (io) |lane| self.joined.waitUncancelable(lane) else std.debug.assert(self.joined.isSet());
+            return;
+        }
+        self.stop_started = true;
         self.stopping.store(true, .release);
         var task = self.registration;
         self.registration = null;
+        if (task == null) {
+            if (io) |lane| self.joined.set(lane) else @atomicStore(std.Io.Event, &self.joined, .is_set, .release);
+            self.mutex.unlock();
+            return;
+        }
         self.mutex.unlock();
-        if (task) |*handle| handle.await(io.?);
-        self.lock();
-        self.mutex.unlock();
+        // Final callback handshakes may take this lifecycle lock. Its joining
+        // caller must release the lock and retain the context until retirement.
+        task.?.await(io orelse @panic("maintenance registration outlived runtime I/O"));
+        self.joined.set(io.?);
     }
+
     fn scheduledStep(self: *Owner) ?u64 {
         return self.step(self.port);
     }
@@ -87,4 +104,81 @@ test "graph cleanup owner preserves bounded cadence and permanent shutdown" {
     try std.testing.expect(owner.registration == null);
     try std.testing.expect(owner.step(port) == null);
     try std.testing.expectEqual(@as(usize, 3), f.calls);
+}
+
+test "maintenance runtime graph cleanup concurrent shutdown retains physical callback" {
+    if (@import("builtin").single_threaded or @import("builtin").os.tag == .freestanding) return error.SkipZigTest;
+    var backend = try @import("../background_runtime.zig").BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend.deinit();
+    var threads = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+    defer threads.deinit();
+    const io = threads.io();
+    var owner: Owner = .{};
+    defer owner.stop(backend.ptr().io());
+    const F = struct {
+        owner: *Owner,
+        runtime: *@import("../background_runtime.zig").BackendRuntime,
+        io: std.Io,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        first_done: std.Io.Event = .unset,
+        second_entered: std.Io.Event = .unset,
+        second_done: std.Io.Event = .unset,
+        unlocked: std.atomic.Value(bool) = .init(false),
+        fn run(ptr: *anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.set(self.io);
+            self.release.waitUncancelable(self.io);
+            // A physical join must not hold the callback's lifecycle mutex.
+            self.owner.lock();
+            self.owner.mutex.unlock();
+            self.unlocked.store(true, .release);
+            return false;
+        }
+
+        fn first(self: *@This()) void {
+            self.owner.stop(self.runtime.io());
+            self.first_done.set(self.io);
+        }
+        fn second(self: *@This()) void {
+            self.second_entered.set(self.io);
+            self.owner.stop(self.runtime.io());
+            self.second_done.set(self.io);
+        }
+    };
+    var f: F = .{ .owner = &owner, .runtime = backend.ptr(), .io = io };
+    owner.start(.{ .ptr = &f, .runtime = backend.ptr(), .run = F.run });
+    defer f.release.set(io);
+    const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } };
+    try f.entered.waitTimeout(io, timeout);
+    var first: ?std.Io.Future(void) = try io.concurrent(F.first, .{&f});
+    defer if (first) |*task| {
+        f.release.set(io);
+        task.await(io);
+    };
+    const deadline = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s;
+    while (!owner.stopping.load(.acquire) and @import("antfly_platform").time.monotonicNs() < deadline)
+        try io.sleep(.fromMilliseconds(1), .awake);
+    try std.testing.expect(owner.stopping.load(.acquire));
+    var second: ?std.Io.Future(void) = try io.concurrent(F.second, .{&f});
+    defer if (second) |*task| {
+        f.release.set(io);
+        task.await(io);
+    };
+    try f.second_entered.waitTimeout(io, timeout);
+    try std.testing.expectError(error.Timeout, f.second_done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }));
+    try std.testing.expect(!f.first_done.isSet());
+    try std.testing.expect(!owner.joined.isSet());
+    try std.testing.expectEqual(@as(usize, 1), (try backend.ptr().maintenanceScheduler()).snapshot().active);
+    f.release.set(io);
+    try f.first_done.waitTimeout(io, timeout);
+    try f.second_done.waitTimeout(io, timeout);
+    first.?.await(io);
+    first = null;
+    second.?.await(io);
+    second = null;
+    try std.testing.expect(owner.joined.isSet());
+    try std.testing.expect(f.unlocked.load(.acquire));
+    try std.testing.expect(owner.registration == null);
+    try std.testing.expectEqual(@as(usize, 0), (try backend.ptr().maintenanceScheduler()).snapshot().active);
 }
