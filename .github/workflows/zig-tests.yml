@@ -1605,8 +1605,8 @@ jobs:
       - name: Initialize lane timing history
         run: cp "${RUNNER_TEMP}/e2e-plan/durations.json" "$ANTFLY_E2E_DURATION_FILE"
 
-      - name: Set up Go for operator runtime contract
-        if: matrix.suite == 'inference'
+      - name: Set up Go for operator runtime and PostgreSQL driver contracts
+        if: matrix.suite == 'inference' || matrix.suite == 'antfly-ordinary-0'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ steps.toolchain.outputs.go_version }}
@@ -1625,6 +1625,28 @@ jobs:
           taskset -c ${{ steps.e2e_cpus.outputs.list }} go test
           -tags runtimeintegration ./controllers/inference
           -run '^TestInferenceRuntimeContract$' -count=1 -v -timeout=20m
+
+      - name: Set up Node for PostgreSQL driver conformance
+        if: matrix.suite == 'antfly-ordinary-0'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ts/package.json
+
+      - name: Set up Rust for PostgreSQL driver conformance
+        if: matrix.suite == 'antfly-ordinary-0'
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ steps.toolchain.outputs.rust_version }}
+
+      - name: Test standard PostgreSQL drivers against candidate runtime
+        if: matrix.suite == 'antfly-ordinary-0'
+        env:
+          GOWORK: 'off'
+        run: >-
+          taskset -c ${{ steps.e2e_cpus.outputs.list }}
+          uv run --no-project --with requests --with pytest
+          --with 'psycopg[binary]==3.3.6' --with asyncpg==0.31.0
+          python scripts/test_pgwire_drivers.py --binary zig/zig-out/bin/antfly
 
       - name: Test exhaustive E2E shard partition
         if: matrix.suite == 'antfly-ordinary-0'

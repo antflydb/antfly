@@ -19,6 +19,7 @@
 const std = @import("std");
 pub const backend = @import("backend.zig");
 const values = @import("values.zig");
+const formatting = @import("formatting.zig");
 const commands = @import("session_commands.zig");
 const settings_catalog = @import("antfly_local_sources").sql_setting_catalog;
 const Spool = @import("cursor_spool.zig").Store;
@@ -104,7 +105,9 @@ pub const Session = struct {
     session_id: ?[]u8 = null,
     status: backend.TransactionStatus = .idle,
     prepared: std.StringHashMapUnmanaged(Prepared) = .empty,
-    portals: std.StringHashMapUnmanaged(Portal) = .empty,
+    // Results borrow their portal allocator until release. Registry growth and
+    // removal must never move that allocator.
+    portals: std.StringHashMapUnmanaged(*Portal) = .empty,
     sql_cursors: std.StringHashMapUnmanaged(SqlCursor) = .empty,
     cursor_budget: ?*Budget = null,
     cursor_epoch: u64 = 0,
@@ -162,7 +165,7 @@ pub const Session = struct {
         self.setDeadline(self.limits.startup_timeout_ms);
         const started = self.startup() catch |err| {
             if (err == error.Canceled) return err;
-            try self.sendError(sqlstate(err), @errorName(err));
+            if (self.diagnostic.code != null) try self.sendDiagnostic('E', self.diagnostic, null) else try self.sendError(sqlstate(err), @errorName(err));
             try self.writer.flush();
             return err;
         };
@@ -251,10 +254,23 @@ pub const Session = struct {
                             if (database != null) return error.ProtocolViolation;
                             database = value;
                         } else if (std.mem.eql(u8, key, "client_encoding")) {
-                            if (!std.ascii.eqlIgnoreCase(value, "UTF8") and !std.ascii.eqlIgnoreCase(value, "UTF-8")) return error.UnsupportedEncoding;
+                            formatting.validateEncoding(value) catch |err| {
+                                self.diagnostic.set("22021", "unsupported startup parameter client_encoding; only UTF8 is supported", null, null);
+                                return err;
+                            };
                         } else if (std.mem.eql(u8, key, "application_name")) {
                             self.application_name = try commands.ApplicationName.init(value);
+                        } else if (formatting.lookup(key)) |setting| {
+                            setting.validate(value) catch |err| {
+                                var buffer: [256]u8 = undefined;
+                                const startup_message = std.fmt.bufPrint(&buffer, "unsupported value for startup parameter {s}; effective value is {s}", .{ setting.name(), setting.value() }) catch "unsupported startup parameter value";
+                                self.diagnostic.set("0A000", startup_message, null, null);
+                                return err;
+                            };
                         } else {
+                            var buffer: [256]u8 = undefined;
+                            const startup_message = std.fmt.bufPrint(&buffer, "unsupported startup parameter: {s}", .{key}) catch "unsupported startup parameter";
+                            self.diagnostic.set("0A000", startup_message, null, null);
                             // Never accept unchecked search_path/options that
                             // could silently change resolution or permissions.
                             return error.UnsupportedStartupOption;
@@ -287,10 +303,8 @@ pub const Session = struct {
                     try self.parameterStatus("server_version", "16.0-antfly");
                     try self.parameterStatus("server_encoding", "UTF8");
                     try self.parameterStatus("client_encoding", "UTF8");
-                    try self.parameterStatus("DateStyle", "ISO, MDY");
-                    try self.parameterStatus("TimeZone", "UTC");
+                    inline for (std.meta.tags(formatting.Setting)) |setting| try self.parameterStatus(setting.name(), setting.value());
                     try self.parameterStatus("integer_datetimes", "on");
-                    try self.parameterStatus("standard_conforming_strings", "on");
                     var key: [8]u8 = undefined;
                     std.mem.writeInt(i32, key[0..4], self.backend_pid, .big);
                     std.mem.writeInt(i32, key[4..8], self.cancel_key, .big);
@@ -350,6 +364,7 @@ pub const Session = struct {
                 .search_path => |value| if (value == .show) &.{.{ .name = "search_path", .type = .string }} else &.{},
                 .statement_timeout => |value| if (value == .show) &.{.{ .name = "statement_timeout", .type = .string }} else &.{},
                 .application_name => |value| if (value == .show) &.{.{ .name = "application_name", .type = .string }} else &.{},
+                .formatting => |value| if (value.action == .show) try alloc.dupe(backend.Column, &.{.{ .name = value.kind.name(), .type = .string }}) else &.{},
                 .client_encoding => |value| if (value == .show) &.{.{ .name = "client_encoding", .type = .string }} else &.{},
                 .catalog => |value| if (value == .show) &.{.{ .name = value.show, .type = .string }} else &.{},
                 .reset_all => &.{},
@@ -387,6 +402,7 @@ pub const Session = struct {
                 .search_path => |value| self.executeSearchPathSetting(alloc, statement, value),
                 .statement_timeout => |value| self.executeTimeoutSetting(alloc, value),
                 .application_name => |value| self.executeApplicationNameSetting(alloc, value),
+                .formatting => |value| self.executeFormattingSetting(alloc, value),
                 .client_encoding => |value| self.executeEncodingSetting(alloc, value),
                 .catalog => |value| self.executeCatalogSetting(alloc, statement, value),
                 .reset_all => self.executeResetAll(),
@@ -573,6 +589,22 @@ pub const Session = struct {
         return result;
     }
 
+    fn executeFormattingSetting(self: *Session, alloc: std.mem.Allocator, setting: commands.FormattingSetting) !backend.Result {
+        if (self.status == .failed) return error.InFailedSqlTransaction;
+        if (setting.local and self.status != .in_transaction) return error.NoActiveSqlTransaction;
+        var result: backend.Result = .{ .command_tag = switch (setting.action) {
+            .show => "SHOW",
+            .set => "SET",
+            .reset => "RESET",
+        }, .transaction_status = self.status, .session_id = self.session_id };
+        if (setting.action == .show) {
+            result.columns = try alloc.dupe(backend.Column, &.{.{ .name = setting.kind.name(), .type = .string }});
+            const row = try alloc.dupe(std.json.Value, &.{.{ .string = setting.kind.value() }});
+            result.rows = try alloc.dupe([]const std.json.Value, &.{row});
+        }
+        return result;
+    }
+
     fn settingsState(self: *Session) *settings_catalog.OverlayState {
         if (self.catalog_settings == null) self.catalog_settings = settings_catalog.OverlayState.init(self.alloc);
         return &self.catalog_settings.?;
@@ -669,7 +701,7 @@ pub const Session = struct {
                 try cursor.finish();
                 self.removePortal("");
                 self.removePrepared("");
-                if (std.mem.trim(u8, statement, " \t\r\n;").len == 0) {
+                if (try commands.isEmptyQuery(statement)) {
                     try self.message('I', "");
                 } else {
                     var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -788,7 +820,10 @@ pub const Session = struct {
                 errdefer if (!transferred) self.alloc.free(owned_name);
                 self.removePortal(name);
                 const namespace = try a.dupe(u8, statement.namespace);
-                try self.portals.put(self.alloc, owned_name, .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path });
+                const portal = try self.alloc.create(Portal);
+                errdefer if (!transferred) self.alloc.destroy(portal);
+                portal.* = .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path };
+                try self.portals.put(self.alloc, owned_name, portal);
                 transferred = true;
                 try self.message('2', "");
             },
@@ -818,7 +853,7 @@ pub const Session = struct {
                 const requested = try cursor.int(i32);
                 if (requested < 0) return error.ProtocolViolation;
                 try cursor.finish();
-                const portal = self.portals.getPtr(name) orelse return error.InvalidPortalName;
+                const portal = self.portals.get(name) orelse return error.InvalidPortalName;
                 const previous_namespace = self.request_namespace;
                 const previous_search_path = self.request_search_path;
                 self.request_namespace = portal.namespace;
@@ -1293,10 +1328,11 @@ pub const Session = struct {
     fn removePortal(self: *Session, name: []const u8) void {
         if (self.portals.fetchRemove(name)) |entry| {
             self.alloc.free(entry.key);
-            var value = entry.value;
+            const value = entry.value;
             if (value.stream) |stream| stream.close(stream.context);
             if (value.result) |*result| result.deinit();
             value.arena.deinit();
+            self.alloc.destroy(value);
         }
     }
 
@@ -1304,9 +1340,11 @@ pub const Session = struct {
         var it = self.portals.iterator();
         while (it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
-            if (entry.value_ptr.stream) |stream| stream.close(stream.context);
-            if (entry.value_ptr.result) |*result| result.deinit();
-            entry.value_ptr.arena.deinit();
+            const portal = entry.value_ptr.*;
+            if (portal.stream) |stream| stream.close(stream.context);
+            if (portal.result) |*result| result.deinit();
+            portal.arena.deinit();
+            self.alloc.destroy(portal);
         }
         self.portals.clearRetainingCapacity();
     }
@@ -1654,7 +1692,7 @@ fn sqlstate(err: anyerror) []const u8 {
         error.UnknownColumn => "42703",
         error.UnknownTable => "42P01",
         error.UnsupportedSqlExecution, error.UnsupportedSqlShape, error.SqlStatementSnapshotRequired => "0A000",
-        error.UnsupportedStartupOption => "0A000",
+        error.UnsupportedStartupOption, error.UnsupportedFormattingSetting => "0A000",
         error.UnsupportedEncoding => "22021",
         error.PortalExecutionFailed => "55000",
         error.TooManyConnections, error.SqlWriteCapacityUnavailable => "53300",

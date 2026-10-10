@@ -68,7 +68,9 @@ pub const ApplicationName = struct {
 pub const ApplicationNameSetting = union(enum) { show, set: struct { local: bool, value: ApplicationName }, reset };
 pub const EncodingSetting = union(enum) { show, set: struct { local: bool }, reset };
 pub const CatalogSetting = union(enum) { show: []const u8, set: struct { name: []const u8, value: []const u8, local: bool }, reset: []const u8, reset_local: []const u8 };
+pub const FormattingSetting = struct { kind: @import("formatting.zig").Setting, action: enum { show, set, reset }, local: bool = false };
 pub const Setting = union(enum) {
+    formatting: FormattingSetting,
     search_path: SearchPathSetting,
     statement_timeout: TimeoutSetting,
     application_name: ApplicationNameSetting,
@@ -81,6 +83,7 @@ pub const Setting = union(enum) {
 /// The protocol uses one classifier for Describe, Execute, and both streaming
 /// paths. A locally owned setting must never be sent to the SQL read provider.
 pub fn settingCommand(alloc: std.mem.Allocator, input: []const u8) !?Setting {
+    if (try formattingSetting(alloc, input)) |value| return .{ .formatting = value };
     if (try searchPathSetting(alloc, input)) |value| return .{ .search_path = value };
     if (try timeoutSetting(alloc, input)) |value| return .{ .statement_timeout = value };
     if (try applicationNameSetting(alloc, input)) |value| return .{ .application_name = value };
@@ -189,7 +192,7 @@ pub fn encodingSetting(alloc: std.mem.Allocator, input: []const u8) !?EncodingSe
     const value = if (quoted) try p.quoted(input[p.pos]) else try p.word();
     try p.finish();
     if (!std.ascii.eqlIgnoreCase(value, "default") or quoted) {
-        if (!std.ascii.eqlIgnoreCase(value, "UTF8") and !std.ascii.eqlIgnoreCase(value, "UTF-8")) return error.UnsupportedEncoding;
+        try @import("formatting.zig").validateEncoding(value);
     }
     return .{ .set = .{ .local = local } };
 }
@@ -745,4 +748,57 @@ test "pgwire SQL session command parser preserves scalar spans and quoted names"
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+pub fn formattingSetting(alloc: std.mem.Allocator, input: []const u8) !?FormattingSetting {
+    var p: Parser = .{ .alloc = alloc, .input = input };
+    const verb = p.word() catch return null;
+    const action: @FieldType(FormattingSetting, "action") = if (std.ascii.eqlIgnoreCase(verb, "show")) .show else if (std.ascii.eqlIgnoreCase(verb, "set")) .set else if (std.ascii.eqlIgnoreCase(verb, "reset")) .reset else return null;
+    var name = p.word() catch return null;
+    var local = false;
+    if (action == .set and (std.ascii.eqlIgnoreCase(name, "local") or std.ascii.eqlIgnoreCase(name, "session"))) {
+        local = std.ascii.eqlIgnoreCase(name, "local");
+        name = try p.word();
+    }
+    const kind = @import("formatting.zig").lookup(name) orelse return null;
+    if (action == .set) {
+        if (!try p.take('=')) if (!std.ascii.eqlIgnoreCase(try p.word(), "to")) return error.InvalidSqlSyntax;
+        try p.space();
+        const quoted = p.pos < input.len and (input[p.pos] == '\'' or input[p.pos] == '"');
+        const value = if (quoted) try p.quoted(input[p.pos]) else blk: {
+            const start = p.pos;
+            while (p.pos < input.len and input[p.pos] != ';') p.pos += 1;
+            break :blk std.mem.trim(u8, input[start..p.pos], " \t\r\n");
+        };
+        if (quoted or !std.ascii.eqlIgnoreCase(value, "default")) try kind.validate(value);
+    }
+    try p.finish();
+    return .{ .kind = kind, .action = action, .local = local };
+}
+
+test "pgwire fixed formatting SQL grammar validates SET and complete commands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    for ([_][]const u8{ "SET DateStyle TO ISO, MDY", "SET TimeZone = 'UTC'", "SET LOCAL extra_float_digits = -15", "SET IntervalStyle = postgres", "SET standard_conforming_strings TO on", "RESET DateStyle", "SHOW TimeZone" }) |sql|
+        try std.testing.expect((try settingCommand(alloc, sql)).? == .formatting);
+    try std.testing.expectError(error.UnsupportedFormattingSetting, settingCommand(alloc, "SET TimeZone = 'America/New_York'"));
+    try std.testing.expectError(error.UnsupportedFormattingSetting, settingCommand(alloc, "SET extra_float_digits = 4"));
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(alloc, "SHOW DateStyle; SELECT 1"));
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(alloc, "SET TimeZone = 'UTC'; SELECT 1"));
+}
+
+/// PostgreSQL EmptyQueryResponse includes comment-only liveness probes (pgx).
+/// Use the same nested-comment scanner as connection commands, without a plan.
+pub fn isEmptyQuery(input: []const u8) !bool {
+    var p: Parser = .{ .alloc = undefined, .input = input };
+    while (try p.take(';')) {}
+    return p.pos == input.len;
+}
+
+test "pgwire empty queries include driver ping and nested comments" {
+    for ([_][]const u8{ "", " ; ; ", "-- ping", "/* outer /* inner */ */; -- ping" }) |sql| try std.testing.expect(try isEmptyQuery(sql));
+    try std.testing.expect(!try isEmptyQuery("-- ping\nSELECT 1"));
+    try std.testing.expect(!try isEmptyQuery("SELECT '-- ping'"));
+    try std.testing.expectError(error.InvalidSqlSyntax, isEmptyQuery("/* unterminated"));
 }
