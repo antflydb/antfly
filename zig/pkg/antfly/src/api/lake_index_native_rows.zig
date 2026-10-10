@@ -60,8 +60,10 @@ const Entry = struct {
     delta: ordered.Delta,
     built_hashes: [][32]u8,
     published: ?local.serverless_manifest_artifact_ref.ArtifactRef = null,
+    root_arena: std.heap.ArenaAllocator,
     fn deinit(self: *Entry) void {
         self.sort.deinit();
+        self.root_arena.deinit();
         if (self.predicate) |*predicate| predicate.deinit();
         self.tuple.deinit();
     }
@@ -234,7 +236,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             if (prior) |root| for (root.file_fingerprints, 0..) |digest, slot| {
                 if (keep[slot]) built_hashes[slot] = digest;
             };
-            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, 512 * 1024), .changed = changed, .slots = slots, .built_hashes = built_hashes, .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
+            try entries.append(a, .{ .tuple = tuple, .predicate = predicate, .binding = binding, .name = name, .cover = cover, .sort = spill.Sort.init(a, &manager, &orders, 512 * 1024), .changed = changed, .slots = slots, .built_hashes = built_hashes, .root_arena = .init(a), .delta = .{ .previous = prior, .keep = keep, .files = slot_names.items, .fingerprints = slot_hashes.items } });
             entries.items[entries.items.len - 1].sort.run_limit = 4;
         }
         if (entries.items.len == 0) continue;
@@ -323,7 +325,10 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
                 const ref = try ordered.publishIncremental(a, ca, store, &entry.sort, entry.name, fingerprint(entry.tuple, entry.predicate, entry.cover), source.inventory, entry.cover, cancellation, delta);
                 entry.published = ref;
                 try input.checkpoint(.{ .name = entry.name, .binding = entry.binding, .artifact = ref });
-                entry.delta.previous = try ordered.loadRoot(ca, store.*, ref, cancellation, null);
+                // Only the latest root directory is needed for the next file.
+                // Retaining every prefix here would grow metadata quadratically.
+                _ = entry.root_arena.reset(.free_all);
+                entry.delta.previous = try ordered.loadRoot(entry.root_arena.allocator(), store.*, ref, cancellation, null);
                 const retained = try ca.alloc(bool, entry.delta.files.len);
                 @memset(retained, true);
                 entry.delta.keep = retained;
