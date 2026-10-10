@@ -1,5 +1,17 @@
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Prevent comparative qualification from accepting inconsistent exact results."""
 
@@ -37,6 +49,19 @@ class ComparativeResultsTest(unittest.TestCase):
         other = deepcopy(self.report)
         other["metadata_filters"]["author"]["total"] = 99
         with self.assertRaisesRegex(ValueError, "Exact filter total"):
+            regional.compare_runs([self.report, other])
+
+    def test_workload_changes_cannot_hide_behind_matching_primary_query(self):
+        self.report["workloads"] = {
+            "sqlite": {"total": 100, "top_hits": [[42, 2.5]], "samples_ms": [100]}
+        }
+        other = deepcopy(self.report)
+        other["workloads"]["sqlite"]["total"] = 99
+        with self.assertRaisesRegex(ValueError, "Workload results differ"):
+            regional.compare_runs([self.report, other])
+        other = deepcopy(self.report)
+        other["workloads"] = {}
+        with self.assertRaisesRegex(ValueError, "Workload coverage differs"):
             regional.compare_runs([self.report, other])
 
     def test_distinct_sources_cannot_be_compared(self):

@@ -595,3 +595,36 @@ than five minutes before the retained restart-pagination check. Reports include
 the configured retention window.
 The first durable generation's transfer latency and automatic background warming
 must be qualified separately from ordinary unordered search latency.
+
+## Full-archive deployment qualification
+
+The merged engine is qualified separately from the public HN deployment. See
+[deployment gates](../../docs/plans/hackernews-deployment-qualification.md) for
+performance targets, source freshness and durable deployment requirements.
+
+Capture only authenticated Parquet footers, including immutable object versions:
+
+```sh
+python examples/hackernews/archive_inventory.py \
+  --prefix hn-poc/20261009-full-portability-2b1f7524d047/archive \
+  --output /private/tmp/hn-archive-inventory.json
+```
+
+Build merged main for Linux using `-Dtarget=x86_64-linux-musl -Doptimize=fast
+-Dmetal=false -Dstrip=true`. Print the bounded plan before executing:
+
+```sh
+python examples/hackernews/archive_qualification.py \
+  --inventory /private/tmp/hn-archive-inventory.json \
+  --binary /path/to/linux/antfly --revision FULL_SOURCE_REVISION \
+  --ledger /private/tmp/hn-archive-budget.json \
+  --output /private/tmp/hn-archive-attempt-01
+```
+
+Add `--execute` to verify the live inventory and start the temporary regional
+pod. Use the same ledger for retries; failed/interrupted runs consume their
+reservation. Results include the raw logs and a failing verdict when construction
+or latency gates fail. Never interpret an index-build failure as successful
+archive qualification. The configuration targets the pinned 47,717,307-row
+export; an expired or changed source requires a newly reviewed inventory/config.
+The temporary bucket is unsuitable for the public service's durable storage.

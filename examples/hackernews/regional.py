@@ -50,6 +50,16 @@ def compare_runs(reports):
         ]
         if actual != expected:
             raise ValueError("Ranked HN IDs/scores changed between runs")
+        expected_workloads = reference.get("workloads", {})
+        if report.get("workloads", {}).keys() != expected_workloads.keys():
+            raise ValueError("Workload coverage differs between runs")
+        for term, result in expected_workloads.items():
+            actual_workload = report["workloads"][term]
+            if any(
+                actual_workload[field] != result[field]
+                for field in ("total", "top_hits")
+            ):
+                raise ValueError(f"Workload results differ for {term}")
         expected_filters = reference["metadata_filters"]
         if report["metadata_filters"].keys() != expected_filters.keys():
             raise ValueError("Filter coverage differs between runs")
@@ -95,6 +105,8 @@ def main():
     parser.add_argument("--memory", default="8Gi")
     parser.add_argument("--disk", default="4Gi")
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--workload-terms", nargs="+", default=[])
+    parser.add_argument("--cursor-pages", type=int, default=0)
     args = parser.parse_args()
     if len(set(args.modes)) != len(args.modes):
         parser.error("modes must not contain duplicates")
@@ -208,6 +220,7 @@ def main():
                 text=True,
             ).stdout
         )
+        (args.output / "worker.json").write_text(json.dumps(worker, indent=2) + "\n")
         run(kubectl + ["exec", pod_name, "--", "mkdir", "-p", "/workspace"])
         run(kubectl + ["cp", str(args.binary), pod_name + ":/workspace/antfly"])
         run(
@@ -254,6 +267,9 @@ def main():
                 "--cursor-retention-ms",
                 str(args.cursor_retention_ms),
             ]
+            command.extend(["--cursor-pages", str(args.cursor_pages)])
+            if args.workload_terms:
+                command.extend(["--workload-terms", *args.workload_terms])
             if mode == "text-only":
                 command.append("--text-only")
             reports[mode] = []
@@ -275,6 +291,17 @@ def main():
                         stderr=subprocess.STDOUT,
                     )
                 if completed.returncode:
+                    subprocess.run(
+                        kubectl
+                        + [
+                            "cp",
+                            pod_name + ":/workspace/" + mode + "/failure.json",
+                            str(args.output / (label + "-failure.json")),
+                        ],
+                        env=env,
+                        check=False,
+                        capture_output=True,
+                    )
                     run(
                         kubectl
                         + [

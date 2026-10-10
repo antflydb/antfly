@@ -59,6 +59,8 @@ def main():
     )
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--workload-terms", nargs="+", default=[])
+    parser.add_argument("--cursor-pages", type=int, default=0)
     parser.add_argument(
         "--bearer-stdin",
         action="store_true",
@@ -67,6 +69,8 @@ def main():
     parser.add_argument("--build-timeout", type=int, default=300)
     parser.add_argument("--cursor-retention-ms", type=int, default=300000)
     args = parser.parse_args()
+    if not 0 <= args.cursor_pages <= 100:
+        parser.error("cursor pages must be between zero and 100")
     if args.repeats < 1 or args.concurrency < 1:
         parser.error("repeats and concurrency must be positive")
     if args.expected_rows < 2 or args.build_timeout < 1:
@@ -256,6 +260,7 @@ def main():
             )
         return result, elapsed
 
+    phase = "startup"
     try:
         start()
         existing = call("GET", "/tables")
@@ -282,6 +287,7 @@ def main():
                     "indexes": {"body_text": {"type": "full_text", "field": "body"}},
                 },
             )
+        phase = "index_build"
         started = time.monotonic()
         build_before = resource_counters()
         peak_rss_bytes = 0
@@ -322,6 +328,7 @@ def main():
             assert metadata_status[column]["status"]["readiness"]["queryable"], (
                 metadata_status[column]
             )
+        phase = "row_count"
         count = call(
             "POST", "/sql", {"statement": "SELECT COUNT(*) FROM hn_archive_poc"}
         )
@@ -334,6 +341,7 @@ def main():
         cache_files_before_search = sum(
             p.is_file() for p in (args.state / "cache").rglob("*")
         )
+        phase = "query_correctness_and_latency"
         query = {
             "full_text_search": {"match": "database", "field": "body"},
             "full_text_index": "body_text",
@@ -387,6 +395,29 @@ def main():
             assert [h["_id"] for h in result["hits"]["hits"]] == [
                 h["_id"] for h in hits
             ]
+        workload_results = {}
+        for workload_term in args.workload_terms:
+            workload_query = dict(
+                query, full_text_search={"match": workload_term, "field": "body"}
+            )
+            samples = []
+            expected = None
+            for _ in range(args.repeats):
+                result, elapsed = timed_query(
+                    workload_query, "workload." + workload_term
+                )
+                signature = [(h["_id"], h["_score"]) for h in result["hits"]["hits"]]
+                if expected is not None:
+                    assert signature == expected, (
+                        "Workload results changed: " + workload_term
+                    )
+                expected = signature
+                samples.append(elapsed)
+            workload_results[workload_term] = {
+                "samples_ms": samples,
+                "total": result["hits"]["total"],
+                "top_hits": expected,
+            }
         first_page = call("POST", "/tables/hn_archive_poc/query", dict(query, limit=1))
         page_query = dict(
             query,
@@ -398,6 +429,31 @@ def main():
         assert [h["_id"] for h in second["hits"]["hits"]] == [
             h["_id"] for h in hits[1:]
         ]
+        cursor_depth = {"hits": 1 + len(second["hits"]["hits"]), "samples_ms": []}
+        deep_page = second
+        seen = {h["_id"] for h in first_page["hits"]["hits"] + second["hits"]["hits"]}
+        deep_request = None
+        deep_signature = None
+        for _ in range(args.cursor_pages):
+            if not deep_page["hits"]["hits"]:
+                break
+            deep_request = dict(
+                query,
+                limit=128,
+                search_after=deep_page["hits"]["hits"][-1]["_sort"],
+                remote_snapshot=first_page["remote_snapshot"],
+            )
+            deep_page, elapsed = timed_query(deep_request, "cursor_depth")
+            deep_signature = [
+                (h["_id"], h["_score"]) for h in deep_page["hits"]["hits"]
+            ]
+            ids = [h["_id"] for h in deep_page["hits"]["hits"]]
+            assert len(set(ids)) == len(ids) and not seen.intersection(ids), (
+                "Cursor repeated hits"
+            )
+            seen.update(ids)
+            cursor_depth["hits"] += len(ids)
+            cursor_depth["samples_ms"].append(elapsed)
         selected = hits[0]["_source"]["hn_id"]
         filtered_query = dict(
             query, filter_query={"term": {"path": "/hn_id", "value": selected}}
@@ -514,6 +570,12 @@ def main():
         assert all(
             h.get("_highlights", {}).get("body") for h in reopened["hits"]["hits"]
         )
+        if deep_request is not None:
+            deep_reopened, elapsed = timed_query(deep_request, "cursor_depth_restart")
+            assert [
+                (h["_id"], h["_score"]) for h in deep_reopened["hits"]["hits"]
+            ] == deep_signature
+            cursor_depth["restart_ms"] = elapsed
         continued = call("POST", "/tables/hn_archive_poc/query", page_query)
         assert [h["_id"] for h in continued["hits"]["hits"]] == [
             h["_id"] for h in hits[1:]
@@ -546,6 +608,8 @@ def main():
             "concurrency": args.concurrency,
             "cursor_retention_ms": args.cursor_retention_ms,
             "metadata_filters": filter_results,
+            "workloads": workload_results,
+            "cursor_depth": cursor_depth,
             "io_profiles": io_profiles,
             "io_profile_note": "Linux process CPU and pod-wide non-loopback network counters. Concurrent intervals overlap; not per-query byte attribution. Includes TLS/DNS/control metadata; not a GCS request trace.",
             "cache_files": len(cache_files),
@@ -591,6 +655,13 @@ def main():
                 indent=2,
             )
         )
+    except Exception as exc:
+        # Do not persist arbitrary provider error bodies or credentials.
+        failure = {"phase": phase, "exception": type(exc).__name__}
+        if phase == "index_build" and "status" in locals():
+            failure["index_status"] = status
+        (args.state / "failure.json").write_text(json.dumps(failure, indent=2) + "\n")
+        raise
     finally:
         stop()
 
