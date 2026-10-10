@@ -153,7 +153,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const text_statistics_controls_tests = b.addTest(.{
         .root_module = text_statistics_controls_mod,
         .filters = &.{"text statistics trusted controls"},
-        .max_rss = 3 * 1024 * 1024 * 1024,
+        // Linux shared-navigation compilation peaked at 3.33 GB.
+        .max_rss = @as(usize, if (target.result.os.tag == .linux) 4 else 3) * 1024 * 1024 * 1024,
     });
     b.step("antfly-text-statistics-controls-test", "Verify trusted statistics controls retain original authority and deadline")
         .dependOn(&b.addRunArtifact(text_statistics_controls_tests).step);

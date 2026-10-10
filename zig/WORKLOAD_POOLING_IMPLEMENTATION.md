@@ -2415,3 +2415,11 @@ independent compiled consumers still require cumulative Lite storage and
 archive integration. Fixture-owned buffers are not proof of whole-request
 memory accounting; production allocation coverage, runtime resource envelopes,
 background holder adoption, performance and default sizing remain incomplete.
+
+
+The merged trusted-control Linux build ran 82 checks with one existing skip,
+but its 3.33 GB compiler peak exceeded the 3 GiB declaration. That run is failed
+qualification evidence despite its passing test summary. The Linux compiler
+reservation is now 4 GiB; native retains 3 GiB. Validation keeps the resource
+check and Linux cgroup limit enabled. Request memory accounting and runtime
+resource envelopes are independent outstanding requirements.
