@@ -479,9 +479,14 @@ Python `antfly_embedded.dbapi`, Rust's optional `sqlx` feature, and TypeScript
 `Connection` / `@antfly/embedded/kysely`. Their shared SQL conformance inputs
 are in `pkg/antfly-embedded/capi-conformance/sql/cases.json`.
 
-SQL source text, parameter data and scalar output share the 64 MiB execution
-memory policy. Token, node and nesting limits bound SQL syntax independently.
-Actual allocations remain budgeted, so a request below the byte limit may exhaust its memory budget.
-Transaction admission counts retained payload and metadata independently of
-the measured preparation working set. Nested OFFSET queries and derived-table
+SQL JSON requests admit at most 64 MiB (67,108,864 bytes), including source
+text and parameter data. Larger requests return a structured SQLSTATE `54000`
+diagnostic naming that limit, including when a SQL session is active.
+Preparation and execution each default to 256 MiB (268,435,456 bytes) of
+working memory; decoding, staged rows and storage representations can coexist.
+Requests below the wire limit can still exhaust working memory. Token, node
+and nesting limits independently bound syntax. Embedded SQL sessions admit
+4,096 staged mutations and 256 MiB of staging memory; native transaction
+intent admission additionally counts retained payload and metadata, with its
+configured transaction-byte limit (128 MiB by default). Nested OFFSET queries and derived-table
 window functions grow retained storage with observed rows and may spill to disk.

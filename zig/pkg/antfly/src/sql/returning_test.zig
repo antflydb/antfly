@@ -287,7 +287,7 @@ test "SQL RETURNING rejects preparation projection and quota failures before com
         .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING n", .failure = error.SqlWriteConflict, .prepare_failure = error.SqlWriteConflict },
         .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING n", .failure = error.InvalidSqlBackendResponse, .corrupt = true },
         .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING n", .failure = error.UnsupportedSqlExecution, .capability = false },
-        .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING n", .failure = error.SqlProgramLimitExceeded, .limits = .{ .retained_bytes = 64 } },
+        .{ .sql = "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING n", .failure = error.SqlWorkingMemoryLimitExceeded, .limits = .{ .retained_bytes = 64 } },
     };
     for (cases) |case| {
         var fixture: Fixture = .{ .prepare_failure = case.prepare_failure, .corrupt_identity = case.corrupt };

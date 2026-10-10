@@ -141,7 +141,7 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     const arena = state.arena.allocator();
     statement_backend.parameter_fallback_types = try parameterFallbackTypes(arena, parameters);
     result.output = runBound(state.budget.allocator(), arena, statement_backend, compiled, parameters, limits, null) catch |err| {
-        if (err == error.OutOfMemory and state.budget.exhausted) return error.SqlProgramLimitExceeded;
+        if (err == error.OutOfMemory and state.budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return err;
     };
     return result;
@@ -2769,7 +2769,7 @@ test "SQL INSERT VALUES scalar subqueries prepare a bounded source before writin
     }
     try std.testing.expectEqual(@as(usize, 0), backend.writes);
     var limited: ValuesBackend = .{ .large = true };
-    try std.testing.expectError(error.SqlProgramLimitExceeded, execute(std.testing.allocator, limited.iface(), &large, &.{}, .{ .retained_bytes = 1024 * 1024 }));
+    try std.testing.expectError(error.SqlWorkingMemoryLimitExceeded, execute(std.testing.allocator, limited.iface(), &large, &.{}, .{ .retained_bytes = 1024 * 1024 }));
     try std.testing.expectEqual(@as(usize, 0), limited.writes);
     var canceled: ValuesBackend = .{ .large = true, .cancel_after = 8 };
     try std.testing.expectError(error.Canceled, execute(std.testing.allocator, canceled.iface(), &large, &.{}, .{ .retained_bytes = 4 * 1024 * 1024 }));
@@ -3532,7 +3532,7 @@ test "SQL memory quota rejects allocations before backend work" {
     var backend: TestBackend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT id FROM things", .{});
     defer compiled.deinit();
-    try std.testing.expectError(error.SqlProgramLimitExceeded, execute(std.testing.allocator, backend.iface(), &compiled, &.{}, .{ .retained_bytes = 1 }));
+    try std.testing.expectError(error.SqlWorkingMemoryLimitExceeded, execute(std.testing.allocator, backend.iface(), &compiled, &.{}, .{ .retained_bytes = 1 }));
     try std.testing.expectEqual(@as(usize, 0), backend.pages);
 }
 

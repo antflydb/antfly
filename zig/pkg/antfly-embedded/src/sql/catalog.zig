@@ -604,7 +604,7 @@ pub const Backend = struct {
         /// bound schema epoch. No writes occur. Mutation consumes these exact
         /// normalized values; SQL must never guess postimages or read them back
         /// after commit. Returned rows preserve key/version/order/deletion.
-        prepare_mutations: ?*const fn (*anyopaque, std.mem.Allocator, std.mem.Allocator, Table, []const Mutation) anyerror![]const Mutation = null,
+        prepare_mutations: ?*const fn (*anyopaque, std.mem.Allocator, Table, []const Mutation) anyerror![]const Mutation = null,
         checkpoint: *const fn (*anyopaque) anyerror!void,
         /// Native authority owns atomic existence checks and durable catalog
         /// publication. SQL must never emulate DDL with read-then-write.

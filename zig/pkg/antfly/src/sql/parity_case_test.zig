@@ -31,7 +31,7 @@ test "SQL physical column qualification validates pinned namespace and alias bou
         fn scan(_: *anyopaque, _: std.mem.Allocator, _: sources.sql_catalog.Table, _: sources.sql_catalog.Scan) !sources.sql_catalog.Page {
             return error.UnexpectedBackendCall;
         }
-        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: sources.sql_catalog.Table, _: []const sources.sql_catalog.Mutation) !sources.sql_catalog.MutationOutcome {
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: sources.sql_catalog.Table, _: []const sources.sql_catalog.Mutation) !sources.sql_catalog.MutationOutcome {
             return error.UnexpectedBackendCall;
         }
         fn checkpoint(_: *anyopaque) !void {}

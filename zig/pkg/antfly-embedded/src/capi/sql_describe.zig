@@ -23,7 +23,7 @@ fn describe(handle: *h.Handle, request_json: []const u8) !h.capi.Buffer {
     const Budget = d.sql_memory_budget;
     var budget = Budget{ .backing = handle.alloc, .limit = sql.runtime.resource_limits.preparation_bytes };
     return describePrepared(handle, request_json, budget.allocator()) catch |err| {
-        if (err == error.OutOfMemory and budget.exhausted) return error.SqlProgramLimitExceeded;
+        if (err == error.OutOfMemory and budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return err;
     };
 }

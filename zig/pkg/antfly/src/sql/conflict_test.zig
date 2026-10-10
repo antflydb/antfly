@@ -112,7 +112,7 @@ const Fixture = struct {
             .{ .name = "positive_n", .kind = .check },
             .{ .name = "parent_fk", .kind = .foreign_key },
         }, .columns = &.{
-            .{ .name = "n", .path = "n", .type = .integer, .nullable = false },
+            .{ .name = "n", .path = "n", .type = .integer, .nullable = false, .defaulted = true },
             .{ .name = "g", .path = "g", .type = .integer, .generated = true },
         } };
     }
@@ -208,7 +208,7 @@ const Fixture = struct {
         }
         return output;
     }
-    fn mutateUnprepared(ptr: *anyopaque, alloc: Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutateUnprepared(ptr: *anyopaque, alloc: Allocator, _: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
         // Native non-RETURNING writes normalize at the storage boundary.
         // Predicate-only fences are not row images and must remain untouched.
         const normalized = try alloc.dupe(catalog.Mutation, input);

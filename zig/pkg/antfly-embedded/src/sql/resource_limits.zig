@@ -13,8 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! SQL text and data admission share the execution memory policy. Token,
-//! node and nesting limits independently bound AST structure.
-pub const default_memory_bytes: usize = 64 * 1024 * 1024;
-pub const request_bytes: usize = default_memory_bytes;
+//! Wire payload and working memory are separate bounded resources: decoded
+//! parameters, staged rows and storage encodings can coexist during execution.
+//! Token, node and nesting limits independently bound AST structure.
+pub const request_bytes: usize = 64 * 1024 * 1024;
+pub const default_memory_bytes: usize = 256 * 1024 * 1024;
 pub const preparation_bytes: usize = default_memory_bytes;

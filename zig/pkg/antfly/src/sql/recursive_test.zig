@@ -171,7 +171,7 @@ test "SQL recursive admission rejects nonlinear scopes and enforces type work me
     var endless = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n FROM r) SELECT n FROM r", .{});
     defer endless.deinit();
     try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, fixture.backend(), &endless, &.{}, .{ .scan_rows = 16 }));
-    try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, fixture.backend(), &endless, &.{}, .{ .retained_bytes = 1024 }));
+    try std.testing.expectError(error.SqlWorkingMemoryLimitExceeded, runtime.execute(std.testing.allocator, fixture.backend(), &endless, &.{}, .{ .retained_bytes = 1024 }));
     fixture.cancel_after = fixture.checkpoints + 32;
     try std.testing.expectError(error.QueryCanceled, runtime.execute(std.testing.allocator, fixture.backend(), &endless, &.{}, .{}));
 }

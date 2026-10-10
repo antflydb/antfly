@@ -5228,13 +5228,13 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
         namespace: ?[]const u8 = null,
     };
     var parsed = std.json.parseFromSlice(Request, temporary, request_json, .{ .allocate = .alloc_always }) catch |err| {
-        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlProgramLimitExceeded;
+        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return error.InvalidSqlParameters;
     };
     defer parsed.deinit();
     if (parsed.value.database != null or parsed.value.namespace != null) return error.UnsupportedSqlExecution;
     var compiled = sql.compiler.compile(temporary, parsed.value.statement, .{}) catch |err| {
-        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlProgramLimitExceeded;
+        if (err == error.OutOfMemory and preparation_budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return err;
     };
     defer compiled.deinit();
@@ -5294,7 +5294,7 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
             out_buf.* = embeddedSqlCommitReceipt(&commit_receipt, result.output);
             return;
         }
-        if (err == error.OutOfMemory and encoding_budget.exhausted) return error.SqlProgramLimitExceeded;
+        if (err == error.OutOfMemory and encoding_budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return err;
     };
     defer encoding_budget.allocator().free(bytes);

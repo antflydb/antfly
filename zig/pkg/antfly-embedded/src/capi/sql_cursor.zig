@@ -88,7 +88,7 @@ fn openWithSession(handle: *h.Handle, table_name: []const u8, request_json: []co
     cursor.arena = std.heap.ArenaAllocator.init(cursor.budget.allocator());
     errdefer cursor.arena.deinit();
     const request = prepare(cursor, handle, table_name, request_json, session) catch |err| {
-        if (err == error.OutOfMemory and cursor.budget.exhausted) return error.SqlProgramLimitExceeded;
+        if (err == error.OutOfMemory and cursor.budget.exhausted) return error.SqlWorkingMemoryLimitExceeded;
         return err;
     };
     errdefer cursor.compiled.deinit();
