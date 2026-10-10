@@ -2138,3 +2138,31 @@ and traversal across readers still require separate bounded-work adoption.
 Shared background CPU admission, complete holder/cleanup adoption, full
 archive/API/DB integration, runtime resource/performance and automatic default
 qualification remain incomplete.
+
+
+### Runtime-wide maintenance admission closes before lease drain
+
+Backend runtime shutdown now closes its existing maintenance scheduler before
+waiting for any executor lane lease to drain. A separate idempotent
+`closeAdmission` stops new registrations and future callback dispatch without
+joining or detaching registration owners. Scheduler destruction uses the same
+fence and still waits for registrations and physically active callbacks to
+retire. Active callbacks retain their capacity until their handle joins.
+The runtime releases its lane initialization mutex before closing maintenance,
+avoiding a nested lifecycle-lock wait. Each component retains its own admission
+linearization point; the runtime then closes all lane gates before draining.
+
+Eleven native maintenance/runtime/scheduler checks passed, and the four
+ownership audit checks passed. The new composed fixture uses a physical
+runtime shutdown thread, a retained API lane lease and a blocked maintenance
+callback. After API admission is observed closed, all four maintenance classes
+reject registration, runtime scheduler acquisition rejects, wake cannot restart
+work, and callback registration/active capacity remain charged. Physical join
+retires callback capacity while the API lease still keeps runtime shutdown
+blocked. Failure observations also release and join their owners.
+
+This closes maintenance dispatch during executor lease draining. It does not
+provide shared foreground/background CPU admission, bound every background
+registration by the node execution policy, adopt all dependency waits or
+qualify the complete cleanup/durability/physical DB/HTTP/PG/resource/performance
+contracts. Automatic defaults remain unqualified.

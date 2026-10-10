@@ -2482,7 +2482,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const maintenance_shutdown_admission_tests = b.addTest(.{
         .name = "maintenance-shutdown-admission-tests",
         .root_module = maintenance_shutdown_admission_root,
-        .filters = &.{ "independent maintenance", "maintenance scheduler" },
+        .filters = &.{ "independent maintenance", "maintenance scheduler", "maintenance runtime" },
         .max_rss = 3 * 1024 * 1024 * 1024,
     });
     b.step("antfly-maintenance-shutdown-admission-test", "Verify recurring maintenance stops admitting stages and physically joins current callbacks")

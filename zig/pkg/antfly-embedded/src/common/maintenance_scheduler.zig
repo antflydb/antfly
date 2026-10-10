@@ -133,10 +133,18 @@ pub const Scheduler = struct {
         return self;
     }
 
-    pub fn destroy(self: *Scheduler) void {
+    /// Deny new registrations and callback dispatch before other runtime
+    /// leases drain. Existing handles still own their physical callback joins.
+    pub fn closeAdmission(self: *Scheduler) void {
         self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         self.stopping = true;
         self.changed.set(self.io);
+    }
+
+    pub fn destroy(self: *Scheduler) void {
+        self.closeAdmission();
+        self.mutex.lockUncancelable(self.io);
         // Registration handles are lifetime leases, like the runtime's API
         // and inference leases. Enforce their drain in release builds too.
         while (self.tasks.items.len != 0 or self.active != 0)

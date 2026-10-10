@@ -1096,7 +1096,11 @@ pub const BackendRuntime = struct {
         // directions, whose callers obey the runtime lifetime contract).
         lockAtomic(&self.lane_init_mutex);
         self.lanes_closing = true;
+        const maintenance = self.maintenance_scheduler.load(.acquire);
         self.lane_init_mutex.unlock();
+        // Recurring work must close before lease draining can block shutdown.
+        // Keep its registered handles and active capacity until physical join.
+        if (maintenance) |scheduler| scheduler.closeAdmission();
         // Close every lane before waiting for any one of them. Otherwise a
         // borrower could continue entering a later lane while teardown drains
         // an earlier one. These waits are production lifetime enforcement,
@@ -4240,4 +4244,67 @@ test "backend runtime worker allocation failure returns its capacity and lifetim
     failing.fail_index = std.math.maxInt(usize);
     var lease = try handle.ptr().acquireWorkers(.{});
     defer lease.release();
+}
+
+test "maintenance runtime closes all callback classes before waiting for an API lease" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    const runtime = handle.ptr();
+    const io = runtime.io().?;
+    const scheduler = try runtime.maintenanceScheduler();
+    var lease = try runtime.acquireApiLane();
+    const Probe = struct {
+        io: Io,
+        entered: Io.Event = .unset,
+        release: Io.Event = .unset,
+        calls: std.atomic.Value(usize) = .init(0),
+        fn step(self: *@This()) ?u64 {
+            _ = self.calls.fetchAdd(1, .acq_rel);
+            self.entered.set(self.io);
+            self.release.waitUncancelable(self.io);
+            return 0;
+        }
+    };
+    var probe: Probe = .{ .io = io };
+    var registration = try scheduler.register(&probe, Probe.step);
+    var joined = false;
+    var deinitialized = std.atomic.Value(bool).init(false);
+    var shutdown: ?std.Thread = null;
+    defer {
+        // This cleanup also runs after failed bounded observations. The
+        // runtime cannot free its scheduler while the API lease is retained.
+        probe.release.set(io);
+        if (!joined) registration.await(io);
+        lease.release();
+        if (shutdown) |thread| thread.join() else handle.deinit();
+    }
+    try probe.entered.waitTimeout(io, .{ .duration = .{ .raw = Io.Duration.fromSeconds(5), .clock = .awake } });
+    shutdown = try std.Thread.spawn(.{}, struct {
+        fn run(h: *BackendRuntimeHandle, done: *std.atomic.Value(bool)) void {
+            h.deinit();
+            done.store(true, .release);
+        }
+    }.run, .{ &handle, &deinitialized });
+    const deadline = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!runtime.api_lane_gate.isClosed() and platform.time.monotonicNs() < deadline)
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    try std.testing.expect(runtime.api_lane_gate.isClosed());
+    try std.testing.expect(!deinitialized.load(.acquire));
+    try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.maintenanceScheduler());
+    for (std.enums.values(MaintenanceScheduler.Class)) |class|
+        try std.testing.expectError(error.BackendRuntimeShuttingDown, scheduler.registerClass(class, &probe, Probe.step));
+    scheduler.wake(&probe);
+    scheduler.closeAdmission(); // Closing is idempotent while handles drain.
+    const held = scheduler.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), held.registrations);
+    try std.testing.expectEqual(@as(usize, 1), held.active);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
+    probe.release.set(io);
+    registration.await(io);
+    joined = true;
+    const retired = scheduler.snapshot();
+    try std.testing.expectEqual(@as(usize, 0), retired.registrations);
+    try std.testing.expectEqual(@as(usize, 0), retired.active);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls.load(.acquire));
+    try std.testing.expect(!deinitialized.load(.acquire));
 }
