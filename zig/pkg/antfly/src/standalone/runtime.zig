@@ -2534,6 +2534,8 @@ const LocalStandaloneMetadata = struct {
                 const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
                 defer alloc.free(bytes);
                 if (bytes.len > publication.max_bytes) return error.CatalogCommandTooLarge;
+                if (command.plan) |plan| if (plan.constraint_name_guard != null)
+                    try store.preflightFkGenerationNameAdmission(group_ids.main_metadata_group_id, plan);
                 try context.ensureActive();
                 const prior_projection_revision = self.durable_revision;
                 try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .apply_fk_generation_publication = bytes });
@@ -2565,7 +2567,12 @@ const LocalStandaloneMetadata = struct {
                 if (!context.fk_generation_publication_authority or !self.localFkPublicationSupported()) return error.UnsupportedOperation;
                 _ = try self.ensureNativeOwnerBindingLocked();
                 const store = self.lifecycle_store orelse return error.UnsupportedOperation;
-                return store.fkInitialCreatePrepareJson(alloc, group_ids.main_metadata_group_id, request);
+                return store.fkInitialCreatePrepareJsonWithContext(alloc, group_ids.main_metadata_group_id, request, context);
+            },
+            .constraint_name_prepare => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                return store.prepareConstraintNamesJsonWithContext(alloc, group_ids.main_metadata_group_id, .{ .addition = request }, context);
             },
             .fk_initial_child_decision => |request| {
                 if (!context.fk_generation_publication_authority or !self.localFkPublicationSupported()) return error.UnsupportedOperation;

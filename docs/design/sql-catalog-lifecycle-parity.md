@@ -626,3 +626,67 @@ remain. The corrected coordinator gate is running, and no pass is claimed yet.
 Public ALTER still needs the preparation RPC and publication wiring for ordinary
 schema changes, rewrite jobs and FK generation transitions. Advertised capability
 remains 33; no original case disposition changes at this checkpoint.
+
+### Private preparation boundary and once-lowered ALTER candidates
+
+Constraint-name preparation now crosses the storage-free facade as an owned
+JSON projection, rather than returning a native arena-bearing plan across the
+kernel boundary. CREATE and additive ALTER share this private boundary. The
+FK CREATE projection also carries a normalized platform deadline. Cancellation
+is checked before and after the facade call; native probes check the transported
+deadline. This does not claim mid-call cancellation-token propagation across the
+archive boundary. Definite name conflicts, occupancy-not-ready and probe-limit
+errors retain stable runtime error identities. The preparation RPC is read-only
+but requires a body-bound administrative grant and linearizable owner admission.
+
+The compiler now recognizes anonymous ALTER CHECK, UNIQUE, PRIMARY KEY and FK
+declarations with explicit internal generated-name provenance. Local preparation
+seeds a bounded name set once, chooses a collision-free unpublished label, and
+lowers/validates one candidate. The catalog receives only the added rule, not a
+caller-supplied baseline schema. Its selected name replaces only that already
+lowered rule. Invalid replies cannot change the pinned owner or mutate the
+predecessor. Ordinary schema publication retains the returned admission predicate.
+FK generation and primary-key rewrite publication explicitly reject a predicate
+until their durable plans can retain and enforce it; neither silently drops it.
+
+The candidate gate passes three tests in Debug and ReleaseFast, including allocation
+failure sweeps, invalid selected names, explicit-name noninterference and duplicate
+primary rejection, malformed ownership and bounded record seeding. The runtime
+error ABI gate passes 25 tests. The corrected
+coordinator gate passes 29 tests. These are component results, not public ALTER
+activation or original-case credit. The native HTTP catalog campaign exposed a
+fixture which observed readiness but omitted durable activation before source
+adoption; it now proposes and waits for that fence through production leader
+admission. The corrected campaign and current facade/API compile qualification
+are still running. Advertised capability stays 33 and the original inventory
+remains 478 implemented / 136 rejected / 73 superseded / 899 unresolved.
+
+### FK generation predicate retention
+
+The successor FK generation plan now retains the captured relation guard and
+selected FK name. Plan validation binds the guard to the exact predecessor
+schema bytes/version, rejects non-FK or missing selected rules, and includes
+the guard in the plan digest used by owner receipts. An absent guard retains
+the predecessor JSON bytes and digest. The builder owns the guard, and SQL
+passes it through the ordinary FK generation workflow rather than dropping
+it or creating a separate publication path.
+
+Read-only native preflight checks the covered namespace, predecessor owner,
+policy state, complete child/parent descriptor cut and every owner lock. The
+same read-only admission boundary runs again before begin's first write. A
+defeated naming-enabled begin is a committed no-op with no lock or reservation;
+errors after lock acquisition still abort. Missing records are distinguished
+from actual storage failures. Invalid lock ownership and corrupt prior plans
+are not optimistic conflicts. Existing pending-schema reservations then retain
+the selected name until publication or completed cancellation.
+
+Final single/batch proposal classification now recognizes the nested FK guard
+and requires capability 34, including malformed non-null guard markers. The
+fixed-memory wire gate passes in Debug and ReleaseFast. The focused FK gate
+passes two tests in both Debug and ReleaseFast covering legacy byte compatibility, named digest/recovery,
+invalid bindings and lower-capability begin nonreservation followed by legacy
+admission, including rejection of corrupt zero-ID lock ownership. Current facade/API
+qualification and the corrected native HTTP campaign remain pending; no public
+activation or original-case disposition is claimed. Primary-key rewrite plan
+integration, distributed race/fault qualification and capability activation
+remain unfinished.

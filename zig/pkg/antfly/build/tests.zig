@@ -298,6 +298,13 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("system-catalog-relation-store-test", "Verify namespace and schema transaction rollback and restart")
         .dependOn(&addFilteredTestRunArtifact(b, relation_namespace_tests).step);
+    const fk_name_admission_tests = b.addTest(.{
+        .root_module = metadata_unit_baseline_mods[8],
+        .filters = &.{ "self-FK generation plan binds both roles", "system catalog relation namespace transaction FK generation publication begins durably" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-fk-generated-name-admission-test", "Verify FK generated-name plan digests, recovery and atomic lower-capability nonadmission")
+        .dependOn(&addFilteredTestRunArtifact(b, fk_name_admission_tests).step);
     const relation_command_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/metadata/relation_reconciliation_command.zig"),
         .target = target,

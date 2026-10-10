@@ -79,6 +79,7 @@ pub const Call = union(enum) {
     fk_generation_publication_decision: @import("../metadata/fk_generation_publication.zig").DecisionRequest,
     fk_generation_publication_source_decision: @import("../metadata/fk_generation_publication.zig").SourceDecisionRequest,
     fk_initial_create_prepare: @import("../metadata/fk_generation_publication.zig").InitialCreatePrepareRequest,
+    constraint_name_prepare: domain.ConstraintNamePrepareRequest,
     fk_initial_child_decision: @import("../metadata/fk_generation_publication.zig").InitialChildDecisionRequest,
     fk_initial_create_begin: @import("../metadata/fk_generation_publication.zig").InitialCreatePlan,
     fk_initial_create_mutate: @import("../metadata/fk_generation_publication.zig").InitialCommand,
@@ -111,7 +112,7 @@ pub const Call = union(enum) {
 
     pub fn requiresAdministrativeGrant(self: @This()) bool {
         return switch (self) {
-            .relation_replace, .relation_schema_mutate => true,
+            .relation_replace, .relation_schema_mutate, .constraint_name_prepare => true,
             .lake_index_lifecycle_mutate, .setting_mutate, .policy_definition_mutate, .policy_publication_mutate, .policy_publication_begin, .fk_generation_publication_begin, .fk_generation_publication_mutate, .fk_initial_create_begin, .fk_initial_create_mutate, .store_root_enroll, .store_root_enrollment_status => true,
             else => false,
         };
@@ -146,7 +147,7 @@ pub const Call = union(enum) {
 
     pub fn isMutation(self: @This()) bool {
         return self == .mutate or self == .fk_initial_retirement_ack or
-            (self != .store_root_enrollment_status and self.requiresAdministrativeGrant());
+            (self != .store_root_enrollment_status and self != .constraint_name_prepare and self.requiresAdministrativeGrant());
     }
 };
 
@@ -186,6 +187,10 @@ test "native lake lifecycle calls bind private read and mutation grants" {
 }
 
 test "system catalog relation replacement requires a body-bound administrative mutation grant" {
+    const prepare: Call = .{ .constraint_name_prepare = undefined };
+    try std.testing.expect(prepare.requiresAdministrativeGrant());
+    try std.testing.expect(!prepare.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!prepare.isMutation());
     const call: Call = .{ .relation_replace = undefined };
     try std.testing.expect(call.requiresAdministrativeGrant());
     try std.testing.expect(call.isMutation());

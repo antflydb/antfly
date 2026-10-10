@@ -2052,6 +2052,11 @@ const Parser = struct {
                     ddl.schema_change = try self.tableConstraint();
                     return ddl;
                 }
+                if (self.peek(.identifier) and (self.tokens[self.pos].isKeyword(.primary) or self.tokens[self.pos].isKeyword(.unique) or self.tokens[self.pos].isKeyword(.check) or self.tokens[self.pos].isKeyword(.foreign))) {
+                    ddl.action = .alter_schema;
+                    ddl.schema_change = generatedConstraint(try self.constraintDefinition("sql_constraint_0"));
+                    return ddl;
+                }
                 _ = self.keyword(.column);
                 const column_name = try self.identifier();
                 var column = try self.columnDefinition(column_name);

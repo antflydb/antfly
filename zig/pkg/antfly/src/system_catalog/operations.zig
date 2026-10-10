@@ -103,10 +103,10 @@ pub fn mutate(svc: anytype, alloc: std.mem.Allocator, context: operation.Request
         const json = request.create_table_json orelse return error.InvalidCatalogMutation;
         var req = try tables_api.parseStoredCreateTableRequest(a, json);
         if (request.generated_constraint_names.len != 0) {
-            var names = try store.prepareGeneratedConstraintNames(a, svc.metadata_group_id, admission.meta.revision, admission.namespace_id, request.mutation.name, req.schema_json orelse return error.InvalidCatalogMutation, request.generated_constraint_names, context);
-            defer names.deinit();
-            req.schema_json = try a.dupe(u8, names.schema_json);
-            command.constraint_name_admission = try names.admission.dupe(a);
+            const bytes = try store.prepareConstraintNamesJsonWithContext(a, svc.metadata_group_id, .{ .create = .{ .expected_revision = admission.meta.revision, .namespace_id = admission.namespace_id, .logical_name = request.mutation.name, .schema_json = req.schema_json orelse return error.InvalidCatalogMutation, .generated_names = request.generated_constraint_names } }, context);
+            const names = try std.json.parseFromSliceLeaky(domain.ConstraintNamePrepared, a, bytes, .{});
+            req.schema_json = try a.dupe(u8, names.schema_json orelse return error.InvalidCatalogRecord);
+            command.constraint_name_admission = names.admission;
             command.version = 2;
         }
         const storage_name = request.physical_name orelse try std.fmt.allocPrint(a, "table:{d}", .{admission.meta.next_id});
@@ -347,13 +347,16 @@ pub fn mutateFkGenerationPublication(svc: anytype, alloc: std.mem.Allocator, con
     if (!context.fk_generation_publication_authority) return error.Forbidden;
     try command.validateShape();
     try context.ensureActive();
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.fk_generation_publication_version);
+    const naming = if (command.plan) |plan| plan.constraint_name_guard != null else false;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, if (naming) protocol.constraint_occupancy_version else protocol.fk_generation_publication_version);
     try svc.ensureLinearizableReadWithContext(context);
     svc.lockCatalogMutation();
     var gate_held = true;
     defer if (gate_held) svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(context, readiness);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+    if (command.plan) |plan| if (plan.constraint_name_guard != null)
+        try store.preflightFkGenerationNameAdmission(svc.metadata_group_id, plan);
     const bytes = try std.json.Stringify.valueAlloc(alloc, command, .{});
     defer alloc.free(bytes);
     if (bytes.len > fk_publication.max_bytes) return error.CatalogCommandTooLarge;
@@ -526,6 +529,13 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             try svc.ensureLinearizableReadWithContext(context);
             const store = svc.projectedStore() orelse return error.MissingMetadataStore;
             break :blk store.fkInitialCreatePrepareJsonWithContext(alloc, svc.metadata_group_id, request, context);
+        },
+        .constraint_name_prepare => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            _ = try svc.ensureTableTopologyProtocolReadyWithContext(context, protocol.constraint_occupancy_version);
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            break :blk store.prepareConstraintNamesJsonWithContext(alloc, svc.metadata_group_id, .{ .addition = request }, context);
         },
         .fk_initial_child_decision => |request| blk: {
             if (!context.fk_generation_publication_authority) return error.Forbidden;

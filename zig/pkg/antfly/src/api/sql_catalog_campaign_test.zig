@@ -60,14 +60,22 @@ fn adoptNativeSources(svc: *@import("../metadata/service.zig").MetadataService) 
     // Tracking adoption is a durable, membership-fenced migration step, not
     // implied by CREATE's topology readiness or a local decoder version.
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, protocol.relation_reconciliation_version);
-    const bytes = try (control.Command{ .adopt = .{
+    const proof: protocol.Activation = .{
         // The wire proof names this command's decoder, not a newer admitted
         // cluster floor. Membership identity still comes from readiness.
         .version = protocol.relation_reconciliation_version,
         .incarnation = readiness.metadata_incarnation orelse return error.TableTopologyProtocolUpgradeRequired,
         .member_count = readiness.protected_member_count,
         .membership_fingerprint = readiness.protected_membership_fingerprint,
-    } }).encodeAlloc(svc.alloc);
+    };
+    // Readiness is an observation, not durable activation. The production
+    // worker commits this fence before adoption; this explicit campaign must
+    // do the same through leader admission, not rely on CREATE's older floor.
+    const activation_bytes = try std.json.Stringify.valueAlloc(svc.alloc, proof, .{});
+    defer svc.alloc.free(activation_bytes);
+    const activation_receipt = try svc.proposeTopologyActivationWithReceipt(activation_bytes, readiness);
+    try svc.waitForTransitionApplied(activation_receipt);
+    const bytes = try (control.Command{ .adopt = proof }).encodeAlloc(svc.alloc);
     defer svc.alloc.free(bytes);
     const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_relation_reconciliation = bytes });
     try svc.waitForTransitionApplied(receipt);

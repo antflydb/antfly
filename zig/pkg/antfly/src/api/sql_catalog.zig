@@ -35,7 +35,116 @@ fn newReceipt(alloc: std.mem.Allocator, target: domain.Target, table_id: u64, ve
 const RelationAdmission = struct { table: domain.ResolvedTable, guard: domain.RelationMutationGuard };
 const SearchPath = @import("../pgwire/search_path.zig").Path;
 
+fn prepareGeneratedAddition(server: *server_mod.ApiHttpServer, context: operation.RequestContext, alloc: std.mem.Allocator, schema: std.json.Value, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, guard: *domain.RelationMutationGuard) !?std.json.Value {
+    try context.ensureActive();
+    var candidate = (try @import("antfly_local_sources").sql_schema_ddl.prepareGeneratedAddition(alloc, schema, ddl)) orelse return null;
+    if (guard.constraint_name_admission != null) return error.InvalidSqlBackendResponse;
+    var private = context;
+    private.setting_admin = true;
+    const bytes = try server.source.systemCatalog(alloc, private, .{ .constraint_name_prepare = .{
+        .guard = guard.*,
+        .fragment_json = candidate.fragment_json,
+        .generated_name = candidate.generated_name,
+    } });
+    defer alloc.free(bytes);
+    const prepared = std.json.parseFromSliceLeaky(domain.ConstraintNamePrepared, alloc, bytes, .{ .allocate = .alloc_always }) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return error.InvalidSqlBackendResponse;
+    };
+    // An additive response may choose one identity, never replace the schema
+    // or change the kind which was already bound and locally validated.
+    if (prepared.schema_json != null or prepared.admission.names.len != 1) return error.InvalidSqlBackendResponse;
+    const expected: @TypeOf(prepared.admission.names[0].kind) = switch (ddl.schema_change.?) {
+        .add_unique => |rule| if (rule.primary) .primary else .unique,
+        .add_check => .check,
+        .add_foreign_key => .foreign_key,
+        else => unreachable,
+    };
+    const selected = prepared.admission.names[0];
+    if (selected.kind != expected) return error.InvalidSqlBackendResponse;
+    try candidate.selectName(alloc, selected.name);
+    var guarded = guard.*;
+    guarded.constraint_name_admission = prepared.admission;
+    guarded.validate() catch return error.InvalidSqlBackendResponse;
+    try context.ensureActive();
+    guard.* = guarded;
+    return candidate.schema;
+}
+
+test "SQL catalog anonymous addition preserves its pinned owner and validates preparation replies" {
+    const Source = struct {
+        calls: usize = 0,
+        mode: enum { valid, wrong_kind, replacement, empty, wrong_scope } = .valid,
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn run(raw: *anyopaque, a: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(context.setting_admin);
+            try std.testing.expect(call == .constraint_name_prepare);
+            try std.testing.expect(!call.isMutation());
+            self.calls += 1;
+            const request = call.constraint_name_prepare;
+            try std.testing.expectEqualStrings("items", request.guard.target.name);
+            try std.testing.expectEqual(@as(u64, 17), request.guard.owner.table_id);
+            try std.testing.expectEqual(@as(u32, 3), request.guard.owner.schema_version);
+            try std.testing.expect(request.guard.constraint_name_admission == null);
+            const fragment = try std.json.parseFromSliceLeaky(std.json.Value, a, request.fragment_json, .{});
+            try std.testing.expectEqual(@as(usize, 1), fragment.object.count());
+            const checks = fragment.object.get("checks").?.array.items;
+            try std.testing.expectEqual(@as(usize, 1), checks.len);
+            try std.testing.expectEqualStrings(request.generated_name, checks[0].object.get("name").?.string);
+            var result: domain.ConstraintNamePrepared = .{
+                .schema_json = if (self.mode == .replacement) "{}" else null,
+                .admission = .{ .namespace_id = if (self.mode == .wrong_scope) 0 else 2, .names = &.{.{ .name = "items_id_check1", .kind = if (self.mode == .wrong_kind) .unique else .check }} },
+            };
+            if (self.mode == .empty) result.admission.names = &.{};
+            return std.json.Stringify.valueAlloc(a, result, .{});
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var source: Source = .{};
+    var server = server_mod.ApiHttpServer.init(a, .{}, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.run } }, null, null);
+    defer server.deinit();
+    const baseline = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}},"checks":[{"name":"items_id_check","expression":{"op":"literal","value":true}}]}
+    , .{});
+    const before = try std.json.Stringify.valueAlloc(a, baseline, .{});
+    var compiled = try @import("antfly_local_sources").sql_compiler.compile(a, "ALTER TABLE items ADD CHECK (id > 0)", .{});
+    defer compiled.deinit();
+    const original: domain.RelationMutationGuard = .{
+        .target = .{ .name = "items" },
+        .logical_table = "items",
+        .owner = .{ .table_id = 17, .schema_version = 3, .schema_digest = @splat(1), .kind = .table },
+        .incarnation = @splat(2),
+    };
+    var guard = original;
+    const result = (try prepareGeneratedAddition(&server, .{}, a, baseline, compiled.statement.catalog_ddl, &guard)).?;
+    try std.testing.expectEqualStrings("items_id_check1", result.object.get("checks").?.array.items[1].object.get("name").?.string);
+    try std.testing.expectEqualStrings("items_id_check1", guard.constraint_name_admission.?.names[0].name);
+    try std.testing.expectEqual(@as(u64, 2), guard.constraint_name_admission.?.namespace_id);
+    try std.testing.expectEqualDeep(original.owner, guard.owner);
+    try std.testing.expectEqualDeep(original.incarnation, guard.incarnation);
+    try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, baseline, .{}));
+    for ([_]@TypeOf(source.mode){ .wrong_kind, .replacement, .empty, .wrong_scope }) |mode| {
+        source.mode = mode;
+        guard = original;
+        try std.testing.expectError(error.InvalidSqlBackendResponse, prepareGeneratedAddition(&server, .{}, a, baseline, compiled.statement.catalog_ddl, &guard));
+        try std.testing.expect(guard.constraint_name_admission == null);
+    }
+    const calls = source.calls;
+    try std.testing.expectError(error.DeadlineExceeded, prepareGeneratedAddition(&server, .{ .deadline_ns = 0 }, a, baseline, compiled.statement.catalog_ddl, &guard));
+    try std.testing.expectEqual(calls, source.calls);
+}
+
 fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, requested_target: domain.Target, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, admission: ?RelationAdmission, path: ?*const SearchPath) !catalog.DdlOutcome {
+    // Compiler labels are not public identities. Do not publish an anonymous
+    // addition until every publication path can atomically admit its name.
+    if (ddl.schema_change) |change| if (change.generatedConstraintName() != null and
+        @import("../metadata/topology_protocol.zig").current_version < @import("../metadata/topology_protocol.zig").constraint_occupancy_version)
+        return error.TableTopologyProtocolUpgradeRequired;
     if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -100,7 +209,10 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         }
     }
     var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, definition.schema_json, .{ .parse_numbers = false });
-    if (!try @import("antfly_local_sources").sql_schema_ddl.apply(a, &schema, ddl)) return .{};
+    var guard = captured.guard;
+    if (try prepareGeneratedAddition(server, context, a, schema, ddl, &guard)) |candidate| {
+        schema = candidate;
+    } else if (!try @import("antfly_local_sources").sql_schema_ddl.apply(a, &schema, ddl)) return .{};
     _ = schema.object.swapRemove("version");
     const proposed = try std.json.Stringify.valueAlloc(a, schema, .{});
     const updated = try server.bindForeignKeySchema(a, target, table.name, proposed, definition.schema_json, identity, context);
@@ -123,7 +235,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         }
         const publication_id = try alloc.alloc(u8, 32);
         errdefer alloc.free(publication_id);
-        const publication = server.beginFkGenerationPublication(alloc, context, identity, before.*, updated) catch |err| switch (err) {
+        const publication = server.beginFkGenerationPublicationWithConstraintNameGuard(alloc, context, identity, before.*, updated, if (guard.constraint_name_admission != null) guard else null) catch |err| switch (err) {
             error.MetadataMutationOutcomeUnknown => return error.SqlMutationOutcomeUnknown,
             else => return err,
         };
@@ -142,7 +254,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         .add_column => |column| if (!column.nullable or column.default_expression != null or column.generated_expression != null)
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_expression != null) &.{column.name} else &.{}),
         .add_unique => |constraint| if (constraint.primary)
-            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}),
+            return if (guard.constraint_name_admission != null) error.TableTopologyProtocolUpgradeRequired else rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}),
         else => {},
     };
     const retirement = try requiresRetirement(a, definition.schema_json, schema);
@@ -163,7 +275,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     };
     // Physical identity is immutable and never reused; native schema CAS also
     // fences concurrent schema changes. Never replay an uncertain submission.
-    const version = submitSchema(server, context, alloc, table.name, table.table_id, native.version, updated, retirement, validation, captured.guard) catch |err| {
+    const version = submitSchema(server, context, alloc, table.name, table.table_id, native.version, updated, retirement, validation, guard) catch |err| {
         if (err == error.ForeignKeyReferenced) return error.SqlDependentConstraint;
         if (err == error.MetadataMutationOutcomeUnknown or err == error.OutOfMemory) return error.SqlMutationOutcomeUnknown;
         return err;

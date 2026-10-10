@@ -1002,6 +1002,23 @@ test "system catalog relation guard preserves legacy JSON and rejects oversized 
     try std.testing.expectError(error.InvalidCatalogMutation, guard.validate());
 }
 
+pub const ConstraintNamePrepareRequest = struct {
+    guard: RelationMutationGuard,
+    fragment_json: []const u8,
+    generated_name: []const u8,
+};
+
+pub const ConstraintNamePreparation = union(enum) {
+    create: struct { expected_revision: u64, namespace_id: u64, logical_name: []const u8, schema_json: []const u8, generated_names: []const []const u8 },
+    addition: ConstraintNamePrepareRequest,
+};
+
+pub const ConstraintNamePrepared = struct {
+    /// ALTER already owns its candidate; only CREATE needs normalized bytes.
+    schema_json: ?[]const u8 = null,
+    admission: @import("constraint_names.zig").Admission,
+};
+
 pub const ResolveMany = struct {
     targets: []const Target = &.{},
     /// Internal reverse lookup for dependency authorization and schema output.

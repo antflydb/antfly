@@ -20,17 +20,18 @@ pub fn requiresOccupancy(bytes: []const u8, max_bytes: usize) bool {
     if (bytes.len > max_bytes) return true;
     // Unknown schema/parent/row fields are skipped rather than materialized.
     const Marker = struct { namespace_id: u64 };
+    const Guard = struct { constraint_name_admission: ?Marker = null };
     const Shape = struct {
         version: u32 = 1,
         constraint_name_admission: ?Marker = null,
-        plan: ?struct { constraint_name_admission: ?Marker = null } = null,
+        plan: ?struct { constraint_name_admission: ?Marker = null, constraint_name_guard: ?Guard = null } = null,
     };
     var buffer: [4096]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&buffer);
     const shape = std.json.parseFromSliceLeaky(Shape, fixed.allocator(), bytes, .{ .ignore_unknown_fields = true }) catch return true;
     // Malformed, exhausted and future frames cannot use legacy admission.
     return shape.version != 1 or shape.constraint_name_admission != null or
-        (if (shape.plan) |plan| plan.constraint_name_admission != null else false);
+        (if (shape.plan) |plan| plan.constraint_name_admission != null or plan.constraint_name_guard != null else false);
 }
 
 test "naming wire projection skips large escaped schemas and detects nested and direct predicates" {
@@ -45,6 +46,9 @@ test "naming wire projection skips large escaped schemas and detects nested and 
     const named = try std.json.Stringify.valueAlloc(a, .{ .plan = .{ .child = .{ .schema_json = large }, .constraint_name_admission = .{ .namespace_id = 2, .names = &.{"ignored"} } } }, .{});
     defer a.free(named);
     try std.testing.expect(requiresOccupancy(named, limit));
+    try std.testing.expect(requiresOccupancy("{\"plan\":{\"constraint_name_guard\":{\"constraint_name_admission\":{\"namespace_id\":2}}}}", limit));
+    try std.testing.expect(requiresOccupancy("{\"plan\":{\"constraint_name_guard\":{}}}", limit));
+    try std.testing.expect(!requiresOccupancy("{\"plan\":{\"constraint_name_guard\":null}}", limit));
     try std.testing.expect(requiresOccupancy("{\"constraint_name_admission\":{\"namespace_id\":2}}", limit));
     try std.testing.expect(!requiresOccupancy("{\"version\":1,\"constraint_name_admission\":null}", limit));
     for ([_][]const u8{ "{", "{\"version\":0}", "{\"version\":2}", "{\"plan\":{\"constraint_name_admission\":{}}}" }) |invalid|

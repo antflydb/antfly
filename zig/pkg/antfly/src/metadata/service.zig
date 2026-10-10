@@ -3420,6 +3420,8 @@ pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.Tra
         return metadata_topology_protocol.constraint_occupancy_version;
     if (command == .apply_fk_initial_create and carriesConstraintNameAdmission(command.apply_fk_initial_create))
         return metadata_topology_protocol.constraint_occupancy_version;
+    if (command == .apply_fk_generation_publication and carriesConstraintNameAdmission(command.apply_fk_generation_publication))
+        return metadata_topology_protocol.constraint_occupancy_version;
     if (command == .compare_and_replace_table) if (command.compare_and_replace_table.relation_guard) |guard|
         return if (guard.constraint_name_admission != null) metadata_topology_protocol.constraint_occupancy_version else metadata_topology_protocol.relation_mutation_version;
     if (command == .apply_relation_reconciliation) {
@@ -13447,7 +13449,8 @@ test "relational topology admission rejects lifecycle proposals before encoding 
     try std.testing.expectEqual(@as(usize, 1), relation_service.appended);
     const naming_catalog: metadata_storage.TransitionCommand = .{ .apply_system_catalog = "{\"version\":2,\"constraint_name_admission\":{\"namespace_id\":2,\"names\":[]}}" };
     const naming_fk: metadata_storage.TransitionCommand = .{ .apply_fk_initial_create = "{\"plan\":{\"constraint_name_admission\":{\"namespace_id\":2,\"names\":[]}}}" };
-    for ([_]metadata_storage.TransitionCommand{ naming_catalog, naming_fk }) |named| {
+    const naming_generation: metadata_storage.TransitionCommand = .{ .apply_fk_generation_publication = "{\"plan\":{\"constraint_name_guard\":{\"constraint_name_admission\":{\"namespace_id\":2,\"names\":[]}}}}" };
+    for ([_]metadata_storage.TransitionCommand{ naming_catalog, naming_fk, naming_generation }) |named| {
         try std.testing.expectEqual(naming_version, transitionRequiredCoordinatedDecoderVersion(named));
         try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{named}));
         try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, relation_service.propose(&.{ legacy, named }));

@@ -4018,8 +4018,49 @@ test "system catalog relation namespace transaction FK generation publication be
     var altered_index_plan = plan;
     altered_index_plan.child_after.indexes_json = "{\"unexpected\":{}}";
     try std.testing.expectError(error.InvalidGenerationPublication, altered_index_plan.validate(alloc));
+    var named_plan = plan;
+    var before_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(old_json, &before_digest, .{});
+    named_plan.constraint_name_guard = .{
+        .target = .{ .name = "child" },
+        .logical_table = "child",
+        .owner = .{ .table_id = child.table_id, .schema_version = 1, .schema_digest = before_digest, .kind = .table },
+        .incarnation = (try store.relationReconciliationWork(group_id)).epoch.?.incarnation,
+        .constraint_name_admission = .{ .namespace_id = system_catalog.default_namespace_id, .names = &.{.{ .name = "fk", .kind = .foreign_key }} },
+    };
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.preflightFkGenerationNameAdmission(group_id, named_plan));
+    const named_begin = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.Command{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 0, .action = .begin, .plan = named_plan }, .{});
+    defer alloc.free(named_begin);
+    try store.applyStandaloneCommand(group_id, .{ .apply_fk_generation_publication = named_begin });
+    // A committed lower-capability begin cannot reserve any owner or publish
+    // a plan. The following legacy admission still succeeds independently.
+    {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        var key_buf: [160]u8 = undefined;
+        try std.testing.expectError(error.NotFound, read.get(try fk_generation_publication.key(&key_buf, group_id, child.table_id)));
+        for ([_]u64{ child.table_id, parent.table_id }) |table_id| {
+            try std.testing.expectError(error.NotFound, read.get(try fk_generation_publication.tableLockKey(&key_buf, group_id, table_id)));
+        }
+    }
     const begin = try std.json.Stringify.valueAlloc(alloc, fk_generation_publication.Command{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 0, .action = .begin, .plan = plan }, .{});
     defer alloc.free(begin);
+    try store.preflightFkGenerationNameAdmission(group_id, plan);
+    {
+        // Corrupt lock ownership is not a defeated optimistic predicate.
+        var key_buf: [160]u8 = undefined;
+        const key = try fk_generation_publication.tableLockKey(&key_buf, group_id, parent.table_id);
+        const bad_lock = RaftApplyStore.fkTableLockValue(.generation, @splat(0));
+        var write = try store.store.beginWriteTxn();
+        errdefer write.abort();
+        try write.put(key, &bad_lock);
+        try write.commit();
+        try std.testing.expectError(error.InvalidGenerationPublication, store.preflightFkGenerationNameAdmission(group_id, plan));
+        var cleanup = try store.store.beginWriteTxn();
+        errdefer cleanup.abort();
+        try cleanup.delete(key);
+        try cleanup.commit();
+    }
     // The child is unprotected, but an active policy on an external parent
     // still forbids an uncoupled generation plan. Reject before publishing a
     // 202/pending plan that its parent owner would be unable to install.
@@ -13113,7 +13154,7 @@ pub const RaftApplyStore = struct {
             error.NotFound => return null,
             else => return err,
         };
-        if (value.len != 1 + @sizeOf(fk_generation_publication.Id)) return error.InvalidGenerationPublication;
+        if (value.len != 1 + @sizeOf(fk_generation_publication.Id) or std.mem.allEqual(u8, value[1..], 0)) return error.InvalidGenerationPublication;
         return switch (value[0]) {
             @backingInt(FkTableLockKind.generation) => .generation,
             @backingInt(FkTableLockKind.initial_support) => .initial_support,
@@ -13210,7 +13251,10 @@ pub const RaftApplyStore = struct {
         if (try backupCohortLocksTableTxn(txn, group_id, expected.table_id) or
             try restoreStagingLocksTableTxn(txn, group_id, expected.table_id)) return error.GenerationPublicationChanged;
         var table_key_buf: [160]u8 = undefined;
-        const encoded = txn.get(try tableKeyForGroup(&table_key_buf, group_id, expected.table_id)) catch return error.GenerationPublicationChanged;
+        const encoded = txn.get(try tableKeyForGroup(&table_key_buf, group_id, expected.table_id)) catch |err| switch (err) {
+            error.NotFound => return error.GenerationPublicationChanged,
+            else => return err,
+        };
         const current = try decodeTableRecord(self.alloc, encoded);
         defer metadata_table_manager.freeTable(self.alloc, current);
         if (!metadata_table_manager.tableDefinitionsEqual(current, expected) or
@@ -13220,7 +13264,10 @@ pub const RaftApplyStore = struct {
         if (ids.len != ranges.len) return error.GenerationPublicationChanged;
         for (ranges) |expected_range| {
             var range_key_buf: [160]u8 = undefined;
-            const range_encoded = txn.get(try rangeKeyForGroup(&range_key_buf, group_id, expected_range.group_id)) catch return error.GenerationPublicationChanged;
+            const range_encoded = txn.get(try rangeKeyForGroup(&range_key_buf, group_id, expected_range.group_id)) catch |err| switch (err) {
+                error.NotFound => return error.GenerationPublicationChanged,
+                else => return err,
+            };
             const current_range = try decodeRangeRecord(self.alloc, range_encoded);
             defer metadata_table_manager.freeRange(self.alloc, current_range);
             if (!metadata_table_manager.rangeRecordsEqual(current_range, expected_range)) return error.GenerationPublicationChanged;
@@ -14265,6 +14312,42 @@ pub const RaftApplyStore = struct {
         return std.json.Stringify.valueAlloc(alloc, decision, .{});
     }
 
+    pub fn preflightFkGenerationNameAdmission(self: *RaftApplyStore, group_id: u64, plan: fk_generation_publication.Plan) !void {
+        try plan.validate(self.alloc);
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        var key_buf: [160]u8 = undefined;
+        const existing = txn.get(try fk_generation_publication.key(&key_buf, group_id, plan.child_before.table_id)) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (existing) |bytes| {
+            var prior = try std.json.parseFromSlice(fk_generation_publication.Publication, self.alloc, bytes, .{});
+            defer prior.deinit();
+            try prior.value.validate(self.alloc);
+            if (prior.value.phase != .published and prior.value.phase != .canceled) return error.GenerationPublicationChanged;
+        }
+        try self.validateFkGenerationBeginAdmissionTxn(&txn, group_id, plan);
+    }
+
+    /// Every expected rejection in this helper is read-only. Lock acquisition
+    /// begins only after all owners pass; errors after that point must abort.
+    fn validateFkGenerationBeginAdmissionTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, plan: fk_generation_publication.Plan) !void {
+        if (plan.constraint_name_guard) |guard|
+            try self.validateRelationMutationTxn(txn, group_id, guard, plan.child_before, plan.child_after);
+        var policy = try system_catalog_storage.loadPolicyPublication(self.alloc, txn, group_id, plan.child_before.table_id);
+        defer if (policy) |*record| record.deinit();
+        if (policy) |record| if (record.value.phase != .disabled or system_catalog_storage.policyPublicationNeedsWork(record.value)) return error.RowPolicyUnsupported;
+        try self.validateFkGenerationCutTxn(txn, group_id, plan, false);
+        for (plan.parents) |parent| if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, parent.table.table_id))
+            return error.RowPolicyUnsupported;
+        for (0..plan.parents.len + 1) |i| {
+            const table_id = if (i == 0) plan.child_before.table_id else plan.parents[i - 1].table.table_id;
+            if (i != 0 and table_id == plan.child_before.table_id) continue;
+            if (try self.fkTableLockKindTxn(txn, group_id, table_id) != null) return error.GenerationPublicationChanged;
+        }
+    }
+
     fn applyFkGenerationPublicationTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, bytes: []const u8) !void {
         if (bytes.len == 0 or bytes.len > fk_generation_publication.max_bytes) return error.InvalidGenerationPublication;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -14290,26 +14373,25 @@ pub const RaftApplyStore = struct {
         var previous: ?std.json.Parsed(fk_generation_publication.Publication) = null;
         defer if (previous) |*value| value.deinit();
         if (command.action == .begin) {
+            const plan = command.plan.?;
+            const plan_digest = try plan.digest(alloc);
             if (existing) |current_bytes| {
                 var prior_terminal = try std.json.parseFromSlice(fk_generation_publication.Publication, alloc, current_bytes, .{});
                 defer prior_terminal.deinit();
-                if (prior_terminal.value.phase != .published and prior_terminal.value.phase != .canceled) return error.GenerationPublicationChanged;
+                if (plan.constraint_name_guard != null) try prior_terminal.value.validate(alloc);
+                if (prior_terminal.value.phase != .published and prior_terminal.value.phase != .canceled) {
+                    if (plan.constraint_name_guard != null) return;
+                    return error.GenerationPublicationChanged;
+                }
                 if (source_tracked) previous_source_digest = try relationFkSourceDigest(prior_terminal.value, table_id);
             }
-            const plan = command.plan.?;
-            const plan_digest = try plan.digest(alloc);
-            var policy_publication = try system_catalog_storage.loadPolicyPublication(alloc, txn, group_id, table_id);
-            defer if (policy_publication) |*record| record.deinit();
-            if (policy_publication) |record| if (record.value.phase != .disabled or system_catalog_storage.policyPublicationNeedsWork(record.value)) return error.RowPolicyUnsupported;
-            try self.validateFkGenerationCutTxn(txn, group_id, plan, false);
-            // Parent-side support and generation receipts also touch an
-            // existing owner. An active policy on any parent cannot safely
-            // inherit those structural controls without a bound policy
-            // handoff, even if the child itself is unprotected.
-            for (plan.parents) |parent| {
-                if (!try self.policyTopologyMutationAllowedTxn(txn, group_id, parent.table.table_id))
-                    return error.RowPolicyUnsupported;
-            }
+            self.validateFkGenerationBeginAdmissionTxn(txn, group_id, plan) catch |err| {
+                if (plan.constraint_name_guard != null) switch (err) {
+                    error.CatalogGenerationChanged, error.CatalogPublicationProofPending, error.CatalogOccupancyNotReady, error.TableTopologyProtocolUpgradeRequired, error.ExtensionOwnedObject, error.GenerationPublicationChanged, error.RowPolicyUnsupported => return,
+                    else => {},
+                };
+                return err;
+            };
             try self.setFkGenerationTableLocksTxn(txn, group_id, plan, true);
             publication = .{ .plan = plan, .plan_digest = plan_digest, .child_identity = try plan.childIdentity(alloc), .revision = 1, .phase = .fencing_child };
         } else {
@@ -14409,6 +14491,20 @@ pub const RaftApplyStore = struct {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         return system_catalog_storage.readMeta(alloc, &txn, group_id);
+    }
+
+    pub fn prepareConstraintNamesJsonWithContext(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, request: system_catalog.ConstraintNamePreparation, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
+        try context.ensureActive();
+        if (topology_protocol.current_version < topology_protocol.constraint_occupancy_version) return error.TableTopologyProtocolUpgradeRequired;
+        var plan = switch (request) {
+            .create => |input| try self.prepareGeneratedConstraintNames(alloc, group_id, input.expected_revision, input.namespace_id, input.logical_name, input.schema_json, input.generated_names, context),
+            .addition => |input| blk: {
+                if (input.guard.constraint_name_admission != null) return error.InvalidCatalogMutation;
+                break :blk try self.prepareGeneratedConstraintAddition(alloc, group_id, input.guard, input.fragment_json, &.{input.generated_name}, context);
+            },
+        };
+        defer plan.deinit();
+        return std.json.Stringify.valueAlloc(alloc, system_catalog.ConstraintNamePrepared{ .schema_json = if (request == .create) plan.schema_json else null, .admission = plan.admission }, .{});
     }
 
     pub fn prepareGeneratedConstraintNames(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, expected_revision: u64, namespace_id: u64, logical_name: []const u8, schema_json: []const u8, generated: []const []const u8, context: @import("antfly_local_sources").api_operation.RequestContext) !relation_names.constraint_naming.Plan {

@@ -728,6 +728,10 @@ pub const Detail = enum(c_int) {
     invalid_generated_tool_arguments,
     sql_feature_not_supported,
     catalog_publication_proof_pending,
+    sql_index_already_exists,
+    sql_constraint_already_exists,
+    program_limit_exceeded,
+    catalog_occupancy_not_ready,
 };
 
 pub const Status = extern struct {
@@ -855,6 +859,10 @@ pub fn statusFromError(err: anyerror) Status {
         error.RelationalExpressionDivisionByZero => status(.invalid_argument, .relational_expression_division_by_zero),
         error.SqlFeatureNotSupported => status(.unsupported, .sql_feature_not_supported),
         error.CatalogPublicationProofPending => status(.retryable, .catalog_publication_proof_pending),
+        error.SqlIndexAlreadyExists => status(.already_exists, .sql_index_already_exists),
+        error.SqlConstraintAlreadyExists => status(.already_exists, .sql_constraint_already_exists),
+        error.ProgramLimitExceeded => status(.invalid_argument, .program_limit_exceeded),
+        error.CatalogOccupancyNotReady => status(.retryable, .catalog_occupancy_not_ready),
         error.RelationalExpressionBudgetExceeded => status(.invalid_argument, .relational_expression_budget_exceeded),
         error.RelationalIndexKeyTooLarge => status(.invalid_argument, .relational_index_key_too_large),
         error.InvalidRelationalExpressionInput => status(.invalid_argument, .invalid_relational_expression_input),
@@ -1555,6 +1563,10 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .relational_expression_division_by_zero => "RelationalExpressionDivisionByZero",
         .sql_feature_not_supported => "SqlFeatureNotSupported",
         .catalog_publication_proof_pending => "CatalogPublicationProofPending",
+        .sql_index_already_exists => "SqlIndexAlreadyExists",
+        .sql_constraint_already_exists => "SqlConstraintAlreadyExists",
+        .program_limit_exceeded => "ProgramLimitExceeded",
+        .catalog_occupancy_not_ready => "CatalogOccupancyNotReady",
         .relational_expression_budget_exceeded => "RelationalExpressionBudgetExceeded",
         .relational_index_key_too_large => "RelationalIndexKeyTooLarge",
         .invalid_relational_expression_input => "InvalidRelationalExpressionInput",
@@ -2304,6 +2316,14 @@ test "catalog publication preparation preserves explicit retry identity across a
     var forged = pending;
     forged.code = @backingInt(Code.corrupt);
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(forged));
+    inline for (.{ error.SqlIndexAlreadyExists, error.SqlConstraintAlreadyExists, error.ProgramLimitExceeded, error.CatalogOccupancyNotReady }) |err| {
+        const encoded = statusFromError(err);
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(encoded));
+        var mismatched = encoded;
+        mismatched.code = @backingInt(Code.corrupt);
+        try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(mismatched));
+    }
 }
 
 test "released main Detail identifiers retain their exact names and numeric values" {

@@ -269,6 +269,15 @@ pub const Plan = struct {
     child_ranges: []const records.RangeRecord,
     child_fences: []const topology.Fence,
     parents: []const Parent,
+    /// Admission is checked before reserving the successor schema. The plan
+    /// digest binds it through owner receipts, cancellation and restart.
+    constraint_name_guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard = null,
+
+    pub fn jsonStringify(self: Plan, writer: anytype) !void {
+        // Legacy digests/receipts must not acquire a new null field.
+        if (self.constraint_name_guard == null) return writer.write(.{ .id = self.id, .child_before = self.child_before, .child_after = self.child_after, .child_catalog_before_b64 = self.child_catalog_before_b64, .child_ranges = self.child_ranges, .child_fences = self.child_fences, .parents = self.parents });
+        try writer.write(.{ .id = self.id, .child_before = self.child_before, .child_after = self.child_after, .child_catalog_before_b64 = self.child_catalog_before_b64, .child_ranges = self.child_ranges, .child_fences = self.child_fences, .parents = self.parents, .constraint_name_guard = self.constraint_name_guard });
+    }
 
     pub fn validate(self: Plan, alloc: std.mem.Allocator) !void {
         if (std.mem.allEqual(u8, &self.id, 0) or self.child_before.table_id == 0 or
@@ -288,6 +297,19 @@ pub const Plan = struct {
         if (before.storage_mode != .relational or after.storage_mode != .relational or
             after.version != next_version)
             return error.InvalidGenerationPublication;
+        if (self.constraint_name_guard) |guard| {
+            guard.validate() catch return error.InvalidGenerationPublication;
+            const admission = guard.constraint_name_admission orelse return error.InvalidGenerationPublication;
+            if (guard.owner.table_id != self.child_before.table_id or guard.owner.schema_version != before.version or
+                admission.names[0].kind != .foreign_key) return error.InvalidGenerationPublication;
+            var digest_before: [32]u8 = undefined;
+            std.crypto.hash.Blake3.hash(self.child_before.schema_json, &digest_before, .{});
+            if (!std.mem.eql(u8, &digest_before, &guard.owner.schema_digest)) return error.InvalidGenerationPublication;
+            admission.validateSchema(alloc, self.child_after.schema_json) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return error.InvalidGenerationPublication;
+            };
+        }
         // A schema version may require a successor full-text incarnation.
         // Verify the entire successor index catalog against the deterministic
         // DDL derivation, rather than allowing unrelated index/runtime edits
@@ -1680,6 +1702,35 @@ test "self-FK generation plan binds both roles to one exact dual owner fence" {
         .parents = &.{.{ .table = table, .ranges = &.{range}, .fences = &.{fence}, .transitions = &.{derived[0].transition} }},
     };
     try plan.validate(alloc);
+    // Adding a nullable field must not change already issued digest inputs.
+    const legacy_json = try std.json.Stringify.valueAlloc(alloc, .{ .id = plan.id, .child_before = plan.child_before, .child_after = plan.child_after, .child_catalog_before_b64 = plan.child_catalog_before_b64, .child_ranges = plan.child_ranges, .child_fences = plan.child_fences, .parents = plan.parents }, .{});
+    try std.testing.expectEqualStrings(legacy_json, try std.json.Stringify.valueAlloc(alloc, plan, .{}));
+    var named = plan;
+    var schema_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(before_json, &schema_digest, .{});
+    named.constraint_name_guard = .{
+        .target = .{ .name = "nodes" },
+        .logical_table = "nodes",
+        .owner = .{ .table_id = 101, .schema_version = 1, .schema_digest = schema_digest, .kind = .table },
+        .incarnation = @splat(1),
+        .constraint_name_admission = .{ .namespace_id = 1, .names = &.{.{ .name = "self_fk", .kind = .foreign_key }} },
+    };
+    try named.validate(alloc);
+    const named_json = try std.json.Stringify.valueAlloc(alloc, named, .{});
+    const recovered = try std.json.parseFromSliceLeaky(Plan, alloc, named_json, .{ .allocate = .alloc_always });
+    try recovered.validate(alloc);
+    try std.testing.expectEqualStrings("self_fk", recovered.constraint_name_guard.?.constraint_name_admission.?.names[0].name);
+    try std.testing.expectEqualDeep(try named.digest(alloc), try recovered.digest(alloc));
+    try std.testing.expect(!std.mem.eql(u8, &(try plan.digest(alloc)), &(try named.digest(alloc))));
+    var bad_named = named;
+    bad_named.constraint_name_guard.?.owner.schema_digest[0] ^= 1;
+    try std.testing.expectError(error.InvalidGenerationPublication, bad_named.validate(alloc));
+    bad_named = named;
+    bad_named.constraint_name_guard.?.constraint_name_admission.?.names = &.{.{ .name = "pk", .kind = .unique }};
+    try std.testing.expectError(error.InvalidGenerationPublication, bad_named.validate(alloc));
+    bad_named = named;
+    bad_named.constraint_name_guard.?.constraint_name_admission.?.names = &.{.{ .name = "missing_fk", .kind = .foreign_key }};
+    try std.testing.expectError(error.InvalidGenerationPublication, bad_named.validate(alloc));
     var wrong_role = fence;
     wrong_role.role = .child_generation_source;
     var invalid = plan;

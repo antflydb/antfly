@@ -95,6 +95,10 @@ fn childCatalogB64(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, 
 }
 
 pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, identity: ?server_mod.AuthenticatedIdentity, before: records.TableRecord, proposed_schema_json: []const u8) !publication.Plan {
+    return buildWithConstraintNameGuard(server, alloc, context, identity, before, proposed_schema_json, null);
+}
+
+pub fn buildWithConstraintNameGuard(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, context: operation.RequestContext, identity: ?server_mod.AuthenticatedIdentity, before: records.TableRecord, proposed_schema_json: []const u8, guard: ?@import("antfly_local_sources").system_catalog_domain.RelationMutationGuard) !publication.Plan {
     try context.ensureActive();
     var snapshot = (try server.source.linearizableSnapshot(context)) orelse return error.MetadataCapabilityUnavailable;
     defer server.source.freeAdminSnapshot(&snapshot);
@@ -171,6 +175,7 @@ pub fn build(server: *server_mod.ApiHttpServer, alloc: std.mem.Allocator, contex
         .child_ranges = child_ranges,
         .child_fences = child_fences,
         .parents = try parents.toOwnedSlice(alloc),
+        .constraint_name_guard = if (guard) |value| try value.clone(alloc) else null,
     };
     try result.validate(alloc);
     return result;

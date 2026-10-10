@@ -5581,13 +5581,17 @@ pub const ApiHttpServer = struct {
     /// checks, read-index owner identities, and exact AIC binding happen in
     /// the builder; metadata rechecks the entire cut at Raft apply.
     pub fn beginFkGenerationPublication(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, identity: ?AuthenticatedIdentity, before: metadata_table_manager.TableRecord, proposed_schema_json: []const u8) !FkGenerationBegin {
+        return self.beginFkGenerationPublicationWithConstraintNameGuard(alloc, context, identity, before, proposed_schema_json, null);
+    }
+
+    pub fn beginFkGenerationPublicationWithConstraintNameGuard(self: *ApiHttpServer, alloc: std.mem.Allocator, context: api_operation.RequestContext, identity: ?AuthenticatedIdentity, before: metadata_table_manager.TableRecord, proposed_schema_json: []const u8, guard: ?system_catalog.RelationMutationGuard) !FkGenerationBegin {
         if (self.cfg.deployment_mode == .standalone and
             (self.hotStandbyMutationPolicy().failover_safe_mutations_only or self.cfg.fk_generation_source == null or self.cfg.fk_generation_parent == null))
             return error.UnsupportedOperation;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const plan = try @import("fk_generation_plan_builder.zig").build(self, a, context, identity, before, proposed_schema_json);
+        const plan = try @import("fk_generation_plan_builder.zig").buildWithConstraintNameGuard(self, a, context, identity, before, proposed_schema_json, guard);
         const result: FkGenerationBegin = .{
             .plan_id = plan.id,
             .child_table_id = plan.child_before.table_id,

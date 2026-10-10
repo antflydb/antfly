@@ -6926,6 +6926,7 @@ pub const MetadataAdminVoprSource = struct {
             .fk_generation_publication_decision,
             .fk_generation_publication_source_decision,
             .fk_initial_create_prepare,
+            .constraint_name_prepare,
             .fk_initial_child_decision,
             .fk_initial_create_begin,
             .fk_initial_create_mutate,

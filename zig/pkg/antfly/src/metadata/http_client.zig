@@ -1150,7 +1150,7 @@ pub const MetadataHttpClient = struct {
         };
         var response = try internal_service_auth.executeRequest(self.alloc, self.executor, .{ .method = .POST, .uri = uri, .headers = &headers, .body = body, .content_type = "application/json", .timeout_ms = @min(default_request_timeout_ms, remaining_ms), .cancellation = cancellation }, self.internal_service);
         defer response.deinit(self.alloc);
-        if (input == .fk_initial_create_prepare and response.status != 200) {
+        if ((input == .fk_initial_create_prepare or input == .constraint_name_prepare) and response.status != 200) {
             if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
         }
         if (response.status != 200) return switch (response.status) {
@@ -4665,6 +4665,15 @@ test "system catalog hidden FK prepare preserves definite naming diagnostics" {
     executor.status = 503;
     executor.body = "CatalogOccupancyNotReady";
     try std.testing.expectError(error.CatalogOccupancyNotReady, client.readSystemCatalog("http://metadata.invalid", call, 25, null));
+    const addition: @import("../system_catalog/server_call.zig").Call = .{ .constraint_name_prepare = .{
+        .guard = .{ .target = .{ .name = "t" }, .logical_table = "t", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .table }, .incarnation = @splat(1) },
+        .fragment_json = "{}",
+        .generated_name = "anonymous",
+    } };
+    try std.testing.expectError(error.CatalogOccupancyNotReady, client.readSystemCatalog("http://metadata.invalid", addition, 25, null));
+    executor.status = 409;
+    executor.body = "SqlIndexAlreadyExists";
+    try std.testing.expectError(error.SqlIndexAlreadyExists, client.readSystemCatalog("http://metadata.invalid", addition, 25, null));
 }
 
 test "system catalog initial FK retirement page requires a store-bound transport" {
