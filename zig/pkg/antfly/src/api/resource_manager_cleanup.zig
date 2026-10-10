@@ -34,6 +34,7 @@ pub const Runtime = struct {
         const self = try allocator.create(Runtime);
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator, .io = io, .manager = manager, .scheduler = scheduler };
+        try self.adoptRegistry();
         // Actual independent worker admission precedes publication.
         self.future = try io.concurrent(run, .{self});
         return self;
@@ -60,6 +61,22 @@ pub const Runtime = struct {
             try self.checkpoint();
         }
     };
+    fn adoptRegistry(self: *Runtime) !void {
+        var execution: native.Execution = .{};
+        defer execution.finish();
+        try execution.startCleanupRoot(self.scheduler, .{
+            .io = self.io,
+            .native_now_ns = clock.monotonicNs,
+            .deadline_ns = clock.monotonicNs() +| round_duration_ns,
+            .retained_bytes = retainedBytes(),
+            .allow_wait = false,
+            .cancellation = .{ .ptr = self, .requested = canceled },
+        });
+        var budget = Budget{ .execution = &execution, .io = self.io };
+        var adapter = admission.Adapter(*Budget){ .budget = &budget };
+        const payload = adapter.payload();
+        try self.manager.admitReclaimerMetadataWithAdmission(admission.Port.init(&payload));
+    }
     fn round(self: *Runtime) !void {
         var execution: native.Execution = .{};
         defer execution.finish();

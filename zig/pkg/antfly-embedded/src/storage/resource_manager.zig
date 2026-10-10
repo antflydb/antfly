@@ -1149,6 +1149,7 @@ pub const ResourceManager = struct {
     // registration path instead of imposing a process-wide index-count cap.
     reclaimers: std.ArrayListUnmanaged(*ReclaimerSlot) = .empty,
     reclaimer_pointers: ?*ReclaimerPointers = null,
+    reclaimer_metadata_admitted: bool = false,
     reclaimer_chunks: ?*ReclaimerChunk = null,
     next_reclaimer_identity: u64 = 1,
     reclaimer_cursor: usize = 0,
@@ -1556,7 +1557,7 @@ pub const ResourceManager = struct {
             };
             return identity;
         }
-        if (self.reclaimer_pointers != null) {
+        if (self.reclaimer_metadata_admitted or self.reclaimer_pointers != null) {
             self.reclaimer_mutex.unlock();
             const Legacy = struct {
                 fn checkpoint(_: *anyopaque) !void {}
@@ -1598,7 +1599,64 @@ pub const ResourceManager = struct {
         return identity;
     }
 
+    /// Activate charged registry ownership before pooled server publication.
+    /// Existing callback cells and pointer storage remain at their addresses.
+    pub fn admitReclaimerMetadataWithAdmission(self: *ResourceManager, control: read_admission.Port) !void {
+        try self.admitLegacyReclaimerMetadata(.lsm_block_table_cache, control);
+    }
+
+    noinline fn admitLegacyReclaimerMetadata(self: *ResourceManager, slice: Slice, control: read_admission.Port) !void {
+        const Target = union(enum) { done, chunk: *ReclaimerChunk, pointers: []*ReclaimerSlot };
+        while (true) {
+            const target: Target = blk: {
+                try @import("../common/bounded_mutex.zig").lockAtomic(&self.reclaimer_mutex, control);
+                defer self.reclaimer_mutex.unlock();
+                var link = self.reclaimer_chunks;
+                while (link) |chunk| : (link = chunk.next) {
+                    try control.checkpoint();
+                    if (chunk.credit == null) break :blk .{ .chunk = chunk };
+                }
+                if (self.reclaimer_pointers == null and self.reclaimers.capacity != 0) break :blk .{ .pointers = self.reclaimers.allocatedSlice() };
+                try control.checkpoint();
+                self.reclaimer_metadata_admitted = true;
+                break :blk .done;
+            };
+            switch (target) {
+                .done => return,
+                .chunk => |chunk| {
+                    // Chunks never move or disappear before producer/callback
+                    // join. Reserve outside the registry, then recheck the claim.
+                    var construction = try self.reserveConstructionWithAdmission(slice, @sizeOf(ReclaimerChunk), control);
+                    defer construction.retire();
+                    try @import("../common/bounded_mutex.zig").lockAtomic(&self.reclaimer_mutex, control);
+                    defer self.reclaimer_mutex.unlock();
+                    try control.checkpoint();
+                    if (chunk.credit == null) chunk.credit = construction.transfer();
+                },
+                .pointers => |entries| {
+                    var construction = try self.reserveConstructionWithAdmission(slice, try ReclaimerPointers.bytes(entries.len), control);
+                    defer construction.retire();
+                    const owned = try self.identity_allocator.create(ReclaimerPointers);
+                    var published = false;
+                    defer if (!published) self.identity_allocator.destroy(owned);
+                    owned.* = .{ .allocator = self.identity_allocator, .entries = entries };
+                    try @import("../common/bounded_mutex.zig").lockAtomic(&self.reclaimer_mutex, control);
+                    defer self.reclaimer_mutex.unlock();
+                    // A legacy resize can invalidate only preparation. Never
+                    // free or register a stale buffer from the earlier snapshot.
+                    if (self.reclaimer_pointers != null or self.reclaimers.items.ptr != entries.ptr or self.reclaimers.capacity != entries.len) continue;
+                    try self.registerPayloadRetirementWithAdmission(&owned.retirement, &owned.credit, &construction, owned, ReclaimerPointers.destroy, control);
+                    self.reclaimer_pointers = owned;
+                    published = true;
+                    // Registration transfers the exact charge with no later
+                    // fallible checkpoint or retained foreground scope.
+                },
+            }
+        }
+    }
+
     noinline fn registerReclaimerAdmitted(self: *ResourceManager, slice: Slice, context: *anyopaque, reclaim: ReclaimerFn, options: ReclaimerOptions, control: read_admission.Port) !u64 {
+        try self.admitLegacyReclaimerMetadata(slice, control);
         var construction: ?ConstructionCredit = null;
         defer if (construction) |*credit| credit.retire();
         var prepared: ?*ReclaimerChunk = null;
@@ -1613,6 +1671,16 @@ pub const ResourceManager = struct {
             try @import("../common/bounded_mutex.zig").lockAtomic(&self.reclaimer_mutex, control);
             var held = true;
             defer if (held) self.reclaimer_mutex.unlock();
+            if (self.reclaimer_chunks) |head| {
+                if (head.credit == null) {
+                    // A legacy writer may have published a chunk after the
+                    // initial adoption snapshot. Admit it before cell reuse.
+                    self.reclaimer_mutex.unlock();
+                    held = false;
+                    try self.admitLegacyReclaimerMetadata(slice, control);
+                    continue;
+                }
+            }
             for (self.reclaimers.items) |slot| {
                 try control.checkpoint();
                 if (slot.identity != 0) continue;
@@ -7917,12 +7985,15 @@ pub fn qualifyControlledReclaimerPointers(control: read_admission.Port, fixture:
         const capacity = manager.reclaimers.capacity;
         while (ids.items.len < capacity) try ids.append(a, try manager.registerReclaimer(.lsm_block_table_cache, &context, Callback.reclaim));
         const first = manager.reclaimers.items[0];
-        const old_bytes = capacity * @sizeOf(*ReclaimerSlot);
         const expected = try ReclaimerPointers.bytes(capacity * 2);
         try ids.append(a, try manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &context, Callback.reclaim, control));
         try std.testing.expectEqual(first, manager.reclaimers.items[0]);
-        try std.testing.expectEqual(@as(u64, expected), manager.snapshot().memory.used_bytes);
-        try std.testing.expectEqual(@as(u64, expected + old_bytes), parent.snapshot().memory.peak_bytes);
+        const chunks = @divTrunc(capacity + 63, 64) * @sizeOf(ReclaimerChunk);
+        const old_owner_bytes = try ReclaimerPointers.bytes(capacity);
+        try std.testing.expectEqual(@as(u64, chunks + expected + old_owner_bytes), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, chunks + expected + old_owner_bytes), parent.snapshot().memory.peak_bytes);
+        try std.testing.expectEqual(@as(usize, 1), try manager.drainPayloadRetirementWithAdmission(control));
+        try std.testing.expectEqual(@as(u64, chunks + expected), parent.snapshot().memory.used_bytes);
     } else if (fixture == 1) {
         for (0..64) |_| try ids.append(a, try manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &context, Callback.reclaim, control));
         const first = manager.reclaimers.items[0];
@@ -7958,6 +8029,67 @@ pub fn qualifyControlledReclaimerPointers(control: read_admission.Port, fixture:
     }
     for (ids.items) |id| manager.unregisterReclaimer(id);
     ids.clearRetainingCapacity();
+    manager.deinit(a);
+    live = false;
+    try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+}
+
+pub fn qualifyLegacyReclaimerAdoption(control: read_admission.Port, fixture: usize) !void {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    var parent = ResourceManager.init(.{ .identity_allocator = a });
+    defer parent.deinit(a);
+    var manager = ResourceManager.init(.{ .identity_allocator = a });
+    var live = true;
+    defer if (live) manager.deinit(a);
+    try manager.installMemoryParent(parent.memoryParentPort());
+    var context: u8 = 0;
+    const Callback = struct {
+        fn reclaim(_: *anyopaque, _: u64) u64 {
+            return 0;
+        }
+    };
+    var ids: [65]u64 = @splat(0);
+    defer if (live) for (ids) |id| if (id != 0) manager.unregisterReclaimer(id);
+    for (&ids) |*id| id.* = try manager.registerReclaimer(.lsm_block_table_cache, &context, Callback.reclaim);
+    const first = manager.reclaimers.items[0];
+    const buffer = manager.reclaimers.items.ptr;
+    const expected = 2 * @sizeOf(ReclaimerChunk) + (try ReclaimerPointers.bytes(manager.reclaimers.capacity));
+    manager.unregisterReclaimer(ids[0]);
+    ids[0] = 0;
+    // Prime accounting identities so the fault probe observes registry header
+    // allocation, rather than the separately retained accounting map itself.
+    try manager.reservation_identities.map.ensureUnusedCapacity(a, 4);
+    parent.memory.budget.hard_limit_bytes = if (fixture == 1) @sizeOf(ReclaimerChunk) - 1 else expected;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    if (fixture != 0) manager.identity_allocator = failing.allocator();
+    const result = manager.registerReclaimerWithAdmission(.lsm_block_table_cache, &context, Callback.reclaim, control);
+    manager.identity_allocator = a;
+    if (fixture == 0) {
+        ids[0] = try result;
+        try std.testing.expectEqual(@as(u64, expected), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, expected), parent.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(buffer, manager.reclaimers.items.ptr);
+        try std.testing.expect(manager.reclaimer_pointers != null);
+    } else {
+        if (result) |_| return error.TestUnexpectedPublishedIdentity else |err| {
+            const wanted = if (fixture == 1) error.ResourceBudgetExceeded else error.OutOfMemory;
+            if (err != wanted) return err;
+        }
+        try std.testing.expectEqual(@as(u64, 0), first.identity);
+        try std.testing.expectEqual(buffer, manager.reclaimers.items.ptr);
+        try std.testing.expectEqual(fixture == 2, failing.has_induced_failure);
+        const charged: u64 = if (fixture == 1) 0 else 2 * @sizeOf(ReclaimerChunk);
+        // Partial migration keeps credit for chunks that remain physically live.
+        try std.testing.expectEqual(charged, manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(charged, parent.snapshot().memory.used_bytes);
+        try std.testing.expect(manager.reclaimer_pointers == null);
+    }
+    try std.testing.expectEqual(first, manager.reclaimers.items[0]);
+    for (&ids) |*id| {
+        if (id.* != 0) manager.unregisterReclaimer(id.*);
+        id.* = 0;
+    }
     manager.deinit(a);
     live = false;
     try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);

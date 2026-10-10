@@ -2422,3 +2422,89 @@ test "text statistics trusted controls reclaimer pointer ownership retires repla
         }
     }
 }
+
+test "text statistics trusted controls legacy reclaimer adoption charges retained metadata before empty cell reuse" {
+    const Budget = struct {
+        execution: *native.Execution,
+        canceled: *std.atomic.Value(bool),
+        calls: usize = 0,
+        stop_at: usize,
+        pub fn checkpoint(self: *@This()) !void {
+            self.calls += 1;
+            if (self.calls == self.stop_at) self.canceled.store(true, .release);
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        for (0..3) |fixture| {
+            for ([_]usize{ 0, 1, 2, 4, 8, 32, 128, 512 }) |stop_at| {
+                var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+                defer scheduler.close();
+                var canceled = std.atomic.Value(bool).init(false);
+                var execution: native.Execution = .{};
+                defer execution.finish();
+                try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = clock.monotonicNs() + 60 * std.time.ns_per_s, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+                var budget = Budget{ .execution = &execution, .canceled = &canceled, .stop_at = stop_at };
+                const admission = sources.common_read_admission;
+                var adapter = admission.Adapter(*Budget){ .budget = &budget };
+                const payload = adapter.payload();
+                const result = sources.storage_resource_manager.qualifyLegacyReclaimerAdoption(admission.Port.init(&payload), fixture);
+                if (stop_at != 0 and budget.calls >= stop_at) try std.testing.expectError(error.Canceled, result) else try result;
+                try std.testing.expectEqual(phase, try execution.retainedClass());
+                execution.finish();
+                try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+                try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+            }
+        }
+    }
+}
+
+test "text statistics trusted controls cleanup startup adopts warm registry and charges later legacy growth" {
+    const Cleanup = @import("api/resource_manager_cleanup.zig").Runtime;
+    const resources = sources.storage_resource_manager;
+    const Callback = struct {
+        fn reclaim(_: *anyopaque, _: u64) u64 {
+            return 0;
+        }
+    };
+    for ([_]bool{ false, true }) |warm| {
+        var scheduler = try native.Scheduler.init(.{ .slots = 3, .control_slots = 1, .max_operations = 8 });
+        defer scheduler.close();
+        var parent = resources.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+        defer parent.deinit(std.testing.allocator);
+        var manager = resources.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+        var live = true;
+        defer if (live) manager.deinit(std.testing.allocator);
+        try manager.installMemoryParent(parent.memoryParentPort());
+        var context: u8 = 0;
+        var ids: [65]u64 = @splat(0);
+        defer if (live) for (ids) |id| if (id != 0) manager.unregisterReclaimer(id);
+        if (warm) for (ids[0..64]) |*id| {
+            id.* = try manager.registerReclaimer(.lsm_block_table_cache, &context, Callback.reclaim);
+        };
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+        defer lane.deinit();
+        const worker = try Cleanup.create(std.testing.allocator, lane.io(), &manager, &scheduler);
+        defer worker.deinit();
+        const initial = manager.snapshot().memory.used_bytes;
+        try std.testing.expectEqual(warm, initial > 0);
+        try std.testing.expectEqual(initial, parent.snapshot().memory.used_bytes);
+        const begin: usize = if (warm) 64 else 0;
+        for (ids[begin..]) |*id| id.* = try manager.registerReclaimer(.lsm_block_table_cache, &context, Callback.reclaim);
+        try std.testing.expect(manager.snapshot().memory.used_bytes > initial);
+        worker.join();
+        try std.testing.expectEqual(manager.snapshot().memory.used_bytes, parent.snapshot().memory.used_bytes);
+        for (&ids) |*id| {
+            manager.unregisterReclaimer(id.*);
+            id.* = 0;
+        }
+        manager.deinit(std.testing.allocator);
+        live = false;
+        try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    }
+}
