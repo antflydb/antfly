@@ -68,6 +68,8 @@ class LiteralSourceOwnership(unittest.TestCase):
             "api_table_reads_test_root.zig",
             "api_table_writes_test_root.zig",
             "data_runtime_test_root.zig",
+            "participant_fanout_control_test_root.zig",
+            "relational_source_contract_test_root.zig",
         ]
         for name in roots:
             with self.subTest(root=name):

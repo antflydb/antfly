@@ -15213,6 +15213,9 @@ fn collectProvisionedHostedLocalAlgebraicPartials(
 ) !?query_api.QueryResponse {
     var parsed = try parseAlgebraicPartialsRequest(alloc, body);
     defer parsed.deinit(alloc);
+    // The control consumer executes aggregation through its query kernel.
+    // Do not instantiate or open a native DB shortcut in that profile.
+    if (comptime control_only_storage_sources) return error.UnsupportedQueryRequest;
     var owner = try provisionedLocalQueryDbOwner(resident_db, cache, replica_root_dir, catalog, alloc, group_id, lsm_root_generation, backend_runtime, table_name, read_activity_held);
     defer owner.deinit();
     const partials = try collectAlgebraicPartialsFromDbForRequest(alloc, owner.db(), parsed);

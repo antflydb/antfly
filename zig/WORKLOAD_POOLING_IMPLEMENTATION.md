@@ -1587,3 +1587,22 @@ These local adapters still hold CPU across internal physical waits: completing
 the storage/Raft service-wait dependency graph remains required, and parking
 around an entire local operation would leave CPU work unscheduled. Routing,
 credentials and complete physical HTTP dependency coverage also remain open.
+
+Latest-main integration exposed stale source-profile bindings. The generated
+control catalog now includes shared relational activation/recovery contracts and
+excludes physical C API implementation imports. Its generator normalizes blank
+sections so regeneration remains stable under Zig formatting. A physical DB
+admission fixture explicitly binds its decoder-cache DB owner. Control-only
+aggregation rejects a native DB shortcut before instantiating that physical
+helper; aggregation continues through the control profile's query kernel.
+
+Relational activation fixtures that open physical DBs now belong to the physical
+owner suite. Control consumers retain guarded failure-publication, bounded
+admission and typed coverage-identity tests. The independent relational contract
+root references recovery declarations and runs those control tests without
+importing a physical DB; the literal ownership audit includes both this root
+and the participant fanout control root. Focused native coverage passes 16
+relational/participant tests, and the compilation accounting/ownership tool has
+12 passing checks using Zig 0.17. Complete physical integration is still required
+to qualify these bindings and physical mutation/activation behavior. Runtime,
+resource/performance and automatic default gates remain open.

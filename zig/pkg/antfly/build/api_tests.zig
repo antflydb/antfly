@@ -2357,6 +2357,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-participant-fanout-control-test", "Verify independent participant scopes, CPU-free physical joins and original completion authority")
         .dependOn(&b.addRunArtifact(participant_fanout_control_tests).step);
+    const relational_source_contract_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/relational_source_contract_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configureConsumer(b, relational_source_contract_root);
+    relational_source_contract_root.addImport("antfly_source_root", relational_source_contract_root);
+    relational_source_contract_root.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const relational_source_contract_tests = b.addTest(.{
+        .name = "relational-source-contract-tests",
+        .root_module = relational_source_contract_root,
+        .filters = &.{"distributed txn"},
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-relational-source-contract-test", "Verify relational activation and recovery consumer contracts without importing a physical DB")
+        .dependOn(&b.addRunArtifact(relational_source_contract_tests).step);
     const local_commit_control_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_local_commit_control_test_root.zig"),
         .target = target,
