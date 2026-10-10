@@ -178,7 +178,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     }
     const ddl = @import("ddl_runtime.zig");
     if (ddl.accepts(compiled.statement)) {
-        const result = try ddl.execute(arena, backend, compiled.statement);
+        const result = try ddl.execute(.{ .result = arena, .scratch = alloc }, backend, compiled.statement);
         return .{ .command_tag = result.command_tag, .mutation_outcome = result.mutation_outcome, .ddl_receipt = result.receipt };
     }
     // Describe and Execute share binding, type inference and authorization.
@@ -5165,4 +5165,36 @@ test "SQL captured search scans bind execution parameters without mutating plans
     try std.testing.expect(bound.relation.?.scans[0].request.search.?.request_text == null);
     capture.release();
     try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
+}
+
+test "SQL DDL scratch is reclaimable under the statement cap while receipts survive" {
+    const Fake = struct {
+        fn ddl(_: *anyopaque, allocators: catalog.DdlAllocators, _: catalog.Ddl) !catalog.DdlOutcome {
+            // A migration can validate many owners without retaining each
+            // owner's scratch until the final statement result is released.
+            for (0..32) |_| {
+                const bytes = try allocators.scratch.alloc(u8, 1024 * 1024);
+                @memset(bytes, 1);
+                allocators.scratch.free(bytes);
+            }
+            return .{ .mutation_outcome = .committed_pending, .receipt = .{
+                .database = try allocators.result.dupe(u8, "default"),
+                .namespace = try allocators.result.dupe(u8, "public"),
+                .table = try allocators.result.dupe(u8, "child"),
+                .table_id = try allocators.result.dupe(u8, "7"),
+                .schema_version = 0,
+                .state = .pending,
+                .fk_generation_publication_id = try allocators.result.dupe(u8, "0123456789abcdef0123456789abcdef"),
+            } };
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "CREATE TABLE child (id TEXT PRIMARY KEY)", .{});
+    defer compiled.deinit();
+    var sentinel: u8 = 0;
+    var result = try execute(std.testing.allocator, .{ .ptr = &sentinel, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .checkpoint = Fake.checkpoint, .ddl = Fake.ddl } }, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024 });
+    defer result.deinit();
+    try std.testing.expect(result.peakMemoryBytes() < 2 * 1024 * 1024);
+    try std.testing.expectEqualStrings("child", result.output.ddl_receipt.?.table);
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", result.output.ddl_receipt.?.fk_generation_publication_id.?);
 }

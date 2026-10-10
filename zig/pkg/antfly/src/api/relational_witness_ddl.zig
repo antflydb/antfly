@@ -111,8 +111,8 @@ pub fn prepare(alloc: Allocator, tables: []const records.TableRecord, child_name
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const owned = arena.allocator();
-    var child = try schema.parseValidatedTableSchema(owned, proposed);
-    defer child.deinit(owned);
+    var child = try schema.parseValidatedTableSchema(alloc, proposed);
+    defer child.deinit(alloc);
     var child_json = try preserveOwned(owned, before, proposed);
     var parents = std.ArrayList(Parent).empty;
     for (try child.relationalForeignKeyDefinitions(owned)) |fk| {
@@ -141,7 +141,7 @@ pub fn prepare(alloc: Allocator, tables: []const records.TableRecord, child_name
             for (tables) |table| if (std.mem.eql(u8, table.name, fk.parent_table)) break :blk table.schema_json;
             return error.ForeignKeyParentTableNotFound;
         };
-        try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(owned, child_json, fk.parent_table, parent_json);
+        try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(alloc, child_json, fk.parent_table, parent_json);
     }
     const owned_result_parents = try parents.toOwnedSlice(owned);
     return .{ .arena = arena, .schema_json = child_json, .parents = owned_result_parents };

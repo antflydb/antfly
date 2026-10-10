@@ -339,6 +339,7 @@ pub const Session = struct {
     fn request(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type) backend.Request {
         return .{
             .statement = statement,
+            .scratch_allocator = self.alloc,
             .parameters = parameters,
             .parameter_types = types,
             .database = self.database,

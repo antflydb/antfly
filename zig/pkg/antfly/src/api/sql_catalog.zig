@@ -35,9 +35,10 @@ fn newReceipt(alloc: std.mem.Allocator, target: domain.Target, table_id: u64, ve
 const RelationAdmission = struct { table: domain.ResolvedTable, guard: domain.RelationMutationGuard };
 const SearchPath = @import("../pgwire/search_path.zig").Path;
 
-fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, admission: ?RelationAdmission) !catalog.DdlOutcome {
+fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, allocators: catalog.DdlAllocators, target: domain.Target, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, admission: ?RelationAdmission) !catalog.DdlOutcome {
+    const alloc = allocators.result;
     if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
-    var arena = std.heap.ArenaAllocator.init(alloc);
+    var arena = std.heap.ArenaAllocator.init(allocators.scratch);
     defer arena.deinit();
     const a = arena.allocator();
     const table = if (admission) |captured| captured.table else blk: {
@@ -349,13 +350,13 @@ test "SQL catalog schema exhaustion is definite nonadmission for replacement and
     }
 }
 
-fn executeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, path: ?*const SearchPath) !catalog.DdlOutcome {
+fn executeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, ddl: @import("antfly_local_sources").sql_ast.CatalogDdl, path: ?*const SearchPath) !catalog.DdlOutcome {
     // Preserve these statement contracts until their distributed build,
     // dependency and atomic multi-owner protocols are active. Never implement
     // them as a blocking alias or a sequence of independently committed drops.
     if (ddl.concurrently or ddl.cascade or ddl.index_targets.len > 1) return error.UnsupportedSqlShape;
     if (!server.source.vtable.supports_query_definitions) return error.UnsupportedSqlExecution;
-    var arena = std.heap.ArenaAllocator.init(alloc);
+    var arena = std.heap.ArenaAllocator.init(allocators.scratch);
     defer arena.deinit();
     const a = arena.allocator();
     const creating = ddl.action == .create;
@@ -408,7 +409,7 @@ fn executeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authent
     transition.kind = .table;
     transition.action = .alter_schema;
     transition.name = .{ .database = table_target.database, .namespace = table_target.namespace, .table = table_target.table };
-    return alterSchema(server, identity, context, alloc, table_target, transition, .{
+    return alterSchema(server, identity, context, allocators, table_target, transition, .{
         .table = owner.table,
         .guard = .{ .target = owner_target, .logical_table = owner.logical_table, .owner = owner.owner, .incarnation = resolved.relation_epoch.?.incarnation },
     });
@@ -419,10 +420,15 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
 }
 
 pub fn executeWithPath(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, alloc: std.mem.Allocator, input: catalog.Ddl, path: ?*const SearchPath) !catalog.DdlOutcome {
+    return executeWithAllocators(server, identity, context, database, namespace, .{ .result = alloc, .scratch = alloc }, input, path);
+}
+
+pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, input: catalog.Ddl, path: ?*const SearchPath) !catalog.DdlOutcome {
+    const alloc = allocators.result;
     try context.ensureActive();
     if (input == .policy_ddl) return @import("sql_policy_ddl.zig").execute(server, identity, context, database, namespace, alloc, input.policy_ddl);
     if (input == .catalog_ddl and input.catalog_ddl.kind == .index)
-        return executeIndex(server, identity, context, database, namespace, alloc, input.catalog_ddl, path);
+        return executeIndex(server, identity, context, database, namespace, allocators, input.catalog_ddl, path);
     const name = switch (input) {
         .create_table => |v| v.name,
         .drop_table => |v| v.table,
@@ -449,7 +455,7 @@ pub fn executeWithPath(server: *server_mod.ApiHttpServer, identity: ?server_mod.
     };
     if (identity) |authenticated| if (!server_mod.permissionsAllow(authenticated.permissions, permission_kind, resource, .admin)) return error.Forbidden;
     if (input == .catalog_ddl and input.catalog_ddl.action == .alter_schema)
-        return alterSchema(server, identity, context, alloc, target, input.catalog_ddl, null);
+        return alterSchema(server, identity, context, allocators, target, input.catalog_ddl, null);
     if (input == .catalog_ddl and input.catalog_ddl.action == .truncate)
         return @import("sql_truncate.zig").execute(server, identity, context, database, namespace, alloc, input.catalog_ddl);
     var request: domain.Request = .{ .mutation = .{ .action = switch (input) {
@@ -461,7 +467,7 @@ pub fn executeWithPath(server: *server_mod.ApiHttpServer, identity: ?server_mod.
         },
         .policy_ddl => unreachable,
     }, .kind = kind, .database = target.database, .namespace = target.namespace, .name = target.table } };
-    var arena = std.heap.ArenaAllocator.init(alloc);
+    var arena = std.heap.ArenaAllocator.init(allocators.scratch);
     defer arena.deinit();
     const a = arena.allocator();
     var creation_receipt: ?catalog.DdlReceipt = null;
@@ -484,12 +490,12 @@ pub fn executeWithPath(server: *server_mod.ApiHttpServer, identity: ?server_mod.
                 return error.ForeignKeyPartialSupportIndexRequired;
             const schema_value = try std.json.parseFromSliceLeaky(std.json.Value, a, bound_schema, .{ .parse_numbers = false });
             const body = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_value, .indexes = std.json.Value{ .object = .empty } }, .{});
-            var parsed = try tables.parseStoredCreateTableRequest(alloc, body);
+            var parsed = try tables.parseStoredCreateTableRequest(allocators.scratch, body);
             parsed.storage = .{};
-            defer parsed.deinit(alloc);
-            if (create.tablespace) |tablespace| parsed.tablespace_name = try alloc.dupe(u8, tablespace);
+            defer parsed.deinit(allocators.scratch);
+            if (create.tablespace) |tablespace| parsed.tablespace_name = try allocators.scratch.dupe(u8, tablespace);
             if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema)) {
-                const plan = @import("fk_initial_create_plan_builder.zig").build(server, a, context, identity, target, parsed) catch |err| switch (err) {
+                const plan = @import("fk_initial_create_plan_builder.zig").buildWithScratch(server, a, allocators.scratch, context, identity, target, parsed) catch |err| switch (err) {
                     error.CatalogAlreadyExists, error.TableAlreadyExists => if (create.if_not_exists) return .{} else return err,
                     else => return err,
                 };
@@ -503,7 +509,7 @@ pub fn executeWithPath(server: *server_mod.ApiHttpServer, identity: ?server_mod.
                 }
                 const hex = std.fmt.bytesToHex(plan.id, .lower);
                 receipt.fk_generation_publication_id = try alloc.dupe(u8, &hex);
-                const accepted = try server.submitFkInitialCreatePlan(a, context, plan);
+                const accepted = try server.submitFkInitialCreatePlan(allocators.scratch, context, plan);
                 receipt.state = if (accepted.state == .admission_unknown) .admission_unknown else .pending;
                 receipt.diagnostic = if (accepted.state == .admission_unknown)
                     "Initial FK table admission is unresolved. Retain the publication ID, refresh table status, and do not replay CREATE."

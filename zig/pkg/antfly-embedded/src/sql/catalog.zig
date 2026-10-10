@@ -506,6 +506,11 @@ pub const DdlReceipt = struct {
     idempotency_key: ?[]const u8 = null,
     fk_generation_publication_id: ?[]const u8 = null,
 };
+/// Scratch must reclaim individual allocations; result may be an arena. DDL
+/// implementations reserve durable receipts in result before admission and
+/// release parsing/validation/plan memory through scratch before returning.
+pub const DdlAllocators = struct { result: std.mem.Allocator, scratch: std.mem.Allocator };
+
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
 /// Complete, authorized aggregate states for one pinned table and recipe.
@@ -609,7 +614,7 @@ pub const Backend = struct {
         checkpoint: *const fn (*anyopaque) anyerror!void,
         /// Native authority owns atomic existence checks and durable catalog
         /// publication. SQL must never emulate DDL with read-then-write.
-        ddl: ?*const fn (*anyopaque, std.mem.Allocator, Ddl) anyerror!DdlOutcome = null,
+        ddl: ?*const fn (*anyopaque, DdlAllocators, Ddl) anyerror!DdlOutcome = null,
     };
 };
 
