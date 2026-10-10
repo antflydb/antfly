@@ -4328,12 +4328,18 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
         }
 
         pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
-            return self.getManySortedWithStats(keys, values, true);
+            return self.getManySortedWithStats(keys, values, true, null);
         }
 
-        fn getManySortedWithStats(self: *@This(), keys: []const []const u8, values: []?[]const u8, record_batch: bool) !void {
+        pub fn getManySortedWithAdmission(self: *@This(), keys: []const []const u8, values: []?[]const u8, control: read_admission.Port) !void {
+            return self.getManySortedWithStats(keys, values, true, control);
+        }
+
+        fn getManySortedWithStats(self: *@This(), keys: []const []const u8, values: []?[]const u8, record_batch: bool, control: ?read_admission.Port) !void {
             if (keys.len != values.len) return error.InvalidBatch;
             @memset(values, null);
+            errdefer @memset(values, null);
+            if (control) |owner| try owner.checkpoint();
             if (record_batch) {
                 self.backend.recordGetManySorted(keys.len);
                 self.backend.recordGetManySortedLocality(keys);
@@ -4343,12 +4349,13 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
             if (self.stable_point_view) {
                 var offset: usize = 0;
                 while (offset < keys.len) {
+                    if (control) |owner| try owner.checkpoint();
                     const end = @min(offset + max_current_batch_read_keys_per_backend_lock, keys.len);
                     const plan = chooseMultiGetPlan(keys[offset..end], .stable_probe);
                     recordMultiGetPlan(self.backend, plan);
                     if (self.read_view.?.directory() == null) try self.ensureStablePointViewLoaded();
                     const chunk_result = if (self.read_view.?.directory()) |directory|
-                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, &.{}, directory, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys[offset..end], values[offset..end], plan == .sorted_by_run, false, self.borrowed_batch_scratch orelse &self.batch_scratch, self.metadata_allocator, null)
+                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, &.{}, directory, self.allocator, &self.held_blocks, &self.held_values, self.namespace, keys[offset..end], values[offset..end], plan == .sorted_by_run, false, self.borrowed_batch_scratch orelse &self.batch_scratch, self.metadata_allocator, control)
                     else switch (plan) {
                         .sorted_by_run => try readManySortedByRunFromSnapshot(
                             self.backend,
@@ -4364,7 +4371,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             keys[offset..end],
                             values[offset..end],
                             false,
-                            null,
+                            control,
                         ),
                         .cursor, .point => try readManySortedPointFromSnapshot(
                             self.backend,
@@ -4380,7 +4387,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             keys[offset..end],
                             values[offset..end],
                             false,
-                            null,
+                            control,
                         ),
                     };
                     result.add(chunk_result);
@@ -4404,9 +4411,11 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                 var unresolved_count: usize = keys.len;
                 var maybe_layout: ?CurrentReadLayout(BackendType) = null;
                 {
+                    if (control) |owner| try owner.checkpoint();
                     const locked = lockBackend(BackendType, self.backend);
                     defer unlockBackend(BackendType, self.backend, locked);
                     for (keys, 0..) |key, i| {
+                        if (control) |owner| try owner.checkpoint();
                         const idx = self.backend.mutable.findIndex(self.namespace, key) orelse continue;
                         const entry = self.backend.mutable.entryAt(idx);
                         resolved[i] = true;
@@ -4415,7 +4424,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             result.misses += 1;
                             continue;
                         }
-                        values[i] = try self.ownValue(entry.value);
+                        values[i] = try copyPointValueWithAdmission(self.backend, self.allocator, &self.held_values, entry.value, control);
                         self.backend.recordMutableHit();
                         result.hits += 1;
                     }
@@ -4438,6 +4447,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     const unresolved_indexes = scratch.pending.indexes.items;
                     var unresolved_index: usize = 0;
                     for (keys, 0..) |key, i| {
+                        if (control) |owner| try owner.checkpoint();
                         if (resolved[i]) continue;
                         unresolved_keys[unresolved_index] = key;
                         unresolved_indexes[unresolved_index] = i;
@@ -4449,7 +4459,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                     const plan = chooseMultiGetPlan(unresolved_keys, .stable_probe);
                     recordMultiGetPlan(self.backend, plan);
                     const unresolved_result = if (layout.read_view.directory()) |directory|
-                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, layout.immutable_memtables, directory, self.allocator, &self.held_blocks, &self.held_values, source_namespace, unresolved_keys, unresolved_values, plan == .sorted_by_run, false, scratch, self.metadata_allocator, null)
+                        try readManySortedDirectoryBatch(self.backend, &self.empty_state, layout.immutable_memtables, directory, self.allocator, &self.held_blocks, &self.held_values, source_namespace, unresolved_keys, unresolved_values, plan == .sorted_by_run, false, scratch, self.metadata_allocator, control)
                     else switch (plan) {
                         .sorted_by_run => try readManySortedByRunFromSnapshot(
                             self.backend,
@@ -4465,7 +4475,7 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             unresolved_keys,
                             unresolved_values,
                             false,
-                            null,
+                            control,
                         ),
                         .cursor, .point => try readManySortedPointFromSnapshot(
                             self.backend,
@@ -4481,13 +4491,14 @@ pub fn BoundProbeTxn(comptime BackendType: type) type {
                             unresolved_keys,
                             unresolved_values,
                             false,
-                            null,
+                            control,
                         ),
                     };
                     for (unresolved_values, unresolved_indexes) |value, index| values[index] = value;
                     result.add(unresolved_result);
                 }
             }
+            if (control) |owner| try owner.checkpoint();
             if (record_batch) self.backend.recordGetManySortedResults(result.hits, result.misses);
         }
 
@@ -4548,6 +4559,20 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             return switch (self.*) {
                 .active => |*cursor| try cursor.next(),
                 .snapshot => |*cursor| try cursor.next(),
+            };
+        }
+
+        pub fn nextWithAdmission(self: *@This(), control: read_admission.Port) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.nextWithAdmission(control),
+                .snapshot => |*cursor| try cursor.nextWithAdmission(control),
+            };
+        }
+
+        pub fn seekAtOrAfterWithAdmission(self: *@This(), key: []const u8, control: read_admission.Port) !?backend_adapter.Entry {
+            return switch (self.*) {
+                .active => |*cursor| try cursor.seekAtOrAfterWithAdmission(key, control),
+                .snapshot => |*cursor| try cursor.seekAtOrAfterWithAdmission(key, control),
             };
         }
 
@@ -4781,6 +4806,19 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 releaseReadReader(BackendType, backend, .current_scan);
             }
             self.* = undefined;
+        }
+
+        /// Admission is borrowed only while constructing this cursor. Every
+        /// admitted step supplies its own borrow; the cursor never retains it.
+        pub fn openCursorWithAdmission(self: *@This(), control: read_admission.Port) !LocalCursor {
+            const cursor_alloc = runtimeScratchAllocator(self.allocator);
+            const sequence: SnapshotCursor.RunSequence = if (self.read_view.directory()) |directory| .{ .directory = directory } else .{ .runs = self.read_view.runs, .levels = self.read_view.levels };
+            const groups = if (sequence.directory != null) &.{} else self.read_view.l0_groups;
+            if (self.mutable_snapshot.ptr()) |snapshot| {
+                return .{ .snapshot = try SnapshotCursor.initSequenceControlled(cursor_alloc, self.backend, snapshot, self.immutable_memtables, sequence, groups, self.namespace, false, control) };
+            }
+            const active_sequence: ActiveCursor.RunSequence = if (sequence.directory) |directory| .{ .directory = directory } else .{ .runs = self.read_view.runs, .levels = self.read_view.levels };
+            return .{ .active = try ActiveCursor.initSequenceControlled(cursor_alloc, self.backend, &self.backend.mutable, self.immutable_memtables, active_sequence, groups, self.namespace, false, control) };
         }
 
         pub fn openCursor(self: *@This()) !LocalCursor {
@@ -5349,7 +5387,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 // Write reads select the current mutable and immutable view
                 // together, even if the backend was empty when probe opened.
                 probe.stable_point_view = false;
-                try probe.getManySortedWithStats(miss_keys[0..miss_count], miss_values, false);
+                try probe.getManySortedWithStats(miss_keys[0..miss_count], miss_values, false, null);
                 for (miss_values) |*value| {
                     const present = value.* orelse {
                         misses += 1;

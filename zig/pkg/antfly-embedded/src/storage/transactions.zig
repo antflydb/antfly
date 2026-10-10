@@ -2400,13 +2400,9 @@ pub const TxnManager = struct {
             }
             var scan = try self.store.beginCurrentScan();
             defer scan.abort();
-            var cursor = try scan.openCursor();
+            var cursor = if (control) |owner| try scan.openCursorWithAdmission(owner) else try scan.openCursor();
             defer cursor.close();
-            // Current scans retain live backend read ownership; their adapters
-            // do not yet support a physical admission port. Keep the original
-            // lifetime around every cursor step without retrying a rejected read.
-            if (control) |owner| try owner.checkpoint();
-            var entry = try cursor.seekAtOrAfter(prefix);
+            var entry = if (control) |owner| try cursor.seekAtOrAfterWithAdmission(prefix, owner) else try cursor.seekAtOrAfter(prefix);
             while (entry) |item| {
                 if (!std.mem.startsWith(u8, item.key, prefix)) break;
                 {
@@ -2415,7 +2411,7 @@ pub const TxnManager = struct {
                     try keys.append(alloc, key);
                 }
                 if (control) |owner| try owner.checkpoint();
-                entry = try cursor.next();
+                entry = if (control) |owner| try cursor.nextWithAdmission(owner) else try cursor.next();
             }
             if (keys.items.len != admission.count) return error.IntentSnapshotChanged;
             return try keys.toOwnedSlice(alloc);
@@ -2548,7 +2544,7 @@ pub const TxnManager = struct {
             const end = if (control != null) start + @min(values.len - start, 64) else values.len;
             if (control) |owner| {
                 try owner.checkpoint();
-                try probe.getManySorted(key_refs[start..end], values[start..end]);
+                try probe.getManySortedWithAdmission(key_refs[start..end], values[start..end], owner);
                 try owner.checkpoint();
             }
             // Copy each probe batch before another probe can reuse scratch.
@@ -5244,11 +5240,18 @@ test "transaction participant batch releases migration allocations on every fail
 }
 
 test "transaction intent collection original admission rejects every phase and retries exact owned data" {
+    try testIntentCollectionOriginalAdmission(false);
+    try testIntentCollectionOriginalAdmission(true);
+}
+
+fn testIntentCollectionOriginalAdmission(persisted: bool) !void {
     const alloc = std.testing.allocator;
     const path = try tempTestPath(alloc, "txn-collection-controls");
     defer alloc.free(path);
     defer cleanupTestDir(path);
-    var store = try DocStore.open(alloc, path, .{});
+    var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold_bytes = if (persisted) 1024 else 64 * 1024 * 1024 });
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
     defer store.close();
     var manager = try TxnManager.init(alloc, &store);
     defer manager.deinit();
@@ -5265,6 +5268,8 @@ test "transaction intent collection original admission rejects every phase and r
     }
     writes[70] = .{ .key = "deleted", .value = null };
     try manager.writeIntents(id, &writes, &.{});
+    if (persisted) try backend.flushBufferedWritesWithOptions(.{ .compact = false });
+    try std.testing.expectEqual(persisted, backend.runs.count() > 0);
     const State = struct {
         checks: usize = 0,
         stop_at: usize,
@@ -5277,14 +5282,20 @@ test "transaction intent collection original admission rejects every phase and r
     var completed: State = .{ .stop_at = std.math.maxInt(usize) };
     var source: read_control.Payload = .{ .ptr = &completed, .vtable = &.{ .checkpoint = State.check } };
     var snapshot = try manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source));
-    const checks = completed.checks;
-    try std.testing.expect(checks > 70);
+
     try std.testing.expectEqual(@as(usize, 70), snapshot.writes.len);
     try std.testing.expectEqual(@as(usize, 1), snapshot.deletes.len);
     try std.testing.expectEqualSlices(u8, payload, snapshot.writes[0].value);
     try std.testing.expectEqual(snapshot.owned_entries.?[1].value.ptr + 1, snapshot.writes[0].value.ptr);
     const revision = snapshot.revision;
     snapshot.deinit(alloc);
+    // Current-scan rotation and cold index/block admission happen only on the
+    // first pass. Warm the physical view before enumerating a stable path.
+    completed.checks = 0;
+    var warmed = try manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source));
+    const checks = completed.checks;
+    try std.testing.expect(checks > 70);
+    warmed.deinit(alloc);
     // Fail at every reachable lifetime check, including after probe batches
     // and partial large copies. TestingAllocator proves exact rollback ownership.
     for (1..checks + 1) |stop_at| {
@@ -5335,11 +5346,15 @@ test "transaction intent collection original admission retains legacy sidecars a
         var state: State = .{};
         var source: read_control.Payload = .{ .ptr = &state, .vtable = &.{ .checkpoint = State.check } };
         var snapshot = try manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source));
-        const checks = state.checks;
+
         try std.testing.expectEqual(@as(usize, 2), snapshot.writes.len);
         try std.testing.expectEqual(@as(usize, 1), snapshot.deletes.len);
         try std.testing.expectEqualSlices(u8, "value-a", snapshot.writes[0].value);
         snapshot.deinit(alloc);
+        state.checks = 0;
+        var warmed = try manager.collectIntentBatchWithAdmission(alloc, id, read_control.Port.init(&source));
+        const checks = state.checks;
+        warmed.deinit(alloc);
         for (1..checks + 1) |stop_at| {
             var stopped: State = .{ .stop_at = stop_at };
             source.ptr = &stopped;

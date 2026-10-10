@@ -228,7 +228,7 @@ pub fn scanPrefixWithAdmission(alloc: std.mem.Allocator, store: *backend_erased.
     if (control) |owner| try owner.checkpoint();
     var txn = try store.beginRead();
     defer txn.abort();
-    var cur = try txn.openCursor();
+    var cur = if (control) |owner| try txn.openCursorWithAdmission(owner) else try txn.openCursor();
     defer cur.close();
     return scanPrefixCursorWithAdmission(alloc, &cur, prefix, control);
 }

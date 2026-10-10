@@ -1697,6 +1697,28 @@ It remains separate from the complete DB/API implementation. New checks also
 prove the native collection adapter retains original lifetime and cannot transfer
 CPU under retained service leases. Four physical collector checks and 88 native
 controlled-service checks pass; the source ownership/accounting audit is separate.
-Current-scan and probe interior waits still require complete physical admission
-transport. Full native resolution integration, capture/Raft/backend service graph,
-resource/performance measurements and automatic defaults remain unqualified.
+Current scans now expose admitted cursor construction, seek and next through
+both the erased parent-owned adapter and the live/snapshot cursor union. These
+operations retain the existing current view instead of substituting a cloned
+ordinary snapshot. The cursor borrows controls only for each synchronous call.
+Probe batches pass the same original controls into mutable-value copying and
+persisted directory/run reads; failures clear output references and abort retires
+the retained physical values. Incapable adapters reject admitted operations
+without retrying an unscoped read. Controlled legacy prefix collection also
+admits cursor construction. Artifact payload reconstruction still requires its
+own physical admission transport and is explicitly rejected by the new admitted
+point-probe entrypoint when a reference needs reconstruction.
+
+The indexed rejection/retry fixture runs against both a mutable view and verified
+persisted runs, with 71 intents including a large payload and a deletion. It
+warms the view before enumerating checkpoints so one-time rotation and cache
+admission do not change the rejection path. Legacy allocation-failure checks
+include admitted cursor construction. Four collector and 88 controlled-service
+checks pass, plus 13 separate source ownership/accounting checks. This does not
+qualify initial backend scan/probe admission locks, lazy layout preparation,
+artifact reconstruction, the complete retained-service CPU reentry graph or
+physical native DB resolution integration. The older cumulative snapshot finished
+with source-profile errors fixed in descendants and additional runtime failures
+requiring review, including NDJSON ownership teardown. The newer cumulative
+snapshot is running. Resource/performance measurements and automatic defaults
+remain unqualified.

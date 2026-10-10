@@ -690,6 +690,25 @@ pub const DocStore = struct {
             };
         }
 
+        pub fn getManySortedWithAdmission(self: *Txn, keys: []const []const u8, values: []?[]const u8, control: @import("../common/read_admission.zig").Port) !void {
+            if (keys.len != values.len) return error.InvalidArgument;
+            @memset(values, null);
+            errdefer @memset(values, null);
+            try control.checkpoint();
+            if (self.write != null or self.current_scan != null) return error.ExecutionWaitUnsupported;
+            if (self.probe) |*probe| {
+                try probe.getManySortedWithAdmission(keys, values, control);
+            } else try self.read.?.getManySortedWithAdmission(keys, values, control);
+            // Artifact reconstruction has a separate physical I/O owner. Do
+            // not silently cross into that owner without admission transport.
+            for (keys, values) |key, value| if (value) |raw| {
+                try control.checkpoint();
+                if (artifact_payload.isEmbeddingKey(key) and artifact_payload.isReference(raw))
+                    return error.ExecutionWaitUnsupported;
+            };
+            try control.checkpoint();
+        }
+
         pub fn getManySortedPhysical(self: *Txn, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidArgument;
             @memset(values, null);
@@ -838,14 +857,22 @@ pub const DocStore = struct {
         }
 
         pub fn openCursorWithBudget(self: *Txn, budget: anytype) !CursorAdapter {
-            if (self.write != null or self.current_scan != null or self.probe != null) return error.ExecutionWaitUnsupported;
             const admission = @import("../common/read_admission.zig");
             var adapter = admission.Adapter(@TypeOf(budget)){ .budget = budget };
             const payload = adapter.payload();
-            var physical = try self.read.?.openCursorWithAdmission(admission.Port.init(&payload));
+            return self.openCursorWithAdmission(admission.Port.init(&payload));
+        }
+
+        pub fn openCursorWithAdmission(self: *Txn, control: @import("../common/read_admission.zig").Port) !CursorAdapter {
+            try control.checkpoint();
+            if (self.write != null or self.probe != null) return error.ExecutionWaitUnsupported;
+            var physical = if (self.current_scan) |*current|
+                try current.openCursorWithAdmission(control)
+            else
+                try self.read.?.openCursorWithAdmission(control);
             errdefer physical.close();
-            // Wrapping transfers physical ownership only after allocation succeeds.
-            return try wrapPayloadCursor(self.alloc, physical, self.payload_session, false);
+            try control.checkpoint();
+            return try wrapPayloadCursor(self.alloc, physical, self.payload_session, self.current_scan != null);
         }
 
         fn openCursorAdapter(self: *Txn) !CursorAdapter {
