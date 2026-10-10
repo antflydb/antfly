@@ -28,6 +28,62 @@ from psycopg import sql as pgsql
 
 
 class IndexLifecycleTest(unittest.TestCase):
+    def test_alter_generated_names_distinguish_index_and_constraint_ownership(self):
+        cases = (
+            (
+                "CREATE UNIQUE INDEX t_id_check ON public.t (id)",
+                "ADD CHECK (id > 0)",
+                [("t_id_check", "c")],
+                [("t_id_check",)],
+            ),
+            (
+                "CREATE INDEX t_id_key ON public.t (id)",
+                "ADD UNIQUE (id)",
+                [("t_id_key1", "u")],
+                [("t_id_key",), ("t_id_key1",)],
+            ),
+            (
+                "ALTER TABLE public.t ADD CONSTRAINT t_id_fkey CHECK (true)",
+                "ADD FOREIGN KEY (id) REFERENCES public.parent (id)",
+                [("t_id_fkey", "c"), ("t_id_fkey1", "f")],
+                [],
+            ),
+            (
+                "ALTER TABLE public.t ADD CONSTRAINT t_id_check CHECK (id > 0)",
+                "ADD CHECK (id < 100)",
+                [("t_id_check", "c"), ("t_id_check1", "c")],
+                [],
+            ),
+        )
+        with postgres() as db:
+            db.execute("CREATE TABLE public.parent (id BIGINT PRIMARY KEY)")
+            db.execute("INSERT INTO public.parent VALUES (1)")
+            for setup, addition, constraints, indexes in cases:
+                with self.subTest(addition=addition, setup=setup):
+                    db.execute("CREATE TABLE public.t (id BIGINT)")
+                    db.execute("INSERT INTO public.t VALUES (1)")
+                    db.execute(setup)
+                    db.execute("ALTER TABLE public.t " + addition)
+                    self.assertEqual(
+                        constraints,
+                        db.execute(
+                            "SELECT conname, contype FROM pg_constraint "
+                            "WHERE conrelid='public.t'::regclass ORDER BY conname"
+                        ).fetchall(),
+                    )
+                    self.assertEqual(
+                        indexes,
+                        db.execute(
+                            "SELECT c.relname FROM pg_index i JOIN pg_class c "
+                            "ON c.oid=i.indexrelid WHERE i.indrelid='public.t'::regclass "
+                            "ORDER BY c.relname"
+                        ).fetchall(),
+                    )
+                    self.assertEqual(
+                        [(1,)], db.execute("SELECT * FROM public.t").fetchall()
+                    )
+                    db.execute("DROP TABLE public.t")
+
     def test_equivalent_index_constraints_normalize_before_final_name_selection(self):
         # Name, kind, deferrable, initially deferred, NULLS NOT DISTINCT.
         cases = (

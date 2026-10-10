@@ -510,6 +510,38 @@ distinct-key growth change is running. The separate mounted catalog campaign
 and coordinator CPU-backed gates remain pending. Original dispositions and
 production occupancy activation remain unchanged.
 
+### Additive ALTER preparation checkpoint
+
+Single-constraint ALTER preparation now seeds table-local constraint and index
+occupancy from an existing schema, then stages only the new constraint. It
+preserves unrelated schema fields and existing declarations rather than
+re-admitting them as CREATE declarations. Standalone UNIQUE indexes contribute
+relation occupancy but not constraint membership, including when their schema
+contains an index-owned uniqueness rule. Selected-name validation likewise
+does not mistake an index-owned rule for a same-named CHECK/FK constraint.
+Replacement-schema and multi-constraint fragments are rejected by this additive
+preparation interface. The existing aggregate probe and cancellation bounds
+remain in force.
+
+Native preparation accepts an immutable captured relation guard, not a caller's
+baseline schema. It checks incarnation, namespace binding, relation kind and
+the exact current owner in one read transaction, then loads that owner's schema
+by table identity. Changes to unrelated owners use current occupancy without a
+global captured-source-epoch CAS. Native regressions cover stale owners, wrong
+incarnations/kinds and schema-only changes; their fresh gate is running.
+
+The shared naming gate passes eleven tests in Debug and ReleaseFast, including
+deterministic allocation-fault sweeps. The sweeps also exposed and fixed an
+arena ownership-transfer bug: serialization now completes before arena state
+is copied into the returned plan, so a later serialization block is not lost.
+All thirteen PostgreSQL 18 catalog oracle tests pass, with four independent
+ALTER index/constraint-ownership profiles and unchanged table postimages.
+
+This is preparation, not public ALTER activation. Ordinary schema publication,
+rewrite jobs and FK generation publication must carry and atomically recheck
+the selected predicates alongside the captured owner before capability 34 is
+advertised. Original inventory dispositions remain unchanged.
+
 ### Prepared generated-name admission checkpoint
 
 The CREATE naming pipeline now owns its schema and selected-name predicates,

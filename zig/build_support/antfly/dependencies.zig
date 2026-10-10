@@ -368,6 +368,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     }) });
     const run_constraint_name_tests = b.addRunArtifact(constraint_name_tests);
+    constraint_name_tests.root_module.addImport("antfly_platform", platform_mod);
     b.step("system-catalog-constraint-name-test", "Test bounded PostgreSQL-compatible generated constraint names")
         .dependOn(&run_constraint_name_tests.step);
     run_sql_tests.step.dependOn(&run_constraint_name_tests.step);

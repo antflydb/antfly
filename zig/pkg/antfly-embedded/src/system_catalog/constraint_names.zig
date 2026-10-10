@@ -206,11 +206,17 @@ pub const Admission = struct {
                 if (rule != .object) return error.InvalidCatalogRecord;
                 const label = rule.object.get("name") orelse return error.InvalidCatalogRecord;
                 if (label != .string) return error.InvalidCatalogRecord;
+                if (base_kind == .unique) if (rule.object.get("origin")) |origin| {
+                    if (origin != .null) {
+                        if (origin != .string) return error.InvalidCatalogRecord;
+                        // A standalone UNIQUE index is not a constraint. A
+                        // CHECK/FK can legitimately have the same SQL name.
+                        if (std.mem.eql(u8, origin.string, "index")) continue;
+                        if (!std.mem.eql(u8, origin.string, "constraint")) return error.InvalidCatalogRecord;
+                    }
+                };
                 if (selected.getPtr(label.string)) |expected| {
                     if (expected.seen) return error.InvalidCatalogRecord;
-                    if (base_kind == .unique) if (rule.object.get("origin")) |origin| {
-                        if (origin != .null and (origin != .string or !std.mem.eql(u8, origin.string, "constraint"))) return error.InvalidCatalogRecord;
-                    };
                     var kind = base_kind;
                     if (base_kind == .unique) if (rule.object.get("primary")) |primary| {
                         if (primary != .bool) return error.InvalidCatalogRecord;
@@ -243,6 +249,20 @@ pub const Plan = struct {
     /// check only relations, not another table's nonexclusive constraint name.
     /// Cancellation applies even to local-only collisions.
     pub fn prepare(alloc: std.mem.Allocator, table: []const u8, namespace_id: u64, schema_json: []const u8, generated: []const []const u8, reader: anytype, max_attempts: u32) !Plan {
+        return prepareWithBaseline(alloc, table, namespace_id, null, schema_json, generated, reader, max_attempts);
+    }
+
+    /// Prepare one additive ALTER constraint against a captured table schema.
+    /// The fragment contains only that constraint, not a replacement schema.
+    /// Existing rules are seeded as local occupancy, never re-admitted as new
+    /// declarations. The caller must fence the captured owner/schema at commit.
+    pub fn prepareAddition(alloc: std.mem.Allocator, table: []const u8, namespace_id: u64, baseline_schema_json: []const u8, fragment_json: []const u8, generated: []const []const u8, reader: anytype, max_attempts: u32) !Plan {
+        if (generated.len != 1) return error.InvalidCatalogRecord;
+        if (baseline_schema_json.len > 16 * 1024 * 1024) return error.ProgramLimitExceeded;
+        return prepareWithBaseline(alloc, table, namespace_id, baseline_schema_json, fragment_json, generated, reader, max_attempts);
+    }
+
+    fn prepareWithBaseline(alloc: std.mem.Allocator, table: []const u8, namespace_id: u64, baseline_schema_json: ?[]const u8, schema_json: []const u8, generated: []const []const u8, reader: anytype, max_attempts: u32) !Plan {
         if (namespace_id == 0 or generated.len == 0) return error.InvalidCatalogRecord;
         if (generated.len > 8192 or schema_json.len > 16 * 1024 * 1024) return error.ProgramLimitExceeded;
         _ = try Candidate.initKind(table, &.{}, .primary);
@@ -283,6 +303,40 @@ pub const Plan = struct {
                 const flag = rule.object.get("primary") orelse return false;
                 if (flag != .bool) return error.InvalidCatalogRecord;
                 return flag.bool;
+            }
+
+            fn seed(self: *@This(), baseline: *std.json.Value) !void {
+                for ([_][]const u8{ "checks", "unique_constraints", "foreign_keys" }) |key| {
+                    for (try rules(baseline, key)) |rule| {
+                        try self.reader.checkpoint();
+                        if (rule != .object) return error.InvalidCatalogRecord;
+                        const name = rule.object.get("name") orelse return error.InvalidCatalogRecord;
+                        if (name != .string) return error.InvalidCatalogRecord;
+                        try validate(name.string);
+                        const unique = std.mem.eql(u8, key, "unique_constraints");
+                        var index_owned = false;
+                        if (unique) if (rule.object.get("origin")) |origin| {
+                            if (origin != .null) {
+                                if (origin != .string) return error.InvalidCatalogRecord;
+                                index_owned = std.mem.eql(u8, origin.string, "index");
+                                if (!index_owned and !std.mem.eql(u8, origin.string, "constraint")) return error.InvalidCatalogRecord;
+                            }
+                        };
+                        if (!index_owned) {
+                            const entry = try self.constraints.getOrPut(self.a, name.string);
+                            if (entry.found_existing) return error.InvalidCatalogRecord;
+                        }
+                        if (unique) try self.relations.put(self.a, name.string, {});
+                    }
+                }
+                for (try rules(baseline, "relational_indexes")) |rule| {
+                    try self.reader.checkpoint();
+                    if (rule != .object) return error.InvalidCatalogRecord;
+                    const name = rule.object.get("name") orelse return error.InvalidCatalogRecord;
+                    if (name != .string) return error.InvalidCatalogRecord;
+                    try validate(name.string);
+                    try self.relations.put(self.a, name.string, {});
+                }
             }
 
             fn column(self: *@This(), expression: std.json.Value, depth: usize, single: *?[]const u8, multiple: *bool) !void {
@@ -369,6 +423,18 @@ pub const Plan = struct {
         }
         try stage.relations.put(a, table, {});
         var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, schema_json, .{ .parse_numbers = false });
+        var baseline: ?std.json.Value = null;
+        if (baseline_schema_json) |bytes| {
+            baseline = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false });
+            try stage.seed(&baseline.?);
+            if (schema != .object) return error.InvalidCatalogRecord;
+            var rule_count: usize = 0;
+            for (schema.object.keys()) |key| {
+                if (!std.mem.eql(u8, key, "checks") and !std.mem.eql(u8, key, "unique_constraints") and !std.mem.eql(u8, key, "foreign_keys")) return error.InvalidCatalogRecord;
+                rule_count += (try Stage.rules(&schema, key)).len;
+            }
+            if (rule_count != 1) return error.InvalidCatalogRecord;
+        }
         for (try Stage.rules(&schema, "checks")) |*rule| try stage.apply(rule, .check);
         const uniques = try Stage.rules(&schema, "unique_constraints");
         for ([_]bool{ true, false }) |is_primary| for (uniques) |*rule| {
@@ -376,7 +442,20 @@ pub const Plan = struct {
         };
         for (try Stage.rules(&schema, "foreign_keys")) |*rule| try stage.apply(rule, .foreign_key);
         for (stage.seen) |seen| if (!seen) return error.InvalidCatalogRecord;
-        return .{ .arena = arena, .schema_json = try std.json.Stringify.valueAlloc(a, schema, .{}), .admission = .{ .namespace_id = namespace_id, .names = stage.selected } };
+        if (baseline) |*base| {
+            for ([_][]const u8{ "checks", "unique_constraints", "foreign_keys" }) |key| {
+                const additions = try Stage.rules(&schema, key);
+                if (additions.len == 0) continue;
+                const entry = try base.object.getOrPut(a, key);
+                if (!entry.found_existing) entry.value_ptr.* = .{ .array = std.json.Array.init(a) };
+                try entry.value_ptr.array.appendSlice(additions);
+            }
+            schema = base.*;
+        }
+        // Finish allocating before copying arena state into the owned result.
+        // Serialization can grow a new arena block; copying first loses it.
+        const encoded = try std.json.Stringify.valueAlloc(a, schema, .{});
+        return .{ .arena = arena, .schema_json = encoded, .admission = .{ .namespace_id = namespace_id, .names = stage.selected } };
     }
 };
 
@@ -422,6 +501,56 @@ fn preparedPlanAllocationCase(a: std.mem.Allocator) !void {
 test "prepared constraint naming uses staged CHECK index FK visibility and owns its predicates" {
     try preparedPlanAllocationCase(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, preparedPlanAllocationCase, .{});
+}
+
+fn preparedAdditionAllocationCase(a: std.mem.Allocator) !void {
+    var namespace: EmptyNamespace = .{};
+    const baseline = "{\"version\":7,\"custom\":{\"preserved\":true},\"checks\":[{\"name\":\"t_id_check\",\"expression\":{\"op\":\"literal\",\"value\":true}}],\"unique_constraints\":[{\"name\":\"old_pk\",\"columns\":[\"id\"],\"primary\":true}]}";
+    const fragment = "{\"checks\":[{\"name\":\"anonymous\",\"expression\":{\"op\":\"column\",\"column\":\"id\"}}]}";
+    var plan = try Plan.prepareAddition(a, "t", 5, baseline, fragment, &.{"anonymous"}, &namespace, 16);
+    defer plan.deinit();
+    try std.testing.expectEqualStrings("t_id_check1", plan.admission.names[0].name);
+    try plan.admission.validateSchema(a, plan.schema_json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, plan.schema_json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 7), parsed.value.object.get("version").?.integer);
+    try std.testing.expect(parsed.value.object.get("custom").?.object.get("preserved").?.bool);
+    const rules = parsed.value.object.get("checks").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    try std.testing.expectEqualStrings("t_id_check", rules[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("old_pk", parsed.value.object.get("unique_constraints").?.array.items[0].object.get("name").?.string);
+}
+
+test "prepared ALTER addition preserves baseline ownership and is allocation safe" {
+    try preparedAdditionAllocationCase(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, preparedAdditionAllocationCase, .{});
+}
+
+test "prepared ALTER distinguishes standalone index and existing constraint occupancy" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { baseline: []const u8, fragment: []const u8, expected: []const u8 }{
+        .{ .baseline = "{\"unique_constraints\":[{\"name\":\"t_id_check\",\"columns\":[\"id\"],\"origin\":\"index\"}],\"relational_indexes\":[{\"name\":\"t_id_check\"}]}", .fragment = "{\"checks\":[{\"name\":\"anonymous\",\"expression\":{\"op\":\"column\",\"column\":\"id\"}}]}", .expected = "t_id_check" },
+        .{ .baseline = "{\"relational_indexes\":[{\"name\":\"t_id_key\"}]}", .fragment = "{\"unique_constraints\":[{\"name\":\"anonymous\",\"columns\":[\"id\"]}]}", .expected = "t_id_key1" },
+        .{ .baseline = "{\"checks\":[{\"name\":\"t_id_fkey\"}]}", .fragment = "{\"foreign_keys\":[{\"name\":\"anonymous\",\"child_columns\":[\"id\"]}]}", .expected = "t_id_fkey1" },
+    };
+    for (cases) |case| {
+        var namespace: EmptyNamespace = .{};
+        var plan = try Plan.prepareAddition(a, "t", 5, case.baseline, case.fragment, &.{"anonymous"}, &namespace, 16);
+        defer plan.deinit();
+        try std.testing.expectEqualStrings(case.expected, plan.admission.names[0].name);
+        try plan.admission.validateSchema(a, plan.schema_json);
+    }
+}
+
+test "prepared ALTER addition rejects replacement and multi-rule fragments" {
+    const a = std.testing.allocator;
+    var namespace: EmptyNamespace = .{};
+    const fragment = "{\"checks\":[{\"name\":\"anonymous\",\"expression\":{\"op\":\"literal\",\"value\":true}}]}";
+    try std.testing.expectError(error.InvalidCatalogRecord, Plan.prepareAddition(a, "t", 5, "{}", fragment, &.{ "anonymous", "other" }, &namespace, 16));
+    try std.testing.expectError(error.InvalidCatalogRecord, Plan.prepareAddition(a, "t", 5, "{}", "{\"version\":2,\"checks\":[]}", &.{"anonymous"}, &namespace, 16));
+    try std.testing.expectError(error.InvalidCatalogRecord, Plan.prepareAddition(a, "t", 5, "{}", "{\"checks\":[{\"name\":\"anonymous\"},{\"name\":\"explicit\"}]}", &.{"anonymous"}, &namespace, 16));
+    namespace.cancelled = true;
+    try std.testing.expectError(error.DeadlineExceeded, Plan.prepareAddition(a, "t", 5, "{\"checks\":[{\"name\":\"old\"}]}", fragment, &.{"anonymous"}, &namespace, 16));
 }
 
 test "prepared naming rejects future explicit collisions and bounds aggregate probes" {
