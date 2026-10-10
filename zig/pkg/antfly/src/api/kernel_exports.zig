@@ -296,6 +296,11 @@ pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
         }
     else
         server_mod.ApiHttpServer.initWithProcessRequestAllocator(owner_alloc, imported_cfg, source.*, reads.*, writes.*);
+    state.server.startResourceCleanup() catch |err| {
+        std.log.err("API memory cleanup startup failed: error.{s}", .{@errorName(err)});
+        state.server.deinit();
+        return fail(err);
+    };
     state.server.startPgwire() catch |err| {
         std.log.err("API pgwire listener startup failed: error.{s}", .{@errorName(err)});
         state.server.deinit();

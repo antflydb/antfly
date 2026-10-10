@@ -27639,3 +27639,18 @@ pub fn qualifyControlledLocalCacheContention(control: @import("../common/read_ad
     try std.testing.expectEqual(resources.Slice.lsm_block_table_cache, value.reservation.?.slice);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.accounting_errors);
 }
+
+pub fn qualifyMakeManagedCleanupPayload(manager: *@import("resource_manager.zig").ResourceManager, control: @import("../common/read_admission.zig").Port) !*SharedBytes {
+    if (!builtin.is_test) @compileError("qualification requires a test build");
+    const a = std.testing.allocator;
+    var credit = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, @sizeOf(SharedBytes) + 8, control);
+    defer credit.retire();
+    const value = blk: {
+        const bytes = try a.dupe(u8, "retained");
+        errdefer a.free(bytes);
+        break :blk try SharedBytes.create(a, bytes);
+    };
+    errdefer value.release();
+    try value.registerRetirementWithAdmission(&credit, control);
+    return value;
+}

@@ -3938,6 +3938,8 @@ pub const ApiHttpServer = struct {
     sql_cleanup_reaper_workers: ?@import("sql_worker_lease.zig").Lease = null,
     sql_cleanup_runtime: ?*@import("runnable_cleanup_owner.zig").Runtime = null,
     sql_cleanup_closing: bool = false,
+    resource_cleanup_runtime: ?*@import("resource_manager_cleanup.zig").Runtime = null,
+    resource_cleanup_workers: ?@import("sql_worker_lease.zig").Lease = null,
     sql_workers_mutex: std.atomic.Mutex = .unlocked,
     sql_workers: ?@import("sql_worker_lease.zig").Lease = null,
     sql_workers_closing: bool = false,
@@ -4462,6 +4464,32 @@ pub const ApiHttpServer = struct {
     fn runnableScheduler(self: *ApiHttpServer) ?*RunnableScheduler.Scheduler {
         if (self.runnable_owner) |owner| return &owner.scheduler;
         return if (self.runnable_scheduler) |*scheduler| scheduler else null;
+    }
+
+    /// Start at the stable server address, before either listener publishes
+    /// pooled storage work. The worker and manager outlive every cleanup round.
+    pub fn startResourceCleanup(self: *ApiHttpServer) !void {
+        const manager = self.shared_resource_manager orelse return;
+        const scheduler = self.runnableScheduler() orelse return;
+        _ = try self.sqlControlIo();
+        platform_sync.lockYielding(&self.sql_workers_mutex);
+        defer self.sql_workers_mutex.unlock();
+        if (self.sql_workers_closing or self.sql_cleanup_closing) return error.ManagerCleanupCapacityUnavailable;
+        if (self.resource_cleanup_runtime != null) return;
+        var workers = try self.acquireSqlWorkers(1);
+        errdefer workers.release();
+        const worker = try @import("resource_manager_cleanup.zig").Runtime.create(self.state_alloc, workers.io(), manager, scheduler);
+        self.resource_cleanup_workers = workers;
+        self.resource_cleanup_runtime = worker;
+    }
+
+    fn stopResourceCleanup(self: *ApiHttpServer) void {
+        if (self.resource_cleanup_runtime) |worker| {
+            worker.deinit();
+            self.resource_cleanup_runtime = null;
+        }
+        if (self.resource_cleanup_workers) |*workers| workers.release();
+        self.resource_cleanup_workers = null;
     }
 
     pub fn runnableSchedulingStats(self: *const ApiHttpServer) @import("antfly_runtime_abi").RunnableStats {
@@ -5045,6 +5073,7 @@ pub const ApiHttpServer = struct {
             active.destroyJoined();
             self.sql_workers_mutex.unlock();
         }
+        self.stopResourceCleanup();
         self.object_tables.deinit(self.owner_alloc);
         platform_sync.lockYielding(&self.sql_workers_mutex);
         self.sql_workers_closing = true;

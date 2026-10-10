@@ -74,9 +74,10 @@ pub const Entry = struct {
     /// One-shot physical cleanup duration, consumed at first activation.
     cleanup_duration_ns: ?u64 = null,
     cleanup_active: bool = false,
+    protected_cleanup_root: bool = false,
 
     fn retainedPhase(self: *const Entry) bool {
-        return self.completion_active or self.cleanup_active;
+        return self.completion_active or self.cleanup_active or self.protected_cleanup_root;
     }
 };
 
@@ -100,6 +101,8 @@ pub const Scheduler = struct {
         retained_bytes: u64 = 0,
         control_operations: usize = 0,
         control_retained_bytes: u64 = 0,
+        cleanup_operations: usize = 0,
+        cleanup_retained_bytes: u64 = 0,
         queued: usize = 0,
         runnable_slots: usize = 0,
         control_slots: usize = 0,
@@ -260,6 +263,17 @@ pub const Scheduler = struct {
         const count_used = if (control) self.metrics.control_operations else self.metrics.operations - self.metrics.control_operations;
         const byte_limit = if (control) self.config.control_bytes else self.config.max_bytes - self.config.control_bytes;
         const byte_used = if (control) self.metrics.control_retained_bytes else self.metrics.retained_bytes - self.metrics.control_retained_bytes;
+        if (e.protected_cleanup_root) {
+            // Cleanup roots share the control partition, but cannot consume
+            // its last operation or more than half its retained byte reserve.
+            const cleanup_limit = @min(@as(usize, 2), control_count -| 1);
+            if (!control or self.metrics.cleanup_operations >= cleanup_limit or
+                e.bytes > (self.config.control_bytes / 2) -| self.metrics.cleanup_retained_bytes)
+            {
+                self.metrics.rejected +|= 1;
+                return error.ResourceTemporarilyUnavailable;
+            }
+        }
         if (count_used >= count_limit or e.bytes > byte_limit - byte_used) {
             self.metrics.rejected +|= 1;
             return error.SchedulerFull;
@@ -268,6 +282,10 @@ pub const Scheduler = struct {
         if (control) {
             self.metrics.control_operations += 1;
             self.metrics.control_retained_bytes += e.bytes;
+        }
+        if (e.protected_cleanup_root) {
+            self.metrics.cleanup_operations += 1;
+            self.metrics.cleanup_retained_bytes += e.bytes;
         }
         // Registry/count/bytes cover queued, running AND blocked operations.
         // Resume never needs another reservation or allocation.
@@ -671,6 +689,11 @@ pub const Scheduler = struct {
             self.metrics.control_operations -= 1;
             self.metrics.control_retained_bytes -= e.bytes;
         }
+        if (e.protected_cleanup_root) {
+            self.metrics.cleanup_operations -= 1;
+            self.metrics.cleanup_retained_bytes -= e.bytes;
+            e.protected_cleanup_root = false;
+        }
         e.state = .finished;
         e.scheduler = null;
         e.completion_options = null;
@@ -804,9 +827,21 @@ pub const Execution = struct {
     /// One stable capsule can account for a bounded CPU team. Its demand stays
     /// attached across yields and waits, independently of retained memory.
     pub fn startWithSlots(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, class: Class, slots: usize) !void {
+        return self.startRoot(scheduler, options, class, slots, false);
+    }
+
+    /// Independent finite cleanup authority, never a refreshed read scope.
+    /// Admission is fail-fast and preserves global health/control headroom.
+    pub fn startCleanupRoot(self: *Execution, scheduler: *Scheduler, options: admission.Options) !void {
+        if (options.deadline_ns == null or options.allow_wait) return error.InvalidArgument;
+        if (options.deadline_ns.? > options.now() +| (250 * std.time.ns_per_ms)) return error.InvalidArgument;
+        return self.startRoot(scheduler, options, .control, 1, true);
+    }
+
+    fn startRoot(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, class: Class, slots: usize, protected_cleanup: bool) !void {
         std.debug.assert(self.entry == null and self.borrowed == null);
         const owner = scheduler orelse return;
-        self.entry = .{ .options = options, .class = class, .slots = slots, .bytes = options.retained_bytes };
+        self.entry = .{ .options = options, .class = class, .slots = slots, .bytes = options.retained_bytes, .protected_cleanup_root = protected_cleanup };
         errdefer self.finish();
         try owner.submit(&self.entry.?);
         try owner.wait(&self.entry.?);

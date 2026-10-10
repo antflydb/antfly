@@ -87,7 +87,7 @@ fn startChecked(raw: *anyopaque, options: *const abi.Start) !void {
         const now: u64 = if (options.native_deadline != 0) owner.native_now_ns() else @intCast(@max(0, std.Io.Clock.now(.awake, clock).nanoseconds));
         if (options.deadline_ns > now +| (250 * std.time.ns_per_ms)) return error.InvalidArgument;
     }
-    try value.execution.startWithSlots(&owner.owner.scheduler, .{
+    const execution_options: @import("antfly_local_sources").common_bounded_admission.Options = .{
         .io = value.io.io(),
         .clock_io = if (value.clock_io) |*clock| clock.io() else null,
         .native_now_ns = if (options.native_deadline != 0) owner.native_now_ns else null,
@@ -95,7 +95,11 @@ fn startChecked(raw: *anyopaque, options: *const abi.Start) !void {
         .cancellation = .{ .ptr = value, .requested = Capsule.cancelled },
         .retained_bytes = options.retained_bytes +| @sizeOf(Capsule),
         .allow_wait = options.allow_wait != 0,
-    }, std.enums.fromInt(runnable.Class, options.class) orelse return error.InvalidArgument, options.slots);
+    };
+    if (cleanup) {
+        if (options.class != @backingInt(abi.Class.control) or options.slots != 1) return error.InvalidArgument;
+        try value.execution.startCleanupRoot(&owner.owner.scheduler, execution_options);
+    } else try value.execution.startWithSlots(&owner.owner.scheduler, execution_options, std.enums.fromInt(runnable.Class, options.class) orelse return error.InvalidArgument, options.slots);
     options.out_handle.* = value;
 }
 fn reserveChild(raw: *anyopaque, options: *const abi.ChildStart) callconv(.c) runtime.error_abi.Status {

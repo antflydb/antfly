@@ -2053,3 +2053,264 @@ test "text statistics trusted controls local cache contention preserves phase de
         }
     }
 }
+
+test "text statistics trusted controls manager cleanup dispatch retires canceled idle buffers while ordinary capacity is saturated" {
+    const Cleanup = @import("api/resource_manager_cleanup.zig").Runtime;
+    const resources = sources.storage_resource_manager;
+    const Budget = struct {
+        execution: *native.Execution,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    for ([_]native.Class{ .query, .inference }) |phase| {
+        var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
+        defer lane.deinit();
+        const io = lane.io();
+        var scheduler = try native.Scheduler.init(.{ .slots = 3, .control_slots = 1, .max_operations = 8 });
+        defer scheduler.close();
+        var parent = resources.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+        defer parent.deinit(std.testing.allocator);
+        var manager = resources.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+        defer manager.deinit(std.testing.allocator);
+        try manager.installMemoryParent(parent.memoryParentPort());
+        const cleanup = try Cleanup.create(std.testing.allocator, io, &manager, &scheduler);
+        defer cleanup.deinit();
+        try std.testing.expectError(error.ManagerCleanupAlreadyBound, Cleanup.create(std.testing.allocator, io, &manager, &scheduler));
+        var canceled = std.atomic.Value(bool).init(false);
+        var producer: native.Execution = .{};
+        defer producer.finish();
+        const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+        try producer.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 23, .cancellation = .{ .ptr = &canceled, .requested = requested } }, phase);
+        var budget = Budget{ .execution = &producer };
+        const admission = sources.common_read_admission;
+        var adapter = admission.Adapter(*Budget){ .budget = &budget };
+        const payload = adapter.payload();
+        var value = try sources.storage_lsm_backend.qualifyMakeManagedCleanupPayload(&manager, admission.Port.init(&payload));
+        var value_owned = true;
+        defer if (value_owned) value.release();
+        canceled.store(true, .release);
+        try std.testing.expectError(error.Canceled, producer.checkpoint());
+        try std.testing.expectEqual(phase, try producer.retainedClass());
+        try std.testing.expectEqual(@as(?u64, deadline), producer.entry.?.options.deadline_ns);
+        producer.finish();
+        var blockers: [2]native.Execution = @splat(.{});
+        defer for (&blockers) |*blocker| blocker.finish();
+        for (&blockers) |*blocker| try blocker.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23, .allow_wait = false }, .query);
+        const before = manager.snapshot().memory.used_bytes;
+        std.debug.assert(parent.mutex.tryLock());
+        var parent_held = true;
+        defer if (parent_held) parent.mutex.unlock();
+        value_owned = false;
+        value.release();
+        // No next read or foreground retry: only the independent consumer may
+        // retire the physical buffer and keep its exact blocked parent credit.
+        const until = clock.monotonicNs() + 5 * std.time.ns_per_s;
+        while (true) {
+            const stats = scheduler.stats();
+            if (stats.cleanup_operations == 1 and stats.resource_blocked == 1) break;
+            if (clock.monotonicNs() >= until) return error.TestCleanupDidNotProgress;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(before, manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(before, parent.memory.used_bytes);
+        try std.testing.expect(manager.cleanupPending());
+        var health: native.Execution = .{};
+        defer health.finish();
+        try health.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 19, .allow_wait = false }, .control);
+        try health.checkpoint();
+        health.finish();
+        parent.mutex.unlock();
+        parent_held = false;
+        while (manager.cleanupPending() or scheduler.stats().cleanup_operations != 0) {
+            if (clock.monotonicNs() >= until) return error.TestCleanupDidNotRetire;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 0), parent.snapshot().memory.used_bytes);
+        try std.testing.expectEqual(@as(u64, 1), cleanup.snapshot().retired_payloads);
+        try std.testing.expectEqual(@as(usize, 2), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 46), scheduler.stats().retained_bytes);
+        cleanup.join();
+        try std.testing.expect(!manager.cleanup_consumer_bound.load(.acquire));
+        for (&blockers) |*blocker| blocker.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+    }
+}
+
+test "text statistics trusted controls protected cleanup roots share global limits and preserve independent health capacity" {
+    const owner_module = @import("api/runnable_owner_execution.zig");
+    var state: owner_module.State = .{ .owner_alloc = std.testing.allocator, .owner = try native.NodeOwner.init(.{ .slots = 3, .control_slots = 1, .max_operations = 8, .max_bytes = 128 << 10, .control_bytes = 64 << 10 }), .native_now_ns = clock.monotonicNs };
+    defer state.owner.deinit();
+    const scheduler = &state.owner.scheduler;
+    var first: native.Execution = .{};
+    defer first.finish();
+    try first.startCleanupRoot(scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = clock.monotonicNs() + 249 * std.time.ns_per_ms, .retained_bytes = 512, .allow_wait = false });
+    try std.testing.expectError(error.InvalidRunnableTransition, first.enter(.query));
+    var child: native.Execution = .{};
+    defer child.finish();
+    try std.testing.expectError(error.InvalidRunnableTransition, child.reserveChild(&first, std.testing.io, @sizeOf(native.Execution)));
+    try first.park(.resource_blocked);
+    const owner = state.port();
+    const io = runtime.native_abi.IoBorrow.init(&std.testing.io);
+    var second: ?*anyopaque = null;
+    const start = owner.start(owner.context, &.{ .io = &io, .class = @backingInt(runtime.runnable_abi.Class.control), .cleanup = 1, .allow_wait = 0, .has_deadline = 1, .native_deadline = 1, .deadline_ns = clock.monotonicNs() + 249 * std.time.ns_per_ms, .retained_bytes = 64, .out_handle = &second });
+    if (!start.isOk()) return runtime.error_abi.errorFromStatus(start);
+    defer if (second) |handle| owner.finish(handle);
+    try std.testing.expect(owner.park(second.?, @backingInt(runtime.runnable_abi.Wait.resource)).isOk());
+    try std.testing.expectEqual(@as(usize, 2), scheduler.stats().cleanup_operations);
+    var rejected: native.Execution = .{};
+    defer rejected.finish();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, rejected.startCleanupRoot(scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = clock.monotonicNs() + 249 * std.time.ns_per_ms, .retained_bytes = 1, .allow_wait = false }));
+    var health: native.Execution = .{};
+    defer health.finish();
+    try health.start(scheduler, .{ .io = std.testing.io, .retained_bytes = 1024, .allow_wait = false }, .control);
+    try health.checkpoint();
+    health.finish();
+    owner.finish(second.?);
+    second = null;
+    first.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().cleanup_operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().cleanup_retained_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, rejected.startCleanupRoot(scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = clock.monotonicNs() + 249 * std.time.ns_per_ms, .retained_bytes = scheduler.config.control_bytes / 2 + 1, .allow_wait = false }));
+    try std.testing.expectError(error.InvalidArgument, rejected.startCleanupRoot(scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s, .allow_wait = false }));
+}
+
+test "text statistics trusted controls manager cleanup startup failure releases binding and admits a later worker" {
+    const Cleanup = @import("api/resource_manager_cleanup.zig").Runtime;
+    const resources = sources.storage_resource_manager;
+    var scheduler = try native.Scheduler.init(.{ .slots = 3, .control_slots = 1, .max_operations = 8 });
+    defer scheduler.close();
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    var unavailable = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    defer unavailable.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, Cleanup.create(std.testing.allocator, unavailable.io(), &manager, &scheduler));
+    try std.testing.expect(!manager.cleanup_consumer_bound.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, Cleanup.create(failing.allocator(), unavailable.io(), &manager, &scheduler));
+    try std.testing.expect(!manager.cleanup_consumer_bound.load(.acquire));
+    var available = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    defer available.deinit();
+    const worker = try Cleanup.create(std.testing.allocator, available.io(), &manager, &scheduler);
+    defer worker.deinit();
+    try std.testing.expect(manager.cleanup_consumer_bound.load(.acquire));
+    worker.join();
+    worker.join();
+    try std.testing.expect(!manager.cleanup_consumer_bound.load(.acquire));
+}
+
+test "text statistics trusted controls manager cleanup shutdown joins stalled physical destruction before unbinding and releasing credit" {
+    const Cleanup = @import("api/resource_manager_cleanup.zig").Runtime;
+    const resources = sources.storage_resource_manager;
+    const admission = sources.common_read_admission;
+    const Gate = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        destroyed: std.atomic.Value(usize) = .init(0),
+        join_started: std.atomic.Value(bool) = .init(false),
+        join_done: std.atomic.Value(bool) = .init(false),
+        fn joinWorker(self: *@This(), worker: *Cleanup) void {
+            self.join_started.store(true, .release);
+            worker.join();
+            self.join_done.store(true, .release);
+        }
+        fn waitFor(flag: *std.atomic.Value(bool)) !void {
+            const deadline = clock.monotonicNs() + 5 * std.time.ns_per_s;
+            while (!flag.load(.acquire)) {
+                if (clock.monotonicNs() >= deadline) return error.TestPhysicalCleanupDidNotProgress;
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            }
+        }
+    };
+    const Physical = struct {
+        node: resources.PayloadRetirement = .{},
+        credit: ?resources.Reservation = null,
+        gate: *Gate,
+        bytes: []u8,
+        fn destroy(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const gate = self.gate;
+            gate.entered.store(true, .release);
+            // Model an allocator destructor that cannot honor IO cancellation.
+            while (!gate.release.load(.acquire)) clock.sleepNs(std.time.ns_per_ms);
+            std.testing.allocator.free(self.bytes);
+            std.testing.allocator.destroy(self);
+            _ = gate.destroyed.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Budget = struct {
+        execution: *native.Execution,
+        pub fn checkpoint(self: *@This()) !void {
+            try self.execution.checkpoint();
+        }
+        pub fn waitForProgress(_: *@This()) !void {
+            return error.TestUnexpectedWait;
+        }
+    };
+    var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
+    defer lane.deinit();
+    var scheduler = try native.Scheduler.init(.{ .slots = 3, .control_slots = 1, .max_operations = 8 });
+    defer scheduler.close();
+    var manager = resources.ResourceManager.init(.{ .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    const worker = try Cleanup.create(std.testing.allocator, lane.io(), &manager, &scheduler);
+    defer worker.deinit();
+    var gate: Gate = .{};
+    defer gate.release.store(true, .release);
+    var producer: native.Execution = .{};
+    defer producer.finish();
+    try producer.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = clock.monotonicNs() + std.time.ns_per_s }, .query);
+    var budget = Budget{ .execution = &producer };
+    var adapter = admission.Adapter(*Budget){ .budget = &budget };
+    const payload = adapter.payload();
+    const control = admission.Port.init(&payload);
+    const charged = @sizeOf(Physical) + 8192;
+    var construction = try manager.reserveConstructionWithAdmission(.lsm_read_working_set, charged, control);
+    defer construction.retire();
+    const physical = blk: {
+        const value = try std.testing.allocator.create(Physical);
+        errdefer std.testing.allocator.destroy(value);
+        value.* = .{ .gate = &gate, .bytes = try std.testing.allocator.alloc(u8, 8192) };
+        break :blk value;
+    };
+    var owned = true;
+    defer if (owned) {
+        std.testing.allocator.free(physical.bytes);
+        std.testing.allocator.destroy(physical);
+    };
+    try manager.registerPayloadRetirementWithAdmission(&physical.node, &physical.credit, &construction, physical, Physical.destroy, control);
+    owned = false;
+    producer.finish();
+    physical.node.publish();
+    try Gate.waitFor(&gate.entered);
+    try std.testing.expectEqual(@as(u64, charged), manager.snapshot().memory.used_bytes);
+    var joining = try lane.io().concurrent(Gate.joinWorker, .{ &gate, worker });
+    defer {
+        gate.release.store(true, .release);
+        joining.await(lane.io());
+    }
+    try Gate.waitFor(&gate.join_started);
+    try std.testing.io.sleep(.fromMilliseconds(40), .awake);
+    // Expiration and cancellation cannot return credit for a live allocation.
+    try std.testing.expect(!gate.join_done.load(.acquire));
+    try std.testing.expect(manager.cleanup_consumer_bound.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), gate.destroyed.load(.acquire));
+    try std.testing.expectEqual(@as(u64, charged), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().cleanup_operations);
+    scheduler.close();
+    gate.release.store(true, .release);
+    joining.await(lane.io());
+    try std.testing.expect(gate.join_done.load(.acquire));
+    try std.testing.expect(!manager.cleanup_consumer_bound.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), gate.destroyed.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}

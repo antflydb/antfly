@@ -1104,6 +1104,9 @@ pub const ResourceManager = struct {
     payload_retirement_mutex: std.atomic.Mutex = .unlocked,
     payload_retirement_head: ?*PayloadRetirement = null,
     payload_retirement_cursor: ?*PayloadRetirement = null,
+    cleanup_consumer_bound: std.atomic.Value(bool) = .init(false),
+    cleanup_epoch: std.atomic.Value(u64) = .init(0),
+    payload_retirement_ready: std.atomic.Value(usize) = .init(0),
 
     dense_checkpoint_ready: @import("maintenance_signal.zig").Signal = .{},
     mutex: std.atomic.Mutex = .unlocked,
@@ -2103,6 +2106,7 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        std.debug.assert(!self.cleanup_consumer_bound.load(.acquire));
         // Quiescent teardown: producers and admitted cleanup have joined.
         while (self.payload_retirement_head) |node| {
             if (!node.ready.load(.acquire)) @panic("resource manager closed with live payload owners");
@@ -2111,6 +2115,7 @@ pub const ResourceManager = struct {
             const destroy = node.destroy.?;
             const context = node.context.?;
             destroy(context);
+            _ = self.payload_retirement_ready.fetchSub(1, .acq_rel);
             credit.release();
         }
         for (&self.construction_cleanup) |*slot| {
@@ -2818,6 +2823,25 @@ pub const ResourceManager = struct {
         }
     }
 
+    /// A single joined consumer owns manager lifetime and independent IO.
+    pub fn bindCleanupConsumer(self: *ResourceManager) !void {
+        if (self.cleanup_consumer_bound.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return error.ManagerCleanupAlreadyBound;
+    }
+    pub fn unbindCleanupConsumer(self: *ResourceManager) void {
+        std.debug.assert(self.cleanup_consumer_bound.swap(false, .acq_rel));
+    }
+    pub fn notifyCleanupReady(self: *ResourceManager) void {
+        _ = self.cleanup_epoch.fetchAdd(1, .release);
+    }
+    pub fn cleanupPending(self: *const ResourceManager) bool {
+        if (self.payload_retirement_ready.load(.acquire) != 0) return true;
+        for (&self.construction_cleanup) |*slot| {
+            const state = slot.state.load(.acquire);
+            if (state == .ready or state == .draining) return true;
+        }
+        return false;
+    }
+
     /// Register embedded, already charged metadata before publication. No
     /// heap registry allocation and no scope borrow survives this call.
     pub fn registerPayloadRetirementWithAdmission(self: *ResourceManager, node: *PayloadRetirement, destination: *?Reservation, construction: *ConstructionCredit, context: *anyopaque, destroy: *const fn (*anyopaque) void, control: read_admission.Port) !void {
@@ -2882,6 +2906,7 @@ pub const ResourceManager = struct {
             const context = node.context.?;
             // No fallible checkpoint from unlink through final destruction.
             destroy(context);
+            _ = self.payload_retirement_ready.fetchSub(1, .acq_rel);
             debt.?.retire();
             retired += 1;
         }
@@ -4438,7 +4463,10 @@ pub const PayloadRetirement = struct {
     ready: std.atomic.Value(bool) = .init(false),
 
     pub fn publish(self: *PayloadRetirement) void {
+        const manager = self.credit.?.manager;
+        _ = manager.payload_retirement_ready.fetchAdd(1, .acq_rel);
         self.ready.store(true, .release); // Final access to the physical owner.
+        manager.notifyCleanupReady();
     }
 };
 
@@ -4470,6 +4498,7 @@ pub const ConstructionCredit = struct {
         const slot = self.slot orelse return;
         self.slot = null;
         slot.state.store(.ready, .release);
+        self.manager.notifyCleanupReady();
         _ = self.manager.tryDrainConstructionSlot(slot);
     }
 };
