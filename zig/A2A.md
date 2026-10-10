@@ -296,6 +296,25 @@ Current event names:
 Clients should treat all events before `done` as progressive UI data. They may render hits, reasoning, and step traces
 incrementally, but should reconcile final state from `done`.
 
+For pipeline retrieval, `step_started` precedes query execution and the pipeline's
+`step_completed` follows retrieval, before answer generation. A retrieval failure completes
+that step with `status: "error"` before emitting the terminal `error`; it does not emit `done`.
+
+Queries without an explicitly pinned identity generation retry the entire read against a
+fresh generation within the server's bounded retry budget and request deadline. A stale
+explicit generation remains a conflict; it is never silently replaced. If generation churn
+exhausts that budget, the SSE error is:
+
+```json
+{"error":"ReadUnavailable","code":"read_unavailable","message":"retrieval read temporarily unavailable; retry the request","retryable":true,"retry_after_ms":1000}
+```
+
+JSON requests receive the same fields with HTTP 503 for an exhausted fresh-read budget,
+or HTTP 409 for a stale explicit generation or topology conflict, plus `Retry-After: 1`.
+Clients may retry an unpinned request after the suggested delay. A stale explicit pin
+requires selecting a new generation. Query retries finish before retrieval hits or
+answer generation are emitted.
+
 Research streaming reuses these event names. `step_progress` events carry `name: "research"` and a `phase` of `plan`,
 `sub_question_started`, `finding`, `reflection`, `section`, or `verification`; the report streams as `generation`
 chunks; `done` carries the `ResearchAgentResult`.

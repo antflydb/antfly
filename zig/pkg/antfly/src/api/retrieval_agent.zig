@@ -391,6 +391,7 @@ const LiveEmitter = struct {
     sink: ?EventSink = null,
     alloc: std.mem.Allocator,
     next_step_index: usize = 0,
+    active_pipeline: ?struct { index: usize, step: AgentStep } = null,
     // Buffered transcripts replay the same event schema with final results.
     replay_result: ?RetrievalAgentResult = null,
 
@@ -562,6 +563,33 @@ const LiveEmitter = struct {
         });
     }
 
+    fn beginPipeline(self: *LiveEmitter, step: AgentStep) !void {
+        if (self.sink == null) return;
+        std.debug.assert(self.active_pipeline == null);
+        const index = self.next_step_index;
+        self.next_step_index += 1;
+        self.active_pipeline = .{ .index = index, .step = step };
+        const id = try std.fmt.allocPrint(self.alloc, "step_{d}", .{index});
+        defer self.alloc.free(id);
+        try self.emitValue("step_started", .{ .id = id, .kind = step.kind, .name = step.name, .action = step.action });
+    }
+
+    fn finishPipeline(self: *LiveEmitter, failed: bool) !void {
+        const pending = self.active_pipeline orelse return;
+        self.active_pipeline = null;
+        const id = try std.fmt.allocPrint(self.alloc, "step_{d}", .{pending.index});
+        defer self.alloc.free(id);
+        const step = pending.step;
+        try self.emitValue("step_completed", .{
+            .id = id,
+            .kind = step.kind,
+            .name = step.name,
+            .action = step.action,
+            .status = if (failed) metadata_openapi.AgentStepStatus.@"error" else step.status,
+            .details = step.details,
+        });
+    }
+
     fn emitHits(self: *LiveEmitter, hits: []const QueryHit, tree_search: bool) !void {
         if (self.sink == null) return;
         if (tree_search) try self.emitTreeProgress(hits);
@@ -598,6 +626,7 @@ fn finishAgentResult(
     result: RetrievalAgentResult,
     live: *LiveEmitter,
 ) !EncodedResponse {
+    try live.finishPipeline(false);
     try live.emitDone(result);
     if (format == .sse and live.sink != null) {
         // Events were written under transport backpressure. Do not retain or
@@ -605,6 +634,21 @@ fn finishAgentResult(
         return .{ .content_type = "text/event-stream", .body = try alloc.dupe(u8, "") };
     }
     return try encodeAgentResult(alloc, format, result);
+}
+
+pub const RetryableReadFailure = struct {
+    @"error": []const u8 = "ReadUnavailable",
+    code: []const u8 = "read_unavailable",
+    message: []const u8 = "retrieval read temporarily unavailable; retry the request",
+    retryable: bool = true,
+    retry_after_ms: u32 = 1000,
+};
+
+pub fn retryableReadFailure(err: anyerror) ?RetryableReadFailure {
+    return switch (err) {
+        error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged => .{},
+        else => null,
+    };
 }
 
 /// Every terminal failure uses the same delivery decision as completion.
@@ -616,7 +660,15 @@ fn failAgentResult(
     err: anyerror,
     kind: enum { retrieval, generation },
 ) !EncodedResponse {
+    try live.finishPipeline(true);
     if (format == .json) return err;
+    if (if (kind == .retrieval) retryableReadFailure(err) else null) |payload| {
+        try live.emitValue("error", payload);
+        return .{
+            .content_type = "text/event-stream",
+            .body = if (live.sink != null) try alloc.dupe(u8, "") else try encodeSseError(alloc, payload),
+        };
+    }
     if (err == error.GenerationCapacityUnavailable) {
         const payload = connections_api.generationCapacityFailure();
         try live.emitValue("error", payload);
@@ -857,7 +909,7 @@ fn executeInternal(
         true;
     if (selection) |value| {
         if (allow_probe_selection and value.indices == null and value.candidate_scores != null and (value.question != null or value.incomplete_reason != null)) {
-            selection = try maybeProbeAgenticSelection(
+            selection = maybeProbeAgenticSelection(
                 alloc,
                 arena,
                 runner,
@@ -866,7 +918,7 @@ fn executeInternal(
                 mandatory_predicates,
                 classification_result,
                 value,
-            );
+            ) catch |err| return failAgentResult(alloc, format, &live, err, .retrieval);
         }
     }
     const selected_query_indices = if (selection) |value| value.indices else null;
@@ -952,13 +1004,20 @@ fn executeInternal(
         try std.fmt.allocPrint(arena, "executed 1 retrieval query", .{})
     else
         try std.fmt.allocPrint(arena, "executed {d} retrieval queries", .{retrieval_queries.len});
-    try appendStep(arena, &steps_list, &live, .{
+    const pipeline_step: AgentStep = .{
         .kind = .planning,
         .name = "pipeline",
         .action = action,
         .status = .success,
         .details = try buildPipelineStepDetails(arena, retrieval_queries, selected_query_indices, broadened_from_decision),
-    });
+    };
+    try steps_list.append(arena, pipeline_step);
+    if (model_directed) {
+        try live.emitStep(pipeline_step);
+    } else {
+        // Preserve result step order, but report success only after retrieval.
+        try live.beginPipeline(pipeline_step);
+    }
     if (agentic_mode and !model_directed) {
         try appendStep(arena, &steps_list, &live, .{
             .kind = .tool_call,
@@ -1092,7 +1151,7 @@ fn executeInternal(
             });
         }
 
-        const query_json = try encodeQueryValueForRetrievalQuery(
+        const query_json = encodeQueryValueForRetrievalQuery(
             alloc,
             runner,
             raw_query,
@@ -1102,7 +1161,8 @@ fn executeInternal(
             classification_result,
             retrieval_query_index,
             .initial,
-        );
+        ) catch |err|
+            return failAgentResult(alloc, format, &live, err, .retrieval);
         defer alloc.free(query_json);
 
         const query_hits = cachedProbeResults(candidate_scores, retrieval_query_index, query_json) orelse
@@ -1124,7 +1184,7 @@ fn executeInternal(
                 .details = try buildRefineQueryStepDetails(arena, retrieval_query, retrieval_query_index),
             });
 
-            const followup_query_json = try encodeQueryValueForRetrievalQuery(
+            const followup_query_json = encodeQueryValueForRetrievalQuery(
                 alloc,
                 runner,
                 raw_query,
@@ -1134,7 +1194,8 @@ fn executeInternal(
                 classification_result,
                 retrieval_query_index,
                 .followup,
-            );
+            ) catch |err|
+                return failAgentResult(alloc, format, &live, err, .retrieval);
             defer alloc.free(followup_query_json);
 
             const followup_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, followup_query_json, request.query, retrieval_query.tree_search != null, false) catch |err|
@@ -1228,7 +1289,7 @@ fn executeInternal(
                     .details = try buildTreeExpansionStepDetails(arena, retrieval_query, retrieval_query_index, tree_plan),
                 });
 
-                const expanded_query_json = try encodeQueryValueForRetrievalQuery(
+                const expanded_query_json = encodeQueryValueForRetrievalQuery(
                     alloc,
                     runner,
                     raw_query,
@@ -1238,7 +1299,8 @@ fn executeInternal(
                     classification_result,
                     retrieval_query_index,
                     .followup,
-                );
+                ) catch |err|
+                    return failAgentResult(alloc, format, &live, err, .retrieval);
                 defer alloc.free(expanded_query_json);
 
                 const expanded_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, expanded_query_json, request.query, true, false) catch |err|
@@ -1311,7 +1373,7 @@ fn executeInternal(
                     ),
                 });
 
-                const refined_query_json = try encodeQueryValueForRetrievalQueryWithText(
+                const refined_query_json = encodeQueryValueForRetrievalQueryWithText(
                     alloc,
                     runner,
                     raw_query,
@@ -1322,7 +1384,8 @@ fn executeInternal(
                     retrieval_query_index,
                     .evaluation,
                     refined_query,
-                );
+                ) catch |err|
+                    return failAgentResult(alloc, format, &live, err, .retrieval);
                 defer alloc.free(refined_query_json);
 
                 const refined_hits = runQueryAndExtractHits(alloc, arena, runner, table_name, refined_query_json, request.query, retrieval_query.tree_search != null, false) catch |err|
@@ -1376,7 +1439,7 @@ fn executeInternal(
                 else => true,
             };
             if (allow_agentic_fallback) {
-                if (try planNextAgenticFallback(
+                if (planNextAgenticFallback(
                     alloc,
                     arena,
                     runner,
@@ -1386,7 +1449,7 @@ fn executeInternal(
                     classification_result,
                     candidate_scores,
                     attempted_query_indices,
-                )) |fallback_plan| {
+                ) catch |err| return failAgentResult(alloc, format, &live, err, .retrieval)) |fallback_plan| {
                     candidate_scores = fallback_plan.candidate_scores;
                     const planner_decision = decideAgenticPlannerAction(
                         evaluation_trigger,
@@ -1509,6 +1572,8 @@ fn executeInternal(
             }
         }
     }
+
+    try live.finishPipeline(false);
 
     if (!model_directed and agentic_mode and hit_list.items.len == 0 and retrieval_queries.len > 1 and !broadened_from_decision and clarification_state.interactive and clarification_state.remaining > 0 and hasUnattemptedAgenticCandidate(candidate_scores, attempted_query_indices)) {
         try appendStep(arena, &steps_list, &live, .{
@@ -5590,7 +5655,7 @@ fn maybeProbeAgenticSelection(
         if (candidate_index >= retrieval_queries.len) continue;
         const retrieval_query = retrieval_queries[candidate_index];
         if (!isProbeableRetrievalQuery(retrieval_query)) continue;
-        const query_json = try encodeQueryValueForRetrievalQuery(
+        const query_json = encodeQueryValueForRetrievalQuery(
             alloc,
             runner,
             raw_queries[candidate_index],
@@ -5600,7 +5665,12 @@ fn maybeProbeAgenticSelection(
             classification_result,
             candidate_index,
             .initial,
-        );
+        ) catch |err| {
+            // Probes are optional. Treat preparation read churn like a
+            // failed probe query, without swallowing other preparation errors.
+            if (retryableReadFailure(err) != null) continue;
+            return err;
+        };
         defer alloc.free(query_json);
 
         var query_response = runner.runQuery(
@@ -5751,7 +5821,7 @@ fn probeAgenticFallbackCandidates(
         if (candidate_index >= retrieval_queries.len) continue;
         const retrieval_query = retrieval_queries[candidate_index];
         if (!isProbeableRetrievalQuery(retrieval_query)) continue;
-        const query_json = try encodeQueryValueForRetrievalQuery(
+        const query_json = encodeQueryValueForRetrievalQuery(
             alloc,
             runner,
             raw_queries[candidate_index],
@@ -5761,7 +5831,12 @@ fn probeAgenticFallbackCandidates(
             classification_result,
             candidate_index,
             .initial,
-        );
+        ) catch |err| {
+            // Keep fallback probing optional when root discovery races a
+            // publication, just as when the probe query itself fails.
+            if (retryableReadFailure(err) != null) continue;
+            return err;
+        };
         defer alloc.free(query_json);
 
         var query_response = runner.runQuery(
@@ -12600,4 +12675,167 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "retrieval agent live pipeline spans retrieval and finishes before generation" {
+    const Fixture = struct {
+        started: bool = false,
+        completed: bool = false,
+        generated: bool = false,
+        fn emit(ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, json: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return;
+            const step = parsed.value.object.get("name") orelse return;
+            if (step != .string or !std.mem.eql(u8, step.string, "pipeline")) return;
+            if (std.mem.eql(u8, name, "step_started")) {
+                try std.testing.expect(!self.started);
+                self.started = true;
+            }
+            if (std.mem.eql(u8, name, "step_completed")) {
+                try std.testing.expect(self.started and !self.completed);
+                try std.testing.expectEqualStrings("success", parsed.value.object.get("status").?.string);
+                self.completed = true;
+            }
+        }
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.started and !self.completed);
+            return .{ .json = try alloc.dupe(u8,
+                \\{"responses":[{"status":200,"hits":{"hits":[{"_id":"doc:a","_score":1,"_source":{"text":"alpha"}}]}}]}
+            ) };
+        }
+        fn generate(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(self.completed);
+            self.generated = true;
+            return .{ .content = try alloc.dupe(u8, "alpha"), .allocator = alloc };
+        }
+    };
+    var fixture: Fixture = .{};
+    const body =
+        \\{"query":"find alpha","stream":true,"generator":{"provider":"antfly","model":"local"},"steps":{"classification":{},"generation":{}},"queries":[{"table":"docs","full_text_search":{"query":"alpha"}}]}
+    ;
+    const response = try executeWithEventSink(std.testing.allocator, .{ .ptr = &fixture, .vtable = &.{ .run_query = Fixture.query } }, .{ .ptr = &fixture, .vtable = &.{ .execute_chain = Fixture.generate } }, body, .{ .ptr = &fixture, .emit_json_fn = Fixture.emit });
+    defer std.testing.allocator.free(response.body);
+    try std.testing.expect(fixture.started and fixture.completed and fixture.generated);
+}
+
+test "retrieval agent live pipeline fails with stable retryable read error" {
+    const Fixture = struct {
+        failure: anyerror,
+        scan_calls: usize = 0,
+        fn query(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.failure;
+        }
+        fn scan(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: u32, _: ?[]const u8, _: ?[]const u8) !QueryRunner.KeyPage {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scan_calls += 1;
+            return self.failure;
+        }
+    };
+    const body =
+        \\{"query":"find alpha","stream":true,"steps":{"classification":{}},"queries":[{"table":"docs","full_text_search":{"query":"alpha"}}]}
+    ;
+    const tree_body =
+        \\{"query":"find alpha","stream":true,"queries":[{"table":"docs"}],"steps":{"retrieval":{"navigation":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2,"query_index":0,"strategy":"tree","selection":"ranked"}}}}
+    ;
+    for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged }) |failure| {
+        for ([_][]const u8{ body, tree_body }, 0..) |request_body, phase| {
+            var fixture: Fixture = .{ .failure = failure };
+            const runner: QueryRunner = .{ .ptr = &fixture, .vtable = &.{ .run_query = Fixture.query, .scan_key_page = Fixture.scan } };
+            var transcript: SseTranscript = .{};
+            defer transcript.bytes.deinit(std.testing.allocator);
+            const response = try executeWithEventSink(std.testing.allocator, runner, null, request_body, .{ .ptr = &transcript, .emit_json_fn = SseTranscript.emit });
+            defer std.testing.allocator.free(response.body);
+            const events = try parseSseEventsAlloc(std.testing.allocator, transcript.bytes.items);
+            defer std.testing.allocator.free(events);
+            var pipeline_started = false;
+            var pipeline_failed = false;
+            for (events) |event| {
+                if (std.mem.eql(u8, event.event, "step_started") or std.mem.eql(u8, event.event, "step_completed")) {
+                    var value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, event.data, .{});
+                    defer value.deinit();
+                    if (!std.mem.eql(u8, value.value.object.get("name").?.string, "pipeline")) continue;
+                    if (std.mem.eql(u8, event.event, "step_started")) pipeline_started = true else {
+                        try std.testing.expect(pipeline_started and !pipeline_failed);
+                        try std.testing.expectEqualStrings("error", value.value.object.get("status").?.string);
+                        pipeline_failed = true;
+                    }
+                }
+                if (std.mem.eql(u8, event.event, "error")) try std.testing.expect(pipeline_failed);
+            }
+            try std.testing.expect(pipeline_failed);
+            try std.testing.expectEqual(@as(usize, phase), fixture.scan_calls);
+            try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "hit"));
+            try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "generation"));
+            try std.testing.expectEqual(@as(usize, 0), countSseEvents(events, "done"));
+            var payload = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, firstSseEventData(events, "error").?, .{});
+            defer payload.deinit();
+            try std.testing.expectEqualStrings("ReadUnavailable", payload.value.object.get("error").?.string);
+            try std.testing.expectEqualStrings("read_unavailable", payload.value.object.get("code").?.string);
+            try std.testing.expect(payload.value.object.get("retryable").?.bool);
+            try std.testing.expectEqual(@as(i64, 1000), payload.value.object.get("retry_after_ms").?.integer);
+            const buffered = try execute(std.testing.allocator, runner, null, request_body);
+            defer std.testing.allocator.free(buffered.body);
+            const buffered_events = try parseSseEventsAlloc(std.testing.allocator, buffered.body);
+            defer std.testing.allocator.free(buffered_events);
+            try std.testing.expectEqualStrings(firstSseEventData(events, "error").?, firstSseEventData(buffered_events, "error").?);
+        }
+    }
+}
+
+test "retrieval agent optional probes tolerate preparation read churn and preserve other failures" {
+    const Fixture = struct {
+        failure: anyerror,
+        scan_calls: usize = 0,
+        query_calls: usize = 0,
+        fn scan(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: u32, _: ?[]const u8, _: ?[]const u8) !QueryRunner.KeyPage {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scan_calls += 1;
+            return self.failure;
+        }
+        fn query(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.query_calls += 1;
+            return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}") };
+        }
+    };
+    const queries = [_]RetrievalQueryRequest{
+        .{ .table = "docs", .tree_search = .{ .index = "hierarchy", .start = .{ .selector = "$roots" } } },
+        .{ .table = "docs" },
+    };
+    const raw_queries = [_]std.json.Value{ .{ .object = .empty }, .{ .object = .empty } };
+    const predicates = [_]MandatoryPredicates{ .{}, .{} };
+    const scores = [_]AgenticCandidateScore{
+        .{ .index = 0, .strategy = .tree, .score = 20 },
+        .{ .index = 1, .strategy = .metadata, .score = 20 },
+    };
+    for ([_]anyerror{ error.IdentityReadGenerationChanged, error.StorageReadTemporarilyUnavailable, error.TopologyChanged, error.OutOfMemory }) |failure| {
+        for ([_]bool{ false, true }) |fallback| {
+            var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena_impl.deinit();
+            const arena = arena_impl.allocator();
+            var fixture: Fixture = .{ .failure = failure };
+            const runner: QueryRunner = .{ .ptr = &fixture, .vtable = &.{ .run_query = Fixture.query, .scan_key_page = Fixture.scan } };
+            const probed = if (fallback)
+                probeAgenticFallbackCandidates(std.testing.allocator, arena, runner, &raw_queries, &queries, &predicates, null, &scores, &.{ false, false })
+            else blk: {
+                const selected = maybeProbeAgenticSelection(std.testing.allocator, arena, runner, &raw_queries, &queries, &predicates, null, .{ .candidate_scores = &scores }) catch |err| break :blk @as(anyerror![]const AgenticCandidateScore, err);
+                break :blk @as(anyerror![]const AgenticCandidateScore, selected.?.candidate_scores.?);
+            };
+            if (failure == error.OutOfMemory) {
+                try std.testing.expectError(error.OutOfMemory, probed);
+                try std.testing.expectEqual(@as(usize, 0), fixture.query_calls);
+            } else {
+                const result = try probed;
+                try std.testing.expect(result[0].probe_hits == null);
+                try std.testing.expectEqual(@as(?i64, 0), result[1].probe_hits);
+                try std.testing.expectEqual(@as(usize, 1), fixture.query_calls);
+            }
+            try std.testing.expectEqual(@as(usize, 1), fixture.scan_calls);
+        }
+    }
 }
