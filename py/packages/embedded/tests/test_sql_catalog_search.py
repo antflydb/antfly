@@ -1197,7 +1197,7 @@ def test_sql_describe_enforces_preparation_budget(require_native, aflite_path):
             return status, result
 
         # Legal request size, but its compilation exceeds the preparation working set.
-        status, result = request("SELECT '" + "x" * (24 * 1024 * 1024) + "' AS value")
+        status, result = request("SELECT '" + "x" * (56 * 1024 * 1024) + "' AS value")
         assert status != 0
         assert result["error"]["code"] == "54000"
         # Rejection must release allocations and leave the handle usable.
@@ -1216,7 +1216,7 @@ def test_sql_cursor_preparation_budget_rejection(require_native, aflite_path, ph
             statement = "SELECT body FROM entries WHERE body=$1"
             parameters = ["x" * (40 * 1024 * 1024)]
         else:
-            statement = "SELECT body FROM entries WHERE body='" + "x" * (24 * 1024 * 1024) + "'"
+            statement = "SELECT body FROM entries WHERE body='" + "x" * (56 * 1024 * 1024) + "'"
             parameters = []
         with pytest.raises(SQLStateError) as failure:
             db.sql_cursor(statement, parameters)
@@ -1242,7 +1242,7 @@ def test_sql_preparation_failure_aborts_session(require_native, aflite_path, api
                 statement = "SELECT body FROM entries WHERE body=$1"
                 parameters = ["x" * (40 * 1024 * 1024)]
             else:
-                statement = "SELECT body FROM entries WHERE body='" + "x" * (24 * 1024 * 1024) + "'"
+                statement = "SELECT body FROM entries WHERE body='" + "x" * (56 * 1024 * 1024) + "'"
                 parameters = []
             with pytest.raises(SQLStateError) as failure:
                 if api == "execute":
