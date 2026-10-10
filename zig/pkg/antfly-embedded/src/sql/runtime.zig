@@ -1844,6 +1844,41 @@ test "SQL floating predicates retain declared NUMERIC parameters for reads and m
     };
 }
 
+test "SQL JSONB object keys reject JSON domains and retain ordinary SQL scalar keys" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT jsonb_build_object('1'::jsonb,2)",
+        "SELECT jsonb_build_object('true'::jsonb,2)",
+        "SELECT jsonb_build_object('\"key\"'::jsonb,2)",
+        "SELECT jsonb_build_object('null'::jsonb,2)",
+        "SELECT jsonb_build_object('{}'::jsonb,2)",
+        "SELECT jsonb_build_object('[]'::jsonb,2)",
+        "SELECT jsonb_build_object('1'::json,2)",
+        "SELECT jsonb_build_object(to_jsonb(1),2)",
+        "SELECT jsonb_build_object('valid',1,'1'::jsonb,2)",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 0 };
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.InvalidSqlParameters, execute(a, fixture.iface(), &compiled, &.{}, .{}));
+    }
+    var fixture: TestBackend = .{ .row_count = 0 };
+    var parameter = try compiler.compile(a, "SELECT jsonb_build_object($1,2)", .{});
+    defer parameter.deinit();
+    var backend = fixture.iface();
+    backend.parameter_descriptor_hints = &.{.{ .kind = .json, .element_type = .jsonb }};
+    for ([_]Json{ .{ .integer = 1 }, .{ .bool = true }, .{ .string = "key" } }) |key| {
+        try std.testing.expectError(error.InvalidSqlParameters, execute(a, backend, &parameter, &.{key}, .{}));
+    }
+    var ordinary = try compiler.compile(a, "SELECT jsonb_build_object(1,'1'::jsonb,true,'true'::jsonb,'key','\"value\"'::jsonb)", .{});
+    defer ordinary.deinit();
+    var result = try execute(a, fixture.iface(), &ordinary, &.{}, .{});
+    defer result.deinit();
+    const json = try std.json.Stringify.valueAlloc(a, result.output.rows[0][0], .{});
+    defer a.free(json);
+    try std.testing.expectEqualStrings("{\"1\":1,\"true\":true,\"key\":\"value\"}", json);
+}
+
 test "SQL JSONB converts declared floating output to exact decimals and special strings" {
     const a = std.testing.allocator;
     const cases = [_]struct { expression: []const u8, expected: []const u8 }{

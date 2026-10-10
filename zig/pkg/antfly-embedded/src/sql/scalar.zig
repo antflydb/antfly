@@ -3456,7 +3456,11 @@ const Evaluator = struct {
                         while (i < call.args.len) : (i += 2) {
                             var key = try self.runDatum(call.args[i], depth + 1);
                             if (key.sql_null) return error.InvalidSqlParameters;
-                            key.value = try self.sqlJson(key, self.program.instructions[call.args[i]].type);
+                            const key_type = self.program.instructions[call.args[i]].type;
+                            // PostgreSQL rejects the JSON input domain even
+                            // when its payload is a scalar string or number.
+                            if (key_type.kind == .json) return error.InvalidSqlParameters;
+                            key.value = try self.sqlJson(key, key_type);
                             if (key.value == .null or key.value == .object or key.value == .array) return error.InvalidSqlParameters;
                             const name = try self.formatText(key.value);
                             try self.charge(name.len + @sizeOf(Json) + @sizeOf([]const u8));
