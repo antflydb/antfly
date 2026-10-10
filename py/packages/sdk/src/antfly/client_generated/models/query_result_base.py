@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.query_result_base_source_ranking import QueryResultBaseSourceRanking
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -27,8 +28,14 @@ class QueryResultBase:
     Attributes:
         took (int): Duration of the query in milliseconds.
         status (int): HTTP status code of the query operation.
-        remote_snapshot (str | Unset): Opaque remote publication and schema fence to echo with ordered pagination. This
-            token does not grant access or retain the publication.
+        source_ranking (QueryResultBaseSourceRanking | Unset): Ranking contract for a composed result.
+        next_source_cursor (str | Unset): Opaque continuation for composed queries. Pass as source_cursor with the same
+            query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication
+            and restart preserve it; authorization and incarnation fences remain enforced.
+        remote_snapshot (str | Unset): Opaque snapshot to echo with ordered pagination. Native tokens retain the
+            complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the
+            configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and
+            recipe. Unavailable retained generations return 409.
         evaluation (QueryResultBaseEvaluation | Unset): Function evaluation scope, population, usage, and scoped
             aggregations.
         hits (QueryHits | Unset): A list of query hits.
@@ -45,6 +52,8 @@ class QueryResultBase:
 
     took: int
     status: int
+    source_ranking: QueryResultBaseSourceRanking | Unset = UNSET
+    next_source_cursor: str | Unset = UNSET
     remote_snapshot: str | Unset = UNSET
     evaluation: QueryResultBaseEvaluation | Unset = UNSET
     hits: QueryHits | Unset = UNSET
@@ -60,6 +69,12 @@ class QueryResultBase:
         took = self.took
 
         status = self.status
+
+        source_ranking: str | Unset = UNSET
+        if not isinstance(self.source_ranking, Unset):
+            source_ranking = self.source_ranking.value
+
+        next_source_cursor = self.next_source_cursor
 
         remote_snapshot = self.remote_snapshot
 
@@ -99,6 +114,10 @@ class QueryResultBase:
                 "status": status,
             }
         )
+        if source_ranking is not UNSET:
+            field_dict["source_ranking"] = source_ranking
+        if next_source_cursor is not UNSET:
+            field_dict["next_source_cursor"] = next_source_cursor
         if remote_snapshot is not UNSET:
             field_dict["remote_snapshot"] = remote_snapshot
         if evaluation is not UNSET:
@@ -133,6 +152,15 @@ class QueryResultBase:
         took = d.pop("took")
 
         status = d.pop("status")
+
+        _source_ranking = d.pop("source_ranking", UNSET)
+        source_ranking: QueryResultBaseSourceRanking | Unset
+        if isinstance(_source_ranking, Unset):
+            source_ranking = UNSET
+        else:
+            source_ranking = QueryResultBaseSourceRanking(_source_ranking)
+
+        next_source_cursor = d.pop("next_source_cursor", UNSET)
 
         remote_snapshot = d.pop("remote_snapshot", UNSET)
 
@@ -185,6 +213,8 @@ class QueryResultBase:
         query_result_base = cls(
             took=took,
             status=status,
+            source_ranking=source_ranking,
+            next_source_cursor=next_source_cursor,
             remote_snapshot=remote_snapshot,
             evaluation=evaluation,
             hits=hits,

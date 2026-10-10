@@ -1257,6 +1257,15 @@ pub const Store = struct {
 
     fn configureDirectory(self: *Store) !void {
         self.preparation_alloc = self.alloc;
+        if (self.read_only) {
+            // Read-only cuts need immutable catalog leases, not writer GC
+            // inventories, liveness scans or location-directory construction.
+            self.positional_batch_reads = true;
+            self.shared_catalog = true;
+            try self.prepareReadCatalog(&self.opened);
+            self.publishReadView(try self.prepareReadPublication(&self.opened));
+            return;
+        }
         self.unlocked_checkpoint = experimentEnabled("ANTFLY_SOURCE_VECTOR_UNLOCKED_CHECKPOINT");
         self.background_checkpoint = experimentEnabled("ANTFLY_SOURCE_VECTOR_BACKGROUND_CHECKPOINT");
         self.positional_batch_reads = @import("dense_perf_experiments.zig").enabledDefault("ANTFLY_SOURCE_VECTOR_POSITIONAL_BATCH_READS", true);
@@ -1331,6 +1340,7 @@ pub const Store = struct {
 
     pub const OpenPolicy = struct {
         checkpoint_receipts: bool = false,
+        inventory_read_only: bool = true,
         pub fn fromEnvironment() OpenPolicy {
             return .{ .checkpoint_receipts = experimentEnabled("ANTFLY_SOURCE_VECTOR_GC_RECEIPTS") };
         }
@@ -1380,7 +1390,7 @@ pub const Store = struct {
         if (read_only) {
             var result: Store = .{ .alloc = alloc, .opened = try native.Store.openReadOnlyWithBlocks(alloc, storage, root), .read_only = true, .segment_sizing = sizing, .snapshot_reads = snapshot_reads, .checkpoint_receipts = policy.checkpoint_receipts };
             errdefer result.deinit();
-            if (!try result.loadCheckpointReceipt() and !experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY")) try result.inventoryRetainedPayloads();
+            if (policy.inventory_read_only and !try result.loadCheckpointReceipt() and !experimentEnabled("ANTFLY_SOURCE_VECTOR_INCREMENTAL_INVENTORY")) try result.inventoryRetainedPayloads();
             try result.configureLocationCache();
             try result.configureDirectory();
             return result;
@@ -1482,6 +1492,62 @@ pub const Store = struct {
             budget.deinit();
             backing.destroy(budget);
         }
+    }
+
+    /// Query retention seals the current vector authority alongside primary
+    /// and ANN checkpoints. Immutable blocks/extents are linked; only the
+    /// active committed WAL is copied, within the caller's remaining budget.
+    pub fn sealQuerySnapshot(self: *Store, io: std.Io, target: []const u8, remaining_wal: *u64, cancellation: @import("antfly_cancellation").CancellationToken) !u64 {
+        while (!self.mutex.tryLock()) {
+            try cancellation.check();
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        defer self.mutex.unlock();
+        if (self.poisoned) return error.VectorPayloadStorePoisoned;
+        try cancellation.check();
+        const store = &self.opened.store;
+        var manifest = store.manifest orelse return error.MissingVectorPayloadStore;
+        const sealed_bytes = try manifest.sealed_wals.bytes();
+        const active_bytes = store.wal_committed_bytes - sealed_bytes;
+        remaining_wal.* = std.math.sub(u64, remaining_wal.*, active_bytes) catch return error.QueryCandidateBudgetExceeded;
+        const paths = @import("antfly_runtime_fs").fs_paths;
+        const backup = @import("db/native_backup.zig");
+        try paths.createDirPathPortable(io, target);
+        var total: u64 = 0;
+        for (manifest.segments) |segment| {
+            try cancellation.check();
+            const source_path = try native.checkpointBlockPathAlloc(self.alloc, store.root_dir, segment.generation, segment.shard_id);
+            defer self.alloc.free(source_path);
+            const target_path = try native.checkpointBlockPathAlloc(self.alloc, target, segment.generation, segment.shard_id);
+            defer self.alloc.free(target_path);
+            try std.Io.Dir.hardLink(.cwd(), source_path, .cwd(), target_path, io, .{});
+            total = std.math.add(u64, total, (try backup.statRegularFile(io, target_path)).size) catch return error.FileTooBig;
+        }
+        for (manifest.sealed_wals.items[0..manifest.sealed_wals.count]) |extent| {
+            try cancellation.check();
+            const source_path = try native.checkpointWalPathAlloc(self.alloc, store.root_dir, extent.generation);
+            defer self.alloc.free(source_path);
+            const target_path = try native.checkpointWalPathAlloc(self.alloc, target, extent.generation);
+            defer self.alloc.free(target_path);
+            try std.Io.Dir.hardLink(.cwd(), source_path, .cwd(), target_path, io, .{});
+            if ((try backup.statRegularFile(io, target_path)).size != extent.committed_bytes) return error.SourceFileChanged;
+            total = std.math.add(u64, total, extent.committed_bytes) catch return error.FileTooBig;
+        }
+        const source_wal = try native.checkpointWalPathAlloc(self.alloc, store.root_dir, store.wal_generation);
+        defer self.alloc.free(source_wal);
+        const target_wal = try native.checkpointWalPathAlloc(self.alloc, target, store.wal_generation);
+        defer self.alloc.free(target_wal);
+        if ((try backup.statRegularFile(io, source_wal)).size != active_bytes) return error.SourceFileChanged;
+        total = std.math.add(u64, total, try backup.copyFileDurableCancellableWithSink(io, source_wal, target_wal, cancellation, null)) catch return error.FileTooBig;
+        manifest.wal_generation = store.wal_generation;
+        manifest.wal_committed_bytes = store.wal_committed_bytes;
+        const bytes = try manifest.encodeAlloc(self.alloc);
+        defer self.alloc.free(bytes);
+        const current = try std.fs.path.join(self.alloc, &.{ target, "CURRENT" });
+        defer self.alloc.free(current);
+        total = std.math.add(u64, total, try backup.writeFileDurable(io, current, bytes)) catch return error.FileTooBig;
+        try paths.syncDirPortable(io, target);
+        return total;
     }
 
     /// Immutable ANN leases share native blocks and persistent WAL nodes.

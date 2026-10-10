@@ -244,6 +244,8 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         active_count: usize = 0,
         mutex: Io.Mutex = Io.Mutex.init,
         last_cleanup: i64 = 0,
+        /// Release/eviction wakes request admission without increasing limits.
+        availability_epoch: std.atomic.Value(u32) = .init(0),
 
         const Self = @This();
 
@@ -389,6 +391,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
 
         /// Releases a connection back to the pool for reuse.
         pub fn releaseConnection(self: *Self, entry: *Entry) void {
+            defer self.notifyAvailability();
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             const now = milliTimestamp(self.io);
@@ -404,6 +407,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         /// Removes a connection from the pool and frees all its resources.
         /// Use this when a network error occurs instead of releasing.
         pub fn evictConnection(self: *Self, entry: *Entry) void {
+            defer self.notifyAvailability();
             var key_buf: [280]u8 = undefined;
             const key = formatHostKey(&key_buf, entry.host, entry.port) orelse {
                 // Fallback: can't format key, just free the entry.
@@ -445,9 +449,15 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
 
         /// Removes idle/broken connections that should be evicted.
         pub fn cleanup(self: *Self) void {
+            defer self.notifyAvailability();
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             self.cleanupLocked(milliTimestamp(self.io));
+        }
+
+        fn notifyAvailability(self: *Self) void {
+            _ = self.availability_epoch.fetchAdd(1, .release);
+            Io.futexWake(self.io, u32, &self.availability_epoch.raw, std.math.maxInt(u32));
         }
 
         fn cleanupLocked(self: *Self, now: i64) void {

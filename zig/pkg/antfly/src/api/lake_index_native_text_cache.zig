@@ -29,6 +29,9 @@ pub const Cache = struct {
     entries: std.AutoHashMapUnmanaged([32]u8, *Entry) = .empty,
     max_entries: usize = 64,
     max_bytes: u64 = 512 * 1024 * 1024,
+    // Seekable packs stay behind bounded block readers. Their total remote
+    // footprint is independent of the decoded heap budget below.
+    max_seekable_bytes: ?u64 = null,
     bytes: u64 = 0,
     reservations: std.AutoHashMapUnmanaged([32]u8, Reservation) = .empty,
     tick: u64 = 0,
@@ -106,7 +109,7 @@ pub const Cache = struct {
         try root.validate();
         var bytes: u64 = root_ref.byte_len;
         for (root.segments) |segment| bytes = std.math.add(u64, bytes, segment.byte_len) catch return error.NativeLakeTextCorpusTooLarge;
-        if (bytes > self.max_bytes or self.max_entries == 0) return error.NativeLakeTextCorpusTooLarge;
+        if (bytes > (if (root.seekable) self.max_seekable_bytes orelse self.max_bytes else self.max_bytes) or self.max_entries == 0) return error.NativeLakeTextCorpusTooLarge;
         var compatible_hash = std.crypto.hash.Blake3.init(.{});
         compatible_hash.update(&cached.scope);
         compatible_hash.update(&root.domain);
@@ -180,7 +183,7 @@ pub const Cache = struct {
                 }
             } else additional +|= value.bytes;
         }
-        if (self.entries.count() >= @min(self.max_entries, 64) or additional > self.max_bytes -| self.bytes) {
+        if (self.entries.count() >= @min(self.max_entries, 64) or additional > (self.max_seekable_bytes orelse self.max_bytes) -| self.bytes) {
             var victim: ?*Entry = null;
             var iterator = self.entries.valueIterator();
             while (iterator.next()) |candidate| {
@@ -466,7 +469,7 @@ const Entry = struct {
         const lease = self.allocator.create(QueryLease) catch return error.NativeLakeTextCacheBusy;
         errdefer self.allocator.destroy(lease);
         lease.* = .{ .entry = self, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager } };
-        return .{ .snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .provider_metadata = &self.identities, .owner = lease, .release_owner = QueryLease.release };
+        return .{ .read_context = &lease.read, .snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .provider_metadata = &self.identities, .owner = lease, .release_owner = QueryLease.release };
     }
     fn releaseSource(raw: *anyopaque) void {
         const self: *Entry = @ptrCast(@alignCast(raw));

@@ -4,6 +4,123 @@
  */
 
 export interface paths {
+    "/db/v1/tables/{tableName}/lake/catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * getLakeCatalog
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
+         */
+        get: operations["getLakeCatalog"];
+        put?: never;
+        /**
+         * initializeLakeCatalog
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
+         */
+        post: operations["initializeLakeCatalog"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/lake/changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * ingestLakeChanges
+         * @description Durably accept one complete CDC transaction for native WAL-to-Iceberg writing. A stable batch ID, source epoch, key fields and predecessor checkpoint are required. Upserts are complete row images; deletes contain only key fields. Acceptance precedes catalog commitment and index publication. Native text searches compose a bounded accepted-WAL suffix with the pinned archive publication. Requires table admin permission and iceberg_writer policy.
+         */
+        post: operations["ingestLakeChanges"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/lake/maintenance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Maintain a writable Iceberg table
+         * @description Plan or execute bounded compaction, snapshot/file vacuum, or covered WAL cleanup. A stable operation ID resumes saved catalog intents after uncertainty. Defaults to dry run. Destructive file vacuum requires an explicit exclusive ownership and external-reader retention agreement; only native ownership proofs authorize object deletion. Current snapshots, named refs, native serving readers and durable snapshot pins remain protected. Compact and vacuum commits automatically schedule index publication.
+         */
+        post: operations["maintainLakeTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/lake/commits": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * commitLakeCatalog
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
+         */
+        post: operations["commitLakeCatalog"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/lake/commits/{commitId}": {
+        parameters: {
+            query: {
+                request_hash: string;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                commitId: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * getLakeCommitOutcome
+         * @description Native Iceberg catalog operation for managed or external REST authority. Catalog mutations require table admin permission and iceberg_writer policy. These endpoints commit already prepared lake files and automatically schedule matching index publication. A committed response does not imply that those indexes are already searchable. Native row transactions use lake/changes.
+         */
+        get: operations["getLakeCommitOutcome"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/status": {
         parameters: {
             query?: never;
@@ -2381,6 +2498,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List saved query sources */
+        get: operations["listQuerySources"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/sources/{sourceName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sourceName: string;
+            };
+            cookie?: never;
+        };
+        /** Get saved query source */
+        get: operations["getQuerySource"];
+        put?: never;
+        /**
+         * Create saved query source
+         * @description Creates an immutable union or keyed overlay in the Antfly metadata catalog. Reads require permission on the saved name and every input table. Drop and recreate to change a definition; existing cursors cannot switch incarnations.
+         */
+        post: operations["createQuerySource"];
+        /** Drop saved query source */
+        delete: operations["dropQuerySource"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tablespaces": {
         parameters: {
             query?: never;
@@ -4461,6 +4619,50 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        LakeCatalogCreateRequest: {
+            /** @description Stable identifier reused with exactly the same request after timeout or restart. */
+            commit_id: string;
+            /** @description Iceberg schema including schema-id and persistent field IDs. */
+            schema: {
+                [key: string]: unknown;
+            };
+            "partition-spec"?: {
+                [key: string]: unknown;
+            };
+            "write-order"?: {
+                [key: string]: unknown;
+            };
+            properties?: {
+                [key: string]: string;
+            };
+        };
+        LakeCatalogCommitRequest: {
+            commit_id: string;
+            expected_metadata_location: string;
+            /** @description Standard Iceberg REST table requirements, validated against the authoritative state. */
+            requirements: {
+                [key: string]: unknown;
+            }[];
+            /** @description Standard Iceberg REST metadata updates. Upload data/delete/manifest files before committing. A lake commit does not establish Antfly index visibility. */
+            updates: {
+                [key: string]: unknown;
+            }[];
+        };
+        LakeCatalogResponse: {
+            /** @enum {string} */
+            state: "loaded" | "lake_committed" | "committed" | "not_committed" | "unknown";
+            commit_id?: string;
+            /** @description Opaque request digest for outcome resolution. */
+            request_hash?: string;
+            metadata_location?: string;
+            metadata?: {
+                [key: string]: unknown;
+            };
+            /** @description False if lake creation committed but native schema binding still needs the same initialization request replayed. */
+            binding_ready?: boolean;
+            /** @description A catalog commit alone does not make a matching index publication searchable. */
+            searchable?: boolean;
+        };
         ChatGPTAuthorize: {
             connection_id?: string;
         };
@@ -4645,6 +4847,12 @@ export interface components {
          *     memory, and encoded results to a 16 MiB allocation budget.
          */
         SQLRequest: {
+            /**
+             * @description Direct read-only statement visibility for writable Iceberg sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. Not supported with sessions, connections or prepared execution.
+             * @default committed
+             * @enum {string}
+             */
+            lake_visibility?: "committed" | "accepted";
             /** @description A single SQL statement. */
             statement: string;
             /** @description Positional JSON parameter values, including null. */
@@ -10233,8 +10441,30 @@ export interface components {
                 [key: string]: string;
             } | string[];
         };
+        LakeReadReceipt: {
+            /** Format: uint64 */
+            table_id: number;
+            /** Format: uint64 */
+            object_generation: number;
+            /** Format: uint64 */
+            wal_lsn: number;
+        };
+        LakeReadRequirement: {
+            /**
+             * @description Accepted requires current WAL visibility; vector/hybrid reads wait for matching publication. Published explicitly permits the retained archive generation. Applies to native writable Iceberg reads.
+             * @enum {string}
+             */
+            visibility?: "accepted" | "published";
+            through?: components["schemas"]["LakeReadReceipt"];
+            /**
+             * Format: uint32
+             * @description Bounded readiness wait, default 5000 ms when lake_read is supplied; also bounded by query timeout and cancellation.
+             */
+            wait_ms?: number;
+        };
         QueryRequest: {
-            /** @description Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409. */
+            lake_read?: components["schemas"]["LakeReadRequirement"];
+            /** @description Opaque retained snapshot token returned by an ordered native or external-table query. Echo with search_after or search_before. Native and lake cuts expire within the configured retention period (default five minutes; maximum one hour); missing, expired or incompatible generations return 409. */
             remote_snapshot?: string;
             evaluate?: components["schemas"]["QueryEvaluation"];
             table_target?: components["schemas"]["CatalogTableTarget"];
@@ -10805,10 +11035,45 @@ export interface components {
              */
             expand_strategy?: "union" | "intersection";
         };
-        /** @description A stateful global query. The target table is required on this route. */
-        GlobalStatefulQueryRequest: components["schemas"]["StatefulQueryRequest"] & {
-            /** @description Name of the table to query. */
+        ComposedTableSource: {
+            /** @description Literal native table name. Each source is independently authorized. */
             table: string;
+        };
+        ComposedSourceOverlay: {
+            base: components["schemas"]["ComposedTableSource"];
+            changes: components["schemas"]["ComposedTableSource"];
+            key: string[];
+            /**
+             * @description Boolean field on change rows; true hides the base row. Changes must retain one latest row/tombstone per stable key. Row-policy identities are currently unsupported for keyed composition.
+             * @default deleted
+             */
+            tombstone_field?: string;
+        };
+        SavedQuerySource: {
+            /** Format: uint64 */
+            source_id: number;
+            name: string;
+            source: components["schemas"]["ComposedQuerySource"];
+        };
+        /** @description Specify exactly one of saved, union or overlay. Union preserves duplicates and table provenance. Overlay suppresses replaced base keys and tombstones before ranking using indexed unfiltered change lookups. Inputs are streamed in bounded pages; result pages allow at most 4096 hits. Large overlay totals are lower bounds unless count is explicitly requested; exact count streams the full visible relation within the request deadline. */
+        ComposedQuerySource: {
+            /** @description Immutable source name from the Antfly catalog. Saved definitions contain literal table leaves, preventing recursive expansion. */
+            saved?: string;
+            union?: components["schemas"]["ComposedTableSource"][];
+            overlay?: components["schemas"]["ComposedSourceOverlay"];
+        };
+        /** @description A stateful global query. Specify a table target or a composed source. */
+        GlobalStatefulQueryRequest: components["schemas"]["StatefulQueryRequest"] & {
+            /** @description Name of the table to query; mutually exclusive with source. */
+            table?: string;
+            source?: components["schemas"]["ComposedQuerySource"];
+            /**
+             * @description Explicit reciprocal rank scoring across source lists after visibility resolution. Required for score ordering; shared corpus BM25 is not implemented. Constant 60, equal source weights.
+             * @enum {string}
+             */
+            source_ranking?: "rrf";
+            /** @description Opaque composed continuation retaining per-leaf native generations or archive publications and accepted WAL cuts for the configured retention period from their creation (default five minutes; maximum one hour). Publication and restart preserve the cut. Authorization, policy, recipe, source and table incarnation changes invalidate it. Leaf search_after/search_before tuples are unsupported. */
+            source_cursor?: string;
         };
         Analyses: {
             pca?: boolean;
@@ -11395,6 +11660,8 @@ export interface components {
         };
         /** @description A single query result hit */
         QueryHit: {
+            /** @description Source table provenance for composed query hits; equal IDs from union inputs remain distinct. */
+            _table?: string;
             /** @description Named query-time computed values, separate from stored source. */
             _computed?: {
                 [key: string]: unknown;
@@ -11532,7 +11799,14 @@ export interface components {
         };
         /** @description Fields shared by canonical and stateful query result envelopes. */
         QueryResultBase: {
-            /** @description Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication. */
+            /**
+             * @description Ranking contract for a composed result.
+             * @enum {string}
+             */
+            source_ranking?: "rrf" | "ordered";
+            /** @description Opaque continuation for composed queries. Pass as source_cursor with the same query; valid until the earliest retained leaf cut expires (default five minutes; maximum one hour). Publication and restart preserve it; authorization and incarnation fences remain enforced. */
+            next_source_cursor?: string;
+            /** @description Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409. */
             remote_snapshot?: string;
             /** @description Function evaluation scope, population, usage, and scoped aggregations. */
             evaluation?: {
@@ -14034,7 +14308,22 @@ export interface components {
             /** @description Required for object_version_digest; pins a Parquet object inventory. */
             digest?: string;
         };
-        /** @description Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows. */
+        /** @description Catalog authority is independent of S3/GCS storage and deployment. managed uses a conditional durable head under the table root. rest uses a named HTTP connection; raw secrets are forbidden. Omit to retain explicit metadata URI/version-hint discovery. */
+        LakeCatalogConfig: {
+            /** @enum {string} */
+            type: "managed" | "rest";
+            /** @description Required for rest. Named external_io/http connection with lake_catalog_read and, for commits, lake_catalog_write capabilities. */
+            connection?: string;
+            /** @description Required for rest; catalog base URI whose origin must be allowed by the named connection. */
+            uri?: string;
+            /** @description Required nonempty namespace components for rest. */
+            namespace?: string[];
+            /** @description Required table name for rest, distinct from Antfly's logical table name. */
+            name?: string;
+            /** @description Optional REST config warehouse selector. Other fields must be omitted for managed. */
+            warehouse?: string;
+        };
+        /** @description Authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows. Iceberg catalog commits require an explicit writable catalog binding; ordinary row mutations remain unsupported. */
         ExternalLakeTableSource: {
             /** @enum {string} */
             kind: "external";
@@ -14045,10 +14334,11 @@ export interface components {
             /** @default auto */
             schema_fingerprint?: string;
             /**
+             * @description iceberg_writer authorizes explicit Iceberg catalog commits and requires catalog plus a current snapshot selector. It does not enable ordinary row batch writes.
              * @default read_only
              * @enum {string}
              */
-            write_policy?: "read_only";
+            write_policy?: "read_only" | "iceberg_writer";
             /**
              * @description Set immutable only when data files are never replaced at an existing URI. Allows authenticated provider-version proofs from retained index generations to be reused for unchanged data files. Metadata and delete files are still verified.
              * @default mutable
@@ -14057,6 +14347,7 @@ export interface components {
             object_mutability?: "mutable" | "immutable";
             credentials?: components["schemas"]["ExternalLakeCredentialRef"];
             snapshot?: components["schemas"]["ExternalLakeSnapshotSelector"];
+            catalog?: components["schemas"]["LakeCatalogConfig"];
         };
         RelationalColumnExpression: {
             column: string;
@@ -14385,7 +14676,7 @@ export interface components {
              */
             readonly version?: number;
             storage_mode?: components["schemas"]["TableStorageMode"];
-            /** @description External tables require relational storage mode and are read-only. Omit for native tables. */
+            /** @description External tables require relational storage mode. Ordinary row writes are read-only; an explicit iceberg_writer catalog binding permits Iceberg file commits. Omit for native tables. */
             base_source?: components["schemas"]["ExternalLakeTableSource"];
             /**
              * @description Immutable typed expressions applied only to absent columns on new
@@ -21302,6 +21593,480 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    getLakeCatalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authoritative catalog result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Invalid or unsupported catalog request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized catalog operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or lake catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Binding, incarnation, or commit conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    initializeLakeCatalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LakeCatalogCreateRequest"];
+            };
+        };
+        responses: {
+            /** @description Authoritative catalog result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Commit outcome is uncertain; resolve or retry the same commit ID and request. Do not checkpoint or delete files yet. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Invalid or unsupported catalog request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized catalog operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or lake catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Binding, incarnation, or commit conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    ingestLakeChanges: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    batch_id: string;
+                    source: string;
+                    epoch: string;
+                    checkpoint: string;
+                    expected_checkpoint?: string | null;
+                    key_fields: string[];
+                    changes: {
+                        /** @enum {string} */
+                        op: "upsert" | "delete";
+                        row: {
+                            [key: string]: unknown;
+                        };
+                    }[];
+                };
+            };
+        };
+        responses: {
+            /** @description Durable WAL acceptance; retry the same transaction after an ambiguous response. Native text search can compose a bounded accepted-WAL overlay before catalog/index publication; SQL reads follow committed snapshots. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        state?: string;
+                        /** Format: uint64 */
+                        wal_lsn?: number;
+                        /** Format: uint64 */
+                        table_id?: number;
+                        /** Format: uint64 */
+                        object_generation?: number;
+                        searchable?: boolean;
+                    };
+                };
+            };
+            /** @description Invalid transaction or unsupported row type */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized ingestion */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Source, predecessor checkpoint or batch identity conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Durable ingestion unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    maintainLakeTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @enum {string} */
+                    action: "compact" | "vacuum" | "wal_gc" | "status" | "enrichment_status";
+                    /** @description Required for compact/vacuum/wal_gc; omitted for scheduler or enrichment status. */
+                    operation_id?: string;
+                    /** @default true */
+                    dry_run?: boolean;
+                    /** @default false */
+                    exclusive_ownership?: boolean;
+                    /**
+                     * Format: uint64
+                     * @default 16384
+                     */
+                    max_rows?: number;
+                    /**
+                     * Format: uint64
+                     * @default 33554432
+                     */
+                    max_bytes?: number;
+                    /**
+                     * Format: uint64
+                     * @default 604800000
+                     */
+                    retain_ms?: number;
+                    /** @default 2 */
+                    keep_latest?: number;
+                    /** @default 4096 */
+                    max_deleted?: number;
+                };
+            };
+        };
+        responses: {
+            /** @description Bounded maintenance result; complete false requires another pass with the same operation ID. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Invalid maintenance limits */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing admin permission, writer policy or ownership agreement */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Conditional conflict or conflicting saved operation */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Maintenance unavailable or uncertain outcome; retry the same operation ID */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    commitLakeCatalog: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LakeCatalogCommitRequest"];
+            };
+        };
+        responses: {
+            /** @description Authoritative catalog result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Commit outcome is uncertain; resolve or retry the same commit ID and request. Do not checkpoint or delete files yet. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Invalid or unsupported catalog request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized catalog operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or lake catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Binding, incarnation, or commit conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getLakeCommitOutcome: {
+        parameters: {
+            query: {
+                request_hash: string;
+            };
+            header?: never;
+            path: {
+                tableName: string;
+                commitId: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Authoritative catalog result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LakeCatalogResponse"];
+                };
+            };
+            /** @description Invalid or unsupported catalog request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Unauthorized catalog operation */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Table or lake catalog not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Binding, incarnation, or commit conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Catalog authority unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Request deadline exceeded */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     getStatus: {
         parameters: {
             query?: never;
@@ -25255,6 +26020,113 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             409: components["responses"]["IndexMutationConflict"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    listQuerySources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Immutable catalog source definitions */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SavedQuerySource"][];
+                };
+            };
+        };
+    };
+    getQuerySource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sourceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Source definition and immutable incarnation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SavedQuerySource"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createQuerySource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sourceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    source: components["schemas"]["ComposedQuerySource"];
+                };
+            };
+        };
+        responses: {
+            /** @description Source created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SavedQuerySource"];
+                };
+            };
+            /** @description Committed with visibility pending */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Source already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dropQuerySource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                sourceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Source dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: components["responses"]["NotFound"];
         };
     };
     listTablespaces: {

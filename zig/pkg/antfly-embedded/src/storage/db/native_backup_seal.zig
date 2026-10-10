@@ -171,6 +171,24 @@ pub fn finish(alloc: Allocator, io: std.Io, root: []const u8, fence: topology.Fe
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
+    const files = try inventoryAlloc(a, io, root, cancellation);
+    const manifest: Manifest = .{ .fence = fence, .sequence = sequence, .primary = primary, .projections = projections, .files = files };
+    var output = std.Io.Writer.Allocating.init(a);
+    var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
+    try json.write(manifest, &stream);
+    if (output.written().len > backup.max_manifest_bytes) return error.BackupSealInventoryTooLarge;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(output.written(), &digest, .{});
+    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, manifest_name });
+    _ = try backup.writeFileDurable(io, path, output.written());
+    const digest_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, digest_name });
+    _ = try backup.writeFileDurable(io, digest_path, &digest);
+    try fs_paths.syncDirPortable(io, root);
+    return .{ .fence = fence, .digest = digest };
+}
+
+/// Metadata-only inventory shared by durable generation consumers.
+pub fn inventoryAlloc(a: Allocator, io: std.Io, root: []const u8, cancellation: Cancellation) ![]const File {
     var files = std.ArrayListUnmanaged(File).empty;
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
     defer dir.close(io);
@@ -195,19 +213,7 @@ pub fn finish(alloc: Allocator, io: std.Io, root: []const u8, fence: topology.Fe
             return std.mem.order(u8, x.path, y.path) == .lt;
         }
     }.less);
-    const manifest: Manifest = .{ .fence = fence, .sequence = sequence, .primary = primary, .projections = projections, .files = files.items };
-    var output = std.Io.Writer.Allocating.init(a);
-    var stream: std.json.Stringify = .{ .writer = &output.writer, .options = .{} };
-    try json.write(manifest, &stream);
-    if (output.written().len > backup.max_manifest_bytes) return error.BackupSealInventoryTooLarge;
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(output.written(), &digest, .{});
-    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, manifest_name });
-    _ = try backup.writeFileDurable(io, path, output.written());
-    const digest_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, digest_name });
-    _ = try backup.writeFileDurable(io, digest_path, &digest);
-    try fs_paths.syncDirPortable(io, root);
-    return .{ .fence = fence, .digest = digest };
+    return files.toOwnedSlice(a);
 }
 
 pub const Opened = struct {

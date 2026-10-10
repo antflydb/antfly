@@ -386,6 +386,8 @@ pub const storage_db_mod = @import("storage/db/mod.zig");
 pub const storage_db_native_backup = @import("storage/db/native_backup.zig");
 pub const storage_db_native_backup_seal = @import("storage/db/native_backup_seal.zig");
 pub const storage_db_native_backup_seal_contract = @import("storage/db/native_backup_seal_contract.zig");
+pub const storage_db_native_query_cut = @import("storage/db/native_query_cut.zig");
+pub const storage_db_native_query_cut_repository = @import("storage/db/native_query_cut_repository.zig");
 pub const storage_db_native_topology_receipt = @import("storage/db/native_topology_receipt.zig");
 pub const storage_db_online_graph_artifacts = @import("storage/db/online_graph_artifacts.zig");
 pub const storage_db_online_integrity_shadow = @import("storage/db/online_integrity_shadow.zig");
@@ -610,7 +612,6 @@ pub const storage_lite_restore_staging = @import("storage/lite/restore_staging.z
 pub const cmd_cli_io = @import("cmd/cli/io.zig");
 pub const cmd_cli_backup_wait = @import("cmd/cli/backup_wait.zig");
 pub const cmd_lite = @import("cmd/lite.zig");
-
 
 comptime {
     if (builtin.is_test) {

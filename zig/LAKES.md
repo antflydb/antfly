@@ -3,6 +3,12 @@
 The remote index lifecycle, persistent cache tiers, SQL materialization matching,
 and public status/explain contract are specified in [REMOTE_TABLE_SERVING.md](REMOTE_TABLE_SERVING.md).
 
+The proposed writable-table, multi-provider catalog, source connector, and
+recent/archive merge architecture is captured in
+[Lake ingestion, change capture, and publication](../docs/plans/lake-ingestion-and-publication.md).
+Remote lake reads and native index publication already exist; that plan describes
+additional ingestion and Parquet/Iceberg write capabilities, not current APIs.
+
 Antfly relational mode makes typed rows first-class while keeping JSON as a
 document-backed column type. Lake query mode extends that contract to files
 owned by users in object storage: Parquet datasets, Iceberg tables, and later
@@ -1094,3 +1100,29 @@ selectively owns the access paths and fragments that need serving-grade
 latency. Over time, that can cover a meaningful subset of warehouse-shaped
 workloads, especially repeated agent and application queries, without making
 arbitrary warehouse replacement the day-one product promise.
+
+
+### Native chunk enrichment and mutable cursor generations
+
+Archive and accepted-WAL vector builders use `api/lake_enrichment_units.zig` and
+`api/lake_vector_enrichment.zig` for complete-row templates, captured media bytes
+and the existing native chunking/provider contracts. Each chunk has a distinct
+vector key and durable chunk/source-unit record in its native checkpoint. Public
+artifact IDs are index-specific; parent visibility masks apply before ANN/sparse
+selection. Unit hydration and parent/member/unit shaping use native query helpers.
+Limits are 4096 units and 64 MiB each of input/output payload per row. Sparse media
+fails explicitly; dense media requires a compatible embedding provider.
+
+`api/native_retained_cut.zig` issues `native2:` capabilities for mutable native
+ordered/composed reads. `storage/db/native_query_cut.zig` validates each owner's
+sealed generation; the internal `_native_cut` envelope travels with search,
+preflight, text statistics and algebraic partials. Public callers cannot forge the
+internal envelope. Capture retains immutable files and bounded committed WAL
+prefixes, including `vector_store` source authority; reads reopen the frozen DB.
+Capabilities last at most 60 seconds. Admission allows 64 cuts per owner, and
+per-cut reader leases protect files from opportunistic expiry collection.
+Filesystem-managed LSM roots and immutable native projection checkpoints are
+required. Storage/topology loss, recipe/incarnation changes, expiry and unavailable
+cuts fail explicitly instead of selecting newer data. See
+[Composed query sources](../docs/plans/composed-query-sources.md) for the complete
+contract and operational tradeoffs.

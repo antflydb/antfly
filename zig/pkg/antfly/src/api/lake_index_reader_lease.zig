@@ -51,6 +51,9 @@ pub const Authority = struct {
 pub const Handle = struct {
     owner: *Owner,
     parent: Context,
+    pub fn retainedToken(self: *const Handle) local.metadata_lake_index_catalog.Token {
+        return self.owner.token;
+    }
     pub fn readContext(self: *Handle) Context {
         var context = self.parent;
         context.checkpoint = .{ .ptr = self, .check = checkpoint };
@@ -93,11 +96,20 @@ const Owner = struct {
         self.unix_deadline.store(std.math.add(u64, now, lifecycle.lease_ms) catch return error.LakeIndexReaderLeaseExpired, .release);
         self.authority_deadline.store(std.math.add(u64, authority, lifecycle.lease_ms * std.time.ns_per_ms) catch return error.LakeIndexReaderLeaseExpired, .release);
     }
-    fn start(self: *Owner, admission: Authority) !void {
+    fn start(self: *Owner, admission: Authority, retained: bool) !void {
         const now = platform.time.realtimeNs() / std.time.ns_per_ms;
         const authority = platform.time.authorityNs();
         if (now == 0 or authority == 0) return error.LakeIndexReaderLeaseExpired;
-        try admission.apply(self.table, .{ .acquire = .{ .token = self.token, .generation = self.generation, .now_ms = now } });
+        if (retained) {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const state = try admission.readState(arena.allocator(), self.table);
+            const generation = for (state.readers) |reader| {
+                if (std.mem.eql(u8, &reader.token, &self.token)) break reader.generation;
+            } else return error.LakeIndexReaderLeaseExpired;
+            if (generation != self.generation) return error.LakeIndexReaderLeaseExpired;
+            try admission.apply(self.table, .{ .renew = .{ .token = self.token, .now_ms = now } });
+        } else try admission.apply(self.table, .{ .acquire = .{ .token = self.token, .generation = self.generation, .now_ms = now } });
         try self.deadline(now, authority);
         try self.check();
         self.heartbeat = try self.io.concurrent(run, .{self});
@@ -139,6 +151,9 @@ pub const Pool = struct {
     closing: bool = false,
 
     pub fn acquire(self: *Pool, io: std.Io, authority: Authority, table: u64, generation: u64, parent: Context) !*Handle {
+        return self.acquireRetained(io, authority, table, generation, parent, null);
+    }
+    pub fn acquireRetained(self: *Pool, io: std.Io, authority: Authority, table: u64, generation: u64, parent: Context, token: ?local.metadata_lake_index_catalog.Token) !*Handle {
         while (true) {
             try parent.ensureActive();
             try self.mutex.lock(io);
@@ -196,14 +211,14 @@ pub const Pool = struct {
             // heartbeat is stopped by Pool.deinit after queries drain.
             session_authority.context = .{};
             owner.* = .{ .table = table, .generation = generation, .authority = session_authority, .io = io, .token = undefined };
-            while (true) {
+            if (token) |retained| owner.token = retained else while (true) {
                 io.random(&owner.token);
                 if (!std.mem.allEqual(u8, &owner.token, 0)) break;
             }
             self.entries[index] = owner;
             self.mutex.unlock(io);
             if (prior) |old| old.destroy();
-            owner.start(authority) catch |err| {
+            owner.start(authority, token != null) catch |err| {
                 owner.failed.store(true, .release);
                 owner.initializing.store(false, .release);
                 _ = owner.users.fetchSub(1, .acq_rel);
@@ -270,6 +285,17 @@ test "external lake native reader pool amortizes admission and fences every cach
         try handle.readContext().ensureActive();
     }
     try std.testing.expectEqual(@as(usize, 1), harness.mutations);
+    var replacement = publication;
+    replacement.generation = 2;
+    replacement.token = @splat(2);
+    harness.state = try harness.state.synchronize(harness.arena.allocator(), .{ .generation = 2, .published = replacement });
+    var restarted: Pool = .{};
+    defer restarted.deinit(std.testing.io);
+    try std.testing.expectError(error.LakeIndexGenerationRetired, restarted.acquire(std.testing.io, authority, 4, 1, .{}));
+    const resumed = try restarted.acquireRetained(std.testing.io, authority, 4, 1, .{}, first.retainedToken());
+    defer resumed.deinit();
+    try resumed.readContext().ensureActive();
+    try std.testing.expectError(error.LakeIndexReaderLeaseExpired, restarted.acquireRetained(std.testing.io, authority, 4, 2, .{}, first.retainedToken()));
     harness.state = try harness.state.drop();
     // Existing sessions retain their exact snapshot even after logical DROP.
     try first.owner.renew();

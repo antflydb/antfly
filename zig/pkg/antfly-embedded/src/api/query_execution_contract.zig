@@ -101,6 +101,7 @@ pub const BackgroundTextStatsFieldRequestInput = struct {
 };
 
 pub const TextStatsRequestInput = struct {
+    _native_cut: ?std.json.Value = null,
     _identity_read_generation: ?u64 = null,
     _resolved_doc_filter: ?std.json.Value = null,
     query_request: ?std.json.Value = null,
@@ -109,6 +110,7 @@ pub const TextStatsRequestInput = struct {
 };
 
 pub const AlgebraicPartialsRequestInput = struct {
+    _native_cut: ?std.json.Value = null,
     index_name: ?[]const u8 = null,
     _identity_read_generation: ?u64 = null,
     tensor_access_paths: ?[]const AlgebraicTensorAccessPathInput = null,
@@ -3308,6 +3310,12 @@ pub fn encodeQueryRequestWithGraphWireMode(
     if (req.order_by.len > 0) try appendQueryOrderByField(alloc, &out, &first, req.order_by);
     if (req.search_after.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_after", req.search_after);
     if (req.search_before.len > 0) try appendQueryCursorField(alloc, &out, &first, "search_before", req.search_before);
+    if (req.native_query_cut) |cut| {
+        try appendJsonFieldName(alloc, &out, &first, "_native_cut");
+        const encoded = try std.json.Stringify.valueAlloc(alloc, cut.forDeadline(req.execution_deadline_ns), .{});
+        defer alloc.free(encoded);
+        try out.appendSlice(alloc, encoded);
+    }
     if (req.remote_snapshot) |snapshot| try appendJsonFieldString(alloc, &out, &first, "remote_snapshot", snapshot);
     if (req.count_only) {
         try appendJsonFieldBool(alloc, &out, &first, "count", true);

@@ -307,6 +307,16 @@ pub const Mutation = union(enum) {
             .finish_collection => |m| state.finishCollection(a, m.token, m.now_ms),
         };
     }
+    /// Admission runs before any command is appended. A publication race is
+    /// an explicit snapshot conflict, also across the native runtime ABI.
+    pub fn preflight(self: Mutation, scratch: A, state: State) !void {
+        const next = self.apply(scratch, state) catch |err| switch (err) {
+            error.LakeIndexGenerationRetired => return error.ExternalLakeSnapshotMismatch,
+            else => return err,
+        };
+        const bytes = try encode(scratch, next);
+        scratch.free(bytes);
+    }
 };
 pub fn parse(a: A, bytes: []const u8) !State {
     if (bytes.len > max_bytes) return error.InvalidLakeIndexLifecycle;
@@ -341,6 +351,7 @@ test "external lake native lifecycle protects readers across replacement and DRO
     state = try state.acquire(a, @splat(9), 1, 100);
     state = try state.synchronize(a, .{ .generation = 2, .published = testPublication(2) });
     try std.testing.expectError(error.LakeIndexGenerationRetired, state.acquire(a, @splat(8), 1, 101));
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, (Mutation{ .acquire = .{ .token = @splat(8), .generation = 1, .now_ms = 101 } }).preflight(a, state));
     state = try state.renew(a, @splat(9), 101);
     state = try state.beginCollection(a, @splat(7), @splat(4), 102);
     try std.testing.expectEqual(@as(usize, 0), state.collection.?.retired.len);
@@ -446,7 +457,7 @@ pub fn mutateOnService(svc: anytype, a: A, write: Write, request: @import("antfl
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     const before = try parse(a, try store.getLakeIndexLifecycle(a, svc.metadata_group_id, write.table_id));
     if (before.revision != write.expected_revision) return error.CatalogGenerationChanged;
-    _ = try encode(a, try write.mutation.apply(a, before));
+    try write.mutation.preflight(a, before);
     const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .mutate_lake_index_lifecycle = .{ .table_id = write.table_id, .expected_revision = write.expected_revision, .mutation = write.mutation } });
     svc.waitForTransitionApplied(receipt) catch return error.MetadataMutationOutcomeUnknown;
     const observed = try parse(a, try store.getLakeIndexLifecycle(a, svc.metadata_group_id, write.table_id));

@@ -24,16 +24,23 @@ pub const Context = struct {
     deadline_ns: ?u64 = null,
     cancellation: ?storage.CancellationToken = null,
     checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
+    additional_checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
     pub fn ensureActive(self: Context) !void {
         if (self.cancellation) |token| try token.check();
         if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
         if (self.checkpoint) |hook| try hook.check(hook.ptr);
+        if (self.additional_checkpoint) |hook| try hook.check(hook.ptr);
     }
 };
 
 pub const Store = struct {
     base: storage.ObjectStorage,
     context: Context,
+    extra_checkpoint: ?struct { ptr: *anyopaque, check: *const fn (*anyopaque) anyerror!void } = null,
+    pub fn ensureActive(self: *const Store) !void {
+        try self.context.ensureActive();
+        if (self.extra_checkpoint) |hook| try hook.check(hook.ptr);
+    }
     pub fn client(self: *Store, alloc: Allocator) storage.ObjectStorage {
         return .{ .allocator = alloc, .ptr = self, .vtable = &.{ .deinit = deinit, .bucket_exists = bucketExists, .make_bucket = makeBucket, .put_object = putObject, .get_object = getObject, .get_object_attributes = attributes, .stat_object = statObject, .stat_object_with_options = statObjectWithOptions, .delete_object = deleteObject, .list_objects = listObjects } };
     }
@@ -42,7 +49,7 @@ pub const Store = struct {
     }
     fn canceled(raw: *const anyopaque) bool {
         const self: *const Store = @ptrCast(@alignCast(raw));
-        self.context.ensureActive() catch return true;
+        self.ensureActive() catch return true;
         return false;
     }
     fn token(self: *Store) storage.CancellationToken {
@@ -60,26 +67,26 @@ pub const Store = struct {
     }
     fn bucketExists(raw: *anyopaque, bucket: []const u8, options: storage.BucketOptions) !bool {
         const self = from(raw);
-        try self.context.ensureActive();
+        try self.ensureActive();
         var opts = options;
         opts.cancellation = self.token();
         const result = self.base.bucketExistsWithOptions(bucket, opts) catch |err| {
-            try self.context.ensureActive();
+            try self.ensureActive();
             return err;
         };
-        try self.context.ensureActive();
+        try self.ensureActive();
         return result;
     }
     fn getObject(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
         const self = from(raw);
-        try self.context.ensureActive();
+        try self.ensureActive();
         var opts = options;
         const Combined = struct {
             store: *Store,
             parent: ?storage.CancellationToken,
             fn canceled(raw_token: *const anyopaque) bool {
                 const value: *const @This() = @ptrCast(@alignCast(raw_token));
-                value.store.context.ensureActive() catch return true;
+                value.store.ensureActive() catch return true;
                 if (value.parent) |parent| parent.check() catch return true;
                 return false;
             }
@@ -90,11 +97,11 @@ pub const Store = struct {
         var base = self.base;
         base.allocator = alloc;
         var result = base.getObject(bucket, key, opts) catch |err| {
-            try self.context.ensureActive();
+            try self.ensureActive();
             return err;
         };
         errdefer result.deinit(alloc);
-        try self.context.ensureActive();
+        try self.ensureActive();
         return result;
     }
     fn statObject(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8) !storage.ObjectMetadata {
@@ -102,42 +109,42 @@ pub const Store = struct {
     }
     fn statObjectWithOptions(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: @import("objectstore").StatOptions) !storage.ObjectMetadata {
         const self = from(raw);
-        try self.context.ensureActive();
+        try self.ensureActive();
         var opts = options;
         opts.cancellation = self.token();
         var base = self.base;
         base.allocator = alloc;
         var result = base.statObjectWithOptions(bucket, key, opts) catch |err| {
-            try self.context.ensureActive();
+            try self.ensureActive();
             return err;
         };
         errdefer result.deinit(alloc);
-        try self.context.ensureActive();
+        try self.ensureActive();
         return result;
     }
     fn attributes(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8) !storage.ObjectAttributes {
         const self = from(raw);
-        try self.context.ensureActive();
+        try self.ensureActive();
         var base = self.base;
         base.allocator = alloc;
         var result = try base.getObjectAttributes(bucket, key);
         errdefer result.deinit(alloc);
-        try self.context.ensureActive();
+        try self.ensureActive();
         return result;
     }
     fn listObjects(raw: *anyopaque, alloc: Allocator, bucket: []const u8, options: storage.ListOptions) !storage.ListResult {
         const self = from(raw);
-        try self.context.ensureActive();
+        try self.ensureActive();
         var opts = options;
         opts.cancellation = self.token();
         var base = self.base;
         base.allocator = alloc;
         var result = base.listObjects(bucket, opts) catch |err| {
-            try self.context.ensureActive();
+            try self.ensureActive();
             return err;
         };
         errdefer result.deinit(alloc);
-        try self.context.ensureActive();
+        try self.ensureActive();
         return result;
     }
 };

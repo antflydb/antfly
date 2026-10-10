@@ -180,6 +180,15 @@ pub const Config = struct {
         protected_bytes: usize = 256 * 1024 * 1024,
     };
     pub const LakeIndexConfig = struct {
+        query_cursors: struct {
+            retention_ms: u64 = 300_000,
+            max_native_cuts: usize = 64,
+            max_native_retained_bytes: u64 = 64 * 1024 * 1024 * 1024,
+        } = .{},
+        text_cache: struct {
+            max_seekable_artifact_bytes: u64 = 64 * 1024 * 1024 * 1024,
+            max_heap_bytes: usize = 256 * 1024 * 1024,
+        } = .{},
         artifact_gc: struct {
             enabled: bool = true,
             dry_run: bool = false,
@@ -3905,6 +3914,10 @@ fn parseLakeIndexConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.La
     const input = value orelse return .{};
     var parsed = std.json.parseFromValue(Config.LakeIndexConfig, a, input, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidConfig;
     defer parsed.deinit();
+    const text = parsed.value.text_cache;
+    if (text.max_seekable_artifact_bytes == 0 or text.max_seekable_artifact_bytes > 1024 * 1024 * 1024 * 1024 or text.max_heap_bytes == 0 or @as(u64, text.max_heap_bytes) > 64 * 1024 * 1024 * 1024) return error.InvalidConfig;
+    const cursors = parsed.value.query_cursors;
+    if (cursors.retention_ms < 1000 or cursors.retention_ms > std.time.ms_per_hour or cursors.max_native_cuts == 0 or cursors.max_native_cuts > 4096 or cursors.max_native_retained_bytes == 0 or cursors.max_native_retained_bytes > 1024 * 1024 * 1024 * 1024) return error.InvalidConfig;
     const gc = parsed.value.artifact_gc;
     if (gc.interval_ms < 1000 or gc.interval_ms > std.time.ms_per_day or gc.max_deleted == 0 or gc.max_deleted > 65536 or gc.max_marked == 0 or gc.max_marked > 1048576 or gc.max_read_bytes == 0 or gc.max_read_bytes > 1024 * 1024 * 1024) return error.InvalidConfig;
     return parsed.value;
@@ -3958,4 +3971,14 @@ test "common config parses ChatGPT connector policy and rejects misspellings" {
         defer a.free(raw);
         try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, raw));
     }
+}
+
+test "external lake cursor retention and capacity policy reject unbounded admission" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"lake_indexes\":{\"query_cursors\":{\"retention_ms\":0}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"retention_ms\":3600001}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_native_cuts\":0}}}",
+        "{\"lake_indexes\":{\"query_cursors\":{\"max_native_retained_bytes\":0}}}",
+    }) |bytes| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, bytes));
 }

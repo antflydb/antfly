@@ -5,6 +5,7 @@ from typing import Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
+from ..models.sql_request_lake_visibility import SQLRequestLakeVisibility
 from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="SQLRequest")
@@ -23,6 +24,9 @@ class SQLRequest:
 
         Attributes:
             statement (str): A single SQL statement.
+            lake_visibility (SQLRequestLakeVisibility | Unset): Direct read-only statement visibility for writable Iceberg
+                sources. Accepted pins typed WAL changes over the committed snapshot; unavailable coverage fails closed. Not
+                supported with sessions, connections or prepared execution. Default: SQLRequestLakeVisibility.COMMITTED.
             parameters (list[Any] | Unset): Positional JSON parameter values, including null.
             database (str | Unset): Database used to resolve unqualified catalog names.
             namespace (str | Unset): Namespace used to resolve unqualified table names.
@@ -34,6 +38,7 @@ class SQLRequest:
     """
 
     statement: str
+    lake_visibility: SQLRequestLakeVisibility | Unset = SQLRequestLakeVisibility.COMMITTED
     parameters: list[Any] | Unset = UNSET
     database: str | Unset = UNSET
     namespace: str | Unset = UNSET
@@ -43,6 +48,10 @@ class SQLRequest:
 
     def to_dict(self) -> dict[str, Any]:
         statement = self.statement
+
+        lake_visibility: str | Unset = UNSET
+        if not isinstance(self.lake_visibility, Unset):
+            lake_visibility = self.lake_visibility.value
 
         parameters: list[Any] | Unset = UNSET
         if not isinstance(self.parameters, Unset):
@@ -65,6 +74,8 @@ class SQLRequest:
                 "statement": statement,
             }
         )
+        if lake_visibility is not UNSET:
+            field_dict["lake_visibility"] = lake_visibility
         if parameters is not UNSET:
             field_dict["parameters"] = parameters
         if database is not UNSET:
@@ -85,6 +96,13 @@ class SQLRequest:
         d = dict(src_dict)
         statement = d.pop("statement")
 
+        _lake_visibility = d.pop("lake_visibility", UNSET)
+        lake_visibility: SQLRequestLakeVisibility | Unset
+        if isinstance(_lake_visibility, Unset):
+            lake_visibility = UNSET
+        else:
+            lake_visibility = SQLRequestLakeVisibility(_lake_visibility)
+
         parameters = cast(list[Any], d.pop("parameters", UNSET))
 
         database = d.pop("database", UNSET)
@@ -99,6 +117,7 @@ class SQLRequest:
 
         sql_request = cls(
             statement=statement,
+            lake_visibility=lake_visibility,
             parameters=parameters,
             database=database,
             namespace=namespace,

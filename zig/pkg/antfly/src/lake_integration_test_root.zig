@@ -16,11 +16,24 @@
 pub const antfly_sources = @import("source_owner_physical.zig");
 
 test {
+    _ = @import("serverless/lake_wal.zig");
+    _ = @import("serverless/lake_ingestion.zig");
     _ = @import("api/sql_execution.zig");
     _ = @import("api/tables.zig");
     _ = @import("api/table_contract.zig");
     _ = @import("serverless/build/lake_sidecar_text.zig");
     _ = @import("api/lake_sql_cursor.zig");
+    _ = @import("api/lake_sql_overlay.zig");
+    _ = @import("api/lake_maintenance_scheduler.zig");
+    _ = @import("api/composed_query.zig");
+    _ = @import("api/lake_retained_cut.zig");
+    _ = @import("api/native_retained_cut_test.zig");
+    _ = @import("api/native_public_repartition_test.zig");
+    _ = @import("api/lake_enrichment_units.zig");
+    _ = @import("api/lake_recent_vectors.zig");
+    _ = @import("api/lake_vector_enrichment.zig");
+    _ = @import("api/lake_expiring_objects.zig");
+    _ = @import("api/lake_vector_enrichment_test.zig");
     _ = @import("api/lake_sql_integration_test.zig");
     _ = @import("api/lake_index_row_source.zig");
     _ = @import("api/lake_index_publication.zig");
@@ -51,4 +64,11 @@ test {
     _ = @import("antfly_local_sources").storage_db_relational_index_keys;
     _ = @import("antfly_local_sources").serverless_query_lake_read_context;
     _ = @import("antfly_local_sources").serverless_query_lake_serving_cache;
+}
+
+comptime {
+    _ = @import("serverless/lake_snapshot_pins.zig");
+    _ = @import("serverless/lake_compaction.zig");
+    _ = @import("serverless/lake_vacuum.zig");
+    _ = @import("api/lake_search_overlay.zig");
 }

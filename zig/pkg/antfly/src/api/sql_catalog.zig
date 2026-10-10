@@ -444,6 +444,7 @@ pub fn executeWithPath(server: *server_mod.ApiHttpServer, identity: ?server_mod.
     defer alloc.free(resource);
     // Check logical scope before any catalog lookup, including IF EXISTS.
     const permission_kind: @import("../usermgr/mod.zig").ResourceType = switch (kind) {
+        .query_source => .table,
         inline else => |tag| @field(@import("../usermgr/mod.zig").ResourceType, @tagName(tag)),
     };
     if (identity) |authenticated| if (!server_mod.permissionsAllow(authenticated.permissions, permission_kind, resource, .admin)) return error.Forbidden;
@@ -552,13 +553,13 @@ pub fn executeWithPath(server: *server_mod.ApiHttpServer, identity: ?server_mod.
             .database => error.SqlDuplicateDatabase,
             .namespace => error.SqlDuplicateNamespace,
             .tablespace => error.SqlDuplicateTablespace,
-            .table => err,
+            .table, .query_source => err,
         };
         if (err == error.CatalogNotFound) return switch (kind) {
             .database => error.DatabaseNotFound,
             .namespace => error.NamespaceNotFound,
             .tablespace => error.TablespaceNotFound,
-            .table => err,
+            .table, .query_source => err,
         };
         return err;
     };

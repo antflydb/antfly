@@ -673,7 +673,7 @@ fn executeMatch(
     request: SearchRequest,
 ) !SearchResult {
     if (preferParallelText(snap) and mq.boost == 1) if (try executeStreamingTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request, .{})) |result| return result;
-    if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) {
+    if (requestHasDocNumConstraints(request)) {
         if (try executeSimpleTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request)) |result| return result;
     }
     const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
@@ -714,7 +714,7 @@ fn executeTerm(
     request: SearchRequest,
 ) !SearchResult {
     if (preferParallelText(snap) and tq.boost == 1) if (try executeStreamingTextBool(alloc, snap, .{ .should = &.{.{ .term = tq }} }, request, .{})) |result| return result;
-    if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) {
+    if (requestHasDocNumConstraints(request)) {
         if (try executeSimpleTextBool(alloc, snap, .{ .should = &.{.{ .term = tq }} }, request)) |result| return result;
     }
     const results = try searchSnapshotTerms(alloc, snap, tq.field, &.{tq.term}, request);
@@ -734,7 +734,7 @@ fn searchSnapshotTerms(
     request: SearchRequest,
 ) !scorer_mod.SearchResults {
     const stats = matchingFieldStats(request.distributed_text_stats, field, terms);
-    const k = if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) @as(u32, @intCast(@min(snap.liveDocCount(), std.math.maxInt(u32)))) else effectiveK(request, snap);
+    const k = if (requestHasDocNumConstraints(request)) @as(u32, @intCast(@min(snap.liveDocCount(), std.math.maxInt(u32)))) else effectiveK(request, snap);
     if (request.diagnostics) |diagnostics| {
         if (stats == null) {
             return snap.searchWithConfigDiagnostics(
@@ -1847,6 +1847,7 @@ fn initFastTermStates(
     field: []const u8,
     terms: []const SimpleTextTerm,
     require_all_terms: bool,
+    scoring_stats: ?distributed_stats_mod.TextFieldStats,
 ) !?[]FastTermState {
     var states = std.ArrayListUnmanaged(FastTermState).empty;
     var success = false;
@@ -1854,7 +1855,7 @@ fn initFastTermStates(
         for (states.items) |*state| state.deinit();
         states.deinit(alloc);
     };
-    const scoring_doc_count = snap.scoringDocCount();
+    const scoring_doc_count = if (scoring_stats) |stats| stats.global_doc_count else snap.scoringDocCount();
 
     // Reject impossible conjunctions before reading corpus-wide scoring metadata.
     // Retain lookups so accepted terms do not repeat dictionary navigation.
@@ -1873,7 +1874,9 @@ fn initFastTermStates(
         names[present] = term.term;
         present += 1;
     };
-    if (present != 0) try snap.termDocFreqs(alloc, field, names[0..present], frequencies[0..present]);
+    if (scoring_stats) |stats| {
+        for (names[0..present], frequencies[0..present]) |name, *frequency| frequency.* = stats.termDocFreq(name) orelse return error.InvalidArgument;
+    } else if (present != 0) try snap.termDocFreqs(alloc, field, names[0..present], frequencies[0..present]);
     var frequency_index: usize = 0;
     for (terms, lookups) |term, found| {
         const lookup_result = found orelse {
@@ -2441,8 +2444,7 @@ fn executeSimpleTextBoolWithProducers(
     producers: ProducerConstraints,
 ) !?SearchResult {
     if (request.aggregations.len != 0 or
-        request.search_after != null or
-        request.distributed_text_stats.len != 0)
+        request.search_after != null)
     {
         return null;
     }
@@ -2474,7 +2476,10 @@ fn executeSimpleTextBoolWithProducers(
     const text_field = field orelse return null;
     const live_doc_count = snap.liveDocCount();
     if (live_doc_count == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
-    const scoring_doc_count = snap.scoringDocCount();
+    var term_names: std.ArrayListUnmanaged([]const u8) = .empty;
+    for ([_][]const SimpleTextTerm{ must_terms.items, should_terms.items, must_not_terms.items }) |terms| for (terms) |term| try term_names.append(arena_alloc, term.term);
+    const scoring_stats = matchingFieldStats(request.distributed_text_stats, text_field, term_names.items);
+    const scoring_doc_count = if (scoring_stats) |stats| stats.global_doc_count else snap.scoringDocCount();
 
     const effective_min_should: u32 = if (should_terms.items.len > 0 and
         bq.min_should == 0 and
@@ -2507,7 +2512,9 @@ fn executeSimpleTextBoolWithProducers(
         if (wand_compatible) {
             const terms = try arena_alloc.alloc([]const u8, should_terms.items.len);
             for (should_terms.items, 0..) |term, i| terms[i] = term.term;
-            const results = if (request.diagnostics) |diagnostics|
+            const results = if (scoring_stats) |stats|
+                try snap.searchWithOverrideAndConfig(alloc, text_field, terms, effectiveK(request, snap), stats, request.bm25_config)
+            else if (request.diagnostics) |diagnostics|
                 try snap.searchWithConfigDiagnostics(alloc, text_field, terms, effectiveK(request, snap), request.bm25_config, diagnostics)
             else
                 try snap.searchWithConfig(alloc, text_field, terms, effectiveK(request, snap), request.bm25_config);
@@ -2531,7 +2538,7 @@ fn executeSimpleTextBoolWithProducers(
     };
     defer collector.deinit();
 
-    const avg_dl = snap.textAvgDocLen(text_field);
+    const avg_dl = if (scoring_stats) |stats| stats.avgDocLen() else snap.textAvgDocLen(text_field);
     var allow_must_block_pruning = must_terms.items.len > 0 and
         should_terms.items.len == 0 and
         must_not_terms.items.len == 0 and
@@ -2563,16 +2570,16 @@ fn executeSimpleTextBoolWithProducers(
             var inv_reader = (try seg.reader.invertedIndexScoped(alloc, text_field)) orelse continue;
             defer inv_reader.deinit();
             {
-                const maybe_must_states = try initFastTermStates(alloc, snap, inv_reader, text_field, must_terms.items, true);
+                const maybe_must_states = try initFastTermStates(alloc, snap, inv_reader, text_field, must_terms.items, true, scoring_stats);
                 const must_states = maybe_must_states orelse continue;
                 defer deinitFastTermStates(alloc, must_states);
 
-                const maybe_should_states = try initFastTermStates(alloc, snap, inv_reader, text_field, should_terms.items, false);
+                const maybe_should_states = try initFastTermStates(alloc, snap, inv_reader, text_field, should_terms.items, false, scoring_stats);
                 var should_states: []FastTermState = &[_]FastTermState{};
                 if (maybe_should_states) |states| should_states = states;
                 defer if (maybe_should_states) |states| deinitFastTermStates(alloc, states);
 
-                const maybe_must_not_states = try initFastTermStates(alloc, snap, inv_reader, text_field, must_not_terms.items, false);
+                const maybe_must_not_states = try initFastTermStates(alloc, snap, inv_reader, text_field, must_not_terms.items, false, scoring_stats);
                 var must_not_states: []FastTermState = &[_]FastTermState{};
                 if (maybe_must_not_states) |states| must_not_states = states;
                 defer if (maybe_must_not_states) |states| deinitFastTermStates(alloc, states);
@@ -4746,7 +4753,9 @@ fn buildResult(
     total_relation: TotalHitsRelation,
     request: SearchRequest,
 ) !SearchResult {
-    if (request.filter_doc_bitmap != null or request.exclude_doc_bitmap != null) {
+    // Fallback scorers may return an unfiltered candidate set. Numeric and
+    // bitmap constraints share the same boundary before final pagination.
+    if (requestHasDocNumConstraints(request)) {
         var filtered: std.ArrayListUnmanaged(scorer_mod.ScoredHit) = .empty;
         defer filtered.deinit(alloc);
         for (scored) |hit| if (requestAllowsDocNum(request, hit.doc_id)) {
@@ -4755,6 +4764,9 @@ fn buildResult(
         var next = request;
         next.filter_doc_bitmap = null;
         next.exclude_doc_bitmap = null;
+        next.filter_doc_nums = &.{};
+        next.filter_doc_nums_positive = false;
+        next.exclude_doc_nums = &.{};
         const count = if (filtered.items.len == scored.len) total_count else @as(u32, @intCast(filtered.items.len));
         return buildResult(alloc, snap, filtered.items, count, total_relation, next);
     }
@@ -5402,6 +5414,34 @@ test "search term query" {
     // Both docs should have stored data
     try std.testing.expect(result.hits[0].stored_data != null);
     try std.testing.expect(result.hits[0].id != null);
+}
+
+test "external lake selected term and match scoring applies doc number predicates before top-k" {
+    const a = std.testing.allocator;
+    const segment = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "first", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 10 }} },
+        .{ .id = "second", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 10 }} },
+        .{ .id = "third", .data = "{}", .terms = &.{.{ .term = "hello", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(segment);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(segment);
+    const stats = [_]distributed_stats_mod.TextFieldStats{.{ .field = "title", .global_doc_count = 9, .global_total_field_len = 90, .term_doc_freqs = &.{.{ .term = "hello", .doc_freq = 3 }} }};
+    for ([_]SearchQuery{ .{ .term = .{ .field = "title", .term = "hello" } }, .{ .match = .{ .field = "title", .text = "hello" } } }) |query| {
+        for ([_]bool{ false, true }) |distributed| {
+            var selected = try execute(a, writer.snapshot(), .{ .query = query, .k = 1, .include_stored = false, .filter_doc_nums = &.{2}, .filter_doc_nums_positive = true, .distributed_text_stats = if (distributed) &stats else &.{} });
+            defer selected.deinit();
+            try std.testing.expectEqual(@as(usize, 1), selected.hits.len);
+            try std.testing.expectEqual(@as(u32, 2), selected.hits[0].doc_id);
+            const expected_avg = if (distributed) stats[0].avgDocLen() else writer.snapshot().textAvgDocLen("title");
+            try std.testing.expectApproxEqAbs(inverted.bm25Score(1, 10, if (distributed) 9 else 3, 3, expected_avg, .{}), selected.hits[0].score, 0.00001);
+            var excluded = try execute(a, writer.snapshot(), .{ .query = query, .k = 1, .include_stored = false, .exclude_doc_nums = &.{ 0, 1 }, .distributed_text_stats = if (distributed) &stats else &.{} });
+            defer excluded.deinit();
+            try std.testing.expectEqual(@as(usize, 1), excluded.hits.len);
+            try std.testing.expectEqual(@as(u32, 2), excluded.hits[0].doc_id);
+        }
+    }
 }
 
 test "bool fallback applies native doc number constraints" {
@@ -7369,9 +7409,9 @@ test "external lake impossible Boolean conjunction skips global scoring reads" {
         .{ .field = "title", .term = "absent", .boost = 1 },
         .{ .field = "title", .term = "common", .boost = 1 },
     };
-    try std.testing.expect((try initFastTermStates(a, snap, &reader, "title", &terms, true)) == null);
+    try std.testing.expect((try initFastTermStates(a, snap, &reader, "title", &terms, true, null)) == null);
     try std.testing.expectEqual(@as(u64, 0), snap.term_doc_freq_cache_misses);
-    const states = (try initFastTermStates(a, snap, &reader, "title", terms[1..], true)).?;
+    const states = (try initFastTermStates(a, snap, &reader, "title", terms[1..], true, null)).?;
     defer deinitFastTermStates(a, states);
     try std.testing.expectEqual(@as(u32, 4), states[0].doc_freq);
 }

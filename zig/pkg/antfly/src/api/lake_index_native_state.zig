@@ -27,6 +27,7 @@ pub const File = struct {
     digest: [32]u8,
     docs: []const artifacts.ChunkRef = &.{},
     count: u64 = 0,
+    key_width: u16 = 96,
 };
 fn part(hash: *std.crypto.hash.Blake3, bytes: []const u8) void {
     var length: [8]u8 = undefined;
@@ -43,7 +44,15 @@ pub fn recipe(table: local.common_topology_records.TableRecord, config: []const 
     hash.final(&digest);
     return digest;
 }
-pub fn identity(a: A, provider: *Provider, file: local.serverless_external_source_types.FileEntry) ![32]u8 {
+pub fn identity(a: A, provider: *Provider, input_file: local.serverless_external_source_types.FileEntry) ![32]u8 {
+    // Warm immutable plans retain an authenticated publication instead of
+    // materializing every provider version into the fresh manifest inventory.
+    // Private row keys must use those same versions as the index builder.
+    const file = if (provider.source.verified_files) |files| blk: {
+        const verified = files.get(input_file.file_id) orelse return error.ExternalLakeSnapshotMismatch;
+        if (!std.mem.eql(u8, verified.object_uri, input_file.object_uri) or verified.byte_len != input_file.byte_len) return error.ExternalLakeSnapshotMismatch;
+        break :blk verified.*;
+    } else input_file;
     var hash = std.crypto.hash.Blake3.init(.{});
     part(&hash, "native-lake-private-file-v3");
     if (provider.source.scanner.iceberg_delete_plan != null and provider.source.prepared_deletes == null) {
@@ -81,19 +90,21 @@ pub fn validate(files: []const File, domain: [32]u8) !void {
     var names: std.StringHashMapUnmanaged(void) = .empty;
     defer names.deinit(std.heap.page_allocator);
     for (files) |file| {
+        if (file.key_width != 96 and file.key_width != 108) return error.InvalidNativeLakeFileState;
         if (file.id.len == 0 or std.mem.allEqual(u8, &file.digest, 0) or (try names.getOrPut(std.heap.page_allocator, file.id)).found_existing) return error.InvalidNativeLakeFileState;
         var count: u64 = 0;
         for (file.docs) |ref| {
-            if (ref.byte_len == 0 or ref.byte_len % 96 != 0 or ref.byte_len > 256 * 1024) return error.InvalidNativeLakeFileState;
+            if (ref.byte_len == 0 or ref.byte_len % file.key_width != 0 or ref.byte_len > 256 * 1024) return error.InvalidNativeLakeFileState;
             try stores.validateSha256ArtifactIdentity(ref.artifact_id, ref.checksum);
             const scope = (try stores.uploadScopeFromArtifactId(ref.artifact_id)) orelse return error.InvalidNativeLakeFileState;
             if (!std.mem.eql(u8, &scope.domain, &domain)) return error.InvalidNativeLakeFileState;
-            count = std.math.add(u64, count, ref.byte_len / 96) catch return error.InvalidNativeLakeFileState;
+            count = std.math.add(u64, count, ref.byte_len / file.key_width) catch return error.InvalidNativeLakeFileState;
         }
         if (count != file.count) return error.InvalidNativeLakeFileState;
     }
 }
-pub fn coordinates(key: []const u8) !struct { group: u32, row: u64 } {
+pub fn coordinates(input_key: []const u8) !struct { group: u32, row: u64 } {
+    const key = try @import("lake_enrichment_units.zig").parent(input_key);
     if (key.len != 96 or (!std.mem.startsWith(u8, key, "lake1:") and !std.mem.startsWith(u8, key, "lake2:")) or key[70] != ':' or key[79] != ':') return error.ExternalLakeSnapshotMismatch;
     for (key[6..], 6..) |byte, offset| if (offset != 70 and offset != 79 and !((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.ExternalLakeSnapshotMismatch;
     return .{ .group = try std.fmt.parseUnsigned(u32, key[71..79], 16), .row = try std.fmt.parseUnsigned(u64, key[80..96], 16) };
@@ -115,6 +126,7 @@ pub const Plan = struct {
             if (old.get(file.file_id)) |prior| if (std.mem.eql(u8, &prior.digest, &state.digest)) {
                 state.docs = prior.docs;
                 state.count = prior.count;
+                state.key_width = prior.key_width;
                 changed.* = false;
             };
             try self.by_id.put(a, file.file_id, index);
@@ -159,8 +171,10 @@ pub const Tracker = struct {
         self.pending.deinit(self.a);
     }
     pub fn append(self: *Tracker, ref: local.storage_rowsource_types.RowRef, key: []const u8) !void {
-        if (key.len != 96 or !std.mem.startsWith(u8, key, "lake2:")) return error.InvalidNativeLakeFileState;
+        if ((key.len != 96 and key.len != 108) or !std.mem.startsWith(u8, key, "lake2:")) return error.InvalidNativeLakeFileState;
         const file = self.plan.by_id.get(ref.external.file_id) orelse return error.SidecarSourceBindingMismatch;
+        if (self.plan.files[file].count == 0) self.plan.files[file].key_width = @intCast(key.len);
+        if (self.plan.files[file].key_width != key.len) return error.InvalidNativeLakeFileState;
         if (self.active != null and self.active.? != file) try self.flush();
         self.active = file;
         try self.pending.appendSlice(self.a, key);
@@ -190,6 +204,7 @@ pub const Deletes = struct {
     file: usize = 0,
     chunk: usize = 0,
     budget: u64 = 256 * 1024 * 1024,
+    key_width: usize = 96,
     pub fn next(self: *Deletes, a: A, store: stores.ArtifactStore, cancellation: Cancellation) !?[]const u8 {
         while (self.file < self.files.len) {
             const file = self.files[self.file];
@@ -203,9 +218,10 @@ pub const Deletes = struct {
             try stores.chargeReadBudget(&self.budget, ref.byte_len);
             const bytes = try artifacts.readArtifact(a, store, ref, cancellation, null);
             errdefer a.free(bytes);
-            if (bytes.len % 96 != 0) return error.InvalidNativeLakeFileState;
-            for (0..bytes.len / 96) |row| {
-                const key = bytes[row * 96 ..][0..96];
+            self.key_width = file.key_width;
+            if (bytes.len % self.key_width != 0) return error.InvalidNativeLakeFileState;
+            for (0..bytes.len / self.key_width) |row| {
+                const key = bytes[row * self.key_width ..][0..self.key_width];
                 const expected = std.fmt.bytesToHex(&file.digest, .lower);
                 if (!std.mem.startsWith(u8, key, "lake2:") or !std.mem.eql(u8, key[6..70], &expected)) return error.InvalidNativeLakeFileState;
                 _ = try coordinates(key);
@@ -241,6 +257,19 @@ test "external lake incremental native file identity ignores snapshot labels and
     var first = try Plan.init(a, ca, &provider, &.{});
     defer first.deinit();
     try std.testing.expect(first.changed[0]);
+    const authenticated_file = source.inventory.files[0];
+    var unresolved_file = authenticated_file;
+    unresolved_file.etag = "";
+    unresolved_file.version_id = @constCast("iceberg:v1:unresolved");
+    try std.testing.expect(!std.mem.eql(u8, &first.files[0].digest, &try identity(a, &provider, unresolved_file)));
+    var verified_files: std.StringHashMapUnmanaged(*const local.serverless_external_source_types.FileEntry) = .empty;
+    defer verified_files.deinit(a);
+    try verified_files.put(a, authenticated_file.file_id, &authenticated_file);
+    source.verified_files = &verified_files;
+    try std.testing.expectEqual(first.files[0].digest, try identity(a, &provider, unresolved_file));
+    unresolved_file.object_uri = @constCast("object://antfly/conflicting.parquet");
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, identity(a, &provider, unresolved_file));
+    source.verified_files = null;
     const snapshot = source.inventory.snapshot_id;
     source.inventory.snapshot_id = try a.dupe(u8, "next-snapshot");
     defer {

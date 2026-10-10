@@ -710,7 +710,16 @@ pub const JsonApiClient = struct {
         meta.content_length = @intCast(response.body.len);
         if (opts.skip_metadata_probe) {
             if (response.etag) |value| meta.etag = try alloc.dupe(u8, value);
-            if (response.generation) |value| meta.version_id = try alloc.dupe(u8, value);
+            if (response.generation) |value| {
+                if (opts.version_id) |expected| {
+                    if (!std.mem.eql(u8, value, expected)) return error.PreconditionFailed;
+                }
+                meta.version_id = try alloc.dupe(u8, value);
+            } else if (opts.version_id) |value| {
+                // The generation-qualified URL selects exactly this immutable
+                // version even when the media response omits its generation.
+                meta.version_id = try alloc.dupe(u8, value);
+            }
         }
         if (response.content_type) |value| {
             if (meta.content_type) |current| alloc.free(current);
@@ -722,6 +731,7 @@ pub const JsonApiClient = struct {
         response.deinit(alloc);
 
         return .{
+            .conditional_etag_verified = opts.if_match_etag != null,
             .body = body,
             .metadata = meta,
         };
@@ -1819,6 +1829,8 @@ fn testGenerationPinnedReads(alloc: Allocator, client_alloc: Allocator) !void {
     try std.testing.expectEqualStrings("bucket", direct.metadata.bucket);
     try std.testing.expectEqualStrings("folder/doc.txt", direct.metadata.key);
     try std.testing.expectEqualStrings("etag-media", direct.metadata.etag.?);
+    try std.testing.expect(direct.conditional_etag_verified);
+    try std.testing.expectEqualStrings("42", direct.metadata.version_id.?);
     try std.testing.expectEqualStrings("text/plain", direct.metadata.content_type.?);
     try std.testing.expectEqual(@as(usize, 3), state.calls);
 }
@@ -2173,6 +2185,24 @@ test "json api client round-trips against env-configured endpoint" {
     var get = try client.getObject(bucket, key, .{});
     defer get.deinit(alloc);
     try std.testing.expectEqualStrings("hello-gcs", get.body);
+
+    var pinned = try client.getObject(bucket, key, .{
+        .version_id = meta.version_id.?,
+        .if_match_etag = meta.etag.?,
+        .range = .{ .offset = 0, .length = 5 },
+        .skip_metadata_probe = true,
+        .max_response_bytes = 5,
+    });
+    defer pinned.deinit(alloc);
+    try std.testing.expectEqualStrings("hello", pinned.body);
+    try std.testing.expect(pinned.conditional_etag_verified);
+    try std.testing.expectEqualStrings(meta.version_id.?, pinned.metadata.version_id.?);
+    try std.testing.expectError(error.PreconditionFailed, client.getObject(bucket, key, .{
+        .if_match_etag = "definitely-not-the-current-etag",
+        .range = .{ .offset = 0, .length = 5 },
+        .skip_metadata_probe = true,
+        .max_response_bytes = 5,
+    }));
 
     var listed = try client.listObjects(bucket, .{
         .prefix = "zig-objectstore-gcs/",

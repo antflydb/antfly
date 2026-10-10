@@ -319,6 +319,7 @@ pub const AntflyRootImports = struct {
         "s3_openapi",               "scraping_openapi", "vectorindex",
     };
     const api_imports = .{
+        "inference_api",
         "exa_api",
         "tavily_api",
         "websearch_openapi",

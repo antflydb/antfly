@@ -828,10 +828,14 @@ pub const TableReadSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        req: db_types.SearchRequest,
+        input: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
         max_work: u32,
     ) !?runtime_preflight.RuntimePreflightSummary {
+        var req = input;
+        if (req.native_query_cut) |cut| if (cut.create) {
+            req.native_query_cut = try cut.forGroup(group_id);
+        };
         if (self.route_fence) |fence| {
             const routed = self.vtable.preflight_query_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("preflight_query_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, req, consistency, max_work });
@@ -904,9 +908,13 @@ pub const TableReadSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        req: db_types.SearchRequest,
+        input: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
     ) !?query_api.QueryResponse {
+        var req = input;
+        if (req.native_query_cut) |cut| if (cut.create) {
+            req.native_query_cut = try cut.forGroup(group_id);
+        };
         if (self.route_fence) |fence| {
             const routed = self.vtable.query_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("query_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, req, consistency });
@@ -920,9 +928,13 @@ pub const TableReadSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        req: db_types.SearchRequest,
+        input: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
     ) !?db_types.SearchResult {
+        var req = input;
+        if (req.native_query_cut) |cut| if (cut.create) {
+            req.native_query_cut = try cut.forGroup(group_id);
+        };
         if (self.route_fence) |fence| {
             const routed = self.vtable.search_result_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("search_result_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, req, consistency });
@@ -936,8 +948,11 @@ pub const TableReadSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        body: []const u8,
+        input: []const u8,
     ) !?query_api.QueryResponse {
+        const bound = try @import("../storage/db/native_query_cut_contract.zig").bindBodyAlloc(alloc, input, group_id);
+        defer if (bound) |bytes| alloc.free(bytes);
+        const body = bound orelse input;
         if (self.route_fence) |fence| {
             const routed = self.vtable.text_stats_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("text_stats_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body });
@@ -951,8 +966,11 @@ pub const TableReadSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        body: []const u8,
+        input: []const u8,
     ) !?query_api.QueryResponse {
+        const bound = try @import("../storage/db/native_query_cut_contract.zig").bindBodyAlloc(alloc, input, group_id);
+        defer if (bound) |bytes| alloc.free(bytes);
+        const body = bound orelse input;
         if (self.route_fence) |fence| {
             const routed = self.vtable.algebraic_partials_group_local_routed orelse return error.CatalogRouteFenceUnsupported;
             return try BoundaryAbi.call("algebraic_partials_group_local_routed", self.boundary_dispatch, routed, .{ self.ptr, alloc, fence, group_id, table_name, body });
@@ -1502,3 +1520,5 @@ test "scan stream preserves chunk backpressure without buffered fallback" {
     try std.testing.expectEqual(@as(usize, 2), consumer.writes);
     try std.testing.expectEqual(@as(usize, 0), fake.buffered_calls);
 }
+
+pub const bindNativeCutBodyAlloc = @import("../storage/db/native_query_cut_contract.zig").bindBodyAlloc;

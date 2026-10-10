@@ -8,6 +8,12 @@ It is intentionally narrower than query-time `foreign_sources`.
 request time. CDC is a control-plane workflow that ingests external changes into
 canonical Antfly table storage.
 
+The proposed generalization to other database connectors, lake notifications,
+authenticated commit hooks, and managed archive publication is described in
+[Lake ingestion, change capture, and publication](../docs/plans/lake-ingestion-and-publication.md).
+It builds on this subsystem's canonical apply, metadata ownership, and durable
+checkpoint contracts; it does not imply those additional source APIs exist today.
+
 ## Metadata substrate
 
 - Public create-table parsing accepts `replication_sources`.
@@ -162,3 +168,18 @@ Real Postgres CDC E2E coverage exists in `e2e/antfly/test_cdc.py` for:
   automatic mutation of an existing slot.
 - Other foreign runtimes (beyond Postgres) still fall back to the non-exact
   cutover path.
+
+## Provider-neutral lake transaction ingress
+
+Writable native Iceberg tables also accept complete provider-neutral CDC
+transactions at `POST /db/v1/tables/{tableName}/lake/changes`. This push boundary
+uses stable source epochs, batch IDs, key definitions, and predecessor
+checkpoints. It durably owns a transaction in a segmented object-store WAL
+before acknowledging it, then drains native Parquet and Iceberg delete/manifests
+through either configured catalog authority. Catalog commitment and searchable
+index publication are distinct visibility stages. This does not replace the
+metadata-owned PostgreSQL snapshot/slot coordinator, provide automatic vendor
+subscription setup, or make recent uncommitted rows queryable.
+
+The exact envelope, recovery contracts, configuration and limitations are in
+[Native transaction ingestion and searchable publication](../docs/plans/lake-ingestion-and-publication.md#native-transaction-ingestion-and-searchable-publication).

@@ -50,7 +50,7 @@ def _export_table(table, root):
     location = table.location().rstrip("/")
     directory = Path(unquote(urlparse(location).path))
     objects = root / "buckets" / "antfly" / "objects"
-    objects.mkdir(parents=True)
+    objects.mkdir(parents=True, exist_ok=True)
 
     def remote(value):
         if isinstance(value, str):

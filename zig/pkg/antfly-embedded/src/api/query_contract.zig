@@ -2108,6 +2108,7 @@ fn freeOwnedMutableStrings(alloc: std.mem.Allocator, values: [][]u8) void {
 pub const OwnedQueryRequest = struct {
     fields: [][]const u8 = &.{},
     req: db_mod.types.SearchRequest = .{},
+    native_cut: ?std.json.Parsed(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child) = null,
 
     pub fn deinit(self: *OwnedQueryRequest, alloc: std.mem.Allocator) void {
         if (self.fields.len > 0) {
@@ -2115,6 +2116,7 @@ pub const OwnedQueryRequest = struct {
             alloc.free(self.fields);
         }
         freeSearchRequest(alloc, &self.req);
+        if (self.native_cut) |*cut| cut.deinit();
         self.* = undefined;
     }
 };
@@ -2224,10 +2226,18 @@ fn applyCommonSearchRequestOptions(
         }
     }
 
+    if (comptime @hasField(@TypeOf(request), "lake_read")) if (request.lake_read) |read| {
+        req.lake_read = .{
+            .visibility = if (read.visibility) |visibility| if (std.mem.eql(u8, visibility, "accepted")) .accepted else if (std.mem.eql(u8, visibility, "published")) .published else return error.InvalidQueryRequest else .accepted,
+            .through = if (read.through) |receipt| .{ .table_id = receipt.table_id, .object_generation = receipt.object_generation, .wal_lsn = receipt.wal_lsn } else null,
+        };
+    };
     if (request.offset) |offset| req.offset = @intCast(offset);
     if (request.count) |count| req.count_only = count;
     if (request.remote_snapshot) |snapshot| {
-        if (snapshot.len != 64) return error.InvalidQueryRequest;
+        const retained_lake = (std.mem.startsWith(u8, snapshot, "lake2:") or std.mem.startsWith(u8, snapshot, "native2:")) and snapshot.len > 64 and snapshot.len <= 512;
+        if (snapshot.len != 64 and !retained_lake) return error.InvalidQueryRequest;
+        if (retained_lake) for (snapshot) |byte| if (byte <= 0x20 or byte >= 0x7f) return error.InvalidQueryRequest;
         req.remote_snapshot = try alloc.dupe(u8, snapshot);
     }
     const has_result_page_options =
@@ -2659,6 +2669,31 @@ pub fn parseQueryRequest(
 /// computes this once and shares it with normalization, embedding, retries, and
 /// execution so no stage silently receives a fresh timeout window.
 pub fn parseQueryRequestWithDeadline(
+    alloc: std.mem.Allocator,
+    semantic_resolver: ?SemanticResolver,
+    table_name: []const u8,
+    body: []const u8,
+    execution_deadline_ns: ?u64,
+) !OwnedQueryRequest {
+    var owned = try parseQueryRequestWithDeadlineCore(alloc, semantic_resolver, table_name, body, execution_deadline_ns);
+    errdefer owned.deinit(alloc);
+    // Internal HTTP hops must retain the authenticated physical cut when the
+    // generated public contract strips private shard fields. Public admission
+    // rejects this control before entering the shared parser. Escaped member
+    // names still receive semantic parsing rather than bypassing retention.
+    if (std.mem.indexOf(u8, body, "_native_cut") != null or std.mem.indexOfScalar(u8, body, '\\') != null) {
+        var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+        defer raw.deinit();
+        if (raw.value == .object) if (raw.value.object.get("_native_cut")) |value| {
+            owned.native_cut = try std.json.parseFromValue(@typeInfo(@FieldType(db_mod.types.SearchRequest, "native_query_cut")).optional.child, alloc, value, .{ .allocate = .alloc_always });
+            try owned.native_cut.?.value.validate(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+            owned.req.native_query_cut = owned.native_cut.?.value;
+        };
+    }
+    return owned;
+}
+
+fn parseQueryRequestWithDeadlineCore(
     alloc: std.mem.Allocator,
     semantic_resolver: ?SemanticResolver,
     table_name: []const u8,
@@ -3985,7 +4020,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .took = meta.took_ms,
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
-                .remote_snapshot = meta.remote_snapshot,
+                .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
             break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
                 alloc,
@@ -4017,7 +4052,7 @@ pub fn encodeQueryResponsesWithDelivery(
                 .took = meta.took_ms,
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
-                .remote_snapshot = meta.remote_snapshot,
+                .remote_snapshot = meta.remote_snapshot orelse if (req.native_query_cut != null) req.remote_snapshot else null,
             };
             break :blk if (hasColumnSources(emitted_hits) or (if (delivery) |sink| sink.hydrator != null else false)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
                 alloc,
@@ -11782,6 +11817,7 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_native_cut",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
@@ -12121,6 +12157,7 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_native_cut",
         "_index_name",
         "_primary_text_index_name",
         "_embedding_limits",
@@ -19005,4 +19042,20 @@ test "external lake streamed column delivery validates limits before headers and
     defer consumed.deinit(a);
     try std.testing.expectEqualStrings(expected.json, capture.bytes.items);
     for (hits) |hit| try std.testing.expect(hit.column_source == null);
+}
+
+test "external lake query parser accepts bounded retained capabilities and rejects malformed envelopes" {
+    const a = std.testing.allocator;
+    const retained_key: [175]u8 = @splat('a');
+    const token = "lake2:" ++ retained_key ++ ":42";
+    const body = try std.json.Stringify.valueAlloc(a, .{ .remote_snapshot = token }, .{});
+    defer a.free(body);
+    var parsed = try parseQueryRequest(a, null, "history", body);
+    defer parsed.deinit(a);
+    try std.testing.expectEqualStrings(token, parsed.req.remote_snapshot.?);
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "history", "{\"remote_snapshot\":\"lake2:short\"}"));
+    const oversized_key: [513]u8 = @splat('a');
+    const oversized = try std.json.Stringify.valueAlloc(a, .{ .remote_snapshot = "lake2:" ++ oversized_key }, .{});
+    defer a.free(oversized);
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(a, null, "history", oversized));
 }

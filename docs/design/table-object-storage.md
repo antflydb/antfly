@@ -144,7 +144,12 @@ bindings must remain table-owned when defaults change.
 The narrow query definition carries the table engine from the same catalog read
 that binds the query. Single-table JSON, table NDJSON, and global multi-query
 requests all dispatch through that binding, authorize each line independently,
-and retain logical table labels in responses. Mixed local/object requests select
+and retain logical table labels in responses. Retrieval/RAG adapters use the same
+object dispatch and published data rather than bypassing it through native shards.
+Query definitions carry the object incarnation generation along with table ID;
+dispatch validates both against the authoritative snapshot. Drop/recreate or an
+engine change during binding returns a catalog conflict, never a result from the
+replacement table. Mixed local/object requests select
 a data path per table. Binding preserves the distinction between a request-local
 foreign alias and a catalog table: foreign primaries go directly to their source
 executor without native engine discovery. Join admission checks every native
@@ -220,3 +225,9 @@ Existing lake API and catalog suites cover source reads and sidecar publication.
 
 Direct embedded storage APIs require a hosted object runtime and reject the object
 engine rather than opening a local DB with different durability semantics.
+
+## Iceberg catalog authority
+
+See [Native Iceberg catalog authorities](lake-catalogs.md) for managed object-store
+and external REST configuration, durable commit recovery and the boundary between
+Iceberg commits and searchable index publication.

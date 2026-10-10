@@ -239,6 +239,11 @@ pub const PutResult = struct {
 };
 
 pub const GetResult = struct {
+    /// The provider enforced the supplied If-Match condition on this successful
+    /// GET. Media and JSON metadata can expose different ETag representations;
+    /// callers may use this proof instead of comparing those representations.
+    /// Hosts that do not supply this proof retain response-evidence validation.
+    conditional_etag_verified: bool = false,
     body: []u8,
     metadata: ObjectMetadata,
 

@@ -135,6 +135,7 @@ pub const raft_catalog = antfly.raft_catalog;
 pub const kernel_runtime_services = antfly.kernel_runtime_services;
 
 pub const StorageOwnerContext = struct {
+    native_queries: ?*@import("../api/native_query_repository.zig").Repository = null,
     allocator_bridge: ?kernel_runtime_services.memory.Allocator = null,
     io_receiver: ?kernel_runtime_services.executor.Receiver = null,
     alloc: Allocator,
@@ -190,6 +191,11 @@ pub const StorageOwnerContext = struct {
         if (self.auth_backend) |*backend| backend.close();
         if (self.lite_backend) |*backend| backend.deinit();
         if (self.remote_content_security) |*parsed| parsed.deinit();
+        if (self.native_queries) |repository| {
+            self.backend_runtime.ptr().query_cut_repository = null;
+            repository.deinit();
+            self.alloc.destroy(repository);
+        }
         self.backend_runtime.deinit();
         self.resources.deinit();
         // The standard allocator adapter points into this context. Copy its
@@ -851,6 +857,26 @@ pub fn storageOwnerContextConfigureSecrets(context: ?*anyopaque, store: ?*anyopa
     defer owner_context.mutex.unlock();
     if (owner_context.active_owners != 0) return .busy;
     owner_context.secret_store = if (store) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    return .ok;
+}
+
+pub fn storageOwnerContextConfigureNativeQueries(context: ?*anyopaque, setup: kernel_owner_abi.BorrowedBytes) callconv(.c) kernel_owner_abi.Status {
+    const owner = asStorageOwnerContext(context) orelse return .invalid_argument;
+    owner.lock();
+    defer owner.mutex.unlock();
+    if (owner.active_owners != 0) return .busy;
+    const Repository = @import("../api/native_query_repository.zig").Repository;
+    const next = owner.alloc.create(Repository) catch |err| return storageOwnerStatusFromError(err);
+    next.* = Repository.initFromSetup(owner.alloc, setup.slice(), owner.secret_store) catch |err| {
+        owner.alloc.destroy(next);
+        return storageOwnerStatusFromError(err);
+    };
+    if (owner.native_queries) |previous| {
+        previous.deinit();
+        owner.alloc.destroy(previous);
+    }
+    owner.native_queries = next;
+    owner.backend_runtime.ptr().query_cut_repository = next.capability();
     return .ok;
 }
 

@@ -20,6 +20,8 @@ const backend = @import("backend.zig");
 const Mock = struct {
     describes: usize = 0,
     executions: usize = 0,
+    lake_log: [32]@import("session_commands.zig").LakeVisibility = undefined,
+    lake_count: usize = 0,
     authentications: usize = 0,
     disconnects: usize = 0,
     releases: usize = 0,
@@ -112,6 +114,8 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         if (std.mem.indexOf(u8, request.statement, "application_name") != null or std.mem.indexOf(u8, request.statement, "client_encoding") != null) self.setting_stream_opens += 1;
         if (self.stream_rows == 0 or !std.mem.startsWith(u8, std.mem.trimStart(u8, request.statement, " \t\r\n"), "SELECT")) return null;
+        self.lake_log[self.lake_count] = request.lake_visibility;
+        self.lake_count += 1;
         if (self.expected_stream_statement) |expected| try std.testing.expectEqualStrings(expected, request.statement);
         try request.check();
         if (request.parameters.len > 0) self.seen_parameter = request.parameters[0].integer;
@@ -193,6 +197,10 @@ const Mock = struct {
         self.observed_setting = if (request.setting_overlay.len == 0) null else request.setting_overlay[0].value.integer;
         self.observed_setting_epoch = request.setting_epoch;
         self.executions += 1;
+        if (std.mem.startsWith(u8, request.statement, "SELECT")) {
+            self.lake_log[self.lake_count] = request.lake_visibility;
+            self.lake_count += 1;
+        }
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "begin")) return .{ .command_tag = "BEGIN", .transaction_status = .in_transaction, .session_id = "0123456789abcdef0123456789abcdef" };
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, request.statement, " \t\r\n;"), "commit")) {
             if (self.unknown_commit) {
@@ -2063,4 +2071,34 @@ test "pgwire separate cancel authenticates secret and works at connection capaci
     defer std.testing.allocator.free(payload);
     try std.testing.expect(std.mem.indexOf(u8, payload, "57014") != null);
     try std.testing.expect(mock.canceled.load(.acquire));
+}
+
+test "pgwire accepted lake visibility follows transaction savepoint and prepared execution scope" {
+    var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer input.deinit();
+    try startup(&input.writer);
+    for ([_][]const u8{
+        "SET antfly.lake_visibility = accepted\x00",        "SELECT n FROM t\x00",
+        "BEGIN\x00",                                        "SAVEPOINT saved\x00",
+        "SET LOCAL antfly.lake_visibility = committed\x00", "SELECT n FROM t\x00",
+        "ROLLBACK TO saved\x00",                            "SELECT n FROM t\x00",
+        "COMMIT\x00",                                       "RESET antfly.lake_visibility\x00",
+        "SELECT n FROM t\x00",                              "BEGIN\x00",
+        "SET antfly.lake_visibility = accepted\x00",        "ROLLBACK\x00",
+        "SELECT n FROM t\x00",                              "SET antfly.lake_visibility = accepted\x00",
+    }) |statement| try frame(&input.writer, 'Q', statement);
+    try parse(&input.writer, "pinned", "SELECT n FROM t", false);
+    try bind(&input.writer, "portal", "pinned", null);
+    try execute(&input.writer, "portal", 0);
+    try frame(&input.writer, 'X', "");
+    for ([_]usize{ 0, 5 }) |stream_rows| {
+        var mock: Mock = .{ .stream_rows = stream_rows };
+        var output = try run(&mock, input.written(), .{});
+        defer output.deinit();
+        const observed = try tags(std.testing.allocator, output.written());
+        defer std.testing.allocator.free(observed);
+        try std.testing.expect(std.mem.indexOfScalar(u8, observed, 'E') == null);
+        const expected: []const @import("session_commands.zig").LakeVisibility = &.{ .accepted, .committed, .accepted, .committed, .committed, .accepted };
+        try std.testing.expectEqualSlices(@import("session_commands.zig").LakeVisibility, expected, mock.lake_log[0..mock.lake_count]);
+    }
 }

@@ -88,6 +88,7 @@ pub const Stream = struct {
     files: []usize,
     owns_files: bool = true,
     selection: ?@import("lake_row_selection.zig").Selection = null,
+    resume_at: ?struct { group: u32, row: u64 } = null,
     active_file: usize = 0,
     file_index: usize = 0,
     work: ?*ScanWork = null,
@@ -321,7 +322,8 @@ pub const Stream = struct {
             (if (self.source.partition_rules) |rules| @import("lake_partition_pruning.zig").mayMatch(rules.items, file, self.predicates) else true);
     }
 
-    pub fn init(alloc: Allocator, source: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, context: Context, limits: Limits) !Stream {
+    pub fn init(alloc: Allocator, source: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, parent: Context, limits: Limits) !Stream {
+        const context = source.protectContext(parent);
         try context.ensureActive();
         const cached_order = source.canonicalOrder();
         if (cached_order == null) try source.inventory.validate();
@@ -336,6 +338,13 @@ pub const Stream = struct {
         if (self.owns_files) self.alloc.free(self.files);
         self.files = files;
         self.owns_files = true;
+    }
+    /// Durable maintenance resumes at a physical coordinate in its pinned
+    /// input file. Older groups are skipped before payload decoding; the page
+    /// cursor uses offset indexes when the file provides them.
+    pub fn resumeFile(self: *Stream, index: usize, group: u32, row: u64) !void {
+        try self.restrictFile(index);
+        self.resume_at = .{ .group = group, .row = row };
     }
     pub fn selectRows(self: *Stream, selection: @import("lake_row_selection.zig").Selection) !void {
         if (self.file_index != 0 or self.discovered != null or self.work != null) return error.InvalidLakeCandidateReference;
@@ -579,6 +588,10 @@ pub const Stream = struct {
                     const groups = plan.inventory.files[0].row_groups;
                     if (input.row_group_ordinal >= groups.len or groups[input.row_group_ordinal].ordinal != input.row_group_ordinal) return error.InvalidParquetRowGroupBatch;
                     const group = groups[input.row_group_ordinal];
+                    if (self.resume_at) |position| {
+                        if (group.ordinal < position.group) continue;
+                        if (group.ordinal == position.group and position.row > group.row_count) return error.InvalidLakeCandidateReference;
+                    }
                     if (self.selection) |selection| if (!selection.rangeMayMatch(self.active_file, group.ordinal, 0, group.row_count)) {
                         self.stats.groups_pruned += 1;
                         continue;
@@ -603,6 +616,9 @@ pub const Stream = struct {
                     self.stats.rows_examined += group.row_count;
                     try self.context.ensureActive();
                     self.page_cursor.?.shared_reader = self.source.scanner.shared_reader;
+                    if (self.resume_at) |position| if (group.ordinal == position.group) {
+                        self.page_cursor.?.position = position.row;
+                    };
                     self.page_cursor.?.prune_ptr = self;
                     self.page_cursor.?.prune_page = pageMayMatch;
                     if (self.filter != null) {

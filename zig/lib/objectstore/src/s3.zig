@@ -737,7 +737,7 @@ pub const Client = struct {
         var target = try bucketTargetAlloc(self.alloc, self.cfg, bucket);
         defer target.deinit(self.alloc);
 
-        var response = try self.performWithResponseLimitAndCancellation(.HEAD, target, &.{}, null, null, null, opts.cancellation);
+        var response = try self.performWithResponseLimitAndCancellationAlloc(self.alloc, .HEAD, target, &.{}, null, null, null, opts.cancellation);
         defer response.deinit(self.alloc);
         return switch (response.status) {
             200, 204 => true,
@@ -752,7 +752,7 @@ pub const Client = struct {
         var target = try bucketTargetAlloc(self.alloc, self.cfg, bucket);
         defer target.deinit(self.alloc);
 
-        var response = try self.performWithResponseLimitAndCancellation(.PUT, target, &.{}, "", null, null, opts.cancellation);
+        var response = try self.performWithResponseLimitAndCancellationAlloc(self.alloc, .PUT, target, &.{}, "", null, null, opts.cancellation);
         defer response.deinit(self.alloc);
         switch (response.status) {
             200, 201 => return,
@@ -781,7 +781,8 @@ pub const Client = struct {
             try headers.append(alloc, .{ "x-amz-checksum-sha256", value });
         }
 
-        var response = try self.performWithResponseLimitAndCancellation(
+        var response = try self.performWithResponseLimitAndCancellationAlloc(
+            alloc,
             .PUT,
             target,
             headers.items,
@@ -856,7 +857,8 @@ pub const Client = struct {
         defer freeQueryPairs(alloc, initiate_pairs);
         var initiate_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, initiate_pairs);
         defer initiate_target.deinit(alloc);
-        var initiated = try self.performWithResponseLimitAndCancellation(
+        var initiated = try self.performWithResponseLimitAndCancellationAlloc(
+            alloc,
             .POST,
             initiate_target,
             &.{},
@@ -909,7 +911,8 @@ pub const Client = struct {
             defer freeQueryPairs(alloc, query_pairs);
             var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query_pairs);
             defer target.deinit(alloc);
-            var response = try self.performWithResponseLimitAndCancellation(
+            var response = try self.performWithResponseLimitAndCancellationAlloc(
+                alloc,
                 .PUT,
                 target,
                 &.{},
@@ -937,7 +940,8 @@ pub const Client = struct {
         defer freeQueryPairs(alloc, complete_pairs);
         var complete_target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, complete_pairs);
         defer complete_target.deinit(alloc);
-        var response = try self.performWithResponseLimitAndCancellation(
+        var response = try self.performWithResponseLimitAndCancellationAlloc(
+            alloc,
             .POST,
             complete_target,
             &.{},
@@ -976,7 +980,8 @@ pub const Client = struct {
         defer freeQueryPairs(self.alloc, query_pairs);
         var target = try objectTargetAllocWithQuery(self.alloc, self.cfg, bucket, key, query_pairs);
         defer target.deinit(self.alloc);
-        var response = try self.performWithResponseLimitAndCancellation(
+        var response = try self.performWithResponseLimitAndCancellationAlloc(
+            self.alloc,
             .DELETE,
             target,
             &.{},
@@ -1038,7 +1043,8 @@ pub const Client = struct {
             }
         }
 
-        var response = try self.performReadWithChecksumFallback(
+        var response = try self.performReadWithChecksumFallbackAlloc(
+            alloc,
             .GET,
             target,
             headers.items,
@@ -1128,7 +1134,7 @@ pub const Client = struct {
         var target = try objectTargetAllocWithQuery(alloc, self.cfg, bucket, key, query);
         defer target.deinit(alloc);
 
-        var response = try self.performReadWithChecksumFallback(.HEAD, target, &.{}, null, cancellation);
+        var response = try self.performReadWithChecksumFallbackAlloc(alloc, .HEAD, target, &.{}, null, cancellation);
         defer response.deinit(alloc);
         switch (response.status) {
             200 => {},
@@ -1160,7 +1166,8 @@ pub const Client = struct {
         const owned_if_match = try appendConditionalHeaders(self.alloc, &headers, opts.if_match_etag, false);
         defer if (owned_if_match) |value| self.alloc.free(value);
 
-        var response = try self.performWithResponseLimitAndCancellation(
+        var response = try self.performWithResponseLimitAndCancellationAlloc(
+            self.alloc,
             .DELETE,
             target,
             headers.items,
@@ -1184,7 +1191,8 @@ pub const Client = struct {
         var target = try bucketTargetAllocWithQuery(alloc, self.cfg, bucket, query);
         defer target.deinit(alloc);
 
-        var response = try self.performWithResponseLimitAndCancellation(
+        var response = try self.performWithResponseLimitAndCancellationAlloc(
+            alloc,
             .GET,
             target,
             &.{},
@@ -1210,7 +1218,7 @@ pub const Client = struct {
         var target = try bucketTargetAllocWithQuery(alloc, self.cfg, bucket, query);
         defer target.deinit(alloc);
 
-        var response = try self.perform(.GET, target, &.{}, null, null);
+        var response = try self.performAlloc(alloc, .GET, target, &.{}, null, null);
         defer response.deinit(alloc);
         switch (response.status) {
             200 => return try parseListObjectVersionsResponse(alloc, response.body),
@@ -1222,19 +1230,21 @@ pub const Client = struct {
         }
     }
 
-    fn perform(
+    fn performAlloc(
         self: *Client,
+        alloc: Allocator,
         method: HttpMethod,
         target: RequestTarget,
         headers: []const HeaderPair,
         body: ?[]const u8,
         content_type: ?[]const u8,
     ) !TransportResponse {
-        return try self.performWithResponseLimit(method, target, headers, body, content_type, null);
+        return try self.performWithResponseLimitAlloc(alloc, method, target, headers, body, content_type, null);
     }
 
-    fn performReadWithChecksumFallback(
+    fn performReadWithChecksumFallbackAlloc(
         self: *Client,
+        alloc: Allocator,
         method: HttpMethod,
         target: RequestTarget,
         headers: []const HeaderPair,
@@ -1243,26 +1253,27 @@ pub const Client = struct {
     ) !TransportResponse {
         std.debug.assert(method == .GET or method == .HEAD);
         var checksum_headers = std.ArrayListUnmanaged(HeaderPair).empty;
-        defer checksum_headers.deinit(self.alloc);
-        try checksum_headers.ensureTotalCapacity(self.alloc, headers.len + 1);
+        defer checksum_headers.deinit(alloc);
+        try checksum_headers.ensureTotalCapacity(alloc, headers.len + 1);
         checksum_headers.appendAssumeCapacity(.{ "x-amz-checksum-mode", "ENABLED" });
         checksum_headers.appendSliceAssumeCapacity(headers);
 
-        var response = self.performWithResponseLimitAndCancellation(method, target, checksum_headers.items, null, null, max_response_size, cancellation) catch |err| switch (err) {
+        var response = self.performWithResponseLimitAndCancellationAlloc(alloc, method, target, checksum_headers.items, null, null, max_response_size, cancellation) catch |err| switch (err) {
             // httpx enforces the caller's body limit before returning the
             // response status. A checksum-permission 403 can therefore look
             // like an oversized response; retrying these safe reads without
             // checksum mode preserves the original limit and disambiguates it.
-            error.ResponseTooLarge => return try self.performWithResponseLimitAndCancellation(method, target, headers, null, null, max_response_size, cancellation),
+            error.ResponseTooLarge => return try self.performWithResponseLimitAndCancellationAlloc(alloc, method, target, headers, null, null, max_response_size, cancellation),
             else => return err,
         };
         if (!checksumModeFallbackStatus(response.status)) return response;
-        response.deinit(self.alloc);
-        return try self.performWithResponseLimitAndCancellation(method, target, headers, null, null, max_response_size, cancellation);
+        response.deinit(alloc);
+        return try self.performWithResponseLimitAndCancellationAlloc(alloc, method, target, headers, null, null, max_response_size, cancellation);
     }
 
-    fn performWithResponseLimit(
+    fn performWithResponseLimitAlloc(
         self: *Client,
+        alloc: Allocator,
         method: HttpMethod,
         target: RequestTarget,
         headers: []const HeaderPair,
@@ -1270,11 +1281,12 @@ pub const Client = struct {
         content_type: ?[]const u8,
         max_response_size: ?usize,
     ) !TransportResponse {
-        return try self.performWithResponseLimitAndCancellation(method, target, headers, body, content_type, max_response_size, null);
+        return try self.performWithResponseLimitAndCancellationAlloc(alloc, method, target, headers, body, content_type, max_response_size, null);
     }
 
-    fn performWithResponseLimitAndCancellation(
+    fn performWithResponseLimitAndCancellationAlloc(
         self: *Client,
+        alloc: Allocator,
         method: HttpMethod,
         target: RequestTarget,
         headers: []const HeaderPair,
@@ -1284,8 +1296,8 @@ pub const Client = struct {
         cancellation: ?types.CancellationToken,
     ) !TransportResponse {
         if (cancellation) |token| try token.check();
-        var dynamic_credentials = if (self.cfg.credential_provider) |provider| try provider.get(self.alloc) else null;
-        defer if (dynamic_credentials) |*credentials| credentials.deinit(self.alloc);
+        var dynamic_credentials = if (self.cfg.credential_provider) |provider| try provider.get(alloc) else null;
+        defer if (dynamic_credentials) |*credentials| credentials.deinit(alloc);
         var signing_config = self.cfg;
         if (dynamic_credentials) |credentials| {
             signing_config.credentials.access_key_id = credentials.access_key_id;
@@ -1293,16 +1305,16 @@ pub const Client = struct {
             signing_config.credentials.session_token = credentials.session_token;
         }
         const timestamp = try currentUnixSeconds();
-        const payload_hash = try sha256HexAlloc(self.alloc, body orelse "");
-        defer self.alloc.free(payload_hash);
+        const payload_hash = try sha256HexAlloc(alloc, body orelse "");
+        defer alloc.free(payload_hash);
 
-        const amz_date = try formatAmzDateAlloc(self.alloc, timestamp);
-        defer self.alloc.free(amz_date);
-        const scope_date = try formatScopeDateAlloc(self.alloc, timestamp);
-        defer self.alloc.free(scope_date);
+        const amz_date = try formatAmzDateAlloc(alloc, timestamp);
+        defer alloc.free(amz_date);
+        const scope_date = try formatScopeDateAlloc(alloc, timestamp);
+        defer alloc.free(scope_date);
 
         const signed = try signHeadersAlloc(
-            self.alloc,
+            alloc,
             signing_config,
             method,
             target.host,
@@ -1314,11 +1326,11 @@ pub const Client = struct {
             scope_date,
             content_type,
         );
-        defer freeHeaderPairs(self.alloc, signed);
+        defer freeHeaderPairs(alloc, signed);
 
         return try self.request_fn(
             self.request_ctx,
-            self.alloc,
+            alloc,
             method,
             target.url,
             signed,
@@ -2926,7 +2938,7 @@ test "s3 get object guards probed current-object reads without version permissio
                         .version_id = try request_alloc.dupe(u8, "v1"),
                     };
                 },
-                2 => blk: {
+                2, 4, 6, 8 => blk: {
                     try std.testing.expectEqual(HttpMethod.HEAD, method);
                     try std.testing.expect(std.mem.indexOf(u8, url, "/bucket/unversioned") != null);
                     break :blk .{
@@ -2941,7 +2953,7 @@ test "s3 get object guards probed current-object reads without version permissio
                         .content_length = 4,
                     };
                 },
-                3 => blk: {
+                3, 5, 7, 9 => blk: {
                     try std.testing.expectEqual(HttpMethod.GET, method);
                     try std.testing.expect(std.mem.indexOf(u8, url, "/bucket/unversioned") != null);
                     try expectHeaderValue(headers, "If-Match", "\"etag-u1\"");
@@ -2993,7 +3005,7 @@ test "s3 get object guards probed current-object reads without version permissio
     try std.testing.expectEqualStrings("sum-v1", pinned.metadata.checksum.?.value);
 
     try std.testing.expectError(error.PreconditionFailed, client.getObject("bucket", "unversioned", .{}));
-    try std.testing.expectEqual(@as(usize, 4), state.calls);
+    try std.testing.expectEqual(@as(usize, 10), state.calls);
 }
 
 test "s3 metadata reads fall back when checksum mode is forbidden or unsupported" {
@@ -3343,4 +3355,40 @@ test "s3 error envelope caps preserve owned and context transport settings" {
         try std.testing.expect(context.client.config.force_http2);
         try std.testing.expect(!context.client.config.verify_ssl);
     }
+}
+
+test "s3 operation response ownership follows caller allocator across checksum fallback" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const operation_alloc = arena.allocator();
+    const State = struct {
+        expected: Allocator,
+        calls: usize = 0,
+        fn request(raw: ?*anyopaque, alloc: Allocator, method: HttpMethod, _: []const u8, headers: []const HeaderPair, _: ?[]const u8, _: ?[]const u8, _: ?usize, _: ?types.CancellationToken) !TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(self.expected.ptr, alloc.ptr);
+            try std.testing.expectEqual(self.expected.vtable, alloc.vtable);
+            self.calls += 1;
+            var checksum = false;
+            for (headers) |header| if (std.ascii.eqlIgnoreCase(header[0], "x-amz-checksum-mode")) {
+                checksum = true;
+            };
+            return .{ .status = if (checksum) 403 else 200, .body = try alloc.dupe(u8, if (method == .GET and !checksum) "data" else ""), .etag = try alloc.dupe(u8, "\"etag\""), .content_length = 4 };
+        }
+    };
+    var state: State = .{ .expected = operation_alloc };
+    const cfg: Config = .{ .credentials = .{ .endpoint = try a.dupe(u8, "s3.example.test"), .use_ssl = true, .access_key_id = try a.dupe(u8, "access"), .secret_access_key = try a.dupe(u8, "secret"), .region = try a.dupe(u8, "us-east-1") }, .addressing_style = .path };
+    var s3 = Client.initWithRequestFn(a, cfg, &state, State.request);
+    defer s3.deinit();
+    var client = s3.client();
+    client.allocator = operation_alloc;
+    var meta = try client.statObject("archive", "hn/file");
+    defer meta.deinit(operation_alloc);
+    var data = try client.getObject("archive", "hn/file", .{});
+    defer data.deinit(operation_alloc);
+    try std.testing.expectEqualStrings("data", data.body);
+    var put = try client.putObject("archive", "hn/file", "data", .{});
+    defer put.deinit(operation_alloc);
+    try std.testing.expect(state.calls >= 5);
 }

@@ -68,7 +68,10 @@ pub const ApplicationName = struct {
 pub const ApplicationNameSetting = union(enum) { show, set: struct { local: bool, value: ApplicationName }, reset };
 pub const EncodingSetting = union(enum) { show, set: struct { local: bool }, reset };
 pub const CatalogSetting = union(enum) { show: []const u8, set: struct { name: []const u8, value: []const u8, local: bool }, reset: []const u8, reset_local: []const u8 };
+pub const LakeVisibility = enum { committed, accepted };
+pub const LakeVisibilitySetting = union(enum) { show, reset, set: struct { local: bool, value: LakeVisibility } };
 pub const Setting = union(enum) {
+    lake_visibility: LakeVisibilitySetting,
     search_path: SearchPathSetting,
     statement_timeout: TimeoutSetting,
     application_name: ApplicationNameSetting,
@@ -81,6 +84,7 @@ pub const Setting = union(enum) {
 /// The protocol uses one classifier for Describe, Execute, and both streaming
 /// paths. A locally owned setting must never be sent to the SQL read provider.
 pub fn settingCommand(alloc: std.mem.Allocator, input: []const u8) !?Setting {
+    if (try lakeVisibilitySetting(alloc, input)) |value| return .{ .lake_visibility = value };
     if (try searchPathSetting(alloc, input)) |value| return .{ .search_path = value };
     if (try timeoutSetting(alloc, input)) |value| return .{ .statement_timeout = value };
     if (try applicationNameSetting(alloc, input)) |value| return .{ .application_name = value };
@@ -462,6 +466,7 @@ const Parser = struct {
     fn quoted(self: *Parser, quote: u8) ![]const u8 {
         if (!try self.take(quote)) return error.InvalidSqlSyntax;
         var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.alloc);
         while (self.pos < self.input.len) {
             const ch = self.input[self.pos];
             self.pos += 1;
@@ -745,4 +750,44 @@ test "pgwire SQL session command parser preserves scalar spans and quoted names"
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+/// Connection-owned execution policy, independent of custom catalog settings.
+pub fn lakeVisibilitySetting(alloc: std.mem.Allocator, input: []const u8) !?LakeVisibilitySetting {
+    var p: Parser = .{ .alloc = alloc, .input = input };
+    const verb = p.word() catch return null;
+    const setting = std.ascii.eqlIgnoreCase(verb, "set");
+    const showing = std.ascii.eqlIgnoreCase(verb, "show");
+    const resetting = std.ascii.eqlIgnoreCase(verb, "reset");
+    if (!setting and !showing and !resetting) return null;
+    const saved = p.pos;
+    const modifier = p.word() catch return null;
+    const local = setting and std.ascii.eqlIgnoreCase(modifier, "local");
+    if (!setting or (!local and !std.ascii.eqlIgnoreCase(modifier, "session"))) p.pos = saved;
+    const name = p.settingName() catch |err| return if (err == error.OutOfMemory) err else null;
+    defer alloc.free(name);
+    if (!std.mem.eql(u8, name, "antfly.lake_visibility")) return null;
+    if (!setting) {
+        try p.finish();
+        return if (showing) .show else .reset;
+    }
+    if (!try p.take('=')) if (!std.ascii.eqlIgnoreCase(try p.word(), "to")) return error.InvalidSqlSyntax;
+    try p.space();
+    const quoted = p.pos < input.len and input[p.pos] == '\'';
+    const value = if (quoted) try p.quoted('\'') else try p.word();
+    defer if (quoted) alloc.free(value);
+    try p.finish();
+    const selected: LakeVisibility = if (std.ascii.eqlIgnoreCase(value, "accepted")) .accepted else if (std.ascii.eqlIgnoreCase(value, "committed") or (!quoted and std.ascii.eqlIgnoreCase(value, "default"))) .committed else return error.InvalidParameter;
+    return .{ .set = .{ .local = local, .value = selected } };
+}
+
+test "pgwire accepted lake visibility is scoped and consumes a complete statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqual(LakeVisibility.accepted, (try settingCommand(a, "SET LOCAL antfly.lake_visibility TO 'accepted'")).?.lake_visibility.set.value);
+    try std.testing.expect((try settingCommand(a, "SHOW antfly.lake_visibility")).?.lake_visibility == .show);
+    try std.testing.expect((try settingCommand(a, "RESET antfly.lake_visibility")).?.lake_visibility == .reset);
+    try std.testing.expectError(error.InvalidParameter, settingCommand(a, "SET antfly.lake_visibility = 'eventual'"));
+    try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET antfly.lake_visibility = 'accepted'; SELECT 1"));
 }
