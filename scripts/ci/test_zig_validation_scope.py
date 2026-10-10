@@ -139,7 +139,10 @@ class ZigValidationScopeTests(unittest.TestCase):
         # Evaluate the actual aggregate shell, including independent low-FD
         # coverage. Full validation must not hide a failed specialized lane.
         aggregate = blocks["e2e-full"]
-        self.assertIn("e2e-base-low-fd, embedded-sdk-native]", aggregate)
+        self.assertIn(
+            "e2e-base-low-fd, embedded-sdk-native, pgwire-driver-conformance]",
+            aggregate,
+        )
         self.assertIn("LOW_FD_RESULT: ${{ needs.e2e-base-low-fd.result }}", aggregate)
         command = textwrap.dedent(aggregate.split("run: |\n", 1)[1])
         for build, tests, low_fd, required, native, success in (
@@ -164,6 +167,7 @@ class ZigValidationScopeTests(unittest.TestCase):
                         "LOW_FD_RESULT": low_fd,
                         "REQUIRE_LOW_FD": required,
                         "NATIVE_SDK_RESULT": native,
+                        "PGWIRE_DRIVER_RESULT": "success",
                     },
                     check=False,
                     capture_output=True,
@@ -182,6 +186,45 @@ class ZigValidationScopeTests(unittest.TestCase):
                 },
             )
         )
+        self.assertTrue(selected("pgwire-driver-conformance"))
+        self.assertTrue(selected("pgwire-driver-conformance", full=True))
+        self.assertTrue(selected("pgwire-driver-conformance", pr="", event="push"))
+        self.assertFalse(
+            selected(
+                "pgwire-driver-conformance",
+                **{
+                    "needs.e2e-base-build.result": "failure",
+                    "needs.e2e-full-build.result": "skipped",
+                },
+            )
+        )
+
+        # Execute both actual aggregate checks: a skipped/failed driver job
+        # cannot be hidden by otherwise successful E2E and native SDK results.
+        for job in ("e2e-base", "e2e-full"):
+            command = textwrap.dedent(blocks[job].split("run: |\n", 1)[1])
+            if job == "e2e-base":
+                command = command.split("\n- uses:", 1)[0]
+            for driver in ("success", "failure", "skipped"):
+                with self.subTest(job=job, driver=driver):
+                    result = subprocess.run(
+                        ["bash", "-c", command],
+                        env={
+                            **os.environ,
+                            "BUILD_RESULT": "success",
+                            "TEST_RESULT": "success",
+                            "PLAN_RESULT": "success",
+                            "LOW_FD_RESULT": "success",
+                            "REQUIRE_LOW_FD": "true",
+                            "NATIVE_SDK_RESULT": "success",
+                            "PGWIRE_DRIVER_RESULT": driver,
+                        },
+                        check=False,
+                        capture_output=True,
+                    )
+                    self.assertEqual(
+                        result.returncode == 0, driver == "success", result.stderr
+                    )
 
     def test_codegen_and_laya_inputs_select_zig_validation(self):
         workflow = (ROOT / ".github/workflows/zig-tests.yml").read_text()

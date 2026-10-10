@@ -496,6 +496,25 @@ const Parser = struct {
         for (result) |*ch| ch.* = std.ascii.toLower(ch.*);
         return result;
     }
+    // Comments separate tokens just like whitespace. Do not concatenate across
+    // them (U/* comment */TC must not become UTC), or stop before validating
+    // the rest of the command. Commas remain available to DateStyle lists.
+    fn formattingValue(self: *Parser) ![]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.alloc);
+        while (true) {
+            try self.space();
+            if (self.pos == self.input.len or self.input[self.pos] == ';') break;
+            const start = self.pos;
+            while (self.pos < self.input.len and self.input[self.pos] != ';' and
+                !std.ascii.isWhitespace(self.input[self.pos]) and
+                !std.mem.startsWith(u8, self.input[self.pos..], "--") and
+                !std.mem.startsWith(u8, self.input[self.pos..], "/*")) self.pos += 1;
+            if (out.items.len != 0) try out.append(self.alloc, ' ');
+            try out.appendSlice(self.alloc, self.input[start..self.pos]);
+        }
+        return out.toOwnedSlice(self.alloc);
+    }
     fn finish(self: *Parser) !void {
         _ = try self.take(';');
         try self.space();
@@ -765,11 +784,7 @@ pub fn formattingSetting(alloc: std.mem.Allocator, input: []const u8) !?Formatti
         if (!try p.take('=')) if (!std.ascii.eqlIgnoreCase(try p.word(), "to")) return error.InvalidSqlSyntax;
         try p.space();
         const quoted = p.pos < input.len and (input[p.pos] == '\'' or input[p.pos] == '"');
-        const value = if (quoted) try p.quoted(input[p.pos]) else blk: {
-            const start = p.pos;
-            while (p.pos < input.len and input[p.pos] != ';') p.pos += 1;
-            break :blk std.mem.trim(u8, input[start..p.pos], " \t\r\n");
-        };
+        const value = if (quoted) try p.quoted(input[p.pos]) else try p.formattingValue();
         if (quoted or !std.ascii.eqlIgnoreCase(value, "default")) try kind.validate(value);
     }
     try p.finish();
@@ -801,4 +816,27 @@ test "pgwire empty queries include driver ping and nested comments" {
     try std.testing.expect(!try isEmptyQuery("-- ping\nSELECT 1"));
     try std.testing.expect(!try isEmptyQuery("SELECT '-- ping'"));
     try std.testing.expectError(error.InvalidSqlSyntax, isEmptyQuery("/* unterminated"));
+}
+
+test "pgwire formatting SET comments separate tokens and preserve command boundaries" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            for ([_][]const u8{
+                "SET extra_float_digits = 3 -- comment",
+                "SET extra_float_digits = 3/* nested /* comment */ */",
+                "SET DateStyle = ISO/* comment */,/* comment */MDY",
+                "SET TimeZone = UTC /* comment */; -- trailing",
+                "SET TimeZone = 'UTC' /* comment */",
+                "SET extra_float_digits = default -- comment",
+            }) |sql| try std.testing.expect((try settingCommand(a, sql)).? == .formatting);
+            try std.testing.expectError(error.UnsupportedFormattingSetting, settingCommand(a, "SET TimeZone = U/* comment */TC"));
+            try std.testing.expectError(error.UnsupportedFormattingSetting, settingCommand(a, "SET extra_float_digits = 3 /* comment */ SELECT 1"));
+            try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET extra_float_digits = 3 /* unterminated"));
+            try std.testing.expectError(error.InvalidSqlSyntax, settingCommand(a, "SET TimeZone = UTC /* comment */; SELECT 1"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

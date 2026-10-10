@@ -184,5 +184,6 @@ and a transaction. Go also exercises database/sql and its comment-only ping.
 Portal arenas have stable addresses through registry growth and removal, so
 retained native results release before their allocator is destroyed. The Python client also verifies unsupported startup values
 through a real connection. Go, Node.js, and Rust (at least 1.94 for SQLx 0.9) toolchains are required.
-The base E2E CI shard runs this driver conformance gate. Use
+Both base and full E2E CI gates require the driver conformance job, which reuses
+the corresponding candidate binary. Use
 `--url` to target an existing node or `--drivers` to select individual clients.

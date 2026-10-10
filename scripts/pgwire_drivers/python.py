@@ -33,6 +33,13 @@ with psycopg.connect(url, autocommit=True) as conn:
         ("extra_float_digits", "3"),
     ]:
         assert conn.execute("SHOW " + name).fetchone() == (value,)
+    for sql in [
+        "SET extra_float_digits = 3 -- comment",
+        "SET DateStyle = ISO/* nested /* comment */ */, MDY",
+        "SET TimeZone = UTC /* comment */; -- trailing",
+    ]:
+        conn.execute(sql)
+        conn.execute(sql, prepare=True)
     with conn.transaction():
         assert conn.execute("SELECT 1").fetchone() == (1,)
 print("psycopg: PASS")
