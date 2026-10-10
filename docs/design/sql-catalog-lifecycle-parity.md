@@ -230,6 +230,23 @@ and rebuild/publish them through the existing bounded reconciliation and GC
 machinery. Occupancy should use an exact-name prefix seek with early exit,
 never a namespace/table schema scan under the admission lock.
 
+The schema-cut component now exposes an opt-in, names-only constraint
+membership projection alongside exclusive relation claims. It includes named
+constraint-origin UNIQUE/PRIMARY, CHECK and FK declarations, excludes
+index-origin unique rules, deduplicates occupancy within a table, and bounds
+aggregate declaration work independently of deduplicated output size.
+Successor projection retains separately fenced active/predecessor and
+reserved/successor memberships, including namespace and table-identity moves.
+Both sets own their names after source buffers are released. Relation-only
+callers retain their existing parsing path and do not allocate memberships.
+All 30 relation-registry tests pass, including stable allocation-failure
+sweeps, cross-table nonexclusivity, declaration bounds and source lifetime.
+This is a projection foundation, not activated catalog occupancy: durable
+owner-qualified storage, same-transaction producer deltas, reconciliation
+candidate verification/root activation, GC and admission lookup remain unwired.
+Do not interpret the default empty membership projection as evidence that a
+generated candidate is free.
+
 The next delivery is mounted catalog activation/recovery evidence for the
 original index and constraint cohort, including real ownership and readiness
 checks. This checkpoint does not close the larger SQL goal or its remaining

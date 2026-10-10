@@ -272,6 +272,19 @@ pub const Claim = struct {
 pub const TableCut = struct {
     arena: std.heap.ArenaAllocator,
     claims: []const Claim,
+    /// Nonexclusive schema memberships, NOT relation claims. Generated names
+    /// avoid CHECK/FK names too, but equal constraint names on different
+    /// tables must neither collide nor shadow a table/index lookup.
+    constraint_memberships: []const ConstraintMembership = &.{},
+
+    pub const ConstraintMembership = struct {
+        key: Key,
+        table_id: u64,
+        schema_version: u32,
+        schema_digest: [32]u8,
+        phase: Phase,
+        publication_id: [16]u8,
+    };
 
     pub const Definition = struct {
         namespace_id: u64,
@@ -287,11 +300,17 @@ pub const TableCut = struct {
     /// Old-only names remain active until cutover; shared names retain both
     /// owners, and new-only names carry a reservation without an active owner.
     pub fn initSuccessor(a: A, predecessor: ?Definition, successor: Definition) !TableCut {
+        return initSuccessorMode(a, predecessor, successor, false);
+    }
+    pub fn initSuccessorWithConstraintMemberships(a: A, predecessor: ?Definition, successor: Definition) !TableCut {
+        return initSuccessorMode(a, predecessor, successor, true);
+    }
+    fn initSuccessorMode(a: A, predecessor: ?Definition, successor: Definition, comptime with_memberships: bool) !TableCut {
         if (successor.phase != .reserved) return error.InvalidCatalogRecord;
         if (predecessor) |before| if (before.phase != .active) return error.InvalidCatalogRecord;
-        var pending = try init(a, successor);
+        var pending = try initMode(a, successor, with_memberships);
         defer pending.deinit();
-        var output: TableCut = if (predecessor) |before| try init(a, before) else .{ .arena = std.heap.ArenaAllocator.init(a), .claims = &.{} };
+        var output: TableCut = if (predecessor) |before| try initMode(a, before, with_memberships) else .{ .arena = std.heap.ArenaAllocator.init(a), .claims = &.{} };
         errdefer output.deinit();
         const owned = output.arena.allocator();
         var scratch = std.heap.ArenaAllocator.init(a);
@@ -312,6 +331,16 @@ pub const TableCut = struct {
             }
         }
         output.claims = try result.toOwnedSlice(owned);
+        // Active and reserved memberships have separate lifetime/fencing.
+        // Retain both even for a shared name: cutover must not retire the
+        // successor when it removes the predecessor's occupancy.
+        var memberships = std.ArrayList(ConstraintMembership).fromOwnedSlice(@constCast(output.constraint_memberships));
+        for (pending.constraint_memberships) |membership| {
+            var copy = membership;
+            copy.key.name = try owned.dupe(u8, membership.key.name);
+            try memberships.append(owned, copy);
+        }
+        output.constraint_memberships = try memberships.toOwnedSlice(owned);
         return output;
     }
     // A names-only projection skips column definitions, expressions, display
@@ -321,17 +350,34 @@ pub const TableCut = struct {
         relational_indexes: ?[]const struct { name: []const u8 } = null,
         unique_constraints: ?[]const struct { name: []const u8, origin: ?[]const u8 = null } = null,
     };
+    const MembershipSchemaNames = struct {
+        version: u32 = 0,
+        relational_indexes: @FieldType(SchemaNames, "relational_indexes") = null,
+        unique_constraints: @FieldType(SchemaNames, "unique_constraints") = null,
+        checks: ?[]const struct { name: []const u8 } = null,
+        foreign_keys: ?[]const struct { name: []const u8 } = null,
+    };
     pub fn init(a: A, definition: Definition) !TableCut {
+        return initMode(a, definition, false);
+    }
+    /// The caller must publish these memberships with the relation cut, using
+    /// the same generation and source epoch. Until that producer is wired,
+    /// ordinary relation-only readers pay no parsing/allocation overhead.
+    pub fn initWithConstraintMemberships(a: A, definition: Definition) !TableCut {
+        return initMode(a, definition, true);
+    }
+    fn initMode(a: A, definition: Definition, comptime with_memberships: bool) !TableCut {
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const owned = arena.allocator();
         // Temporary parsing storage is reclaimed before returning the cut.
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
-        const schema: SchemaNames = if (definition.schema_json.len == 0)
+        const Names = if (with_memberships) MembershipSchemaNames else SchemaNames;
+        const schema: Names = if (definition.schema_json.len == 0)
             .{}
         else
-            std.json.parseFromSliceLeaky(SchemaNames, scratch.allocator(), definition.schema_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            std.json.parseFromSliceLeaky(Names, scratch.allocator(), definition.schema_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => return error.InvalidCatalogRecord,
             };
@@ -373,7 +419,29 @@ pub const TableCut = struct {
                 try append(owned, &claims, definition.namespace_id, name, owner);
             }
         }
-        return .{ .arena = arena, .claims = try claims.toOwnedSlice(owned) };
+        var memberships: std.ArrayList(ConstraintMembership) = .empty;
+        if (with_memberships) {
+            const checks = schema.checks orelse &.{};
+            const foreign_keys = schema.foreign_keys orelse &.{};
+            if (checks.len > max_claims or foreign_keys.len > max_claims or
+                uniques.len + checks.len + foreign_keys.len > max_claims) return error.CatalogCommandTooLarge;
+            var constraint_names: std.StringHashMapUnmanaged(void) = .empty;
+            for (uniques) |unique| {
+                if (unique.origin) |origin| if (std.mem.eql(u8, origin, "index")) continue;
+                try appendMembership(owned, scratch.allocator(), &memberships, &constraint_names, definition, schema.version, digest, unique.name);
+            }
+            for (checks) |check| try appendMembership(owned, scratch.allocator(), &memberships, &constraint_names, definition, schema.version, digest, check.name);
+            for (foreign_keys) |foreign| try appendMembership(owned, scratch.allocator(), &memberships, &constraint_names, definition, schema.version, digest, foreign.name);
+        }
+        return .{ .arena = arena, .claims = try claims.toOwnedSlice(owned), .constraint_memberships = try memberships.toOwnedSlice(owned) };
+    }
+    fn appendMembership(a: A, scratch: A, memberships: *std.ArrayList(ConstraintMembership), names: *std.StringHashMapUnmanaged(void), definition: Definition, version: u32, digest: [32]u8, name: []const u8) !void {
+        const key: Key = .{ .namespace_id = definition.namespace_id, .name = name };
+        try key.validate();
+        // Occupancy is a set, independent of the declaration's constraint
+        // category. Schema validation owns duplicate-declaration diagnostics.
+        if ((try names.getOrPut(scratch, name)).found_existing) return;
+        try memberships.append(a, .{ .key = .{ .namespace_id = key.namespace_id, .name = try a.dupe(u8, name) }, .table_id = definition.table_id, .schema_version = version, .schema_digest = digest, .phase = definition.phase, .publication_id = definition.publication_id });
     }
     pub fn deinit(self: *TableCut) void {
         self.arena.deinit();
@@ -967,6 +1035,98 @@ test "catalog relation effect keys decode canonically and reject cross-group rec
 }
 fn testClaim(namespace: u64, name: []const u8, table: u64, version: u32, kind: Kind) Claim {
     return .{ .key = .{ .namespace_id = namespace, .name = name }, .owner = .{ .table_id = table, .schema_version = version, .schema_digest = @splat(@intCast(version)), .kind = kind } };
+}
+
+test "catalog constraint occupancy includes nonrelation names without cross-table exclusivity" {
+    const a = std.testing.allocator;
+    const schema =
+        \\{"version":9,"relational_indexes":[{"name":"access"}],"unique_constraints":[{"name":"pk"},{"name":"access","origin":"index"}],"checks":[{"name":"check_only"},{"name":"shared"}],"foreign_keys":[{"name":"fk_only"},{"name":"shared"}]}
+    ;
+    const definition: TableCut.Definition = .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = schema };
+    var cut = try TableCut.initWithConstraintMemberships(a, definition);
+    defer cut.deinit();
+    try std.testing.expectEqual(@as(usize, 3), cut.claims.len);
+    try std.testing.expectEqual(@as(usize, 4), cut.constraint_memberships.len);
+    const names = [_][]const u8{ "pk", "check_only", "shared", "fk_only" };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(schema, &digest, .{});
+    for (cut.constraint_memberships, names) |membership, name| {
+        try std.testing.expectEqualStrings(name, membership.key.name);
+        try std.testing.expectEqual(@as(u64, 2), membership.key.namespace_id);
+        try std.testing.expectEqual(@as(u64, 7), membership.table_id);
+        try std.testing.expectEqual(@as(u32, 9), membership.schema_version);
+        try std.testing.expectEqualSlices(u8, &digest, &membership.schema_digest);
+        try std.testing.expectEqual(Phase.active, membership.phase);
+        for (cut.claims) |claim| if (!std.mem.eql(u8, name, "pk")) try std.testing.expect(!Context.eql(.{}, membership.key, claim.key));
+    }
+    var other = definition;
+    other.table_id = 8;
+    other.name = "other";
+    var second = try TableCut.initWithConstraintMemberships(a, other);
+    defer second.deinit();
+    // These equal namespace/name pairs intentionally belong to two tables.
+    for (cut.constraint_memberships, second.constraint_memberships) |left, right| {
+        try std.testing.expect(Context.eql(.{}, left.key, right.key));
+        try std.testing.expect(left.table_id != right.table_id);
+    }
+    var ordinary = try TableCut.init(a, definition);
+    defer ordinary.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ordinary.constraint_memberships.len);
+}
+
+test "catalog constraint occupancy bounds aggregate declarations before constructing memberships" {
+    const a = std.testing.allocator;
+    var schema: std.ArrayList(u8) = .empty;
+    defer schema.deinit(a);
+    try schema.appendSlice(a, "{\"checks\":[");
+    for (0..max_claims) |i| {
+        if (i != 0) try schema.append(a, ',');
+        try schema.appendSlice(a, "{\"name\":\"shared\"}");
+    }
+    try schema.appendSlice(a, "]}");
+    var definition: TableCut.Definition = .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = schema.items };
+    var cut = try TableCut.initWithConstraintMemberships(a, definition);
+    defer cut.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cut.constraint_memberships.len);
+    try std.testing.expectEqualStrings("shared", cut.constraint_memberships[0].key.name);
+    // Bound total declaration work, not only the deduplicated output size:
+    // thousands of repeated constraints must not bypass admission budgets.
+    schema.items.len -= 1;
+    try schema.appendSlice(a, ",\"foreign_keys\":[{\"name\":\"other\"}]}");
+    definition.schema_json = schema.items;
+    try std.testing.expectError(error.CatalogCommandTooLarge, TableCut.initWithConstraintMemberships(a, definition));
+    // Existing relation lookups still ignore nonrelation declarations.
+    var ordinary = try TableCut.init(a, definition);
+    defer ordinary.deinit();
+    try std.testing.expectEqual(@as(usize, 1), ordinary.claims.len);
+}
+
+test "catalog constraint occupancy successor owns both fenced schema cuts" {
+    const Probe = struct {
+        fn run(a: A) !void {
+            var cut = blk: {
+                const before_schema = try a.dupe(u8, "{\"version\":1,\"checks\":[{\"name\":\"old\"},{\"name\":\"shared\"}]}");
+                defer a.free(before_schema);
+                const after_schema = try a.dupe(u8, "{\"version\":2,\"foreign_keys\":[{\"name\":\"new\"},{\"name\":\"shared\"}]}");
+                defer a.free(after_schema);
+                break :blk try TableCut.initSuccessorWithConstraintMemberships(a, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = before_schema }, .{ .namespace_id = 3, .table_id = 8, .name = "items", .schema_json = after_schema, .phase = .reserved, .publication_id = @splat(9) });
+            };
+            defer cut.deinit();
+            try std.testing.expectEqual(@as(usize, 4), cut.constraint_memberships.len);
+            const expected = [_][]const u8{ "old", "shared", "new", "shared" };
+            for (cut.constraint_memberships, expected, 0..) |membership, name, i| {
+                try std.testing.expectEqualStrings(name, membership.key.name);
+                try std.testing.expectEqual(@as(u64, if (i < 2) 7 else 8), membership.table_id);
+                try std.testing.expectEqual(@as(u64, if (i < 2) 2 else 3), membership.key.namespace_id);
+                try std.testing.expectEqual(@as(u32, if (i < 2) 1 else 2), membership.schema_version);
+                try std.testing.expectEqual(if (i < 2) Phase.active else Phase.reserved, membership.phase);
+                try std.testing.expect(std.mem.allEqual(u8, &membership.publication_id, if (i < 2) 0 else 9));
+            }
+        }
+    };
+    try Probe.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try std.testing.expectError(error.InvalidCatalogName, TableCut.initWithConstraintMemberships(std.testing.allocator, .{ .namespace_id = 2, .table_id = 7, .name = "items", .schema_json = "{\"checks\":[{\"name\":\"\"}]}" }));
 }
 
 test "catalog table cuts preserve constraint and index provenance without duplicating unique index relations" {
