@@ -788,3 +788,148 @@ def test_sql_search_preserves_native_nulls_and_json_numbers(require_native, afli
             db.sql("UPDATE values_source SET payload=CAST('{}' AS JSONB)")
             remaining = cursor.fetch(10)["result"]["rows"]
             assert sorted(first + remaining, key=lambda row: row[0]) == expected
+
+
+@pytest.mark.parametrize("nullable", [False, True])
+@pytest.mark.parametrize(
+    "predicate,selected",
+    [
+        ("archived", (True,)),
+        ("NOT archived", (False,)),
+        ("NOT NOT archived", (True,)),
+        ("archived IS TRUE", (True,)),
+        ("archived IS FALSE", (False,)),
+        ("archived IS NOT TRUE", (False, None)),
+        ("archived IS NOT FALSE", (True, None)),
+        ("NOT (archived = true)", (False,)),
+        ("NOT (archived = false)", (True,)),
+        ("NOT (archived IS FALSE)", (True, None)),
+        ("NOT (archived IS NOT TRUE)", (True,)),
+        ("archived AND label <> ''", (True,)),
+        ("NOT (NOT archived OR label = '')", (True,)),
+    ],
+)
+def test_sql_boolean_partial_index_membership_and_unique_claims(
+    require_native, aflite_path, nullable, predicate, selected
+):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql(f"CREATE TABLE threads (n BIGINT, label TEXT, archived BOOLEAN {'NULL' if nullable else 'NOT NULL'})")
+        states = [True, False, None] if nullable else [True, False]
+        for n, state in enumerate(states):
+            db.sql("INSERT INTO threads(_id,n,label,archived) VALUES ($1,$2,$3,$4)", [f"row{n}", n, f"label{n}", state])
+        receipt = db.sql(f"CREATE UNIQUE INDEX visible ON threads(label) INCLUDE(n) WHERE {predicate}")
+        assert receipt["ddl_receipt"]["state"] == "ready"
+        with db.open_table("threads") as table:
+            schema = table.get_schema()
+        index = schema["relational_indexes"][0]
+        assert index["where"] == schema["unique_constraints"][0]["where"]
+        if predicate in ("archived IS NOT TRUE", "archived IS NOT FALSE", "NOT (archived IS FALSE)"):
+            assert index["where"][0]["op"] == "is_distinct"
+        for n, state in enumerate(states):
+            statement = "INSERT INTO threads(_id,n,label,archived) VALUES ($1,$2,$3,$4)"
+            parameters = [f"duplicate{n}", n + 10, f"label{n}", state]
+            if state in selected:
+                with pytest.raises(SQLStateError) as duplicate:
+                    db.sql(statement, parameters)
+                assert duplicate.value.sqlstate == "23505"
+            else:
+                db.sql(statement, parameters)
+        expected = [[str(n)] for n, state in enumerate(states) if state in selected]
+        assert db.sql(f"SELECT n FROM threads WHERE {predicate} ORDER BY n")["rows"] == expected
+        # Updates must consult the same native partial-unique membership as
+        # index construction: entering coverage now conflicts with row0/row1.
+        if predicate == "NOT archived":
+            db.sql("INSERT INTO threads(_id,n,label,archived) VALUES ('outside',99,'label1',true)")
+            with pytest.raises(SQLStateError) as duplicate:
+                db.sql("UPDATE threads SET archived=false WHERE _id='outside'")
+            assert duplicate.value.sqlstate == "23505"
+
+
+def test_sql_boolean_partial_index_updates_and_reopen(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE threads(n BIGINT, archived BOOLEAN)")
+        db.sql("INSERT INTO threads(_id,n,archived) VALUES ('false',1,false),('true',2,true),('null',3,NULL)")
+        db.sql("CREATE INDEX visible ON threads(n DESC) WHERE NOT archived")
+        db.sql("CREATE INDEX not_true ON threads(n DESC) WHERE archived IS NOT TRUE")
+        assert db.sql("SELECT n FROM threads WHERE n >= 0 AND archived = false ORDER BY n DESC")["rows"] == [["1"]]
+        assert db.sql("SELECT n FROM threads WHERE n >= 0 AND archived IS NOT TRUE ORDER BY n DESC")["rows"] == [
+            ["3"],
+            ["1"],
+        ]
+        db.sql("UPDATE threads SET archived=false WHERE _id='true'")
+        db.sql("UPDATE threads SET archived=true WHERE _id='false'")
+    with af.open(aflite_path) as db:
+        assert db.sql("SELECT n FROM threads WHERE n >= 0 AND archived = false ORDER BY n DESC")["rows"] == [["2"]]
+        assert db.sql("SELECT n FROM threads WHERE n >= 0 AND archived IS NOT TRUE ORDER BY n DESC")["rows"] == [
+            ["3"],
+            ["2"],
+        ]
+
+
+@pytest.mark.parametrize(
+    "predicate,selected",
+    [
+        ("flag IS TRUE", (True,)),
+        ("flag IS FALSE", (False,)),
+        ("flag IS NOT TRUE", (False, None)),
+        ("flag IS NOT FALSE", (True, None)),
+    ],
+)
+def test_sql_check_boolean_truth_tests_preserve_null_semantics(require_native, aflite_path, predicate, selected):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql(f"CREATE TABLE truth_tests(flag BOOLEAN, CONSTRAINT truth_test CHECK ({predicate}))")
+        for n, state in enumerate([True, False, None]):
+            if state in selected:
+                db.sql("INSERT INTO truth_tests(_id,flag) VALUES ($1,$2)", [f"row{n}", state])
+            else:
+                with pytest.raises(SQLStateError) as violation:
+                    db.sql("INSERT INTO truth_tests(_id,flag) VALUES ($1,$2)", [f"row{n}", state])
+                assert violation.value.sqlstate == "23514"
+
+
+@pytest.mark.parametrize(
+    "predicate,sqlstate",
+    [
+        ("label", "22023"),
+        ("NOT label", "22023"),
+        ("label IS FALSE", "22023"),
+        ("archived OR label = ''", "0A000"),
+        ("NOT (archived AND label = '')", "0A000"),
+    ],
+)
+def test_sql_partial_index_rejects_invalid_predicates_without_schema_changes(
+    require_native, aflite_path, predicate, sqlstate
+):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE threads(n BIGINT, label TEXT, archived BOOLEAN)")
+        with db.open_table("threads") as table:
+            before = table.get_schema()
+        with pytest.raises(SQLStateError) as rejected:
+            db.sql(f"CREATE INDEX invalid ON threads(n) WHERE {predicate}")
+        assert rejected.value.sqlstate == sqlstate
+        with db.open_table("threads") as table:
+            assert table.get_schema() == before
+
+
+@pytest.mark.parametrize(
+    "predicate,value",
+    [
+        ("flag IS NOT TRUE", True),
+        ("flag IS NOT FALSE", False),
+        ("NOT (flag IS TRUE)", True),
+        ("NOT (flag IS FALSE)", False),
+    ],
+)
+def test_sql_partial_index_null_safe_historical_rows(require_native, aflite_path, predicate, value):
+    with af.create(aflite_path, no_sync=True) as db:
+        db.sql("CREATE TABLE historical(n BIGINT)")
+        db.sql("INSERT INTO historical(_id,n) VALUES ('old',1)")
+        db.sql("ALTER TABLE historical ADD COLUMN flag BOOLEAN NOT NULL DEFAULT false")
+        db.sql(f"CREATE INDEX visible ON historical(n) WHERE {predicate}")
+        with db.open_table("historical") as table:
+            assert table.get_schema()["relational_indexes"][0]["where"] == [
+                {"column": "flag", "op": "is_distinct", "value": value}
+            ]
+        assert db.sql(f"SELECT _id,flag FROM historical WHERE n>=0 AND {predicate}")["rows"] == [["old", None]]
+    with af.open(aflite_path) as db:
+        assert db.sql(f"SELECT _id,flag FROM historical WHERE n>=0 AND {predicate}")["rows"] == [["old", None]]
