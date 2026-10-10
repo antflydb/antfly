@@ -2683,3 +2683,54 @@ noinline fn qualifyDedicatedCleanupCpu() !void {
 test "text statistics trusted controls dedicated cleanup CPU cannot borrow health or ordinary capacity" {
     try qualifyDedicatedCleanupCpu();
 }
+
+noinline fn qualifyClosedRunningCheckpoint(phase: native.Class, use_abi: bool) !void {
+    const Clock = struct {
+        fn now() u64 {
+            return 100;
+        }
+    };
+    const owner_module = @import("api/runnable_owner_execution.zig");
+    var state: owner_module.State = .{ .owner_alloc = std.testing.allocator, .owner = try native.NodeOwner.init(.{ .slots = 4, .control_slots = 1, .cleanup_slots = 1, .max_operations = 8, .checkpoint_budget = 1048576, .quantum_ms = 100 }), .native_now_ns = Clock.now };
+    defer state.owner.deinit();
+    const scheduler = &state.owner.scheduler;
+    var execution: native.Execution = .{};
+    defer execution.finish();
+    const port = state.port();
+    const io = runtime.native_abi.IoBorrow.init(&std.testing.io);
+    var handle: ?*anyopaque = null;
+    defer if (handle) |value| port.finish(value);
+    if (use_abi) {
+        const status = port.start(port.context, &.{ .io = &io, .class = @backingInt(phase), .allow_wait = 0, .has_deadline = 1, .native_deadline = 1, .deadline_ns = 1000, .retained_bytes = 23, .out_handle = &handle });
+        if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+    } else try execution.start(scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = 1000, .retained_bytes = 23, .allow_wait = false }, phase);
+    const before = scheduler.stats();
+    state.owner.close();
+    if (use_abi) {
+        try std.testing.expectEqual(error.SchedulerClosed, runtime.error_abi.errorFromStatus(port.checkpoint(handle.?)));
+        try std.testing.expectEqual(error.SchedulerClosed, runtime.error_abi.errorFromStatus(port.checkpoint(handle.?)));
+    } else {
+        try std.testing.expectError(error.SchedulerClosed, execution.checkpoint());
+        try std.testing.expectError(error.SchedulerClosed, execution.checkLifetime());
+        try std.testing.expectEqual(phase, try execution.retainedClass());
+        try std.testing.expectEqual(@as(?u64, 1000), execution.entry.?.options.deadline_ns);
+    }
+    // A rejected publication does not release physical work or its CPU early.
+    const stopped = scheduler.stats();
+    try std.testing.expectEqual(before.operations, stopped.operations);
+    try std.testing.expectEqual(before.retained_bytes, stopped.retained_bytes);
+    try std.testing.expectEqual(before.runnable_slots, stopped.runnable_slots);
+    if (use_abi) {
+        port.finish(handle.?);
+        handle = null;
+    } else execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+}
+
+test "text statistics trusted controls running checkpoints reject closed publication before a quantum without early retirement" {
+    for ([_]native.Class{ .query, .write, .inference, .background, .control }) |phase| {
+        for ([_]bool{ false, true }) |use_abi| try qualifyClosedRunningCheckpoint(phase, use_abi);
+    }
+}

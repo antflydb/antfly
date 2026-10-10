@@ -337,6 +337,9 @@ pub const Scheduler = struct {
         self.lock();
         defer self.mutex.unlock();
         try self.checkAncestorsLocked(e);
+        // Close fences foreground publication even while the caller still
+        // owns a live grant. Physical joins and owning finish retire it.
+        if (self.closed and !e.retainedPhase()) return error.SchedulerClosed;
     }
 
     fn checkAncestorsLocked(self: *Scheduler, e: *const Entry) !void {
@@ -944,6 +947,7 @@ pub const Execution = struct {
             if (e.scheduler != owner) return error.InvalidRunnableTransition;
             if (e.state == .stopped) return e.failure orelse error.InvalidRunnableTransition;
             try owner.checkAncestorsLocked(e);
+            if (owner.closed and !e.retainedPhase()) return error.SchedulerClosed;
             break :blk e.options;
         };
         if (options.cancellation) |token| if (token.requested(token.ptr)) return error.Canceled;
@@ -978,7 +982,17 @@ pub const Execution = struct {
         }
         const e = if (self.entry) |*entry| entry else return;
         const owner = try schedulerFor(e, true);
-        try owner.checkAuthority(e);
+        owner.checkAuthority(e) catch |err| {
+            if (err == error.SchedulerClosed) {
+                self.checkpoints +|= 1;
+                // Preserve the existing safe-quantum CPU return so accepted
+                // completion can progress before foreground consumers join.
+                if (self.checkpoints >= owner.config.checkpoint_budget or
+                    e.options.now() -| self.quantum_start_ns >= @as(u64, owner.config.quantum_ms) * std.time.ns_per_ms)
+                    try owner.yield(e);
+            }
+            return err;
+        };
         self.checkpoints +|= 1;
         if (self.checkpoints < owner.config.checkpoint_budget and
             e.options.now() -| self.quantum_start_ns < @as(u64, owner.config.quantum_ms) * std.time.ns_per_ms) return;
