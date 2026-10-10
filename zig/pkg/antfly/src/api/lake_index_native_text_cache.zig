@@ -315,6 +315,10 @@ const Entry = struct {
     arena: std.heap.ArenaAllocator,
     writer: ?local.index.IndexWriter = null,
     seekable: bool = false,
+    statistics_version: u8 = 0,
+    term_statistics: ?corpus.statistics.Ref = null,
+    segment_summaries: []const ?corpus.statistics.Ref = &.{},
+    domain: [32]u8 = @splat(0),
     identities: @import("lake_index_text_predicate.zig").Identities = undefined,
     analysis: local.introducer.TextAnalysisConfig = .{},
     selected_field: ?[]const u8 = null,
@@ -325,7 +329,21 @@ const Entry = struct {
     resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
     fn build(self: *Entry, io: std.Io, store: stores.ArtifactStore, root: corpus.Root, name: []const u8, schema_json: []const u8, cached: artifacts.CachedRead, cancellation: Cancellation, base: ?*Entry, peers: []const *Entry) !void {
         self.seekable = root.seekable;
+        self.statistics_version = root.statistics_version;
+        self.term_statistics = root.term_statistics;
+        self.domain = root.domain;
         const a = self.arena.allocator();
+        if (root.statistics_version == 1) {
+            const refs = try a.alloc(?corpus.statistics.Ref, root.segments.len);
+            var position_: usize = 0;
+            for (root.file_groups) |group| {
+                if (group.summaries.len != group.segments.len or group.summaries.len > refs.len - position_) return error.InvalidNativeLakeTextCorpus;
+                @memcpy(refs[position_..][0..group.summaries.len], group.summaries);
+                position_ += group.summaries.len;
+            }
+            if (position_ != refs.len) return error.InvalidNativeLakeTextCorpus;
+            self.segment_summaries = refs;
+        }
         if (root.stored_projection) {
             const fields = try a.alloc([]const u8, root.binding.column_bindings.len);
             for (fields, root.binding.column_bindings) |*field, path| field.* = try a.dupe(u8, path);
@@ -454,6 +472,7 @@ const Entry = struct {
     const QueryLease = struct {
         entry: *Entry,
         read: @import("lake_index_seekable_text.zig").Read,
+        statistics: corpus.statistics.Reader = undefined,
         fn release(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const entry = self.entry;
@@ -466,7 +485,12 @@ const Entry = struct {
         const lease = self.allocator.create(QueryLease) catch return error.NativeLakeTextCacheBusy;
         errdefer self.allocator.destroy(lease);
         lease.* = .{ .entry = self, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager } };
-        return .{ .snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .provider_metadata = &self.identities, .owner = lease, .release_owner = QueryLease.release };
+        const snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err;
+        if (self.statistics_version == 1) {
+            lease.statistics = .{ .read = lease.read, .domain = self.domain, .global = self.term_statistics, .segments = self.segment_summaries };
+            snapshot.text_statistics = lease.statistics.interface();
+        }
+        return .{ .snapshot = snapshot, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .stored_projection_fields = self.stored_projection_fields, .provider_metadata = &self.identities, .owner = lease, .release_owner = QueryLease.release };
     }
     fn releaseSource(raw: *anyopaque) void {
         const self: *Entry = @ptrCast(@alignCast(raw));

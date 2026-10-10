@@ -929,10 +929,6 @@ pub const IndexSnapshot = struct {
     epoch: u64,
     segments: []SegmentEntry,
     global_total_field_len: std.StringHashMapUnmanaged(u64),
-    // TODO: Profile significant_terms term-doc-freq lookups before adding a
-    // persisted term-stat sidecar. If this cache shows up hot across snapshot
-    // rebuilds/reopens, consider a sidecar keyed by segment/snapshot identity
-    // instead of re-walking dictionaries/postings.
     term_doc_freq_cache_mu: std.atomic.Mutex,
     // Bounded singleflight stripes. Warm hits avoid these; cold readers of
     // the same term batch reuse the first reader's exact, generation-bound result.
@@ -952,6 +948,15 @@ pub const IndexSnapshot = struct {
     /// The owner contains no query capability; cache misses use this facade.
     scoring_owner: ?*IndexSnapshot = null,
 
+    /// Installed only on a query facade. Shared scoring caches retain values,
+    /// never the caller's credentials, publication lease or read capability.
+    text_statistics: ?TextStatistics = null,
+    pub const TextStatistics = struct {
+        ptr: *anyopaque,
+        check: *const fn (*anyopaque) anyerror!void,
+        frequencies: *const fn (*anyopaque, Allocator, []const u8, []const []const u8, []u32) anyerror!void,
+        summary: *const fn (*anyopaque, Allocator, usize, []const u8, []const u8, f32, inverted.BM25Config) anyerror!TextTermSummary,
+    };
     pub const TextTermSummary = struct { frequency: u32, tf_upper: f32 };
     fn textSummaryKey(a: Allocator, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config) ![]u8 {
         const key = try a.alloc(u8, 28 + field.len + term.len);
@@ -965,13 +970,23 @@ pub const IndexSnapshot = struct {
         return key;
     }
     pub fn cachedTextTermSummary(self: *const IndexSnapshot, a: Allocator, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config) !?TextTermSummary {
+        if (self.text_statistics) |reader| try reader.check(reader.ptr);
         if (self.segments[segment].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
         const key = try textSummaryKey(a, segment, field, term, average, config);
         defer a.free(key);
         const owner = self.scoringCache();
         while (!owner.text_summary_mu.tryLock()) spinOrYield();
-        defer owner.text_summary_mu.unlock();
-        return owner.text_summaries.get(key);
+        const cached = owner.text_summaries.get(key);
+        owner.text_summary_mu.unlock();
+        if (cached) |value| return value;
+        if (self.text_statistics) |reader| {
+            const value = try reader.summary(reader.ptr, a, segment, field, term, average, config);
+            try reader.check(reader.ptr);
+            if (self.segments[segment].query_source) |source| if (source == .ranges) if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
+            try self.rememberTextTermSummary(segment, field, term, average, config, value);
+            return value;
+        }
+        return null;
     }
     pub fn rememberTextTermSummary(self: *const IndexSnapshot, segment: usize, field: []const u8, term: []const u8, average: f32, config: inverted.BM25Config, value: TextTermSummary) !void {
         const owner = self.scoringCache();
@@ -1474,6 +1489,7 @@ pub const IndexSnapshot = struct {
     }
 
     fn checkScoringReadContext(self: *const IndexSnapshot) !void {
+        if (self.text_statistics) |reader| try reader.check(reader.ptr);
         for (self.segments) |segment| if (segment.query_source) |source| if (source == .ranges) {
             if (source.ranges.check_read_context) |check| try check(source.ranges.ptr);
         };
@@ -1532,6 +1548,12 @@ pub const IndexSnapshot = struct {
             } else cold = true;
         };
         if (!cold) return;
+        if (self.text_statistics) |reader| {
+            try reader.frequencies(reader.ptr, alloc, field, terms, output);
+            try self.checkScoringReadContext();
+            for (terms, output, missing) |term, value, miss| if (miss) self.cacheTermDocFreq(field, term, value);
+            return;
+        }
         const scheduler = @import("sql/parallel_scheduler.zig");
         const Worker = struct {
             fn run(snapshot_ref: *const IndexSnapshot, a: Allocator, name: []const u8, needles: []const []const u8, mask: []const bool, counts: []u32, lane: usize, lanes: usize) anyerror!void {

@@ -1297,3 +1297,106 @@ Qualification for these refinements with Zig 0.17.0:
   signed/zero sparse ranking, positional filters, sorted cursor pages and
   persistence; quantized sparse score/ranking preservation. The entire
   `e2e-full` suite was not run; the Iceberg fixtures remain registered there.
+
+## Persisted statistics and request-wide planning (#1058)
+
+Status: implemented. This phase keeps the native engine, query syntax, scoring
+semantics and snapshot/cursor contracts. Representative archive benchmarks remain
+pending; work-count regressions demonstrate the eliminated work without claiming
+throughput on the 50-million-row archive.
+
+### Authenticated text statistics and segment summaries
+
+New native text publications include an immutable global term-frequency B-tree
+and a summary B-tree for each segment. Keys encode the field length, field and
+term without delimiter ambiguity. Global values store u64 document frequencies;
+segment values store document frequency, maximum frequency and minimum norm.
+Existing authenticated native field headers supply field totals and average
+lengths. Serving seeks only requested term pages, avoiding the cold dictionary
+pass across every segment. Summary planning still visits the segment inventory,
+but opens statistics pages rather than each segment's native dictionary.
+
+The page trees reuse the existing authenticated page format, SHA-256 identities,
+publication domains and upload attempts. Pages target 32 KiB with a 1 MiB hard
+limit. Requests use current credentials, publication leases and cancellation;
+shared corpus entries retain only immutable references and bounded scalar caches.
+Warm cache hits still check request authority. Referenced missing, malformed or
+cross-domain pages fail the request. Legacy publications without statistics keep
+the exact dictionary fallback. An authenticated statistics-version fence prevents reusing old builds as new
+statistics-bearing publications; optional fields preserve metadata compatibility.
+The stored-source recipe stays stable, preserving legacy coverage attestation.
+
+Builders stream sorted segment dictionary metadata without decoding postings.
+Signed per-file deltas spill with a 4 MiB in-memory run target under the existing
+1 GiB temporary disk cap. Publication working-set admission also bounds sorting,
+merge buffers and concurrent runs. Incremental publications subtract replaced or removed file
+contributions and add new contributions, retaining unchanged summaries. Global
+updates apply sorted mutations in batches of at most 4096 entries or 2 MiB and
+copy only touched B-tree paths. Initial builds stream the merged vocabulary into
+the tree. Publication read/write budgets remain explicit; exceeding them fails
+publication before its fenced commit, leaving the prior generation readable.
+
+Raw envelopes exclude request scoring parameters. Readers derive conservative
+BM25 ceilings using the request's average length, k1 and b. Frequency saturation
+retains the asymptotic ceiling. Combining a segment's maximum frequency and
+minimum norm may produce a looser bound than individual block pairs; it cannot
+exclude a valid winner. Full-corpus deletion semantics and complete/partial
+distributed overrides retain their established behavior.
+
+Global and segment roots belong to the authenticated corpus/file manifests and
+GC reachability graph. Durable collection traverses every page and retains roots
+reachable only from a live reader's pinned publication. Releasing that reader
+allows the obsolete pages to be reclaimed.
+
+### Sparse active-stream routing
+
+Parallel sparse search builds one immutable interval directory, sorted by stream
+start and augmented with subtree maximum ends. Each task enumerates overlapping
+streams and restores their original index order before scoring, preserving
+signed f32 addition and ordinal ties. Unknown legacy bounds cover the whole
+pinned domain. The exclusive 2^32 endpoint and existing mask semantics remain
+supported.
+
+Task planning and routing share a 4 MiB allocation cap. The directory uses one
+24-byte record per stream; it never stores a ranges-times-streams matrix. Each
+lane reuses decoder and index arrays sized to its maximum active overlap, instead
+of allocating arrays for the entire archive inventory or rescanning that inventory
+for each range. Existing per-lane and shared scheduler workspace limits still
+apply. Explicit planning-cap exhaustion selects the exact serial/spill path
+before any shared cutoff is published. Ordinary allocation failures propagate;
+worker cancellation and errors join all tasks before releasing the directory.
+
+The routing regression uses 8192 streams, returns the three canonical overlapping
+indices, and visits fewer than 64 tree nodes. It also covers whole-domain legacy
+bounds, the final u32 row and allocation-failure cleanup. Existing signed-score,
+mask, provider-error and parallel fallback regressions exercise the serving path.
+
+### Analyze and lower text queries once per request
+
+An immutable request-owned query tree resolves analysis, deduplication, simple
+Boolean flattening, minimum-should-match rules, optional grouping, normalization
+and distributed-statistics choices before segment planning starts. Phrase groups
+retain alternatives, repeated positions, slop and analyzed gaps. Metadata planning,
+prepared readers and scoring lanes bind segment-local scoring constants, readers
+and private mutable iterators to that tree.
+
+The tree lives in the request statistics arena and never enters a snapshot cache.
+Cached readers and scalar summaries continue to use query-bound read authority.
+The regression lowers repeated match clauses across 20 segments, changes the
+analyzer afterward, then proves segment binding retains the established streaming
+score bits. Allocation-failure checks cover the lowered request's ownership.
+Existing differential tests cover nested/mixed-field clauses, phrases, filters,
+negative/zero boosts, cursors and complete/partial distributed statistics.
+
+### Qualification
+
+Focused Debug and ReleaseFast suites, incremental publication/GC integration,
+the production build and real Parquet/Iceberg fixtures qualify this phase. Iceberg
+remains registered in `e2e-full`. Statistics regressions prove cold reads avoid
+native dictionary I/O, incremental updates preserve exact frequencies, sorted
+runs spill, a one-term update rewrites less than 64 KiB of an 8000-term tree, and
+obsolete statistics remain reachable until the last pinned reader releases them.
+
+Archive-scale cold/warm throughput, fetched bytes, cache hit rates, planning and
+lane peaks, and process RSS still need measurement on a representative fragmented
+archive. No archive-scale speedup is asserted by these bounded regressions.
