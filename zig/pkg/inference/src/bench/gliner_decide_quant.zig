@@ -39,9 +39,14 @@ pub fn main(init: std.process.Init) !void {
     var warmups: usize = 3;
     var reps: usize = 20;
     var tolerance: f64 = 0.05;
+    var worker = false;
     while (args.next()) |key| {
         const value = args.next() orelse return error.MissingArgument;
-        if (std.mem.eql(u8, key, "--model-dir")) path = value else if (std.mem.eql(u8, key, "--capture")) capture = value else if (std.mem.eql(u8, key, "--backend")) backend = value else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--reps")) reps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--tolerance")) tolerance = try std.fmt.parseFloat(f64, value) else return error.InvalidArgument;
+        if (std.mem.eql(u8, key, "--model-dir")) path = value else if (std.mem.eql(u8, key, "--capture")) capture = value else if (std.mem.eql(u8, key, "--backend")) backend = value else if (std.mem.eql(u8, key, "--warmups")) warmups = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--reps")) reps = try std.fmt.parseInt(usize, value, 10) else if (std.mem.eql(u8, key, "--tolerance")) tolerance = try std.fmt.parseFloat(f64, value) else if (std.mem.eql(u8, key, "--worker")) worker = switch (try std.fmt.parseInt(u8, value, 10)) {
+            0 => false,
+            1 => true,
+            else => return error.InvalidArgument,
+        } else return error.InvalidArgument;
     }
     if (reps < 3 or reps > 1000 or warmups > 100 or !std.math.isFinite(tolerance) or tolerance <= 0) return error.InvalidArgument;
     const bytes = try inference.util.c_file.readFile(a, capture orelse return error.MissingArgument);
@@ -66,6 +71,52 @@ pub fn main(init: std.process.Init) !void {
     const watchdog = if (std.mem.eql(u8, backend, "metal") or std.mem.eql(u8, backend, "cuda")) try inference.HardCancellationWatchdog.create(a) else null;
     defer if (watchdog) |owner| owner.destroy();
     if (watchdog) |owner| try owner.start(init.io);
+    if (worker) {
+        const ready = try std.json.Stringify.valueAlloc(a, .{
+            .event = "ready",
+            .backend = backend,
+            .build_mode = @tagName(@import("builtin").mode),
+            .model_dir = directory,
+            .capture = capture.?,
+            .cases = cases.value.len,
+            .load_ms = load_ms,
+            .tolerance = tolerance,
+            .qualification = false,
+            .timing_boundary = "prepared_cpu_input_upload+encoder+classifier+completed_cpu_readback",
+            .cuda_stats = factory.getCudaRuntimeStats(session),
+        }, .{});
+        defer a.free(ready);
+        try std.Io.File.stdout().writeStreamingAll(init.io, ready);
+        try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
+        var buffer: [4096]u8 = undefined;
+        var stdin = std.Io.File.stdin().readerStreaming(init.io, &buffer);
+        const Command = struct { request_id: u32, op: enum { validate, run, stop }, case_index: usize = 0 };
+        var commands: usize = 0;
+        while (try stdin.interface.takeDelimiter('\n')) |line| {
+            if (line.len > 2048 or commands >= 65536) return error.BenchmarkCommandLimitExceeded;
+            commands += 1;
+            const command = try std.json.parseFromSlice(Command, a, line, .{});
+            defer command.deinit();
+            if (command.value.op == .stop) return;
+            if (command.value.case_index >= cases.value.len) return error.InvalidCase;
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const invocation = try invoke(arena.allocator(), session, tok, config, watchdog, cases.value[command.value.case_index], tolerance);
+            const response = try std.json.Stringify.valueAlloc(arena.allocator(), .{
+                .request_id = command.value.request_id,
+                .id = cases.value[command.value.case_index].id,
+                .tokens = cases.value[command.value.case_index].input_ids.len,
+                .elapsed_ms = invocation.elapsed_ms,
+                .core_ms = invocation.core_ms,
+                .max_logit_error = invocation.max_logit_error,
+                .logits = invocation.logits,
+                .cuda_stats = factory.getCudaRuntimeStats(session),
+            }, .{});
+            try std.Io.File.stdout().writeStreamingAll(init.io, response);
+            try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
+        }
+        return error.BenchmarkProtocolEndedWithoutStop;
+    }
     var report_arena = std.heap.ArenaAllocator.init(a);
     defer report_arena.deinit();
     const out = report_arena.allocator();
@@ -79,38 +130,11 @@ pub fn main(init: std.process.Init) !void {
             var request_arena = std.heap.ArenaAllocator.init(a);
             defer request_arena.deinit();
             const ra = request_arena.allocator();
-            const control = inference.InferenceExecutionControl{
-                .hard_cancellation = if (watchdog) |owner| owner.boundary() else null,
-                .deadline_ns = inference.platform.time.monotonicNs() + 120 * std.time.ns_per_s,
-            };
-            const start = inference.platform.time.monotonicNs();
-            var compiled = try schema.compile(ra, case.schema_json, .{});
-            defer compiled.deinit();
-            var prepared = try processor.prepare(ra, tok.tokenizer(), &.{.{ .text = case.text, .schema = &compiled }}, .{ .max_sequence_tokens = 7999, .max_batch_tokens = 7999 });
-            defer prepared.deinit();
-            if (prepared.samples.len != 1) return error.InvalidCase;
-            const counts = try ra.alloc(usize, compiled.schema.classifications.len);
-            for (compiled.schema.classifications, counts) |classification, *count| count.* = classification.task.labels.len;
-            const core_start = inference.platform.time.monotonicNs();
-            var managed = try factory.getManagedComputeBackend(session, ra, null, control);
-            defer managed.deinit();
-            const rows = try executor.classificationLogits(&managed.backend, ra, .{ .modern_bert = config.modern_bert }, prepared.samples[0], counts);
-            const end = inference.platform.time.monotonicNs();
-            const elapsed = @as(f64, @floatFromInt(end - start)) / std.time.ns_per_ms;
-            const core_elapsed = @as(f64, @floatFromInt(end - core_start)) / std.time.ns_per_ms;
-            if (!std.mem.eql(i64, prepared.input_ids, case.input_ids) or rows.len != case.logits.len) return error.PreprocessingMismatch;
-            for (rows, case.logits) |got, expected| {
-                if (got.len != expected.len) return error.LogitShapeMismatch;
-                for (got, expected) |actual, want| {
-                    if (!std.math.isFinite(actual) or !std.math.isFinite(want)) return error.NonFiniteLogit;
-                    const delta = @abs(actual - want);
-                    max_error = @max(max_error, delta);
-                    if (delta > tolerance) {
-                        std.debug.print("{s}: logit error {d} exceeds {d}\n", .{ case.id, delta, tolerance });
-                        return error.LogitMismatch;
-                    }
-                }
-            }
+            const invocation = try invoke(ra, session, tok, config, watchdog, case, tolerance);
+            const elapsed = invocation.elapsed_ms;
+            const core_elapsed = invocation.core_ms;
+            const rows = invocation.logits;
+            max_error = @max(max_error, invocation.max_logit_error);
             if (iteration > warmups) {
                 samples[iteration - warmups - 1] = elapsed;
                 core_samples[iteration - warmups - 1] = core_elapsed;
@@ -139,4 +163,43 @@ pub fn main(init: std.process.Init) !void {
     defer a.free(result);
     try std.Io.File.stdout().writeStreamingAll(init.io, result);
     try std.Io.File.stdout().writeStreamingAll(init.io, "\n");
+}
+
+const Invocation = struct { elapsed_ms: f64, core_ms: f64, max_logit_error: f64, logits: [][]f64 };
+
+fn invoke(ra: std.mem.Allocator, session: anytype, tok: anytype, config: anytype, watchdog: anytype, case: Case, tolerance: f64) !Invocation {
+    var max_error: f64 = 0;
+    const control = inference.InferenceExecutionControl{
+        .hard_cancellation = if (watchdog) |owner| owner.boundary() else null,
+        .deadline_ns = inference.platform.time.monotonicNs() + 120 * std.time.ns_per_s,
+    };
+    const start = inference.platform.time.monotonicNs();
+    var compiled = try schema.compile(ra, case.schema_json, .{});
+    defer compiled.deinit();
+    var prepared = try processor.prepare(ra, tok.tokenizer(), &.{.{ .text = case.text, .schema = &compiled }}, .{ .max_sequence_tokens = 7999, .max_batch_tokens = 7999 });
+    defer prepared.deinit();
+    if (prepared.samples.len != 1) return error.InvalidCase;
+    const counts = try ra.alloc(usize, compiled.schema.classifications.len);
+    for (compiled.schema.classifications, counts) |classification, *count| count.* = classification.task.labels.len;
+    const core_start = inference.platform.time.monotonicNs();
+    var managed = try factory.getManagedComputeBackend(session, ra, null, control);
+    defer managed.deinit();
+    const rows = try executor.classificationLogits(&managed.backend, ra, .{ .modern_bert = config.modern_bert }, prepared.samples[0], counts);
+    const end = inference.platform.time.monotonicNs();
+    const elapsed = @as(f64, @floatFromInt(end - start)) / std.time.ns_per_ms;
+    const core_elapsed = @as(f64, @floatFromInt(end - core_start)) / std.time.ns_per_ms;
+    if (!std.mem.eql(i64, prepared.input_ids, case.input_ids) or rows.len != case.logits.len) return error.PreprocessingMismatch;
+    for (rows, case.logits) |got, expected| {
+        if (got.len != expected.len) return error.LogitShapeMismatch;
+        for (got, expected) |actual, want| {
+            if (!std.math.isFinite(actual) or !std.math.isFinite(want)) return error.NonFiniteLogit;
+            const delta = @abs(actual - want);
+            max_error = @max(max_error, delta);
+            if (delta > tolerance) {
+                std.debug.print("{s}: logit error {d} exceeds {d}\n", .{ case.id, delta, tolerance });
+                return error.LogitMismatch;
+            }
+        }
+    }
+    return .{ .elapsed_ms = elapsed, .core_ms = core_elapsed, .max_logit_error = max_error, .logits = rows };
 }

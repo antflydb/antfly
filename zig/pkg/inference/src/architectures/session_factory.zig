@@ -1950,6 +1950,8 @@ fn createCudaSessionWithRequiredProfile(
     cuda_compute.gliner_q8_f16_mirrors = cuda_compute.gliner_encoder_attention and
         native_impl.gliner_decision_identity != null and !native_impl.gliner_decision_identity.?.inventory.all_f32 and
         platform.env.getenvBool("ANTFLY_CUDA_GLINER_1B_Q8_F16_MIRRORS");
+    cuda_compute.gliner_q8_f16_attention = cuda_compute.gliner_q8_f16_mirrors and
+        platform.env.getenvBoolDefault("ANTFLY_CUDA_GLINER_1B_Q8_F16_ATTENTION", true);
     cuda_compute.laya_optimizations = (cuda_profile == .laya or cuda_profile == .gliner25_modern_bert) and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_OPTIMIZATIONS", true);
     cuda_compute.laya_fusion = cuda_compute.laya_optimizations and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_FUSION", true);
     if (a4b_inference != null and

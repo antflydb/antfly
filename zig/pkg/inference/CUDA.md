@@ -489,45 +489,93 @@ encoder/classifier/completed-readback clock; HTTP and model load are separate.
 projection candidate analogous to the Metal optimization. Only the 112 typed
 encoder projections receive mirrors. Raw Q8 tensors remain resident; token
 embedding lookup and F32 normalization, attention and task heads retain their
-existing routes. Host decoding uses a 16 KiB F32 tile and at most 26.25 MiB of
+existing routes for short inputs. At 512 through 7,999 encoder tokens, complete
+mirror profiles use tiled FP16 tensor-core attention with F32 online softmax
+and output accumulation. Global layers use wider query tiles from 2,048 tokens;
+local layers preserve their exact window and key masks. Missing optional
+attention symbols retain F32 attention. Set
+`ANTFLY_CUDA_GLINER_1B_Q8_F16_ATTENTION=0` to compare the previous attention
+route while retaining the projection mirrors. This switch has no effect on
+dense-source precision profiles or the public serving qualification gate.
+Host decoding uses a 16 KiB F32 tile and at most 26.25 MiB of
 FP16 staging per projection, checked for malformed blocks and finite FP16
 range. The mirror replaces the Q8 tensor-core pack rather than adding a third
 weight representation. Model teardown releases all mirrors. Disabling the
 candidate, or lacking its complete FP16 kernel/library capabilities, retains
 Q8 execution. Device residency includes all execution packs and mirrors.
 
-On an NVIDIA L4 with driver 580.159.03, all 14 published cases retain their
-Q8-reference selections. Maximum logit error is 0.00177 for packed tensor-core
-execution, 0.00140 with FP16 projection mirrors, and 0.00000477 for direct Q8.
-The original FP32 checkpoint also passes all 14 cases (maximum error 0.00000406).
-Projection mirrors use 3.61 GB of resident weights, versus 2.73 GB for Q8 plus
-tensor-core packs and 1.74 GB for direct Q8. Prepared-core diagnostic medians
-for the mirror profile and a decoded-Q8 PyTorch FP16 SDPA reference are:
+On an NVIDIA L4 with driver 580.159.03, a fresh Q8 comparison uses 30 paired
+rounds and 200 additional tail rounds per case, after three warmups and one
+validation preflight. The previous mirror path and the new path use the same
+optimized binary; only the attention switch differs. All three models remain
+resident and execute serially in balanced permutations. Prepared-core medians
+across all 230 timed rounds are:
 
-| Tokens, batch 1 | Native mirrors | PyTorch FP16 |
-|---|---:|---:|
-| 25 | 9.86 ms | 22.80 ms |
-| 83 | 13.79 ms | 24.74 ms |
-| 198 | 24.84 ms | 25.05 ms |
-| 512 | 70.58 ms | 30.53 ms |
-| 2,048 | 664.25 ms | 132.94 ms |
+| Tokens, batch 1 | Previous mirrors | Tiled-attention mirrors | PyTorch FP16 | CUDA/Python latency |
+|---|---:|---:|---:|---:|
+| 25 | 9.81 ms | 9.81 ms | 23.47 ms | 0.418× |
+| 83 | 13.24 ms | 13.10 ms | 25.92 ms | 0.505× |
+| 198 | 24.51 ms | 24.18 ms | 26.49 ms | 0.913× |
+| 512 | 77.38 ms | 32.08 ms | 32.02 ms | 1.002× |
+| 2,048 | 688.78 ms | 145.48 ms | 137.58 ms | 1.057× |
 
-These are sequential, unpaired diagnostic replays with three warmups and ten
-timed repetitions, not a release performance campaign. Both clocks include
-prepared CPU input upload and completed CPU logit readback. Python uses
-Torch 2.14.0/Transformers 5.17.0, SDPA, disabled TF32 and an FP16 encoder with
-an F32 classifier; native retains F32 embedding outputs, norms and attention. The
-Python resident model contains only the encoder and classifier, while native
-retains the complete bundle. The two synthetic capacity cases pass a 0.002
-logit tolerance against an independent decoded-Q8 F32 reference. Short-case
-competitiveness does not establish long-context parity: the 512/2,048-token
-cells remain slower, and qualifying tensor-core attention for this Q8 profile
-is follow-up work.
+The paired native speedups are **2.409×** at 512 tokens (95% bootstrap CI
+2.369–2.445×) and **4.745×** at 2,048 tokens (4.658–4.772×). The 512-token
+cell reaches Python parity; the 2,048-token median remains **5.7% slower**.
+All five cells pass the 10% latency regression guard against Python. At 2,048
+tokens, native/Python p95 is 149.33/141.07 ms. Performance is scoped to these
+batch-1 cells and this hardware; it does not establish serving qualification.
+
+Both clocks include prepared CPU input upload and completed CPU logit readback.
+Python uses Torch 2.14.0+cu130/Transformers 5.17.0, SDPA, disabled TF32 and an
+FP16 encoder with an F32 classifier. Native retains F32 embedding outputs,
+norms, classifier and attention accumulation, with FP16 attention operands at
+long contexts. These arithmetic profiles differ. Both native mirror routes use
+3.61 GB of resident weights, versus 2.73 GB for Q8 plus tensor-core packs and
+1.74 GB for direct Q8 in earlier diagnostic measurements. Native retains the
+complete bundle; Python loads only the encoder and classifier. No additional
+projection mirrors or global attention score allocation are introduced.
+
+The previous unpaired 70.58/664.25 ms native measurements motivated this change;
+the paired table uses fresh baselines rather than mixing campaigns. Source,
+binary and model pins, raw samples and validation receipts are saved under
+`/tmp/antfly-gliner25-q8-long-context/`, including `paired/report.json` and
+`validation-receipt.json`. Runtime counters confirm 13,104 FP16 attention
+launches (2,340 wide global tiles), with F32 attention retained in short cases.
 
 CUDA validation is independent of public serving qualification. The exact
 Q8 bundle does not acquire CUDA `/decisions` qualification from the Metal PR
 or this offline benchmark. HTTP admission, cancellation/concurrency, broad
 holdouts and the complete capacity/performance matrix remain release checks.
+
+The long-context route passes all 14 published cases and both synthetic
+512/2,048-token capacity cases at the existing 0.002 absolute logit tolerance
+(maximum error 0.001394). Seven direct attention checks cover key masks,
+empty documents, batched/odd lengths, local windows and wide global tiles.
+Eight additional multilingual/compound-padding holdouts through 7,999 tokens
+preserve selected labels, but only five pass the same 0.002 logit bound in
+either mirror route. Maximum absolute error is 0.004900 in both profiles;
+the largest change between them is 0.007043 on a 512-token hard case. That
+case also exceeds the Python FP16 0.01 error bound. These diagnostics do not
+qualify FP16 numerical behavior on broader inputs or public CUDA serving.
+
+For fresh paired Q8 measurements, provide a capture containing independent
+decoded-Q8 reference logits and use the persistent worker controller:
+
+```sh
+python scripts/gliner25/benchmark_decide_quant.py \
+  --model-dir "$MODEL" --capture /tmp/gliner-decide-q8-cases.json \
+  --native zig-out/bin/antfly-inference-gliner-decide-quant-bench \
+  --pairs 30 --tails 200 --warmups 3 --output /tmp/gliner-decide-q8-paired
+```
+
+The controller keeps the previous F32-attention mirror route, the new attention
+route, and the decoded-Q8 PyTorch FP16 SDPA model resident. It executes them
+serially in balanced permutations, checks logits and selected labels on every
+invocation, and saves paired confidence intervals, latency distributions,
+compressed raw samples, kernel counters, artifact hashes and runtime versions.
+Python requires PyTorch, Transformers and NumPy. Captures and model artifacts
+stay outside Git, and the output directory must be new.
 
 Build optimized workers from `zig/pkg/inference`:
 

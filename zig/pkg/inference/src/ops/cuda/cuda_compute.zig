@@ -1526,6 +1526,9 @@ pub const RuntimeStats = struct {
     prefill_profile_f16_linear_us: u64 = 0,
     gliner_boundary_wide_attention_launches: usize = 0,
     gliner_boundary_compact_attention_launches: usize = 0,
+    gliner_encoder_f32_attention_launches: usize = 0,
+    gliner_encoder_f16_attention_launches: usize = 0,
+    gliner_encoder_wide_attention_launches: usize = 0,
     prefill_profile_bf16_qkv_us: u64 = 0,
     prefill_profile_bf16_pair_us: u64 = 0,
     prefill_profile_attention_us: u64 = 0,
@@ -2170,6 +2173,9 @@ pub const CudaCompute = struct {
     /// Opt-in decoded Q8 projection mirrors for the authenticated Decide-1B
     /// bundle. Raw Q8 embeddings/weights and all F32 heads remain resident.
     gliner_q8_f16_mirrors: bool = false,
+    /// Long-context attention for the opt-in Q8 mirror profile. Kept separate
+    /// from dense mixed precision and disabled without all 112 mirrors.
+    gliner_q8_f16_attention: bool = false,
     /// Frozen load-time contract for the qualified resident Gemma 4 A4B path.
     /// A non-null value is fail-closed: generic MoE fallback is not permitted.
     a4b_inference: ?backend_contracts.A4bInferenceConfig = null,
@@ -18655,6 +18661,48 @@ fn packedGegluExact(ctx: *anyopaque, input: CT, rows: usize, width: usize) anyer
     return createTensor(self, device, shape, count);
 }
 
+fn glinerQ8F16AttentionEligible(self: *const CudaCompute, batch: usize, seq: usize, heads: usize, dim: usize) bool {
+    return self.gliner_encoder_attention and self.gliner_q8_f16_mirrors and self.gliner_q8_f16_attention and
+        self.gliner_boundary_f16_mirrors.count() == 112 and
+        batch > 0 and seq >= 512 and seq <= 7999 and heads == 28 and dim == 64 and
+        self.ctx.info.compute_major >= 7 and self.kernels.gliner_encoder_attention_tc_f16 != null;
+}
+
+test "GLiNER Decide CUDA Q8 long-context attention requires complete supported mirror profile" {
+    var compute: CudaCompute = undefined;
+    compute.gliner_encoder_attention = true;
+    compute.gliner_q8_f16_mirrors = true;
+    compute.gliner_q8_f16_attention = true;
+    compute.ctx.info.compute_major = 8;
+    compute.kernels.gliner_encoder_attention_tc_f16 = @ptrFromInt(1);
+    compute.gliner_boundary_f16_mirrors = .{};
+    defer compute.gliner_boundary_f16_mirrors.deinit(std.testing.allocator);
+    for (0..111) |index| try compute.gliner_boundary_f16_mirrors.put(std.testing.allocator, index + 1, .{});
+    try std.testing.expect(!glinerQ8F16AttentionEligible(&compute, 1, 2048, 28, 64));
+    try compute.gliner_boundary_f16_mirrors.put(std.testing.allocator, 112, .{});
+    try std.testing.expect(glinerQ8F16AttentionEligible(&compute, 1, 512, 28, 64));
+    try std.testing.expect(glinerQ8F16AttentionEligible(&compute, 8, 7999, 28, 64));
+    try std.testing.expect(!glinerQ8F16AttentionEligible(&compute, 1, 511, 28, 64));
+    try std.testing.expect(!glinerQ8F16AttentionEligible(&compute, 1, 8000, 28, 64));
+    try std.testing.expect(!glinerQ8F16AttentionEligible(&compute, 0, 2048, 28, 64));
+    try std.testing.expect(!glinerQ8F16AttentionEligible(&compute, 1, 2048, 14, 64));
+    try std.testing.expect(!glinerQ8F16AttentionEligible(&compute, 1, 2048, 28, 128));
+    compute.ctx.info.compute_major = 6;
+    try std.testing.expect(!glinerQ8F16AttentionEligible(&compute, 1, 2048, 28, 64));
+    compute.ctx.info.compute_major = 8;
+    compute.kernels.gliner_encoder_attention_tc_f16 = null;
+    try std.testing.expect(!glinerQ8F16AttentionEligible(&compute, 1, 2048, 28, 64));
+    compute.kernels.gliner_encoder_attention_tc_f16 = @ptrFromInt(1);
+    compute.gliner_q8_f16_attention = false;
+    try std.testing.expect(!glinerQ8F16AttentionEligible(&compute, 1, 2048, 28, 64));
+    compute.gliner_q8_f16_attention = true;
+    compute.gliner_q8_f16_mirrors = false;
+    try std.testing.expect(!glinerQ8F16AttentionEligible(&compute, 1, 2048, 28, 64));
+    compute.gliner_q8_f16_mirrors = true;
+    compute.gliner_encoder_attention = false;
+    try std.testing.expect(!glinerQ8F16AttentionEligible(&compute, 1, 2048, 28, 64));
+}
+
 fn encoderLocalAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, mask: []const i64, batch: usize, seq: usize, heads: usize, dim: usize, radius: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const count = try checkedMul(try checkedMul(batch, seq), try checkedMul(heads, dim));
@@ -18668,12 +18716,16 @@ fn encoderLocalAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, mask: []const i64
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    if (self.gliner_mixed_attention and dim == 64) {
-        var profile = beginPrefillProfile(self, .attention, batch * seq);
-        defer if (profile) |*scope| scope.end();
+    var profile = beginPrefillProfile(self, .attention, batch * seq);
+    defer if (profile) |*scope| scope.end();
+    if ((self.gliner_mixed_attention and dim == 64) or glinerQ8F16AttentionEligible(self, batch, seq, heads, dim)) {
         try self.kernels.launchGlinerEncoderAttentionTcF16(&self.ctx, device, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
+        self.stats.gliner_encoder_f16_attention_launches += 1;
+        if (seq >= 2048 and radius >= seq and self.kernels.gliner_encoder_attention_tc_f16_m64 != null)
+            self.stats.gliner_encoder_wide_attention_launches += 1;
     } else if (self.gliner_encoder_attention) {
         try self.kernels.launchGlinerEncoderAttentionF32(&self.ctx, device, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
+        self.stats.gliner_encoder_f32_attention_launches += 1;
     } else if (layaWarpEligible(self, batch, seq, dim)) {
         try self.kernels.launchLayaAttentionWarpF32(&self.ctx, device, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
         self.stats.laya_warp_attention += 1;
@@ -18750,13 +18802,17 @@ fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64,
     defer if (prefill_profile_scope) |*scope| scope.end();
     // Mixed candidates retain F32 softmax/output accumulation and use F16
     // attention operands even when encoder matrix weights are BF16.
-    if (self.gliner_mixed_attention and has_mask and bias_mode == 0 and head_dim == 64) {
+    if (has_mask and bias_mode == 0 and ((self.gliner_mixed_attention and head_dim == 64) or glinerQ8F16AttentionEligible(self, batch, seq_len, num_heads, head_dim))) {
         try self.kernels.launchGlinerEncoderAttentionTcF16(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim, seq_len);
+        self.stats.gliner_encoder_f16_attention_launches += 1;
+        if (seq_len >= 2048 and self.kernels.gliner_encoder_attention_tc_f16_m64 != null)
+            self.stats.gliner_encoder_wide_attention_launches += 1;
         self.stats.launch_attention += 1;
         return createTensor(self, device, shape, count);
     }
     if (self.gliner_encoder_attention and has_mask and bias_mode == 0) {
         try self.kernels.launchGlinerEncoderAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim, seq_len);
+        self.stats.gliner_encoder_f32_attention_launches += 1;
     } else if (has_mask and bias_mode == 0 and layaWarpEligible(self, batch, seq_len, head_dim)) {
         try self.kernels.launchLayaAttentionWarpF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim, seq_len);
         self.stats.laya_warp_attention += 1;
