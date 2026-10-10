@@ -24,7 +24,7 @@ const compiler = @import("compiler.zig");
 const Allocator = std.mem.Allocator;
 pub const Kind = enum { row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value, count, sum, avg, min, max, bool_and, bool_or };
 pub const Sort = struct { partition: []const usize, order: []const usize, directions: []const @import("operators.zig").Order };
-pub const Spec = struct { kind: Kind, arguments: []const usize, filter: ?usize, sort: usize, frame: ?ast.Window.Frame, type: ast.ColumnType, star: bool };
+pub const Spec = struct { kind: Kind, arguments: []const usize, filter: ?usize, sort: usize, frame: ?ast.Window.Frame, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, star: bool };
 pub const Bound = struct {
     input: *const describe.BoundStatement,
     statement: ast.Select,
@@ -132,7 +132,10 @@ const Builder = struct {
         if (scalar.statementConstant(node_)) return node_;
         if (!contains(node_) and !containsDecision(node_)) return self.slot("input", try self.input(node_));
         if (node_.* == .call and node_.call.window != null) {
+            // Alias reuse must not allocate/evaluate another identical window.
+            for (self.specs.items, 0..) |pending, index| if (@import("aggregate_binding.zig").same(pending.node, node_)) return self.slot("window", index);
             const call = node_.call;
+            if (call.within_group != null) return error.UnsupportedSqlShape;
             if (call.distinct) return error.UnsupportedSqlShape;
             _ = std.meta.stringToEnum(Kind, call.name) orelse return error.UndefinedSqlFunction;
             const args = try self.alloc.alloc(usize, call.args.len);
@@ -161,7 +164,7 @@ const Builder = struct {
         return self.node(switch (node_.*) {
             .binary => |part| .{ .binary = .{ .op = part.op, .left = try self.rewrite(part.left), .right = try self.rewrite(part.right) } },
             .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.rewrite(part.operand) } },
-            .cast => |part| .{ .cast = .{ .type = part.type, .operand = try self.rewrite(part.operand) } },
+            .cast => |part| .{ .cast = part.withOperand(try self.rewrite(part.operand)) },
             .call => |part| blk: {
                 const args = try self.alloc.alloc(*const ast.Scalar, part.args.len);
                 for (part.args, args) |arg, *out| out.* = try self.rewrite(arg);
@@ -191,7 +194,7 @@ fn directionsEqual(left: []const @import("operators.zig").Order, right: []const 
 }
 
 pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, hints: []const ?ast.ColumnType) !Bound {
-    const statement = compiled.statement.select;
+    const statement = try @import("order_aliases.zig").normalize(alloc, compiled.statement.select);
     const inferred = try alloc.alloc(?ast.ColumnType, compiled.parameter_count);
     @memset(inferred, null);
     @memcpy(inferred[0..hints.len], hints);
@@ -231,13 +234,17 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
     input_statement.order_by = &.{};
     input_statement.limit = null;
     input_statement.offset = null;
+    // The scalar cardinality bound belongs to the completed window query,
+    // never to its input. Window counts, frames and final sort keys may need
+    // rows beyond the two scalar-result witnesses.
+    input_statement.scalar_cardinality_limit = false;
     var input_compiled = compiled.*;
     input_compiled.statement = .{ .select = input_statement };
     const input = try alloc.create(describe.BoundStatement);
-    input.* = try describe.bind(alloc, pinned_backend, &input_compiled, inferred);
+    input.* = try describe.bindInternal(alloc, pinned_backend, &input_compiled, inferred);
     const parameters = @constCast(input.parameter_types);
     const columns = try alloc.alloc(scalar.Column, input.columns.len + builder.specs.items.len);
-    for (input.columns, columns[0..input.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type };
+    for (input.columns, columns[0..input.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .numeric_modifier = column.numeric_modifier };
     const specs = try alloc.alloc(Spec, builder.specs.items.len);
     for (builder.specs.items, specs, columns[input.columns.len..], 0..) |pending, *spec, *column, index| {
         const call = pending.node.call;
@@ -253,12 +260,14 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
         const first_null = nargs != 0 and call.args[0].* == .literal and call.args[0].literal == .null;
         const default_null = nargs == 3 and call.args[2].* == .literal and call.args[2].literal == .null;
         var input_type = if (nargs != 0) input.columns[pending.arguments[0]].type else ast.ColumnType.integer;
+        var input_element = if (nargs != 0) input.columns[pending.arguments[0]].element_type else null;
         if (first_null) input_type = switch (kind) {
             .sum, .avg => .number,
             .bool_and, .bool_or => .boolean,
             .lag, .lead => if (nargs == 3 and !default_null) input.columns[pending.arguments[2]].type else input_type,
             else => input_type,
         };
+        if (first_null and nargs == 3 and !default_null and (kind == .lag or kind == .lead)) input_element = input.columns[pending.arguments[2]].element_type;
         switch (kind) {
             .sum, .avg => if (input_type != .integer and input_type != .number) return error.SqlTypeMismatch,
             .bool_and, .bool_or => if (input_type != .boolean) return error.SqlTypeMismatch,
@@ -268,8 +277,17 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
                 if (nargs == 3 and !default_null) {
                     const default_type = input.columns[pending.arguments[2]].type;
                     if ((input_type == .integer or input_type == .number) and (default_type == .integer or default_type == .number)) {
+                        const left = input_element orelse (if (input_type == .integer) @import("array_value.zig").ElementType.int64 else .float64);
+                        const right = input.columns[pending.arguments[2]].element_type orelse (if (default_type == .integer) @import("array_value.zig").ElementType.int64 else .float64);
+                        input_element = try @import("builtin_cast.zig").commonNumeric(left, right);
                         if (default_type == .number) input_type = .number;
                     } else if (default_type != input_type) return error.SqlTypeMismatch;
+                    const default_element = input.columns[pending.arguments[2]].element_type;
+                    if (input_type == .array) {
+                        const left = input_element orelse return error.SqlTypeMismatch;
+                        const right = default_element orelse return error.SqlTypeMismatch;
+                        input_element = if (left == right) left else @import("builtin_cast.zig").commonNumeric(left, right) catch return error.SqlTypeMismatch;
+                    }
                 }
             },
             else => {},
@@ -280,6 +298,14 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
             .avg, .percent_rank, .cume_dist => .number,
             .bool_and, .bool_or => .boolean,
             else => input_type,
+        };
+        const result_element = switch (kind) {
+            .row_number, .rank, .dense_rank, .ntile, .count => @import("array_value.zig").ElementType.int64,
+            .avg => if (input_element == .numeric) @import("array_value.zig").ElementType.numeric else .float64,
+            .percent_rank, .cume_dist => @import("array_value.zig").ElementType.float64,
+            .bool_and, .bool_or => @import("array_value.zig").ElementType.boolean,
+            .sum => if (result_type == .integer) @import("array_value.zig").ElementType.int64 else input_element,
+            else => input_element,
         };
         if (pending.filter) |filter| if (input.columns[filter].type != .boolean) return error.SqlTypeMismatch;
         if (call.window.?.frame) |frame| if (frame.mode == .groups and call.window.?.order.len == 0) return error.InvalidSqlSyntax;
@@ -302,13 +328,13 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
                 } else slot.* = .integer;
             };
         };
-        spec.* = .{ .kind = kind, .arguments = pending.arguments, .filter = pending.filter, .sort = pending.sort, .frame = call.window.?.frame, .type = result_type, .star = call.star };
-        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$window_{d}", .{index}), .type = result_type };
+        spec.* = .{ .kind = kind, .arguments = pending.arguments, .filter = pending.filter, .sort = pending.sort, .frame = call.window.?.frame, .type = result_type, .element_type = result_element, .star = call.star };
+        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$window_{d}", .{index}), .type = result_type, .element_type = result_element };
     }
     const output_programs = try alloc.alloc(scalar.Program, outputs.len);
     const names = try alloc.alloc([]const u8, outputs.len);
     for (outputs, output_programs, statement.columns, names) |node_, *program, projection, *name| {
-        program.* = try scalar.bindWithSettings(alloc, node_, columns, parameters, .{}, backend.settings_view);
+        program.* = try scalar.bindWithSettings(alloc, node_, columns, parameters, .{ .invocation = backend.parameter_invocation }, backend.settings_view);
         name.* = projection.alias orelse if (projection.field.len != 0) projection.field else if (projection.expression.?.* == .call) projection.expression.?.call.name else "?column?";
     }
     const order_outputs = try alloc.alloc(?usize, orders.len);
@@ -320,6 +346,6 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
         };
     }
     const order_programs = try alloc.alloc(scalar.Program, orders.len);
-    for (orders, order_programs) |node_, *program| program.* = try scalar.bindWithSettings(alloc, node_, columns, parameters, .{}, backend.settings_view);
+    for (orders, order_programs) |node_, *program| program.* = try scalar.bindWithSettings(alloc, node_, columns, parameters, .{ .invocation = backend.parameter_invocation }, backend.settings_view);
     return .{ .input = input, .statement = input_statement, .specs = specs, .sorts = builder.sorts.items, .outputs = output_programs, .orders = order_programs, .order_outputs = order_outputs, .names = names };
 }

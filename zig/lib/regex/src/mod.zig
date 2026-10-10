@@ -20,6 +20,8 @@ const fst = @import("antfly_fst");
 const Allocator = std.mem.Allocator;
 
 pub const RegexAutomaton = automaton.RegexAutomaton;
+/// Capture-capable Unicode execution, independent of byte/FST automata.
+pub const captures = @import("antfly_capture_regex");
 pub const compile = automaton.compile;
 
 const CharClass = struct {

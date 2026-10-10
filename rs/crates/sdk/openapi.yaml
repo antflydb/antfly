@@ -12090,8 +12090,8 @@ components:
           type: boolean
     SQLColumnType:
       type: string
-      description: Logical SQL result type. Integer values are decimal strings to preserve exact precision
-        in every client.
+      description: Logical SQL result type. Integer values and numbers with element_type numeric are decimal
+        strings to preserve exact precision in every client.
       enum:
         - string
         - uuid
@@ -12100,7 +12100,81 @@ components:
         - boolean
         - datetime
         - json
+        - array
         - unknown
+    SQLArrayElementType:
+      type: string
+      description: Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC.
+        Never inferred from JSON value shape.
+      enum:
+        - text
+        - int16
+        - int32
+        - int64
+        - float32
+        - float64
+        - boolean
+        - uuid
+        - jsonb
+        - numeric
+    SQLArrayDimension:
+      type: object
+      additionalProperties: false
+      required:
+        - length
+        - lower_bound
+      properties:
+        length:
+          type: integer
+          minimum: 1
+          maximum: 2147483647
+        lower_bound:
+          type: integer
+          minimum: -2147483648
+          maximum: 2147483647
+    SQLArrayValue:
+      type: object
+      additionalProperties: false
+      required:
+        - dimensions
+        - values
+        - sql_nulls
+      description: >
+        Non-NULL SQL array result. Elements are flat, row-major values using the
+
+        column's element_type. Their count equals the product of dimension
+
+        lengths. Empty arrays have no dimensions and no elements. Integer
+
+        elements are canonical decimal strings. Exact numeric elements are
+
+        decimal strings preserving display scale, or NaN, Infinity and -Infinity.
+
+        Floating elements are JSON
+
+        numbers, or the strings NaN, Infinity and -Infinity. Element null flags
+
+        distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL
+
+        array is an outer null result cell, not an empty array or this envelope.
+      properties:
+        dimensions:
+          type: array
+          maxItems: 6
+          items:
+            $ref: '#/components/schemas/SQLArrayDimension'
+        values:
+          type: array
+          maxItems: 65536
+          items:
+            x-go-type: json.RawMessage
+        sql_nulls:
+          type: array
+          maxItems: 65536
+          description: Exactly one flag per value. True requires a null value; false permits a JSON null
+            only for jsonb elements.
+          items:
+            type: boolean
     SQLColumn:
       type: object
       additionalProperties: false
@@ -12113,6 +12187,14 @@ components:
           description: Display label. Labels need not be unique; rows use matching ordinal positions.
         type:
           $ref: '#/components/schemas/SQLColumnType'
+        element_type:
+          $ref: '#/components/schemas/SQLArrayElementType'
+          description: Required for array columns and exact NUMERIC number columns. Identifies scalar
+            widths when supplied. The descriptor applies even to NULL or empty arrays.
+        numeric_modifier:
+          $ref: '#/components/schemas/SQLNumericModifier'
+          description: Present only for constrained NUMERIC scalar or array results. Prepared result metadata
+            is stable before execution-time constant folding.
     SQLPrepareRequest:
       type: object
       additionalProperties: false
@@ -12203,6 +12285,21 @@ components:
           type: string
         namespace:
           type: string
+    SQLParameterDescriptor:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - nullable
+      description: Immutable positional input contract. Element identity also preserves primitive widths;
+        array inputs require it. Unknown slots have no SQL constraint.
+      properties:
+        type:
+          $ref: '#/components/schemas/SQLColumnType'
+        element_type:
+          $ref: '#/components/schemas/SQLArrayElementType'
+        nullable:
+          type: boolean
     SQLPreparedResponse:
       type: object
       additionalProperties: false
@@ -12211,6 +12308,7 @@ components:
         - expires_at_ms
         - owner_node_id
         - parameter_types
+        - parameter_descriptors
         - columns
       properties:
         prepared_id:
@@ -12228,6 +12326,14 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SQLColumnType'
+        parameter_descriptors:
+          type: array
+          maxItems: 1024
+          description: Precise positional contracts, aligned with parameter_types. Array arguments use
+            the lossless SQLArrayValue envelope or PostgreSQL array text; plain JSON arrays are not SQL
+            arrays.
+          items:
+            $ref: '#/components/schemas/SQLParameterDescriptor'
         columns:
           type: array
           items:
@@ -12474,6 +12580,10 @@ components:
         the JSON literal null. Integer-typed values are exact decimal strings; datetime
 
         values are strings. Objects and arrays in JSON columns remain JSON.
+
+        Array-typed columns contain SQLArrayValue envelopes, with their element
+
+        descriptor in the corresponding SQLColumn. They are not JSON columns.
       properties:
         columns:
           type: array
@@ -24911,6 +25021,23 @@ components:
             are applied as additional narrowing.
       required:
         - name
+    SQLNumericModifier:
+      type: object
+      additionalProperties: false
+      required:
+        - precision
+        - scale
+      description: PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element,
+        not dimensions. Absent means unconstrained NUMERIC.
+      properties:
+        precision:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        scale:
+          type: integer
+          minimum: -1000
+          maximum: 1000
     RerankerProvider:
       type: string
       enum:
@@ -27223,6 +27350,12 @@ components:
         - and
         - or
         - not
+        - cast
+        - case_when
+        - modulo
+        - in_list
+        - not_in_list
+        - array
     RelationalExpressionType:
       type: string
       enum:
@@ -27232,6 +27365,57 @@ components:
         - datetime
         - integer
         - number
+        - numeric
+        - sql_array
+    SQLBuiltinType:
+      type: string
+      description: >
+        Exact PostgreSQL builtin identity for a relational root scalar column.
+
+        SQL array columns use SQLArrayElementType for their element identity.
+
+        Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
+
+        these values. The underlying property type must match. SQL array storage
+
+        is not implied by this annotation. Existing unannotated schemas retain
+
+        their original domains.
+
+        The numeric identity uses an underlying number property and exact
+
+        PostgreSQL NUMERIC semantics, never binary float. Submit finite values
+
+        as JSON numeric lexemes or decimal strings; special values use strings
+
+        NaN, Infinity and -Infinity. Const/enum finite numeric members must be
+
+        JSON numbers, not strings. Bounds and multipleOf are exact decimals.
+
+        Public scalar NUMERIC schemas require reader capability version 22.
+
+        To constrain a NUMERIC scalar or SQL-array column, set the root
+
+        property's `x-antfly-sql-numeric-modifier` annotation to an object with
+
+        precision (1..1000) and signed scale (-1000..1000). The annotation
+
+        requires numeric identity and reader capability version 23. Assignment
+
+        rounds before constraints, indexes and generated dependents; overflow
+
+        rejects the write. Restore verifies stored values without rounding.
+      enum:
+        - text
+        - int16
+        - int32
+        - int64
+        - float32
+        - float64
+        - boolean
+        - uuid
+        - jsonb
+        - numeric
     RelationalScalarExpression:
       type: object
       additionalProperties: false
@@ -27273,12 +27457,136 @@ components:
         evaluate left to right with SQL three-valued short-circuit semantics;
 
         NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+
+        Numeric literals and arithmetic operations may specify sql_type to
+
+        retain PostgreSQL builtin overflow and float4 rounding semantics.
+
+        Without it, integer and number operations retain int64 and float64
+
+        semantics. Numeric cast requires type and sql_type, takes one numeric
+
+        argument, and performs a checked conversion when evaluated (not when
+
+        the schema is compiled). Floating-to-integer casts round ties to even.
+
+        The numeric expression type uses exact PostgreSQL NUMERIC values and
+
+        may specify sql_type numeric. Its literals accept decimal strings or
+
+        exact JSON numeric lexemes, including string-valued special values.
+
+        Exact NUMERIC programs require reader capability version 21 even when
+
+        their result is boolean or integer. Float/integer assignment casts keep
+
+        their declared PostgreSQL rounding and overflow semantics.
+
+        A cast to numeric may specify numeric_modifier for PostgreSQL precision
+
+        and signed-scale coercion. Overflow is checked when the selected cast
+
+        executes; unselected lazy branches do not fail. Modifier-bearing programs
+
+        require reader capability version 23 even with integer/boolean output.
+
+        The sql_array expression type requires sql_type on literals, including
+
+        typed NULL, to declare the element builtin. Non-null literals use the
+
+        ordinal SQL array envelope (dimensions with length/lower_bound, values,
+
+        and sql_nulls), retaining shape and lower bounds. Array columns derive
+
+        their exact element identity from the immutable schema. Comparisons,
+
+        IN, COALESCE and CASE require matching array element identities; no
+
+        element type is inferred from values. Array-dependent programs require
+
+        reader capability version 24 even with scalar output. Assignment to a
+
+        NUMERIC array column applies its precision/signed-scale modifier to
+
+        each element. Array casts require type sql_array and an explicit matching
+
+        sql_type; identity casts borrow the immutable input. Casts of numeric
+
+        arrays may additionally specify numeric_modifier, coercing each non-NULL
+
+        element with PostgreSQL precision and signed-scale semantics while
+
+        preserving dimensions, lower bounds and NULL slots. Coercion is lazy
+
+        and shares invocation admission with the surrounding expression.
+
+        Array-valued ordered index keys and element-changing array casts are
+
+        not supported by this expression contract.
+
+        The array constructor requires sql_type and zero to 32 arguments.
+
+        Constructor programs additionally require reader capability version 25,
+
+        including constructors hidden inside scalar/boolean expressions.
+
+        Scalar arguments must have the declared element domain, with explicit
+
+        width-preserving numeric casts where needed. SQL NULL arguments become
+
+        NULL elements. Array arguments must all have matching element types,
+
+        dimensions and lower bounds; one leading dimension with lower bound 1
+
+        is added. All empty/NULL subarrays produce an empty array; mixing an
+
+        empty/NULL subarray with a nonempty one is a dimension mismatch. Child
+
+        expressions execute once, with shared work/cancellation and byte limits.
+
+        case_when takes alternating boolean conditions and result expressions,
+
+        followed by a mandatory fallback result (3 to 31 arguments, at most
+
+        15 branches). Conditions are evaluated in order; only the selected
+
+        result is evaluated, and a NULL condition is not TRUE. All result
+
+        expressions must have the same physical type. Numeric SQL lowering
+
+        records builtin result-domain promotions as explicit casts. This
+
+        operation requires schema capability version 18.
+
+        modulo takes two same-domain integer or NUMERIC operands and returns the signed
+
+        remainder (minInt modulo -1 is zero); a zero divisor rejects the write.
+
+        in_list and not_in_list take one probe followed by 1 to 31 same-domain
+
+        candidates. The probe is evaluated once; NULL probes return UNKNOWN.
+
+        A matching candidate wins over NULL candidates; otherwise a NULL
+
+        candidate makes the result UNKNOWN. These operations require schema
+
+        capability version 19.
       properties:
         op:
           $ref: '#/components/schemas/RelationalExpressionOp'
         type:
           $ref: '#/components/schemas/RelationalExpressionType'
+        sql_type:
+          $ref: '#/components/schemas/SQLBuiltinType'
+          description: Numeric builtin result identity on numeric literals, arithmetic, negate, and cast
+            (capability version 18), or required array element identity on sql_array literals including
+            typed NULL (capability version 24).
+        numeric_modifier:
+          $ref: '#/components/schemas/SQLNumericModifier'
+          description: Optional precision/signed-scale coercion; accepted only on cast with type numeric
+            and sql_type numeric. Requires reader capability version 23.
         value:
+          nullable: true
           description: Typed literal value, including null.
         column:
           type: string
@@ -27722,6 +28030,14 @@ components:
           description: String comparison collation; uses the same rules as ordered indexes.
         expression:
           $ref: '#/components/schemas/RelationalScalarExpression'
+    RelationalUniqueConstraintOrigin:
+      type: string
+      enum:
+        - constraint
+        - index
+      default: constraint
+      description: Durable ownership kind. Index-owned uniqueness participates in ON CONFLICT inference
+        but is not a named SQL constraint. Human-readable index descriptions never determine ownership.
     ForeignKeyTiming:
       type: string
       enum:
@@ -27755,6 +28071,8 @@ components:
           type: string
           minLength: 1
           maxLength: 256
+        origin:
+          $ref: '#/components/schemas/RelationalUniqueConstraintOrigin'
         primary:
           type: boolean
           description: SQL primary-key identity. At most one per relational table; all key columns must
@@ -28046,6 +28364,54 @@ components:
             text title can expose a sortable keyword subfield.
           additionalProperties:
             $ref: '#/components/schemas/DocumentSubfieldMapping'
+    SQLArrayColumnSchema:
+      type: object
+      additionalProperties: true
+      required:
+        - type
+        - x-antfly-sql-type
+      description: >
+        JSON Schema property declaration for one typed SQL-array column in a
+
+        relational table. Use it as a root property of DocumentSchema.schema.
+
+        The element identity is mandatory; a JSON Schema `array` remains a JSON
+
+        column and is never inferred to be a SQL array. Column values use the
+
+        lossless SQLArrayValue envelope: dimensions with lower bounds, flat
+
+        row-major values and explicit SQL NULL flags. Integer elements are
+
+        decimal strings, even when small. JSONB null and SQL NULL are distinct.
+
+        Float elements acquire their declared width before validation and
+
+        storage. Outer null represents a SQL NULL array when nullable is true.
+
+        Additional JSON Schema constraints apply to this envelope, not to
+
+        PostgreSQL array subscripts. SQL array index keys and SQL DDL activation
+
+        are not implied by accepting this storage schema.
+      properties:
+        type:
+          type: string
+          enum:
+            - sql_array
+        x-antfly-sql-type:
+          $ref: '#/components/schemas/SQLArrayElementType'
+        x-antfly-sql-numeric-modifier:
+          $ref: '#/components/schemas/SQLNumericModifier'
+          x-go-type-skip-optional-pointer: false
+          description: Accepted only with numeric element identity. Applies assignment coercion to each
+            non-NULL element while preserving dimensions and lower bounds. Requires reader capability
+            version 23.
+        nullable:
+          type: boolean
+          default: false
+        description:
+          type: string
     DocumentSchema:
       type: object
       description: Defines the structure of a document type
@@ -28062,6 +28428,12 @@ components:
             This is used to infer indexing rules and field types.
           x-antfly-field-mapping-schema:
             $ref: '#/components/schemas/DocumentFieldMapping'
+          x-antfly-sql-type-schema:
+            $ref: '#/components/schemas/SQLBuiltinType'
+          x-antfly-sql-numeric-modifier-schema:
+            $ref: '#/components/schemas/SQLNumericModifier'
+          x-antfly-sql-array-column-schema:
+            $ref: '#/components/schemas/SQLArrayColumnSchema'
     TtlConfig:
       type: object
       additionalProperties: false

@@ -295,6 +295,7 @@ pub fn mapError(err: anyerror) ErrorCode {
     if (err == error.GeneratedColumnRewriteRequired) return .intent_conflict;
     return switch (err) {
         error.VersionConflict => .version_conflict,
+        error.SqlFeatureNotSupported => .unsupported,
         error.IntentConflict, error.DecisionConflict, error.SchemaInUse => .intent_conflict,
         error.TxnNotFound => .txn_not_found,
         error.NotFound, error.IndexNotFound, error.TableNotFound => .not_found,

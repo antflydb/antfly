@@ -1,0 +1,235 @@
+{
+  "reference": "PostgreSQL exact text-array input and binary value contracts",
+  "entries": [
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{}",
+      "binary": "000000000000000000000019"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{{},{}}",
+      "binary": "000000000000000000000019"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{NULL,\"NULL\",N\\ULL,\"\",a b,\" a \",a\\ b}",
+      "binary": "0000000100000001000000190000000700000001ffffffff000000044e554c4c000000044e554c4c00000000000000036120620000000320612000000003612062"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "[-2:-1][3:4]={{α,\"a,b\"},{\"a\\\"b\",NULL}}",
+      "binary": "00000002000000010000001900000002fffffffe000000020000000300000002ceb100000003612c6200000003612262ffffffff"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "[2]={a,b}",
+      "binary": "000000010000000000000019000000020000000100000001610000000162"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "[+1:+2] = {a,b}",
+      "binary": "000000010000000000000019000000020000000100000001610000000162"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "[1:2] [1:1]={{a},{b}}",
+      "binary": "0000000200000000000000190000000200000001000000010000000100000001610000000162"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "[-2147483648:-2147483648]={a}",
+      "binary": "00000001000000000000001900000001800000000000000161"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{a\\,b,a\\}b,a\\{b,a\\\\b}",
+      "binary": "000000010000000000000019000000040000000100000003612c6200000003617d6200000003617b6200000003615c62"
+    },
+    {
+      "element_type": "int16",
+      "sql_type": "int2",
+      "input": "{-32768,32767,NULL}",
+      "binary": "0000000100000001000000150000000300000001000000028000000000027fffffffffff"
+    },
+    {
+      "element_type": "int32",
+      "sql_type": "int4",
+      "input": "{0x_10,1_000,-2147483648}",
+      "binary": "0000000100000000000000170000000300000001000000040000001000000004000003e80000000480000000"
+    },
+    {
+      "element_type": "int64",
+      "sql_type": "int8",
+      "input": "{9007199254740993,9223372036854775807,-9223372036854775808}",
+      "binary": "0000000100000000000000140000000300000001000000080020000000000001000000087fffffffffffffff000000088000000000000000"
+    },
+    {
+      "element_type": "float32",
+      "sql_type": "real",
+      "input": "{1.1,-0,NaN,Infinity,-Infinity,NULL}",
+      "binary": "0000000100000001000002bc0000000600000001000000043f8ccccd0000000480000000000000047fc00000000000047f80000000000004ff800000ffffffff"
+    },
+    {
+      "element_type": "float64",
+      "sql_type": "float8",
+      "input": "{0x1p0,1e20,-0,NaN,-Infinity,NULL}",
+      "binary": "0000000100000001000002bd0000000600000001000000083ff0000000000000000000084415af1d78b58c40000000088000000000000000000000087ff800000000000000000008fff0000000000000ffffffff"
+    },
+    {
+      "element_type": "boolean",
+      "sql_type": "bool",
+      "input": "{t,off,yes,0,NULL}",
+      "binary": "00000001000000010000001000000005000000010000000101000000010000000001010000000100ffffffff"
+    },
+    {
+      "element_type": "uuid",
+      "sql_type": "uuid",
+      "input": "{550E8400-E29B-41D4-A716-446655440000,NULL}",
+      "binary": "000000010000000100000b86000000020000000100000010550e8400e29b41d4a716446655440000ffffffff"
+    },
+    {
+      "element_type": "jsonb",
+      "sql_type": "jsonb",
+      "input": "{\"{\\\"n\\\":9007199254740993}\",\"null\",NULL,\"[1,null]\",\"\\\"x\\\"\"}",
+      "binary": "000000010000000100000eda000000050000000100000018017b226e223a20393030373139393235343734303939337d00000005016e756c6cffffffff0000000a015b312c206e756c6c5d0000000401227822"
+    },
+    {
+      "element_type": "int32",
+      "sql_type": "int4",
+      "input": "{{1,2},{3,NULL}}",
+      "binary": "00000002000000010000001700000002000000010000000200000001000000040000000100000004000000020000000400000003ffffffff"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{{{{{{a}}}}}}",
+      "binary": "0000000600000000000000190000000100000001000000010000000100000001000000010000000100000001000000010000000100000001000000010000000161"
+    }
+  ],
+  "errors": [
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{",
+      "code": "22P02"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{a,}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{,a}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{{a},{b,c}}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{a,{b}}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{\"a\" b}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{a\"b}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{a\\}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "[1:0]={}",
+      "code": "2202E"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "[1:3]={a,b}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "[1:2][1:1]={a,b}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "[ 1:2]={a,b}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "[2147483647:2147483647]={a}",
+      "code": "54000"
+    },
+    {
+      "element_type": "int16",
+      "sql_type": "int2",
+      "input": "{32768}",
+      "code": "22003"
+    },
+    {
+      "element_type": "int32",
+      "sql_type": "int4",
+      "input": "{1__0}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "boolean",
+      "sql_type": "bool",
+      "input": "{o}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "uuid",
+      "sql_type": "uuid",
+      "input": "{bad}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "jsonb",
+      "sql_type": "jsonb",
+      "input": "{foo}",
+      "code": "22P02"
+    },
+    {
+      "element_type": "text",
+      "sql_type": "text",
+      "input": "{{{{{{{a}}}}}}}",
+      "code": "54000"
+    }
+  ]
+}

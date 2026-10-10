@@ -104,6 +104,18 @@ def test_generated_composite_foreign_key_and_unique_contracts() -> None:
     assert schema.to_dict()["foreign_keys"][0]["on_delete"] == "cascade"
 
 
+def test_public_unique_ownership_origin_round_trip() -> None:
+    from antfly import RelationalUniqueConstraintOrigin
+
+    for origin in RelationalUniqueConstraintOrigin:
+        rule = RelationalUniqueConstraint(name="email_key", columns=["email"], origin=origin)
+        assert rule.to_dict()["origin"] == origin.value
+        assert RelationalUniqueConstraint.from_dict(rule.to_dict()).origin is origin
+    assert "origin" not in RelationalUniqueConstraint(name="default_key").to_dict()
+    with pytest.raises(ValueError):
+        RelationalUniqueConstraint.from_dict({"name": "bad", "origin": "display-label"})
+
+
 def test_generated_typed_rows_preserve_integer_and_version_precision() -> None:
     row = {"_id": "a", "row": {"id": 9223372036854775807}, "version": "18446744073709551615", "schema_version": 7}
     assert RelationalRow.from_dict(row).to_dict() == row

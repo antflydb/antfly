@@ -21,7 +21,22 @@ const std = @import("std");
 const operators = @import("operators.zig");
 const Datum = @import("scalar.zig").Datum;
 const A = std.mem.Allocator;
-const magic = "AGS\x01";
+const magic = "AGS\x02";
+
+fn elementId(identity: ?@import("array_value.zig").ElementType) u8 {
+    return if (identity) |kind| switch (kind) {
+        .text => 0,
+        .int16 => 1,
+        .int32 => 2,
+        .int64 => 3,
+        .float32 => 4,
+        .float64 => 5,
+        .boolean => 6,
+        .uuid => 7,
+        .jsonb => 8,
+        .numeric => 9,
+    } else 255;
+}
 
 // Wire IDs are explicit: AST enum insertion/reordering cannot reinterpret a
 // persisted state. Changing these IDs or the layout requires a new version.
@@ -46,6 +61,7 @@ fn typeId(type_: ?@import("ast.zig").ColumnType) u8 {
         .datetime => 5,
         .json => 6,
         .uuid => 7,
+        .array => 8,
     } else 255;
 }
 
@@ -81,6 +97,14 @@ const Encoder = struct {
     fn datum(self: *Encoder, value: Datum) !void {
         if (value.patterns != null) return error.InvalidSqlSpill;
         if (value.sql_null) return self.raw(&.{0});
+        if (value.array != null or value.numeric != null) {
+            // Reuse the portable typed-block codec; a typed value's scalar
+            // JSON placeholder is not its value or its element identity.
+            const encoded = try @import("spill.zig").encodeColumnarBlockAlloc(self.a, &.{.{ .values = &.{value}, .keys = &.{}, .ordinal = 0 }}, 16 << 20);
+            defer self.a.free(encoded);
+            try self.raw(&.{8});
+            return self.text(encoded);
+        }
         switch (value.value) {
             .null => try self.raw(&.{1}),
             .bool => |v| try self.raw(&.{ 2, @intFromBool(v) }),
@@ -110,6 +134,7 @@ const Encoder = struct {
     }
 };
 const Decoder = struct {
+    sql_floating: bool = false,
     a: A,
     bytes: []const u8,
     position: usize = 0,
@@ -138,12 +163,19 @@ const Decoder = struct {
             3 => Datum.json(.{ .integer = try self.integer(i64) }),
             4 => blk: {
                 const value: f64 = @bitCast(try self.integer(u64));
-                if (!std.math.isFinite(value)) return error.InvalidSqlSpill;
+                if (!std.math.isFinite(value) and !self.sql_floating) return error.InvalidSqlSpill;
                 break :blk Datum.json(.{ .float = value });
             },
             5 => Datum.json(.{ .string = try self.text() }),
             6 => Datum.json(.{ .number_string = try self.text() }),
             7 => Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, self.a, try self.text(), .{ .allocate = .alloc_always, .parse_numbers = false })),
+            8 => blk: {
+                const block = try @import("spill.zig").decodeColumnarBlockInArena(self.a, try self.text(), 16 << 20);
+                if (block.count() != 1 or block.values.len != 1 or block.keys.len != 0) return error.InvalidSqlSpill;
+                const value = try block.cell(0, 0);
+                if (value.sql_null or (value.array == null and value.numeric == null)) return error.InvalidSqlSpill;
+                break :blk value;
+            },
             else => error.InvalidSqlSpill,
         };
     }
@@ -153,10 +185,22 @@ pub fn cell(a: A, state: operators.Aggregate) !Datum {
     var encoder: Encoder = .{ .a = a };
     errdefer encoder.bytes.deinit(a);
     try encoder.raw(magic);
-    try encoder.raw(&.{ kindId(state.kind), typeId(state.input_type), @intFromBool(state.distinct), @intFromBool(state.boolean) });
+    try encoder.raw(&.{ kindId(state.kind), typeId(state.input_type), @intFromBool(state.distinct), @intFromBool(state.boolean), elementId(state.input_element) });
     try encoder.integer(u64, state.count);
     try encoder.integer(i128, state.integer_sum);
     inline for (.{ state.number_sum, state.compensation, state.mean }) |value| try encoder.integer(u64, @bitCast(value));
+    const exact = state.input_element == .numeric and (state.kind == .sum or state.kind == .avg);
+    if (exact != (state.numeric != null)) return error.InvalidSqlSpill;
+    try encoder.raw(&.{@intFromBool(exact)});
+    if (state.numeric) |reducer| {
+        if (reducer.state.count != state.count) return error.InvalidSqlSpill;
+        var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+        const size = try reducer.state.encodedSize(&context);
+        try encoder.integer(u64, @intCast(size));
+        const buffer = try encoder.bytes.addManyAsSlice(a, size);
+        var writer: std.Io.Writer = .fixed(buffer);
+        try reducer.state.encode(&context, &writer);
+    }
     try encoder.datum(if (state.selected) |v| v.row.values[0] else .{});
     try encoder.integer(u64, @intCast(state.distinct_values.items.len));
     for (state.distinct_values.items) |entry| try encoder.datum(entry.row.row.values[0]);
@@ -172,32 +216,50 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
     if (value.sql_null or value.patterns != null or value.value != .string) return error.InvalidSqlSpill;
     var scratch = std.heap.ArenaAllocator.init(a);
     defer scratch.deinit();
-    var decoder: Decoder = .{ .a = scratch.allocator(), .bytes = value.value.string };
+    const sql_floating = spec.input_element == .float32 or spec.input_element == .float64;
+    var decoder: Decoder = .{ .a = scratch.allocator(), .bytes = value.value.string, .sql_floating = sql_floating };
     if (!std.mem.eql(u8, try decoder.raw(4), magic)) return error.InvalidSqlSpill;
-    const signature = try decoder.raw(4);
-    if (signature[0] != kindId(spec.kind) or signature[1] != typeId(spec.input_type) or signature[2] != @intFromBool(spec.distinct) or signature[3] > 1) return error.InvalidSqlSpill;
+    const signature = try decoder.raw(5);
+    if (signature[0] != kindId(spec.kind) or signature[1] != typeId(spec.input_type) or signature[2] != @intFromBool(spec.distinct) or signature[3] > 1 or signature[4] != elementId(spec.input_element)) return error.InvalidSqlSpill;
     const count = try decoder.integer(u64);
     if (count > std.math.maxInt(i64)) return error.InvalidSqlSpill;
     const sum = try decoder.integer(i128);
     var numbers: [3]f64 = undefined;
-    for (&numbers) |*v| {
+    for (&numbers, 0..) |*v, i| {
         v.* = @bitCast(try decoder.integer(u64));
-        if (!std.math.isFinite(v.*)) return error.InvalidSqlSpill;
+        if (!std.math.isFinite(v.*) and !(sql_floating and ((i == 0 and spec.kind == .sum) or (i == 2 and spec.kind == .avg)))) return error.InvalidSqlSpill;
+    }
+    if (spec.kind == .sum and spec.input_element == .float32) {
+        const rounded: f32 = @floatCast(numbers[0]);
+        if ((numbers[0] != @as(f64, rounded) and !(std.math.isNan(numbers[0]) and std.math.isNan(rounded))) or numbers[1] != 0 or numbers[2] != 0) return error.InvalidSqlSpill;
+    }
+    const numeric_flag = try decoder.integer(u8);
+    const exact = spec.input_element == .numeric and (spec.kind == .sum or spec.kind == .avg);
+    if (numeric_flag != @intFromBool(exact)) return error.InvalidSqlSpill;
+    var numeric_context: @import("numeric_value.zig").Context = .{ .alloc = scratch.allocator() };
+    var checkpoint: ?@import("numeric_aggregate.zig").State = if (exact) @import("numeric_aggregate.zig").decode(&numeric_context, try decoder.text()) catch |err| return switch (err) {
+        error.InvalidNumericAggregateState => error.InvalidSqlSpill,
+        else => err,
+    } else null;
+    defer if (checkpoint) |*state| state.deinit(scratch.allocator());
+    if (checkpoint) |state| {
+        if (state.count != count or sum != 0 or numbers[0] != 0 or numbers[1] != 0 or numbers[2] != 0 or signature[3] != 0) return error.InvalidSqlSpill;
     }
     const selected = try decoder.datum();
     if (!selected.sql_null) if (spec.input_type) |type_| {
         const valid = switch (type_) {
             .integer => selected.value == .integer,
-            .number => selected.value == .integer or selected.value == .float,
+            .number => selected.numeric != null or selected.value == .integer or selected.value == .float,
             .boolean => selected.value == .bool,
             .string, .datetime, .uuid => selected.value == .string,
             .json => true,
+            .array => selected.array != null,
         };
         if (!valid) return error.InvalidSqlSpill;
     };
     const members = try decoder.integer(u64);
     if (members > decoder.bytes.len - decoder.position) return error.InvalidSqlSpill;
-    var state = try operators.Aggregate.init(a, spec.kind, spec.input_type);
+    var state = try operators.Aggregate.initTyped(a, spec.kind, spec.input_type, spec.input_element);
     errdefer state.deinit();
     state.distinct = spec.distinct;
     for (0..@as(usize, @intCast(members))) |_| try state.update(try decoder.datum());
@@ -214,6 +276,16 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
     if (spec.distinct) {
         if (state.count != count or state.integer_sum != sum or state.number_sum != numbers[0] or state.compensation != numbers[1] or state.mean != numbers[2] or state.boolean != (signature[3] == 1)) return error.InvalidSqlSpill;
     } else if (members != 0) return error.InvalidSqlSpill;
+    if (checkpoint) |incoming| {
+        if (spec.distinct) {
+            if (!try incoming.equivalent(&numeric_context, state.numeric.?.state)) return error.InvalidSqlSpill;
+        } else {
+            var owned_context: @import("numeric_value.zig").Context = .{ .alloc = a };
+            const replacement = try incoming.clone(&owned_context);
+            state.numeric.?.state.deinit(a);
+            state.numeric.?.state = replacement;
+        }
+    }
     state.count = count;
     state.integer_sum = sum;
     state.number_sum = numbers[0];
@@ -230,18 +302,131 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
     return state;
 }
 
+test "SQL real SUM partials preserve rounded transitions across restore and merge" {
+    const a = std.testing.allocator;
+    const spec: operators.AggregateSpec = .{ .kind = .sum, .input_type = .number, .input_element = .float32 };
+    var left = try operators.Aggregate.initTyped(a, .sum, .number, .float32);
+    defer left.deinit();
+    var right = try operators.Aggregate.initTyped(a, .sum, .number, .float32);
+    defer right.deinit();
+    try left.update(Datum.json(.{ .float = 16777216 }));
+    try right.update(Datum.json(.{ .float = 1 }));
+    const encoded = try cell(a, right);
+    defer a.free(encoded.value.string);
+    var restored = try decode(a, encoded, spec);
+    defer restored.deinit();
+    try merge(&left, restored);
+    try left.update(Datum.json(.{ .float = -16777216 }));
+    try std.testing.expectEqual(@as(f64, 0), (try left.finish()).value.float);
+    try std.testing.expectEqual(@as(f64, 0), left.compensation);
+    try std.testing.expectError(error.SqlNumericOutOfRange, operators.Aggregate.addRealSum(std.math.floatMax(f32), std.math.floatMax(f32)));
+}
+
+fn numericCheckpointScenario(backing: A, corruptions: bool) !void {
+    var vtable = backing.vtable.*;
+    vtable.resize = A.noResize;
+    vtable.remap = A.noRemap;
+    const a: A = .{ .ptr = backing.ptr, .vtable = &vtable };
+    const numeric = @import("numeric_value.zig");
+    var context: numeric.Context = .{ .alloc = a };
+    for ([_]operators.Aggregate.Kind{ .sum, .avg }) |kind| {
+        for ([_]bool{ false, true }) |distinct| {
+            const spec: operators.AggregateSpec = .{ .kind = kind, .input_type = .number, .input_element = .numeric, .distinct = distinct };
+            var whole = try operators.Aggregate.initTyped(a, kind, .number, .numeric);
+            defer whole.deinit();
+            var left = try operators.Aggregate.initTyped(a, kind, .number, .numeric);
+            defer left.deinit();
+            var right = try operators.Aggregate.initTyped(a, kind, .number, .numeric);
+            defer right.deinit();
+            whole.distinct = distinct;
+            left.distinct = distinct;
+            right.distinct = distinct;
+            for ([_][]const u8{ "1.20", "2.300", "2.300", "1.200" }, 0..) |text, index| {
+                var value = try numeric.parse(&context, text);
+                defer value.deinit();
+                const datum = Datum.typedNumeric(&value.value);
+                try whole.update(datum);
+                try (if (index < 2) &left else &right).update(datum);
+            }
+            try left.update(.{});
+            // Finalization is cached; later merge must invalidate that result.
+            _ = try left.finish();
+            const encoded = try cell(a, right);
+            defer a.free(encoded.value.string);
+            var restored = try decode(a, encoded, spec);
+            defer restored.deinit();
+            try merge(&left, restored);
+            const expected = (try whole.finish()).numeric.?;
+            const actual = (try left.finish()).numeric.?;
+            try std.testing.expectEqual(std.math.Order.eq, try numeric.order(&context, expected.*, actual.*));
+            try std.testing.expectEqual(expected.scale, actual.scale);
+            try std.testing.expectEqual(whole.count, left.count);
+            // Decoded state owns its buckets and DISTINCT members.
+            const one: numeric.Value = .{ .digits = &.{1} };
+            try right.update(Datum.typedNumeric(&one));
+            try std.testing.expectEqual(@as(u64, 2), restored.count);
+            const replay = (try restored.finish()).numeric.?;
+            try std.testing.expectEqual(@as(u16, if (kind == .sum) 3 else 16), replay.scale);
+            if (corruptions) {
+                for (0..encoded.value.string.len) |length| {
+                    try std.testing.expectError(error.InvalidSqlSpill, decode(a, Datum.json(.{ .string = encoded.value.string[0..length] }), spec));
+                }
+                var incompatible = spec;
+                incompatible.input_element = .float64;
+                try std.testing.expectError(error.InvalidSqlSpill, decode(a, encoded, incompatible));
+                incompatible = spec;
+                incompatible.kind = if (kind == .sum) .avg else .sum;
+                try std.testing.expectError(error.InvalidSqlSpill, decode(a, encoded, incompatible));
+            }
+        }
+    }
+}
+
+test "SQL NUMERIC aggregate checkpoints merge exact SUM AVG and DISTINCT ownership under allocation faults" {
+    try numericCheckpointScenario(std.testing.allocator, true);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, numericCheckpointScenario, .{false});
+}
+
+test "SQL NUMERIC aggregate extrema partials retain exact values and display scale" {
+    const a = std.testing.allocator;
+    const exact = @import("numeric_value.zig");
+    var context: exact.Context = .{ .alloc = a };
+    var number = try exact.parse(&context, "9007199254740993.1200");
+    defer number.deinit();
+    var state = try operators.Aggregate.init(a, .min, .number);
+    defer state.deinit();
+    try state.update(Datum.typedNumeric(&number.value));
+    const encoded = try cell(a, state);
+    defer a.free(encoded.value.string);
+    var restored = try decode(a, encoded, .{ .kind = .min, .input_type = .number });
+    defer restored.deinit();
+    const result = try restored.finish();
+    try std.testing.expect(result.numeric != null and !result.sql_null);
+    try std.testing.expectEqual(@as(u16, 4), result.numeric.?.scale);
+    try std.testing.expectEqual(std.math.Order.eq, try @import("scalar.zig").compareDatums(result, Datum.typedNumeric(&number.value)));
+}
+
 /// Merge complete decoded states. DISTINCT uses membership, while ordinary
 /// numeric states merge without narrowing intermediate sums.
 pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
+    if (target.kind != source.kind or target.input_type != source.input_type or target.input_element != source.input_element or target.distinct != source.distinct) return error.InvalidSqlSpill;
     if (source.distinct) {
         if (source.patterns) |patterns| {
             for (patterns.values.items) |value| try target.update(if (value == .null) Datum{} else Datum.json(value));
         } else for (source.distinct_values.items) |entry| try target.update(entry.row.row.values[0]);
         return;
     }
-    if (source.count == 0) return;
     const total = std.math.add(u64, target.count, source.count) catch return error.SqlNumericOutOfRange;
     if (total > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+    if (target.numeric) |reducer| {
+        const incoming = source.numeric orelse return error.InvalidSqlSpill;
+        if (reducer.state.count != target.count or incoming.state.count != source.count) return error.InvalidSqlSpill;
+        try reducer.merge(incoming.state);
+        target.count = total;
+        return;
+    }
+    if (source.numeric != null) return error.InvalidSqlSpill;
+    if (source.count == 0) return;
     switch (target.kind) {
         .count => {},
         .sum => if (target.input_type == .integer) {
@@ -252,21 +437,25 @@ pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
             // answer differently before any other contribution is merged.
             target.number_sum = source.number_sum;
             target.compensation = source.compensation;
+        } else if (target.input_element == .float32) {
+            target.number_sum = try operators.Aggregate.addRealSum(target.number_sum, source.number_sum);
         } else {
             // Include the incoming compensation when composing local sums.
             for ([_]f64{ source.number_sum, -source.compensation }) |value| {
-                const adjusted = value - target.compensation;
-                const sum = target.number_sum + adjusted;
-                if (!std.math.isFinite(sum)) return error.SqlNumericOutOfRange;
-                target.compensation = (sum - target.number_sum) - adjusted;
-                target.number_sum = sum;
+                try operators.Aggregate.addFloatSum(&target.number_sum, &target.compensation, value);
             }
         },
         .avg => {
             const fraction = @as(f64, @floatFromInt(source.count)) / @as(f64, @floatFromInt(total));
             const delta = source.mean - target.mean;
-            target.mean = if (target.count == 0) source.mean else if (std.math.isFinite(delta)) target.mean + delta * fraction else target.mean * (1 - fraction) + source.mean * fraction;
-            if (!std.math.isFinite(target.mean)) return error.SqlNumericOutOfRange;
+            if (target.count == 0) {
+                target.mean = source.mean;
+            } else if (!std.math.isFinite(target.mean) or !std.math.isFinite(source.mean)) {
+                target.mean += source.mean;
+            } else {
+                target.mean = if (std.math.isFinite(delta)) target.mean + delta * fraction else target.mean * (1 - fraction) + source.mean * fraction;
+                if (!std.math.isFinite(target.mean)) return error.SqlNumericOutOfRange;
+            }
         },
         .bool_and => target.boolean = target.boolean and source.boolean,
         .bool_or => target.boolean = target.boolean or source.boolean,
@@ -332,19 +521,66 @@ test "SQL binary aggregate codec preserves exact states and rejects incomplete o
 
 // Frozen empty COUNT record: explicit kind=1/type=255, zero native state,
 // SQL-null extremum, no distinct members, and no pattern NULL position.
+test "SQL aggregate typed-array partials use the shared portable block codec" {
+    const Scenario = struct {
+        fn run(a: A) !void {
+            var array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -3 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+            var state = try operators.Aggregate.init(a, .min, .array);
+            defer state.deinit();
+            try state.update(Datum.typedArray(&array));
+            const encoded = try cell(a, state);
+            defer a.free(encoded.value.string);
+            var decoded = try decode(a, encoded, .{ .kind = .min, .input_type = .array });
+            defer decoded.deinit();
+            const value = decoded.selected.?.row.values[0];
+            try std.testing.expectEqual(@as(i32, -3), value.array.?.dimensions[0].lower);
+            try std.testing.expectEqual(@as(i64, 9007199254740993), value.array.?.elements[0].value.integer);
+            try std.testing.expect(value.array.?.elements[1].sql_null);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}
+
 test "SQL aggregate wire signature uses stable explicit IDs" {
     const a = std.testing.allocator;
     var state = try operators.Aggregate.init(a, .count, null);
     defer state.deinit();
     const encoded = try cell(a, state);
     defer a.free(encoded.value.string);
-    var expected: [73]u8 = @splat(0);
-    @memcpy(expected[0..8], "AGS\x01\x01\xff\x00\x00");
-    @memset(expected[65..], 255);
+    var expected: [75]u8 = @splat(0);
+    @memcpy(expected[0..9], "AGS\x02\x01\xff\x00\x00\xff");
+    @memset(expected[67..], 255);
     try std.testing.expectEqualSlices(u8, &expected, encoded.value.string);
     var decoded = try decode(a, Datum.json(.{ .string = &expected }), .{ .kind = .count });
     defer decoded.deinit();
     try std.testing.expectEqual(@as(u64, 0), decoded.count);
     try std.testing.expectEqual(@as(u8, 3), typeId(.number));
     try std.testing.expectEqual(@as(u8, 7), typeId(.uuid));
+}
+
+test "SQL floating special values survive partial codec and combination" {
+    const a = std.testing.allocator;
+    for ([_]@import("array_value.zig").ElementType{ .float32, .float64 }) |kind| {
+        for ([_]operators.Aggregate.Kind{ .sum, .avg }) |operation| {
+            var source = try operators.Aggregate.initTyped(a, operation, .number, kind);
+            defer source.deinit();
+            try source.update(Datum.json(.{ .float = std.math.inf(f64) }));
+            const saved = try cell(a, source);
+            defer a.free(saved.value.string);
+            var restored = try decode(a, saved, .{ .kind = operation, .input_type = .number, .input_element = kind });
+            defer restored.deinit();
+            try merge(&restored, source);
+            try std.testing.expect(std.math.isPositiveInf((try restored.finish()).value.float));
+            var opposite = try operators.Aggregate.initTyped(a, operation, .number, kind);
+            defer opposite.deinit();
+            try opposite.update(Datum.json(.{ .float = -std.math.inf(f64) }));
+            try merge(&restored, opposite);
+            try std.testing.expect(std.math.isNan((try restored.finish()).value.float));
+            const nan_saved = try cell(a, restored);
+            defer a.free(nan_saved.value.string);
+            var nan_restored = try decode(a, nan_saved, .{ .kind = operation, .input_type = .number, .input_element = kind });
+            defer nan_restored.deinit();
+            try std.testing.expect(std.math.isNan((try nan_restored.finish()).value.float));
+        }
+    }
 }

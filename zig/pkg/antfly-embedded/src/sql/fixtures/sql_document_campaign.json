@@ -1,0 +1,7218 @@
+{
+  "format": 1,
+  "source_commit": "79644dfa1605e8da0f486d021d1c1393577d6265",
+  "entries": [
+    {
+      "id": "sql-0881",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0882",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0883",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0884",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0885",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0886",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0887",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0888",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0889",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0890",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0891",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0893",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0894",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0895",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0896",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0897",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0898",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0899",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0900",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "obsolete": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0901",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0902",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0903",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "tags": {
+                  "type": "array",
+                  "items": {
+                    "type": "keyword"
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0907",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0908",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0909",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0910",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "title_lc": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "lower",
+                      "args": [
+                        {
+                          "field": "title"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0911",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0912",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0913",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0914",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0915",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0916",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "tags": {
+                  "type": "array",
+                  "items": {
+                    "type": "keyword"
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0917",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "metadata": {
+                  "type": "object",
+                  "properties": {
+                    "plan": {
+                      "type": "keyword",
+                      "x-antfly-column-name": "metadata_plan"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0918",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "metadata": {
+                  "type": "object",
+                  "properties": {
+                    "plan": {
+                      "type": "keyword"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0919",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "default": "draft"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0920",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "title_lc": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "lower",
+                      "args": [
+                        {
+                          "field": "title"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0921",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0922",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0923",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0924",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0925",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0926",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0927",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0928",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0929",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0930",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0931",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0932",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0933",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0934",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0935",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0936",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0937",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0938",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0939",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0940",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                },
+                "note": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0941",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0942",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0943",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0944",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0945",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0946",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0947",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0948",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0949",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0950",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0951",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0952",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0953",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0954",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0955",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0956",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_lower": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "lower",
+                      "args": [
+                        {
+                          "field": "status"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0957",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_title_key": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "concat",
+                      "args": [
+                        {
+                          "field": "status"
+                        },
+                        {
+                          "value": ":"
+                        },
+                        {
+                          "field": "title"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "status_title_ws": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "concat_ws",
+                      "args": [
+                        {
+                          "value": ":"
+                        },
+                        {
+                          "field": "status"
+                        },
+                        {
+                          "field": "title"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0958",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_title_key": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "concat",
+                      "args": [
+                        {
+                          "field": "status"
+                        },
+                        {
+                          "value": ":"
+                        },
+                        {
+                          "field": "title"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "status_title_ws": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "concat_ws",
+                      "args": [
+                        {
+                          "value": ":"
+                        },
+                        {
+                          "field": "status"
+                        },
+                        {
+                          "field": "title"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0959",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_title_key": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "concat",
+                      "args": [
+                        {
+                          "field": "status"
+                        },
+                        {
+                          "value": ":"
+                        },
+                        {
+                          "field": "title"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "status_title_ws": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "concat_ws",
+                      "args": [
+                        {
+                          "value": ":"
+                        },
+                        {
+                          "field": "status"
+                        },
+                        {
+                          "field": "title"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0960",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_slug": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "replace",
+                      "args": [
+                        {
+                          "op": "lower",
+                          "args": [
+                            {
+                              "field": "status"
+                            }
+                          ]
+                        },
+                        {
+                          "value": " "
+                        },
+                        {
+                          "value": "-"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0961",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_slug": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "replace",
+                      "args": [
+                        {
+                          "op": "lower",
+                          "args": [
+                            {
+                              "field": "status"
+                            }
+                          ]
+                        },
+                        {
+                          "value": " "
+                        },
+                        {
+                          "value": "-"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0962",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0963",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_slug": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "replace",
+                      "args": [
+                        {
+                          "op": "lower",
+                          "args": [
+                            {
+                              "field": "title"
+                            }
+                          ]
+                        },
+                        {
+                          "value": " "
+                        },
+                        {
+                          "value": "-"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0964",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_slug": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "replace",
+                      "args": [
+                        {
+                          "op": "lower",
+                          "args": [
+                            {
+                              "field": "status"
+                            }
+                          ]
+                        },
+                        {
+                          "value": " "
+                        },
+                        {
+                          "value": "-"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0965",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_slug": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "replace",
+                      "args": [
+                        {
+                          "op": "lower",
+                          "args": [
+                            {
+                              "field": "status"
+                            }
+                          ]
+                        },
+                        {
+                          "value": " "
+                        },
+                        {
+                          "value": "-"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "status_slug",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0966",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_slug": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "replace",
+                      "args": [
+                        {
+                          "op": "lower",
+                          "args": [
+                            {
+                              "field": "status"
+                            }
+                          ]
+                        },
+                        {
+                          "value": " "
+                        },
+                        {
+                          "value": "-"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-name": "status_slug_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:status_slug_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "status_slug",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0967",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_abs": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "abs",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "status_pos": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "strpos",
+                      "args": [
+                        {
+                          "field": "status"
+                        },
+                        {
+                          "value": "a"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0968",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_abs": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "abs",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "status_pos": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "strpos",
+                      "args": [
+                        {
+                          "field": "status"
+                        },
+                        {
+                          "value": "a"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0969",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "fee": {
+                  "type": "numeric"
+                },
+                "amount_abs": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "abs",
+                      "args": [
+                        {
+                          "field": "fee"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0970",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_mod": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "mod",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0971",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_mod": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "mod",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0972",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0973",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "fee": {
+                  "type": "numeric"
+                },
+                "amount_mod": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "mod",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "fee"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0974",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_sum": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "add",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0975",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_delta": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "sub",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0976",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_product": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "mul",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0977",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_ratio": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "div",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0978",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_power": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "power",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "value": 2
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0979",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_sum": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "add",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0980",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_power": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "power",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "value": 2
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0981",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0982",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "fee": {
+                  "type": "numeric"
+                },
+                "amount_sum": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "add",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "fee"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0983",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_sum": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "add",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0984",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_sum": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "add",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "amount_sum",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0985",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_sum": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "add",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-name": "amount_sum_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:amount_sum_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "amount_sum",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0986",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0987",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "fee": {
+                  "type": "numeric"
+                },
+                "amount_power": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "power",
+                      "args": [
+                        {
+                          "field": "fee"
+                        },
+                        {
+                          "value": 2
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0988",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_power": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "power",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "value": 2
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0989",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_power": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "power",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "value": 2
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "amount_power",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0990",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_power": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "power",
+                      "args": [
+                        {
+                          "field": "amount"
+                        },
+                        {
+                          "value": 2
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-name": "amount_power_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:amount_power_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "amount_power",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0991",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_text": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "cast",
+                      "to": "text",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0992",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_text": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "cast",
+                      "to": "text",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0993",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_text": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "cast",
+                      "to": "text",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0994",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_text": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "cast",
+                      "to": "text",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0995",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0996",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "fee": {
+                  "type": "numeric"
+                },
+                "amount_text": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "cast",
+                      "to": "text",
+                      "args": [
+                        {
+                          "field": "fee"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0997",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_text": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "cast",
+                      "to": "text",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0998",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_text": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "cast",
+                      "to": "text",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "amount_text",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-0999",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_text": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "cast",
+                      "to": "text",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-name": "amount_text_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:amount_text_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "amount_text",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1000",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1001",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "fee": {
+                  "type": "numeric"
+                },
+                "amount_text": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "cast",
+                      "to": "text",
+                      "args": [
+                        {
+                          "field": "fee"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1002",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_text": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "cast",
+                      "to": "text",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1003",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_text": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "cast",
+                      "to": "text",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "amount_text",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1004",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_text": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "cast",
+                      "to": "text",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-name": "amount_text_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:amount_text_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "amount_text",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1005",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_source": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "source",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1006",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_type": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_typeof",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1007",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_flag_count": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_array_length",
+                      "args": [
+                        {
+                          "op": "json_extract",
+                          "path": "flags",
+                          "args": [
+                            {
+                              "field": "metadata"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1008",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1009",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "payload": {
+                  "type": "json"
+                },
+                "metadata_source": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "source",
+                      "args": [
+                        {
+                          "field": "payload"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1010",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_source": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "source",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1011",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_source": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "source",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "metadata_source",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1012",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_source": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "source",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-name": "metadata_source_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:metadata_source_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "metadata_source",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1013",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1014",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "payload": {
+                  "type": "json"
+                },
+                "metadata_type": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_typeof",
+                      "args": [
+                        {
+                          "field": "payload"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1015",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_type": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_typeof",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1016",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_type": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_typeof",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "metadata_type",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1017",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_type": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_typeof",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-name": "metadata_type_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:metadata_type_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "metadata_type",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1018",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1019",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "payload": {
+                  "type": "json"
+                },
+                "metadata_flag_count": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_array_length",
+                      "args": [
+                        {
+                          "op": "json_extract",
+                          "path": "flags",
+                          "args": [
+                            {
+                              "field": "payload"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1020",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_flag_count": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_array_length",
+                      "args": [
+                        {
+                          "op": "json_extract",
+                          "path": "flags",
+                          "args": [
+                            {
+                              "field": "metadata"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1021",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_flag_count": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_array_length",
+                      "args": [
+                        {
+                          "op": "json_extract",
+                          "path": "flags",
+                          "args": [
+                            {
+                              "field": "metadata"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "metadata_flag_count",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1022",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_flag_count": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_array_length",
+                      "args": [
+                        {
+                          "op": "json_extract",
+                          "path": "flags",
+                          "args": [
+                            {
+                              "field": "metadata"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-name": "metadata_flag_count_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:metadata_flag_count_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "metadata_flag_count",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1023",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_source": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "source",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1024",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_type": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_typeof",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1025",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_flag_count": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_array_length",
+                      "args": [
+                        {
+                          "op": "json_extract",
+                          "path": "flags",
+                          "args": [
+                            {
+                              "field": "metadata"
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1026",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_source": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "source",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1027",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_billing_plan": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "billing.plan",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1028",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_flags": {
+                  "type": "json",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "path": "flags",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1029",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1030",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "payload": {
+                  "type": "json"
+                },
+                "metadata_source": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "source",
+                      "args": [
+                        {
+                          "field": "payload"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1031",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_source": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "source",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1032",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_source": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "source",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "metadata_source",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1033",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_source": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "source",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-name": "metadata_source_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:metadata_source_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "metadata_source",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1044",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "metadata": {
+                  "type": "json"
+                },
+                "metadata_source": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "json_extract",
+                      "as_text": true,
+                      "path": "source",
+                      "args": [
+                        {
+                          "field": "metadata"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1047",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_abs": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "abs",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "status_pos": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "strpos",
+                      "args": [
+                        {
+                          "field": "status"
+                        },
+                        {
+                          "value": "a"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1048",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1049",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_pos": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "strpos",
+                      "args": [
+                        {
+                          "field": "title"
+                        },
+                        {
+                          "value": "a"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1050",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_pos": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "strpos",
+                      "args": [
+                        {
+                          "field": "status"
+                        },
+                        {
+                          "value": "a"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1051",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_pos": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "strpos",
+                      "args": [
+                        {
+                          "field": "status"
+                        },
+                        {
+                          "value": "a"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "status_pos",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1052",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_pos": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "strpos",
+                      "args": [
+                        {
+                          "field": "status"
+                        },
+                        {
+                          "value": "a"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-name": "status_pos_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:status_pos_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "status_pos",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1053",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_abs": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "abs",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "status_pos": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "strpos",
+                      "args": [
+                        {
+                          "field": "status"
+                        },
+                        {
+                          "value": "a"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1054",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1055",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1056",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1057",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1058",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_lower": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "lower",
+                      "args": [
+                        {
+                          "field": "status"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1059",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1060",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1061",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1062",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "status",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1063",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-index-name": "status_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:status_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "status",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1064",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1065",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_abs": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "abs",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-lifecycle": "building"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1066",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_abs": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "abs",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-where": {
+                    "all": [
+                      {
+                        "field": "amount_abs",
+                        "op": "is_not_null"
+                      }
+                    ]
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1067",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "amount": {
+                  "type": "numeric"
+                },
+                "amount_abs": {
+                  "type": "numeric",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "abs",
+                      "args": [
+                        {
+                          "field": "amount"
+                        }
+                      ]
+                    }
+                  },
+                  "x-antfly-index-name": "amount_abs_idx",
+                  "x-antfly-index-access-method": "ordered_tuple",
+                  "x-antfly-index-generation": 1,
+                  "x-antfly-index-schema-fingerprint": "secondary-index-v1:amount_abs_idx",
+                  "x-antfly-index-keys": [
+                    {
+                      "column": "amount_abs",
+                      "direction": "desc"
+                    }
+                  ]
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1068",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1069",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1070",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1071",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text",
+                  "x-antfly-column-name": "title"
+                },
+                "score": {
+                  "type": "numeric",
+                  "x-antfly-column-name": "score"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1072",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                },
+                "status_lower": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "lower",
+                      "args": [
+                        {
+                          "field": "status"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1073",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1074",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                },
+                "status_lower": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "lower",
+                      "args": [
+                        {
+                          "field": "status"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1075",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1076",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1077",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1078",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1079",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "title_lc": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "lower",
+                      "args": [
+                        {
+                          "field": "title"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1080",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1081",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "archived_at": {
+                  "type": "numeric",
+                  "nullable": true
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1082",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "metadata": {
+                  "type": "object",
+                  "properties": {
+                    "plan": {
+                      "type": "keyword",
+                      "x-antfly-column-name": "metadata_plan"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1083",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "tags": {
+                  "type": "array",
+                  "items": {
+                    "type": "keyword"
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1084",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1085",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1086",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "amount": {
+                  "type": "numeric"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1087",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "enabled": {
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1088",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "metadata": {
+                  "type": "object",
+                  "properties": {
+                    "plan": {
+                      "type": "keyword",
+                      "x-antfly-column-name": "metadata_plan"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1089",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1090",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1091",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1092",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1093",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1094",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1095",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1096",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1097",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                },
+                "status_lower": {
+                  "type": "keyword",
+                  "generated": {
+                    "op": "expression",
+                    "expression": {
+                      "op": "lower",
+                      "args": [
+                        {
+                          "field": "status"
+                        }
+                      ]
+                    }
+                  }
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1098",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "keyword",
+                  "x-antfly-cardinality-proof": "unique"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1099",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "category": {
+                  "type": "keyword",
+                  "x-antfly-index": false
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1100",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1102",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1103",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1104",
+      "family": "unsupported_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1105",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1106",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1107",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "sql-1108",
+      "family": "document_write",
+      "schema": {
+        "version": 1,
+        "storage_mode": "document",
+        "default_type": "doc",
+        "document_schemas": {
+          "doc": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "title": {
+                  "type": "text"
+                },
+                "status": {
+                  "type": "keyword"
+                }
+              },
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    }
+  ]
+}

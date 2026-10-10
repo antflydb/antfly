@@ -1,0 +1,815 @@
+{
+  "format": 1,
+  "schema": {
+    "version": 1,
+    "storage_mode": "relational",
+    "default_type": "row",
+    "document_schemas": {
+      "row": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "keyword"
+            },
+            "name": {
+              "type": "keyword"
+            },
+            "status": {
+              "type": "keyword"
+            },
+            "organization_id": {
+              "type": "keyword"
+            },
+            "email": {
+              "type": "keyword"
+            },
+            "amount": {
+              "type": "integer"
+            },
+            "quantity": {
+              "type": "integer"
+            },
+            "tenant_id": {
+              "type": "keyword"
+            },
+            "customer_id": {
+              "type": "keyword"
+            },
+            "created_at": {
+              "type": "keyword"
+            },
+            "enabled": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "keyword"
+            },
+            "tags": {
+              "type": "json"
+            },
+            "metadata": {
+              "type": "json"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  },
+  "rows": [
+    {
+      "key": "r01",
+      "value": {
+        "id": "u1",
+        "name": "Ada",
+        "status": "active",
+        "organization_id": "org_1",
+        "email": "ADA@EXAMPLE.TEST",
+        "amount": 12,
+        "quantity": 2,
+        "tenant_id": "t1",
+        "customer_id": "c1",
+        "created_at": "2025-01-01T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [
+          "hot",
+          "new"
+        ],
+        "metadata": {
+          "source": "api",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "pro"
+          }
+        }
+      }
+    },
+    {
+      "key": "r02",
+      "value": {
+        "id": "u2",
+        "name": "Grace",
+        "status": "ready",
+        "organization_id": "org_1",
+        "email": "grace@example.test",
+        "amount": 6,
+        "quantity": 2,
+        "tenant_id": "t2",
+        "customer_id": "c2",
+        "created_at": "2025-01-02T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [
+          "cold"
+        ],
+        "metadata": {
+          "source": "manual",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "free"
+          }
+        }
+      }
+    },
+    {
+      "key": "r03",
+      "value": {
+        "id": "u3",
+        "name": "Other",
+        "status": "pending",
+        "organization_id": "org_2",
+        "email": "blocked@example.test",
+        "amount": 9,
+        "quantity": 3,
+        "tenant_id": "t1",
+        "customer_id": "c1",
+        "created_at": "2025-01-03T00:00:00Z",
+        "enabled": false,
+        "kind": "order",
+        "tags": [],
+        "metadata": {
+          "source": "autoscale_delta",
+          "kind": "internal",
+          "flags": [],
+          "billing": {
+            "plan": "pro"
+          }
+        }
+      }
+    },
+    {
+      "key": "r04",
+      "value": {
+        "id": "u4",
+        "name": "Ada",
+        "status": "open",
+        "organization_id": "org_1",
+        "email": "ADA@EXAMPLE.TEST",
+        "amount": 12,
+        "quantity": 0,
+        "tenant_id": "t2",
+        "customer_id": "c2",
+        "created_at": "2025-01-04T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [
+          "hot",
+          null,
+          "new"
+        ],
+        "metadata": {
+          "source": "api",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "free"
+          }
+        }
+      }
+    },
+    {
+      "key": "r05",
+      "value": {
+        "id": "u5",
+        "name": "Grace",
+        "status": "closed",
+        "organization_id": "org_1",
+        "email": "grace@example.test",
+        "amount": 15,
+        "quantity": 1,
+        "tenant_id": "t1",
+        "customer_id": "c1",
+        "created_at": "2025-01-05T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [
+          "hot",
+          "new"
+        ],
+        "metadata": {
+          "source": "manual",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "pro"
+          }
+        }
+      }
+    },
+    {
+      "key": "r06",
+      "value": {
+        "id": "u6",
+        "name": "Other",
+        "status": "draft",
+        "organization_id": "org_2",
+        "email": "blocked@example.test",
+        "amount": 18,
+        "quantity": 2,
+        "tenant_id": "t2",
+        "customer_id": "c2",
+        "created_at": "2025-01-06T00:00:00Z",
+        "enabled": false,
+        "kind": "order",
+        "tags": [
+          "cold"
+        ],
+        "metadata": {
+          "source": "autoscale_delta",
+          "kind": "internal",
+          "flags": [],
+          "billing": {
+            "plan": "free"
+          }
+        }
+      }
+    },
+    {
+      "key": "r07",
+      "value": {
+        "id": "u7",
+        "name": "Ada",
+        "status": "queued",
+        "organization_id": "org_1",
+        "email": "ADA@EXAMPLE.TEST",
+        "amount": 21,
+        "quantity": 3,
+        "tenant_id": "t1",
+        "customer_id": "c1",
+        "created_at": "2025-01-07T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [],
+        "metadata": {
+          "source": "api",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "pro"
+          }
+        }
+      }
+    },
+    {
+      "key": "r08",
+      "value": {
+        "id": "u8",
+        "name": "Grace",
+        "status": "deleted",
+        "organization_id": "org_1",
+        "email": "grace@example.test",
+        "amount": 24,
+        "quantity": 0,
+        "tenant_id": "t2",
+        "customer_id": "c2",
+        "created_at": "2025-01-08T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [
+          "hot",
+          null,
+          "new"
+        ],
+        "metadata": {
+          "source": "manual",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "free"
+          }
+        }
+      }
+    },
+    {
+      "key": "r09",
+      "value": {
+        "id": "u9",
+        "name": "Other",
+        "status": "archived",
+        "organization_id": "org_2",
+        "email": "blocked@example.test",
+        "amount": 27,
+        "quantity": 1,
+        "tenant_id": "t1",
+        "customer_id": "c1",
+        "created_at": "2025-01-09T00:00:00Z",
+        "enabled": false,
+        "kind": "order",
+        "tags": [
+          "hot",
+          "new"
+        ],
+        "metadata": {
+          "source": "autoscale_delta",
+          "kind": "internal",
+          "flags": [],
+          "billing": {
+            "plan": "pro"
+          }
+        }
+      }
+    },
+    {
+      "key": "r10",
+      "value": {
+        "id": "u10",
+        "name": "Ada",
+        "status": "active-123",
+        "organization_id": "org_1",
+        "email": "ADA@EXAMPLE.TEST",
+        "amount": 30,
+        "quantity": 2,
+        "tenant_id": "t2",
+        "customer_id": "c2",
+        "created_at": "2025-01-10T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [
+          "cold"
+        ],
+        "metadata": {
+          "source": "api",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "free"
+          }
+        }
+      }
+    },
+    {
+      "key": "r11",
+      "value": {
+        "id": "u11",
+        "name": "Grace",
+        "status": "--active-",
+        "organization_id": "org_1",
+        "email": "grace@example.test",
+        "amount": 33,
+        "quantity": 3,
+        "tenant_id": "t1",
+        "customer_id": "c1",
+        "created_at": "2025-01-11T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [],
+        "metadata": {
+          "source": "manual",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "pro"
+          }
+        }
+      }
+    },
+    {
+      "key": "r12",
+      "value": {
+        "id": "u12",
+        "name": "Other",
+        "status": "active-user",
+        "organization_id": "org_2",
+        "email": "blocked@example.test",
+        "amount": 36,
+        "quantity": 0,
+        "tenant_id": "t2",
+        "customer_id": "c2",
+        "created_at": "2025-01-12T00:00:00Z",
+        "enabled": false,
+        "kind": "order",
+        "tags": [
+          "hot",
+          null,
+          "new"
+        ],
+        "metadata": {
+          "source": "autoscale_delta",
+          "kind": "internal",
+          "flags": [],
+          "billing": {
+            "plan": "free"
+          }
+        }
+      }
+    },
+    {
+      "key": "r13",
+      "value": {
+        "id": "u13",
+        "name": "Ada",
+        "status": "active ready",
+        "organization_id": "org_1",
+        "email": "ADA@EXAMPLE.TEST",
+        "amount": 39,
+        "quantity": 1,
+        "tenant_id": "t1",
+        "customer_id": "c1",
+        "created_at": "2025-01-13T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [
+          "hot",
+          "new"
+        ],
+        "metadata": {
+          "source": "api",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "pro"
+          }
+        }
+      }
+    },
+    {
+      "key": "r14",
+      "value": {
+        "id": "u14",
+        "name": "Grace",
+        "status": "hello",
+        "organization_id": "org_1",
+        "email": "grace@example.test",
+        "amount": 42,
+        "quantity": 2,
+        "tenant_id": "t2",
+        "customer_id": "c2",
+        "created_at": "2025-01-14T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [
+          "cold"
+        ],
+        "metadata": {
+          "source": "manual",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "free"
+          }
+        }
+      }
+    },
+    {
+      "key": "r15",
+      "value": {
+        "id": "u15",
+        "name": "Other",
+        "status": "a_b",
+        "organization_id": "org_2",
+        "email": "blocked@example.test",
+        "amount": 45,
+        "quantity": 3,
+        "tenant_id": "t1",
+        "customer_id": "c1",
+        "created_at": "2025-01-15T00:00:00Z",
+        "enabled": false,
+        "kind": "order",
+        "tags": [],
+        "metadata": {
+          "source": "autoscale_delta",
+          "kind": "internal",
+          "flags": [],
+          "billing": {
+            "plan": "pro"
+          }
+        }
+      }
+    },
+    {
+      "key": "r16",
+      "value": {
+        "id": "u16",
+        "name": "Ada",
+        "status": "active  user",
+        "organization_id": "org_1",
+        "email": "ADA@EXAMPLE.TEST",
+        "amount": 48,
+        "quantity": 0,
+        "tenant_id": "t2",
+        "customer_id": "c2",
+        "created_at": "2025-01-16T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [
+          "hot",
+          null,
+          "new"
+        ],
+        "metadata": {
+          "source": "api",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "free"
+          }
+        }
+      }
+    },
+    {
+      "key": "r17",
+      "value": {
+        "id": "u17",
+        "name": "Grace",
+        "status": "manual",
+        "organization_id": "org_1",
+        "email": "grace@example.test",
+        "amount": 51,
+        "quantity": 1,
+        "tenant_id": "t1",
+        "customer_id": "c1",
+        "created_at": "2025-01-17T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [
+          "hot",
+          "new"
+        ],
+        "metadata": {
+          "source": "manual",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "pro"
+          }
+        }
+      }
+    },
+    {
+      "key": "r18",
+      "value": {
+        "id": "u18",
+        "name": "Other",
+        "organization_id": "org_2",
+        "email": "blocked@example.test",
+        "amount": 54,
+        "quantity": 2,
+        "tenant_id": "t2",
+        "customer_id": "c2",
+        "created_at": "2025-01-18T00:00:00Z",
+        "enabled": false,
+        "kind": "order",
+        "tags": [
+          "cold"
+        ],
+        "metadata": {
+          "source": "autoscale_delta",
+          "kind": "internal",
+          "flags": [],
+          "billing": {
+            "plan": "free"
+          }
+        }
+      }
+    },
+    {
+      "key": "r19",
+      "value": {
+        "id": "u19",
+        "name": "Ada",
+        "status": "ready",
+        "organization_id": "org_1",
+        "email": "ADA@EXAMPLE.TEST",
+        "amount": 57,
+        "quantity": 3,
+        "tenant_id": "t1",
+        "customer_id": "c1",
+        "created_at": "2025-01-19T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [],
+        "metadata": {
+          "source": "meter",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "pro"
+          }
+        }
+      }
+    },
+    {
+      "key": "r20",
+      "value": {
+        "id": "u20",
+        "name": "Grace",
+        "status": "ready",
+        "organization_id": "org_1",
+        "email": "grace@example.test",
+        "amount": 60,
+        "quantity": 0,
+        "tenant_id": "t2",
+        "customer_id": "c2",
+        "created_at": "2025-01-20T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [
+          "hot",
+          null,
+          "new"
+        ],
+        "metadata": {
+          "source": "meter",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "free"
+          }
+        }
+      }
+    },
+    {
+      "key": "r21",
+      "value": {
+        "id": "u21",
+        "name": "Other",
+        "status": "ready",
+        "organization_id": "org_2",
+        "email": "blocked@example.test",
+        "amount": 63,
+        "quantity": 1,
+        "tenant_id": "t1",
+        "customer_id": "c1",
+        "created_at": "2025-01-21T00:00:00Z",
+        "enabled": false,
+        "kind": "order",
+        "tags": [
+          "hot",
+          "new"
+        ],
+        "metadata": {
+          "source": "meter",
+          "kind": "internal",
+          "flags": [],
+          "billing": {
+            "plan": "pro"
+          }
+        }
+      }
+    },
+    {
+      "key": "r22",
+      "value": {
+        "id": "u22",
+        "name": "Ada",
+        "status": "ready",
+        "organization_id": "org_1",
+        "email": "ADA@EXAMPLE.TEST",
+        "amount": 66,
+        "quantity": 2,
+        "tenant_id": "t2",
+        "customer_id": "c2",
+        "created_at": "2025-01-22T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [
+          "cold"
+        ],
+        "metadata": {
+          "source": "meter",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "free"
+          }
+        }
+      }
+    },
+    {
+      "key": "r23",
+      "value": {
+        "id": "u23",
+        "name": "Grace",
+        "status": "ready",
+        "organization_id": "org_1",
+        "email": "grace@example.test",
+        "amount": 69,
+        "quantity": 3,
+        "tenant_id": "t1",
+        "customer_id": "c1",
+        "created_at": "2025-01-23T00:00:00Z",
+        "enabled": true,
+        "kind": "order",
+        "tags": [],
+        "metadata": {
+          "source": "meter",
+          "kind": "external",
+          "flags": [
+            "rated"
+          ],
+          "billing": {
+            "plan": "pro"
+          }
+        }
+      }
+    },
+    {
+      "key": "r24",
+      "value": {
+        "id": "u24",
+        "name": "Other",
+        "status": "ready",
+        "organization_id": "org_2",
+        "email": "blocked@example.test",
+        "amount": 72,
+        "quantity": 0,
+        "tenant_id": "t2",
+        "customer_id": "c2",
+        "created_at": "2025-01-24T00:00:00Z",
+        "enabled": false,
+        "kind": "order",
+        "tags": [
+          "hot",
+          null,
+          "new"
+        ],
+        "metadata": {
+          "source": "meter",
+          "kind": "internal",
+          "flags": [],
+          "billing": {
+            "plan": "free"
+          }
+        }
+      }
+    },
+    {
+      "key": "c1",
+      "value": {
+        "id": "c1",
+        "name": "Ada Customer",
+        "status": "customer",
+        "organization_id": "org_2",
+        "email": "customer@example.test",
+        "amount": 0,
+        "quantity": 0,
+        "tenant_id": "t1",
+        "customer_id": "c1",
+        "created_at": "2024-12-31T00:00:00Z",
+        "enabled": true,
+        "kind": "customer",
+        "tags": [],
+        "metadata": {
+          "source": "internal",
+          "flags": []
+        }
+      }
+    },
+    {
+      "key": "c2",
+      "value": {
+        "id": "c2",
+        "name": "Grace Customer",
+        "status": "customer",
+        "organization_id": "org_2",
+        "email": "customer@example.test",
+        "amount": 0,
+        "quantity": 0,
+        "tenant_id": "t2",
+        "customer_id": "c2",
+        "created_at": "2024-12-31T00:00:00Z",
+        "enabled": true,
+        "kind": "customer",
+        "tags": [],
+        "metadata": {
+          "source": "internal",
+          "flags": []
+        }
+      }
+    }
+  ]
+}

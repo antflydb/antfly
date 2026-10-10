@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import copy
+import contextlib
+import io
 import json
 import unittest
 from unittest.mock import patch
@@ -21,8 +23,11 @@ from unittest.mock import patch
 from check_sql_parity_inventory import (
     FIXTURES,
     evidence_runs,
+    family_report,
+    main,
     release_blockers,
     run_evidence,
+    select_evidence_gates,
     validate,
 )
 
@@ -96,6 +101,119 @@ class ParityInventoryTest(unittest.TestCase):
 
     def test_deferral_does_not_count_as_completion(self):
         self.assertEqual(1, len(release_blockers([{"status": "deferred"}])))
+
+    def test_family_report_distinguishes_partial_and_absent_evidence(self):
+        inventory = {
+            "entries": [
+                {
+                    "id": "a",
+                    "family": "read",
+                    "source_expectation": "requires_behavior_review",
+                },
+                {"id": "b", "family": "read", "source_expectation": "rejection"},
+                {
+                    "id": "c",
+                    "family": "read",
+                    "source_expectation": "requires_behavior_review",
+                },
+                {
+                    "id": "d",
+                    "family": "ddl",
+                    "source_expectation": "requires_behavior_review",
+                },
+            ]
+        }
+        entries = [
+            {"id": "a", "status": "implemented", "evidence": [{"gate": "read"}]},
+            {"id": "b", "status": "unresolved"},
+            {"id": "c", "status": "unresolved", "evidence": [{"gate": "partial"}]},
+            {"id": "d", "status": "deferred"},
+        ]
+        report = family_report(inventory, entries)
+        self.assertEqual(["ddl", "read"], list(report))
+        self.assertEqual(3, report["read"]["total"])
+        self.assertEqual(1, report["read"]["partial_evidence"])
+        self.assertEqual(1, report["read"]["no_evidence"])
+        self.assertEqual(1, report["read"]["original_rejections"])
+        self.assertEqual(1, report["ddl"]["no_evidence"])
+        self.assertEqual(3, len(release_blockers(entries)))
+
+    def test_family_gate_selection_preserves_partial_evidence(self):
+        inventory, entries, gates = validate(self.inventory, self.ledger)
+        blockers_before = release_blockers(entries)
+        ddl = select_evidence_gates(inventory, entries, gates, "ddl")
+        self.assertIn("sql-original-prepared-cte-runtime", ddl)
+        self.assertEqual(
+            ["sql-original-prepared-cte-runtime"],
+            select_evidence_gates(
+                inventory,
+                entries,
+                gates,
+                "ddl",
+                ["sql-original-prepared-cte-runtime"] * 2,
+            ),
+        )
+        self.assertEqual(gates, select_evidence_gates(inventory, entries, gates))
+        # A scoped execution must not change the full release denominator.
+        self.assertEqual(blockers_before, release_blockers(entries))
+
+    def test_empty_unknown_and_wrong_family_gate_selections_fail_closed(self):
+        inventory = {
+            "entries": [
+                {"id": "a", "family": "read"},
+                {"id": "b", "family": "window"},
+            ]
+        }
+        entries = [
+            {"id": "a", "evidence": [{"gate": "read-proof"}]},
+            {"id": "b"},
+        ]
+        gates = ["read-proof"]
+        for family, requested in (
+            ("missing", None),
+            ("window", None),
+            (None, ["typo"]),
+            ("window", ["read-proof"]),
+        ):
+            with self.assertRaises(ValueError):
+                select_evidence_gates(inventory, entries, gates, family, requested)
+
+    def test_gate_selection_cannot_narrow_release_validation(self):
+        for mode in ([], ["--release"]):
+            with (
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                main(mode + ["--gate", "sql-compiler-rejections"])
+            self.assertEqual(2, raised.exception.code)
+
+    def test_recorded_zig_gates_do_not_rely_on_ignored_runtime_filters(self):
+        for gate in self.ledger["gates"].values():
+            command = gate["command"]
+            if command[:2] == ["zig", "build"]:
+                self.assertNotIn("--", command)
+                self.assertNotIn("--test-filter", command)
+
+    def test_cli_runs_only_selected_evidence_without_changing_dispositions(self):
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            patch("check_sql_parity_inventory.run_evidence") as run,
+        ):
+            result = main(["--evidence", "--gate", "sql-explain-runtime"])
+        self.assertEqual(0, result)
+        self.assertEqual(["sql-explain-runtime"], run.call_args.args[0])
+        self.assertIn("still block release", output.getvalue())
+
+    def test_family_report_does_not_turn_release_into_a_subset_gate(self):
+        with (
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+            patch("check_sql_parity_inventory.run_evidence") as run,
+        ):
+            result = main(["--release", "--family", "read", "--report"])
+        self.assertEqual(1, result)
+        self.assertIn("BLOCKED", errors.getvalue())
+        run.assert_not_called()
 
     def test_unresolved_partial_evidence_is_checked_and_runs_without_release_credit(
         self,
@@ -209,6 +327,37 @@ class ParityInventoryTest(unittest.TestCase):
         self.assertEqual(["c"], runs[1]["gate_ids"])
         self.assertEqual(["d"], runs[2]["gate_ids"])
         self.assertEqual(["e"], runs[3]["gate_ids"])
+
+    def test_compile_filter_grouping_keeps_owner_and_build_options_isolated(self):
+        def gate(filters, target="sql-test", options=()):
+            return {
+                "command": [
+                    "zig",
+                    "build",
+                    target,
+                    *options,
+                    *("-Dtest-filter=" + value for value in filters),
+                ],
+                "cwd": "zig",
+                "timeout_seconds": 5,
+            }
+
+        gates = {
+            "a": gate(["alpha"]),
+            "b": gate(["beta", "alpha", "beta"]),
+            "c": gate(["gamma"], target="pgwire-test"),
+            "d": gate(["delta"], options=["-Doptimize=ReleaseSafe"]),
+        }
+        runs = evidence_runs(list(gates), gates)
+        self.assertEqual(3, len(runs))
+        self.assertEqual(["a", "b"], runs[0]["gate_ids"])
+        self.assertEqual(
+            ["zig", "build", "sql-test", "-Dtest-filter=alpha", "-Dtest-filter=beta"],
+            runs[0]["command"],
+        )
+        self.assertEqual(10, runs[0]["timeout_seconds"])
+        self.assertEqual(["c"], runs[1]["gate_ids"])
+        self.assertEqual(["d"], runs[2]["gate_ids"])
 
 
 if __name__ == "__main__":

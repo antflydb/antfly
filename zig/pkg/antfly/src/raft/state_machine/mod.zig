@@ -55,6 +55,10 @@ pub const SnapshotBuilder = struct {
             snapshot: []const u8,
         ) anyerror!void = null,
         apply_batch: *const fn (ptr: *anyopaque, batch: ApplyBatch) anyerror!void,
+        /// Opt in only for errors that leave a retained Ready safe to replay,
+        /// including an already installed snapshot. Never classify corruption
+        /// or arbitrary resource failures as expected preparation backpressure.
+        is_apply_retryable: ?*const fn (ptr: *anyopaque, group_id: u64, err: anyerror) bool = null,
     };
 
     pub fn buildSnapshot(self: SnapshotBuilder, alloc: std.mem.Allocator, group_id: u64) ![]u8 {
@@ -72,6 +76,11 @@ pub const SnapshotBuilder = struct {
 
     pub fn applyBatch(self: SnapshotBuilder, batch: ApplyBatch) !void {
         return try self.vtable.apply_batch(self.ptr, batch);
+    }
+
+    pub fn isApplyRetryable(self: SnapshotBuilder, group_id: u64, err: anyerror) bool {
+        const classify = self.vtable.is_apply_retryable orelse return false;
+        return classify(self.ptr, group_id, err);
     }
 
     pub fn installSnapshot(

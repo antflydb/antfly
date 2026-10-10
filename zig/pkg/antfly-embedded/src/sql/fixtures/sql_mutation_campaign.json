@@ -1,0 +1,1182 @@
+{
+  "format": 1,
+  "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
+  "description": "Fixed mutation campaign cohort. Profiles route discovery; they are not implementation evidence. SQL and parameters are owned by the immutable inventory.",
+  "entries": [
+    {
+      "id": "sql-0012",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0013",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0570",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0571",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-0572",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-0573",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0574",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-0575",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-0595",
+      "family": "update",
+      "profile": "point"
+    },
+    {
+      "id": "sql-0596",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-0597",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0598",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0599",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0600",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0601",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0602",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0603",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0604",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0605",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0606",
+      "family": "delete_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-0607",
+      "family": "delete_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-0608",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0609",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0610",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0611",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0612",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0613",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0614",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0615",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0619",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0620",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0621",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0622",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0624",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0625",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0626",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0627",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0628",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0629",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0630",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0631",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0632",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0633",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0634",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0635",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0636",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0637",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0638",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0639",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0640",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0643",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0644",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0645",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0646",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0647",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0648",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0649",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0650",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0651",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0652",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0653",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0654",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0655",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0656",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0657",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0658",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0659",
+      "family": "update_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0660",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0661",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0662",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0663",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0664",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0665",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0666",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0667",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-0668",
+      "family": "delete_joined_source",
+      "profile": "joined"
+    },
+    {
+      "id": "sql-1388",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1389",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1390",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1391",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1392",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1393",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1394",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1395",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1396",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1397",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1398",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1399",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1400",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1401",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1402",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1403",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1404",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1405",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1406",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1407",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1412",
+      "family": "insert",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1414",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1415",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1416",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1417",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1418",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1419",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1420",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1421",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1422",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1423",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1424",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1425",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1426",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1427",
+      "family": "insert",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1432",
+      "family": "insert_source",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1433",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1434",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1435",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1436",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1437",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1438",
+      "family": "insert_source",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1439",
+      "family": "insert_source",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1441",
+      "family": "insert_source",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1442",
+      "family": "insert_source",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1443",
+      "family": "insert_source",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1444",
+      "family": "insert_source",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1445",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1446",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1447",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1448",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1449",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1450",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1451",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1452",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1453",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1454",
+      "family": "insert_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1455",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1456",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1457",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1458",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1459",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1460",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1461",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1462",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1463",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1464",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1465",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1466",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1467",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1468",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1469",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1470",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1471",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1472",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1473",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1474",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1475",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1476",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1477",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1478",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1479",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1480",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1482",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1483",
+      "family": "insert",
+      "profile": "conflict"
+    },
+    {
+      "id": "sql-1488",
+      "family": "insert",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1489",
+      "family": "insert",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1490",
+      "family": "insert",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1491",
+      "family": "insert",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1492",
+      "family": "insert",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1493",
+      "family": "insert",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1499",
+      "family": "update",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1500",
+      "family": "update",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1501",
+      "family": "update",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1502",
+      "family": "update",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1503",
+      "family": "update",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1508",
+      "family": "update",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1509",
+      "family": "update",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1510",
+      "family": "update",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1511",
+      "family": "update",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1512",
+      "family": "update",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1514",
+      "family": "delete",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1515",
+      "family": "delete",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1516",
+      "family": "delete",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1517",
+      "family": "delete",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1519",
+      "family": "delete",
+      "profile": "point"
+    },
+    {
+      "id": "sql-1523",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1524",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1525",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1526",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1527",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1528",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1529",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1530",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1533",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1534",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1535",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1536",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1537",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1538",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1539",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1540",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1541",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1542",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1543",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1544",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1545",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1546",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1547",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1548",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1549",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1550",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1551",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1552",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1553",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1554",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1555",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1556",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1557",
+      "family": "update_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1558",
+      "family": "update_source",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1559",
+      "family": "update_source",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1560",
+      "family": "update_source",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1561",
+      "family": "update_source",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1562",
+      "family": "delete_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1563",
+      "family": "delete_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1564",
+      "family": "delete_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1565",
+      "family": "delete_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1566",
+      "family": "delete_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1567",
+      "family": "delete_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1568",
+      "family": "delete_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1569",
+      "family": "delete_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1570",
+      "family": "delete_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1571",
+      "family": "delete_source",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1572",
+      "family": "delete_source",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1573",
+      "family": "delete_source",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1574",
+      "family": "delete_source",
+      "profile": "temporal"
+    },
+    {
+      "id": "sql-1575",
+      "family": "delete_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1576",
+      "family": "delete_source",
+      "profile": "source"
+    },
+    {
+      "id": "sql-1577",
+      "family": "delete_source",
+      "profile": "source"
+    }
+  ]
+}

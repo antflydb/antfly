@@ -55,7 +55,13 @@ const Fixture = struct {
 
 test "SQL INSERT expressions infer batch parameters and preserve exact integers" {
     var fixture: Fixture = .{};
-    var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id, n) VALUES (lower('A'), $1 + 1), ('b', $1 + 1)", .{});
+    // The int4 operator fixes $1 before bigint assignment coercion. An exact
+    // bigint input requires a bigint cast; the target cannot silently widen it.
+    var narrow = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id, n) VALUES (lower('A'), $1 + 1), ('b', $1 + 1)", .{});
+    defer narrow.deinit();
+    try std.testing.expectError(error.SqlNumericOutOfRange, runtime.execute(std.testing.allocator, fixture.backend(), &narrow, &.{.{ .number_string = "9007199254740992" }}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id, n) VALUES (lower('A'), $1::bigint + 1), ('b', $1::bigint + 1)", .{});
     defer compiled.deinit();
     var result = try runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{.{ .number_string = "9007199254740992" }}, .{});
     defer result.deinit();
@@ -90,7 +96,7 @@ fn expressionAllocationCase(alloc: std.mem.Allocator) !void {
 }
 
 test "SQL INSERT expression ownership and JSON null survive allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, expressionAllocationCase, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, expressionAllocationCase, .{});
 }
 
 test "SQL INSERT SELECT retains typed exact integers and JSON null across set sources" {
@@ -98,10 +104,10 @@ test "SQL INSERT SELECT retains typed exact integers and JSON null across set so
         "INSERT INTO items (_id,n,j) SELECT 'a',9007199254740993,CAST('null' AS json)",
         "INSERT INTO items (_id,n,j) SELECT 'a',SUM(9007199254740993),CAST('null' AS json)",
         "INSERT INTO items (_id,n,j) SELECT 'a',$1,CAST('null' AS json)",
-        "INSERT INTO items (_id,n,j) SELECT 'a',COALESCE($1,NULL),CAST('null' AS json)",
-        "INSERT INTO items (_id,n,j) SELECT 'a',d.x,CAST('null' AS json) FROM (SELECT $1 AS x) d",
-        "INSERT INTO items (_id,n,j) WITH a AS (SELECT $1 AS x), b AS (SELECT x FROM a) SELECT 'a',x,CAST('null' AS json) FROM b",
-        "INSERT INTO items (_id,n,j) SELECT 'a',$1,CAST('null' AS json) UNION ALL SELECT 'b',$1,CAST('null' AS json)",
+        "INSERT INTO items (_id,n,j) SELECT 'a',COALESCE($1::bigint,NULL),CAST('null' AS json)",
+        "INSERT INTO items (_id,n,j) SELECT 'a',d.x,CAST('null' AS json) FROM (SELECT $1::bigint AS x) d",
+        "INSERT INTO items (_id,n,j) WITH a AS (SELECT $1::bigint AS x), b AS (SELECT x FROM a) SELECT 'a',x,CAST('null' AS json) FROM b",
+        "INSERT INTO items (_id,n,j) SELECT 'a',$1::bigint,CAST('null' AS json) UNION ALL SELECT 'b',$1,CAST('null' AS json)",
         "INSERT INTO items (_id,n,j) SELECT 'a',9007199254740993,CAST('null' AS json) UNION ALL SELECT 'b',9007199254740993,CAST('null' AS json)",
         "INSERT INTO items (_id,n,j) WITH q AS (SELECT 'a' AS k,9007199254740993 AS n,CAST('null' AS json) AS j) SELECT k,n,j FROM q",
     };
@@ -113,6 +119,22 @@ test "SQL INSERT SELECT retains typed exact integers and JSON null across set so
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), fixture.calls);
         try std.testing.expectEqual(fixture.rows, result.output.rows_affected);
+    }
+}
+
+test "SQL INSERT source type boundaries reject unknown text before any mutation" {
+    for ([_][]const u8{
+        "INSERT INTO items (_id,n,j) SELECT 'a',COALESCE($1,NULL),CAST('null' AS json)",
+        "INSERT INTO items (_id,n,j) SELECT 'a',d.x,CAST('null' AS json) FROM (SELECT $1 AS x) d",
+        "INSERT INTO items (_id,n,j) SELECT 'a',$1,CAST('null' AS json) UNION ALL SELECT 'b',$1,CAST('null' AS json)",
+        "INSERT INTO items (_id,n,j) SELECT 'a',9007199254740993,NULL UNION ALL SELECT 'b',9007199254740993,NULL",
+        "INSERT INTO items (_id,n,j) WITH q AS (SELECT 'a' AS k,9007199254740993 AS n,NULL AS j) SELECT k,n,j FROM q",
+    }) |sql| {
+        var fixture: Fixture = .{};
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlTypeMismatch, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, if (compiled.parameter_count == 0) &.{} else &.{.{ .integer = 1 }}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.calls);
     }
 }
 
@@ -150,8 +172,8 @@ test "SQL INSERT SELECT empty sources do not mutate and untyped NULL takes targe
     defer inserted.deinit();
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
     const nested = [_][]const u8{
-        "INSERT INTO items (_id,n,j) SELECT 'a',9007199254740993,NULL UNION ALL SELECT 'b',9007199254740993,NULL",
-        "INSERT INTO items (_id,n,j) WITH q AS (SELECT 'a' AS k,9007199254740993 AS n,NULL AS j) SELECT k,n,j FROM q",
+        "INSERT INTO items (_id,n,j) SELECT 'a',9007199254740993,NULL::json UNION ALL SELECT 'b',9007199254740993,NULL",
+        "INSERT INTO items (_id,n,j) WITH q AS (SELECT 'a' AS k,9007199254740993 AS n,NULL::json AS j) SELECT k,n,j FROM q",
     };
     for (nested) |sql| {
         fixture = .{ .json_null_fields_expected = 0 };
@@ -222,7 +244,7 @@ fn sourceAllocationCase(alloc: std.mem.Allocator) !void {
 }
 
 test "SQL INSERT SELECT pages preserve null flags widen numeric types and close before commit" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, sourceAllocationCase, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, sourceAllocationCase, .{});
 }
 
 test "SQL INSERT SELECT source failures and row quotas occur before mutation" {

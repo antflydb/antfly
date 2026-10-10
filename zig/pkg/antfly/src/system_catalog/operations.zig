@@ -486,7 +486,7 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
     return result;
 }
 
-pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) ![]u8 {
+pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) anyerror![]u8 {
     return switch (input) {
         .lake_index_lifecycle_read => |table_id| @import("../metadata/lake_index_lifecycle.zig").readOnService(svc, alloc, table_id, context),
         .lake_index_lifecycle_work => |after| @import("../metadata/lake_index_lifecycle.zig").workOnService(svc, alloc, after, context),
@@ -606,6 +606,31 @@ pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestCo
             const result = try store.resolveSystemCatalogIdentities(alloc, svc.metadata_group_id, request);
             defer result.deinit(alloc);
             break :blk std.json.Stringify.valueAlloc(alloc, result, .{});
+        },
+        .relation_schema_mutate => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try svc.ensureLinearizableReadWithContext(context);
+            const store = svc.projectedStore() orelse return error.MissingMetadataStore;
+            const before = (try store.getTable(alloc, svc.metadata_group_id, request.guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
+            defer table_manager.freeTable(alloc, before);
+            if (try tables_api.schemaVersion(before.schema_json) != request.guard.owner.schema_version) return error.CatalogGenerationChanged;
+            const after = try tables_api.applySchemaMutationRecord(alloc, &before, .replace, request.schema_json);
+            defer table_manager.freeTable(alloc, after);
+            break :blk call(svc, alloc, context, .{ .relation_replace = .{ .guard = request.guard, .expected = before, .replacement = after } });
+        },
+        .relation_replace => |request| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try context.ensureActive();
+            try request.validate();
+            try indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, request.replacement.indexes_json);
+            try managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, request.replacement.indexes_json);
+            const version = try tables_api.schemaVersion(request.replacement.schema_json);
+            const stamp = try svc.replaceRelationTableDefinitionStampedWithContext(context, request.expected, request.replacement, request.guard);
+            // A response allocation failure after the durable receipt cannot
+            // become a replayable pre-admission error on the forwarding hop.
+            break :blk std.json.Stringify.valueAlloc(alloc, @import("server_call.zig").RelationReplacementResult{ .schema_version = version, .stamp = stamp }, .{}) catch return error.MetadataMutationOutcomeUnknown;
         },
         .mutate => |request| mutate(svc, alloc, context, request),
     };

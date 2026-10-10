@@ -160,8 +160,15 @@ export type SQLConnectionResponse = components["schemas"]["SQLConnectionResponse
 export type SQLPrepareRequest = components["schemas"]["SQLPrepareRequest"];
 export type SQLPreparedExecutionRequest = components["schemas"]["SQLPreparedExecutionRequest"];
 export type SQLPreparedResponse = components["schemas"]["SQLPreparedResponse"];
+export type SQLParameterDescriptor = components["schemas"]["SQLParameterDescriptor"];
 export type SQLResponse = components["schemas"]["SQLResponse"];
+export type SQLArrayDimension = components["schemas"]["SQLArrayDimension"];
+export type SQLArrayColumnSchema = components["schemas"]["SQLArrayColumnSchema"];
+export type SQLBuiltinType = components["schemas"]["SQLBuiltinType"];
+export type SQLArrayElementType = components["schemas"]["SQLArrayElementType"];
+export type SQLArrayValue = components["schemas"]["SQLArrayValue"];
 export type SQLColumn = components["schemas"]["SQLColumn"];
+export type SQLNumericModifier = components["schemas"]["SQLNumericModifier"];
 export type SQLColumnType = components["schemas"]["SQLColumnType"];
 export type SQLDiagnostic = components["schemas"]["SQLDiagnostic"];
 export type SQLMutationOutcome = components["schemas"]["SQLMutationOutcome"];
@@ -172,6 +179,8 @@ export type CommittedMutationOutcome = components["schemas"]["CommittedMutationO
 export type CreateTableRequest = components["schemas"]["CreateTableRequest"];
 export type TableSchema = components["schemas"]["TableSchema"];
 export type RelationalUniqueConstraint = components["schemas"]["RelationalUniqueConstraint"];
+export type RelationalUniqueConstraintOrigin =
+  components["schemas"]["RelationalUniqueConstraintOrigin"];
 export type RelationalForeignKeyConstraint =
   components["schemas"]["RelationalForeignKeyConstraint"];
 export type RelationalRow = components["schemas"]["RelationalRow"];

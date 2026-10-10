@@ -47,6 +47,7 @@ pub const Recipe = struct {
         for (self.inputs) |input| {
             part(&hash, @tagName(input.spec.kind));
             if (input.spec.input_type) |kind| part(&hash, @tagName(kind)) else part(&hash, "*");
+            if (input.spec.input_element) |identity| part(&hash, @tagName(identity)) else part(&hash, "*");
             hash.update(&.{ @intFromBool(input.spec.distinct), @intFromBool(input.column != null) });
             if (input.column) |column| keyHash(&hash, column);
         }

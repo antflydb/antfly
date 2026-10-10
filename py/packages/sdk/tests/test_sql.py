@@ -23,12 +23,81 @@ import pytest
 from antfly import (
     AntflyClient,
     AntflyException,
+    RelationalScalarExpression,
+    SQLArrayColumnSchema,
+    SQLArrayColumnSchemaType,
+    SQLArrayElementType,
+    SQLArrayValue,
+    SQLBuiltinType,
+    SQLColumn,
     SQLExecutionError,
     SQLPreparedExecutionRequest,
     SQLPrepareRequest,
     SQLRequest,
     SQLResponse,
 )
+
+
+@pytest.mark.parametrize("kind", list(SQLArrayElementType))
+def test_array_column_schema_exports_explicit_element_identity_and_transport_constraints(kind):
+    schema = SQLArrayColumnSchema(
+        type_=SQLArrayColumnSchemaType.SQL_ARRAY,
+        x_antfly_sql_type=kind,
+        nullable=True,
+    )
+    schema.additional_properties["properties"] = {"values": {"minItems": 2}}
+    expected = {
+        "type": "sql_array",
+        "x-antfly-sql-type": kind.value,
+        "nullable": True,
+        "properties": {"values": {"minItems": 2}},
+    }
+    assert schema.to_dict() == expected
+    assert SQLArrayColumnSchema.from_dict(expected).to_dict() == expected
+    with pytest.raises(ValueError):
+        SQLArrayColumnSchema.from_dict({"type": "array", "x-antfly-sql-type": "int64"})
+
+
+def test_numeric_scalar_and_array_result_modifiers_round_trip():
+    for kind in ("number", "array"):
+        source = {
+            "name": "n",
+            "type": kind,
+            "element_type": "numeric",
+            "numeric_modifier": {"precision": 2, "scale": -3},
+        }
+        column = SQLColumn.from_dict(source)
+        assert column.numeric_modifier.precision == 2
+        assert column.numeric_modifier.scale == -3
+        assert column.to_dict() == source
+
+
+@pytest.mark.parametrize("modifier", [None, {"precision": 2, "scale": -3}, {"precision": 2, "scale": 4}])
+def test_numeric_array_schema_preserves_optional_modifier(modifier):
+    source = {"type": "sql_array", "x-antfly-sql-type": "numeric"}
+    if modifier is not None:
+        source["x-antfly-sql-numeric-modifier"] = modifier
+    column = SQLArrayColumnSchema.from_dict(source)
+    assert column.to_dict() == source
+    if modifier is not None:
+        assert column.x_antfly_sql_numeric_modifier.precision == modifier["precision"]
+        assert column.x_antfly_sql_numeric_modifier.scale == modifier["scale"]
+
+
+def test_array_result_models_preserve_exact_values_dimensions_and_null_flags():
+    column = SQLColumn.from_dict({"name": "items", "type": "array", "element_type": "int64"})
+    assert column.element_type is SQLArrayElementType.INT64
+    assert column.to_dict() == {"name": "items", "type": "array", "element_type": "int64"}
+    envelope = {
+        "dimensions": [{"length": 3, "lower_bound": -2}],
+        "values": ["-9223372036854775808", "9223372036854775807", None],
+        "sql_nulls": [False, False, True],
+    }
+    assert SQLArrayValue.from_dict(envelope).to_dict() == envelope
+    jsonb = {"dimensions": [{"length": 2, "lower_bound": 1}], "values": [None, None], "sql_nulls": [False, True]}
+    assert SQLArrayValue.from_dict(jsonb).to_dict() == jsonb
+    empty = {"dimensions": [], "values": [], "sql_nulls": []}
+    assert SQLArrayValue.from_dict(empty).to_dict() == empty
 
 
 def test_prepared_sql_lifecycle_preserves_owner_and_execution_shape():
@@ -38,10 +107,16 @@ def test_prepared_sql_lifecycle_preserves_owner_and_execution_shape():
         "owner_node_id": "9007199254740993",
         "expires_at_ms": 123,
         "columns": [],
-        "parameter_types": [],
+        "parameter_types": ["array", "integer"],
+        "parameter_descriptors": [
+            {"type": "array", "element_type": "int64", "nullable": True},
+            {"type": "integer", "element_type": "int32", "nullable": True},
+        ],
     }
     with patch.object(client, "_request", return_value=prepared) as request:
-        assert client.prepare_sql(SQLPrepareRequest(statement="SELECT 1")).owner_node_id == "9007199254740993"
+        result = client.prepare_sql(SQLPrepareRequest(statement="SELECT $1::bigint[],$2::integer"))
+        assert result.owner_node_id == "9007199254740993"
+        assert [item.to_dict() for item in result.parameter_descriptors] == prepared["parameter_descriptors"]
         assert request.call_args.kwargs["follow_redirects"] is False
     with patch.object(client, "_request", return_value={"columns": [], "rows": [[1]]}):
         with pytest.raises(AntflyException, match="row width"):
@@ -132,6 +207,43 @@ def test_sql_bound_parameters_and_exact_integer_results():
     assert json.loads(request.call_args.kwargs["content"])["parameters"] == [9223372036854775807]
     assert request.call_args.kwargs["follow_redirects"] is False
     assert request.call_args.kwargs["_max_response_bytes"] == 16 << 20
+
+
+def test_public_numeric_schema_expression_round_trip_retains_exact_literal_text():
+    source = {"op": "literal", "type": "numeric", "sql_type": "numeric", "value": "9007199254740993.2500"}
+    expression = RelationalScalarExpression.from_dict(source)
+    assert expression.sql_type == SQLBuiltinType.NUMERIC
+    assert expression.to_dict() == source
+
+
+@pytest.mark.parametrize("scale", [-3, 0, 4])
+def test_public_numeric_cast_modifier_round_trip(scale):
+    source = {
+        "op": "cast",
+        "type": "numeric",
+        "sql_type": "numeric",
+        "numeric_modifier": {"precision": 2, "scale": scale},
+        "args": [{"op": "literal", "type": "numeric", "value": "1.245"}],
+    }
+    expression = RelationalScalarExpression.from_dict(source)
+    assert expression.numeric_modifier.precision == 2
+    assert expression.numeric_modifier.scale == scale
+    assert expression.to_dict() == source
+
+
+def test_sql_numeric_results_preserve_precision_scale_nulls_and_specials():
+    client = AntflyClient(base_url="http://localhost:8080")
+    result = {
+        "columns": [{"name": "n", "type": "number", "element_type": "numeric"}],
+        "rows": [[value] for value in ["9007199254740993.1200", "0.0000", None, "NaN", "Infinity", "-Infinity"]],
+        "rows_affected": 0,
+        "command_tag": "SELECT 6",
+    }
+    with patch.object(client, "_request", return_value=result):
+        response = client.execute_sql(SQLRequest(statement="SELECT n FROM amounts"))
+    assert response.rows == result["rows"]
+    assert response.columns[0].element_type == SQLArrayElementType.NUMERIC
+    assert response.to_dict() == result
 
 
 def test_sql_rejects_malformed_row_width():

@@ -242,6 +242,7 @@ test "join inequality: incomparable types return 0" {
 }
 
 test "api module compiles" {
+    _ = @import("sql_catalog_campaign_test.zig");
     _ = @import("online_merge_io.zig");
     _ = @import("sql_truncate.zig");
     _ = @import("sql_policy_ddl.zig");
@@ -249,6 +250,7 @@ test "api module compiles" {
     _ = @import("sql_schema_cache.zig");
     _ = sql_pgwire;
     _ = sql_session;
+    _ = @import("sql_prepared.zig");
     _ = @import("sql_connection_record.zig");
     _ = @import("sql_connections.zig");
     _ = cluster;

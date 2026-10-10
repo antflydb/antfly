@@ -1,0 +1,15 @@
+{
+  "format": 1,
+  "entries": [
+    {"id":"sql-0095","setup":[],"kind":"namespace","name":"public","present":true,"command_tag":"CREATE SCHEMA","unchanged":true},
+    {"id":"sql-0101","setup":[],"kind":"namespace","name":"tenant_ops","present":true,"command_tag":"CREATE SCHEMA"},
+    {"id":"sql-0102","setup":["CREATE SCHEMA tenant_ops"],"kind":"namespace","name":"tenant_ops","present":true,"command_tag":"CREATE SCHEMA","unchanged":true},
+    {"id":"sql-0103","setup":["CREATE SCHEMA tenant_ops"],"kind":"namespace","name":"tenant_ops_archive","prior_name":"tenant_ops","present":true,"command_tag":"ALTER SCHEMA"},
+    {"id":"sql-0104","setup":["CREATE SCHEMA tenant_ops"],"kind":"namespace","name":"tenant_ops","present":false,"command_tag":"DROP SCHEMA"},
+    {"id":"sql-0106","setup":[],"kind":"database","name":"tenant_ops","present":true,"command_tag":"CREATE DATABASE"},
+    {"id":"sql-0108","setup":["CREATE DATABASE tenant_ops"],"kind":"database","name":"tenant_ops","present":false,"command_tag":"DROP DATABASE"},
+    {"id":"sql-0157","setup":["CREATE TABLE usage_records (id uuid, status text)"],"kind":"table","name":"usage_records","present":false,"command_tag":"DROP TABLE"},
+    {"id":"sql-0159","setup":["CREATE TABLE usage_records (id uuid, status text)"],"kind":"table","name":"usage_records","present":false,"command_tag":"DROP TABLE","repeat_noop":true},
+    {"id":"sql-0676","setup":[],"kind":"table","name":"usage_stage","present":true,"command_tag":"CREATE TABLE"}
+  ]
+}

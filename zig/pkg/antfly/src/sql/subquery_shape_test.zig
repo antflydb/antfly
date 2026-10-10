@@ -99,20 +99,70 @@ test "SQL subquery shapes resolve untyped standalone output to text" {
     }
 }
 
-test "SQL subquery shapes reject correlation across complete value boundaries" {
-    const queries = [_][]const u8{
-        "SELECT (SELECT i.y FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x ORDER BY i.y LIMIT 1) FROM (SELECT 1 AS x) o",
-        "SELECT (SELECT SUM(i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x GROUP BY i.k) FROM (SELECT 1 AS x) o",
-        "SELECT (SELECT ROW_NUMBER() OVER (ORDER BY i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x) FROM (SELECT 1 AS x) o",
-        "SELECT o.x IN (SELECT i.y FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x ORDER BY i.y LIMIT 1) FROM (SELECT 1 AS x) o",
-        "SELECT o.x < ANY (SELECT SUM(i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x GROUP BY i.k) FROM (SELECT 1 AS x) o",
-        "SELECT o.x = ALL (SELECT ROW_NUMBER() OVER (ORDER BY i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x) FROM (SELECT 1 AS x) o",
+test "SQL subquery shapes preserve quantified correlated query boundaries" {
+    const cases = [_]struct { sql: []const u8, expected: ?bool }{
+        .{ .sql = "SELECT o.x IN (SELECT i.y FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x ORDER BY i.y LIMIT 1) FROM (SELECT 1 AS x) o", .expected = false },
+        .{ .sql = "SELECT o.x < ANY (SELECT SUM(i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x GROUP BY i.k) FROM (SELECT 1 AS x) o", .expected = true },
+        .{ .sql = "SELECT o.x = ALL (SELECT ROW_NUMBER() OVER (ORDER BY i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x) FROM (SELECT 1 AS x) o", .expected = true },
+        .{ .sql = "SELECT o.x IN (SELECT i.y FROM (SELECT 1 AS k, CAST(NULL AS BIGINT) AS y) i WHERE i.k=o.x LIMIT 1) FROM (SELECT 1 AS x) o", .expected = null },
+        .{ .sql = "SELECT o.x <> ALL (SELECT i.y FROM (SELECT 1 AS k, CAST(NULL AS BIGINT) AS y) i WHERE i.k=o.x LIMIT 0) FROM (SELECT 1 AS x) o", .expected = true },
+        .{ .sql = "SELECT o.x = ANY (SELECT i.y FROM (SELECT 1 AS k, CAST(NULL AS BIGINT) AS y) i WHERE i.k=o.x LIMIT 0) FROM (SELECT 1 AS x) o", .expected = false },
+        .{ .sql = "SELECT o.x < ALL (SELECT i.y FROM (SELECT 1 AS k, 2 AS y UNION ALL SELECT 1,NULL) i WHERE i.k=o.x ORDER BY i.y LIMIT 2) FROM (SELECT 1 AS x) o", .expected = null },
+        .{ .sql = "SELECT o.x > ALL (SELECT i.y FROM (SELECT 1 AS k, 2 AS y UNION ALL SELECT 1,NULL) i WHERE i.k=o.x ORDER BY i.y LIMIT 2) FROM (SELECT 1 AS x) o", .expected = false },
+        .{ .sql = "SELECT o.x < ANY (SELECT i.y FROM (SELECT 1 AS k, 2 AS y UNION ALL SELECT 1,NULL) i WHERE i.k=o.x ORDER BY i.y LIMIT 2) FROM (SELECT 1 AS x) o", .expected = true },
+        .{ .sql = "SELECT o.x LIKE ANY (SELECT i.y FROM (SELECT 1 AS k, 'a%' AS y) i WHERE i.k=o.k LIMIT 1) FROM (SELECT 1 AS k, 'abc' AS x) o", .expected = true },
+        .{ .sql = "SELECT o.x NOT ILIKE ALL (SELECT i.y FROM (SELECT 1 AS k, 'A%' AS y) i WHERE i.k=o.k LIMIT 1) FROM (SELECT 1 AS k, 'abc' AS x) o", .expected = false },
+        .{ .sql = "SELECT o.x IN (SELECT x LIMIT 1) FROM (SELECT 9007199254740993 AS x) o", .expected = true },
+        .{ .sql = "SELECT \"$quantified_input\".x IN (SELECT \"$quantified_input\".x LIMIT 1) FROM (SELECT 1 AS x) \"$quantified_input\"", .expected = true },
+        .{ .sql = "SELECT \"$quantified_input_1\".x IN (SELECT \"$quantified_input_1\".x LIMIT 1) FROM (SELECT 1 AS x) \"$quantified_input_1\"", .expected = true },
+        .{ .sql = "SELECT \"$quantified_demand_0\".x IN (SELECT \"$quantified_demand_0\".x LIMIT 1) FROM (SELECT 1 AS x) \"$quantified_demand_0\"", .expected = true },
+        .{ .sql = "SELECT o.x <> ALL (SELECT i.y FROM (SELECT 9007199254740992 AS y) i WHERE i.y<o.x LIMIT 1) FROM (SELECT 9007199254740993 AS x) o", .expected = true },
+        .{ .sql = "SELECT o.x IN (SELECT i.y FROM (SELECT CAST('null' AS JSONB) AS y) i WHERE o.k=1 LIMIT 1) FROM (SELECT 1 AS k,CAST('null' AS JSONB) AS x) o", .expected = true },
+        .{ .sql = "SELECT o.x IN (SELECT i.y FROM (SELECT CAST(NULL AS JSONB) AS y) i WHERE o.k=1 LIMIT 1) FROM (SELECT 1 AS k,CAST('null' AS JSONB) AS x) o", .expected = null },
+        .{ .sql = "SELECT CASE WHEN FALSE THEN o.x IN (SELECT 1/(i.y-2) FROM (SELECT 1 AS k,2 AS y) i WHERE i.k=o.x LIMIT 1) ELSE TRUE END FROM (SELECT 1 AS x) o", .expected = true },
     };
     var backend: Backend = .{};
-    for (queries) |sql| {
+    for (cases) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}) catch |err| {
+            std.debug.print("quantified boundary failed: {s}: {s}\n", .{ case.sql, @errorName(err) });
+            return err;
+        };
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        if (case.expected) |truth| try std.testing.expectEqual(truth, result.output.rows[0][0].bool) else try std.testing.expect(result.output.sql_nulls.?[0][0]);
+    }
+    try std.testing.expectEqual(@as(usize, 0), backend.calls);
+}
+
+test "SQL quantified correlated boundaries infer parameters through typed producers" {
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT $1 < ANY (SELECT i.y FROM (SELECT 1 AS k,2 AS y) i WHERE i.k=o.x ORDER BY i.y LIMIT $2 OFFSET $3) FROM (SELECT 1 AS x) o", .{});
+    defer compiled.deinit();
+    var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, backend.backend(), &compiled, &.{});
+    defer description.deinit();
+    for (description.binding.parameter_types) |kind| try std.testing.expectEqual(ast.ColumnType.integer, kind.?);
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{ .{ .integer = 1 }, .{ .integer = 1 }, .{ .integer = 0 } }, .{});
+    defer result.deinit();
+    try std.testing.expect(result.output.rows[0][0].bool);
+    var empty = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{ .null, .{ .integer = 0 }, .{ .integer = 0 } }, .{});
+    defer empty.deinit();
+    try std.testing.expect(!empty.output.rows[0][0].bool);
+}
+
+test "SQL scalar query boundaries retain outer aggregate ownership admission" {
+    var backend: Backend = .{};
+    // PostgreSQL produces one outer aggregate row containing 3. A lateral
+    // per-parent implementation returning 1,2 would silently change ownership.
+    for ([_][]const u8{
+        "SELECT (SELECT SUM(o.x)) FROM (SELECT 1 AS x UNION ALL SELECT 2) o",
+        "SELECT CASE WHEN TRUE THEN (SELECT SUM(o.x)) ELSE 0 END FROM (SELECT 1 AS x UNION ALL SELECT 2) o",
+        "SELECT (SELECT SUM(x)) FROM (SELECT 1 AS x UNION ALL SELECT 2) o",
+    }) |sql| {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
-        try std.testing.expectError(error.UndefinedColumn, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectError(error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
     }
     try std.testing.expectEqual(@as(usize, 0), backend.calls);
 }

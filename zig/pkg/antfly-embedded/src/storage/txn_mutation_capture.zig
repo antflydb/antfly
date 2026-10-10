@@ -19,6 +19,13 @@ pub const Capture = struct {
     arena: std.heap.ArenaAllocator,
     keys: std.StringHashMapUnmanaged(void) = .empty,
     bytes: usize = 0,
+    /// Optional command-local before-image observer. Ordinary final-key
+    /// capture remains unchanged; the observer runs before the actual store
+    /// mutation and a failure prevents that mutation from being admitted.
+    on_first_touch: ?struct {
+        ptr: *anyopaque,
+        call: *const fn (*anyopaque, []const u8) anyerror!void,
+    } = null,
     pub fn init(alloc: std.mem.Allocator) Capture {
         return .{ .arena = .init(alloc) };
     }
@@ -29,6 +36,7 @@ pub const Capture = struct {
         if (self.keys.contains(key)) return;
         const next = std.math.add(usize, self.bytes, key.len + @sizeOf([]const u8)) catch return error.MetadataHAEffectTooLarge;
         if (next > 64 * 1024 * 1024) return error.MetadataHAEffectTooLarge;
+        if (self.on_first_touch) |observer| try observer.call(observer.ptr, key);
         const alloc = self.arena.allocator();
         try self.keys.put(alloc, try alloc.dupe(u8, key), {});
         self.bytes = next;

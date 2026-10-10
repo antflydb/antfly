@@ -528,6 +528,13 @@ fn chooseCacheClass(
     };
 }
 
+test "lake explain counts ordered indexes as sidecars" {
+    var accounting: ArtifactAccounting = .{};
+    try accountArtifact(&accounting, .{ .kind = .ordered_row_index, .artifact_id = "ordered", .byte_len = 40, .checksum = "len:40" });
+    try std.testing.expectEqual(@as(u32, 1), accounting.search_sidecar_count);
+    try std.testing.expectEqual(@as(u64, 40), accounting.manifest_accounted_bytes);
+}
+
 test "lake explain accounts for Antfly row fragments and stats" {
     const row_fragment_ids = [_][]const u8{"rows-1"};
     const row_fragment_stats_ids = [_][]const u8{"rows-1.stats"};

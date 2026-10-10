@@ -106,6 +106,7 @@ pub const AntflyRootImports = struct {
     casbin: *std.Build.Module,
     fst: *std.Build.Module,
     regex: *std.Build.Module,
+    sql_regex: *std.Build.Module,
     json: *std.Build.Module,
     jsonschema: *std.Build.Module,
     mcp: *std.Build.Module,
@@ -184,6 +185,7 @@ pub const AntflyRootImports = struct {
         .{ .name = "antfly_casbin", .field = "casbin" },
         .{ .name = "antfly_fst", .field = "fst" },
         .{ .name = "antfly_regex", .field = "regex" },
+        .{ .name = "antfly_sql_regex", .field = "sql_regex" },
         .{ .name = "antfly-json", .field = "json" },
         .{ .name = "antfly_jsonschema", .field = "jsonschema" },
         .{ .name = "antfly_mcp", .field = "mcp" },
@@ -306,7 +308,7 @@ pub const AntflyRootImports = struct {
             "openai_api",     "pdf",                "query_openapi",     "reader_config",
             "readers",        "regex",              "reranking",         "scraping",
             "synthesizing",   "transcribing",       "vector",            "fst",
-            "schema_openapi",
+            "schema_openapi", "sql_regex",
         }) |field| self.addImport(mod, field);
     }
 

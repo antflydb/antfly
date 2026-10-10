@@ -87,8 +87,23 @@ pub fn Adapter(comptime native: type) type {
             const handle = self.handle orelse return error.UnsupportedSqlExecution;
             const tables = @import("tables.zig");
             try tables.requireDatabase(handle);
-            if (ddl_request.kind != .table or ddl_request.action != .alter_schema or ddl_request.schema_change == null) return error.UnsupportedSqlExecution;
             var ddl_value = ddl_request;
+            if (ddl_value.kind == .index) {
+                if (ddl_value.concurrently) return error.UnsupportedSqlExecution;
+                switch (ddl_value.action) {
+                    .create => ddl_value.name = ddl_value.index_table orelse return error.InvalidSqlSyntax,
+                    .drop => {
+                        if (ddl_value.index_targets.len != 1) return error.UnsupportedSqlExecution;
+                        const index = ddl_value.index_targets[0];
+                        if (index.database != null or (index.namespace != null and !std.mem.eql(u8, index.namespace.?, "public"))) return error.UnsupportedSqlExecution;
+                        ddl_value.name = .{ .table = "" };
+                    },
+                    else => return error.UnsupportedSqlExecution,
+                }
+                ddl_value.kind = .table;
+                ddl_value.action = .alter_schema;
+            }
+            if (ddl_value.kind != .table or ddl_value.action != .alter_schema or ddl_value.schema_change == null) return error.UnsupportedSqlExecution;
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
             const a = arena.allocator();
@@ -285,13 +300,13 @@ pub fn Adapter(comptime native: type) type {
             return error.UnsupportedSqlExecution;
         }
 
-        fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, columns: []const []const u8, expressions: []const catalog.ConflictExpression, conditions: []const catalog.Condition, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
+        fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
             const adapter_owner: *Self = @ptrCast(@alignCast(ptr));
             var selected_adapter = try adapter_owner.selected(table.physical_name);
             const self = &selected_adapter;
             if (self.read_only) return error.SqlReadOnlyTransaction;
             if (!std.mem.eql(u8, table.physical_name, self.table_name)) return error.UndefinedTable;
-            if (columns.len == 0 and expressions.len == 0) {
+            if (target.constraint_name == null and target.columns.len == 0 and target.expressions.len == 0) {
                 const json = (try self.db.getSchemaJson(alloc)) orelse return error.IntegrityCatalogUnavailable;
                 const parsed = try native.public_api.tables.parseValidatedTableSchema(alloc, json);
                 if (parsed.version != table.schema_version) return error.PreparedGenerationChanged;
@@ -303,9 +318,9 @@ pub fn Adapter(comptime native: type) type {
             }
             const metadata = try self.localCatalog(alloc, table.schema_version);
             const writes = try dependencies.sql_mutation_images.writes(types.BatchWrite, alloc, mutations);
-            const target_predicates = try dependencies.sql_conflict_predicate.toNative(alloc, conditions);
-            const keys = try dependencies.sql_conflict_predicate.expressionsToNative(alloc, expressions);
-            const owners = try integrity.resolveConflictOwners(alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, columns, keys, target_predicates, writes, if (self.transaction) |session| if (session.active) try session.commitRequests(alloc) else &.{} else &.{}, .{});
+            const target_predicates = try dependencies.sql_conflict_predicate.toNative(alloc, target.conditions);
+            const keys = try dependencies.sql_conflict_predicate.expressionsToNative(alloc, target.expressions);
+            const owners = try integrity.resolveConflictTargetOwners(alloc, self.localSource(), metadata.table, metadata.range, self.table_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = target_predicates, .constraint_name = target.constraint_name }, writes, if (self.transaction) |session| if (session.active) try session.commitRequests(alloc) else &.{} else &.{}, .{});
             const output = try alloc.alloc(catalog.ConflictOwner, owners.len);
             for (owners, output) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .identities = owner.identities, .guard = owner };
             return output;
@@ -571,35 +586,39 @@ pub fn Adapter(comptime native: type) type {
                         };
                     }
                 }
-                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .type = dependencies.sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
+                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .element_type = column.sql_element_type, .type = dependencies.sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
                     .string => .string,
                     .integer => .integer,
                     .number => .number,
                     .boolean => .boolean,
                     .datetime => .datetime,
                     .json => .json,
+                    .sql_array => .array,
                     else => return error.UnsupportedSqlExecution,
                 }) };
             }
-            return .{ .id = self.db.core.identity_namespace.table_id, .physical_name = try alloc.dupe(u8, self.table_name), .schema_version = schema.version, .columns = columns };
+            return .{ .id = self.db.core.identity_namespace.table_id, .physical_name = try alloc.dupe(u8, self.table_name), .schema_version = schema.version, .columns = columns, .constraints = try catalog.Constraint.derive(alloc, parsed) };
         }
 
         const Cursor = struct {
             session: *DB.RelationalReadSession,
             alloc: std.mem.Allocator,
+            projection: dependencies.sql_document_row.Projection,
             fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
                 var page = try self.session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024 });
                 errdefer page.deinit();
                 const owned = page.arena.allocator();
                 const rows = try owned.alloc(catalog.Row, page.rows.len);
-                for (page.rows, rows) |row, *out| out.* = .{ .id = row.key, .version = row.version, .value = row.typed orelse return error.InvalidSqlBackendResponse, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest };
+                const layout = try self.projection.pageLayout(owned);
+                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, .{ .id = row.key, .version = row.version, .value = row.typed orelse return error.InvalidSqlBackendResponse, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest });
                 const after = if (page.more) try owned.dupe(u8, self.session.reader.after.items) else null;
                 return .{ .rows = rows, .after = after, .owned_arena = page.arena };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
                 self.session.deinit();
+                self.projection.deinit(self.alloc);
                 self.alloc.destroy(self);
             }
         };
@@ -658,8 +677,10 @@ pub fn Adapter(comptime native: type) type {
                 .relational_query = .{ .page_bytes = 256 * 1024, .fields = request.fields, .conditions = conditions, .schema_version = table.schema_version, .auto_index = request.primary_key == null and !request.primary_order and self.transaction == null },
             });
             errdefer session.deinit();
+            const projection = try dependencies.sql_document_row.Projection.init(alloc, table, request.fields);
+            errdefer projection.deinit(alloc);
             const cursor = try alloc.create(Cursor);
-            cursor.* = .{ .session = session, .alloc = alloc };
+            cursor.* = .{ .session = session, .alloc = alloc, .projection = projection };
             return .{ .ptr = cursor, .next = Cursor.next, .close = Cursor.close };
         }
 

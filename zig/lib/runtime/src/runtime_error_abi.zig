@@ -38,7 +38,9 @@ test "execution wait scheduling details are append-only and preserve behavior cl
     try std.testing.expectEqual(@backingInt(Detail.invalid_sql_spill) + 1, @backingInt(Detail.metric_not_ready));
     try std.testing.expectEqual(@backingInt(Detail.metric_not_ready) + 1, @backingInt(Detail.metric_stale));
     try std.testing.expectEqual(@backingInt(Detail.metric_stale) + 1, @backingInt(Detail.invalid_generated_tool_arguments));
-    try std.testing.expectEqual(@backingInt(Detail.invalid_generated_tool_arguments) + 1, @backingInt(Detail.runnable_wait_timeout));
+    try std.testing.expectEqual(@backingInt(Detail.invalid_generated_tool_arguments) + 1, @backingInt(Detail.sql_feature_not_supported));
+    try std.testing.expectEqual(@backingInt(Detail.sql_feature_not_supported) + 1, @backingInt(Detail.catalog_publication_proof_pending));
+    try std.testing.expectEqual(@as(c_int, 0x10000), @backingInt(Detail.runnable_wait_timeout));
     const cases = [_]struct { err: anyerror, code: Code }{
         .{ .err = error.RunnableWaitTimeout, .code = .timeout },
         .{ .err = error.SchedulerClosed, .code = .unavailable },
@@ -759,9 +761,11 @@ pub const Detail = enum(c_int) {
     metric_not_ready,
     metric_stale,
     invalid_generated_tool_arguments,
-    // Append-only scheduling details are shared by wait hooks in independently
-    // generated storage/coordinator archives. Do not move older detail IDs.
-    runnable_wait_timeout,
+    sql_feature_not_supported,
+    catalog_publication_proof_pending,
+    // Reserve a separate range for the unpublished pooling extension so future
+    // main-branch additions cannot renumber either set of detail identities.
+    runnable_wait_timeout = 0x10000,
     scheduler_closed,
     scheduler_full,
     invalid_runnable_transition,
@@ -906,6 +910,8 @@ pub fn statusFromError(err: anyerror) Status {
         error.RelationalRewriteBudgetExceeded => status(.invalid_argument, .relational_rewrite_budget_exceeded),
         error.RelationalExpressionOverflow => status(.invalid_argument, .relational_expression_overflow),
         error.RelationalExpressionDivisionByZero => status(.invalid_argument, .relational_expression_division_by_zero),
+        error.SqlFeatureNotSupported => status(.unsupported, .sql_feature_not_supported),
+        error.CatalogPublicationProofPending => status(.retryable, .catalog_publication_proof_pending),
         error.RelationalExpressionBudgetExceeded => status(.invalid_argument, .relational_expression_budget_exceeded),
         error.RelationalIndexKeyTooLarge => status(.invalid_argument, .relational_index_key_too_large),
         error.InvalidRelationalExpressionInput => status(.invalid_argument, .invalid_relational_expression_input),
@@ -1614,6 +1620,8 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .relational_rewrite_budget_exceeded => "RelationalRewriteBudgetExceeded",
         .relational_expression_overflow => "RelationalExpressionOverflow",
         .relational_expression_division_by_zero => "RelationalExpressionDivisionByZero",
+        .sql_feature_not_supported => "SqlFeatureNotSupported",
+        .catalog_publication_proof_pending => "CatalogPublicationProofPending",
         .relational_expression_budget_exceeded => "RelationalExpressionBudgetExceeded",
         .relational_index_key_too_large => "RelationalIndexKeyTooLarge",
         .invalid_relational_expression_input => "InvalidRelationalExpressionInput",
@@ -2354,6 +2362,17 @@ test "storage owner contention retains retryability and exact identity" {
     try std.testing.expectEqual(error.StorageBusy, errorFromStatus(wire));
 }
 
+test "catalog publication preparation preserves explicit retry identity across archives" {
+    const pending = statusFromError(error.CatalogPublicationProofPending);
+    try std.testing.expectEqual(@backingInt(Code.retryable), pending.code);
+    try std.testing.expectEqual(error.CatalogPublicationProofPending, errorFromStatus(pending));
+    try std.testing.expect(pending.detail != statusFromError(error.ResourceTemporarilyUnavailable).detail);
+    try std.testing.expect(pending.detail != statusFromError(error.InvalidCatalogRecord).detail);
+    var forged = pending;
+    forged.code = @backingInt(Code.corrupt);
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(forged));
+}
+
 test "released main Detail identifiers retain their exact names and numeric values" {
     @setEvalBranchQuota(2000);
     const std_test = @import("std");
@@ -2431,4 +2450,12 @@ test "SQL worker capacity error preserves append-only identity and unavailable b
     try std.testing.expectEqual(@backingInt(Code.unavailable), value.code);
     try std.testing.expectEqual(error.SqlWriteCapacityUnavailable, errorFromStatus(value));
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(Code.internal), .detail = value.detail }));
+}
+
+test "pre-merge pooling detail collisions fail closed" {
+    const first = @backingInt(Detail.invalid_generated_tool_arguments) + 1;
+    const codes = [_]Code{ .timeout, .unavailable, .retryable, .internal, .internal, .unsupported, .unavailable, .unavailable, .invalid_argument, .unavailable };
+    for (codes, 0..) |code, index| {
+        try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(code), .detail = first + @as(c_int, @intCast(index)) }));
+    }
 }

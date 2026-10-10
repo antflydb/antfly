@@ -122,6 +122,14 @@ test "shard adapter archive boundary preserves busy retry and topology read erro
     // error domain so callers can classify predecision availability safely.
     failure = errors.statusFromError(error.CatalogRoutingSnapshotTimeout);
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, retained.topologyRead(std.testing.allocator, 17, "rows", request, .none));
+    // Nonfinite numeric casts are definite PostgreSQL rejections, not an
+    // unknown archive-local error or a retryable committed-log failure.
+    failure = errors.statusFromError(error.SqlFeatureNotSupported);
+    try std.testing.expectEqual(@backingInt(errors.Code.unsupported), failure.code);
+    try std.testing.expectEqual(@backingInt(errors.Detail.sql_feature_not_supported), failure.detail);
+    try std.testing.expectError(error.SqlFeatureNotSupported, adapter.execute(action));
+    try std.testing.expectError(error.SqlFeatureNotSupported, retained.execute(action));
+    try std.testing.expectError(error.SqlFeatureNotSupported, retained.topologyRead(std.testing.allocator, 17, "rows", request, .none));
     for ([_]anyerror{ error.TransitionOperationBusy, error.GroupLeaderUnavailable, error.MergeTransitionNotReady, error.MergeReceiverProjectionNotReady, error.MergeSourceProjectionNotReady, error.MergeSourceProjectionAdvanced, error.StorageBusy, error.OnlineSourcePinMissing, error.Canceled, error.RelationalRewriteTypeChange, error.RelationalRewriteColumnDrop, error.RelationalRewriteRequiresRelational, error.RelationalRewriteBudgetExceeded, error.RelationalExpressionOverflow, error.RelationalExpressionDivisionByZero, error.RelationalExpressionBudgetExceeded, error.InvalidRelationalExpressionInput, error.InvalidRelationalGeneratedValue, error.GeneratedColumnRewriteRequired }) |expected| {
         failure = errors.statusFromError(expected);
         different_ordinal = different_ordinal or shard_adapter_test_error_ordinal(failure) != @intFromError(expected);

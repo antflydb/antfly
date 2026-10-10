@@ -1,0 +1,24 @@
+{
+  "reference": "PostgreSQL exact SQL",
+  "scope": "typed-array value operators; not parser or public API activation",
+  "entries": [
+    {"sql":"2 = ANY(ARRAY[1,2,NULL]::int4[])","values":[1,2,null],"scalar":2,"comparison":"eq","quantifier":"any","expected":true},
+    {"sql":"3 = ANY(ARRAY[1,2,NULL]::int4[])","values":[1,2,null],"scalar":3,"comparison":"eq","quantifier":"any","expected":null},
+    {"sql":"3 = ANY(ARRAY[1,2]::int4[])","values":[1,2],"scalar":3,"comparison":"eq","quantifier":"any","expected":false},
+    {"sql":"NULL::int4 = ANY(ARRAY[]::int4[])","values":[],"scalar":null,"comparison":"eq","quantifier":"any","expected":false},
+    {"sql":"NULL::int4 = ALL(ARRAY[]::int4[])","values":[],"scalar":null,"comparison":"eq","quantifier":"all","expected":true},
+    {"sql":"NULL::int4 = ANY(ARRAY[1]::int4[])","values":[1],"scalar":null,"comparison":"eq","quantifier":"any","expected":null},
+    {"sql":"2 = ALL(ARRAY[2,2,NULL]::int4[])","values":[2,2,null],"scalar":2,"comparison":"eq","quantifier":"all","expected":null},
+    {"sql":"2 = ALL(ARRAY[2,1,NULL]::int4[])","values":[2,1,null],"scalar":2,"comparison":"eq","quantifier":"all","expected":false},
+    {"sql":"2 = ALL(ARRAY[2,2]::int4[])","values":[2,2],"scalar":2,"comparison":"eq","quantifier":"all","expected":true},
+    {"sql":"2 <> ALL(ARRAY[1,3]::int4[])","values":[1,3],"scalar":2,"comparison":"ne","quantifier":"all","expected":true},
+    {"sql":"2 <> ANY(ARRAY[2,NULL]::int4[])","values":[2,null],"scalar":2,"comparison":"ne","quantifier":"any","expected":null},
+    {"sql":"2 < ANY(ARRAY[1,3,NULL]::int4[])","values":[1,3,null],"scalar":2,"comparison":"lt","quantifier":"any","expected":true},
+    {"sql":"2 <= ALL(ARRAY[2,3]::int4[])","values":[2,3],"scalar":2,"comparison":"le","quantifier":"all","expected":true},
+    {"sql":"2 > ALL(ARRAY[1,NULL]::int4[])","values":[1,null],"scalar":2,"comparison":"gt","quantifier":"all","expected":null},
+    {"sql":"2 >= ANY(ARRAY[2,3]::int4[])","values":[2,3],"scalar":2,"comparison":"ge","quantifier":"any","expected":true},
+    {"sql":"2 = ANY('[0:1]={1,2}'::int4[])","values":[1,2],"lower":0,"scalar":2,"comparison":"eq","quantifier":"any","expected":true},
+    {"sql":"2 = ANY(ARRAY[[1,2],[3,4]]::int4[])","values":[1,2,3,4],"shape":[2,2],"scalar":2,"comparison":"eq","quantifier":"any","expected":true},
+    {"sql":"2 < ALL(ARRAY[[3,4],[5,6]]::int4[])","values":[3,4,5,6],"shape":[2,2],"scalar":2,"comparison":"lt","quantifier":"all","expected":true}
+  ]
+}

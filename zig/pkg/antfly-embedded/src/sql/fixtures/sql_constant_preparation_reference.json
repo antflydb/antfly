@@ -1,0 +1,21 @@
+{
+  "reference": "PostgreSQL 18 lazy constant array and numeric execution",
+  "entries": [
+    {"sql": "CASE WHEN false THEN ARRAY[32768::smallint] ELSE ARRAY[1::smallint] END", "expected": "{1}"},
+    {"sql": "CASE WHEN false THEN CAST(ARRAY[32768] AS smallint[]) ELSE ARRAY[1::smallint] END", "expected": "{1}"},
+    {"sql": "COALESCE(ARRAY[1::smallint], CAST(ARRAY[32768] AS smallint[]))", "expected": "{1}"},
+    {"sql": "CASE WHEN false THEN CAST(ARRAY[1,2] AS numeric(1,2)[]) ELSE ARRAY[0::numeric] END", "expected": "{0}"},
+    {"sql": "CASE WHEN false THEN CAST('{bad}' AS integer[]) ELSE ARRAY[1] END", "error": "22P02"},
+    {"sql": "COALESCE(ARRAY[1], CAST('{bad}' AS integer[]))", "error": "22P02"},
+    {"sql": "CASE WHEN false THEN CAST(CAST('{bad}' AS text) AS integer[]) ELSE ARRAY[1] END", "expected": "{1}"},
+    {"sql": "CASE WHEN false THEN CAST(ARRAY['bad'] AS integer[]) ELSE ARRAY[1] END", "error": "22P02"},
+    {"sql": "CASE WHEN false THEN CAST('99.995' AS numeric(4,2)) ELSE 0::numeric END", "expected": "0"},
+    {"sql": "CASE WHEN false THEN CAST('{99.995}' AS numeric(4,2)[]) ELSE ARRAY[0::numeric] END", "expected": "{0}"},
+    {"sql": "CASE WHEN false THEN CAST(ARRAY[1e100::numeric] AS bigint[]) ELSE ARRAY[1::bigint] END", "expected": "{1}"},
+    {"sql": "CASE WHEN false THEN sqrt(-1::numeric) ELSE 1::numeric END", "expected": "1"},
+    {"sql": "CASE WHEN true THEN CAST(ARRAY[32768] AS smallint[]) ELSE ARRAY[1::smallint] END", "error": "22003"},
+    {"sql": "COALESCE(NULL::smallint[], CAST(ARRAY[32768] AS smallint[]))", "error": "22003"},
+    {"sql": "CASE WHEN true THEN CAST('{bad}' AS integer[]) ELSE ARRAY[1] END", "error": "22P02"},
+    {"sql": "CASE WHEN true THEN CAST(ARRAY[1,2] AS numeric(1,2)[]) ELSE ARRAY[0::numeric] END", "error": "22003"}
+  ]
+}

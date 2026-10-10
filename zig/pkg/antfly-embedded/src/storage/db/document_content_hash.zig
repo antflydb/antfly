@@ -267,6 +267,16 @@ fn hashRelationalCellCanonical(
         return;
     }
     switch (column.column_type) {
+        .numeric => {
+            hasher.update("N");
+            const view = try @import("../../common/sql_numeric_layout.zig").View.openAuthenticated(cell.value.bytes_val, .{});
+            view.updateLogicalHash(hasher);
+        },
+        .sql_array => {
+            const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
+            const view = try @import("../../common/sql_array_layout.zig").View.openAuthenticated(kind, cell.value.bytes_val, .{});
+            view.updateLogicalHash(hasher);
+        },
         .string, .blob, .geoshape => {
             hasher.update("s");
             hashBytes(hasher, cell.value.bytes_val);
@@ -308,7 +318,12 @@ fn hashCanonicalJsonBytes(hasher: *std.crypto.hash.Blake3, encoded: []const u8) 
 pub fn canonicalJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
-    try writeCanonicalJsonValue(alloc, &writer.writer, value);
+    // This writer only targets an allocating memory buffer, never external IO.
+    // Preserve allocation-failure semantics for callers' quota/fault handling.
+    writeCanonicalJsonValue(alloc, &writer.writer, value) catch |err| return switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
     return try writer.toOwnedSlice();
 }
 
@@ -339,6 +354,17 @@ fn writeCanonicalJsonValue(alloc: std.mem.Allocator, writer: *std.Io.Writer, val
             try writer.writeByte('}');
         },
         .number_string => |number| try writeCanonicalJsonNumber(alloc, writer, number),
+        .float => |number| {
+            // The same logical JSONB value can arrive as a native float or
+            // an exact parsed number token. Normalize both with the identical
+            // decimal codec so encoding always passes strict restore checks.
+            const parts = try @import("../../common/json_float_decimal.zig").Parts.init(number);
+            var coefficient_buffer: [768]u8 = undefined;
+            const coefficient = try parts.coefficientText(&coefficient_buffer);
+            var buffer: [800]u8 = undefined;
+            const raw = std.fmt.bufPrint(&buffer, "{s}{s}e{d}", .{ if (parts.negative) "-" else "", coefficient, parts.decimalExponent() }) catch unreachable;
+            try writeCanonicalJsonNumber(alloc, writer, raw);
+        },
         else => try std.json.Stringify.value(value, .{}, writer),
     }
 }
@@ -596,6 +622,27 @@ fn hashRelationalColumnValue(
         return;
     }
     switch (column.column_type) {
+        .sql_array => {
+            const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
+            var decoded = try @import("../../sql/array_wire.zig").decodeBorrowedWithModifier(alloc, kind, value, column.numeric_modifier, .{});
+            defer decoded.deinit();
+            const bytes = try @import("../../sql/array_storage.zig").encodeAlloc(alloc, decoded.value, .{});
+            defer alloc.free(bytes);
+            const view = try @import("../../common/sql_array_layout.zig").View.open(kind, bytes, .{});
+            view.updateLogicalHash(hasher);
+        },
+        .numeric => {
+            const numeric = @import("../../sql/numeric_value.zig");
+            var ctx: numeric.Context = .{ .alloc = alloc };
+            var parsed = try @import("../../sql/numeric_storage.zig").fromJson(&ctx, value);
+            defer parsed.deinit();
+            hasher.update("N");
+            if (column.numeric_modifier) |modifier| {
+                var constrained = try numeric.applyTypeModifier(&ctx, parsed.value, modifier);
+                defer constrained.deinit();
+                try numeric.hash(&ctx, constrained.value, hasher);
+            } else try numeric.hash(&ctx, parsed.value, hasher);
+        },
         .string, .blob, .geoshape => switch (value) {
             .string => |text| {
                 hasher.update("s");
@@ -824,6 +871,30 @@ test "canonical JSON normalizes equivalent number spellings losslessly" {
     const canonical_huge = try canonicalJsonValueAlloc(alloc, huge.value);
     defer alloc.free(canonical_huge);
     try std.testing.expectEqualStrings("1e999999999999999999999", canonical_huge);
+}
+
+test "canonical JSON retains exact native float bytes across strict token decoding" {
+    const alloc = std.testing.allocator;
+    for ([_]struct { value: f64, expected: []const u8 }{
+        .{ .value = -0.0, .expected = "0" },
+        .{ .value = 0.5, .expected = "0.5" },
+        .{ .value = 0.1, .expected = "0.1000000000000000055511151231257827021181583404541015625" },
+        .{ .value = 1000000000000000128.0, .expected = "1000000000000000128" },
+    }) |case| {
+        const canonical = try canonicalJsonValueAlloc(alloc, .{ .float = case.value });
+        defer alloc.free(canonical);
+        try std.testing.expectEqualStrings(case.expected, canonical);
+    }
+    for ([_]f64{ @bitCast(@as(u64, 1)), -std.math.floatMin(f64), std.math.floatMax(f64) }) |value| {
+        const canonical = try canonicalJsonValueAlloc(alloc, .{ .float = value });
+        defer alloc.free(canonical);
+        var decoded = try std.json.parseFromSlice(std.json.Value, alloc, canonical, .{ .parse_numbers = false });
+        defer decoded.deinit();
+        const encoded = try canonicalJsonValueAlloc(alloc, decoded.value);
+        defer alloc.free(encoded);
+        try std.testing.expectEqualStrings(canonical, encoded);
+        try std.testing.expectEqual(@as(u64, @bitCast(value)), @as(u64, @bitCast(try std.fmt.parseFloat(f64, canonical))));
+    }
 }
 
 test "relational JSON semantic hash ignores number spelling" {

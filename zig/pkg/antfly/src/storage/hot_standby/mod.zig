@@ -16,6 +16,7 @@
 pub const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 pub const metadata_effects = @import("metadata_effects.zig");
 pub const metadata_effect_chunks = @import("metadata_effect_chunks.zig");
+pub const metadata_effect_probe = @import("metadata_effect_probe.zig");
 pub const replay_floor = @import("replay_floor.zig");
 pub const restore_owner_contract = @import("restore_owner_contract.zig");
 pub const restore_owner_registry = @import("restore_owner_registry.zig");
@@ -68,6 +69,7 @@ pub const http_client = @import("http_client.zig");
 pub const layout = @import("layout.zig");
 
 test {
+    _ = metadata_effect_probe;
     _ = @import("lifecycle_receipt_inventory_test.zig");
     _ = @import("seed_prefix_cleanup_test.zig");
     _ = replication_record;

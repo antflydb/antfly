@@ -44,7 +44,7 @@ pub const Worklist = struct {
             for (values) |value| {
                 var bytes: [9]u8 = undefined;
                 bytes[0] = @intFromBool(value.sql_null);
-                std.mem.writeInt(u64, bytes[1..9], if (value.sql_null) 0 else try scalar.semanticHash(value.value), .little);
+                std.mem.writeInt(u64, bytes[1..9], if (value.sql_null) 0 else try scalar.semanticHashDatum(value), .little);
                 hasher.update(&bytes);
             }
             hash = hasher.final();
@@ -53,7 +53,7 @@ pub const Worklist = struct {
                 try engine.checkpoint();
                 const row = self.rows.items[index];
                 const equal = for (row.values, values) |left, right| {
-                    if (left.sql_null != right.sql_null or (!left.sql_null and try scalar.compare(left.value, right.value) != .eq)) break false;
+                    if (left.sql_null != right.sql_null or (!left.sql_null and try scalar.compareDatums(left, right) != .eq)) break false;
                 } else true;
                 if (equal) return;
                 cursor = row.next;

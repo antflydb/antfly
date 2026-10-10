@@ -1,0 +1,233 @@
+{
+  "format": 1,
+  "entries": [
+    {
+      "id": "empty",
+      "expression": "E''",
+      "value": "",
+      "sqlstate": null
+    },
+    {
+      "id": "lowercase-prefix",
+      "expression": "e'hello'",
+      "value": "hello",
+      "sqlstate": null
+    },
+    {
+      "id": "ordinary-backslashes",
+      "expression": "'\\n\\u0041\\\\'",
+      "value": "\\n\\u0041\\\\",
+      "sqlstate": null
+    },
+    {
+      "id": "control-escapes",
+      "expression": "E'\\b\\f\\n\\r\\t'",
+      "value": "\b\f\n\r\t",
+      "sqlstate": null
+    },
+    {
+      "id": "escaped-quotes",
+      "expression": "E'a\\'b''c\\\\'",
+      "value": "a'b'c\\",
+      "sqlstate": null
+    },
+    {
+      "id": "unknown-escapes",
+      "expression": "E'\\q\\8\\&\\雪'",
+      "value": "q8&雪",
+      "sqlstate": null
+    },
+    {
+      "id": "octal-width",
+      "expression": "E'\\1\\12\\1234'",
+      "value": "\u0001\nS4",
+      "sqlstate": null
+    },
+    {
+      "id": "hex-width",
+      "expression": "E'\\x1\\x12\\x123\\xz'",
+      "value": "\u0001\u0012\u00123xz",
+      "sqlstate": null
+    },
+    {
+      "id": "hex-utf8",
+      "expression": "E'\\xC3\\xA9'",
+      "value": "é",
+      "sqlstate": null
+    },
+    {
+      "id": "octal-utf8",
+      "expression": "E'\\303\\251'",
+      "value": "é",
+      "sqlstate": null
+    },
+    {
+      "id": "unicode",
+      "expression": "E'\\u96EA\\U0001F600'",
+      "value": "雪😀",
+      "sqlstate": null
+    },
+    {
+      "id": "surrogate-pair",
+      "expression": "E'\\uD83D\\uDE00'",
+      "value": "😀",
+      "sqlstate": null
+    },
+    {
+      "id": "wide-surrogate-pair",
+      "expression": "E'\\U0000D83D\\U0000DE00'",
+      "value": "😀",
+      "sqlstate": null
+    },
+    {
+      "id": "mixed-surrogate-pair",
+      "expression": "E'\\uD83D\\U0000DE00'",
+      "value": "😀",
+      "sqlstate": null
+    },
+    {
+      "id": "backslash-newline",
+      "expression": "E'a\\\nb'",
+      "value": "a\nb",
+      "sqlstate": null
+    },
+    {
+      "id": "newline-continuation",
+      "expression": "E'a'\n'\\n'",
+      "value": "a\n",
+      "sqlstate": null
+    },
+    {
+      "id": "ordinary-continuation",
+      "expression": "'a'\n'\\n'",
+      "value": "a\\n",
+      "sqlstate": null
+    },
+    {
+      "id": "line-comment-continuation",
+      "expression": "E'a' -- note\n'\\n'",
+      "value": "a\n",
+      "sqlstate": null
+    },
+    {
+      "id": "block-comment-newline-only",
+      "expression": "E'a' /*\n*/ 'b'",
+      "value": null,
+      "sqlstate": "42601"
+    },
+    {
+      "id": "block-comment-after-newline",
+      "expression": "E'a'\n/* note */'b'",
+      "value": null,
+      "sqlstate": "42601"
+    },
+    {
+      "id": "space-not-continuation",
+      "expression": "E'a' 'b'",
+      "value": null,
+      "sqlstate": "42601"
+    },
+    {
+      "id": "prefix-not-continuation",
+      "expression": "E'a'\nE'b'",
+      "value": null,
+      "sqlstate": "42601"
+    },
+    {
+      "id": "unicode-short",
+      "expression": "E'\\u12'",
+      "value": null,
+      "sqlstate": "22025"
+    },
+    {
+      "id": "unicode-bad-digit",
+      "expression": "E'\\uZZZZ'",
+      "value": null,
+      "sqlstate": "22025"
+    },
+    {
+      "id": "unicode-overflow",
+      "expression": "E'\\UFFFFFFFF'",
+      "value": null,
+      "sqlstate": "42601"
+    },
+    {
+      "id": "unicode-outside-range",
+      "expression": "E'\\U00110000'",
+      "value": null,
+      "sqlstate": "42601"
+    },
+    {
+      "id": "surrogate-alone",
+      "expression": "E'\\uD800'",
+      "value": null,
+      "sqlstate": "42601"
+    },
+    {
+      "id": "low-surrogate-alone",
+      "expression": "E'\\uDC00'",
+      "value": null,
+      "sqlstate": "42601"
+    },
+    {
+      "id": "surrogate-wrong-tail",
+      "expression": "E'\\uD800\\u0041'",
+      "value": null,
+      "sqlstate": "42601"
+    },
+    {
+      "id": "surrogate-separated",
+      "expression": "E'\\uD800x\\uDC00'",
+      "value": null,
+      "sqlstate": "42601"
+    },
+    {
+      "id": "unicode-zero",
+      "expression": "E'\\u0000'",
+      "value": null,
+      "sqlstate": "42601"
+    },
+    {
+      "id": "octal-zero",
+      "expression": "E'\\000'",
+      "value": null,
+      "sqlstate": "22021"
+    },
+    {
+      "id": "hex-zero",
+      "expression": "E'\\x00'",
+      "value": null,
+      "sqlstate": "22021"
+    },
+    {
+      "id": "invalid-utf8",
+      "expression": "E'\\xff'",
+      "value": null,
+      "sqlstate": "22021"
+    },
+    {
+      "id": "octal-truncation-invalid",
+      "expression": "E'\\777'",
+      "value": null,
+      "sqlstate": "22021"
+    },
+    {
+      "id": "octal-truncation-valid",
+      "expression": "E'\\541'",
+      "value": "a",
+      "sqlstate": null
+    },
+    {
+      "id": "unterminated",
+      "expression": "E'abc",
+      "value": null,
+      "sqlstate": "42601"
+    },
+    {
+      "id": "trailing-backslash",
+      "expression": "E'abc\\",
+      "value": null,
+      "sqlstate": "42601"
+    }
+  ]
+}

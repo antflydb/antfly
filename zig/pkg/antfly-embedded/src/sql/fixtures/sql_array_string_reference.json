@@ -1,0 +1,26 @@
+{
+  "entries": [
+    {"expression":"ARRAY[1,NULL] && ARRAY[NULL::int]", "expected":false},
+    {"expression":"ARRAY[1,1] && ARRAY[2,1]", "expected":true},
+    {"expression":"NULL::integer[] && ARRAY[1]", "expected":null},
+    {"expression":"ARRAY[]::integer[] && ARRAY[1]", "expected":false},
+    {"expression":"ARRAY[1] && ARRAY[1::bigint]", "error":"42883"},
+    {"expression":"'{NaN}'::double precision[] && '{NaN}'::double precision[]", "expected":true},
+    {"expression":"ARRAY['null'::jsonb] && ARRAY[NULL::jsonb]", "expected":false},
+    {"expression":"array_to_string(NULL::integer[],',')", "expected":null},
+    {"expression":"array_to_string(ARRAY[1],NULL)", "expected":null},
+    {"expression":"array_to_string(ARRAY[1,NULL,2],',',NULL)", "expected":"1,2"},
+    {"expression":"array_to_string(ARRAY[NULL::text],',')", "expected":""},
+    {"expression":"array_to_string(ARRAY[]::integer[],',','null')", "expected":""},
+    {"expression":"array_to_string('[0:1][-1:0]={{1,NULL},{2,3}}'::integer[],'|','NULL')", "expected":"1|NULL|2|3"},
+    {"expression":"array_to_string(ARRAY[true,NULL,false],',','NULL')", "expected":"t,NULL,f"},
+    {"expression":"array_to_string(ARRAY[9007199254740993::bigint,NULL],',','x')", "expected":"9007199254740993,x"},
+    {"expression":"array_to_string(ARRAY[0.1::real],',')", "expected":"0.1"},
+    {"expression":"array_to_string('{NaN,Infinity,-Infinity}'::double precision[],',')", "expected":"NaN,Infinity,-Infinity"},
+    {"expression":"array_to_string(ARRAY['a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid],',')", "expected":"a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"},
+    {"expression":"array_to_string(ARRAY['null'::jsonb,NULL,'{\"long\":2,\"x\":1}'::jsonb],'|','<NULL>')", "expected":"null|<NULL>|{\"x\": 1, \"long\": 2}"},
+    {"expression":"array_to_string(ARRAY['{\"bb\":1.2300e2,\"a\":[true,null,\"x\"]}'::jsonb],'|')", "expected":"{\"a\": [true, null, \"x\"], \"bb\": 123.00}"},
+    {"expression":"array_to_string(ARRAY['-0.000e-2'::jsonb],'|')", "expected":"0.00000"},
+    {"expression":"array_to_string(ARRAY['NULL','','é,{}'],',')", "expected":"NULL,,é,{}"}
+  ]
+}

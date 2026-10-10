@@ -232,6 +232,8 @@ SOURCE_MODULES = {
     "antfly_reader_config": ("zig/lib/readers/src/config.zig",),
     "antfly_readers": ("zig/lib/readers/src/mod.zig",),
     "antfly_regex": ("zig/lib/regex/src/mod.zig",),
+    "antfly_capture_regex": ("zig/lib/regex/src/captures.zig",),
+    "antfly_sql_regex": ("zig/lib/sql_regex/src/mod.zig",),
     "antfly_reranking": ("zig/lib/reranking/src/mod.zig",),
     "antfly_reranking_openapi": (
         "zig/pkg/antfly-embedded/src/openapi/generated/antfly_reranking_openapi/root.zig",

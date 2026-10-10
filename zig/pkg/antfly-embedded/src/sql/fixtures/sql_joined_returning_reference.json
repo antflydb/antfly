@@ -1,0 +1,8 @@
+{
+  "entries": [
+    {"sql":"UPDATE target t SET a=s.a,cold='new' FROM source s WHERE t.id=s.id RETURNING t.a,t.j,s.a", "target_first":"3", "target_lower":3},
+    {"sql":"UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t.id=s.id RETURNING t.a,t.j,s.a", "target_first":"9007199254740993", "target_lower":-1},
+    {"sql":"DELETE FROM target t USING source s WHERE t.id=s.id RETURNING t.a,t.j,s.a", "target_first":"9007199254740993", "target_lower":-1},
+    {"sql":"UPDATE target t SET a=s.a,cold='new' FROM source s WHERE t.id=s.id RETURNING t.a,t.j,s.a", "target_first":"3", "target_lower":3, "duplicates":true}
+  ]
+}

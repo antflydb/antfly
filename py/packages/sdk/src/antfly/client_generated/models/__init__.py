@@ -1160,6 +1160,7 @@ from .relational_row_query_request import RelationalRowQueryRequest
 from .relational_row_row import RelationalRowRow
 from .relational_scalar_expression import RelationalScalarExpression
 from .relational_unique_constraint import RelationalUniqueConstraint
+from .relational_unique_constraint_origin import RelationalUniqueConstraintOrigin
 from .rename_catalog_resource_request import RenameCatalogResourceRequest
 from .repair_issue_list_request import RepairIssueListRequest
 from .repair_run_request import RepairRunRequest
@@ -1260,12 +1261,20 @@ from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
+from .sql_array_column_schema import SQLArrayColumnSchema
+from .sql_array_column_schema_type import SQLArrayColumnSchemaType
+from .sql_array_dimension import SQLArrayDimension
+from .sql_array_element_type import SQLArrayElementType
+from .sql_array_value import SQLArrayValue
+from .sql_builtin_type import SQLBuiltinType
 from .sql_column import SQLColumn
 from .sql_column_type import SQLColumnType
 from .sql_connection_open_request import SQLConnectionOpenRequest
 from .sql_connection_response import SQLConnectionResponse
 from .sql_diagnostic import SQLDiagnostic
 from .sql_mutation_outcome import SQLMutationOutcome
+from .sql_numeric_modifier import SQLNumericModifier
+from .sql_parameter_descriptor import SQLParameterDescriptor
 from .sql_prepare_request import SQLPrepareRequest
 from .sql_prepared_execution_request import SQLPreparedExecutionRequest
 from .sql_prepared_response import SQLPreparedResponse
@@ -2607,6 +2616,7 @@ __all__ = (
     "RelationalRowRow",
     "RelationalScalarExpression",
     "RelationalUniqueConstraint",
+    "RelationalUniqueConstraintOrigin",
     "RenameCatalogResourceRequest",
     "RepairIssueListRequest",
     "RepairRunRequest",
@@ -2707,6 +2717,12 @@ __all__ = (
     "SortProfile",
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
+    "SQLArrayColumnSchema",
+    "SQLArrayColumnSchemaType",
+    "SQLArrayDimension",
+    "SQLArrayElementType",
+    "SQLArrayValue",
+    "SQLBuiltinType",
     "SQLColumn",
     "SQLColumnType",
     "SQLConnectionOpenRequest",
@@ -2715,6 +2731,8 @@ __all__ = (
     "SQLDDLReceiptState",
     "SQLDiagnostic",
     "SQLMutationOutcome",
+    "SQLNumericModifier",
+    "SQLParameterDescriptor",
     "SQLPreparedExecutionRequest",
     "SQLPreparedResponse",
     "SQLPrepareRequest",

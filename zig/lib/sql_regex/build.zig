@@ -1,0 +1,46 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const module = createModule(b, target, optimize, b.path("."));
+    if (target.result.cpu.arch.isWasm() and target.result.os.tag == .freestanding) {
+        module.root_source_file = b.path("src/wasm_smoke.zig");
+        const smoke = b.addExecutable(.{ .name = "sql-regex-smoke", .root_module = module });
+        smoke.entry = .disabled;
+        smoke.rdynamic = true;
+        b.step("check", "Compile the freestanding SQL regex backend").dependOn(&smoke.step);
+        const run = b.addSystemCommand(&.{"node"});
+        run.addFileArg(b.path("wasm_smoke.mjs"));
+        run.addArtifactArg(smoke);
+        b.step("test", "Execute independent PostgreSQL contracts in freestanding WASM").dependOn(&run.step);
+        return;
+    }
+    const probe_module = b.createModule(.{ .root_source_file = b.path("src/parity_probe.zig"), .target = target, .optimize = optimize, .link_libc = false });
+    probe_module.addImport("antfly_sql_regex", module);
+    const probe = b.addExecutable(.{ .name = "sql-regex-parity-probe", .root_module = probe_module });
+    b.step("parity-probe", "Build the offline PostgreSQL regex witness runner").dependOn(&b.addInstallArtifact(probe, .{}).step);
+    const tests = b.addTest(.{ .root_module = module });
+    b.step("test", "Run SQL regex portability and admission tests").dependOn(&b.addRunArtifact(tests).step);
+    b.step("check", "Compile SQL regex portability contracts without executing them").dependOn(&tests.step);
+}
+
+pub fn createModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, root: std.Build.LazyPath) *std.Build.Module {
+    const module = b.createModule(.{ .root_source_file = root.path(b, "src/mod.zig"), .target = target, .optimize = optimize, .link_libc = false, .single_threaded = if (target.result.cpu.arch.isWasm()) true else null });
+    module.addImport("antfly_capture_regex", b.createModule(.{ .root_source_file = root.path(b, "../regex/src/captures.zig"), .target = target, .optimize = optimize, .link_libc = false }));
+    return module;
+}

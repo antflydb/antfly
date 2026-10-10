@@ -76,6 +76,7 @@ pub const Resource = struct {
     /// the mutable session values. Execution re-reads values at its own cut.
     setting_epoch: ?u64 = null,
     parameter_types: []const ?ast.ColumnType,
+    parameter_descriptors: []const @import("antfly_local_sources").sql_scalar.Type = &.{},
     bindings: []const Binding,
 
     pub fn verifyExecutionSession(self: Resource, encoded: ?[]const u8) !void {
@@ -103,7 +104,16 @@ const Entry = struct { id: [32]u8, expires_at_ms: u64, bytes: usize };
 const Directory = struct { resources: []const Entry = &.{} };
 const Action = union(enum) { create: Resource, close: []const u8 };
 
+fn validateParameters(resource: Resource) !void {
+    if (resource.parameter_types.len != resource.parameter_descriptors.len or resource.parameter_descriptors.len > 1024) return error.InvalidSqlParameters;
+    for (resource.parameter_types, resource.parameter_descriptors) |kind, descriptor| {
+        if (kind != descriptor.kind) return error.InvalidSqlParameters;
+        try @import("antfly_local_sources").sql_scalar.validateParameterType(descriptor);
+    }
+}
+
 pub fn create(store: *transactions.DurableSessionStore, resource: Resource, now_ms: u64) !void {
+    try validateParameters(resource);
     if (resource.statement.len == 0 or resource.statement.len > max_statement_bytes or resource.bindings.len > 64 or resource.parameter_types.len > 1024 or resource.expires_at_ms <= now_ms or resource.expires_at_ms - now_ms > ttl_ms) return error.SqlProgramLimitExceeded;
     try access(store, store.alloc, .{ .create = resource }, resource.principal, resource.owner_node_id, now_ms, resource.connection_id);
 }
@@ -149,6 +159,7 @@ fn loadTxn(txn: anytype, alloc: std.mem.Allocator, id: []const u8, principal: []
     var value = std.json.parseFromSlice(Resource, budget.allocator(), raw, .{ .allocate = .alloc_always }) catch |err| return if (budget.exhausted) error.SqlProgramLimitExceeded else err;
     errdefer value.deinit();
     if (value.value.statement.len > max_statement_bytes or value.value.bindings.len > 64 or value.value.parameter_types.len > 1024) return error.SqlProgramLimitExceeded;
+    validateParameters(value.value) catch return error.SqlPreparedNotFound;
     if (value.value.expires_at_ms <= now_ms or !std.mem.eql(u8, value.value.principal, principal) or !std.mem.eql(u8, &value.value.id, id)) return error.SqlPreparedNotFound;
     if (value.value.owner_node_id != owner_node_id) return error.SqlPreparedWrongOwner;
     if (value.value.connection_id) |bound| {
@@ -313,7 +324,7 @@ test "SQL prepared durable directory preserves ownership expiry admission and lo
     var native = try backend.runtimeStore(alloc, .{ .name = "prepared-test" });
     defer native.deinit();
     var store = transactions.DurableSessionStore.initRuntime(alloc, &native);
-    const first: Resource = .{ .id = @splat('1'), .principal = "alice", .owner_node_id = 7, .expires_at_ms = 100, .database = "app", .namespace = "public", .statement = "SELECT $1::BIGINT", .parameter_types = &.{.integer}, .bindings = &.{} };
+    const first: Resource = .{ .id = @splat('1'), .principal = "alice", .owner_node_id = 7, .expires_at_ms = 100, .database = "app", .namespace = "public", .statement = "SELECT $1::BIGINT", .parameter_types = &.{.integer}, .parameter_descriptors = &.{.{ .kind = .integer, .element_type = .int64 }}, .bindings = &.{} };
     try create(&store, first, 1);
     try std.testing.expectError(error.SqlPreparedNotFound, load(&store, alloc, &first.id, "bob", 7, 2));
     try std.testing.expectError(error.SqlPreparedWrongOwner, load(&store, alloc, &first.id, "alice", 8, 2));
@@ -325,6 +336,10 @@ test "SQL prepared durable directory preserves ownership expiry admission and lo
     try std.testing.expectEqualStrings(first.statement, loaded.value.statement);
     try loaded.value.verifyExecutionSession(null);
     try std.testing.expectEqual(ast.ColumnType.integer, loaded.value.parameter_types[0].?);
+    try std.testing.expectEqual(@as(?@import("antfly_local_sources").sql_array_value.ElementType, .int64), loaded.value.parameter_descriptors[0].element_type);
+    var invalid = first;
+    invalid.parameter_descriptors = &.{};
+    try std.testing.expectError(error.InvalidSqlParameters, create(&store, invalid, 2));
     store.fail_writes_for_test = true;
     var read_during_write_failure = try load(&store, alloc, &first.id, "alice", 7, 2);
     read_during_write_failure.deinit();

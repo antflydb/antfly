@@ -12,10 +12,114 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { AntflyClient, SQLExecutionError } from "../src/client.js";
+import type {
+  RelationalScalarExpression,
+  SQLBuiltinType,
+  SQLArrayColumnSchema,
+  SQLArrayElementType,
+} from "../src/index.js";
+import type { SQLPreparedResponse, SQLColumn, SQLNumericModifier } from "../src/index.js";
+
+it("exports generated NUMERIC scalar and array result modifiers", () => {
+  const modifier: SQLNumericModifier = { precision: 2, scale: -3 };
+  for (const type of ["number", "array"] as const) {
+    const column: SQLColumn = {
+      name: "n",
+      type,
+      element_type: "numeric",
+      numeric_modifier: modifier,
+    };
+    expect(JSON.parse(JSON.stringify(column)).numeric_modifier).toEqual(modifier);
+  }
+});
+
+it("exports exact NUMERIC schema and expression identities without rounding literal text", () => {
+  const kind: SQLBuiltinType = "numeric";
+  const expression: RelationalScalarExpression = {
+    op: "literal",
+    type: "numeric",
+    sql_type: kind,
+    value: "9007199254740993.2500",
+  };
+  expect(JSON.parse(JSON.stringify(expression))).toEqual({
+    op: "literal",
+    type: "numeric",
+    sql_type: "numeric",
+    value: "9007199254740993.2500",
+  });
+});
+
+it.each([
+  "int64",
+  "numeric",
+] as const)("exports a typed %s array column schema without losing envelope constraints", (kind) => {
+  expectTypeOf<SQLArrayColumnSchema["x-antfly-sql-type"]>().toEqualTypeOf<SQLArrayElementType>();
+  const schema: SQLArrayColumnSchema = {
+    type: "sql_array",
+    "x-antfly-sql-type": kind,
+    nullable: true,
+    properties: { values: { minItems: 2 } },
+  };
+  expect(JSON.parse(JSON.stringify(schema))).toEqual({
+    type: "sql_array",
+    "x-antfly-sql-type": kind,
+    nullable: true,
+    properties: { values: { minItems: 2 } },
+  });
+});
+
+it.each([
+  undefined,
+  { precision: 2, scale: -3 },
+  { precision: 2, scale: 4 },
+])("preserves optional NUMERIC array modifier %j", (modifier) => {
+  const schema: SQLArrayColumnSchema = {
+    type: "sql_array",
+    "x-antfly-sql-type": "numeric",
+    "x-antfly-sql-numeric-modifier": modifier,
+  };
+  const encoded = JSON.parse(JSON.stringify(schema));
+  expect(encoded["x-antfly-sql-numeric-modifier"]).toEqual(modifier);
+  expect(Object.hasOwn(encoded, "x-antfly-sql-numeric-modifier")).toBe(modifier !== undefined);
+});
 
 afterEach(() => vi.unstubAllGlobals());
+
+it("preserves exact NUMERIC decimal text, display scale, SQL NULL and specials", async () => {
+  const result = {
+    columns: [{ name: "n", type: "number", element_type: "numeric" }],
+    rows: ["9007199254740993.1200", "0.0000", null, "NaN", "Infinity", "-Infinity"].map((value) => [
+      value,
+    ]),
+    rows_affected: 0,
+    command_tag: "SELECT 6",
+  };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify(result))));
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  expect(await client.executeSQL({ statement: "SELECT n FROM amounts" })).toEqual(result);
+});
+
+it("preserves precise prepared SQL array and integer parameter contracts", async () => {
+  const prepared: SQLPreparedResponse = {
+    prepared_id: "a".repeat(32),
+    expires_at_ms: 123,
+    owner_node_id: "9007199254740993",
+    parameter_types: ["array", "integer"],
+    parameter_descriptors: [
+      { type: "array", element_type: "int64", nullable: true },
+      { type: "integer", element_type: "int32", nullable: true },
+    ],
+    columns: [],
+  };
+  const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(prepared)));
+  vi.stubGlobal("fetch", fetch);
+  const client = new AntflyClient({ baseUrl: "http://localhost:8080" });
+  const result = await client.prepareSQL({ statement: "SELECT $1::bigint[],$2::integer" });
+  expect(result).toEqual(prepared);
+  expect(result.parameter_descriptors[0].element_type).toBe("int64");
+});
 
 describe("durable SQL connection client", () => {
   const connection = {

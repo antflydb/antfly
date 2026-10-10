@@ -42,6 +42,7 @@ pub fn configureBrowserModule(
     hash_mod: *std.Build.Module,
     fst_mod: *std.Build.Module,
     regex_mod: *std.Build.Module,
+    sql_regex_mod: *std.Build.Module,
     image_mod: *std.Build.Module,
     font_mod: *std.Build.Module,
     pdf_mod: *std.Build.Module,
@@ -71,6 +72,7 @@ pub fn configureBrowserModule(
     mod.addImport("antfly_hash", hash_mod);
     mod.addImport("antfly_fst", fst_mod);
     mod.addImport("antfly_regex", regex_mod);
+    mod.addImport("antfly_sql_regex", sql_regex_mod);
     mod.addImport("antfly_image", image_mod);
     mod.addImport("antfly_font", font_mod);
     mod.addImport("antfly_pdf", pdf_mod);

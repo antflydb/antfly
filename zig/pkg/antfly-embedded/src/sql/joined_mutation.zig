@@ -22,6 +22,7 @@ const catalog = @import("catalog.zig");
 const compiler = @import("compiler.zig");
 const describe = @import("describe.zig");
 const runtime = @import("runtime.zig");
+const scalar = @import("scalar.zig");
 const Allocator = std.mem.Allocator;
 
 pub const metadata_fields = [_][]const u8{ "\x00mutation_version", "\x00mutation_digest", "\x00mutation_document", "\x00mutation_presence" };
@@ -34,15 +35,17 @@ pub fn cell(alloc: Allocator, row: catalog.Row, name: []const u8) !catalog.Row.C
     if (std.mem.eql(u8, name, metadata_fields[1])) return .{ .value = .{ .string = if (row.expected_content_digest) |digest| try alloc.dupe(u8, &std.fmt.bytesToHex(digest, .lower)) else "" }, .sql_null = false };
     if (std.mem.eql(u8, name, metadata_fields[2])) return .{ .value = row.document orelse .null, .sql_null = row.document == null };
     if (std.mem.eql(u8, name, metadata_fields[3])) {
-        if (row.value != .object) return error.InvalidSqlBackendResponse;
+        const names = try row.fieldNames();
         var size: usize = 0;
-        for (row.value.object.keys()) |key| {
+        for (names) |key| {
+            if (!try row.hasField(key)) continue;
             if (key.len > std.math.maxInt(u16)) return error.SqlProgramLimitExceeded;
             size = std.math.add(usize, size, key.len + 2) catch return error.SqlProgramLimitExceeded;
         }
         const encoded = try alloc.alloc(u8, size);
         var cursor: usize = 0;
-        for (row.value.object.keys()) |key| {
+        for (names) |key| {
+            if (!try row.hasField(key)) continue;
             encoded[cursor] = @truncate(key.len);
             encoded[cursor + 1] = @truncate(key.len >> 8);
             @memcpy(encoded[cursor + 2 ..][0..key.len], key);
@@ -66,6 +69,23 @@ fn presenceContains(encoded: []const u8, name: []const u8) !bool {
     return false;
 }
 
+/// Build once per source row, borrowing names from its pinned metadata. Wide
+/// replacement images must not rescan this variable-width directory per cell.
+pub fn presenceDirectory(alloc: Allocator, encoded: []const u8) !std.StringHashMapUnmanaged(void) {
+    var directory: std.StringHashMapUnmanaged(void) = .empty;
+    errdefer directory.deinit(alloc);
+    var offset: usize = 0;
+    while (offset < encoded.len) {
+        if (encoded.len - offset < 2) return error.InvalidSqlBackendResponse;
+        const length = @as(usize, encoded[offset]) | (@as(usize, encoded[offset + 1]) << 8);
+        offset += 2;
+        if (length > encoded.len - offset) return error.InvalidSqlBackendResponse;
+        if ((try directory.getOrPut(alloc, encoded[offset..][0..length])).found_existing) return error.InvalidSqlBackendResponse;
+        offset += length;
+    }
+    return directory;
+}
+
 test "joined mutation presence distinguishes omitted cells from present SQL null" {
     const alloc = std.testing.allocator;
     var object: std.json.ObjectMap = .empty;
@@ -80,6 +100,25 @@ test "joined mutation presence distinguishes omitted cells from present SQL null
     try std.testing.expect(try presenceContains(encoded.value.string, "nullable.extra"));
     try std.testing.expect(!try presenceContains(encoded.value.string, "missing"));
     try std.testing.expectError(error.InvalidSqlBackendResponse, presenceContains(&.{ 4, 0, 'x' }, "x"));
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const layout = try catalog.Row.TypedLayout.init(arena.allocator(), &.{ "nullable", "missing" });
+    const typed: catalog.Row = .{ .id = "r", .version = 1, .value = .null, .typed_cells = .{ .layout = layout, .values = &.{ .{}, .{} }, .presence = &.{ true, false } } };
+    const typed_encoded = try cell(arena.allocator(), typed, metadata_fields[3]);
+    try std.testing.expect(try presenceContains(typed_encoded.value.string, "nullable"));
+    try std.testing.expect(!try presenceContains(typed_encoded.value.string, "missing"));
+}
+
+test "joined mutation presence directories reject duplicate and truncated names" {
+    const alloc = std.testing.allocator;
+    var directory = try presenceDirectory(alloc, &.{ 1, 0, 'a', 2, 0, 'b', 'c' });
+    defer directory.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), directory.count());
+    try std.testing.expect(directory.contains("a") and directory.contains("bc"));
+    try std.testing.expect(!directory.contains("b"));
+    try std.testing.expectError(error.InvalidSqlBackendResponse, presenceDirectory(alloc, &.{ 1, 0, 'a', 1, 0, 'a' }));
+    try std.testing.expectError(error.InvalidSqlBackendResponse, presenceDirectory(alloc, &.{ 2, 0, 'a' }));
+    try std.testing.expectError(error.InvalidSqlBackendResponse, presenceDirectory(alloc, &.{1}));
 }
 
 pub const Bound = struct {
@@ -90,6 +129,12 @@ pub const Bound = struct {
     default_paths: []const []const u8,
     deleting: bool,
     returning: ?[]const ast.Projection,
+    returning_plan: ?@import("mutation_returning.zig").Plan = null,
+    returning_binding: ?*const describe.BoundStatement = null,
+    returning_query: ?ast.Select = null,
+    returning_scope: []const @import("relation_binding.zig").Column = &.{},
+    returning_sources: []const usize = &.{},
+    target_qualifier: []const u8 = "",
 };
 
 fn column(alloc: Allocator, qualifier: []const u8, name: []const u8) !*const ast.Scalar {
@@ -112,10 +157,10 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
         for (assignments[0..i]) |prior| if (std.mem.eql(u8, prior.field, field.name)) return error.DuplicateSqlColumn;
     }
     var projections: std.ArrayList(ast.Projection) = .empty;
-    var expected: std.ArrayList(ast.ColumnType) = .empty;
+    var expected: std.ArrayList(scalar.Type) = .empty;
     for ([_][]const u8{ "_id", metadata_fields[0], metadata_fields[1], metadata_fields[2], metadata_fields[3] }, 0..) |field, i| {
         try projections.append(alloc, .{ .expression = try column(alloc, alias, field) });
-        try expected.append(alloc, if (i == 3) .json else .string);
+        try expected.append(alloc, .{ .kind = if (i == 3) .json else .string });
     }
     var fields: std.ArrayList(catalog.Column) = .empty;
     var preserve: std.ArrayList(bool) = .empty;
@@ -139,8 +184,9 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
             continue;
         }
         if (!deleting and table.storage_mode == .document and expression == null) continue;
-        try projections.append(alloc, .{ .expression = expression orelse try column(alloc, alias, field.name) });
-        try expected.append(alloc, field.type);
+        const required: scalar.Type = .{ .kind = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier };
+        try projections.append(alloc, .{ .expression = if (expression) |assigned| try scalar.assignmentExpression(alloc, assigned, required) else try column(alloc, alias, field.name) });
+        try expected.append(alloc, required);
         try fields.append(alloc, field);
         try preserve.append(alloc, expression == null);
     }
@@ -162,18 +208,130 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, co
     if (deleting) for (projections.items, groups) |projection, *group| {
         group.* = projection.expression.?;
     };
-    const query: ast.Select = .{ .source = source, .ctes = if (deleting) compiled.statement.delete.ctes else compiled.statement.update.ctes, .columns = projections.items, .predicate = predicate, .group_by = groups };
+    var query: ast.Select = .{ .source = source, .ctes = if (deleting) compiled.statement.delete.ctes else compiled.statement.update.ctes, .columns = projections.items, .predicate = predicate, .group_by = groups };
     // The target was already resolved/authorized for read+write. Reuse that
     // immutable binding; resolve every other physical source for read access.
-    var adapter: @import("relation_binding.zig").TargetResolveAdapter = .{ .backend = backend, .table = table, .name = name };
-    try @import("relation_binding.zig").inferExpected(alloc, adapter.iface(), query, parameters, expected.items);
+    var adapter: @import("relation_binding.zig").TargetResolveAdapter = .{ .backend = backend, .table = table, .name = name, .cache_sources = true };
+    try @import("relation_binding.zig").inferExpectedTypes(alloc, adapter.iface(), query, parameters, expected.items);
     const selected: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = query }, .parameter_count = compiled.parameter_count };
     const input = try alloc.create(describe.BoundStatement);
     input.* = try describe.bind(alloc, adapter.iface(), &selected, parameters);
     for (input.columns, expected.items) |actual, required| {
-        if (!actual.untyped_null and actual.type != required and !(actual.type == .integer and required == .number)) return error.SqlTypeMismatch;
+        if (!actual.untyped_null and actual.type != required.kind and !(actual.type == .integer and required.kind == .number)) return if (required.kind == .array) error.SqlAssignmentTypeMismatch else error.SqlTypeMismatch;
+        if (actual.type == .array and required.kind == .array and !@import("builtin_cast.zig").assignmentAllowed(actual.element_type orelse return error.SqlAssignmentTypeMismatch, required.element_type orelse return error.SqlAssignmentTypeMismatch)) return error.SqlAssignmentTypeMismatch;
     }
-    return .{ .input = input, .query = query, .fields = fields.items, .preserve = preserve.items, .default_paths = default_paths.items, .deleting = deleting, .returning = returning };
+    // FROM/USING columns also participate in RETURNING name resolution.
+    // Validate against the existing authorized input scope before projecting
+    // prepared target images; do not silently resolve an ambiguous bare name
+    // to the target, or perform another catalog/read capture for this check.
+    var returning_plan: ?@import("mutation_returning.zig").Plan = null;
+    var returning_binding: ?*const describe.BoundStatement = null;
+    var returning_query: ?ast.Select = null;
+    var scope: []const @import("relation_binding.zig").Column = &.{};
+    var captured: std.ArrayList(usize) = .empty;
+    if (returning) |projections_| {
+        const relation = input.relation orelse return error.InvalidSqlBackendResponse;
+        for (projections_) |projection| {
+            if (projection.wildcard) continue;
+            const field: ast.Scalar = .{ .column = projection.field };
+            _ = try @import("relation_binding.zig").lowerBoundExpression(alloc, relation.root.columns, projection.expression orelse &field);
+        }
+        {
+            scope = relation.root.columns;
+            const slots = try alloc.alloc(scalar.Column, scope.len);
+            for (scope, slots) |field, *slot| slot.* = .{ .name = field.internal, .type = field.type, .element_type = field.element_type, .numeric_modifier = field.numeric_modifier };
+            const authorized_scope = scope;
+            var required = try alloc.alloc(bool, scope.len);
+            @memset(required, false);
+            if (!describe.returningReads(returning)) {
+                const plan = try @import("mutation_returning.zig").bind(alloc, backend, scope, slots, projections_, alias, parameters);
+                for (plan.programs) |program| for (program.required_columns) |ordinal| {
+                    required[ordinal] = true;
+                };
+            } else {
+                const relations = @import("relation_binding.zig");
+                const expanded = try relations.expandWildcards(alloc, scope, projections_, alias);
+                const outputs = try alloc.dupe(ast.Projection, expanded);
+                for (outputs) |*projection| if (projection.bound_column) |ordinal| {
+                    const field = scope[ordinal];
+                    projection.field = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ field.qualifier, field.name });
+                    projection.bound_column = null;
+                };
+                const prepared_source = try alloc.create(ast.Relation);
+                prepared_source.* = .{ .table = .{ .name = .{ .table = relations.prepared_scope_name }, .prepared_rows = true } };
+                returning_query = .{ .source = prepared_source, .columns = outputs, .ctes = query.ctes };
+                const output = try describe.bindPreparedReturning(alloc, adapter.iface(), returning_query.?, parameters, scope);
+                for (scope, required) |field, *needed| for (output.relation.?.prepared_fields) |name_| {
+                    if (std.mem.eql(u8, name_, field.internal)) needed.* = true;
+                };
+            }
+            // Keep execution width proportional to RETURNING dependencies,
+            // not to all columns in every authorized joined table. The full
+            // scope remains authoritative for ambiguity and wildcard binding.
+            var dense_scope: std.ArrayList(@import("relation_binding.zig").Column) = .empty;
+            var dense_slots: std.ArrayList(scalar.Column) = .empty;
+            var source_ordinals: std.ArrayList(usize) = .empty;
+            for (scope, slots, required, 0..) |field, slot, used, ordinal| {
+                if (!used) continue;
+                try dense_scope.append(alloc, field);
+                try dense_slots.append(alloc, slot);
+                try source_ordinals.append(alloc, ordinal);
+            }
+            scope = dense_scope.items;
+            if (returning_query) |selection| {
+                const output = try alloc.create(describe.BoundStatement);
+                output.* = try describe.bindPreparedReturning(alloc, adapter.iface(), selection, parameters, scope);
+                returning_binding = output;
+            } else returning_plan = try @import("mutation_returning.zig").bind(alloc, backend, authorized_scope, dense_slots.items, projections_, alias, parameters);
+            required = try alloc.alloc(bool, scope.len);
+            @memset(required, true);
+            if (deleting) {
+                var retained: std.ArrayList(ast.Projection) = .empty;
+                try retained.appendSlice(alloc, projections.items[0..5]);
+                var retained_fields: std.ArrayList(catalog.Column) = .empty;
+                var retained_presence: std.ArrayList(bool) = .empty;
+                for (fields.items, preserve.items, 0..) |field, preserved, index| {
+                    const needed = for (scope, required) |visible, used| {
+                        if (used and std.mem.eql(u8, visible.qualifier, alias) and std.mem.eql(u8, visible.name, field.name)) break true;
+                    } else false;
+                    if (!needed) continue;
+                    try retained.append(alloc, projections.items[5 + index]);
+                    try retained_fields.append(alloc, field);
+                    try retained_presence.append(alloc, preserved);
+                }
+                projections = retained;
+                fields = retained_fields;
+                preserve = retained_presence;
+            }
+            for (scope, required, 0..) |field, needed, ordinal| {
+                if (!needed or std.mem.eql(u8, field.qualifier, alias)) continue;
+                try captured.append(alloc, ordinal);
+                try projections.append(alloc, .{ .bound_column = source_ordinals.items[ordinal] });
+            }
+            if (captured.items.len != 0 or deleting) {
+                query.columns = projections.items;
+                // Source fanout is reduced by target identity in the streaming
+                // collector, retaining one coherent representative source row.
+                // Grouping by source cells would reintroduce fanout amplification.
+                if (deleting) {
+                    if (captured.items.len != 0) {
+                        query.group_by = &.{};
+                    } else {
+                        const keys = try alloc.alloc(*const ast.Scalar, projections.items.len);
+                        for (projections.items, keys) |projection, *key| key.* = projection.expression.?;
+                        query.group_by = keys;
+                    }
+                }
+                const expanded: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = query }, .parameter_count = compiled.parameter_count };
+                input.* = try describe.bind(alloc, adapter.iface(), &expanded, parameters);
+                const rebound = input.relation orelse return error.InvalidSqlBackendResponse;
+                if (rebound.root.columns.len != authorized_scope.len) return error.InvalidSqlBackendResponse;
+                for (authorized_scope, rebound.root.columns) |before, after| if (!std.mem.eql(u8, before.internal, after.internal) or before.type != after.type or before.element_type != after.element_type) return error.InvalidSqlBackendResponse;
+            }
+            input.parameter_types = parameters;
+        }
+    }
+    return .{ .input = input, .query = query, .fields = fields.items, .preserve = preserve.items, .default_paths = default_paths.items, .deleting = deleting, .returning = returning, .returning_plan = returning_plan, .returning_binding = returning_binding, .returning_query = returning_query, .returning_scope = scope, .returning_sources = captured.items, .target_qualifier = alias };
 }
 
 fn equalityConjuncts(alloc: Allocator, expression: *const ast.Scalar) anyerror!?*const ast.Scalar {
@@ -213,72 +371,253 @@ fn scalarOnly(expression: *const ast.Scalar) bool {
     };
 }
 
-pub fn execute(context: anytype, bound: Bound) !runtime.Output {
-    var read = context;
-    read.binding = bound.input.*;
+pub fn execute(execution: anytype, definition_: Bound) !runtime.Output {
+    var read = execution;
+    read.binding = definition_.input.*;
     read.typed_output = true;
-    read.limits.result_rows = context.limits.mutation_rows;
-    const selected = try read.select(bound.query);
-    const flags = selected.sql_nulls orelse if (selected.rows.len == 0) &.{} else return error.InvalidSqlBackendResponse;
-    if (flags.len != selected.rows.len or selected.rows.len > context.limits.mutation_rows) return error.InvalidSqlBackendResponse;
-    var mutations: std.ArrayList(catalog.Mutation) = .empty;
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
-    const table = context.binding.table.?;
-    for (selected.rows, flags) |values, nulls| {
-        try context.checkpoint();
-        if (values.len != bound.fields.len + 5 or nulls.len != values.len) return error.InvalidSqlBackendResponse;
-        if (nulls[0]) continue; // An outer join may have no target row.
-        if (values[0] != .string or nulls[1] or values[1] != .string or nulls[2] or values[2] != .string) return error.InvalidSqlBackendResponse;
-        const key = values[0].string;
-        if ((try seen.getOrPut(context.arena, key)).found_existing) {
-            if (bound.deleting) continue;
-            return error.SqlMutationCardinalityViolation;
-        }
-        var digest: ?[32]u8 = null;
-        if (values[2].string.len != 0) {
-            var bytes: [32]u8 = undefined;
-            if (values[2].string.len != 64) return error.InvalidSqlBackendResponse;
-            _ = std.fmt.hexToBytes(&bytes, values[2].string) catch return error.InvalidSqlBackendResponse;
-            digest = bytes;
-        }
-        const version = std.fmt.parseInt(u64, values[1].string, 10) catch return error.InvalidSqlBackendResponse;
-        if (table.storage_mode == .document and version != 0 and digest == null) return error.InvalidSqlBackendResponse;
-        if (nulls[4] or values[4] != .string) return error.InvalidSqlBackendResponse;
-        const present = values[4].string;
-        var object: std.json.ObjectMap = .empty;
-        var json_null_fields: std.ArrayList([]const u8) = .empty;
-        var old_flags: std.ArrayList(bool) = .empty;
-        if (!bound.deleting and table.storage_mode == .document) {
-            if (nulls[3] or values[3] != .object) return error.InvalidSqlBackendResponse;
-            var iter = values[3].object.iterator();
-            while (iter.next()) |member| {
-                const declared = table.column(member.key_ptr.*) catch null;
-                if (declared) |field| if (field.generated) continue;
-                const overwritten = for (bound.fields) |field| {
-                    if (std.mem.eql(u8, field.path, member.key_ptr.*)) break true;
-                } else false;
-                if (overwritten) continue;
-                const reset = for (bound.default_paths) |path| {
-                    if (std.mem.eql(u8, path, member.key_ptr.*)) break true;
-                } else false;
-                if (reset) continue;
-                try object.put(context.arena, member.key_ptr.*, member.value_ptr.*);
-                if (declared) |field| if (field.type == .json and member.value_ptr.* == .null) try json_null_fields.append(context.arena, field.path);
-            }
-        }
-        for (bound.fields, bound.preserve, values[5..], nulls[5..]) |field, preserve, value, is_null| {
-            if (preserve and !try presenceContains(present, field.name)) continue;
-            if (!bound.deleting and is_null and !field.nullable) return error.SqlNotNullViolation;
-            try object.put(context.arena, field.path, if (is_null) .null else try describe.coerce(value, field.type));
-            if (!is_null and value == .null) try json_null_fields.append(context.arena, field.path);
-            try old_flags.append(context.arena, is_null);
-        }
-        const previous = if (bound.deleting and bound.returning != null) blk: {
-            const old = try context.arena.create(catalog.Row);
-            old.* = .{ .id = key, .version = version, .value = .{ .object = object }, .sql_nulls = old_flags.items };
-            break :blk old;
-        } else null;
-        try mutations.append(context.arena, .{ .key = key, .expected_version = version, .expected_content_digest = digest, .row = if (bound.deleting) null else .{ .object = object }, .json_null_fields = json_null_fields.items, .previous = previous });
+    // Match fanout is work, not the affected-row count. Both UPDATE FROM and
+    // DELETE USING choose one coherent source match for each target, as in
+    // PostgreSQL; the collector enforces the mutation quota on unique targets.
+    read.limits.result_rows = execution.limits.scan_rows;
+    var pending_mutations: std.ArrayList(catalog.Mutation) = .empty;
+    defer pending_mutations.deinit(execution.alloc);
+    var visited: std.StringHashMapUnmanaged(void) = .empty;
+    defer visited.deinit(execution.alloc);
+    const target = execution.binding.table.?;
+    var previous_layout: ?catalog.Row.TypedLayout = null;
+    if (definition_.deleting and definition_.returning != null) {
+        const names = try execution.arena.alloc([]const u8, definition_.fields.len);
+        for (definition_.fields, names) |field, *name| name.* = field.path;
+        previous_layout = try catalog.Row.TypedLayout.init(execution.arena, names);
     }
-    return context.commitMutations(table, mutations.items, if (bound.deleting) "DELETE" else "UPDATE", bound.returning);
+    const Capture = @import("result_cursor.zig").Cursor;
+    const sources = if (definition_.returning_sources.len == 0) null else if (execution.spill) |manager| try Capture.create(execution.alloc, manager, definition_.returning_sources.len) else try Capture.createMemory(execution.alloc, definition_.returning_sources.len, execution.limits.retained_bytes / 2);
+    var sources_live = sources != null;
+    defer if (sources_live) sources.?.close();
+    const Collector = struct {
+        context: runtime.Context,
+        bound: Bound,
+        mutations: *std.ArrayList(catalog.Mutation),
+        seen: *std.StringHashMapUnmanaged(void),
+        old_layout: ?catalog.Row.TypedLayout,
+        sources: ?*Capture,
+        scratch: std.heap.ArenaAllocator,
+        fn append(raw: *anyopaque, values: []const scalar.Datum) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const context_ = self.context;
+            const bound_ = self.bound;
+            return self.add(context_, bound_, values);
+        }
+        fn add(self: *@This(), ctx: runtime.Context, definition: Bound, values: []const scalar.Datum) !void {
+            const context = ctx;
+            const bound = definition;
+            const table = context.binding.table.?;
+            const mutations = self.mutations;
+            const seen = self.seen;
+            const old_layout = self.old_layout;
+            _ = self.scratch.reset(.retain_capacity);
+            const temporary = self.scratch.allocator();
+            try context.checkpoint();
+            if (values.len != bound.fields.len + 5 + bound.returning_sources.len) return error.InvalidSqlBackendResponse;
+            if (values[0].sql_null) return; // An outer join may have no target row.
+            if (values[0].value != .string or values[1].sql_null or values[1].value != .string or values[2].sql_null or values[2].value != .string) return error.InvalidSqlBackendResponse;
+            if (seen.contains(values[0].value.string)) {
+                return;
+            }
+            if (mutations.items.len >= context.limits.mutation_rows) return error.SqlProgramLimitExceeded;
+            const key = try context.arena.dupe(u8, values[0].value.string);
+            try seen.put(context.alloc, key, {});
+            var digest: ?[32]u8 = null;
+            if (values[2].value.string.len != 0) {
+                var bytes: [32]u8 = undefined;
+                if (values[2].value.string.len != 64) return error.InvalidSqlBackendResponse;
+                _ = std.fmt.hexToBytes(&bytes, values[2].value.string) catch return error.InvalidSqlBackendResponse;
+                digest = bytes;
+            }
+            const version = std.fmt.parseInt(u64, values[1].value.string, 10) catch return error.InvalidSqlBackendResponse;
+            if (table.storage_mode == .document and version != 0 and digest == null) return error.InvalidSqlBackendResponse;
+            if (values[4].sql_null or values[4].value != .string) return error.InvalidSqlBackendResponse;
+            const present = try presenceDirectory(temporary, values[4].value.string);
+            var object: std.json.ObjectMap = .empty;
+            var json_null_fields: std.ArrayList([]const u8) = .empty;
+            if (!bound.deleting and table.storage_mode == .document) {
+                if (values[3].sql_null or values[3].value != .object) return error.InvalidSqlBackendResponse;
+                var iter = values[3].value.object.iterator();
+                while (iter.next()) |member| {
+                    const declared = table.column(member.key_ptr.*) catch null;
+                    if (declared) |field| if (field.generated) continue;
+                    const overwritten = for (bound.fields) |field| {
+                        if (std.mem.eql(u8, field.path, member.key_ptr.*)) break true;
+                    } else false;
+                    if (overwritten) continue;
+                    const reset = for (bound.default_paths) |path| {
+                        if (std.mem.eql(u8, path, member.key_ptr.*)) break true;
+                    } else false;
+                    if (reset) continue;
+                    try object.put(context.arena, try context.arena.dupe(u8, member.key_ptr.*), try runtime.clone(context.arena, member.value_ptr.*));
+                    if (declared) |field| if (field.type == .json and member.value_ptr.* == .null) try json_null_fields.append(context.arena, field.path);
+                }
+            }
+            const previous = if (bound.deleting and bound.returning != null) blk: {
+                const old = try context.arena.create(catalog.Row);
+                old.* = try catalog.Row.fromDatums(context.arena, key, old_layout.?, values[5..][0..bound.fields.len]);
+                old.version = version;
+                old.expected_content_digest = digest;
+                if (!values[3].sql_null) old.document = try runtime.clone(context.arena, values[3].value);
+                const presence = try context.arena.alloc(bool, bound.fields.len);
+                for (bound.fields, presence) |field, *flag| flag.* = present.contains(field.name);
+                old.typed_cells.?.presence = presence;
+                break :blk old;
+            } else null;
+            if (!bound.deleting) for (bound.fields, bound.preserve, values[5..][0..bound.fields.len]) |field, preserve, datum| {
+                if (preserve and !present.contains(field.name)) continue;
+                try object.put(context.arena, field.path, try context.storageDatum(datum, field));
+                if (field.type == .json and !datum.sql_null and datum.value == .null) try json_null_fields.append(context.arena, field.path);
+            };
+            try mutations.append(context.alloc, .{ .key = key, .expected_version = version, .expected_content_digest = digest, .row = if (bound.deleting) null else .{ .object = object }, .json_null_fields = json_null_fields.items, .previous = previous });
+            if (self.sources) |capture| try Capture.append(capture, values[5 + bound.fields.len ..]);
+        }
+    };
+    var collector: Collector = .{ .context = execution, .bound = definition_, .mutations = &pending_mutations, .seen = &visited, .old_layout = previous_layout, .sources = sources, .scratch = std.heap.ArenaAllocator.init(execution.alloc) };
+    defer collector.scratch.deinit();
+    // Consume the statement's one captured read directly. DELETE fanout keeps
+    // one target image and one coherent source representative, not a full join
+    // result per match. Only required source RETURNING cells enter the bounded
+    // typed capture; no per-row JSON compatibility representation is retained.
+    try read.selectInto(definition_.query, .{ .ptr = &collector, .append = Collector.append });
+    if (definition_.returning_binding) |binding| {
+        const output = try relationalReturningOutput(execution, definition_, pending_mutations.items, sources);
+        if (sources) |capture| capture.close();
+        sources_live = false;
+        var committed = try execution.commitPreparedMutations(target, output.prepared, if (definition_.deleting) "DELETE" else "UPDATE");
+        committed.columns = binding.columns;
+        committed.rows = output.rows;
+        committed.sql_nulls = output.nulls;
+        return committed;
+    }
+    if (definition_.returning_plan) |plan| {
+        const output = try returningOutput(execution, definition_, plan, pending_mutations.items, sources);
+        if (sources) |capture| capture.close();
+        sources_live = false;
+        var committed = try execution.commitPreparedMutations(target, output.prepared, if (definition_.deleting) "DELETE" else "UPDATE");
+        committed.columns = plan.columns;
+        committed.rows = output.rows;
+        committed.sql_nulls = output.nulls;
+        return committed;
+    }
+    return execution.commitMutations(target, pending_mutations.items, if (definition_.deleting) "DELETE" else "UPDATE", definition_.returning);
+}
+
+const ReturningOutput = struct { prepared: []const catalog.Mutation, rows: []const []const std.json.Value, nulls: []const []const bool };
+
+fn relationalReturningOutput(context: runtime.Context, bound: Bound, input: []const catalog.Mutation, sources: ?*@import("result_cursor.zig").Cursor) !ReturningOutput {
+    if (input.len > context.limits.result_rows) return error.SqlResultTooLarge;
+    const prepared = if (input.len == 0) input else try (context.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, context.binding.table.?, input);
+    if (prepared.len != input.len) return error.InvalidSqlBackendResponse;
+    const names = try context.arena.alloc([]const u8, bound.returning_scope.len);
+    var fields: std.ArrayList([]const u8) = .empty;
+    for (bound.returning_scope, names) |field, *name| {
+        name.* = field.internal;
+        if (std.mem.eql(u8, field.qualifier, bound.target_qualifier)) try fields.append(context.arena, field.name);
+    }
+    const images = try runtime.Context.ReturningImages.init(context.arena, context.binding.table.?, fields.items);
+    const layout = try catalog.Row.TypedLayout.init(context.arena, names);
+    const Cursor = @import("result_cursor.zig").Cursor;
+    const rows = if (context.spill) |manager| try Cursor.create(context.alloc, manager, names.len) else try Cursor.createMemory(context.alloc, names.len, context.limits.retained_bytes / 2);
+    defer rows.close();
+    const reader = if (sources) |capture| try capture.openReplayReader() else null;
+    defer if (reader) |cursor| cursor.close();
+    var scratch = std.heap.ArenaAllocator.init(context.alloc);
+    defer scratch.deinit();
+    for (prepared, input) |mutation, original| {
+        try context.checkpoint();
+        _ = scratch.reset(.retain_capacity);
+        const a = scratch.allocator();
+        const image = try images.row(a, mutation, original);
+        const cells = try a.alloc(scalar.Datum, names.len);
+        @memset(cells, .{});
+        if (reader) |cursor| {
+            const source = (try cursor.next()) orelse return error.InvalidSqlBackendResponse;
+            if (source.len != bound.returning_sources.len) return error.InvalidSqlBackendResponse;
+            for (source, bound.returning_sources) |value, ordinal| cells[ordinal] = value;
+        }
+        for (bound.returning_scope, cells) |field, *datum| if (std.mem.eql(u8, field.qualifier, bound.target_qualifier)) {
+            datum.* = try image.cell(field.name);
+        };
+        try Cursor.append(rows, cells);
+    }
+    if (reader) |cursor| if (cursor.index != input.len or cursor.owner.count() != input.len) return error.InvalidSqlBackendResponse;
+    var output_context = context;
+    output_context.binding = bound.returning_binding.?.*;
+    output_context.returning_cursor = rows;
+    output_context.returning_layout = layout;
+    output_context.sink = null;
+    const output = if (input.len == 0) runtime.Output{ .columns = output_context.binding.columns, .rows = &.{}, .sql_nulls = &.{}, .command_tag = "SELECT" } else try output_context.select(bound.returning_query.?);
+    if (output.rows.len != input.len) return error.InvalidSqlBackendResponse;
+    return .{ .prepared = prepared, .rows = output.rows, .nulls = output.sql_nulls orelse return error.InvalidSqlBackendResponse };
+}
+
+fn returningOutput(context: runtime.Context, bound: Bound, plan: @import("mutation_returning.zig").Plan, input: []const catalog.Mutation, sources: ?*@import("result_cursor.zig").Cursor) !ReturningOutput {
+    if (input.len > context.limits.result_rows) return error.SqlResultTooLarge;
+    const prepared = if (input.len == 0) input else try (context.backend.vtable.prepare_mutations orelse return error.UnsupportedSqlExecution)(context.backend.ptr, context.arena, context.binding.table.?, input);
+    if (prepared.len != input.len) return error.InvalidSqlBackendResponse;
+    const required = try context.arena.alloc(bool, bound.returning_scope.len);
+    @memset(required, false);
+    for (plan.programs) |program| for (program.required_columns) |ordinal| {
+        required[ordinal] = true;
+    };
+    var fields: std.ArrayList([]const u8) = .empty;
+    for (bound.returning_scope, required) |field, needed| if (needed and std.mem.eql(u8, field.qualifier, bound.target_qualifier)) {
+        try fields.append(context.arena, field.name);
+    };
+    const images = try runtime.Context.ReturningImages.init(context.arena, context.binding.table.?, fields.items);
+    const rows = try context.arena.alloc([]const std.json.Value, input.len);
+    const nulls = try context.arena.alloc([]const bool, input.len);
+    const reader = if (sources) |capture| try capture.openReplayReader() else null;
+    defer if (reader) |cursor| cursor.close();
+    var arena = std.heap.ArenaAllocator.init(context.alloc);
+    defer arena.deinit();
+    const decisions = @import("decision_eval.zig");
+    var first: usize = 0;
+    while (first < input.len) {
+        try context.checkpoint();
+        _ = arena.reset(.retain_capacity);
+        const a = arena.allocator();
+        var budget: decisions.PageBudget = .{ .row_limit = context.limits.page_rows, .byte_limit = context.limits.page_bytes };
+        var page: std.ArrayList([]const scalar.Datum) = .empty;
+        var end = first;
+        while (end < input.len) {
+            const image = try images.row(a, prepared[end], input[end]);
+            const cells = try a.alloc(scalar.Datum, bound.returning_scope.len);
+            @memset(cells, .{});
+            if (reader) |cursor| {
+                const source = (try cursor.next()) orelse return error.InvalidSqlBackendResponse;
+                if (source.len != bound.returning_sources.len) return error.InvalidSqlBackendResponse;
+                for (source, bound.returning_sources) |value, ordinal| cells[ordinal] = try @import("operators.zig").cloneDatum(a, value);
+            }
+            for (bound.returning_scope, required, cells) |field, needed, *cell_| if (needed and std.mem.eql(u8, field.qualifier, bound.target_qualifier)) {
+                cell_.* = try image.cell(field.name);
+            };
+            const full = try budget.add(cells);
+            try page.append(a, cells);
+            end += 1;
+            if (full) break;
+        }
+        const evaluated = try a.alloc([]const scalar.Datum, plan.programs.len);
+        for (plan.programs, evaluated) |*program, *column_| column_.* = try decisions.evaluateBatchWithLimits(a, context.backend.decision_provider, program, page.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
+        for (first..end) |index| {
+            const values = try context.arena.alloc(std.json.Value, plan.programs.len);
+            const flags = try context.arena.alloc(bool, plan.programs.len);
+            for (evaluated, plan.columns, values, flags) |column_values, descriptor, *value, *flag| {
+                const datum = column_values[index - first];
+                value.* = try context.outputDatum(datum, descriptor.type, descriptor.element_type);
+                flag.* = datum.sql_null;
+            }
+            rows[index] = values;
+            nulls[index] = flags;
+        }
+        first = end;
+    }
+    if (reader) |cursor| if (cursor.index != input.len or cursor.owner.count() != input.len) return error.InvalidSqlBackendResponse;
+    return .{ .prepared = prepared, .rows = rows, .nulls = nulls };
 }

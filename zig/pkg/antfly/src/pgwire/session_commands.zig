@@ -20,7 +20,7 @@ const Type = @import("backend.zig").Type;
 pub const Direction = enum { forward, backward, absolute, relative };
 pub const Fetch = struct { name: []const u8, count: u32 = 1, direction: Direction = .forward, offset: i64 = 0, move: bool = false };
 pub const Command = union(enum) {
-    prepare: struct { name: []const u8, types: []const Type, statement: []const u8 },
+    prepare: struct { name: []const u8, types: []const Type, descriptors: []const @import("backend.zig").Parameter, statement: []const u8 },
     execute: struct { name: []const u8, expressions: []const []const u8 },
     deallocate: ?[]const u8,
     declare_cursor: struct { name: []const u8, statement: []const u8, scroll: bool = false, hold: bool = false },
@@ -543,12 +543,40 @@ const Parser = struct {
     }
 };
 
+test "pgwire SQL PREPARE retains primitive widths and array element descriptors" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const command = (try parse(arena.allocator(), "PREPARE q(smallint,integer,bigint,real,double precision,bigint[][],jsonb[],uuid[]) AS SELECT 1", 16)).?.prepare;
+    const expected = [_]u32{ 21, 23, 20, 700, 701, 1016, 3807, 2951 };
+    for (command.descriptors, expected) |descriptor, oid| try std.testing.expectEqual(oid, try @import("values.zig").parameterOid(descriptor));
+    try std.testing.expectError(error.UnsupportedParameterType, parse(arena.allocator(), "PREPARE q(numeric[]) AS SELECT 1", 16));
+    try std.testing.expectError(error.UnsupportedParameterType, parse(arena.allocator(), "PREPARE q(json[]) AS SELECT 1", 16));
+}
+
+fn preparedTypeOid(name: []const u8) !u32 {
+    const Entry = struct { name: []const u8, oid: u32 };
+    for ([_]Entry{
+        .{ .name = "smallint", .oid = 21 },  .{ .name = "int2", .oid = 21 },
+        .{ .name = "integer", .oid = 23 },   .{ .name = "int", .oid = 23 },
+        .{ .name = "int4", .oid = 23 },      .{ .name = "bigint", .oid = 20 },
+        .{ .name = "int8", .oid = 20 },      .{ .name = "real", .oid = 700 },
+        .{ .name = "float4", .oid = 700 },   .{ .name = "float8", .oid = 701 },
+        .{ .name = "numeric", .oid = 1700 }, .{ .name = "decimal", .oid = 1700 },
+        .{ .name = "text", .oid = 25 },      .{ .name = "varchar", .oid = 1043 },
+        .{ .name = "boolean", .oid = 16 },   .{ .name = "bool", .oid = 16 },
+        .{ .name = "uuid", .oid = 2950 },    .{ .name = "json", .oid = 114 },
+        .{ .name = "jsonb", .oid = 3802 },   .{ .name = "timestamptz", .oid = 1184 },
+    }) |entry| if (std.ascii.eqlIgnoreCase(name, entry.name)) return entry.oid;
+    return error.UnsupportedParameterType;
+}
+
 pub fn parse(alloc: std.mem.Allocator, input: []const u8, max_parameters: usize) !?Command {
     var p: Parser = .{ .alloc = alloc, .input = input };
     const verb = p.word() catch return null;
     if (std.ascii.eqlIgnoreCase(verb, "prepare")) {
         const name = try p.name();
         var types: std.ArrayList(Type) = .empty;
+        var descriptors: std.ArrayList(@import("backend.zig").Parameter) = .empty;
         if (try p.take('(')) {
             while (true) {
                 if (types.items.len == max_parameters) return error.ProgramLimitExceeded;
@@ -556,13 +584,24 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8, max_parameters: usize)
                 if (std.ascii.eqlIgnoreCase(type_name, "double")) {
                     if (!std.ascii.eqlIgnoreCase(try p.word(), "precision")) return error.UnsupportedParameterType;
                     type_name = "float8";
-                } else if (std.ascii.eqlIgnoreCase(type_name, "int2") or std.ascii.eqlIgnoreCase(type_name, "int4") or std.ascii.eqlIgnoreCase(type_name, "smallint")) {
-                    type_name = "integer";
-                } else if (std.ascii.eqlIgnoreCase(type_name, "decimal") or std.ascii.eqlIgnoreCase(type_name, "float4")) {
-                    type_name = "numeric";
                 }
-                const kind: Type = if (std.ascii.eqlIgnoreCase(type_name, "integer") or std.ascii.eqlIgnoreCase(type_name, "int") or std.ascii.eqlIgnoreCase(type_name, "bigint") or std.ascii.eqlIgnoreCase(type_name, "int8")) .integer else if (std.ascii.eqlIgnoreCase(type_name, "text") or std.ascii.eqlIgnoreCase(type_name, "varchar")) .string else if (std.ascii.eqlIgnoreCase(type_name, "boolean") or std.ascii.eqlIgnoreCase(type_name, "bool")) .boolean else if (std.ascii.eqlIgnoreCase(type_name, "json") or std.ascii.eqlIgnoreCase(type_name, "jsonb")) .json else if (std.ascii.eqlIgnoreCase(type_name, "timestamptz")) .datetime else if (std.ascii.eqlIgnoreCase(type_name, "numeric") or std.ascii.eqlIgnoreCase(type_name, "real") or std.ascii.eqlIgnoreCase(type_name, "float8")) .number else return error.UnsupportedParameterType;
+                const scalar_oid = try preparedTypeOid(type_name);
+                var descriptor = try @import("values.zig").parameterFromOid(scalar_oid);
+                var kind = try @import("values.zig").fromOid(scalar_oid);
+                var rank: usize = 0;
+                while (try p.take('[')) {
+                    if (!try p.take(']')) return error.InvalidSqlSyntax;
+                    rank += 1;
+                    if (rank > 6) return error.ProgramLimitExceeded;
+                    // NUMERIC/json/varchar arrays need their own physical
+                    // descriptor/codec; do not substitute float8/jsonb/text.
+                    if (scalar_oid == 1700 or scalar_oid == 114 or scalar_oid == 1043 or scalar_oid == 1184) return error.UnsupportedParameterType;
+                    if (descriptor.element_type == null) return error.UnsupportedParameterType;
+                    descriptor.kind = .array;
+                    kind = .array;
+                }
                 try types.append(alloc, kind);
+                try descriptors.append(alloc, descriptor);
                 if (try p.take(')')) break;
                 if (!try p.take(',')) return error.InvalidSqlSyntax;
             }
@@ -570,7 +609,7 @@ pub fn parse(alloc: std.mem.Allocator, input: []const u8, max_parameters: usize)
         if (!std.ascii.eqlIgnoreCase(try p.word(), "as")) return error.InvalidSqlSyntax;
         try p.space();
         if (p.pos == input.len) return error.InvalidSqlSyntax;
-        return .{ .prepare = .{ .name = name, .types = try types.toOwnedSlice(alloc), .statement = input[p.pos..] } };
+        return .{ .prepare = .{ .name = name, .types = try types.toOwnedSlice(alloc), .descriptors = try descriptors.toOwnedSlice(alloc), .statement = input[p.pos..] } };
     }
     if (std.ascii.eqlIgnoreCase(verb, "execute")) {
         const name = try p.name();

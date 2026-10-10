@@ -142,6 +142,15 @@ test "lake cache accounting separates pinned metadata from payload bytes" {
     try std.testing.expectEqual(@as(u64, 207), accounting.total_bytes);
 }
 
+test "lake cache ordered indexes charge the evictable sidecar payload budget" {
+    const accounting = try accountArtifacts(&.{.{ .kind = .ordered_row_index, .artifact_id = "ordered", .byte_len = 40, .checksum = "len:40" }}, .{ .max_payload_bytes = 39 });
+    try std.testing.expectEqual(@as(u64, 40), accounting.search_sidecar_bytes);
+    try std.testing.expectEqual(@as(u64, 40), accounting.payload_bytes);
+    try std.testing.expectEqual(@as(u64, 40), accounting.total_bytes);
+    try std.testing.expectEqual(@as(u64, 0), accounting.pinned_bytes);
+    try std.testing.expect(accounting.over_payload_budget);
+}
+
 test "lake cache accounting reports budget pressure by lane" {
     const artifacts = [_]artifact_ref.ArtifactRef{
         .{ .kind = .row_fragment, .artifact_id = "rows-1", .byte_len = 100, .checksum = "len:100" },

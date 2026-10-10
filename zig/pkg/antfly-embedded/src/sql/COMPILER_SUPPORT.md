@@ -11,7 +11,12 @@ statement before any mutation.
   `COUNT(*)`; typed comparisons, `IS [NOT] NULL`, `AND`/`OR`/`NOT`, IN/BETWEEN,
   arithmetic, casts, CASE, registered scalar functions and JSON extraction.
   Ordering supports source columns, aliases, ordinal positions, expressions,
-  ASC/DESC and NULLS FIRST/LAST; LIMIT/OFFSET accept nonnegative integers/parameters.
+  ASC/DESC and NULLS FIRST/LAST. LIMIT/OFFSET accept integer literals, parameters
+  and NULL; negative bounds fail at execution with PostgreSQL diagnostics.
+  LIMIT ALL is unbounded; OFFSET ROW/ROWS and FETCH FIRST/NEXT ROW/ROWS ONLY
+  normalize to the same bounded execution plan, with an omitted FETCH count
+  defaulting to one. FETCH WITH TIES and arbitrary bound expressions remain
+  unsupported.
 - Inner/outer joins with source aliases, derived tables and nonrecursive CTEs;
   grouping, aggregate FILTER/DISTINCT, HAVING, and bounded aggregate ordering.
 - Linear recursive CTEs with seed-typed outputs, delta worklists, UNION ALL or

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 
 from ..models.foreign_key_timing import ForeignKeyTiming
+from ..models.relational_unique_constraint_origin import RelationalUniqueConstraintOrigin
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -24,6 +25,9 @@ class RelationalUniqueConstraint:
 
         Attributes:
             name (str):
+            origin (RelationalUniqueConstraintOrigin | Unset): Durable ownership kind. Index-owned uniqueness participates
+                in ON CONFLICT inference but is not a named SQL constraint. Human-readable index descriptions never determine
+                ownership.
             primary (bool | Unset): SQL primary-key identity. At most one per relational table; all key columns must be
                 required and nonnullable.
             columns (list[str] | Unset):
@@ -41,6 +45,7 @@ class RelationalUniqueConstraint:
     """
 
     name: str
+    origin: RelationalUniqueConstraintOrigin | Unset = UNSET
     primary: bool | Unset = UNSET
     columns: list[str] | Unset = UNSET
     keys: list[RelationalIndexKey] | Unset = UNSET
@@ -51,6 +56,10 @@ class RelationalUniqueConstraint:
 
     def to_dict(self) -> dict[str, Any]:
         name = self.name
+
+        origin: str | Unset = UNSET
+        if not isinstance(self.origin, Unset):
+            origin = self.origin.value
 
         primary = self.primary
 
@@ -87,6 +96,8 @@ class RelationalUniqueConstraint:
                 "name": name,
             }
         )
+        if origin is not UNSET:
+            field_dict["origin"] = origin
         if primary is not UNSET:
             field_dict["primary"] = primary
         if columns is not UNSET:
@@ -111,6 +122,13 @@ class RelationalUniqueConstraint:
 
         d = dict(src_dict)
         name = d.pop("name")
+
+        _origin = d.pop("origin", UNSET)
+        origin: RelationalUniqueConstraintOrigin | Unset
+        if isinstance(_origin, Unset):
+            origin = UNSET
+        else:
+            origin = RelationalUniqueConstraintOrigin(_origin)
 
         primary = d.pop("primary", UNSET)
 
@@ -147,6 +165,7 @@ class RelationalUniqueConstraint:
 
         relational_unique_constraint = cls(
             name=name,
+            origin=origin,
             primary=primary,
             columns=columns,
             keys=keys,
