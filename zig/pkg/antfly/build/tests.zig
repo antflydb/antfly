@@ -298,6 +298,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("system-catalog-relation-store-test", "Verify namespace and schema transaction rollback and restart")
         .dependOn(&addFilteredTestRunArtifact(b, relation_namespace_tests).step);
+    const relation_command_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata/relation_reconciliation_command.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, relation_command_test_mod, true, true);
+    const relation_command_tests = b.addTest(.{ .root_module = relation_command_test_mod, .filters = &.{"system catalog relation"} });
+    b.step("system-catalog-reconciliation-command-test", "Verify bounded catalog control framing and decoder/activation floors")
+        .dependOn(&b.addRunArtifact(relation_command_tests).step);
+    const relation_worker_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata/relation_reconciliation_worker.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, relation_worker_test_mod, true, true);
+    const relation_worker_tests = b.addTest(.{ .root_module = relation_worker_test_mod, .filters = &.{ "relation reconciliation worker", "relation publication preparation", "relation publication proof pool" } });
+    b.step("system-catalog-reconciliation-worker-test", "Verify bounded publication preparation and capability-preserving coordinator scheduling")
+        .dependOn(&b.addRunArtifact(relation_worker_tests).step);
     const relation_coordinator_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[1],
         .filters = &.{ "relational topology admission rejects lifecycle proposals before encoding", "relation reconciliation worker", "relation mutation admission", "table definition stamp distinguishes rejection", "system catalog relation replacement" },

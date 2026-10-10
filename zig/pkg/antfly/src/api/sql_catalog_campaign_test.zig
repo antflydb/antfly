@@ -54,7 +54,24 @@ const NativeOwner = struct {
     }
 };
 
-fn settleNativeOwner(svc: *@import("../metadata/service.zig").MetadataService) !void {
+fn adoptNativeSources(svc: *@import("../metadata/service.zig").MetadataService) !void {
+    const protocol = @import("../metadata/topology_protocol.zig");
+    const control = @import("../metadata/relation_reconciliation_command.zig");
+    // Tracking adoption is a durable, membership-fenced migration step, not
+    // implied by CREATE's topology readiness or a local decoder version.
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, protocol.relation_reconciliation_version);
+    const bytes = try (control.Command{ .adopt = .{
+        .version = readiness.required_version,
+        .incarnation = readiness.metadata_incarnation orelse return error.TableTopologyProtocolUpgradeRequired,
+        .member_count = readiness.protected_member_count,
+        .membership_fingerprint = readiness.protected_membership_fingerprint,
+    } }).encodeAlloc(svc.alloc);
+    defer svc.alloc.free(bytes);
+    const receipt = try svc.proposeTransitionCommandWithReceipt(.{ .apply_relation_reconciliation = bytes });
+    try svc.waitForTransitionApplied(receipt);
+}
+
+fn settleNativeOwner(svc: *@import("../metadata/service.zig").MetadataService, stage: []const u8) !void {
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
     for (0..32) |_| {
         svc.relation_reconciliation_worker.next_round_at_ns = 0;
@@ -64,6 +81,16 @@ fn settleNativeOwner(svc: *@import("../metadata/service.zig").MetadataService) !
             current.phase == .ready and current.failure == .none and work.garbage == null and
             work.root != null and work.root.?.eql(local.system_catalog_relation_reconciliation.Generation.of(&current))) return;
     }
+    const work = try store.relationReconciliationWork(svc.metadata_group_id);
+    std.debug.print("native catalog reconciliation did not converge ({s}): source={d}, phase={any}, failure={any}, root={any}, garbage={any}, pending={any}\n", .{
+        stage,
+        if (work.epoch) |epoch| epoch.revision else 0,
+        if (work.current) |current| current.phase else null,
+        if (work.current) |current| current.failure else null,
+        work.root,
+        work.garbage != null,
+        svc.relation_reconciliation_worker.pending,
+    });
     return error.ReconciliationDidNotConverge;
 }
 
@@ -141,7 +168,8 @@ test "httpx SQL catalog original null uniqueness declarations use real leader ad
             try std.testing.expect(result.value.ddl_receipt.?.schema_version < std.math.maxInt(u32));
             break :blk result.value.ddl_receipt.?.schema_version;
         };
-        try settleNativeOwner(&svc);
+        try adoptNativeSources(&svc);
+        try settleNativeOwner(&svc, "after CREATE and source adoption");
         const resolutions = owner.resolutions;
         const mutations = owner.mutations;
         var response = try request(a, &handler, original.sql);
@@ -157,7 +185,7 @@ test "httpx SQL catalog original null uniqueness declarations use real leader ad
         try std.testing.expectEqual(initial_version + 1, result.value.ddl_receipt.?.schema_version);
         try std.testing.expectEqual(resolutions + 1, owner.resolutions);
         try std.testing.expectEqual(mutations + 1, owner.mutations);
-        try settleNativeOwner(&svc);
+        try settleNativeOwner(&svc, "after ALTER");
         var before = try resolveNativeOwner(a, &svc);
         defer before.deinit(a);
         const table = before.relations[0].?;
@@ -175,7 +203,7 @@ test "httpx SQL catalog original null uniqueness declarations use real leader ad
         _ = try svc.ensureMetadataReplica(.{ .group_id = 1941, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted });
         try svc.campaignMetadataGroup();
         for (0..8) |_| try svc.runRound();
-        try settleNativeOwner(&svc);
+        try settleNativeOwner(&svc, "after restart");
         var recovered = try resolveNativeOwner(a, &svc);
         defer recovered.deinit(a);
         try std.testing.expect(table.owner.eql(recovered.relations[0].?.owner));

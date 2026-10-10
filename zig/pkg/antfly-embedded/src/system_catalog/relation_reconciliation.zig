@@ -30,6 +30,16 @@ pub const max_cursor_bytes = 512;
 pub const max_tables_per_page = 64;
 pub const max_page_bytes = 4 * 1024 * 1024;
 
+/// Coverage is part of the durable seal, not an inferred property of an empty
+/// candidate range. Extended records remain gated by native decoder adoption.
+pub const Coverage = enum(u8) { relations = 1, constraint_names = 2 };
+fn decodeCoverage(bytes: []const u8, length: usize, comptime legacy: []const u8, comptime extended: []const u8) !Coverage {
+    if (bytes.len != length) return error.InvalidCatalogRecord;
+    if (std.mem.eql(u8, bytes[0..legacy.len], legacy)) return .relations;
+    if (std.mem.eql(u8, bytes[0..extended.len], extended)) return .constraint_names;
+    return error.InvalidCatalogRecord;
+}
+
 pub const Epoch = struct {
     incarnation: [16]u8,
     revision: u64,
@@ -95,9 +105,11 @@ pub fn nextJobId(prior: ?*const State) ![16]u8 {
 }
 pub const Retirement = struct {
     generation: Generation,
+    coverage: Coverage = .relations,
     cursor_len: u16 = 0,
     cursor_bytes: [max_cursor_bytes]u8 = @splat(0),
     const magic = "AFRT01";
+    const occupancy_magic = "AFRT02";
     pub const encoded_len = magic.len + 8 + 16 + 2 + max_cursor_bytes;
     pub fn init(generation: Generation) Retirement {
         return .{ .generation = generation };
@@ -108,9 +120,9 @@ pub const Retirement = struct {
     pub fn encode(self: *const Retirement) ![encoded_len]u8 {
         try self.generation.validate();
         if (self.cursor_len > max_cursor_bytes or !std.mem.allEqual(u8, self.cursor_bytes[self.cursor_len..], 0)) return error.InvalidCatalogRecord;
-        if (self.cursor_len != 0) _ = try decodeCandidateGenerationKey(self.cursor(), self.generation);
+        if (self.cursor_len != 0) _ = try decodeCandidateGenerationKeyWithCoverage(self.cursor(), self.generation, self.coverage);
         var bytes: [encoded_len]u8 = undefined;
-        @memcpy(bytes[0..magic.len], magic);
+        @memcpy(bytes[0..magic.len], if (self.coverage == .relations) magic else occupancy_magic);
         std.mem.writeInt(u64, bytes[magic.len..][0..8], self.generation.group_id, .big);
         @memcpy(bytes[magic.len + 8 ..][0..16], &self.generation.job_id);
         std.mem.writeInt(u16, bytes[magic.len + 24 ..][0..2], self.cursor_len, .big);
@@ -118,8 +130,9 @@ pub const Retirement = struct {
         return bytes;
     }
     pub fn decode(bytes: []const u8) !Retirement {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidCatalogRecord;
+        const coverage = try decodeCoverage(bytes, encoded_len, magic, occupancy_magic);
         const result: Retirement = .{
+            .coverage = coverage,
             .generation = .{ .group_id = std.mem.readInt(u64, bytes[magic.len..][0..8], .big), .job_id = bytes[magic.len + 8 ..][0..16].* },
             .cursor_len = std.mem.readInt(u16, bytes[magic.len + 24 ..][0..2], .big),
             .cursor_bytes = bytes[magic.len + 26 ..][0..max_cursor_bytes].*,
@@ -141,6 +154,7 @@ pub const State = struct {
     group_id: u64,
     job_id: [16]u8,
     epoch: Epoch,
+    coverage: Coverage = .relations,
     phase: Phase = .building,
     failure: FailureReason = .none,
     cursor_len: u16 = 0,
@@ -149,7 +163,10 @@ pub const State = struct {
     pass: Totals = .{},
 
     pub fn init(group: u64, id: [16]u8, epoch: Epoch) !State {
-        const state: State = .{ .group_id = group, .job_id = id, .epoch = epoch };
+        return initWithCoverage(group, id, epoch, .relations);
+    }
+    pub fn initWithCoverage(group: u64, id: [16]u8, epoch: Epoch, coverage: Coverage) !State {
+        const state: State = .{ .group_id = group, .job_id = id, .epoch = epoch, .coverage = coverage };
         try state.validate();
         return state;
     }
@@ -176,11 +193,12 @@ pub const State = struct {
         if (self.phase == .ready and (self.cursor_len != 0 or !totalsEqual(self.pass, .{}))) return error.InvalidCatalogRecord;
     }
     const magic = "AFRC04";
+    const occupancy_magic = "AFRC05";
     pub const encoded_len = magic.len + 8 + 16 + 16 + 8 + 2 + 2 + max_cursor_bytes + 2 * (8 + 8 + 32 + 32);
     pub fn encode(self: *const State) ![encoded_len]u8 {
         try self.validate();
         var out: [encoded_len]u8 = undefined;
-        @memcpy(out[0..magic.len], magic);
+        @memcpy(out[0..magic.len], if (self.coverage == .relations) magic else occupancy_magic);
         var offset: usize = magic.len;
         inline for (.{ self.group_id, self.job_id, self.epoch.incarnation, self.epoch.revision, @as(u8, @backingInt(self.phase)), @as(u8, @backingInt(self.failure)), self.cursor_len, self.cursor_bytes, self.expected.rows, self.expected.claims, self.expected.source_hash, self.expected.claim_hash, self.pass.rows, self.pass.claims, self.pass.source_hash, self.pass.claim_hash }) |value| {
             const T = @TypeOf(value);
@@ -195,8 +213,9 @@ pub const State = struct {
         return out;
     }
     pub fn decode(bytes: []const u8) !State {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidCatalogRecord;
+        const coverage = try decodeCoverage(bytes, encoded_len, magic, occupancy_magic);
         var out: State = undefined;
+        out.coverage = coverage;
         var phase: u8 = undefined;
         var failure: u8 = undefined;
         var offset: usize = magic.len;
@@ -256,10 +275,13 @@ fn decodeCandidateKey(bytes: []const u8, state: *const State) !names.Key {
     return decodeCandidateGenerationKey(bytes, Generation.of(state));
 }
 fn decodeCandidateGenerationKey(bytes: []const u8, generation: Generation) !names.Key {
+    return decodeCandidateGenerationKeyWithCoverage(bytes, generation, .relations);
+}
+fn decodeCandidateGenerationKeyWithCoverage(bytes: []const u8, generation: Generation, coverage: Coverage) !names.Key {
     const key = try decodeTypedCandidateGenerationKey(bytes, generation);
     // Existing v1 seals certify relations only. Extended key support must not
     // silently turn an old root or restore proof into occupancy authority.
-    if (key.membership_table_id != 0) return error.InvalidCatalogRecord;
+    if (key.membership_table_id != 0 and coverage != .constraint_names) return error.InvalidCatalogRecord;
     return key;
 }
 fn decodeTypedCandidateGenerationKey(bytes: []const u8, generation: Generation) !names.Key {
@@ -308,17 +330,19 @@ pub fn liveKey(buf: []u8, group: u64) ![]const u8 {
 /// readiness and fence decoder/writer capabilities before installing this cut.
 pub const LiveRoot = struct {
     generation: Generation,
+    coverage: Coverage = .relations,
     epoch: Epoch,
     sequence: u64 = 1,
     claims: u64,
     claim_hash: [32]u8,
     const magic = "AFRL01";
+    const occupancy_magic = "AFRL02";
     pub const encoded_len = magic.len + Generation.encoded_len + 16 + 8 + 8 + 8 + 32;
 
     pub fn initial(ready: State) !LiveRoot {
         try ready.validate();
         if (ready.phase != .ready or ready.failure != .none) return error.InvalidCatalogRecord;
-        const root: LiveRoot = .{ .generation = Generation.of(&ready), .epoch = ready.epoch, .claims = ready.expected.claims, .claim_hash = ready.expected.claim_hash };
+        const root: LiveRoot = .{ .generation = Generation.of(&ready), .epoch = ready.epoch, .claims = ready.expected.claims, .claim_hash = ready.expected.claim_hash, .coverage = ready.coverage };
         try root.validate();
         return root;
     }
@@ -330,7 +354,7 @@ pub const LiveRoot = struct {
     pub fn encode(self: LiveRoot) ![encoded_len]u8 {
         try self.validate();
         var out: [encoded_len]u8 = undefined;
-        @memcpy(out[0..magic.len], magic);
+        @memcpy(out[0..magic.len], if (self.coverage == .relations) magic else occupancy_magic);
         var offset: usize = magic.len;
         inline for (.{ try self.generation.encode(), self.epoch.incarnation, self.epoch.revision, self.sequence, self.claims, self.claim_hash }) |value| {
             const size = @sizeOf(@TypeOf(value));
@@ -344,11 +368,11 @@ pub const LiveRoot = struct {
         return out;
     }
     pub fn decode(bytes: []const u8) !LiveRoot {
-        if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidCatalogRecord;
+        const coverage = try decodeCoverage(bytes, encoded_len, magic, occupancy_magic);
         var offset: usize = magic.len;
         const generation = try Generation.decode(bytes[offset..][0..Generation.encoded_len]);
         offset += Generation.encoded_len;
-        var result: LiveRoot = .{ .generation = generation, .epoch = undefined, .sequence = undefined, .claims = undefined, .claim_hash = undefined };
+        var result: LiveRoot = .{ .generation = generation, .epoch = undefined, .sequence = undefined, .claims = undefined, .claim_hash = undefined, .coverage = coverage };
         inline for (.{ &result.epoch.incarnation, &result.epoch.revision, &result.sequence, &result.claims, &result.claim_hash }) |ptr| {
             const T = @typeInfo(@TypeOf(ptr)).pointer.child;
             const size = @sizeOf(T);
@@ -371,6 +395,7 @@ pub const LiveRoot = struct {
         var changed = false;
         var old = plan.before_by_name.iterator();
         while (old.next()) |entry| {
+            if (entry.key_ptr.membership_table_id != 0 and self.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
             const next = plan.after_by_name.get(entry.key_ptr.*);
             if (next) |value| if (value.eql(entry.value_ptr.*)) continue;
             changed = true;
@@ -380,6 +405,7 @@ pub const LiveRoot = struct {
         }
         var next = plan.after_by_name.iterator();
         while (next.next()) |entry| {
+            if (entry.key_ptr.membership_table_id != 0 and self.coverage != .constraint_names) return error.CatalogOccupancyNotReady;
             if (plan.before_by_name.get(entry.key_ptr.*)) |prior| if (prior.eql(entry.value_ptr.*)) continue;
             changed = true;
             const claim = try names.Claim.fromEntry(entry.key_ptr.*, entry.value_ptr.*);
@@ -409,6 +435,7 @@ pub fn publishVerifiedRoot(txn: anytype, ready: State, epoch: Epoch, prior: ?Liv
     const live = if (try optionalGet(txn, try liveKey(&buf, ready.group_id))) |bytes| try LiveRoot.decode(bytes) else null;
     if (!std.meta.eql(live, prior) or !std.meta.eql(root, if (prior) |value| @as(?Generation, value.generation) else null)) return error.CatalogGenerationChanged;
     if (prior) |value| {
+        if (value.coverage == .constraint_names and next.coverage != .constraint_names) return error.CatalogGenerationChanged;
         if (value.generation.group_id != ready.group_id) return error.InvalidCatalogRecord;
         if (!value.epoch.eql(epoch)) return error.CatalogGenerationChanged;
         if (value.generation.eql(next.generation)) {
@@ -683,9 +710,13 @@ pub fn Verifier(comptime Reader: type) type {
             if (root) |generation| {
                 if (generation.group_id != group) return error.InvalidCatalogRecord;
                 if (try result.retirementFor(generation)) |retired| {
+                    if (live) |value| if (value.coverage != retired.coverage) return error.InvalidCatalogRecord;
                     // GC must never have progressed into a published root.
                     if (retired.cursor_len != 0) return error.InvalidCatalogRecord;
-                } else if (current.?.phase != .ready) return error.InvalidCatalogRecord;
+                } else {
+                    if (current.?.phase != .ready) return error.InvalidCatalogRecord;
+                    if (live) |value| if (value.coverage != current.?.coverage) return error.InvalidCatalogRecord;
+                }
             }
             return result;
         }
@@ -970,25 +1001,25 @@ pub fn start(txn: anytype, state: *const State, current_epoch: Epoch, prior: ?[]
         if (err == error.NotFound) break :blk null;
         return err;
     };
-    var retired: ?Generation = null;
+    var retired: ?Retirement = null;
     if (prior) |expected| {
         if (found == null or !std.mem.eql(u8, expected, found.?)) return error.CatalogGenerationChanged;
         const old = try State.decode(expected);
         if (old.group_id != state.group_id) return error.InvalidCatalogRecord;
+        if (old.coverage == .constraint_names and state.coverage != .constraint_names) return error.CatalogGenerationChanged;
         if (std.mem.order(u8, &old.job_id, &state.job_id) != .lt) return error.CatalogGenerationChanged;
-        retired = Generation.of(&old);
+        retired = .{ .generation = Generation.of(&old), .coverage = old.coverage };
     } else if (found != null) return error.CatalogGenerationChanged;
     var candidate_buf: [max_cursor_bytes]u8 = undefined;
     if (try txn.hasPrefix(try candidatePrefix(&candidate_buf, state))) return error.CatalogGenerationChanged;
-    if (retired) |generation| {
+    if (retired) |retirement| {
         var retirement_buf: [128]u8 = undefined;
-        const retired_key = try retirementKey(&retirement_buf, generation);
+        const retired_key = try retirementKey(&retirement_buf, retirement.generation);
         const existing = txn.get(retired_key) catch |err| blk: {
             if (err == error.NotFound) break :blk null;
             return err;
         };
         if (existing != null) return error.InvalidCatalogRecord;
-        const retirement = Retirement.init(generation);
         try txn.put(retired_key, &(try retirement.encode()));
     }
     const bytes = try state.encode();
@@ -1439,6 +1470,86 @@ const CountedLiveTxn = struct {
         try self.base.delete(key);
     }
 };
+
+test "relation occupancy coverage headers preserve legacy cuts and reject implicit promotion" {
+    const legacy = try State.init(41, try nextJobId(null), test_epoch);
+    const legacy_bytes = try legacy.encode();
+    try std.testing.expect(std.mem.startsWith(u8, &legacy_bytes, "AFRC04"));
+    const decoded_legacy = try State.decode(&legacy_bytes);
+    try std.testing.expectEqual(Coverage.relations, decoded_legacy.coverage);
+    try std.testing.expectEqualSlices(u8, &legacy_bytes, &(try decoded_legacy.encode()));
+    var covered = try State.initWithCoverage(41, legacy.job_id, test_epoch, .constraint_names);
+    const covered_bytes = try covered.encode();
+    try std.testing.expect(std.mem.startsWith(u8, &covered_bytes, "AFRC05"));
+    try std.testing.expectEqualSlices(u8, legacy_bytes[6..], covered_bytes[6..]);
+    const decoded = try State.decode(&covered_bytes);
+    try std.testing.expectEqual(Coverage.constraint_names, decoded.coverage);
+    try std.testing.expectEqualSlices(u8, &covered_bytes, &(try decoded.encode()));
+    var unknown = covered_bytes;
+    @memcpy(unknown[0..6], "AFRC06");
+    try std.testing.expectError(error.InvalidCatalogRecord, State.decode(&unknown));
+    covered.phase = .ready;
+    const root = try LiveRoot.initial(covered);
+    try std.testing.expectEqual(Coverage.constraint_names, root.coverage);
+    const root_bytes = try root.encode();
+    try std.testing.expect(std.mem.startsWith(u8, &root_bytes, "AFRL02"));
+    try std.testing.expectEqual(Coverage.constraint_names, (try LiveRoot.decode(&root_bytes)).coverage);
+    try std.testing.expectEqualSlices(u8, &root_bytes, &(try (try LiveRoot.decode(&root_bytes)).encode()));
+    var old_root = root;
+    old_root.coverage = .relations;
+    const old_root_bytes = try old_root.encode();
+    try std.testing.expect(std.mem.startsWith(u8, &old_root_bytes, "AFRL01"));
+    try std.testing.expectEqualSlices(u8, old_root_bytes[6..], root_bytes[6..]);
+    try std.testing.expectEqual(Coverage.relations, (try LiveRoot.decode(&old_root_bytes)).coverage);
+    var retired: Retirement = .{ .generation = root.generation, .coverage = .constraint_names };
+    var key = test_claims[0].key;
+    key.membership_table_id = 7;
+    const cursor = try candidateGenerationKey(&retired.cursor_bytes, retired.generation, key);
+    retired.cursor_len = @intCast(cursor.len);
+    const retired_bytes = try retired.encode();
+    try std.testing.expect(std.mem.startsWith(u8, &retired_bytes, "AFRT02"));
+    const retired_copy = try Retirement.decode(&retired_bytes);
+    try std.testing.expectEqual(Coverage.constraint_names, retired_copy.coverage);
+    try std.testing.expectEqualSlices(u8, &retired_bytes, &(try retired_copy.encode()));
+    retired.coverage = .relations;
+    try std.testing.expectError(error.InvalidCatalogRecord, retired.encode());
+}
+
+test "relation occupancy header changes cannot promote an independently sealed legacy generation" {
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    const ready = try seedLiveRootForTest(&txn, &test_claims, try nextJobId(null), test_epoch);
+    var root = try publishVerifiedRoot(&txn, ready, test_epoch, null);
+    root.coverage = .constraint_names;
+    var buf: [128]u8 = undefined;
+    try txn.put(try liveKey(&buf, 41), &(try root.encode()));
+    try std.testing.expectError(error.InvalidCatalogRecord, Verifier(TestTxn).init(&txn, 41));
+    root.coverage = .relations;
+    try txn.put(try liveKey(&buf, 41), &(try root.encode()));
+    var promoted = ready;
+    promoted.coverage = .constraint_names;
+    try txn.put(try jobKey(&buf, 41), &(try promoted.encode()));
+    try std.testing.expectError(error.InvalidCatalogRecord, Verifier(TestTxn).init(&txn, 41));
+}
+
+test "relation occupancy job replacement retains retirement coverage and rejects downgrade before writes" {
+    var txn = TestTxn.init();
+    defer txn.deinit();
+    const first = try State.initWithCoverage(41, try nextJobId(null), test_epoch, .constraint_names);
+    try start(&txn, &first, test_epoch, null);
+    const next = try State.initWithCoverage(41, try nextJobId(&first), test_epoch, .constraint_names);
+    const before = try first.encode();
+    var downgrade = next;
+    downgrade.coverage = .relations;
+    const count = txn.values.count();
+    try std.testing.expectError(error.CatalogGenerationChanged, start(&txn, &downgrade, test_epoch, &before));
+    try std.testing.expectEqual(count, txn.values.count());
+    try start(&txn, &next, test_epoch, &before);
+    var buf: [128]u8 = undefined;
+    const retirement = try Retirement.decode(try txn.get(try retirementKey(&buf, Generation.of(&first))));
+    try std.testing.expectEqual(Coverage.constraint_names, retirement.coverage);
+    try std.testing.expect(retirement.generation.eql(Generation.of(&first)));
+}
 
 test "relation candidate typed membership codec preserves exact-name prefixes but legacy seals reject it" {
     var txn = TestTxn.init();

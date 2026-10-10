@@ -320,9 +320,8 @@ noncanonical suffixes, whole-suffix truncation paired with a mismatched owner,
 cross-table/relation coexistence, exact-owner retirement, rejected replay with
 zero writes, input retirement, and allocation-failure cleanup. Current Debug
 registry/reconciliation gates pass 95 tests. The optimized SQL gate passed
-697 local plus 226 native tests and 93 registry/reconciliation tests, including
-the final legacy-adapter guard. The additional prepared-cut tests passed in
-Debug; their optimized SQL gate is now running. Native mounted catalog
+697 local plus 226 native tests and 95 registry/reconciliation tests, including
+the final legacy-adapter guard and prepared-cut tests. Native mounted catalog
 campaign validation is still running separately.
 
 Combined typed-cut preparation now caches the result per owned schema cut,
@@ -333,17 +332,29 @@ A relation-only source cut cannot invoke this path as if an empty membership
 list were complete: its projection flag remains explicitly unready. The
 source-lifetime/allocation-failure sweep exercises combined preparation too.
 
-For the next coverage-format integration, retain the current fixed-size binary
-state layouts but use distinct equal-length format headers (current AFRC04
-job state and AFRL01 live root versus occupancy-capable successors). Carry the
-coverage kind through decoding, encoding, independent verification, replay and
-publication so old cuts round-trip without being promoted. New root seals must
+Coverage-format preparation retains fixed-size binary state layouts with
+distinct equal-length headers: AFRC04/AFRC05 job state, AFRL01/AFRL02 live roots,
+and AFRT01/AFRT02 retirement state. Coverage survives source-epoch changes and
+retirement; mismatched root/job coverage and downgrades fail closed. The
+extended command floor is reserved at topology version 34, but the advertised
+version remains 33: this is not production activation. Debug and ReleaseFast
+focused control gates pass (15 worker, 3 command, 64 reconciliation tests,
+plus the 34-test relation gate reused from cache). Remaining consumers must
+carry coverage through replay and publication before enabling writers.
+New root seals must
 cover both typed relations and memberships, while a new topology decoder floor
 gates production of the extended state/entries and writer adoption. Old
 decoders must reject the new header rather than ignore a JSON extension or
 reinterpret a relation-only seal. Startup, active/pending FK/restore sources,
 ordinary writer deltas, bounded candidate verification and GC must all select
 the same coverage mode before generated-name admission can be enabled.
+
+The mounted native campaign must adopt source tracking through the actual
+membership-fenced reconciliation command before waiting for publication.
+CREATE topology readiness alone does not initialize the source epoch; without
+it, the worker correctly remains idle. The fixture now performs that durable
+adoption and reports compact diagnostics on convergence failure. Its expanded
+native gate is still running; this is not yet activation or recovery evidence.
 
 The next delivery is mounted catalog activation/recovery evidence for the
 original index and constraint cohort, including real ownership and readiness

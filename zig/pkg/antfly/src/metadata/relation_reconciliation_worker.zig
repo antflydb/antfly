@@ -233,7 +233,7 @@ pub fn nextIntent(work: r.Work, group: u64, prefer_gc: bool) !?control.Command {
     if (prefer_gc) if (work.garbage) |retired| return .{ .garbage = retired };
     if (work.current) |state| {
         if (!state.epoch.eql(source_epoch)) return .{ .start = .{
-            .next = try r.State.init(group, try r.nextJobId(&state), source_epoch),
+            .next = try r.State.initWithCoverage(group, try r.nextJobId(&state), source_epoch, state.coverage),
             .prior = state,
         } };
         if (state.failure == .none and state.phase != .ready) return .{ .advance = state };
@@ -580,6 +580,21 @@ test "relation reconciliation worker publication pool releases preparation on ev
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fault.run, .{});
+}
+
+test "relation reconciliation worker preserves occupancy coverage when source epochs advance" {
+    const prior = try r.State.initWithCoverage(41, try r.nextJobId(null), epoch, .constraint_names);
+    var changed = epoch;
+    changed.revision += 1;
+    const command = (try nextIntent(.{ .epoch = changed, .current = prior, .root = null }, 41, false)).?;
+    try std.testing.expectEqual(r.Coverage.constraint_names, command.start.next.coverage);
+    try std.testing.expectEqual(r.Coverage.constraint_names, command.start.prior.?.coverage);
+    try std.testing.expect(command.start.next.epoch.eql(changed));
+    try std.testing.expectEqual(@import("topology_protocol.zig").constraint_occupancy_version, command.requiredDecoderVersion());
+    const legacy = try r.State.init(41, prior.job_id, epoch);
+    const old = (try nextIntent(.{ .epoch = changed, .current = legacy, .root = null }, 41, false)).?;
+    try std.testing.expectEqual(r.Coverage.relations, old.start.next.coverage);
+    try std.testing.expectEqual(@import("topology_protocol.zig").relation_reconciliation_version, old.requiredDecoderVersion());
 }
 
 test "relation reconciliation worker budgets pending work and alternates GC" {
