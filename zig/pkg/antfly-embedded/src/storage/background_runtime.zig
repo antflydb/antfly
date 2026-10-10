@@ -467,6 +467,8 @@ pub const Config = struct {
     /// released after every lane, recurring callback and durable job joins.
     /// Callbacks must explicitly adopt CPU stages and mandatory reentry.
     runnable_owner: ?runnable_abi.Owner = null,
+    /// Includes pending construction and detached callbacks until physical join.
+    maintenance_registration_limit: usize = MaintenanceScheduler.default_max_registrations,
     backend: Backend = runtime_backend.defaultExecutorBackend(),
     /// Value-semantic executor limits. Separate lanes preserve isolation for
     /// nested submissions; validation keeps their simultaneously activatable
@@ -980,6 +982,7 @@ pub const BackendRuntime = struct {
     threaded_network_io_vtable: ?*Io.VTable = null,
     io_impl: ?*IoImpl = null,
     maintenance_scheduler: std.atomic.Value(?*MaintenanceScheduler) = .init(null),
+    maintenance_registration_limit: usize,
     shared_sql_workers: [3]SharedSqlPool = @splat(.{}),
     /// Specialized executor lanes are activated on first use. The runtime is
     /// their sole owner; this mutex serializes first publication and teardown
@@ -1021,6 +1024,7 @@ pub const BackendRuntime = struct {
     pub fn init(alloc: Allocator, config: Config) !BackendRuntime {
         try runtime_backend.ensureExecutorBackendAvailable(config.backend);
         try config.lane_limits.validate();
+        if (config.maintenance_registration_limit == 0) return error.InvalidMaintenanceCapacity;
         if (config.borrowed_io != null and config.backend != .manual)
             return error.BorrowedIoRequiresManualBackend;
 
@@ -1045,6 +1049,7 @@ pub const BackendRuntime = struct {
             .alloc = alloc,
             .backend = config.backend,
             .lane_limits = config.lane_limits,
+            .maintenance_registration_limit = config.maintenance_registration_limit,
             .next_owner_id = .init(retired_generation_cleanup_owner_id + 1),
             .retired_generation_cleanup_owner_id = retired_generation_cleanup_owner_id,
             .owner_registry = owner_registry,
@@ -1096,7 +1101,11 @@ pub const BackendRuntime = struct {
         // One coordinator and the durable-job reaper also use this lane.
         if (self.lane_limits.durable_background < 8) return error.InvalidMaintenanceCapacity;
         const cpu_limit = platform.process_memory.cpuCapacity().parallelism();
-        const scheduler = try MaintenanceScheduler.createWithRunnableOwner(self.alloc, scheduler_io, MaintenanceScheduler.cpuLimitedCapacity(cpu_limit, @max(1, self.lane_limits.durable_background / 2)), self.runnableOwner());
+        const scheduler = try MaintenanceScheduler.createWithConfig(self.alloc, scheduler_io, .{
+            .max_active = MaintenanceScheduler.cpuLimitedCapacity(cpu_limit, @max(1, self.lane_limits.durable_background / 2)),
+            .max_registrations = self.maintenance_registration_limit,
+            .runnable_owner = self.runnableOwner(),
+        });
         self.maintenance_scheduler.store(scheduler, .release);
         return scheduler;
     }
@@ -4517,4 +4526,24 @@ test "maintenance runtime owner rejection and allocation rollback preserve exact
     var runtime = try BackendRuntime.init(std.testing.allocator, .{ .backend = .manual, .runnable_owner = owner.port() });
     runtime.deinit();
     try std.testing.expectEqual(@as(usize, 0), owner.references.load(.acquire));
+}
+
+test "maintenance runtime applies finite recurring registration policy at birth" {
+    try std.testing.expectError(error.InvalidMaintenanceCapacity, BackendRuntime.init(std.testing.allocator, .{ .maintenance_registration_limit = 0 }));
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .maintenance_registration_limit = 1 });
+    defer handle.deinit();
+    const scheduler = try handle.ptr().maintenanceScheduler();
+    const Probe = struct {
+        fn step(_: *@This()) ?u64 {
+            return null;
+        }
+    };
+    var probe: Probe = .{};
+    var registration = try scheduler.register(&probe, Probe.step);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.snapshot().max_registrations);
+    try std.testing.expectError(error.ResourceBudgetExceeded, scheduler.registerClass(.producer, &probe, Probe.step));
+    registration.await(handle.ptr().io().?);
+    var replacement = try scheduler.registerClass(.derived, &probe, Probe.step);
+    replacement.await(handle.ptr().io().?);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.snapshot().owned_registrations);
 }

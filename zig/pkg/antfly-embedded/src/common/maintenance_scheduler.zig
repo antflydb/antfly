@@ -52,6 +52,9 @@ pub const Scheduler = struct {
     alloc: std.mem.Allocator,
     io: Io,
     max_active: usize,
+    max_registrations: usize,
+    owned_registrations: usize = 0,
+    registration_rejections: u64 = 0,
     mutex: Io.Mutex = .init,
     drained: Io.Condition = .init,
     changed: Io.Event = .unset,
@@ -67,6 +70,9 @@ pub const Scheduler = struct {
 
     pub const Stats = struct {
         registrations: usize,
+        owned_registrations: usize,
+        max_registrations: usize,
+        registration_rejections: u64,
         active: usize,
         peak_active: usize,
         active_by_class: [class_count]usize,
@@ -84,6 +90,9 @@ pub const Scheduler = struct {
         defer self.mutex.unlock(self.io);
         return .{
             .registrations = self.tasks.items.len,
+            .owned_registrations = self.owned_registrations,
+            .max_registrations = self.max_registrations,
+            .registration_rejections = self.registration_rejections,
             .active = self.active,
             .peak_active = self.peak_active,
             .active_by_class = self.active_by_class,
@@ -147,6 +156,7 @@ pub const Scheduler = struct {
             scheduler.drained.broadcast(scheduler.io);
             scheduler.mutex.unlock(scheduler.io);
             alloc.destroy(task);
+            scheduler.releaseRegistration();
             self.* = undefined;
         }
     };
@@ -157,13 +167,26 @@ pub const Scheduler = struct {
 
     /// Retain the shared node before any pass can be dispatched. The lease
     /// outlives registration detachment, callback joins and coordinator exit.
+    pub const default_max_registrations: usize = 4096;
+    pub const Config = struct {
+        max_active: usize,
+        max_registrations: usize = default_max_registrations,
+        runnable_owner: ?runnable.Owner = null,
+    };
+
     pub fn createWithRunnableOwner(alloc: std.mem.Allocator, io: Io, max_active: usize, owner: ?runnable.Owner) !*Scheduler {
-        if (max_active == 0) return error.InvalidMaintenanceCapacity;
+        return createWithConfig(alloc, io, .{ .max_active = max_active, .runnable_owner = owner });
+    }
+
+    pub fn createWithConfig(alloc: std.mem.Allocator, io: Io, config: Config) !*Scheduler {
+        const max_active = config.max_active;
+        const owner = config.runnable_owner;
+        if (max_active == 0 or config.max_registrations == 0) return error.InvalidMaintenanceCapacity;
         var lease = if (owner) |port| try runnable.Lease.init(port) else null;
         errdefer if (lease) |*value| value.deinit();
         const self = try alloc.create(Scheduler);
         errdefer alloc.destroy(self);
-        self.* = .{ .alloc = alloc, .io = io, .max_active = max_active, .runnable_owner = lease };
+        self.* = .{ .alloc = alloc, .io = io, .max_active = max_active, .max_registrations = config.max_registrations, .runnable_owner = lease };
         self.coordinator = try io.concurrent(coordinate, .{self});
         return self;
     }
@@ -183,7 +206,7 @@ pub const Scheduler = struct {
         self.mutex.lockUncancelable(self.io);
         // Registration handles are lifetime leases, like the runtime's API
         // and inference leases. Enforce their drain in release builds too.
-        while (self.tasks.items.len != 0 or self.active != 0)
+        while (self.owned_registrations != 0 or self.active != 0)
             self.drained.waitUncancelable(self.io, &self.mutex);
         self.mutex.unlock(self.io);
         if (self.coordinator) |*future| future.await(self.io);
@@ -202,6 +225,8 @@ pub const Scheduler = struct {
                 return step(@ptrCast(@alignCast(raw)));
             }
         };
+        try self.reserveRegistration();
+        errdefer self.releaseRegistration();
         const task = try self.alloc.create(Task);
         errdefer self.alloc.destroy(task);
         task.* = .{ .scheduler = self, .context = context, .step = Adapter.call, .class = class };
@@ -227,6 +252,8 @@ pub const Scheduler = struct {
                 return step(@ptrCast(@alignCast(raw)), borrow);
             }
         };
+        try self.reserveRegistration();
+        errdefer self.releaseRegistration();
         const task = try self.alloc.create(Task);
         errdefer self.alloc.destroy(task);
         task.* = .{ .scheduler = self, .context = context, .runnable_step = Adapter.call, .runnable_pass = pass, .class = class };
@@ -236,6 +263,28 @@ pub const Scheduler = struct {
         try self.tasks.append(self.alloc, task);
         self.changed.set(self.io);
         return .{ .task = task };
+    }
+
+    /// Reserve before allocating any task or growing the registry. Allocation
+    /// runs outside the mutex: reclaimer callbacks cannot reenter admission
+    /// under its lock. Pending installers and detached joiners retain capacity.
+    fn reserveRegistration(self: *Scheduler) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.stopping) return error.BackendRuntimeShuttingDown;
+        if (self.owned_registrations == self.max_registrations) {
+            self.registration_rejections += 1;
+            return error.ResourceBudgetExceeded;
+        }
+        self.owned_registrations += 1;
+    }
+
+    fn releaseRegistration(self: *Scheduler) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        std.debug.assert(self.owned_registrations != 0);
+        self.owned_registrations -= 1;
+        self.drained.broadcast(self.io);
     }
 
     /// Notifications coalesce even during a running pass. Lookup avoids
@@ -567,4 +616,89 @@ test "CPU limited maintenance capacity preserves dependency progress slots" {
     try std.testing.expectEqual(@as(usize, 4), Scheduler.cpuLimitedCapacity(1, 16));
     try std.testing.expectEqual(@as(usize, 8), Scheduler.cpuLimitedCapacity(8, 16));
     try std.testing.expectEqual(@as(usize, 4), Scheduler.cpuLimitedCapacity(8, 4));
+}
+
+test "maintenance scheduler registration capacity survives detachment until physical join" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threaded = Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const scheduler = try Scheduler.createWithConfig(std.testing.allocator, io, .{ .max_active = 1, .max_registrations = 2 });
+    defer scheduler.destroy();
+    const Probe = struct {
+        io: Io,
+        entered: Io.Event = .unset,
+        release: Io.Event = .unset,
+        fn step(self: *@This()) ?u64 {
+            self.entered.set(self.io);
+            self.release.waitUncancelable(self.io);
+            return null;
+        }
+        fn idle(_: *@This()) ?u64 {
+            return null;
+        }
+    };
+    var probe: Probe = .{ .io = io };
+    var first = try scheduler.register(&probe, Probe.step);
+    var first_owned = true;
+    defer {
+        probe.release.set(io);
+        if (first_owned) first.await(io);
+    }
+    try probe.entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+    var second = try scheduler.registerClass(.derived, &probe, Probe.idle);
+    defer second.await(io);
+    try std.testing.expectError(error.ResourceBudgetExceeded, scheduler.register(&probe, Probe.idle));
+    var join: ?Io.Future(void) = try io.concurrent(Scheduler.Handle.await, .{ &first, io });
+    first_owned = false;
+    defer if (join) |*future| {
+        probe.release.set(io);
+        future.await(io);
+    };
+    const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(2));
+    while (scheduler.snapshot().registrations != 1 and std.Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds)
+        try io.sleep(.fromMilliseconds(1), .awake);
+    const detached = scheduler.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), detached.registrations);
+    try std.testing.expectEqual(@as(usize, 2), detached.owned_registrations);
+    try std.testing.expectEqual(@as(usize, 2), detached.max_registrations);
+    try std.testing.expectError(error.ResourceBudgetExceeded, scheduler.registerClass(.producer, &probe, Probe.idle));
+    try std.testing.expectEqual(@as(u64, 2), scheduler.snapshot().registration_rejections);
+    probe.release.set(io);
+    join.?.await(io);
+    join = null;
+    try std.testing.expectEqual(@as(usize, 1), scheduler.snapshot().owned_registrations);
+    var replacement = try scheduler.registerClass(.propagation, &probe, Probe.idle);
+    defer replacement.await(io);
+    try std.testing.expectEqual(@as(usize, 2), scheduler.snapshot().owned_registrations);
+}
+
+test "maintenance scheduler registration allocation rollback restores capacity" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var threaded = Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Probe = struct {
+        fn step(_: *@This()) ?u64 {
+            return null;
+        }
+    };
+    var probe: Probe = .{};
+    try std.testing.expectError(error.InvalidMaintenanceCapacity, Scheduler.createWithConfig(std.testing.allocator, io, .{ .max_active = 1, .max_registrations = 0 }));
+    for (0..2) |failure| {
+        const scheduler = try Scheduler.createWithConfig(std.testing.allocator, io, .{ .max_active = 1, .max_registrations = 1 });
+        defer scheduler.destroy();
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = failure });
+        scheduler.alloc = failing.allocator();
+        try std.testing.expectError(error.OutOfMemory, scheduler.register(&probe, Probe.step));
+        scheduler.alloc = std.testing.allocator;
+        try std.testing.expectEqual(@as(usize, 0), scheduler.snapshot().owned_registrations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.snapshot().registrations);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        var handle = try scheduler.register(&probe, Probe.step);
+        handle.await(io);
+        scheduler.closeAdmission();
+        try std.testing.expectError(error.BackendRuntimeShuttingDown, scheduler.register(&probe, Probe.step));
+        try std.testing.expectEqual(@as(usize, 0), scheduler.snapshot().owned_registrations);
+    }
 }

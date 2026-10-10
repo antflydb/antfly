@@ -1018,3 +1018,27 @@ callback resumes, takes its lifecycle lock and physically joins. These lifetime
 checks are prerequisites for shared CPU adoption; neither callback has yet been
 migrated to explicit runnable stage authority. Defaults and full integration
 remain unqualified.
+
+### Bounded recurring registrations
+
+The recurring scheduler now bounds registration ownership independently of
+active CPU and I/O callbacks. Its default ceiling is 4096; backend runtime
+configuration can supply a smaller or larger finite registration limit, and
+zero is rejected before runtime allocation or node-owner retention. All classes
+and both legacy and explicitly runnable callbacks share that ceiling. A full
+registry rejects with ResourceBudgetExceeded before allocating a task packet or
+growing the registry. Pending installers and detached callbacks retain their
+reservation until allocation rollback or physical join and task destruction.
+Scheduler destruction waits for those in-flight owners as well as active work.
+Allocation runs outside the scheduler mutex to preserve reclaimer progress.
+
+Snapshots expose admitted registrations, all physically owned registrations,
+the ceiling and capacity rejection count. This bounds scheduler packet and
+registry metadata; it does not account callback inputs, durable owner queues or
+all process memory. Public operator sizing, production callback CPU stages and
+the complete overload/performance/default gates remain required.
+
+Physical fixtures require that detaching a stalled callback does not admit a
+replacement, that capacity becomes reusable only after its join, and that task
+and registry allocation failures restore the reservation without leaks. A
+runtime fixture verifies the birth configuration is actually applied.
