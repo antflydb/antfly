@@ -35,6 +35,15 @@ def canonical(rows):
 
 
 def test_sql_conformance(require_native, aflite_path):
+    fixture = json.loads((CASES.parent / "search-fixture.json").read_text())
+    with af.create(aflite_path, no_sync=True) as database:
+        database.create_table(fixture["table"], fixture["schema"])
+        database.create_table("history_items", fixture["history"])
+        with database.open_table(fixture["table"]) as table:
+            for index in fixture["indexes"]:
+                table.add_index(index)
+            table.batch_json(fixture["batch"])
+            table.run_until_idle()
     with closing(dbapi.connect(aflite_path, autocommit=True, no_sync=True)) as connection:
         cursor = connection.cursor()
         for case in json.loads(CASES.read_text()):

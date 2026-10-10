@@ -38,6 +38,38 @@ fn sqlx_conformance_and_streaming() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&directory).unwrap();
+    {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../zig/pkg/antfly-embedded/capi-conformance/sql/search-fixture.json"
+        ))
+        .unwrap();
+        let database =
+            antfly_embedded::Database::create_default(directory.join("db.aflite")).unwrap();
+        database
+            .create_table_json(
+                fixture["table"].as_str().unwrap(),
+                serde_json::to_vec(&fixture["schema"]).unwrap(),
+            )
+            .unwrap();
+        let table = database
+            .open_table(fixture["table"].as_str().unwrap())
+            .unwrap();
+        database
+            .create_table_json(
+                "history_items",
+                serde_json::to_vec(&fixture["history"]).unwrap(),
+            )
+            .unwrap();
+        for index in fixture["indexes"].as_array().unwrap() {
+            table
+                .add_index_json(serde_json::to_vec(index).unwrap())
+                .unwrap();
+        }
+        table
+            .batch_json(serde_json::to_vec(&fixture["batch"]).unwrap())
+            .unwrap();
+        table.run_until_idle().unwrap();
+    }
     tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
