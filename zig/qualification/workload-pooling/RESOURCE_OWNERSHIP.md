@@ -772,3 +772,11 @@ allocation, snapshot construction, tree comparisons and foreign I/O are not
 qualified by that quantum. The memory-store capability supports admitted snapshot,
 point-batch and cursor boundaries without an uncontrolled fallback. Focused
 fixtures use the actual memory backend; DB/provider/LSM integration remains open.
+
+A read-budget restriction during checked CPU return observes original lifetime
+without a running CPU checkpoint. Its temporary request controls suppress the
+CPU borrow; the stored original borrow and all parent resource authority remain
+retained. The same lifetime check is valid before queue admission and after grant.
+Missing lifetime capability fails before parking. Rejected resumption retains the
+original cause, phase, operation and bytes until physical users join and their
+owner finishes. Running checkpoints still charge ordinary CPU quanta.

@@ -14,10 +14,22 @@ pub fn Budget(comptime Controls: type, comptime check: anytype) type {
 
         pub fn checkpoint(self: *@This()) !void {
             if (self.rejection) |err| return err;
-            check(self.controls) catch |err| {
+            self.checkControls() catch |err| {
                 self.rejection = err;
                 return err;
             };
+        }
+        fn checkControls(self: *@This()) !void {
+            var controls = self.controls;
+            if (self.parked_class != null) {
+                // Admission can check before a grant exists and again just
+                // after granting it. Neither restriction may perform a CPU
+                // checkpoint or yield the grant while enterChecked owns it.
+                const borrow = controls.execution_runnable orelse return error.ExecutionWaitUnsupported;
+                try borrow.checkLifetime();
+                controls.execution_runnable = null;
+            }
+            try check(controls);
         }
         pub fn executionBoundary(self: *@This()) ?@import("execution_wait.zig").Boundary {
             if (self.controls.execution_runnable == null) return null;
@@ -29,6 +41,8 @@ pub fn Budget(comptime Controls: type, comptime check: anytype) type {
             if (self.parked_class != null) return error.InvalidRunnableTransition;
             const borrow = self.controls.execution_runnable orelse return error.ExecutionWaitUnsupported;
             try borrow.validate();
+            // Reject missing retained-lifetime authority before releasing CPU.
+            if (borrow.check_lifetime == null) return error.ExecutionWaitUnsupported;
             if (@hasField(Controls, "require_checked_reentry")) {
                 if (self.controls.require_checked_reentry and borrow.enter_checked == null) return error.ExecutionWaitUnsupported;
             }

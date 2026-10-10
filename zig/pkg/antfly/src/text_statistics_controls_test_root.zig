@@ -2785,3 +2785,95 @@ noinline fn qualifyCleanupStartupCpuPolicy() !void {
 test "text statistics trusted controls managed startup reserves cleanup CPU before publication without expanding total capacity" {
     try qualifyCleanupStartupCpuPolicy();
 }
+
+test "text statistics trusted controls checked reentry validates queued and granted restrictions without CPU checkpoints" {
+    const Fixture = struct {
+        const Self = @This();
+        scheduler: *native.Scheduler,
+        parent: *native.Execution,
+        queued: bool,
+        cause: anyerror,
+        cpu_checks: usize = 0,
+        granted_checks: usize = 0,
+        const Controls = struct {
+            execution_runnable: ?runtime.runnable_abi.Borrowed,
+            fixture: *Self,
+        };
+        fn check(request: Controls) !void {
+            const self = request.fixture;
+            if (request.execution_runnable) |borrow| {
+                self.cpu_checks += 1;
+                try checked(borrow);
+                return;
+            }
+            // Restriction callbacks run outside the scheduler mutex and must
+            // reject before exposing a queued or newly granted CPU phase.
+            const stats = self.scheduler.stats();
+            if (self.queued and stats.queued == 1) return self.cause;
+            if (!self.queued and self.parent.entry.?.state == .running) {
+                self.granted_checks += 1;
+                if (self.granted_checks == 2) return self.cause;
+            }
+        }
+    };
+    const Budget = sources.common_read_execution_budget.Budget(Fixture.Controls, Fixture.check);
+    for ([_]bool{ false, true }) |queued| {
+        for ([_]anyerror{ error.Canceled, error.CatalogRoutingSnapshotTimeout, error.PreDecisionDeadlineExceeded }) |cause| {
+            var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+            defer scheduler.close();
+            var parent: native.Execution = .{};
+            defer parent.finish();
+            const deadline = clock.monotonicNs() + 60 * std.time.ns_per_s;
+            try parent.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = clock.monotonicNs, .deadline_ns = deadline, .retained_bytes = 17 }, .inference);
+            var read: Read = .{ .execution = &parent, .allocator = std.testing.allocator };
+            const team = try read.team();
+            var fixture: Fixture = .{ .scheduler = &scheduler, .parent = &parent, .queued = queued, .cause = cause };
+            var budget: Budget = .{ .controls = .{ .execution_runnable = team.borrow, .fixture = &fixture }, .io = std.testing.io };
+            const boundary = budget.executionBoundary().?;
+            try boundary.beginWait();
+            var holder: native.Execution = .{};
+            defer holder.finish();
+            if (queued) try holder.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+            try std.testing.expectError(cause, boundary.endWait());
+            try std.testing.expectEqual(@as(usize, 1), fixture.cpu_checks);
+            try std.testing.expectEqual(native.State.stopped, parent.entry.?.state);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().queued);
+            try std.testing.expectEqual(@as(usize, @intFromBool(queued)), scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(1 + @as(usize, @intFromBool(queued)), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, if (queued) 40 else 17), scheduler.stats().retained_bytes);
+            try std.testing.expectEqual(@as(?u64, deadline), parent.entry.?.options.deadline_ns);
+            try std.testing.expectEqual(runtime.runnable_abi.Class.inference, budget.parked_class.?);
+            try std.testing.expectEqual(team.borrow.context, budget.controls.execution_runnable.?.context);
+            const grants = scheduler.stats().grants;
+            try std.testing.expectError(cause, budget.checkpoint());
+            try std.testing.expectError(cause, budget.waitForProgress());
+            try std.testing.expectEqual(grants, scheduler.stats().grants);
+            var health: native.Execution = .{};
+            try health.start(&scheduler, .{ .io = std.testing.io, .allow_wait = false }, .control);
+            health.finish();
+            parent.finish();
+            holder.finish();
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+            try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        }
+    }
+}
+
+test "text statistics trusted controls missing retained lifetime capability rejects before parking CPU" {
+    const Budget = sources.common_read_execution_budget.Budget(types.SearchRequest, checkReadBudget);
+    var scheduler = try native.Scheduler.init(.{ .slots = 2, .control_slots = 1 });
+    defer scheduler.close();
+    var parent: native.Execution = .{};
+    defer parent.finish();
+    try parent.start(&scheduler, .{ .io = std.testing.io, .retained_bytes = 23 }, .query);
+    var read: Read = .{ .execution = &parent, .allocator = std.testing.allocator };
+    var team = try read.team();
+    team.borrow.check_lifetime = null;
+    var budget: Budget = .{ .controls = .{ .execution_runnable = team.borrow }, .io = std.testing.io };
+    try std.testing.expectError(error.ExecutionWaitUnsupported, budget.waitForProgress());
+    try std.testing.expectEqual(native.State.running, parent.entry.?.state);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 0), scheduler.stats().resource_blocked);
+    try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+    try std.testing.expectEqual(@as(u64, 23), scheduler.stats().retained_bytes);
+}

@@ -2291,3 +2291,31 @@ mandatory acknowledgement latency, overall memory accounting and fair CPU holder
 adoption remain separate open requirements. The copy quantum bounds local memcpy
 between checks; it does not bound allocation, snapshot construction, tree key
 comparison or foreign I/O latency.
+
+### Read-budget lifetime restrictions during checked CPU return
+
+The earlier cumulative text-statistics binary reproduced nine
+InvalidRunnableTransition failures (40/49 checks passed). Shared read budgets
+called their ordinary CPU checkpoint from a checked-reentry restriction while
+the original execution was parked or queued. A running checkpoint correctly
+rejects that state, so the adapter prevented valid reads from resuming.
+
+While a budget owns a parked phase, it now checks the original borrow's retained
+lifetime and calls the request-specific restriction with a temporary controls
+copy whose CPU borrow is absent. The stored controls, parent, phase, original
+clock/deadline and physical resources remain owned. This permits restrictions
+before queue admission and after a grant without CPU checkpoints or yielding
+inside enterChecked. Once return succeeds, running checkpoints retain their
+ordinary behavior. Missing retained-lifetime capability rejects before parking;
+original rejection remains sticky until owning physical retirement.
+
+The trusted-control suite retains its existing physical file/descriptor/async
+read, credit, cache and cleanup fixtures. New cases reject both queued and
+post-grant restrictions, verify retained operation/bytes/deadline/class, observe
+control progress, and verify missing-capability rejection without releasing CPU.
+All fifty-one trusted checks passed on the compiled native binary with loopback
+permission; the initial sandbox run's remaining decision-transport failure is
+preserved separately. The transport fixture uses a loopback test server, not a
+production deployment. Full generic-helper consumers, independent archives,
+physical DB/API integration, provider deadlines, background holder adoption and
+runtime/performance/default qualification still require their own evidence.
