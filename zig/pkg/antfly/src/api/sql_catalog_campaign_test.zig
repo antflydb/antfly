@@ -59,11 +59,12 @@ fn adoptNativeSources(svc: *@import("../metadata/service.zig").MetadataService) 
     const control = @import("../metadata/relation_reconciliation_command.zig");
     // Tracking adoption is a durable, membership-fenced migration step, not
     // implied by CREATE's topology readiness or a local decoder version.
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, protocol.relation_reconciliation_version);
+    const floor = if (protocol.current_version >= protocol.constraint_occupancy_version) protocol.constraint_occupancy_version else protocol.relation_reconciliation_version;
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, floor);
     const proof: protocol.Activation = .{
         // The wire proof names this command's decoder, not a newer admitted
         // cluster floor. Membership identity still comes from readiness.
-        .version = protocol.relation_reconciliation_version,
+        .version = floor,
         .incarnation = readiness.metadata_incarnation orelse return error.TableTopologyProtocolUpgradeRequired,
         .member_count = readiness.protected_member_count,
         .membership_fingerprint = readiness.protected_membership_fingerprint,
@@ -163,6 +164,11 @@ test "httpx SQL catalog original null uniqueness declarations use real leader ad
         _ = try svc.ensureMetadataReplica(.{ .group_id = 1941, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .empty });
         try svc.campaignMetadataGroup();
         for (0..8) |_| try svc.runRound();
+        // Anonymous CREATE constraints need a verified namespace cut, even
+        // when the namespace is empty. Bootstrap through actual leader and
+        // all-voter admission before accepting the first named declaration.
+        try adoptNativeSources(&svc);
+        try settleNativeOwner(&svc, "before first anonymous CREATE");
         var owner: NativeOwner = .{ .svc = &svc };
         var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr() }, owner.source(), null, null);
         defer server.deinit();
@@ -181,7 +187,6 @@ test "httpx SQL catalog original null uniqueness declarations use real leader ad
             try std.testing.expect(result.value.ddl_receipt.?.schema_version < std.math.maxInt(u32));
             break :blk result.value.ddl_receipt.?.schema_version;
         };
-        try adoptNativeSources(&svc);
         try settleNativeOwner(&svc, "after CREATE and source adoption");
         const resolutions = owner.resolutions;
         const mutations = owner.mutations;

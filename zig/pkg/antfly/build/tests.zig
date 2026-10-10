@@ -300,7 +300,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, relation_namespace_tests).step);
     const fk_name_admission_tests = b.addTest(.{
         .root_module = metadata_unit_baseline_mods[8],
-        .filters = &.{ "self-FK generation plan binds both roles", "system catalog relation namespace transaction FK generation publication begins durably" },
+        .filters = &.{ "self-FK generation plan binds both roles", "system catalog relation namespace transaction FK generation publication begins durably", "system catalog relation namespace transaction activated generated FK begin" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-fk-generated-name-admission-test", "Verify FK generated-name plan digests, recovery and atomic lower-capability nonadmission")
@@ -313,7 +313,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     test_imports.configure(b, rewrite_name_admission_mod, true, true);
     const rewrite_name_admission_tests = b.addTest(.{
         .root_module = rewrite_name_admission_mod,
-        .filters = &.{ "relational integrity restore staging rewrite intent binds original schema source pin and immutable target", "metadata raft apply store generated primary rewrite cannot reserve names or jobs below capability" },
+        .filters = &.{ "relational integrity restore staging rewrite intent binds original schema source pin and immutable target", "metadata raft apply store generated primary rewrite cannot reserve names or jobs below capability", "system catalog relation namespace transaction generated addition races publish and recover under activated occupancy", "metadata raft apply store activated primary rewrite" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-rewrite-generated-name-admission-test", "Verify primary-key rewrite naming guard recovery and frozen intent binding")

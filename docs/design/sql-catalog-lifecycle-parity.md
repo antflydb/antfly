@@ -730,3 +730,38 @@ checkpoint. The inventory verifier still reports 478 implemented, 136 rejected,
 
 The follow-up is PR #1061 (after merged #1048). Main was merged again at
 `0102c506d1`, containing upstream `121699433e`; in-progress edits were preserved.
+
+### Occupancy activation qualification (local, unpublished)
+
+The working tree now advertises decoder 34 for qualification; this activation
+change is not yet published. A native activated-owner test passes in Debug and
+ReleaseFast: a competing relation claims a prepared generated UNIQUE name,
+read-only preflight rejects it, replicated apply commits a no-op without changing
+the source cut, and explicit re-preparation chooses a suffix. The versioned
+successor survives checkpoint/restart; a delayed rejected command at the next
+applied index cannot overwrite it. The expanded native store gate passed 49
+tests before the later rewrite-fixture additions.
+
+Activated primary-key rewrite fixtures additionally exercise pending name
+reservation, abort/first-job behavior, guard immutability during freeze,
+restart and cancellation retirement. Their first run found that the older
+fixture reused the existing sealed reconciliation job. It now allocates a
+successor and performs the actual native CAS/retirement transition, preserving
+typed coverage instead of resetting the existing job. The corrected Debug gate
+passes all five focused tests with no leaks, including explicit pending-name
+occupancy, release after cancellation, and rejection of a substituted guard
+during freeze. The optimized rerun also passes all five focused tests, and the
+native store rerun passes 49 tests with no leaks.
+
+The public campaign bootstraps an independently verified namespace through
+real leader/all-voter admission before its first anonymous CREATE. Broader
+coordinator/public campaigns are still running. The new native named-FK gate
+passes three tests in both Debug and ReleaseFast: it prepares the name from an attested namespace,
+begins with typed child/parent schemas and exact metadata cuts, and preserves
+both owner locks, the guard and plan digest through restart. Cancellation stays
+pending across a second restart and retains the name and locks until real
+owner receipts arrive. These standalone
+native fixtures supply the capability barrier externally; they are not proof
+of quorum failover or data-owner enforcement. Distributed ownership/failover
+and data-owner activation qualification remain
+required; no original-case dispositions change at this checkpoint.

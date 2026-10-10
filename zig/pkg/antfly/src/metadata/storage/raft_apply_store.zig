@@ -426,6 +426,104 @@ test "system catalog relation namespace transaction ALTER naming pins exact tabl
     try std.testing.expectError(error.InvalidCatalogRecord, store.prepareGeneratedConstraintAddition(a, group, latest, fragment, &.{"anonymous"}, .{}));
 }
 
+test "system catalog relation namespace transaction generated addition races publish and recover under activated occupancy" {
+    const T = struct {
+        fn successorSchema(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
+            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+            defer parsed.deinit();
+            parsed.value.object.getPtr("version").?.* = .{ .integer = 2 };
+            return std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+        }
+    };
+    const a = std.testing.allocator;
+    const group: u64 = 41;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/activated-names", .{tmp.sub_path});
+    defer a.free(path);
+    const identity = "01010101010101010101010101010101".*;
+    const base =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"x":{"type":"integer","nullable":false}},"required":["x"],"additionalProperties":false}}}}
+    ;
+    const table: metadata.TableRecord = .{ .table_id = 7, .name = "items", .schema_json = base };
+    var committed: ?[]u8 = null;
+    defer if (committed) |bytes| a.free(bytes);
+    var delayed: ?[]u8 = null;
+    defer if (delayed) |bytes| a.free(bytes);
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = identity });
+        try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+        const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.constraint_occupancy_version, .incarnation = identity, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
+        defer a.free(activation);
+        try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+        try std.testing.expectEqual(topology_protocol.constraint_occupancy_version, (try store.topologyActivation(group)).?.version);
+        try adoptRelationWriterForTest(&store, a, group);
+        const published = try publishLiveRelationRootWithCoverageForTest(&store, a, group, .constraint_names);
+        var guard: system_catalog.RelationMutationGuard = undefined;
+        {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&read, group)).?;
+            guard = .{ .target = .{ .name = table.name }, .logical_table = table.name, .owner = (try live.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = table.name })).?, .incarnation = published.epoch.incarnation };
+        }
+        const fragment = "{\"unique_constraints\":[{\"name\":\"anonymous\",\"columns\":[\"x\"]}]}";
+        var first = try store.prepareGeneratedConstraintAddition(a, group, guard, fragment, &.{"anonymous"}, .{});
+        defer first.deinit();
+        try std.testing.expectEqualStrings("items_x_key", first.admission.names[0].name);
+        var named_guard = guard;
+        named_guard.constraint_name_admission = first.admission;
+        var replacement = table;
+        const first_schema = try T.successorSchema(a, first.schema_json);
+        defer a.free(first_schema);
+        replacement.schema_json = first_schema;
+        // An unrelated owner claims the prepared name after preparation.
+        // Exact predecessor identity still matches; only occupancy defeats it.
+        try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 8, .name = "items_x_key", .schema_json = "{\"version\":1}" } });
+        const observed = try store.relationReconciliationWork(group);
+        try std.testing.expectError(error.CatalogGenerationChanged, store.checkConstraintNamesWithContext(a, group, .{ .guard = named_guard, .schema_json = replacement.schema_json }, .{}));
+        const rejected = try encodeTransitionCommand(a, .{ .compare_and_replace_table = .{ .expected = table, .replacement = replacement, .relation_guard = named_guard } });
+        defer a.free(rejected);
+        delayed = try a.dupe(u8, rejected);
+        var replay = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 1, .index = 1, .data = rejected }});
+        defer replay.deinit();
+        try std.testing.expect(std.meta.eql(observed, try store.relationReconciliationWork(group)));
+        const unchanged = (try store.getTable(a, group, 7)).?;
+        defer metadata_table_manager.freeTable(a, unchanged);
+        try std.testing.expectEqualDeep(table, unchanged);
+        // Explicit re-preparation, not transparent replay, chooses a suffix.
+        var next = try store.prepareGeneratedConstraintAddition(a, group, guard, fragment, &.{"anonymous"}, .{});
+        defer next.deinit();
+        try std.testing.expectEqualStrings("items_x_key1", next.admission.names[0].name);
+        named_guard.constraint_name_admission = next.admission;
+        const next_schema = try T.successorSchema(a, next.schema_json);
+        defer a.free(next_schema);
+        replacement.schema_json = next_schema;
+        try store.checkConstraintNamesWithContext(a, group, .{ .guard = named_guard, .schema_json = replacement.schema_json }, .{});
+        try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = replacement, .relation_guard = named_guard } });
+        const actual = (try store.getTable(a, group, 7)).?;
+        defer metadata_table_manager.freeTable(a, actual);
+        try std.testing.expectEqualStrings(next_schema, actual.schema_json);
+        committed = try a.dupe(u8, actual.schema_json);
+        try verifyRelationRecoveryForTest(&store, a, group);
+    }
+    {
+        var reopened = try RaftApplyStore.init(a, .{ .root_dir = path });
+        defer reopened.deinit();
+        try verifyRelationRecoveryForTest(&reopened, a, group);
+        const before = try reopened.relationReconciliationWork(group);
+        var replay = try MetadataReplayTest.apply(&reopened, group, &.{.{ .term = 2, .index = 2, .data = delayed.? }});
+        defer replay.deinit();
+        try std.testing.expect(std.meta.eql(before, try reopened.relationReconciliationWork(group)));
+        try std.testing.expectEqual(@as(u64, 2), try reopened.durableAppliedIndex(group));
+        const actual = (try reopened.getTable(a, group, 7)).?;
+        defer metadata_table_manager.freeTable(a, actual);
+        try std.testing.expectEqualStrings(committed.?, actual.schema_json);
+        try std.testing.expectEqual(topology_protocol.constraint_occupancy_version, (try reopened.topologyActivation(group)).?.version);
+    }
+}
+
 test "system catalog relation namespace transaction hidden FK legacy plan digests retain their wire shape" {
     const a = std.testing.allocator;
     const plan: fk_generation_publication.InitialCreatePlan = .{
@@ -3933,6 +4031,127 @@ test "initial child root receipt requires enrollment current reporter and exact 
         var txn = try store.store.beginReadTxn();
         defer txn.abort();
         try std.testing.expectError(error.InitialChildRootReceiptChanged, store.requireInitialChildRootReceiptTxn(&txn, group_id, receipt));
+    }
+}
+
+test "system catalog relation namespace transaction activated generated FK begin reserves both owners and recovers its name guard" {
+    const a = std.testing.allocator;
+    const group = group_ids.main_metadata_group_id;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/named-fk", .{tmp.sub_path});
+    defer a.free(path);
+    const identity = "11111111111111111111111111111111".*;
+    const before_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const parent_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"parent_id_key","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const child: metadata.TableRecord = .{ .table_id = 101, .name = "child", .schema_json = before_json };
+    const parent: metadata.TableRecord = .{ .table_id = 201, .name = "parent", .schema_json = parent_json };
+    const child_range: metadata.RangeRecord = .{ .table_id = 101, .group_id = 301, .range_id = 301, .doc_identity_shard_id = 301, .doc_identity_range_id = 301, .start_key = "" };
+    const parent_range: metadata.RangeRecord = .{ .table_id = 201, .group_id = 401, .range_id = 401, .doc_identity_shard_id = 401, .doc_identity_range_id = 401, .start_key = "" };
+    var id: fk_generation_publication.Id = @splat(0);
+    std.mem.writeInt(u64, id[0..8], 7, .little);
+    std.mem.writeInt(u64, id[8..16], 1, .little);
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+    const child_fence: topology.Fence = .{ .transition_id = 7, .attempt = 1, .peer_group_id = 301, .owner_group_id = 301, .role = .child_generation_source, .namespace = .{ .table_id = 101, .shard_id = 301, .range_id = 301 }, .catalog_digest = @splat(1) };
+    const parent_fence: topology.Fence = .{ .transition_id = 7, .attempt = 1, .peer_group_id = 401, .owner_group_id = 401, .role = .child_generation_parent, .namespace = .{ .table_id = 201, .shard_id = 401, .range_id = 401 }, .catalog_digest = @splat(2) };
+    var expected_digest: [32]u8 = undefined;
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = identity });
+        try store.applyStandaloneCommand(group, .{ .upsert_table = parent });
+        try store.applyStandaloneCommand(group, .{ .upsert_table = child });
+        try store.applyStandaloneCommand(group, .{ .upsert_range = parent_range });
+        try store.applyStandaloneCommand(group, .{ .upsert_range = child_range });
+        const activation = try std.json.Stringify.valueAlloc(a, topology_protocol.Activation{ .version = topology_protocol.constraint_occupancy_version, .incarnation = identity, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
+        defer a.free(activation);
+        try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = activation });
+        try adoptRelationWriterForTest(&store, a, group);
+        _ = try publishLiveRelationRootWithCoverageForTest(&store, a, group, .constraint_names);
+        var guard: system_catalog.RelationMutationGuard = undefined;
+        {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&read, group)).?;
+            guard = .{ .target = .{ .name = child.name }, .logical_table = child.name, .owner = (try live.getClaim(.{ .namespace_id = system_catalog.default_namespace_id, .name = child.name })).?, .incarnation = live.root.epoch.incarnation };
+        }
+        const fragment = "{\"foreign_keys\":[{\"name\":\"anonymous\",\"child_columns\":[\"id\"],\"parent_table\":\"parent\",\"parent_columns\":[\"id\"]}]}";
+        var names = try store.prepareGeneratedConstraintAddition(a, group, guard, fragment, &.{"anonymous"}, .{});
+        defer names.deinit();
+        try std.testing.expectEqualStrings("child_id_fkey", names.admission.names[0].name);
+        guard.constraint_name_admission = names.admission;
+        var after = try std.json.parseFromSlice(std.json.Value, a, names.schema_json, .{});
+        defer after.deinit();
+        after.value.object.getPtr("version").?.* = .{ .integer = 2 };
+        const after_json = try std.json.Stringify.valueAlloc(a, after.value, .{});
+        defer a.free(after_json);
+        var parsed = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, before_json);
+        defer parsed.deinit(a);
+        var catalog = try fk_generation_publication.compileCatalog(a, parsed, child.table_id, null);
+        defer catalog.deinit();
+        const before_b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(catalog.value.len));
+        defer a.free(before_b64);
+        _ = std.base64.standard.Encoder.encode(before_b64, catalog.value);
+        const transitions = try fk_generation_publication.deriveTransitions(a, child.table_id, child.name, before_json, after_json, before_b64);
+        defer fk_generation_publication.freeDerivedTransitions(a, transitions);
+        try std.testing.expectEqual(@as(usize, 1), transitions.len);
+        var child_after = child;
+        child_after.schema_json = after_json;
+        const plan: fk_generation_publication.Plan = .{ .id = id, .child_before = child, .child_after = child_after, .child_catalog_before_b64 = before_b64, .child_ranges = &.{child_range}, .child_fences = &.{child_fence}, .parents = &.{.{ .table = parent, .ranges = &.{parent_range}, .fences = &.{parent_fence}, .transitions = &.{transitions[0].transition} }}, .constraint_name_guard = guard };
+        try plan.validate(a);
+        expected_digest = try plan.digest(a);
+        try store.preflightFkGenerationNameAdmission(group, plan);
+        const begin = try std.json.Stringify.valueAlloc(a, fk_generation_publication.Command{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 0, .action = .begin, .plan = plan }, .{});
+        defer a.free(begin);
+        try store.applyStandaloneCommand(group, .{ .apply_fk_generation_publication = begin });
+        try verifyRelationRecoveryForTest(&store, a, group);
+    }
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        try verifyRelationRecoveryForTest(&store, a, group);
+        const bytes = try store.fkGenerationPublicationStatusJson(a, group, child.table_id);
+        defer a.free(bytes);
+        var recovered = try std.json.parseFromSlice(fk_generation_publication.Publication, a, bytes, .{});
+        defer recovered.deinit();
+        try recovered.value.validate(a);
+        try std.testing.expectEqual(.fencing_child, recovered.value.phase);
+        try std.testing.expectEqualDeep(expected_digest, recovered.value.plan_digest);
+        try std.testing.expectEqualStrings("child_id_fkey", recovered.value.plan.constraint_name_guard.?.constraint_name_admission.?.names[0].name);
+        {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            for ([_]u64{ child.table_id, parent.table_id }) |table_id| try std.testing.expectEqual(RaftApplyStore.FkTableLockKind.generation, (try store.fkTableLockKindTxn(&read, group, table_id)).?);
+            var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&read, group)).?;
+            try std.testing.expect(try live.nameOccupied(system_catalog.default_namespace_id, "child_id_fkey", false));
+        }
+        // Cancellation is not completion. No invented owner receipt may
+        // release the name or either generation lock ahead of real owners.
+        const cancel = try std.json.Stringify.valueAlloc(a, fk_generation_publication.Command{ .plan_id = id, .child_table_id = child.table_id, .expected_revision = 1, .action = .cancel }, .{});
+        defer a.free(cancel);
+        try store.applyStandaloneCommand(group, .{ .apply_fk_generation_publication = cancel });
+    }
+    {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        try verifyRelationRecoveryForTest(&store, a, group);
+        const bytes = try store.fkGenerationPublicationStatusJson(a, group, child.table_id);
+        defer a.free(bytes);
+        var recovered = try std.json.parseFromSlice(fk_generation_publication.Publication, a, bytes, .{});
+        defer recovered.deinit();
+        try recovered.value.validate(a);
+        try std.testing.expectEqual(.canceling, recovered.value.phase);
+        try std.testing.expectEqual(@as(u64, 2), recovered.value.revision);
+        try std.testing.expectEqualDeep(expected_digest, recovered.value.plan_digest);
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        for ([_]u64{ child.table_id, parent.table_id }) |table_id| try std.testing.expectEqual(RaftApplyStore.FkTableLockKind.generation, (try store.fkTableLockKindTxn(&read, group, table_id)).?);
+        var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&read, group)).?;
+        try std.testing.expect(try live.nameOccupied(system_catalog.default_namespace_id, "child_id_fkey", false));
     }
 }
 
@@ -8055,7 +8274,14 @@ fn reconcileRestoreNamesForTest(store: *RaftApplyStore, a: std.mem.Allocator, in
         errdefer txn.abort();
         var buf: [128]u8 = undefined;
         if (try RaftApplyStore.stagingGet(&txn, try r.jobKey(&buf, group))) |bytes| {
-            try std.testing.expect(std.meta.eql(initial, try r.State.decode(bytes)));
+            const prior = try r.State.decode(bytes);
+            if (!std.meta.eql(initial, prior)) {
+                try std.testing.expectEqual(r.Phase.ready, prior.phase);
+                // A fixture with an activated root already has a completed
+                // generation. Use the real CAS/retirement transition rather
+                // than resetting its job or reusing the sealed generation.
+                try r.start(&txn, &initial, initial.epoch, bytes);
+            }
         } else {
             try r.start(&txn, &initial, initial.epoch, null);
         }
@@ -8483,6 +8709,18 @@ test "metadata raft apply store generated primary rewrite cannot reserve names o
 }
 
 fn testRewriteDraftWithNames(cancel: bool, compound: bool, named: bool) !void {
+    return testRewriteDraftWithActivation(cancel, compound, named, false);
+}
+
+test "metadata raft apply store activated primary rewrite retains its name guard across freeze and restart" {
+    try testRewriteDraftWithActivation(false, true, true, true);
+}
+
+test "metadata raft apply store activated primary rewrite cancellation retires the guarded reservation" {
+    try testRewriteDraftWithActivation(true, false, true, true);
+}
+
+fn testRewriteDraftWithActivation(cancel: bool, compound: bool, named: bool, activated: bool) !void {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -8521,7 +8759,7 @@ fn testRewriteDraftWithNames(cancel: bool, compound: bool, named: bool) !void {
     targets[0].generation_handoffs = &.{};
     try std.testing.expectError(error.RestoreSourceProofMissing, draft.validate(alloc));
     targets[0].generation_handoffs = handoffs;
-    const draft_digest = try draft.digest(alloc);
+    var draft_digest = try draft.digest(alloc);
     {
         var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
         defer store.deinit();
@@ -8538,6 +8776,12 @@ fn testRewriteDraftWithNames(cancel: bool, compound: bool, named: bool) !void {
         const user_key = restore_job_logical_prefix ++ "0000000000000007";
         const user_value = "{\"job_id\":7,\"attempt_id\":1,\"staging_attempt_id\":1,\"source_kind\":\"schema_rewrite\",\"phase\":\"queued\"}";
         if (named) {
+            if (activated) {
+                const proof = try std.json.Stringify.valueAlloc(alloc, topology_protocol.Activation{ .version = topology_protocol.constraint_occupancy_version, .incarnation = "01010101010101010101010101010101".*, .member_count = 3, .membership_fingerprint = @splat(7) }, .{});
+                defer alloc.free(proof);
+                try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = proof });
+                _ = try publishLiveRelationRootWithCoverageForTest(&store, alloc, group, .constraint_names);
+            }
             const work = try store.relationReconciliationWork(group);
             var schema_digest: [32]u8 = undefined;
             std.crypto.hash.Blake3.hash(schema_json, &schema_digest, .{});
@@ -8549,42 +8793,47 @@ fn testRewriteDraftWithNames(cancel: bool, compound: bool, named: bool) !void {
                 .constraint_name_admission = .{ .namespace_id = system_catalog.default_namespace_id, .names = &.{.{ .name = "rows_pkey", .kind = .primary }} },
             };
             try draft.validate(alloc);
-            try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.checkConstraintNamesWithContext(alloc, group, .{ .guard = draft.constraint_name_guard.?, .schema_json = target_schema }, .{}));
-            const plan_json = try std.json.Stringify.valueAlloc(alloc, draft, .{});
-            defer alloc.free(plan_json);
-            const reserve_json = try std.json.Stringify.valueAlloc(alloc, restore_staging.Command{ .id = id, .action = .reserve, .plan = draft }, .{});
-            defer alloc.free(reserve_json);
-            try store.applyStandaloneCommand(group, .{ .apply_restore_staging = reserve_json });
-            try store.applyStandaloneCommand(group, .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = plan_json } });
-            try std.testing.expect(std.meta.eql(work, try store.relationReconciliationWork(group)));
-            {
-                var read = try store.store.beginReadTxn();
-                defer read.abort();
+            draft_digest = try draft.digest(alloc);
+            if (activated) {
+                try store.checkConstraintNamesWithContext(alloc, group, .{ .guard = draft.constraint_name_guard.?, .schema_json = target_schema }, .{});
+            } else {
+                try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, store.checkConstraintNamesWithContext(alloc, group, .{ .guard = draft.constraint_name_guard.?, .schema_json = target_schema }, .{}));
+                const plan_json = try std.json.Stringify.valueAlloc(alloc, draft, .{});
+                defer alloc.free(plan_json);
+                const reserve_json = try std.json.Stringify.valueAlloc(alloc, restore_staging.Command{ .id = id, .action = .reserve, .plan = draft }, .{});
+                defer alloc.free(reserve_json);
+                try store.applyStandaloneCommand(group, .{ .apply_restore_staging = reserve_json });
+                try store.applyStandaloneCommand(group, .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = plan_json } });
+                try std.testing.expect(std.meta.eql(work, try store.relationReconciliationWork(group)));
+                {
+                    var read = try store.store.beginReadTxn();
+                    defer read.abort();
+                    var key_buf: [256]u8 = undefined;
+                    try std.testing.expectError(error.NotFound, read.get(try restore_staging.jobKey(&key_buf, group, id)));
+                    try std.testing.expectError(error.NotFound, read.get(try restoreJobKeyForGroup(&key_buf, group, user_key)));
+                    try std.testing.expectError(error.NotFound, read.get(try tableKeyForGroup(&key_buf, group, 10)));
+                    const unchanged = try decodeTableRecord(alloc, try read.get(try tableKeyForGroup(&key_buf, group, 9)));
+                    defer metadata_table_manager.freeTable(alloc, unchanged);
+                    try std.testing.expectEqualDeep(original, unchanged);
+                    var cursor = try read.openCursor();
+                    defer cursor.close();
+                    const prefix = try restore_staging.activePrefix(&key_buf, group);
+                    if (try cursor.seekAtOrAfter(prefix)) |row| try std.testing.expect(!std.mem.startsWith(u8, row.key, prefix));
+                }
+                // The exact same topology and schema can be admitted without the
+                // new predicate. This proves the negative result above was not
+                // caused by an invalid rewrite fixture or missing source facts.
+                draft.constraint_name_guard = null;
+                const legacy_json = try std.json.Stringify.valueAlloc(alloc, draft, .{});
+                defer alloc.free(legacy_json);
+                try store.applyStandaloneCommand(group, .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = legacy_json } });
+                var accepted = try store.store.beginReadTxn();
+                defer accepted.abort();
                 var key_buf: [256]u8 = undefined;
-                try std.testing.expectError(error.NotFound, read.get(try restore_staging.jobKey(&key_buf, group, id)));
-                try std.testing.expectError(error.NotFound, read.get(try restoreJobKeyForGroup(&key_buf, group, user_key)));
-                try std.testing.expectError(error.NotFound, read.get(try tableKeyForGroup(&key_buf, group, 10)));
-                const unchanged = try decodeTableRecord(alloc, try read.get(try tableKeyForGroup(&key_buf, group, 9)));
-                defer metadata_table_manager.freeTable(alloc, unchanged);
-                try std.testing.expectEqualDeep(original, unchanged);
-                var cursor = try read.openCursor();
-                defer cursor.close();
-                const prefix = try restore_staging.activePrefix(&key_buf, group);
-                if (try cursor.seekAtOrAfter(prefix)) |row| try std.testing.expect(!std.mem.startsWith(u8, row.key, prefix));
+                _ = try accepted.get(try restore_staging.jobKey(&key_buf, group, id));
+                try std.testing.expectEqualStrings(user_value, try accepted.get(try restoreJobKeyForGroup(&key_buf, group, user_key)));
+                return;
             }
-            // The exact same topology and schema can be admitted without the
-            // new predicate. This proves the negative result above was not
-            // caused by an invalid rewrite fixture or missing source facts.
-            draft.constraint_name_guard = null;
-            const legacy_json = try std.json.Stringify.valueAlloc(alloc, draft, .{});
-            defer alloc.free(legacy_json);
-            try store.applyStandaloneCommand(group, .{ .create_restore_job_with_staging = .{ .key = user_key, .value = user_value, .plan_json = legacy_json } });
-            var accepted = try store.store.beginReadTxn();
-            defer accepted.abort();
-            var key_buf: [256]u8 = undefined;
-            _ = try accepted.get(try restore_staging.jobKey(&key_buf, group, id));
-            try std.testing.expectEqualStrings(user_value, try accepted.get(try restoreJobKeyForGroup(&key_buf, group, user_key)));
-            return;
         }
         if (compound) {
             const plan_json = try std.json.Stringify.valueAlloc(alloc, draft, .{});
@@ -8667,7 +8916,9 @@ fn testRewriteDraftWithNames(cancel: bool, compound: bool, named: bool) !void {
     }
     try std.testing.expectEqual(.preparing_sources, (try store.loadRestoreStagingProgress(alloc, group, id)).?.state);
     try verifyRelationRecoveryForTest(&store, alloc, group);
-    const namespace_ready = try reconcileRestoreNamesForTest(&store, alloc, try relation_reconciliation.State.init(group, try relation_reconciliation.nextJobId(null), .{ .incarnation = @splat(1), .revision = 2 }));
+    const prior_work = try store.relationReconciliationWork(group);
+    const next_job = try relation_reconciliation.nextJobId(if (prior_work.current) |*prior| prior else null);
+    const namespace_ready = try reconcileRestoreNamesForTest(&store, alloc, try relation_reconciliation.State.initWithCoverage(group, next_job, .{ .incarnation = @splat(1), .revision = 2 }, if (activated) .constraint_names else .relations));
     const namespace_source_cut = blk: {
         var read = try store.store.beginReadTxn();
         defer read.abort();
@@ -8716,6 +8967,12 @@ fn testRewriteDraftWithNames(cancel: bool, compound: bool, named: bool) !void {
     draft.cohort_digest = @splat(8);
     try draft.validate(alloc);
     try std.testing.expectError(error.InvalidRestoreStaging, (restore_staging.Command{ .id = id, .action = .reserve, .plan = draft }).validate(alloc));
+    if (activated) {
+        var read = try store.store.beginReadTxn();
+        defer read.abort();
+        var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&read, group)).?;
+        try std.testing.expect(try live.nameOccupied(system_catalog.default_namespace_id, "rows_pkey", true));
+    }
     if (cancel) {
         var txn = try store.store.beginWriteTxn();
         errdefer txn.abort();
@@ -8739,6 +8996,12 @@ fn testRewriteDraftWithNames(cancel: bool, compound: bool, named: bool) !void {
         try txn.commit();
         try std.testing.expectEqual(.canceled, (try store.loadRestoreStagingProgress(alloc, group, id)).?.state);
         try verifyRelationRecoveryForTest(&store, alloc, group);
+        if (activated) {
+            var read = try store.store.beginReadTxn();
+            defer read.abort();
+            var live = (try relation_reconciliation.LiveStore(docstore.DocStore.Txn).open(&read, group)).?;
+            try std.testing.expect(!try live.nameOccupied(system_catalog.default_namespace_id, "rows_pkey", true));
+        }
         return;
     }
     {
@@ -8770,6 +9033,13 @@ fn testRewriteDraftWithNames(cancel: bool, compound: bool, named: bool) !void {
         targets[0].table.description = "changed after pin";
         try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .freeze_rewrite, .expected_revision = 2, .plan = draft });
         targets[0].table.description = "";
+        if (activated) {
+            // The admitted predicate is part of the immutable pre-pin intent,
+            // not an optional field that source preparation may replace.
+            draft.constraint_name_guard.?.incarnation[0] ^= 1;
+            try applyRestoreStagingForTest(&store, &txn, group, .{ .id = id, .action = .freeze_rewrite, .expected_revision = 2, .plan = draft });
+            draft.constraint_name_guard.?.incarnation[0] ^= 1;
+        }
         var buf: [256]u8 = undefined;
         const progress = try std.json.parseFromSlice(restore_staging.Progress, alloc, try txn.get(try restore_staging.progressKey(&buf, group, id)), .{});
         defer progress.deinit();

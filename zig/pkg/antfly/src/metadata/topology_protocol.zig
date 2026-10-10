@@ -61,10 +61,10 @@ const std = @import("std");
 /// and adopts every native namespace writer in the same durable transaction.
 /// Version 33 decodes name-sensitive table replacements carrying an exact
 /// relation-owner, logical-binding and metadata-incarnation mutation fence.
-pub const current_version: u16 = 33;
-/// Reserved decoder floor for occupancy-capable reconciliation/root formats.
-/// Not advertised until every authoritative source/writer/restore path adopts
-/// the same complete constraint-name projection.
+/// Version 34 decodes constraint-membership reconciliation and immutable
+/// generated-name admission predicates for catalog, FK and rewrite workflows.
+pub const current_version: u16 = 34;
+/// Decoder floor for occupancy-capable reconciliation and name admission.
 pub const constraint_occupancy_version: u16 = 34;
 pub const relation_mutation_version: u16 = 33;
 pub const relation_publication_version: u16 = 32;
