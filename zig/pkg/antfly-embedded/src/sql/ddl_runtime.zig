@@ -27,16 +27,32 @@ pub fn accepts(statement: ast.Statement) bool {
     };
 }
 
+fn generatedConstraintNamesAlloc(a: std.mem.Allocator, create: ast.CreateTable) ![]const []const u8 {
+    var count: usize = 0;
+    for (create.constraints) |constraint| if (constraint.generatedConstraintName() != null) {
+        count += 1;
+    };
+    if (count == 0) return &.{};
+    const result = try a.alloc([]const u8, count);
+    var index: usize = 0;
+    for (create.constraints) |constraint| if (constraint.generatedConstraintName()) |name| {
+        result[index] = name;
+        index += 1;
+    };
+    return result;
+}
+
 pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, statement: ast.Statement) !Output {
     const dispatch = backend.vtable.ddl orelse return error.UnsupportedSqlExecution;
     try backend.vtable.checkpoint(backend.ptr);
     const request: catalog.Ddl = switch (statement) {
-        .create_table => |create| .{ .create_table = .{ .name = create.table, .schema_json = try createSchemaAlloc(alloc, create), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace } },
+        .create_table => |create| .{ .create_table = .{ .name = create.table, .schema_json = try createSchemaAlloc(alloc, create), .if_not_exists = create.if_not_exists, .tablespace = create.tablespace, .generated_constraint_names = try generatedConstraintNamesAlloc(alloc, create) } },
         .drop_table => |drop| .{ .drop_table = drop },
         .catalog_ddl => |ddl| .{ .catalog_ddl = ddl },
         .policy_ddl => |ddl| .{ .policy_ddl = ddl },
         else => return error.UnsupportedSqlExecution,
     };
+
     const outcome = try dispatch(backend.ptr, alloc, request);
     return .{ .command_tag = if (outcome.mutation_outcome == .committed_pending or (outcome.receipt != null and outcome.receipt.?.state != .ready)) "DDL PENDING" else switch (request) {
         .create_table => "CREATE TABLE",
@@ -227,6 +243,64 @@ pub fn defaultExpression(alloc: std.mem.Allocator, value: ast.Value, kind: ast.C
         return @import("schema_expression.zig").numericLiteral(alloc, if (value == .null) .null else .{ .string = value.string });
     const literal = try bindDefault(alloc, value, kind, element);
     return std.json.parseFromSliceLeaky(std.json.Value, alloc, try std.json.Stringify.valueAlloc(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = literal }, .{}), .{ .parse_numbers = false });
+}
+
+test "SQL DDL generated name hints use one bounded allocation and borrow compiler-owned names" {
+    const Probe = struct {
+        fn run(a: std.mem.Allocator, create: ast.CreateTable) !void {
+            const names = try generatedConstraintNamesAlloc(a, create);
+            defer a.free(names);
+            try std.testing.expectEqual(@as(usize, 2), names.len);
+            try std.testing.expect(names[0].ptr == create.constraints[0].generatedConstraintName().?.ptr);
+            try std.testing.expect(names[1].ptr == create.constraints[1].generatedConstraintName().?.ptr);
+        }
+    };
+    var compiled = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE t (id BIGINT PRIMARY KEY, email TEXT UNIQUE)", .{});
+    defer compiled.deinit();
+    try Probe.run(std.testing.allocator, compiled.statement.create_table);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{compiled.statement.create_table});
+    var explicit = try @import("compiler.zig").compile(std.testing.allocator, "CREATE TABLE t (id BIGINT CONSTRAINT sql_primary_0 PRIMARY KEY)", .{});
+    defer explicit.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const names = try generatedConstraintNamesAlloc(failing.allocator(), explicit.statement.create_table);
+    try std.testing.expectEqual(@as(usize, 0), names.len);
+}
+
+test "SQL DDL carries generated name provenance outside the editable public schema" {
+    const Fake = struct {
+        expected: []const []const u8,
+        calls: usize = 0,
+        fn ddl(raw: *anyopaque, a: std.mem.Allocator, request: catalog.Ddl) !catalog.DdlOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const create = request.create_table;
+            try std.testing.expectEqual(self.expected.len, create.generated_constraint_names.len);
+            for (self.expected, create.generated_constraint_names) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+            try std.testing.expect(std.mem.indexOf(u8, create.schema_json, "name_generated") == null);
+            try std.testing.expect(std.mem.indexOf(u8, create.schema_json, "generated_constraint_names") == null);
+            const schema = try std.json.parseFromSlice(std.json.Value, a, create.schema_json, .{});
+            defer schema.deinit();
+            try std.testing.expectEqualStrings("relational", schema.value.object.get("storage_mode").?.string);
+            self.calls += 1;
+            return .{ .mutation_outcome = .committed };
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const cases = [_]struct { sql: []const u8, generated: []const []const u8 }{
+        .{ .sql = "CREATE TABLE t (id BIGINT PRIMARY KEY, email TEXT UNIQUE)", .generated = &.{ "sql_primary_0", "sql_unique_1" } },
+        .{ .sql = "CREATE TABLE t (id BIGINT CONSTRAINT sql_primary_0 PRIMARY KEY, email TEXT CONSTRAINT sql_unique_1 UNIQUE)", .generated = &.{} },
+        .{ .sql = "CREATE TABLE t (id BIGINT, PRIMARY KEY (id), CHECK (id > 0))", .generated = &.{ "sql_constraint_0", "sql_constraint_1" } },
+        .{ .sql = "CREATE TABLE t (id BIGINT CHECK (id > 0))", .generated = &.{"sql_inline_0"} },
+    };
+    for (cases) |case| {
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var fake: Fake = .{ .expected = case.generated };
+        const result = try execute(arena.allocator(), .{ .ptr = &fake, .vtable = &.{ .resolve = undefined, .scan = undefined, .mutate = undefined, .ddl = Fake.ddl, .checkpoint = Fake.checkpoint } }, compiled.statement);
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        try std.testing.expectEqualStrings("CREATE TABLE", result.command_tag);
+    }
 }
 
 test "SQL TRUNCATE lowers complete table set and honest durable admission receipt" {

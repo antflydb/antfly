@@ -1841,7 +1841,7 @@ const Parser = struct {
             }
             if (self.peek(.identifier) and (self.tokens[self.pos].isKeyword(.primary) or self.tokens[self.pos].isKeyword(.unique) or self.tokens[self.pos].isKeyword(.check) or self.tokens[self.pos].isKeyword(.foreign))) {
                 const constraint_name = try std.fmt.allocPrint(self.alloc, "sql_constraint_{d}", .{constraints.items.len});
-                try constraints.append(self.alloc, try self.constraintDefinition(constraint_name));
+                try constraints.append(self.alloc, generatedConstraint(try self.constraintDefinition(constraint_name)));
                 if (!self.take(.comma)) break;
                 continue;
             }
@@ -1871,16 +1871,16 @@ const Parser = struct {
                 } else if (self.keyword(.primary)) {
                     try self.expectKeyword(.key);
                     definition.nullable = false;
-                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_primary_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}), .primary = true } }));
+                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_primary_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}), .name_generated = true, .primary = true } }));
                 } else if (self.keyword(.unique)) {
                     const nulls_not_distinct = try self.uniqueNulls();
-                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_unique_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}), .nulls_not_distinct = nulls_not_distinct } }));
+                    try constraints.append(self.alloc, try self.uniqueTiming(.{ .add_unique = .{ .name = try std.fmt.allocPrint(self.alloc, "sql_unique_{d}", .{constraints.items.len}), .columns = try self.alloc.dupe([]const u8, &.{column}), .name_generated = true, .nulls_not_distinct = nulls_not_distinct } }));
                 } else if (self.keyword(.constraint)) {
                     const constraint_name = try self.identifier();
                     try constraints.append(self.alloc, try self.inlineConstraint(constraint_name, column));
                 } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and (self.tokens[self.pos].isKeyword(.check) or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "REFERENCES"))) {
                     const constraint_name = try std.fmt.allocPrint(self.alloc, "sql_inline_{d}", .{constraints.items.len});
-                    try constraints.append(self.alloc, try self.inlineConstraint(constraint_name, column));
+                    try constraints.append(self.alloc, generatedConstraint(try self.inlineConstraint(constraint_name, column)));
                 } else break;
             }
             try columns.append(self.alloc, definition);
@@ -2189,6 +2189,17 @@ const Parser = struct {
         }
         if (self.ddlWord("NO") and self.ddlWord("ACTION")) return "no_action";
         return self.fail(error.UnsupportedSqlShape, "unsupported foreign key action");
+    }
+
+    fn generatedConstraint(change: ast.SchemaChange) ast.SchemaChange {
+        var result = change;
+        switch (result) {
+            .add_unique => |*rule| rule.name_generated = true,
+            .add_check => |*rule| rule.name_generated = true,
+            .add_foreign_key => |*rule| rule.name_generated = true,
+            else => unreachable,
+        }
+        return result;
     }
 
     fn tableConstraint(self: *Parser) Error!ast.SchemaChange {
@@ -2560,6 +2571,24 @@ test "compiler deferred uniqueness and constraint timing are explicit" {
     defer named.deinit();
     try std.testing.expect(!named.statement.set_constraints.deferred);
     try std.testing.expectEqualStrings("Other", named.statement.set_constraints.names[1]);
+}
+
+test "constraint name provenance distinguishes explicit identifiers from generated placeholders" {
+    const cases = [_]struct { sql: []const u8, generated: []const bool }{
+        .{ .sql = "CREATE TABLE t (id BIGINT PRIMARY KEY, email TEXT UNIQUE, CHECK (id > 0), FOREIGN KEY (id) REFERENCES parent (id))", .generated = &.{ true, true, true, true } },
+        .{ .sql = "CREATE TABLE t (id BIGINT CONSTRAINT sql_primary_0 PRIMARY KEY, email TEXT CONSTRAINT sql_unique_1 UNIQUE, CONSTRAINT sql_constraint_2 CHECK (id > 0), CONSTRAINT sql_inline_3 FOREIGN KEY (id) REFERENCES parent (id))", .generated = &.{ false, false, false, false } },
+        .{ .sql = "CREATE TABLE t (id BIGINT CHECK (id > 0) REFERENCES parent (id), email TEXT, UNIQUE (email), PRIMARY KEY (id))", .generated = &.{ true, true, true, true } },
+    };
+    for (cases) |case| {
+        var compiled = try compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        const constraints = compiled.statement.create_table.constraints;
+        try std.testing.expectEqual(case.generated.len, constraints.len);
+        for (constraints, case.generated) |constraint, generated| try std.testing.expectEqual(generated, constraint.generatedConstraintName() != null);
+    }
+    var altered = try compile(std.testing.allocator, "ALTER TABLE t ADD CONSTRAINT sql_unique_0 UNIQUE (email)", .{});
+    defer altered.deinit();
+    try std.testing.expect(altered.statement.catalog_ddl.schema_change.?.generatedConstraintName() == null);
 }
 
 test "policy DDL parses draft definitions and never accepts publication commands" {

@@ -255,7 +255,44 @@ The production response was HTTP 202 with a pending receipt and schema
 version 0. The fixture now asserts 202/pending explicitly for setup and ALTER,
 and derives ALTER's expected version from the committed setup receipt rather
 than assuming an initial version of 1. The post-main-merge gate is rerunning;
-the new real-owner campaign is not yet claimed passing.
+the new real-owner campaign is not yet claimed passing. A subsequent compile
+caught the public OpenAPI receipt's signed 64-bit version versus the native
+catalog's unsigned 32-bit version; the fixture now keeps the wire type and
+checks the native range before deriving the next expected version.
+
+Generated-name provenance now survives parsing and SQL DDL lowering as
+compiler-owned data, distinct from the editable public schema. Anonymous
+inline and table-level PRIMARY, UNIQUE, CHECK and FK declarations are marked
+explicitly; user names that happen to start with `sql_primary_`,
+`sql_unique_`, `sql_constraint_` or `sql_inline_` are not. CREATE's internal
+catalog request carries only the generated names, in declaration order.
+Preparing the hints makes one exact-sized pointer-array allocation (none for
+fully explicit declarations), borrowing names from the live compiled
+statement rather than copying identifier bytes.
+The first optimized SQL gate passed 696 local and 226 native tests, plus 30
+relation-name and 56 reconciliation tests. A follow-up gate adds the hint
+allocation-failure test and runs the two native formatter tests as an explicit
+`sql-test` dependency, also exposed as `system-catalog-constraint-name-test`.
+The follow-up passed all 19 steps: 697 local and 226 native tests, plus both
+formatter tests; the 30/56 relation and reconciliation results were cached.
+Formatting, inventory integrity and the Apache boundary (1991 source files)
+also passed. No generated name is yet chosen against
+durable namespace occupancy: admission and private native requests remain the
+next integration boundary, including the initial FK-create publication path.
+
+Publication must explicitly certify occupancy coverage, not merely reuse a
+relation root that happened to contain no nonrelation members. Current native
+topology decoder capabilities stop at version 33, and existing relation/live
+root seals attest only relation claims. The membership producer must therefore
+have a new capability-gated, independently verified root/coverage contract.
+Old roots and partially rebuilt candidates cannot satisfy generated-name
+admission. Use owner-qualified typed keys in the same staged generation and
+bounded source/candidate verification, atomic root publication and GC job;
+the exact-name seek must authenticate that complete generation/source epoch
+before treating absence as free. Include membership owners in canonical
+counts/hashes and replay/backup verification, and force a fresh reconciliation
+generation when the coverage format changes. Do not silently reinterpret old
+v1 root seals as proof of the new projection.
 
 The next delivery is mounted catalog activation/recovery evidence for the
 original index and constraint cohort, including real ownership and readiness

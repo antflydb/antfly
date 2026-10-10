@@ -127,7 +127,7 @@ test "httpx SQL catalog original null uniqueness declarations use real leader ad
         var server = server_mod.ApiHttpServer.init(a, .{ .backend_runtime = runtime.ptr() }, owner.source(), null, null);
         defer server.deinit();
         var handler: handler_mod.AntflyApiHandler = .{ .api_server = &server };
-        const initial_version: u32 = blk: {
+        const initial_version: i64 = blk: {
             var created = try request(a, &handler, "CREATE TABLE usage_records (id BIGINT PRIMARY KEY, email TEXT)");
             defer created.deinit();
             try std.testing.expectEqual(@as(u16, 202), created.status.code);
@@ -137,6 +137,8 @@ test "httpx SQL catalog original null uniqueness declarations use real leader ad
             try std.testing.expectEqualStrings("DDL PENDING", result.value.command_tag);
             try std.testing.expectEqual(.pending, result.value.ddl_receipt.?.state);
             try std.testing.expectEqual(@as(i64, 0), result.value.rows_affected);
+            try std.testing.expect(result.value.ddl_receipt.?.schema_version >= 0);
+            try std.testing.expect(result.value.ddl_receipt.?.schema_version < std.math.maxInt(u32));
             break :blk result.value.ddl_receipt.?.schema_version;
         };
         try settleNativeOwner(&svc);

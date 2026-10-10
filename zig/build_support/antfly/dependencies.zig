@@ -362,6 +362,15 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     b.step("system-catalog-relation-test", "Test namespace ownership and atomic catalog publication plans")
         .dependOn(&run_relation_name_tests.step);
     run_sql_tests.step.dependOn(&run_relation_name_tests.step);
+    const constraint_name_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/constraint_names.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    const run_constraint_name_tests = b.addRunArtifact(constraint_name_tests);
+    b.step("system-catalog-constraint-name-test", "Test bounded PostgreSQL-compatible generated constraint names")
+        .dependOn(&run_constraint_name_tests.step);
+    run_sql_tests.step.dependOn(&run_constraint_name_tests.step);
     const relation_reconciliation_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/system_catalog/relation_reconciliation.zig"),
         .target = target,
