@@ -25,7 +25,7 @@ const Backend = struct {
     fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
         return error.UnexpectedBackendCall;
     }
-    fn mutate(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(_: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
         return error.UnexpectedBackendCall;
     }
     fn checkpoint(_: *anyopaque) !void {}
@@ -33,6 +33,449 @@ const Backend = struct {
         return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
     }
 };
+
+test "SQL ordered-set execution preserves grouped namespaces and shares compatible streams" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, rows: []const u8 }{
+        .{ .sql = "SELECT g,percentile_cont(g/10.0) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS g,2 AS x UNION ALL SELECT 1,4) t GROUP BY g", .rows = "[[\"1\",2.2]]" },
+        .{ .sql = "SELECT mode() WITHIN GROUP (ORDER BY t.x DESC) FILTER (WHERE t.x>0) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[\"3\"]]" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x),percentile_disc(0.5) WITHIN GROUP (ORDER BY x),mode() WITHIN GROUP (ORDER BY x),COUNT(*) FROM (SELECT 1 AS x UNION ALL SELECT 3 UNION ALL SELECT 3 UNION ALL SELECT 7) t", .rows = "[[3,\"3\",\"3\",\"4\"]]" },
+        .{ .sql = "SELECT g,percentile_disc(NULL) WITHIN GROUP (ORDER BY x),mode() WITHIN GROUP (ORDER BY x) FROM (SELECT 2 AS g,10 AS x UNION ALL SELECT 1,3 UNION ALL SELECT 2,20 UNION ALL SELECT 1,1) t GROUP BY g ORDER BY g", .rows = "[[\"1\",null,\"1\"],[\"2\",null,\"10\"]]" },
+        .{ .sql = "SELECT g,percentile_disc(NULL) WITHIN GROUP (ORDER BY x) FROM (SELECT 2 AS g,10 AS x UNION ALL SELECT 1,3 UNION ALL SELECT 2,20 UNION ALL SELECT 1,1) t GROUP BY g ORDER BY g", .rows = "[[\"1\",null],[\"2\",null]]" },
+        .{ .sql = "SELECT g,mode() WITHIN GROUP (ORDER BY x) FILTER (WHERE x>5),percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM (SELECT 2 AS g,10 AS x UNION ALL SELECT 1,3 UNION ALL SELECT 2,20 UNION ALL SELECT 1,1) t GROUP BY g HAVING COUNT(*)=2 ORDER BY g", .rows = "[[\"1\",null,2],[\"2\",\"10\",15]]" },
+        .{ .sql = "SELECT percentile_cont(NULL) WITHIN GROUP (ORDER BY x),mode() WITHIN GROUP (ORDER BY x),COUNT(*) FROM (SELECT 1 AS x) t WHERE false", .rows = "[[null,null,\"0\"]]" },
+        .{ .sql = "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM (SELECT 9007199254740993 AS x UNION ALL SELECT 9007199254740995) t", .rows = "[[\"9007199254740993\"]]" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY '1')", .rows = "[[1]]" },
+        .{ .sql = "SELECT array_length(percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x),1) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[\"3\"]]" },
+        .{ .sql = "SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x) IS NOT DISTINCT FROM ARRAY[1.5,NULL,2.5]::float8[] FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[true]]" },
+        .{ .sql = "SELECT percentile_disc('[0:2]={0.25,NULL,0.75}'::float8[]) WITHIN GROUP (ORDER BY x) IS NOT DISTINCT FROM '[0:2]={1,NULL,3}'::bigint[] FROM (SELECT 1::bigint AS x UNION ALL SELECT 3::bigint) t", .rows = "[[true]]" },
+        .{ .sql = "SELECT percentile_cont('{}'::float8[]) WITHIN GROUP (ORDER BY x) IS NOT DISTINCT FROM '{}'::float8[] FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[true]]" },
+        .{ .sql = "SELECT array_length(percentile_disc(ARRAY[[0.25,NULL],[0.75,1.0]]) WITHIN GROUP (ORDER BY x),2) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[\"2\"]]" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FILTER(WHERE x>10),mode() WITHIN GROUP(ORDER BY x) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[null,\"1\"]]" },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        const actual = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(case.rows, actual);
+    }
+    // Public array results retain their element descriptor and SQL-null flags;
+    // they are not approximated by untyped JSON arrays.
+    var array = try compiler.compile(std.testing.allocator, "SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .{});
+    defer array.deinit();
+    var array_result = try runtime.execute(std.testing.allocator, backend.backend(), &array, &.{}, .{});
+    defer array_result.deinit();
+    try std.testing.expectEqual(@import("antfly_local_sources").sql_array_value.ElementType.float64, array_result.output.columns[0].element_type.?);
+    const envelope = array_result.output.rows[0][0];
+    const values = envelope.object.get("values").?.array.items;
+    try std.testing.expectEqual(@as(f64, 1.5), values[0].float);
+    try std.testing.expectEqual(@as(f64, 2.5), values[2].float);
+    try std.testing.expect(envelope.object.get("sql_nulls").?.array.items[1].bool);
+    const invalid = [_]struct { sql: []const u8, code: []const u8 }{
+        .{ .sql = "SELECT COUNT(*) WITHIN GROUP (ORDER BY 1)", .code = "42809" },
+        .{ .sql = "SELECT percentile_cont(0.5)", .code = "42883" },
+        .{ .sql = "SELECT percentile_cont(0.5,1.0)", .code = "42809" },
+        .{ .sql = "SELECT mode()", .code = "42883" },
+        .{ .sql = "SELECT mode(1)", .code = "42809" },
+        .{ .sql = "SELECT percentile_cont(x) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS x,2 AS g) t GROUP BY g", .code = "42803" },
+        .{ .sql = "SELECT percentile_cont(SUM(x)) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS x) t", .code = "42803" },
+        .{ .sql = "SELECT mode() WITHIN GROUP (ORDER BY 1) OVER ()", .code = "0A000" },
+        .{ .sql = "SELECT percentile_cont(-1) WITHIN GROUP(ORDER BY x) FROM (SELECT 1 AS x) t WHERE false", .code = "22003" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY true)", .code = "42883" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY '1'::text)", .code = "42883" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY ARRAY[1])", .code = "42883" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY 'x')", .code = "22P02" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY CAST(true AS uuid))", .code = "42846" },
+    };
+    for (invalid) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        if (runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{})) |value| {
+            var result = value;
+            result.deinit();
+            return error.ExpectedOrderedSetBindingFailure;
+        } else |err| try std.testing.expectEqualStrings(case.code, @import("antfly_local_sources").sql_errors.describe(err).code);
+    }
+}
+
+test "SQL masked Apply preserves PostgreSQL conditional subquery demand and NULL truth" {
+    const fixture = try std.json.parseFromSlice(struct {
+        reference: []const u8,
+        entries: []const struct { sql: []const u8, rows: []const std.json.Value },
+        errors: []const struct { sql: []const u8, code: []const u8 },
+    }, std.testing.allocator, @import("antfly_local_sources").sql_parity_fixtures.conditional_subquery_reference, .{});
+    defer fixture.deinit();
+    var backend: Backend = .{};
+    for (fixture.value.entries) |entry| {
+        var compiled = try compiler.compile(std.testing.allocator, entry.sql, .{});
+        defer compiled.deinit();
+        var result = runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}) catch |err| {
+            std.debug.print("masked Apply contract failed: {s} {s}\n", .{ entry.sql, @errorName(err) });
+            return err;
+        };
+        defer result.deinit();
+        try std.testing.expectEqual(entry.rows.len, result.output.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), result.output.columns.len);
+        if (entry.rows.len == 0) continue;
+        for (result.output.rows, result.output.sql_nulls.?, entry.rows) |row, nulls, want| {
+            try std.testing.expectEqual(@as(usize, 1), row.len);
+            try std.testing.expectEqual(want == .null, nulls[0]);
+            switch (want) {
+                .null => try std.testing.expect(row[0] == .null),
+                .bool => |value| try std.testing.expectEqual(value, row[0].bool),
+                .integer => |value| try std.testing.expectEqual(value, try std.fmt.parseInt(i64, row[0].string, 10)),
+                else => return error.UnexpectedConditionalContractValue,
+            }
+        }
+    }
+    for (fixture.value.errors) |entry| {
+        var compiled = try compiler.compile(std.testing.allocator, entry.sql, .{});
+        defer compiled.deinit();
+        if (runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{})) |value| {
+            var result = value;
+            result.deinit();
+            std.debug.print("conditional subquery unexpectedly succeeded: {s}\n", .{entry.sql});
+            return error.ExpectedConditionalSubqueryFailure;
+        } else |err| try std.testing.expectEqualStrings(entry.code, @import("antfly_local_sources").sql_errors.describe(err).code);
+    }
+}
+
+test "SQL global aggregate invocation constants preserve parameter types and empty rows" {
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT COALESCE(o.x,7)+COUNT(*) FROM (SELECT 1 AS y WHERE FALSE) i) FROM (SELECT $1::bigint AS x) o", .{});
+    defer compiled.deinit();
+    var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, backend.backend(), &compiled, &.{});
+    defer description.deinit();
+    try std.testing.expectEqual(ast.ColumnType.integer, description.binding.parameter_types[0].?);
+    for ([_]std.json.Value{ .null, .{ .integer = 9 }, .{ .integer = -3 } }, [_][]const u8{ "7", "9", "-3" }) |value, expected| {
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{value}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings(expected, result.output.rows[0][0].string);
+        try std.testing.expect(!result.output.sql_nulls.?[0][0]);
+    }
+}
+
+test "SQL global aggregate invocation constants unwind every allocation failure" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{};
+            var compiled = try compiler.compile(a, "SELECT (SELECT (SELECT o.x+q.z+COUNT(*) FROM (SELECT 1 AS y WHERE FALSE) i) FROM (SELECT 3 AS z) q) FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY o.x", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            try std.testing.expectEqualStrings("4", result.output.rows[0][0].string);
+            try std.testing.expectEqualStrings("5", result.output.rows[1][0].string);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "SQL global aggregate invocation constants survive spill-backed nested result cursors" {
+    var backend: Backend = .{};
+    var iface = backend.backend();
+    iface.execution_io = std.testing.io;
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT (SELECT o.x+q.z+COUNT(*) FROM (SELECT 1 AS y WHERE FALSE) i) FROM (SELECT 3 AS z) q) FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY o.x", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, iface, &compiled, &.{}, .{ .spill_bytes = 1024 * 1024 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+    try std.testing.expectEqualStrings("4", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("5", result.output.rows[1][0].string);
+}
+
+test "SQL sorted scalar outputs retain computed aliases and NULL provenance" {
+    var backend: Backend = .{};
+    for ([_][]const u8{
+        "SELECT o.x+1 AS rank,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY rank DESC LIMIT 1",
+        "SELECT (SELECT o.x+1) AS rank,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY rank DESC LIMIT 1",
+    }) |sql| {
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings("rank", result.output.columns[0].name);
+        try std.testing.expectEqualStrings("v", result.output.columns[1].name);
+        try std.testing.expectEqualStrings("3", result.output.rows[0][0].string);
+        try std.testing.expect(result.output.sql_nulls.?[0][1]);
+    }
+}
+
+test "SQL sorted wildcard scalar outputs bind ordinals before selection" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, rows: []const u8 }{
+        .{ .sql = "SELECT o.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 DESC LIMIT 1", .rows = "[[\"2\",null]]" },
+        .{ .sql = "SELECT o.*,o.x+10 AS rank,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 2 DESC LIMIT 1", .rows = "[[\"2\",\"12\",null]]" },
+        .{ .sql = "SELECT o.*,(SELECT o.x+10) AS rank FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 2 DESC LIMIT 1", .rows = "[[\"2\",\"12\"]]" },
+        .{ .sql = "SELECT o.*,(SELECT o.x+10) AS rank FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 ASC LIMIT 1 OFFSET 1", .rows = "[[\"2\",\"12\"]]" },
+        .{ .sql = "SELECT o.*,o.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 2 DESC LIMIT 1", .rows = "[[\"2\",\"2\",null]]" },
+        .{ .sql = "WITH c(x) AS (SELECT 1 UNION ALL SELECT 2) SELECT c.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE c.x=1) AS v FROM c ORDER BY 1 DESC LIMIT 1", .rows = "[[\"2\",null]]" },
+        .{ .sql = "SELECT p.k,l.x,l.v FROM (SELECT 1 AS k) p CROSS JOIN LATERAL (SELECT q.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE q.x=p.k) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) q ORDER BY 1 DESC LIMIT 1) l", .rows = "[[\"1\",\"2\",null]]" },
+        .{ .sql = "SELECT * FROM ((SELECT o.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 DESC LIMIT 1) UNION ALL SELECT 3,CAST(NULL AS BIGINT)) s ORDER BY 1", .rows = "[[\"2\",null],[\"3\",null]]" },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        const rows = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+        defer std.testing.allocator.free(rows);
+        try std.testing.expectEqualStrings(case.rows, rows);
+    }
+    var skipped = try compiler.compile(std.testing.allocator, "SELECT o.*,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE o.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 ASC LIMIT 1 OFFSET 1", .{});
+    defer skipped.deinit();
+    try std.testing.expectError(error.SqlCardinalityViolation, runtime.execute(std.testing.allocator, backend.backend(), &skipped, &.{}, .{}));
+}
+
+test "SQL sorted wildcard ordinal staging releases all allocations" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{};
+            var compiled = try compiler.compile(a, "SELECT o.*,(SELECT o.x+10) AS rank FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY 1 ASC LIMIT $1 OFFSET $2", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{ .{ .integer = 1 }, .{ .integer = 1 } }, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+            try std.testing.expectEqualStrings("12", result.output.rows[0][1].string);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "SQL window input subqueries retain partition ordering and filter domains" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, rows: []const u8 }{
+        .{ .sql = "SELECT t.x,row_number() OVER (PARTITION BY (SELECT t.x%2) ORDER BY (SELECT t.x) DESC) AS n FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) t ORDER BY t.x", .rows = "[[\"1\",\"2\"],[\"2\",\"1\"],[\"3\",\"1\"]]" },
+        .{ .sql = "SELECT t.x,row_number() OVER w AS n FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) t WINDOW w AS (PARTITION BY (SELECT t.x%2) ORDER BY (SELECT t.x) DESC) ORDER BY t.x", .rows = "[[\"1\",\"2\"],[\"2\",\"1\"],[\"3\",\"1\"]]" },
+        .{ .sql = "SELECT t.x,SUM(t.x) FILTER (WHERE t.x>1) OVER (ORDER BY (SELECT t.x) ROWS UNBOUNDED PRECEDING) AS n FROM (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) t ORDER BY t.x", .rows = "[[\"1\",null],[\"2\",\"2\"],[\"3\",\"5\"]]" },
+        .{ .sql = "SELECT row_number() OVER (ORDER BY CASE WHEN t.x=1 THEN (SELECT t.x) ELSE (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i) END) FROM (SELECT 1 AS x) t", .rows = "[[\"1\"]]" },
+        .{ .sql = "SELECT COUNT((SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i)) FILTER (WHERE false) OVER (ORDER BY (SELECT t.x)) FROM (SELECT 1 AS x) t", .rows = "[[\"0\"]]" },
+        .{ .sql = "SELECT row_number() OVER (ORDER BY (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i)) FROM (SELECT 1 AS x) t WHERE false", .rows = "[]" },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        const rows = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+        defer std.testing.allocator.free(rows);
+        try std.testing.expectEqualStrings(case.rows, rows);
+    }
+    var filtered = try compiler.compile(std.testing.allocator, "SELECT COUNT(*) FILTER (WHERE false) OVER (ORDER BY (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i)) FROM (SELECT 1 AS x) t", .{});
+    defer filtered.deinit();
+    try std.testing.expectError(error.SqlCardinalityViolation, runtime.execute(std.testing.allocator, backend.backend(), &filtered, &.{}, .{}));
+    var unused = try compiler.compile(std.testing.allocator, "SELECT 1 WINDOW unused AS (ORDER BY (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i))", .{});
+    defer unused.deinit();
+    try std.testing.expectError(error.SqlCardinalityViolation, runtime.execute(std.testing.allocator, backend.backend(), &unused, &.{}, .{}));
+}
+
+test "SQL window input subquery staging releases every allocation" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{};
+            var compiled = try compiler.compile(a, "SELECT t.x,row_number() OVER w,rank() OVER w FROM (SELECT 1 AS x UNION ALL SELECT 2) t WINDOW w AS (ORDER BY (SELECT t.x) DESC) ORDER BY t.x", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            try std.testing.expectEqualStrings("2", result.output.rows[0][1].string);
+            try std.testing.expectEqualStrings("row_number", result.output.columns[1].name);
+            try std.testing.expectEqualStrings("rank", result.output.columns[2].name);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "SQL phase outputs evaluate scalar children after grouping and windows" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, rows: []const u8 }{
+        .{ .sql = "SELECT t.x,(SELECT t.x+10) AS v FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x", .rows = "[[\"1\",\"11\"],[\"2\",\"12\"]]" },
+        .{ .sql = "SELECT SUM(t.x),(SELECT 1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) t", .rows = "[[\"3\",\"1\"]]" },
+        .{ .sql = "SELECT t.x,row_number() OVER (ORDER BY t.x) AS n,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE t.x=1) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY t.x DESC LIMIT 1", .rows = "[[\"2\",\"2\",null]]" },
+        .{ .sql = "SELECT t.x,COUNT(*)+(SELECT t.x) AS n FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x HAVING (SELECT t.x)>1 ORDER BY t.x", .rows = "[[\"2\",\"3\"]]" },
+        .{ .sql = "SELECT t.x+1 AS k,COUNT(*),(SELECT 9) AS v FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY 1 ORDER BY k", .rows = "[[\"2\",\"2\",\"9\"],[\"3\",\"1\",\"9\"]]" },
+        .{ .sql = "SELECT t.x+1 AS k,COUNT(*),(SELECT 9) AS v FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY k ORDER BY k", .rows = "[[\"2\",\"2\",\"9\"],[\"3\",\"1\",\"9\"]]" },
+        .{ .sql = "SELECT t.x+1 AS k,COUNT(*),(SELECT 9) AS v FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY x+1 ORDER BY k", .rows = "[[\"2\",\"2\",\"9\"],[\"3\",\"1\",\"9\"]]" },
+        .{ .sql = "SELECT t.x,COUNT(*),row_number() OVER (ORDER BY COUNT(*) DESC),(SELECT t.x) FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x", .rows = "[[\"1\",\"2\",\"1\",\"1\"],[\"2\",\"1\",\"2\",\"2\"]]" },
+        .{ .sql = "SELECT COUNT(*),(SELECT 7) FROM (SELECT 1 AS x) t WHERE false", .rows = "[[\"0\",\"7\"]]" },
+        .{ .sql = "SELECT t.x,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i) FROM (SELECT 1 AS x) t WHERE false GROUP BY t.x", .rows = "[]" },
+        .{ .sql = "SELECT t.x,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE t.x=1) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x DESC LIMIT 1", .rows = "[[\"2\",null]]" },
+        .{ .sql = "SELECT t.x,(SELECT t.x FROM (SELECT 3 AS x) t) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x", .rows = "[[\"1\",\"3\"],[\"2\",\"3\"]]" },
+        .{ .sql = "SELECT t.x,(SELECT x+10) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x", .rows = "[[\"1\",\"11\"],[\"2\",\"12\"]]" },
+        .{ .sql = "SELECT CASE WHEN COUNT(*)=0 THEN (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i) ELSE 1 END FROM (SELECT 1 AS x) t", .rows = "[[\"1\"]]" },
+        .{ .sql = "WITH c(x) AS (SELECT 1 UNION ALL SELECT 2) SELECT t.x,(SELECT c.x FROM c WHERE c.x=t.x) FROM c t GROUP BY t.x ORDER BY t.x", .rows = "[[\"1\",\"1\"],[\"2\",\"2\"]]" },
+        .{ .sql = "SELECT p.k,l.x,l.v FROM (SELECT 1 AS k) p CROSS JOIN LATERAL (SELECT q.x,(SELECT q.x+p.k) AS v FROM (SELECT 1 AS x UNION ALL SELECT 2) q GROUP BY q.x ORDER BY q.x DESC LIMIT 1) l", .rows = "[[\"1\",\"2\",\"3\"]]" },
+        .{ .sql = "SELECT t.x,COUNT(*),row_number() OVER (ORDER BY t.x),(SELECT t.x) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x HAVING t.x>1 ORDER BY t.x", .rows = "[[\"2\",\"1\",\"1\",\"2\"]]" },
+        .{ .sql = "SELECT t.x,COUNT(*),row_number() OVER (ORDER BY t.x),(SELECT t.x) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x HAVING (SELECT t.x)>1 ORDER BY t.x", .rows = "[[\"2\",\"1\",\"1\",\"2\"]]" },
+        .{ .sql = "SELECT t.x,CASE WHEN row_number() OVER (ORDER BY t.x)=1 THEN (SELECT t.x+10) ELSE 0 END FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY t.x", .rows = "[[\"1\",\"11\"],[\"2\",\"0\"]]" },
+        .{ .sql = "SELECT t.x,SUM((SELECT t.x)) OVER (ORDER BY t.x)+(SELECT 1) FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY t.x", .rows = "[[\"1\",\"2\"],[\"2\",\"4\"]]" },
+        .{ .sql = "SELECT * FROM ((SELECT t.x,(SELECT t.x+10) FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x DESC LIMIT 1) UNION ALL SELECT 3,13) s ORDER BY 1", .rows = "[[\"2\",\"12\"],[\"3\",\"13\"]]" },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}) catch |err| {
+            std.debug.print("phase output failed: {s}: {s}\n", .{ case.sql, @errorName(err) });
+            return err;
+        };
+        defer result.deinit();
+        const rows = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+        defer std.testing.allocator.free(rows);
+        try std.testing.expectEqualStrings(case.rows, rows);
+    }
+}
+
+test "SQL phase outputs retain aggregate and EXISTS labels" {
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT COUNT(*),EXISTS(SELECT 1) FROM (SELECT 1 AS x) t", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("count", result.output.columns[0].name);
+    try std.testing.expectEqualStrings("exists", result.output.columns[1].name);
+    try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+    try std.testing.expect(result.output.rows[0][1].bool);
+}
+
+test "SQL phase outputs preserve grouping and child cardinality diagnostics" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, code: []const u8 }{
+        .{ .sql = "SELECT COUNT(*),(SELECT t.x) FROM (SELECT 1 AS x) t", .code = "42803" },
+        .{ .sql = "SELECT t.x,(SELECT t.y) FROM (SELECT 1 AS x,2 AS y) t GROUP BY t.x", .code = "42803" },
+        .{ .sql = "SELECT t.x+1,(SELECT t.x+1) FROM (SELECT 1 AS x) t GROUP BY t.x+1", .code = "42803" },
+        .{ .sql = "SELECT t.x,(SELECT t.missing) FROM (SELECT 1 AS x) t GROUP BY t.x", .code = "42703" },
+        .{ .sql = "SELECT t.x,(SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE t.x=1) FROM (SELECT 1 AS x UNION ALL SELECT 2) t GROUP BY t.x ORDER BY t.x ASC LIMIT 1 OFFSET 1", .code = "21000" },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        if (runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{})) |value| {
+            var result = value;
+            result.deinit();
+            return error.ExpectedPhaseOutputFailure;
+        } else |err| try std.testing.expectEqualStrings(case.code, @import("antfly_local_sources").sql_errors.describe(err).code);
+    }
+}
+
+test "SQL phase outputs release every allocation with prepared grouped demand" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{};
+            var compiled = try compiler.compile(a, "SELECT t.x,COUNT(*)+(SELECT t.x+$1) AS n FROM (SELECT 1 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t GROUP BY t.x HAVING (SELECT t.x)>$2 ORDER BY n DESC,t.x DESC LIMIT $3 OFFSET $4", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{ .{ .integer = 2 }, .{ .integer = 0 }, .{ .integer = 1 }, .{ .integer = 1 } }, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+            try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+            try std.testing.expectEqualStrings("5", result.output.rows[0][1].string);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "SQL row bounds validate negative parameters at execution in their own domain" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, code: []const u8 }{
+        .{ .sql = "SELECT 1 LIMIT $1", .code = "2201W" },
+        .{ .sql = "SELECT 1 OFFSET $1", .code = "2201X" },
+        .{ .sql = "SELECT 1 FETCH NEXT $1 ROWS ONLY", .code = "2201W" },
+        .{ .sql = "SELECT i.x FROM (SELECT 1 AS x) i LIMIT $1", .code = "2201W" },
+        .{ .sql = "SELECT i.x FROM (SELECT 1 AS x) i OFFSET $1", .code = "2201X" },
+        .{ .sql = "SELECT (SELECT i.x FROM (SELECT 1 AS x) i LIMIT $1)", .code = "2201W" },
+        .{ .sql = "SELECT (SELECT i.x FROM (SELECT 1 AS x) i OFFSET $1)", .code = "2201X" },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        if (runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{.{ .integer = -1 }}, .{})) |value| {
+            var result = value;
+            result.deinit();
+            return error.ExpectedNegativeRowBoundFailure;
+        } else |err| try std.testing.expectEqualStrings(case.code, @import("antfly_local_sources").sql_errors.describe(err).code);
+    }
+    // Binding negative literal bounds must not reject an undemanded child.
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT CASE WHEN FALSE THEN (SELECT 1 LIMIT -1) ELSE 7 END", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("7", result.output.rows[0][0].string);
+}
+
+test "SQL scalar cardinality NULL limits retain unbounded result admission" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, parameters: []const std.json.Value = &.{} }{
+        .{ .sql = "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) o LIMIT NULL" },
+        .{ .sql = "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) o LIMIT $1", .parameters = &.{.null} },
+        .{ .sql = "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) o LIMIT ALL" },
+        .{ .sql = "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) o FETCH NEXT NULL ROWS ONLY" },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlResultTooLarge, runtime.execute(std.testing.allocator, backend.backend(), &compiled, case.parameters, .{ .result_rows = 1 }));
+    }
+}
+
+test "SQL nested join buffers own borrowed text and JSON across upstream pulls" {
+    const Fixture = struct {
+        const Owner = @This();
+        const Cursor = struct {
+            offset: usize = 0,
+            payload: [32]u8 = undefined,
+            fn next(ptr: *anyopaque, a: std.mem.Allocator, _: u32) !catalog.Page {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.offset == 9) return .{ .rows = &.{} };
+                const text = try std.fmt.bufPrint(&self.payload, "payload-{d:0>3}", .{self.offset});
+                var object: std.json.ObjectMap = .empty;
+                var metadata: std.json.ObjectMap = .empty;
+                try metadata.put(a, "text", .{ .string = text });
+                try object.put(a, "id", .{ .integer = @intCast(self.offset) });
+                try object.put(a, "label", .{ .string = text });
+                try object.put(a, "metadata", .{ .object = metadata });
+                const rows = try a.alloc(catalog.Row, 1);
+                rows[0] = .{ .id = text, .version = 1, .value = .{ .object = object } };
+                self.offset += 1;
+                return .{ .rows = rows, .after = if (self.offset < 9) "more" else null };
+            }
+        };
+        states: [2]Cursor = .{ .{}, .{} },
+        cursors: [2]catalog.Cursor = undefined,
+        closes: usize = 0,
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, name: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{
+                .{ .name = "id", .path = "id", .type = .integer },
+                .{ .name = "label", .path = "label", .type = .string },
+                .{ .name = "metadata", .path = "metadata", .type = .json },
+            } };
+        }
+        fn capture(ptr: *anyopaque, _: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const self: *Owner = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 2), scans.len);
+            for (&self.states, &self.cursors) |*state, *cursor| cursor.* = .{ .ptr = state, .next = Cursor.next, .close = undefined };
+            return .{ .ptr = self, .cursors = &self.cursors, .close = close };
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *Owner = @ptrCast(@alignCast(ptr));
+            self.closes += 1;
+        }
+        fn run(a: std.mem.Allocator) !void {
+            var fixture: Owner = .{};
+            const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = resolve, .scan = Backend.scan, .mutate = Backend.mutate, .checkpoint = Backend.checkpoint, .open_statement = capture } };
+            var compiled = try compiler.compile(a, "WITH joined_rows AS (SELECT o.id,o.label,o.metadata FROM records o JOIN records c ON o.id=c.id WHERE o.label <> 'discard') SELECT id,label,metadata FROM joined_rows ORDER BY id", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend, &compiled, &.{}, .{ .page_rows = 3 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 9), result.output.rows.len);
+            for (result.output.rows, 0..) |row, index| {
+                var buffer: [32]u8 = undefined;
+                const expected = try std.fmt.bufPrint(&buffer, "payload-{d:0>3}", .{index});
+                try std.testing.expectEqualStrings(expected, row[1].string);
+                try std.testing.expectEqualStrings(expected, row[2].object.get("text").?.string);
+            }
+            try std.testing.expectEqual(@as(usize, 1), fixture.closes);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
 
 test "SQL quantified subqueries match three valued comparison truth tables" {
     const Set = struct { sql: []const u8, values: []const ?i64 };
@@ -48,8 +491,8 @@ test "SQL quantified subqueries match three valued comparison truth tables" {
     const operands = [_]?i64{ 0, 1, 2, null };
     var backend: Backend = .{};
     for ([_][]const u8{ "=", "<>", "<", "<=", ">", ">=" }, 0..) |op, op_index| {
-        for ([_]bool{ false, true }) |every| for (sets) |set| {
-            const query = try std.fmt.allocPrint(std.testing.allocator, "SELECT x {s} {s} (SELECT y FROM ({s}) i) FROM (SELECT 0 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT NULL) o", .{ op, if (every) "ALL" else "ANY", set.sql });
+        for ([_]bool{ false, true }) |every| for (sets) |set| for ([_]bool{ false, true }) |boundary| {
+            const query = try std.fmt.allocPrint(std.testing.allocator, "SELECT x {s} {s} (SELECT y FROM ({s}) i{s}) FROM (SELECT 0 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT NULL) o", .{ op, if (every) "ALL" else "ANY", set.sql, if (boundary) " WHERE o.x IS NULL OR o.x IS NOT NULL ORDER BY i.y LIMIT 100" else "" });
             defer std.testing.allocator.free(query);
             var compiled = try compiler.compile(std.testing.allocator, query, .{});
             defer compiled.deinit();
@@ -218,7 +661,7 @@ test "SQL correlated IN groups NULL evidence by lexical correlation keys" {
     try std.testing.expect(!result.output.rows[2][1].bool);
 }
 
-test "SQL membership unwinds allocations admits parameters and fails closed outside decorrelation" {
+test "SQL membership unwinds allocations admits parameters and preserves nonkeyed correlation" {
     const Case = struct {
         fn run(alloc: std.mem.Allocator) !void {
             var backend: Backend = .{};
@@ -234,9 +677,11 @@ test "SQL membership unwinds allocations admits parameters and fails closed outs
     var compiled = try compiler.compile(std.testing.allocator, "SELECT 1 IN (SELECT x FROM (SELECT 1 AS x) i)", .{});
     defer compiled.deinit();
     try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .retained_bytes = 1 }));
-    var invalid = try compiler.compile(std.testing.allocator, "SELECT o.x IN (SELECT i.x FROM (SELECT 1 AS x) i WHERE i.x > o.x) FROM (SELECT 1 AS x) o", .{});
-    defer invalid.deinit();
-    try std.testing.expectError(error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, backend.backend(), &invalid, &.{}, .{}));
+    var correlated = try compiler.compile(std.testing.allocator, "SELECT o.x IN (SELECT i.x FROM (SELECT 1 AS x) i WHERE i.x > o.x) FROM (SELECT 1 AS x) o", .{});
+    defer correlated.deinit();
+    var correlated_result = try runtime.execute(std.testing.allocator, backend.backend(), &correlated, &.{}, .{});
+    defer correlated_result.deinit();
+    try std.testing.expect(!correlated_result.output.rows[0][0].bool);
     try std.testing.expectError(error.SqlLimitExceeded, compiler.compile(std.testing.allocator, "SELECT 1 IN (SELECT 1 IN (SELECT 1 IN (SELECT 1)))", .{ .max_depth = 2 }));
 }
 
@@ -322,6 +767,23 @@ test "SQL membership bounded hash projections share one capture instead of per r
     try std.testing.expectEqual(@as(usize, 1), fixture.captures);
     try std.testing.expectEqual(@as(usize, 1), fixture.closes);
     std.debug.print("SQL membership: outer_rows={d} inner_rows={d} native_scans=3 captures=1 peak_bytes={d} elapsed_ns={d}\n", .{ fixture.count, fixture.count, result.peakMemoryBytes(), elapsed });
+    {
+        // An independent ordered child must remain a hash build, not replay
+        // its comparison rows for every parent merely because it has LIMIT.
+        var independent: Fixture = .{ .count = fixture.count, .key_count = fixture.key_count };
+        var ordered = try compiler.compile(std.testing.allocator, "SELECT count(*) FROM outer_rows o WHERE o.x+1 IN (SELECT i.x+1 FROM inner_rows i ORDER BY i.x LIMIT 100000)", .{});
+        defer ordered.deinit();
+        var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, independent.backend(), &ordered, &.{});
+        defer description.deinit();
+        const join = description.binding.relation.?.root.operation.join;
+        try std.testing.expectEqual(@as(usize, 1), join.left_keys.len);
+        var output = try runtime.execute(execution_alloc, independent.backend(), &ordered, &.{}, .{ .retained_bytes = 32 * 1024 * 1024 });
+        defer output.deinit();
+        try std.testing.expectEqual(independent.count, try std.fmt.parseInt(usize, output.output.rows[0][0].string, 10));
+        try std.testing.expectEqual(independent.count * 3, independent.rows);
+        try std.testing.expectEqual(@as(usize, 1), independent.captures);
+        try std.testing.expectEqual(@as(usize, 1), independent.closes);
+    }
     fixture.canceled = true;
     try std.testing.expectError(error.QueryCanceled, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
     for ([_][]const u8{
@@ -340,7 +802,8 @@ test "SQL membership bounded hash projections share one capture instead of per r
         var output = try runtime.execute(execution_alloc, fixture.backend(), &ordered, &.{}, .{ .retained_bytes = 32 * 1024 * 1024 });
         defer output.deinit();
         try std.testing.expectEqual(fixture.count, try std.fmt.parseInt(usize, output.output.rows[0][0].string, 10));
-        try std.testing.expectEqual(fixture.count + (if (case_index == 2) @min(fixture.count, 256) else fixture.count), fixture.rows);
+        // An invariant EXISTS needs one witness, not a speculative full page.
+        try std.testing.expectEqual(fixture.count + (if (case_index == 2) @as(usize, 1) else fixture.count), fixture.rows);
         try std.testing.expectEqual(@as(usize, 1), fixture.captures);
         try std.testing.expectEqual(@as(usize, 1), fixture.closes);
         std.debug.print("SQL subquery: shape={s} rows={d} native_rows={d} native_scans=2 captures=1 peak_bytes={d} elapsed_ns={d}\n", .{ if (case_index == 2) "uncorrelated-exists" else "ordered", fixture.count, fixture.rows, output.peakMemoryBytes(), std.Io.Clock.awake.now(std.testing.io).nanoseconds - ordered_start });
@@ -596,7 +1059,7 @@ test "SQL decorrelation unwinds every allocation and enforces shared memory admi
 
 test "SQL correlated scalar parameter constraints propagate through join and result domains" {
     var backend: Backend = .{};
-    var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT $1 FROM (SELECT 1 AS y) i WHERE i.y=o.x)+1 FROM (SELECT $2 AS x) o WHERE o.x=1", .{});
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT $1::bigint FROM (SELECT 1 AS y) i WHERE i.y=o.x)+1 FROM (SELECT $2::bigint AS x) o WHERE o.x=1", .{});
     defer compiled.deinit();
     var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, backend.backend(), &compiled, &.{});
     defer description.deinit();

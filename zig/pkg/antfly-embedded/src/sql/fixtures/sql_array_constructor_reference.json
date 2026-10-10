@@ -1,0 +1,32 @@
+{
+  "inputs": "SELECT 12::integer n,'hello'::text t,true flag,'[-2:-1]={1,NULL}'::integer[] a,'[-2:-1]={3,4}'::integer[] b,'{}'::integer[] e,NULL::integer[] z",
+  "entries": [
+    {"sql":"ARRAY[n,NULL,n+1]","text":"{12,NULL,13}","pg_type":"integer[]"},
+    {"sql":"ARRAY['1',n]","text":"{1,12}","pg_type":"integer[]"},
+    {"sql":"ARRAY[CAST(n AS real),CAST(2.5 AS real),NULL]","text":"{12,2.5,NULL}","pg_type":"real[]"},
+    {"sql":"ARRAY[CAST(n AS numeric),1.245::numeric,NULL]","text":"{12,1.245,NULL}","pg_type":"numeric[]"},
+    {"sql":"ARRAY[t,'hello',NULL]","text":"{hello,hello,NULL}","pg_type":"text[]"},
+    {"sql":"ARRAY[flag,true,NULL]","text":"{t,t,NULL}","pg_type":"boolean[]"},
+    {"sql":"ARRAY['00000000-0000-0000-0000-000000000001'::uuid,NULL]","text":"{00000000-0000-0000-0000-000000000001,NULL}","pg_type":"uuid[]"},
+    {"sql":"ARRAY[a,b]","text":"[1:2][-2:-1]={{1,NULL},{3,4}}","pg_type":"integer[]"},
+    {"sql":"ARRAY[e,e]","text":"{}","pg_type":"integer[]"},
+    {"sql":"ARRAY[z,z]","text":"{}","pg_type":"integer[]"},
+    {"sql":"ARRAY[z,e]","text":"{}","pg_type":"integer[]"},
+    {"sql":"ARRAY[a,e]","sqlstate":"2202E"},
+    {"sql":"ARRAY[a,z]","sqlstate":"2202E"},
+    {"sql":"ARRAY[a,'[1:2]={3,4}'::integer[]]","sqlstate":"2202E"},
+    {"sql":"ARRAY[ARRAY[n,n+1],ARRAY[n+2,NULL]]","text":"{{12,13},{14,NULL}}","pg_type":"integer[]"},
+    {"sql":"ARRAY[NULL,NULL]","text":"{NULL,NULL}","pg_type":"text[]"},
+    {"sql":"ARRAY[]::numeric[]","text":"{}","pg_type":"numeric[]"},
+    {"sql":"CASE WHEN false THEN ARRAY[32768::smallint] ELSE ARRAY[1::smallint] END","text":"{1}","pg_type":"smallint[]"},
+    {"sql":"ARRAY[32768::smallint]","sqlstate":"22003"},
+    {"sql":"CAST('[-2:-1]={1,NULL}' AS integer[])","text":"[-2:-1]={1,NULL}","pg_type":"integer[]"},
+    {"sql":"CAST('{12.345,NULL}' AS numeric(4,2)[])","text":"{12.35,NULL}","pg_type":"numeric[]"},
+    {"sql":"CAST('{true,NULL,false}' AS boolean[])","text":"{t,NULL,f}","pg_type":"boolean[]"},
+    {"sql":"CAST('{\"null\",NULL}' AS jsonb[])","text":"{\"null\",NULL}","pg_type":"jsonb[]"},
+    {"sql":"ARRAY['bad',n]","sqlstate":"22P02"},
+    {"sql":"CASE WHEN false THEN ARRAY['bad',n] ELSE ARRAY[n] END","sqlstate":"22P02"},
+    {"sql":"ARRAY['1'::text,n]","sqlstate":"42804"},
+    {"sql":"ARRAY[ARRAY[n],ARRAY[n,n+1]]","sqlstate":"2202E"}
+  ]
+}

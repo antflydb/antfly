@@ -36,6 +36,11 @@ pub const Error = std.mem.Allocator.Error || error{
     InvalidSqlParameter,
     InvalidSqlNumber,
     DuplicateSqlColumn,
+    SqlInvalidUnicodeEscape,
+    SqlInvalidTextEncoding,
+    SqlInvalidParameterValue,
+    SqlInvalidTextRepresentation,
+    SqlNumericOutOfRange,
 };
 
 /// Immutable and schema independent: safely share a compiled statement between
@@ -82,7 +87,7 @@ pub fn compileScalar(allocator: std.mem.Allocator, sql: []const u8, limits: Limi
     };
     const tokens = switch (lexed) {
         .tokens => |value| value,
-        .diagnostic => return error.InvalidSqlSyntax,
+        .diagnostic => |failure| return lexicalError(failure.kind),
     };
     var diagnostic: Diagnostic = .{};
     var parser: Parser = .{ .alloc = arena.allocator(), .tokens = tokens.items, .source = sql, .limits = limits, .diagnostic = &diagnostic };
@@ -117,7 +122,7 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
         .tokens => |tokens| tokens,
         .diagnostic => |failure| {
             diagnostic.* = .{ .start = failure.source_start, .end = failure.source_end, .message = failure.message() };
-            return error.InvalidSqlSyntax;
+            return lexicalError(failure.kind);
         },
     };
     if (tokens.items.len > limits.max_tokens) return error.SqlLimitExceeded;
@@ -126,6 +131,28 @@ pub fn compileDiagnostic(allocator: std.mem.Allocator, sql: []const u8, limits: 
     _ = parser.take(.semicolon);
     if (parser.pos != tokens.items.len) return parser.fail(error.UnsupportedSqlShape, "unexpected trailing SQL; only one supported statement is allowed");
     return .{ .arena = arena, .statement = statement, .parameter_count = parser.parameter_count, .uses_current_setting = parser.uses_current_setting };
+}
+
+fn lexicalError(kind: lexer.LexErrorKind) Error {
+    return switch (kind) {
+        .invalid_escape_sequence => error.SqlInvalidUnicodeEscape,
+        .invalid_string_encoding => error.SqlInvalidTextEncoding,
+        else => error.InvalidSqlSyntax,
+    };
+}
+
+test "SQL escape string diagnostics retain PostgreSQL SQLSTATEs" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.SqlInvalidUnicodeEscape, compileScalar(a, "E'\\u12'", .{}));
+    try std.testing.expectError(error.SqlInvalidTextEncoding, compileScalar(a, "E'\\xFF'", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compileScalar(a, "E'\\u0000'", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compileScalar(a, "E'a' 'b'", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compileScalar(a, "E'a'\nE'b'", .{}));
+    try std.testing.expectError(error.InvalidSqlSyntax, compileScalar(a, "E'a'\n/* comment */'b'", .{}));
+    var diagnostic: Diagnostic = .{};
+    try std.testing.expectError(error.SqlInvalidUnicodeEscape, compileDiagnostic(a, "SELECT E'\\u12'", .{}, &diagnostic));
+    try std.testing.expect(diagnostic.start >= 7);
+    try std.testing.expect(diagnostic.end <= 14);
 }
 
 test "setting authority capture follows parsed calls, not SQL text" {
@@ -323,10 +350,15 @@ const Parser = struct {
     }
 
     fn field(self: *Parser) Error![]const u8 {
-        const result = try self.identifier();
+        var result = try self.identifier();
         // Internal separator preserves the distinction between t.column and
         // the single quoted identifier "t.column" without reparsing names.
-        if (self.take(.dot)) return std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ result, try self.identifier() });
+        var parts: usize = 1;
+        while (self.take(.dot)) {
+            if (parts == 4) return self.fail(error.InvalidSqlSyntax, "column references have at most four identifiers");
+            result = try std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ result, try self.identifier() });
+            parts += 1;
+        }
         return result;
     }
 
@@ -353,19 +385,20 @@ const Parser = struct {
         if (!self.peek(.number)) return self.fail(if (self.pos == self.tokens.len or self.peek(.semicolon) or self.peek(.rparen)) error.InvalidSqlSyntax else error.UnsupportedSqlShape, "expected a literal or positional parameter; expression is not supported");
         const t = self.tokens[self.pos];
         self.pos += 1;
-        if (std.mem.indexOfAny(u8, t.text, ".eE") != null) {
-            const parsed = std.fmt.parseFloat(f64, t.text) catch return self.fail(error.InvalidSqlNumber, "invalid numeric literal");
-            if (!std.math.isFinite(parsed)) return self.fail(error.InvalidSqlNumber, "numeric literal must be finite");
-            return .{ .number = if (negative) -parsed else parsed };
-        }
-        const magnitude = std.fmt.parseInt(u64, t.text, 10) catch return self.fail(error.InvalidSqlNumber, "integer literal exceeds 64-bit range");
+        const radix = t.text.len > 2 and t.text[0] == '0' and std.mem.indexOfScalar(u8, "xXoObB", t.text[1]) != null;
+        if (!radix and std.mem.indexOfAny(u8, t.text, ".eE") != null) return self.numericLiteral(t.text, negative);
+        const magnitude = std.fmt.parseInt(u64, t.text, 0) catch return self.numericLiteral(t.text, negative);
         if (negative) {
-            if (magnitude > @as(u64, std.math.maxInt(i64)) + 1) return self.fail(error.InvalidSqlNumber, "integer literal exceeds 64-bit range");
+            if (magnitude > @as(u64, std.math.maxInt(i64)) + 1) return self.numericLiteral(t.text, negative);
             if (magnitude == @as(u64, std.math.maxInt(i64)) + 1) return .{ .integer = std.math.minInt(i64) };
             return .{ .integer = -@as(i64, @intCast(magnitude)) };
         }
-        if (magnitude > std.math.maxInt(i64)) return self.fail(error.InvalidSqlNumber, "integer literal exceeds 64-bit range");
+        if (magnitude > std.math.maxInt(i64)) return self.numericLiteral(t.text, negative);
         return .{ .integer = @intCast(magnitude) };
+    }
+
+    fn numericLiteral(self: *Parser, text: []const u8, negative: bool) Error!ast.Value {
+        return .{ .numeric = if (negative) try std.fmt.allocPrint(self.alloc, "-{s}", .{text}) else try self.alloc.dupe(u8, text) };
     }
 
     fn scalarNode(self: *Parser, expression: ast.Scalar) Error!*const ast.Scalar {
@@ -394,13 +427,17 @@ const Parser = struct {
             try self.rowSubqueryWidth(set.right.*, width);
             return;
         }
-        // A wildcard's width depends on the catalog. Keep this parser-owned
-        // expansion explicit so no assignment can silently discard a column.
-        if (query.count_all or query.columns.len != width)
+        // Wildcards have a schema-bound width. Preserve an exact output
+        // contract for the binder instead of guessing from AST item count.
+        if (!query.count_all) {
+            if (query.columns.len == 0) return;
+            for (query.columns) |projection| if (projection.wildcard) return;
+        }
+        if ((if (query.count_all) @as(usize, 1) else query.columns.len) != width)
             return self.fail(error.InvalidSqlSyntax, "row subquery column count differs from assignment targets");
     }
 
-    fn rowSubqueryAssignments(self: *Parser, targets: []const []const u8, assignments: *std.ArrayList(ast.Assignment), ctes: *std.ArrayList(ast.Cte)) Error!void {
+    fn rowSubqueryAssignments(self: *Parser, targets: []const []const u8, assignments: *std.ArrayList(ast.Assignment)) Error!void {
         self.relation_depth += 1;
         defer self.relation_depth -= 1;
         if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
@@ -410,26 +447,20 @@ const Parser = struct {
         const query = try self.alloc.create(ast.Select);
         query.* = nested.select;
         try self.rowSubqueryWidth(query.*, targets.len);
-        const names = try self.alloc.alloc([]const u8, targets.len);
-        for (names, 0..) |*output_name, index| output_name.* = try std.fmt.allocPrint(self.alloc, "$row_{d}", .{index});
-        // A NUL-prefixed name cannot be spelled by SQL identifiers and thus
-        // cannot shadow a user WITH binding, including quoted `$` names.
-        const cte_name = try std.fmt.allocPrint(self.alloc, "\x00$update_row_source_{d}", .{ctes.items.len});
-        try ctes.append(self.alloc, .{ .name = cte_name, .columns = names, .query = query, .materialization = .materialized });
-        // Both scalar projections reference one typed materialized producer.
-        // Positional names leave the child's aliases and ordering intact.
-        for (targets, names) |target, output_name| {
-            const row_source = try self.relationNode(.{ .table = .{ .name = .{ .table = cte_name }, .alias = "$row_source" } });
-            const output_field = try self.scalarNode(.{ .column = try std.fmt.allocPrint(self.alloc, "$row_source\x00{s}", .{output_name}) });
-            const value_query = try self.alloc.create(ast.Select);
-            value_query.* = .{ .source = row_source, .columns = try self.alloc.dupe(ast.Projection, &.{.{ .expression = output_field }}) };
-            const expression = try self.scalarNode(.{ .call = .{ .name = "$scalar", .args = &.{}, .subquery = value_query } });
+        query.required_output_columns = targets.len;
+        // Every member points at one producer identity. Lowering attaches that
+        // producer once in the target's lexical frame, preserving correlation
+        // and positional typing without inventing an independent CTE scope.
+        for (targets, 0..) |target, index| {
+            const slot = try self.scalarNode(.{ .literal = .{ .integer = @intCast(index) } });
+            const expression = try self.scalarNode(.{ .call = .{ .name = "$row_scalar", .args = try self.alloc.dupe(*const ast.Scalar, &.{slot}), .subquery = query } });
             try assignments.append(self.alloc, .{ .field = target, .expression = expression });
         }
     }
 
     fn scalar(self: *Parser, depth: usize, minimum: u8) Error!*const ast.Scalar {
         if (depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL scalar nesting budget exceeded");
+        if (self.peek(.lbracket)) return self.fail(error.InvalidSqlSyntax, "bare array brackets require ARRAY constructor context");
         var left: *const ast.Scalar = undefined;
         if (self.keyword(.not)) {
             left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = try self.scalar(depth + 1, 3) } });
@@ -455,15 +486,30 @@ const Parser = struct {
                 query.* = nested.select;
                 try self.singleColumnSubquery(query.*);
                 left = try self.scalarNode(.{ .call = .{ .name = "$scalar", .args = &.{}, .subquery = query } });
-            } else left = try self.scalar(depth + 1, 0);
+            } else {
+                left = try self.scalar(depth + 1, 0);
+                if (self.take(.comma)) {
+                    var fields: std.ArrayList(*const ast.Scalar) = .empty;
+                    try fields.append(self.alloc, left);
+                    while (true) {
+                        if (fields.items.len == 256) return self.fail(error.SqlLimitExceeded, "row expression exceeds column limit");
+                        try fields.append(self.alloc, try self.scalar(depth + 1, 0));
+                        if (!self.take(.comma)) break;
+                    }
+                    left = try self.scalarNode(.{ .call = .{ .name = "$row", .args = try fields.toOwnedSlice(self.alloc) } });
+                }
+            }
             try self.expect(.rparen);
         } else if (self.keyword(.cast)) {
             try self.expect(.lparen);
             const operand = try self.scalar(depth + 1, 0);
             try self.expectKeyword(.as);
-            const kind = try self.columnType();
+            const kind = try self.castType();
             try self.expect(.rparen);
-            left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind } });
+            left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
+        } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "array") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) {
+            self.pos += 1;
+            left = try self.arrayConstructor(depth + 1);
         } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "timestamptz") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .string) {
             // Typed literals use the same validating/canonicalizing cast as
             // CAST(text AS timestamptz), including offset normalization.
@@ -492,6 +538,7 @@ const Parser = struct {
             self.pos += 2;
             const name_value = try self.alloc.dupe(u8, function.text);
             if (!function.owned) _ = std.ascii.lowerString(name_value, name_value);
+            if (std.mem.startsWith(u8, name_value, "$")) return self.fail(error.UnsupportedSqlShape, "compiler-owned helper functions cannot be called from SQL");
             if (std.mem.eql(u8, name_value, "current_setting")) self.uses_current_setting = true;
             var args: std.ArrayList(*const ast.Scalar) = .empty;
             const distinct = self.keyword(.distinct);
@@ -499,12 +546,51 @@ const Parser = struct {
             if (star) {
                 if (!std.mem.eql(u8, name_value, "count")) return self.fail(error.InvalidSqlSyntax, "only COUNT accepts a star argument");
                 try self.expect(.rparen);
+            } else if (!function.owned and std.mem.eql(u8, name_value, "position")) {
+                // IN is otherwise a comparison operator. Parse its first
+                // operand above comparison precedence, then swap SQL's order
+                // into the shared strpos(text, needle) bound instruction.
+                const needle = try self.scalar(depth + 1, 4);
+                try self.expectKeyword(.in);
+                const haystack = try self.scalar(depth + 1, 0);
+                try args.appendSlice(self.alloc, &.{ haystack, needle });
+                try self.expect(.rparen);
             } else if (!self.take(.rparen)) {
-                while (true) {
+                const first = try self.scalar(depth + 1, 0);
+                try args.append(self.alloc, first);
+                if (!function.owned and std.mem.eql(u8, name_value, "substring") and (self.keyword(.from) or (self.pos < self.tokens.len and self.tokens[self.pos].isKeyword(.@"for")))) {
+                    if (self.keyword(.@"for")) {
+                        try args.append(self.alloc, try self.scalarNode(.{ .literal = .{ .integer = 1 } }));
+                        try args.append(self.alloc, try self.scalar(depth + 1, 0));
+                    } else {
+                        try args.append(self.alloc, try self.scalar(depth + 1, 0));
+                        if (self.keyword(.@"for")) try args.append(self.alloc, try self.scalar(depth + 1, 0));
+                    }
+                } else if (!function.owned and std.mem.eql(u8, name_value, "overlay") and self.ddlWord("placing")) {
                     try args.append(self.alloc, try self.scalar(depth + 1, 0));
-                    if (!self.take(.comma)) break;
+                    try self.expectKeyword(.from);
+                    try args.append(self.alloc, try self.scalar(depth + 1, 0));
+                    if (self.keyword(.@"for")) try args.append(self.alloc, try self.scalar(depth + 1, 0));
+                } else while (self.take(.comma)) {
+                    try args.append(self.alloc, try self.scalar(depth + 1, 0));
                 }
                 try self.expect(.rparen);
+            }
+            var within_group: ?*const ast.Scalar.WithinGroup = null;
+            if (self.ddlWord("within")) {
+                try self.expectKeyword(.group);
+                try self.expect(.lparen);
+                const orders = try self.orderExpressionsDepth(false, depth + 1);
+                if (orders.len == 0) return self.fail(error.InvalidSqlSyntax, "WITHIN GROUP requires ORDER BY");
+                try self.expect(.rparen);
+                const ordering = try self.alloc.alloc(ast.Scalar.Ordering, orders.len);
+                for (orders, ordering) |order, *out| {
+                    out.* = .{ .descending = order.descending, .nulls_first = order.nulls_first };
+                    try args.append(self.alloc, order.expression orelse try self.scalarNode(.{ .column = order.field }));
+                }
+                const descriptor = try self.alloc.create(ast.Scalar.WithinGroup);
+                descriptor.* = .{ .orders = ordering };
+                within_group = descriptor;
             }
             var filter: ?*const ast.Scalar = null;
             if (self.keyword(.filter)) {
@@ -514,7 +600,10 @@ const Parser = struct {
                 try self.expect(.rparen);
             }
             const window_spec = if (self.keyword(.over)) try self.window(depth + 1) else null;
-            left = try self.scalarNode(.{ .call = .{ .name = name_value, .args = try args.toOwnedSlice(self.alloc), .star = star, .distinct = distinct, .filter = filter, .window = window_spec } });
+            const row = !function.owned and std.mem.eql(u8, name_value, "row");
+            if (row and (distinct or star or filter != null or window_spec != null or within_group != null)) return self.fail(error.InvalidSqlSyntax, "ROW constructor does not accept aggregate modifiers");
+            if (row and args.items.len > 256) return self.fail(error.SqlLimitExceeded, "row expression exceeds column limit");
+            left = try self.scalarNode(.{ .call = .{ .name = if (row) "$row" else name_value, .args = try args.toOwnedSlice(self.alloc), .star = star, .distinct = distinct, .filter = filter, .window = window_spec, .within_group = within_group } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].isKeyword(.null) and !self.tokens[self.pos].isKeyword(.true) and !self.tokens[self.pos].isKeyword(.false)) {
             left = try self.scalarNode(.{ .column = try self.field() });
         } else left = try self.scalarNode(.{ .literal = try self.value() });
@@ -524,10 +613,19 @@ const Parser = struct {
                 const negated = self.tokens[self.pos].isKeyword(.not) and self.pos + 1 < self.tokens.len and (self.tokens[self.pos + 1].isKeyword(.in) or self.tokens[self.pos + 1].isKeyword(.between) or self.tokens[self.pos + 1].isKeyword(.like) or self.tokens[self.pos + 1].isKeyword(.ilike));
                 if (negated) self.pos += 1;
                 if (self.keyword(.between)) {
+                    const symmetric = self.ddlWord("symmetric");
+                    if (!symmetric) _ = self.ddlWord("asymmetric");
                     const low = try self.scalar(depth + 1, 4);
                     try self.expectKeyword(.@"and");
                     const high = try self.scalar(depth + 1, 4);
-                    left = try self.scalarNode(.{ .binary = .{ .op = .@"and", .left = try self.scalarNode(.{ .binary = .{ .op = .gte, .left = left, .right = low } }), .right = try self.scalarNode(.{ .binary = .{ .op = .lte, .left = left, .right = high } }) } });
+                    const operand = left;
+                    left = try self.scalarNode(.{ .binary = .{ .op = .@"and", .left = try self.scalarNode(.{ .binary = .{ .op = .gte, .left = operand, .right = low } }), .right = try self.scalarNode(.{ .binary = .{ .op = .lte, .left = operand, .right = high } }) } });
+                    // Preserve PostgreSQL's comparison/three-valued-logic
+                    // expansion. LEAST/GREATEST would discard NULL bounds.
+                    if (symmetric) {
+                        const reversed = try self.scalarNode(.{ .binary = .{ .op = .@"and", .left = try self.scalarNode(.{ .binary = .{ .op = .gte, .left = operand, .right = high } }), .right = try self.scalarNode(.{ .binary = .{ .op = .lte, .left = operand, .right = low } }) } });
+                        left = try self.scalarNode(.{ .binary = .{ .op = .@"or", .left = left, .right = reversed } });
+                    }
                     if (negated) left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = left } });
                     continue;
                 }
@@ -540,7 +638,8 @@ const Parser = struct {
                         const nested = try self.statement();
                         if (nested != .select) return self.fail(error.InvalidSqlSyntax, "subquery requires SELECT");
                         query.* = nested.select;
-                        try self.singleColumnSubquery(query.*);
+                        const tuple = left.* == .call and std.mem.eql(u8, left.call.name, "$row");
+                        if (!tuple) try self.singleColumnSubquery(query.*);
                         self.relation_depth -= 1;
                         try self.expect(.rparen);
                         left = try self.scalarNode(.{ .call = .{ .name = "$in_subquery", .args = try self.alloc.dupe(*const ast.Scalar, &.{left}), .subquery = query } });
@@ -562,6 +661,12 @@ const Parser = struct {
                     const every = self.keyword(.all);
                     if (every or self.keyword(.any) or self.keyword(.some)) {
                         try self.expect(.lparen);
+                        if (self.pos < self.tokens.len and !self.tokens[self.pos].isKeyword(.select) and !self.tokens[self.pos].isKeyword(.with)) {
+                            const input = try self.scalar(depth + 1, 0);
+                            try self.expect(.rparen);
+                            left = try self.patternArray(left, input, every, insensitive, true);
+                            continue;
+                        }
                         if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
                         self.relation_depth += 1;
                         const query = try self.alloc.create(ast.Select);
@@ -578,15 +683,27 @@ const Parser = struct {
                         } });
                         continue;
                     }
-                    left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = try self.patternExpression(left, try self.scalar(depth + 1, 4), insensitive, depth) } });
+                    const pattern = try self.scalar(depth + 1, 4);
+                    left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = try self.likeExpression(left, pattern, insensitive, depth) } });
                     continue;
                 }
             }
             if (self.peek(.colon_colon)) {
                 if (minimum > 8) break;
                 self.pos += 1;
-                left = try self.scalarNode(.{ .cast = .{ .operand = left, .type = try self.columnType() } });
+                const kind = try self.castType();
+                left = try self.scalarNode(.{ .cast = .{ .operand = left, .type = kind.type, .element_type = kind.element_type, .numeric_modifier = kind.numeric_modifier } });
                 continue;
+            }
+            // PostgreSQL's postfix spellings share the ordinary IS NULL
+            // precedence. Quoted identifiers are never consumed as operators.
+            if (minimum <= 3 and self.peek(.identifier) and !self.tokens[self.pos].owned) {
+                const spelling = self.tokens[self.pos].text;
+                if (std.ascii.eqlIgnoreCase(spelling, "isnull") or std.ascii.eqlIgnoreCase(spelling, "notnull")) {
+                    self.pos += 1;
+                    left = try self.scalarNode(.{ .unary = .{ .op = if (std.ascii.eqlIgnoreCase(spelling, "isnull")) .is_null else .is_not_null, .operand = left } });
+                    continue;
+                }
             }
             if (minimum <= 3 and self.keyword(.is)) {
                 const negated = self.keyword(.not);
@@ -594,12 +711,39 @@ const Parser = struct {
                     try self.expectKeyword(.from);
                     left = try self.scalarNode(.{ .binary = .{ .op = if (negated) .is_not_distinct else .is_distinct, .left = left, .right = try self.scalar(depth + 1, 4) } });
                 } else {
-                    const op: ast.Scalar.Unary = if (self.keyword(.null)) (if (negated) .is_not_null else .is_null) else if (self.keyword(.true)) (if (negated) .is_not_true else .is_true) else if (self.keyword(.false)) (if (negated) .is_not_false else .is_false) else return self.fail(error.InvalidSqlSyntax, "expected NULL, TRUE, FALSE or DISTINCT");
+                    const op: ast.Scalar.Unary = if (self.keyword(.null)) (if (negated) .is_not_null else .is_null) else if (self.keyword(.true)) (if (negated) .is_not_true else .is_true) else if (self.keyword(.false)) (if (negated) .is_not_false else .is_false) else if (self.ddlWord("unknown")) (if (negated) .is_not_unknown else .is_unknown) else return self.fail(error.InvalidSqlSyntax, "expected NULL, TRUE, FALSE, UNKNOWN or DISTINCT");
                     left = try self.scalarNode(.{ .unary = .{ .op = op, .operand = left } });
                 }
                 continue;
             }
             const current = self.tokens[self.pos];
+            if (minimum <= 4 and (current.kind == .regex_match or current.kind == .regex_imatch or current.kind == .regex_not_match or current.kind == .regex_not_imatch)) {
+                self.pos += 1;
+                const right = try self.scalar(depth + 1, 5);
+                const insensitive = current.kind == .regex_imatch or current.kind == .regex_not_imatch;
+                const flags = try self.scalarNode(.{ .literal = .{ .string = if (insensitive) "i" else "c" } });
+                const matched = try self.scalarNode(.{ .call = .{ .name = "$regex_operator", .args = try self.alloc.dupe(*const ast.Scalar, &.{ left, right, flags }) } });
+                // Ordinary PostgreSQL regex operators share the prepared ARE
+                // session and admission of regexp_like, rather than a second
+                // regex implementation or per-row parser. NOT preserves NULL.
+                left = if (current.kind == .regex_not_match or current.kind == .regex_not_imatch)
+                    try self.scalarNode(.{ .unary = .{ .op = .not, .operand = matched } })
+                else
+                    matched;
+                continue;
+            }
+            if ((current.kind == .at_contains or current.kind == .range_overlap or current.kind == .question or current.kind == .question_any or current.kind == .question_all) and minimum <= 4) {
+                self.pos += 1;
+                const right = try self.scalar(depth + 1, 5);
+                left = try self.scalarNode(.{ .call = .{ .name = switch (current.kind) {
+                    .at_contains => "$contains",
+                    .range_overlap => "$overlaps",
+                    .question_any => "jsonb_exists_any",
+                    .question_all => "jsonb_exists_all",
+                    else => "jsonb_exists",
+                }, .args = try self.alloc.dupe(*const ast.Scalar, &.{ left, right }) } });
+                continue;
+            }
             const op: ast.Scalar.Binary = switch (current.kind) {
                 .plus => .add,
                 .minus => .subtract,
@@ -632,6 +776,27 @@ const Parser = struct {
                 const every = self.keyword(.all);
                 if (every or self.keyword(.any) or self.keyword(.some)) {
                     try self.expect(.lparen);
+                    if (self.pos < self.tokens.len and !self.tokens[self.pos].isKeyword(.select) and !self.tokens[self.pos].isKeyword(.with)) {
+                        const input = try self.scalar(depth + 1, 0);
+                        try self.expect(.rparen);
+                        if (op == .like or op == .ilike) {
+                            left = try self.patternArray(left, input, every, op == .ilike, false);
+                            continue;
+                        }
+                        const comparison_value: @import("array_value.zig").Comparison = switch (op) {
+                            .eq => .eq,
+                            .neq => .ne,
+                            .lt => .lt,
+                            .lte => .le,
+                            .gt => .gt,
+                            .gte => .ge,
+                            else => unreachable,
+                        };
+                        const comparison_node = try self.scalarNode(.{ .literal = .{ .integer = @backingInt(comparison_value) } });
+                        const all_node = try self.scalarNode(.{ .literal = .{ .boolean = every } });
+                        left = try self.scalarNode(.{ .call = .{ .name = "$array_quantified", .args = try self.alloc.dupe(*const ast.Scalar, &.{ left, input, comparison_node, all_node }) } });
+                        continue;
+                    }
                     if (self.relation_depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL subquery nesting limit exceeded");
                     self.relation_depth += 1;
                     const query = try self.alloc.create(ast.Select);
@@ -650,21 +815,34 @@ const Parser = struct {
                 }
             }
             const right = try self.scalar(depth + 1, precedence + 1);
-            left = if (op == .like or op == .ilike)
-                try self.patternExpression(left, right, op == .ilike, depth)
-            else
-                try self.scalarNode(.{ .binary = .{ .op = op, .left = left, .right = right } });
+            left = if (op == .like or op == .ilike) try self.likeExpression(left, right, op == .ilike, depth) else try self.scalarNode(.{ .binary = .{ .op = op, .left = left, .right = right } });
         }
         return left;
     }
 
-    fn patternExpression(self: *Parser, left: *const ast.Scalar, right: *const ast.Scalar, insensitive: bool, depth: usize) Error!*const ast.Scalar {
-        if (!self.keyword(.escape)) return self.scalarNode(.{ .binary = .{ .op = if (insensitive) .ilike else .like, .left = left, .right = right } });
+    fn likeExpression(self: *Parser, operand: *const ast.Scalar, pattern: *const ast.Scalar, insensitive: bool, depth: usize) Error!*const ast.Scalar {
+        if (!self.keyword(.escape)) return self.scalarNode(.{ .binary = .{ .op = if (insensitive) .ilike else .like, .left = operand, .right = pattern } });
         const escape = try self.scalar(depth + 1, 4);
-        return self.scalarNode(.{ .call = .{
-            .name = if (insensitive) "$ilike_escape" else "$like_escape",
-            .args = try self.alloc.dupe(*const ast.Scalar, &.{ left, right, escape }),
-        } });
+        const mode = try self.scalarNode(.{ .literal = .{ .boolean = insensitive } });
+        return self.scalarNode(.{ .call = .{ .name = "$like_escape", .args = try self.alloc.dupe(*const ast.Scalar, &.{ operand, pattern, escape, mode }) } });
+    }
+
+    /// Bare nested brackets are array grammar, not a new scalar expression.
+    fn arrayConstructor(self: *Parser, depth: usize) Error!*const ast.Scalar {
+        if (depth >= self.limits.max_depth) return self.fail(error.SqlLimitExceeded, "SQL array nesting budget exceeded");
+        try self.expect(.lbracket);
+        var elements: std.ArrayList(*const ast.Scalar) = .empty;
+        if (!self.take(.rbracket)) {
+            const nested_brackets = self.peek(.lbracket);
+            while (true) {
+                if (self.peek(.lbracket) != nested_brackets) return self.fail(error.InvalidSqlSyntax, "nested array bracket lists cannot mix with scalar expressions");
+                const element = if (nested_brackets) try self.arrayConstructor(depth + 1) else try self.scalar(depth + 1, 0);
+                try elements.append(self.alloc, element);
+                if (!self.take(.comma)) break;
+            }
+            try self.expect(.rbracket);
+        }
+        return self.scalarNode(.{ .call = .{ .name = "$array", .args = try elements.toOwnedSlice(self.alloc) } });
     }
 
     fn checkScalarDepth(self: *Parser, expression: *const ast.Scalar, depth: usize) Error!void {
@@ -788,7 +966,7 @@ const Parser = struct {
             },
             else => return err,
         };
-        if (self.pos < self.tokens.len and self.tokens[self.pos].kind != .semicolon and !self.tokens[self.pos].isKeyword(.order) and !self.tokens[self.pos].isKeyword(.limit) and !self.tokens[self.pos].isKeyword(.offset) and !self.tokens[self.pos].isKeyword(.returning)) {
+        if (self.pos < self.tokens.len and self.tokens[self.pos].kind != .semicolon and !self.tokens[self.pos].isKeyword(.order) and !self.tokens[self.pos].isKeyword(.limit) and !self.tokens[self.pos].isKeyword(.offset) and !self.tokens[self.pos].isKeyword(.fetch) and !self.tokens[self.pos].isKeyword(.returning)) {
             self.pos = start;
             const expression = try self.scalar(0, 0);
             try self.checkScalarDepth(expression, 0);
@@ -802,14 +980,65 @@ const Parser = struct {
         return self.selectFinish(try self.selectCore());
     }
 
+    // VALUES shares the flat, bounded row-source representation used by
+    // INSERT sources; it is not a chain of pairwise UNION coercions.
+    fn valuesCore(self: *Parser) Error!ast.Select {
+        var arms: std.ArrayList(*const ast.Select) = .empty;
+        var width: ?usize = null;
+        while (true) {
+            if (arms.items.len >= self.limits.max_insert_rows) return self.fail(error.SqlLimitExceeded, "VALUES row budget exceeded");
+            try self.expect(.lparen);
+            var projections: std.ArrayList(ast.Projection) = .empty;
+            while (true) {
+                try self.node();
+                const expression = try self.scalar(0, 0);
+                try self.checkScalarDepth(expression, 0);
+                try projections.append(self.alloc, .{ .alias = try std.fmt.allocPrint(self.alloc, "column{d}", .{projections.items.len + 1}), .expression = expression });
+                if (!self.take(.comma)) break;
+            }
+            try self.expect(.rparen);
+            if (width) |expected| {
+                if (projections.items.len != expected) return self.fail(error.InvalidSqlSyntax, "VALUES rows must have equal width");
+            } else width = projections.items.len;
+            const leaf = try self.alloc.create(ast.Select);
+            leaf.* = .{ .columns = try projections.toOwnedSlice(self.alloc), .generated_values = true };
+            try arms.append(self.alloc, leaf);
+            if (!self.take(.comma)) break;
+        }
+        return .{ .values_arms = try arms.toOwnedSlice(self.alloc), .generated_values = true };
+    }
+
     fn selectFinish(self: *Parser, first: ast.Select) Error!ast.Select {
         var result = try self.setTail(first, 1, 0);
         result.order_by = try self.selectOrder();
         try @import("window_names.zig").resolveOrder(self.alloc, result, self.limits.max_depth);
-        result.limit = if (self.keyword(.limit)) try self.rowBound() else null;
-        result.offset = if (self.keyword(.offset)) try self.rowBound() else null;
+        // PostgreSQL admits either pagination-clause order. Normalize FETCH
+        // into the same bound as LIMIT, retaining explicit NULL/ALL as an
+        // unbounded request rather than a configured-result truncation.
+        var has_limit = false;
+        var has_offset = false;
+        while (true) {
+            if (self.keyword(.limit)) {
+                if (has_limit) return self.fail(error.InvalidSqlSyntax, "duplicate row limit");
+                has_limit = true;
+                result.limit = if (self.keyword(.all)) .null else try self.rowBound();
+            } else if (self.keyword(.offset)) {
+                if (has_offset) return self.fail(error.InvalidSqlSyntax, "duplicate row offset");
+                has_offset = true;
+                result.offset = try self.rowBound();
+                if (!self.keyword(.row)) _ = self.keyword(.rows);
+            } else if (self.keyword(.fetch)) {
+                if (has_limit) return self.fail(error.InvalidSqlSyntax, "duplicate row limit");
+                has_limit = true;
+                if (!self.keyword(.first)) try self.expectKeyword(.next);
+                result.limit = if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.row) or self.tokens[self.pos].isKeyword(.rows))) .{ .integer = 1 } else try self.rowBound();
+                if (!self.keyword(.row)) try self.expectKeyword(.rows);
+                if (self.keyword(.with)) return self.fail(error.UnsupportedSqlShape, "FETCH WITH TIES requires peer-aware result admission");
+                try self.expectKeyword(.only);
+            } else break;
+        }
         if (result.columns.len == 1 and result.group_by.len == 0 and result.having == null and result.order_by.len == 0) {
-            if (result.columns[0].expression) |expression| if (expression.* == .call and expression.call.window == null and expression.call.star and !expression.call.distinct and expression.call.filter == null and std.mem.eql(u8, expression.call.name, "count")) {
+            if (result.columns[0].expression) |expression| if (expression.* == .call and expression.call.window == null and expression.call.within_group == null and expression.call.star and !expression.call.distinct and expression.call.filter == null and std.mem.eql(u8, expression.call.name, "count")) {
                 result.count_all = true;
                 result.count_alias = result.columns[0].alias;
                 result.columns = &.{};
@@ -839,8 +1068,12 @@ const Parser = struct {
                 right = statement_value.select;
                 try self.expect(.rparen);
             } else {
-                try self.expectKeyword(.select);
-                right = try self.selectCore();
+                if (self.keyword(.values)) {
+                    right = try self.valuesCore();
+                } else {
+                    try self.expectKeyword(.select);
+                    right = try self.selectCore();
+                }
             }
             right = try self.setTail(right, precedence + 1, depth + 1);
             try self.node();
@@ -855,24 +1088,15 @@ const Parser = struct {
 
     fn selectCore(self: *Parser) Error!ast.Select {
         var columns = std.ArrayList(ast.Projection).empty;
-        if (self.take(.star)) {
-            // Wildcard must stand alone in this execution shape.
-        } else {
-            while (true) {
-                try self.node();
-                const expression = try self.scalar(0, 0);
-                try self.checkScalarDepth(expression, 0);
-                const alias = if (self.keyword(.as))
-                    try self.identifier()
-                else if (self.peek(.identifier) and (self.tokens[self.pos].owned or self.tokens[self.pos].keyword == null or token.keywordClass(self.tokens[self.pos].keyword.?) == .unreserved))
-                    try self.identifier()
-                else
-                    null;
-                try columns.append(self.alloc, if (expression.* == .column) .{ .field = expression.column, .alias = alias } else .{ .expression = expression, .alias = alias });
-                if (!self.take(.comma)) break;
-            }
+        while (true) {
+            try columns.append(self.alloc, try self.parseProjection(true));
+            if (!self.take(.comma)) break;
         }
         const source = if (self.keyword(.from)) try self.relation() else null;
+        if (source == null) for (columns.items) |projection| if (projection.wildcard and projection.field.len == 0) return self.fail(error.InvalidSqlSyntax, "wildcard projection requires a FROM source");
+        // Preserve the established compact representation of a lone * only
+        // after validating its source; an empty projection loses that marker.
+        if (columns.items.len == 1 and columns.items[0].wildcard and columns.items[0].field.len == 0) columns.clearRetainingCapacity();
         const simple = source != null and source.?.* == .table and source.?.table.alias == null and source.?.table.search == null;
         const table = if (simple) source.?.table.name else null;
         const filter = try self.where();
@@ -960,15 +1184,21 @@ const Parser = struct {
     }
 
     fn orderExpressions(self: *Parser, positions: bool) Error![]const ast.Order {
+        return self.orderExpressionsDepth(positions, 0);
+    }
+    fn orderExpressionsDepth(self: *Parser, positions: bool, depth: usize) Error![]const ast.Order {
         var order_by = std.ArrayList(ast.Order).empty;
         if (self.keyword(.order)) {
             try self.expectKeyword(.by);
             while (true) {
                 try self.node();
-                const expression = try self.scalar(0, 0);
+                const expression = try self.scalar(depth, 0);
                 try self.checkScalarDepth(expression, 0);
-                const descending = self.keyword(.desc);
-                if (!descending) _ = self.keyword(.asc);
+                var descending = self.keyword(.desc);
+                const explicit_direction = descending or self.keyword(.asc);
+                if (!explicit_direction and self.keyword(.using)) {
+                    if (self.take(.gt)) descending = true else if (!self.take(.lt)) return self.fail(error.UnsupportedSqlShape, "ORDER BY USING requires a supported ordering operator (< or >)");
+                }
                 var order: ast.Order = .{ .descending = descending };
                 if (expression.* == .column) order.field = expression.column else if (positions and expression.* == .literal and expression.literal == .integer) {
                     order.position = std.math.cast(u32, expression.literal.integer) orelse return self.fail(error.InvalidSqlSyntax, "ORDER BY position must be a positive integer");
@@ -1001,6 +1231,7 @@ const Parser = struct {
     }
 
     fn relationAtom(self: *Parser) Error!*const ast.Relation {
+        const lateral = self.keyword(.lateral);
         if (self.take(.lparen)) {
             self.relation_depth += 1;
             defer self.relation_depth -= 1;
@@ -1020,8 +1251,9 @@ const Parser = struct {
             }
             const query = try self.alloc.create(ast.Select);
             query.* = statement_value.select;
-            return self.relationNode(.{ .derived = .{ .query = query, .alias = alias, .columns = try names.toOwnedSlice(self.alloc) } });
+            return self.relationNode(.{ .derived = .{ .query = query, .alias = alias, .columns = try names.toOwnedSlice(self.alloc), .lateral = lateral } });
         }
+        if (lateral) return self.fail(error.InvalidSqlSyntax, "LATERAL requires a derived query");
         const name_value = try self.tableReferenceName();
         if (name_value.database == null and name_value.namespace == null and std.ascii.eqlIgnoreCase(name_value.table, "antfly_search") and self.take(.lparen)) {
             const table_value = try self.value();
@@ -1073,9 +1305,9 @@ const Parser = struct {
     fn rowBound(self: *Parser) Error!ast.Value {
         const result = try self.value();
         switch (result) {
-            .integer => |v| if (v < 0) return self.fail(error.InvalidSqlSyntax, "row bound must be nonnegative"),
-            .parameter => {},
-            else => return self.fail(error.InvalidSqlSyntax, "row bound must be an integer or parameter"),
+            .integer => {},
+            .parameter, .null => {},
+            else => return self.fail(error.InvalidSqlSyntax, "row bound must be an integer, NULL or parameter"),
         }
         return result;
     }
@@ -1083,11 +1315,12 @@ const Parser = struct {
     fn insert(self: *Parser) Error!ast.Insert {
         try self.expectKeyword(.into);
         const table = try self.tableReferenceName();
+        const alias = if (self.keyword(.as)) try self.identifier() else null;
         if (self.keyword(.default)) {
             try self.expectKeyword(.values);
             const rows = try self.alloc.alloc([]const ast.Value, 1);
             rows[0] = &.{};
-            return .{ .table = table, .columns = &.{}, .rows = rows, .conflict = try self.conflict(), .returning = try self.returning() };
+            return .{ .table = table, .alias = alias, .columns = &.{}, .rows = rows, .conflict = try self.conflict(), .returning = try self.returning() };
         }
         try self.expect(.lparen);
         var columns = std.ArrayList([]const u8).empty;
@@ -1119,7 +1352,7 @@ const Parser = struct {
                     source.columns = projected;
                 }
             }
-            return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .source = source, .conflict = conflict_clause, .returning = try self.returning() };
+            return .{ .table = table, .alias = alias, .columns = try columns.toOwnedSlice(self.alloc), .source = source, .conflict = conflict_clause, .returning = try self.returning() };
         }
         try self.expectKeyword(.values);
         var rows = std.ArrayList([]const ast.Value).empty;
@@ -1163,7 +1396,7 @@ const Parser = struct {
         for (cells) |row| for (row) |cell| if (cell) |expression| {
             contains_subquery = contains_subquery or @import("subquery_lowering.zig").has(expression);
         };
-        if (!contains_subquery and captures.len == 0) return .{ .table = table, .columns = names, .rows = values, .expressions = cells, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
+        if (!contains_subquery and captures.len == 0) return .{ .table = table, .alias = alias, .columns = names, .rows = values, .expressions = cells, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
 
         // VALUES with scalar subqueries is one source relation, not a collection
         // of independent expression evaluations. Keep source arms flat and in
@@ -1189,7 +1422,7 @@ const Parser = struct {
         }
         const source = try self.alloc.create(ast.Select);
         source.* = .{ .values_arms = try arms.toOwnedSlice(self.alloc), .generated_values = true };
-        return .{ .table = table, .columns = names, .source = source, .values_source_rows = values, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
+        return .{ .table = table, .alias = alias, .columns = names, .source = source, .values_source_rows = values, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
     }
 
     fn conflictCaptures(self: *Parser, clause: *ast.Conflict) Error![]const *const ast.Scalar {
@@ -1215,7 +1448,12 @@ const Parser = struct {
         try self.expectKeyword(.conflict);
         var columns: std.ArrayList([]const u8) = .empty;
         var expressions: std.ArrayList(*const ast.Scalar) = .empty;
+        const constraint_name = if (self.keyword(.on)) name: {
+            try self.expectKeyword(.constraint);
+            break :name try self.identifier();
+        } else null;
         if (self.take(.lparen)) {
+            if (constraint_name != null) return self.fail(error.InvalidSqlSyntax, "named conflict target cannot include inferred keys");
             while (true) {
                 try self.node();
                 const expression = try self.scalar(0, 0);
@@ -1225,10 +1463,11 @@ const Parser = struct {
             try self.expect(.rparen);
         }
         const arbiter_predicate = if (self.keyword(.where)) try self.scalar(0, 0) else null;
+        if (constraint_name != null and arbiter_predicate != null) return self.fail(error.InvalidSqlSyntax, "named conflict target cannot include an inference predicate");
         if (arbiter_predicate != null and columns.items.len + expressions.items.len == 0) return self.fail(error.UnsupportedSqlShape, "partial conflict inference requires an explicit target");
         try self.expectKeyword(.do);
-        if (self.keyword(.nothing)) return .{ .columns = try columns.toOwnedSlice(self.alloc), .expressions = try expressions.toOwnedSlice(self.alloc), .arbiter_predicate = arbiter_predicate };
-        if (columns.items.len + expressions.items.len == 0) return self.fail(error.UnsupportedSqlShape, "ON CONFLICT DO UPDATE requires an explicit conflict target");
+        if (self.keyword(.nothing)) return .{ .columns = try columns.toOwnedSlice(self.alloc), .constraint_name = constraint_name, .expressions = try expressions.toOwnedSlice(self.alloc), .arbiter_predicate = arbiter_predicate };
+        if (constraint_name == null and columns.items.len + expressions.items.len == 0) return self.fail(error.UnsupportedSqlShape, "ON CONFLICT DO UPDATE requires an explicit conflict target");
         try self.expectKeyword(.update);
         try self.expectKeyword(.set);
         var assignments: std.ArrayList(ast.Assignment) = .empty;
@@ -1237,6 +1476,11 @@ const Parser = struct {
             const column_name = try self.identifier();
             for (assignments.items) |prior| if (std.mem.eql(u8, prior.field, column_name)) return self.fail(error.DuplicateSqlColumn, "duplicate conflict assignment");
             try self.expect(.eq);
+            if (self.keyword(.default)) {
+                try assignments.append(self.alloc, .{ .field = column_name, .use_default = true });
+                if (!self.take(.comma)) break;
+                continue;
+            }
             const expression = try self.scalar(0, 0);
             try self.checkScalarDepth(expression, 0);
             try assignments.append(self.alloc, .{ .field = column_name, .expression = expression });
@@ -1244,7 +1488,7 @@ const Parser = struct {
         }
         const filter = if (self.keyword(.where)) try self.scalar(0, 0) else null;
         if (filter) |expression| try self.checkScalarDepth(expression, 0);
-        return .{ .columns = try columns.toOwnedSlice(self.alloc), .expressions = try expressions.toOwnedSlice(self.alloc), .arbiter_predicate = arbiter_predicate, .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = filter };
+        return .{ .columns = try columns.toOwnedSlice(self.alloc), .constraint_name = constraint_name, .expressions = try expressions.toOwnedSlice(self.alloc), .arbiter_predicate = arbiter_predicate, .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = filter };
     }
 
     fn update(self: *Parser) Error!ast.Update {
@@ -1254,7 +1498,6 @@ const Parser = struct {
         var source = try self.relationTail(target);
         try self.expectKeyword(.set);
         var assignments = std.ArrayList(ast.Assignment).empty;
-        var row_ctes = std.ArrayList(ast.Cte).empty;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         while (true) {
             const tuple = self.take(.lparen);
@@ -1277,7 +1520,7 @@ const Parser = struct {
                 _ = self.keyword(.row);
                 try self.expect(.lparen);
                 if (self.pos < self.tokens.len and (self.tokens[self.pos].isKeyword(.select) or self.tokens[self.pos].isKeyword(.with))) {
-                    try self.rowSubqueryAssignments(targets.items, &assignments, &row_ctes);
+                    try self.rowSubqueryAssignments(targets.items, &assignments);
                     if (!self.take(.comma)) break;
                     continue;
                 }
@@ -1307,7 +1550,7 @@ const Parser = struct {
             if (source != target) return self.fail(error.InvalidSqlSyntax, "use either joined UPDATE or UPDATE FROM");
             source = try self.relationNode(.{ .join = .{ .kind = .cross, .left = target, .right = try self.relation() } });
         }
-        return .{ .table = table, .alias = alias, .source = if (alias != null or source != target) source else null, .ctes = try row_ctes.toOwnedSlice(self.alloc), .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = try self.where(), .returning = try self.returning() };
+        return .{ .table = table, .alias = alias, .source = if (alias != null or source != target) source else null, .assignments = try assignments.toOwnedSlice(self.alloc), .predicate = try self.where(), .returning = try self.returning() };
     }
 
     fn delete(self: *Parser) Error!ast.Delete {
@@ -1410,17 +1653,141 @@ const Parser = struct {
 
     fn returning(self: *Parser) Error!?[]const ast.Projection {
         if (!self.keyword(.returning)) return null;
-        if (self.take(.star)) return &.{};
         var columns: std.ArrayList(ast.Projection) = .empty;
         while (true) {
-            try self.node();
-            const expression = try self.scalar(0, 0);
-            try self.checkScalarDepth(expression, 0);
-            const alias = if (self.keyword(.as)) try self.identifier() else null;
-            try columns.append(self.alloc, if (expression.* == .column) .{ .field = expression.column, .alias = alias } else .{ .expression = expression, .alias = alias });
+            try columns.append(self.alloc, try self.parseProjection(false));
             if (!self.take(.comma)) break;
         }
+        if (columns.items.len == 1 and columns.items[0].wildcard and columns.items[0].field.len == 0) columns.clearRetainingCapacity();
         return try columns.toOwnedSlice(self.alloc);
+    }
+
+    fn parseProjection(self: *Parser, implicit_alias: bool) Error!ast.Projection {
+        try self.node();
+        if (self.take(.star)) return .{ .wildcard = true };
+        if (self.peek(.identifier)) {
+            var end = self.pos;
+            var parts: usize = 0;
+            while (end + 2 < self.tokens.len and self.tokens[end].kind == .identifier and self.tokens[end + 1].kind == .dot) {
+                parts += 1;
+                if (self.tokens[end + 2].kind == .star) {
+                    if (parts > 3) return self.fail(error.InvalidSqlSyntax, "wildcard qualification has at most three identifiers");
+                    var qualifier = try self.identifier();
+                    while (self.pos < end + 1) {
+                        try self.expect(.dot);
+                        qualifier = try std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ qualifier, try self.identifier() });
+                    }
+                    try self.expect(.dot);
+                    try self.expect(.star);
+                    return .{ .field = qualifier, .wildcard = true };
+                }
+                end += 2;
+            }
+        }
+        const expression = try self.scalar(0, 0);
+        try self.checkScalarDepth(expression, 0);
+        const alias = if (self.keyword(.as)) try self.identifier() else if (implicit_alias and self.peek(.identifier) and (self.tokens[self.pos].owned or self.tokens[self.pos].keyword == null or token.keywordClass(self.tokens[self.pos].keyword.?) == .unreserved)) try self.identifier() else null;
+        // Keep the original PostgreSQL function/CASE label before lowering
+        // replaces expressions with internal columns or aggregate slots.
+        const label = alias orelse switch (expression.*) {
+            .call => |call| if (std.mem.eql(u8, call.name, "$regex_operator")) "?column?" else if (std.mem.startsWith(u8, call.name, "$")) null else call.name,
+            .case_when => "case",
+            else => null,
+        };
+        return if (expression.* == .column) .{ .field = expression.column, .alias = alias } else .{ .expression = expression, .alias = label };
+    }
+
+    fn patternArray(self: *Parser, operand: *const ast.Scalar, input: *const ast.Scalar, every: bool, insensitive: bool, negated: bool) Error!*const ast.Scalar {
+        const all_node = try self.scalarNode(.{ .literal = .{ .boolean = every } });
+        const insensitive_node = try self.scalarNode(.{ .literal = .{ .boolean = insensitive } });
+        const negated_node = try self.scalarNode(.{ .literal = .{ .boolean = negated } });
+        return self.scalarNode(.{ .call = .{ .name = "$array_pattern_quantified", .args = try self.alloc.dupe(*const ast.Scalar, &.{ operand, input, all_node, insensitive_node, negated_node }) } });
+    }
+
+    const CastType = struct { type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null, numeric_modifier: ?@import("../common/sql_builtin_type.zig").NumericModifier = null };
+
+    fn numericModifier(self: *Parser) Error!?@import("../common/sql_builtin_type.zig").NumericModifier {
+        if (!self.take(.lparen)) return null;
+        var arguments: [2][]const u8 = undefined;
+        var count: usize = 0;
+        while (true) {
+            const negative = self.take(.minus);
+            if (negative and !self.peek(.number)) return self.fail(error.InvalidSqlSyntax, "expected numeric type modifier");
+            const text = if (self.peek(.number) or self.peek(.string)) text: {
+                const current = self.tokens[self.pos];
+                self.pos += 1;
+                break :text current.text;
+            } else if (self.peek(.identifier)) try self.identifier() else return self.fail(error.InvalidSqlSyntax, "expected numeric type modifier");
+            if (count < arguments.len) arguments[count] = if (negative) try std.fmt.allocPrint(self.alloc, "-{s}", .{text}) else text;
+            count += 1;
+            if (!self.take(.comma)) break;
+        }
+        try self.expect(.rparen);
+        if (count == 0 or count > 2) return self.fail(error.SqlInvalidParameterValue, "NUMERIC requires precision and optional scale");
+        const casts = @import("builtin_cast.zig");
+        const precision = casts.integerText(arguments[0], .int32) catch |err| return self.fail(if (err == error.SqlNumericOutOfRange) error.SqlNumericOutOfRange else error.SqlInvalidTextRepresentation, "invalid NUMERIC precision");
+        const scale = if (count == 2) casts.integerText(arguments[1], .int32) catch |err| return self.fail(if (err == error.SqlNumericOutOfRange) error.SqlNumericOutOfRange else error.SqlInvalidTextRepresentation, "invalid NUMERIC scale") else 0;
+        if (precision < 1 or precision > 1000 or scale < -1000 or scale > 1000) return self.fail(error.SqlInvalidParameterValue, "NUMERIC precision must be 1..1000 and scale -1000..1000");
+        return .{ .precision = @intCast(precision), .scale = @intCast(scale) };
+    }
+
+    fn castType(self: *Parser) Error!CastType {
+        const start = self.pos;
+        if (!self.peek(.identifier) or self.tokens[self.pos].owned) return .{ .type = try self.columnType() };
+        const name_value = self.tokens[self.pos].text;
+        self.pos += 1;
+        const pairs = .{
+            .{ "text", @import("array_value.zig").ElementType.text },
+            .{ "uuid", @import("array_value.zig").ElementType.uuid },
+            .{ "smallint", @import("array_value.zig").ElementType.int16 },
+            .{ "int2", @import("array_value.zig").ElementType.int16 },
+            .{ "int", @import("array_value.zig").ElementType.int32 },
+            .{ "integer", @import("array_value.zig").ElementType.int32 },
+            .{ "int4", @import("array_value.zig").ElementType.int32 },
+            .{ "bigint", @import("array_value.zig").ElementType.int64 },
+            .{ "int8", @import("array_value.zig").ElementType.int64 },
+            .{ "real", @import("array_value.zig").ElementType.float32 },
+            .{ "float4", @import("array_value.zig").ElementType.float32 },
+            .{ "float8", @import("array_value.zig").ElementType.float64 },
+            .{ "double", @import("array_value.zig").ElementType.float64 },
+            .{ "bool", @import("array_value.zig").ElementType.boolean },
+            .{ "boolean", @import("array_value.zig").ElementType.boolean },
+            .{ "jsonb", @import("array_value.zig").ElementType.jsonb },
+            .{ "numeric", @import("array_value.zig").ElementType.numeric },
+            .{ "decimal", @import("array_value.zig").ElementType.numeric },
+        };
+        var element: ?@import("array_value.zig").ElementType = null;
+        inline for (pairs) |pair| if (std.ascii.eqlIgnoreCase(name_value, pair[0])) {
+            element = pair[1];
+        };
+        if (std.ascii.eqlIgnoreCase(name_value, "double")) {
+            if (!self.ddlWord("precision")) return self.fail(error.InvalidSqlSyntax, "expected DOUBLE PRECISION");
+        }
+        const numeric_modifier = if (element == .numeric) try self.numericModifier() else null;
+        if (!self.take(.lbracket)) {
+            if (element) |resolved| return .{ .type = switch (resolved) {
+                .text => .string,
+                .uuid => .uuid,
+                .int16, .int32, .int64 => .integer,
+                .float32, .float64, .numeric => .number,
+                .boolean => .boolean,
+                .jsonb => .json,
+            }, .element_type = resolved, .numeric_modifier = numeric_modifier };
+            self.pos = start;
+            return .{ .type = try self.columnType() };
+        }
+        const resolved = element orelse return self.fail(error.UnsupportedSqlShape, "unsupported SQL array element type");
+        // Declared dimensions do not participate in PostgreSQL type identity
+        // and do not constrain a value's actual rank or bounds.
+        while (true) {
+            if (self.peek(.number)) {
+                const size = try self.value();
+                if (size != .integer or size.integer < 0 or size.integer > std.math.maxInt(i32)) return self.fail(error.InvalidSqlSyntax, "invalid declared array dimension");
+            }
+            try self.expect(.rbracket);
+            if (!self.take(.lbracket)) break;
+        }
+        return .{ .type = .array, .element_type = resolved, .numeric_modifier = numeric_modifier };
     }
 
     fn columnType(self: *Parser) Error!ast.ColumnType {
@@ -1449,6 +1816,11 @@ const Parser = struct {
         return self.fail(error.UnsupportedSqlShape, "unsupported SQL column type");
     }
 
+    fn columnDefinition(self: *Parser, name_value: []const u8) Error!ast.Column {
+        const declared = try self.castType();
+        return .{ .name = name_value, .type = declared.type, .element_type = declared.element_type, .numeric_modifier = declared.numeric_modifier };
+    }
+
     pub fn createTable(self: *Parser) Error!ast.CreateTable {
         const if_not_exists = self.keyword(.@"if");
         if (if_not_exists) {
@@ -1467,7 +1839,7 @@ const Parser = struct {
                 if (!self.take(.comma)) break;
                 continue;
             }
-            if (self.tokens[self.pos].isKeyword(.primary) or self.tokens[self.pos].isKeyword(.unique) or self.tokens[self.pos].isKeyword(.check) or self.tokens[self.pos].isKeyword(.foreign)) {
+            if (self.peek(.identifier) and (self.tokens[self.pos].isKeyword(.primary) or self.tokens[self.pos].isKeyword(.unique) or self.tokens[self.pos].isKeyword(.check) or self.tokens[self.pos].isKeyword(.foreign))) {
                 const constraint_name = try std.fmt.allocPrint(self.alloc, "sql_constraint_{d}", .{constraints.items.len});
                 try constraints.append(self.alloc, try self.constraintDefinition(constraint_name));
                 if (!self.take(.comma)) break;
@@ -1477,7 +1849,7 @@ const Parser = struct {
             if (std.mem.eql(u8, column, "_id")) return self.fail(error.UnsupportedSqlShape, "_id is reserved for row identity");
             const entry = try seen.getOrPut(self.alloc, column);
             if (entry.found_existing) return self.fail(error.DuplicateSqlColumn, "duplicate CREATE TABLE column");
-            var definition: ast.Column = .{ .name = column, .type = try self.columnType() };
+            var definition = try self.columnDefinition(column);
             var null_seen = false;
             var default_seen = false;
             while (true) {
@@ -1490,10 +1862,12 @@ const Parser = struct {
                     if (null_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column nullability");
                     null_seen = true;
                 } else if (self.keyword(.default)) {
-                    if (default_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column default");
-                    definition.default_value = try self.value();
-                    if (definition.default_value.? == .parameter) return self.fail(error.UnsupportedSqlShape, "schema defaults cannot contain execution parameters");
+                    if (default_seen or definition.generated_expression != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting column default");
+                    definition.default_expression = try self.schemaDefault();
                     default_seen = true;
+                } else if (self.ddlWord("generated")) {
+                    if (default_seen or definition.generated_expression != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting generated column");
+                    definition.generated_expression = try self.generatedExpression();
                 } else if (self.keyword(.primary)) {
                     try self.expectKeyword(.key);
                     definition.nullable = false;
@@ -1503,7 +1877,7 @@ const Parser = struct {
                 } else if (self.keyword(.constraint)) {
                     const constraint_name = try self.identifier();
                     try constraints.append(self.alloc, try self.inlineConstraint(constraint_name, column));
-                } else if (self.tokens[self.pos].isKeyword(.check) or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "REFERENCES")) {
+                } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and (self.tokens[self.pos].isKeyword(.check) or std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "REFERENCES"))) {
                     const constraint_name = try std.fmt.allocPrint(self.alloc, "sql_inline_{d}", .{constraints.items.len});
                     try constraints.append(self.alloc, try self.inlineConstraint(constraint_name, column));
                 } else break;
@@ -1554,12 +1928,25 @@ const Parser = struct {
                 }
                 _ = self.keyword(.column);
                 const column_name = try self.identifier();
-                var column: ast.Column = .{ .name = column_name, .type = try self.columnType() };
-                if (self.keyword(.not)) {
-                    try self.expectKeyword(.null);
-                    column.nullable = false;
+                var column = try self.columnDefinition(column_name);
+                var null_seen = false;
+                while (true) {
+                    if (self.keyword(.not)) {
+                        if (null_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column nullability");
+                        try self.expectKeyword(.null);
+                        column.nullable = false;
+                        null_seen = true;
+                    } else if (self.keyword(.null)) {
+                        if (null_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column nullability");
+                        null_seen = true;
+                    } else if (self.keyword(.default)) {
+                        if (column.default_expression != null or column.generated_expression != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting column default");
+                        column.default_expression = try self.schemaDefault();
+                    } else if (self.ddlWord("generated")) {
+                        if (column.default_expression != null or column.generated_expression != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting generated column");
+                        column.generated_expression = try self.generatedExpression();
+                    } else break;
                 }
-                if (self.keyword(.default)) column.default_value = try self.value();
                 ddl.action = .alter_schema;
                 ddl.schema_change = .{ .add_column = column };
             } else if (kind == .table and self.keyword(.drop)) {
@@ -1577,7 +1964,7 @@ const Parser = struct {
                 ddl.action = .alter_schema;
                 if (self.keyword(.set)) {
                     try self.expectKeyword(.default);
-                    ddl.schema_change = .{ .set_default = .{ .column = column_name, .value = try self.value() } };
+                    ddl.schema_change = .{ .set_default = .{ .column = column_name, .expression = try self.schemaDefault() } };
                 } else {
                     try self.expectKeyword(.drop);
                     try self.expectKeyword(.default);
@@ -1657,17 +2044,33 @@ const Parser = struct {
     }
 
     fn indexDdl(self: *Parser, create: bool, unique: bool) Error!ast.CatalogDdl {
+        const concurrently = self.ddlWord("concurrently");
         const conditional = self.keyword(.@"if");
         if (conditional) {
             if (create) try self.expectKeyword(.not);
             try self.expectKeyword(.exists);
         }
+        if (!create) {
+            var targets = std.ArrayList(ast.Name).empty;
+            while (true) {
+                try self.node();
+                try targets.append(self.alloc, try self.name());
+                if (!self.take(.comma)) break;
+            }
+            // Retain the embedded API's explicit table-owner extension.
+            if (self.keyword(.on)) {
+                if (concurrently or targets.items.len != 1 or targets.items[0].namespace != null or targets.items[0].database != null) return error.UnsupportedSqlShape;
+                const owner = try self.tableReferenceName();
+                return .{ .kind = .table, .action = .alter_schema, .name = owner, .conditional = conditional, .schema_change = .{ .drop_index = targets.items[0].table } };
+            }
+            const cascade = self.keyword(.cascade);
+            if (!cascade) _ = self.keyword(.restrict);
+            const first = targets.items[0];
+            return .{ .kind = .index, .action = .drop, .name = first, .conditional = conditional, .concurrently = concurrently, .cascade = cascade, .index_targets = try targets.toOwnedSlice(self.alloc), .schema_change = .{ .drop_index = first.table } };
+        }
         const index_name = try self.identifier();
-        const table_name: ast.Name = if (self.keyword(.on)) try self.tableReferenceName() else if (create)
-            return self.fail(error.InvalidSqlSyntax, "CREATE INDEX requires ON table")
-        else
-            .{ .table = "" };
-        if (!create) return .{ .kind = .table, .action = .alter_schema, .name = table_name, .conditional = conditional, .schema_change = .{ .drop_index = index_name } };
+        try self.expectKeyword(.on);
+        const table_name = try self.tableReferenceName();
         try self.expect(.lparen);
         var keys = std.ArrayList(ast.Order).empty;
         while (true) {
@@ -1694,7 +2097,65 @@ const Parser = struct {
         }
         const partial_predicate = if (self.keyword(.where)) try self.scalar(0, 0) else null;
         if (partial_predicate) |expression| try self.checkScalarDepth(expression, 0);
-        return .{ .kind = .table, .action = .alter_schema, .name = table_name, .conditional = conditional, .schema_change = .{ .create_index = .{ .name = index_name, .keys = try keys.toOwnedSlice(self.alloc), .include_columns = try included.toOwnedSlice(self.alloc), .unique = unique, .predicate = partial_predicate } } };
+        return .{ .kind = .index, .action = .create, .name = .{ .table = index_name }, .index_table = table_name, .conditional = conditional, .concurrently = concurrently, .schema_change = .{ .create_index = .{ .name = index_name, .keys = try keys.toOwnedSlice(self.alloc), .include_columns = try included.toOwnedSlice(self.alloc), .unique = unique, .predicate = partial_predicate } } };
+    }
+
+    fn schemaDefault(self: *Parser) Error!*const ast.Scalar {
+        // Persistent defaults cannot capture a request's parameter values or
+        // run a subquery. Keep CREATE and both ALTER paths consistent before
+        // any catalog admission or physical schema publication.
+        var probe = self.pos;
+        while (probe < self.tokens.len and self.tokens[probe].kind == .lparen) probe += 1;
+        if (probe > self.pos and probe < self.tokens.len and (self.tokens[probe].isKeyword(.select) or self.tokens[probe].isKeyword(.with)))
+            return self.fail(error.UnsupportedSqlShape, "subqueries are not allowed in schema defaults");
+        const result = try self.scalar(0, 0);
+        try self.checkScalarDepth(result, 0);
+        try self.persistentExpression(result, false);
+        return result;
+    }
+
+    fn generatedExpression(self: *Parser) Error!*const ast.Scalar {
+        if (!self.ddlWord("always")) return self.fail(error.UnsupportedSqlShape, "only GENERATED ALWAYS AS stored expressions are supported");
+        try self.expectKeyword(.as);
+        if (self.ddlWord("identity")) return self.fail(error.UnsupportedSqlShape, "identity columns require a durable sequence allocator");
+        try self.expect(.lparen);
+        const result = try self.scalar(0, 0);
+        try self.expect(.rparen);
+        if (!self.ddlWord("stored")) return self.fail(error.UnsupportedSqlShape, "virtual generated columns require read-time expression evaluation");
+        try self.checkScalarDepth(result, 0);
+        try self.persistentExpression(result, true);
+        return result;
+    }
+
+    // The bounded owned tree, not a token prefix, determines whether durable
+    // state could capture request parameters, subqueries or row references.
+    fn persistentExpression(self: *Parser, expression: *const ast.Scalar, generated: bool) Error!void {
+        switch (expression.*) {
+            .literal => |value_| if (value_ == .parameter) return self.fail(error.UnsupportedSqlShape, if (generated) "schema expressions cannot contain execution parameters" else "schema defaults cannot contain execution parameters"),
+            .column => if (!generated) return self.fail(error.UnsupportedSqlShape, "column references are not allowed in schema defaults"),
+            .unary => |part| try self.persistentExpression(part.operand, generated),
+            .binary => |part| {
+                try self.persistentExpression(part.left, generated);
+                try self.persistentExpression(part.right, generated);
+            },
+            .cast => |part| try self.persistentExpression(part.operand, generated),
+            .call => |part| {
+                if (part.subquery != null or part.star or part.distinct or part.filter != null or part.window != null or part.within_group != null)
+                    return self.fail(error.UnsupportedSqlShape, "subqueries, aggregates and windows are not allowed in schema expressions");
+                for (part.args) |arg| try self.persistentExpression(arg, generated);
+            },
+            .case_when => |part| {
+                for (part.branches) |branch| {
+                    try self.persistentExpression(branch.condition, generated);
+                    try self.persistentExpression(branch.value, generated);
+                }
+                if (part.otherwise) |other| try self.persistentExpression(other, generated);
+            },
+            .in_list => |part| {
+                try self.persistentExpression(part.operand, generated);
+                for (part.values) |value_| try self.persistentExpression(value_, generated);
+            },
+        }
     }
 
     fn ddlWord(self: *Parser, word: []const u8) bool {
@@ -1761,7 +2222,7 @@ const Parser = struct {
             return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = columns, .primary = true } });
         }
         if (self.keyword(.unique)) return self.uniqueTiming(.{ .add_unique = .{ .name = constraint_name, .columns = columns } });
-        if (self.tokens[self.pos].isKeyword(.check)) return self.constraintDefinition(constraint_name);
+        if (self.peek(.identifier) and self.tokens[self.pos].isKeyword(.check)) return self.constraintDefinition(constraint_name);
         return self.foreignKeyDefinition(constraint_name, columns);
     }
 
@@ -1954,6 +2415,7 @@ const Parser = struct {
             return .{ .select = try self.selectFinish(.{ .source = source }) };
         }
         if (self.keyword(.select)) return .{ .select = try self.select() };
+        if (self.keyword(.values)) return .{ .select = try self.selectFinish(try self.valuesCore()) };
         if (self.keyword(.insert)) return .{ .insert = try self.insert() };
         if (self.keyword(.update)) return .{ .update = try self.update() };
         if (self.keyword(.delete)) {
@@ -2114,6 +2576,37 @@ test "policy DDL parses draft definitions and never accepts publication commands
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE POLICY bad ON accounts FOR SELECT WITH CHECK (true)", .{}));
 }
 
+test "compiler index DDL retains namespace ownership and distributed statement contracts" {
+    var create = try compile(std.testing.allocator, "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS email_key ON ONLY tenant.accounts (lower(email)) INCLUDE (id) WHERE email IS NOT NULL", .{});
+    defer create.deinit();
+    const index = create.statement.catalog_ddl;
+    try std.testing.expectEqual(.index, index.kind);
+    try std.testing.expectEqual(.create, index.action);
+    try std.testing.expect(index.concurrently and index.conditional);
+    try std.testing.expectEqualStrings("email_key", index.name.table);
+    try std.testing.expectEqualStrings("tenant", index.index_table.?.namespace.?);
+    try std.testing.expectEqualStrings("accounts", index.index_table.?.table);
+    try std.testing.expect(index.schema_change.?.create_index.unique);
+    var drop = try compile(std.testing.allocator, "DROP INDEX IF EXISTS tenant.email_key, public.other_key CASCADE", .{});
+    defer drop.deinit();
+    const targets = drop.statement.catalog_ddl;
+    try std.testing.expectEqual(.index, targets.kind);
+    try std.testing.expectEqual(.drop, targets.action);
+    try std.testing.expectEqual(@as(usize, 2), targets.index_targets.len);
+    try std.testing.expect(targets.cascade and targets.conditional);
+    try std.testing.expectEqualStrings("tenant", targets.index_targets[0].namespace.?);
+    try std.testing.expectEqualStrings("other_key", targets.index_targets[1].table);
+    var concurrent = try compile(std.testing.allocator, "DROP INDEX CONCURRENTLY tenant.email_key RESTRICT", .{});
+    defer concurrent.deinit();
+    try std.testing.expect(concurrent.statement.catalog_ddl.concurrently);
+    try std.testing.expect(!concurrent.statement.catalog_ddl.cascade);
+    // CREATE names inherit the table's schema; DROP is not table-bound syntax.
+    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "CREATE INDEX tenant.email_key ON tenant.accounts (email)", .{}));
+    var scoped = try compile(std.testing.allocator, "DROP INDEX email_key ON accounts", .{});
+    defer scoped.deinit();
+    try std.testing.expectEqualStrings("accounts", scoped.statement.catalog_ddl.name.table);
+}
+
 test "compiler ONLY scopes exact table references across read and write statements" {
     for ([_][]const u8{
         "SELECT id FROM ONLY public.records",
@@ -2163,7 +2656,18 @@ test "compiler UPDATE row assignments flatten simultaneous typed expressions" {
     try std.testing.expectEqual(@as(usize, 2), queried.statement.update.assignments.len);
     for (queried.statement.update.assignments) |assignment| {
         try std.testing.expect(assignment.expression.?.* == .call);
-        try std.testing.expectEqualStrings("$scalar", assignment.expression.?.call.name);
+        try std.testing.expectEqualStrings("$row_scalar", assignment.expression.?.call.name);
+    }
+    for ([_][]const u8{
+        "UPDATE rows SET (quantity,status)=(SELECT * FROM source)",
+        "UPDATE rows SET (quantity,status)=(SELECT source.* FROM source)",
+        "UPDATE rows SET (quantity,status)=(SELECT source.*,'copied' FROM source)",
+        "UPDATE rows SET (quantity)=(SELECT COUNT(*) FROM source)",
+    }) |sql| {
+        var deferred = try compile(std.testing.allocator, sql, .{});
+        defer deferred.deinit();
+        const mutation = deferred.statement.update;
+        try std.testing.expectEqual(@as(?usize, mutation.assignments.len), mutation.assignments[0].expression.?.call.subquery.?.required_output_columns);
     }
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = (SELECT n FROM source)", .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "UPDATE rows SET (quantity, status) = (SELECT n, status, id FROM source)", .{}));
@@ -2239,6 +2743,23 @@ test "compiler keeps typed parameters and boolean precedence" {
     try std.testing.expectEqual(@as(u32, 2), select.limit.?.parameter);
 }
 
+test "compiler pagination normalizes bounds and rejects duplicate or incomplete clauses" {
+    var compiled = try compile(std.testing.allocator, "SELECT 1 OFFSET $1 ROWS FETCH NEXT $2 ROWS ONLY", .{});
+    defer compiled.deinit();
+    try std.testing.expectEqual(@as(u32, 1), compiled.statement.select.offset.?.parameter);
+    try std.testing.expectEqual(@as(u32, 2), compiled.statement.select.limit.?.parameter);
+    for ([_][]const u8{
+        "SELECT 1 FETCH",
+        "SELECT 1 FETCH NEXT",
+        "SELECT 1 FETCH NEXT ROW",
+        "SELECT 1 LIMIT 1 LIMIT 2",
+        "SELECT 1 OFFSET 1 OFFSET 2",
+        "SELECT 1 LIMIT ALL FETCH FIRST ROW ONLY",
+        "SELECT 1 FETCH FIRST ROW ONLY LIMIT 1",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT 1 ORDER BY 1 FETCH FIRST ROW WITH TIES", .{}));
+}
+
 test "compiler rejects unsupported clauses and additional statements atomically" {
     const cases = [_][]const u8{
         "SELECT * FROM t; DELETE FROM t",
@@ -2263,8 +2784,11 @@ test "compiler bounds resources and validates parameters and numbers" {
     try std.testing.expectError(error.SqlLimitExceeded, compile(std.testing.allocator, "SELECT * FROM t WHERE (((a=1)))", .{ .max_depth = 2 }));
     try std.testing.expectError(error.InvalidSqlParameter, compile(std.testing.allocator, "DELETE FROM t WHERE x=$0", .{}));
     try std.testing.expectError(error.InvalidSqlParameter, compile(std.testing.allocator, "DELETE FROM t WHERE x=$1025", .{}));
-    try std.testing.expectError(error.InvalidSqlNumber, compile(std.testing.allocator, "INSERT INTO t(x) VALUES (9223372036854775808)", .{}));
-    try std.testing.expectError(error.InvalidSqlNumber, compile(std.testing.allocator, "INSERT INTO t(x) VALUES (1e9999)", .{}));
+    for ([_][]const u8{ "SELECT 9223372036854775808", "SELECT 1e9999" }) |sql| {
+        var exact = try compile(std.testing.allocator, sql, .{});
+        defer exact.deinit();
+        try std.testing.expect(exact.statement.select.columns[0].expression.?.literal == .numeric);
+    }
     try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, "UPDATE t SET x=1,X=2", .{}));
 }
 
@@ -2273,11 +2797,155 @@ test "compiler DDL literal defaults and count" {
     defer ddl.deinit();
     try std.testing.expect(ddl.statement.create_table.if_not_exists);
     try std.testing.expect(!ddl.statement.create_table.columns[0].nullable);
-    try std.testing.expectEqual(@as(i64, 0), ddl.statement.create_table.columns[1].default_value.?.integer);
+    try std.testing.expectEqual(@as(i64, 0), ddl.statement.create_table.columns[1].default_expression.?.literal.integer);
     var count = try compile(std.testing.allocator, "SELECT count(*) AS total FROM t", .{});
     defer count.deinit();
     try std.testing.expect(count.statement.select.count_all);
     try std.testing.expectEqualStrings("total", count.statement.select.count_alias.?);
+}
+
+test "compiler predicate modifiers preserve keyword quoting and unwind allocation faults" {
+    for ([_][]const u8{ "TRUE IS \"unknown\"", "7 BETWEEN \"symmetric\" 9 AND 2", "7 BETWEEN SYMMETRIC ASYMMETRIC 9 AND 2" }) |sql| {
+        if (compileScalar(std.testing.allocator, sql, .{})) |result| {
+            var owned = result;
+            owned.deinit();
+            return error.ExpectedPredicateSyntaxFailure;
+        } else |_| {}
+    }
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var compiled = try compileScalar(alloc, "($1 BETWEEN SYMMETRIC $2 AND $3) IS NOT UNKNOWN", .{});
+            defer compiled.deinit();
+            var program = try @import("scalar.zig").bind(alloc, compiled.expression, &.{}, &.{ .integer, .integer, .integer }, .{});
+            defer program.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "compiler durable defaults and stored generated columns own complete scalar trees" {
+    const alloc = std.testing.allocator;
+    var created = try compile(alloc, "CREATE TABLE exprs (g integer GENERATED ALWAYS AS (CASE WHEN n IS NULL THEN 0 ELSE n+1 END) STORED NOT NULL, n smallint DEFAULT (2+3) NOT NULL, label text DEFAULT lower('READY'))", .{});
+    defer created.deinit();
+    const columns = created.statement.create_table.columns;
+    try std.testing.expect(columns[0].generated_expression.?.* == .case_when);
+    try std.testing.expect(!columns[0].nullable);
+    try std.testing.expect(columns[1].default_expression.?.* == .binary);
+    try std.testing.expect(columns[2].default_expression.?.* == .call);
+    var added = try compile(alloc, "ALTER TABLE exprs ADD COLUMN g2 bigint GENERATED ALWAYS AS (n*2) STORED NOT NULL", .{});
+    defer added.deinit();
+    try std.testing.expect(added.statement.catalog_ddl.schema_change.?.add_column.generated_expression.?.* == .binary);
+    var changed = try compile(alloc, "ALTER TABLE exprs ALTER COLUMN n SET DEFAULT CASE WHEN true THEN 7 ELSE 9 END", .{});
+    defer changed.deinit();
+    try std.testing.expect(changed.statement.catalog_ddl.schema_change.?.set_default.expression.* == .case_when);
+}
+
+test "compiler persistent expression guards inspect nested parameters subqueries and references" {
+    for ([_][]const u8{
+        "CREATE TABLE t (n integer DEFAULT coalesce(1,$1))",
+        "ALTER TABLE t ADD COLUMN n integer DEFAULT (1+$1)",
+        "ALTER TABLE t ALTER COLUMN n SET DEFAULT CASE WHEN true THEN 1 ELSE $1 END",
+        "CREATE TABLE t (n integer DEFAULT coalesce(1,(SELECT 2)))",
+        "ALTER TABLE t ADD COLUMN n integer DEFAULT n+1",
+        "CREATE TABLE t (n integer, g integer GENERATED ALWAYS AS (n+$1) STORED)",
+        "CREATE TABLE t (n integer, g integer GENERATED ALWAYS AS ((SELECT 1)) STORED)",
+        "CREATE TABLE t (n integer GENERATED ALWAYS AS (1) VIRTUAL)",
+    }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, sql, .{}));
+    for ([_][]const u8{
+        "CREATE TABLE t (n integer DEFAULT 1 GENERATED ALWAYS AS (2) STORED)",
+        "ALTER TABLE t ADD COLUMN n integer GENERATED ALWAYS AS (1) STORED DEFAULT 2",
+        "ALTER TABLE t ADD COLUMN n integer DEFAULT 1 DEFAULT 2",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+}
+
+test "compiler durable expression trees unwind every allocation fault" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var compiled = try compile(a, "CREATE TABLE exprs (g integer GENERATED ALWAYS AS (CASE WHEN n IS NULL THEN 0 ELSE n+1 END) STORED, n smallint DEFAULT (2+3), label text DEFAULT lower('READY'))", .{});
+            defer compiled.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "compiler array DDL retains PostgreSQL builtin element identity without dimension constraints" {
+    const Element = @import("array_value.zig").ElementType;
+    const cases = .{
+        .{ .declaration = "text[]", .element = Element.text, .oid = @as(u32, 1009) },
+        .{ .declaration = "smallint[]", .element = Element.int16, .oid = @as(u32, 1005) },
+        .{ .declaration = "int2[7]", .element = Element.int16, .oid = @as(u32, 1005) },
+        .{ .declaration = "integer[]", .element = Element.int32, .oid = @as(u32, 1007) },
+        .{ .declaration = "int[][]", .element = Element.int32, .oid = @as(u32, 1007) },
+        .{ .declaration = "int4[2][3]", .element = Element.int32, .oid = @as(u32, 1007) },
+        .{ .declaration = "bigint[]", .element = Element.int64, .oid = @as(u32, 1016) },
+        .{ .declaration = "int8[0]", .element = Element.int64, .oid = @as(u32, 1016) },
+        .{ .declaration = "real[]", .element = Element.float32, .oid = @as(u32, 1021) },
+        .{ .declaration = "float4[]", .element = Element.float32, .oid = @as(u32, 1021) },
+        .{ .declaration = "double precision[]", .element = Element.float64, .oid = @as(u32, 1022) },
+        .{ .declaration = "float8[]", .element = Element.float64, .oid = @as(u32, 1022) },
+        .{ .declaration = "boolean[]", .element = Element.boolean, .oid = @as(u32, 1000) },
+        .{ .declaration = "bool[]", .element = Element.boolean, .oid = @as(u32, 1000) },
+        .{ .declaration = "uuid[]", .element = Element.uuid, .oid = @as(u32, 2951) },
+        .{ .declaration = "jsonb[]", .element = Element.jsonb, .oid = @as(u32, 3807) },
+    };
+    inline for (cases) |case| {
+        var create = try compile(std.testing.allocator, "CREATE TABLE arrays (payload " ++ case.declaration ++ " NOT NULL)", .{});
+        defer create.deinit();
+        const column = create.statement.create_table.columns[0];
+        try std.testing.expectEqual(ast.ColumnType.array, column.type);
+        try std.testing.expectEqual(case.element, column.element_type.?);
+        try std.testing.expectEqual(case.oid, column.element_type.?.arrayOid());
+        try std.testing.expect(!column.nullable);
+        var alter = try compile(std.testing.allocator, "ALTER TABLE arrays ADD COLUMN payload " ++ case.declaration ++ " NOT NULL", .{});
+        defer alter.deinit();
+        try std.testing.expectEqualDeep(column, alter.statement.catalog_ddl.schema_change.?.add_column);
+    }
+}
+
+test "compiler precise DDL descriptors retain scalar storage widths" {
+    var compiled = try compile(std.testing.allocator, "CREATE TABLE widths (i integer, b bigint, f double precision, j json, a jsonb[])", .{});
+    defer compiled.deinit();
+    const columns = compiled.statement.create_table.columns;
+    try std.testing.expectEqual(@import("array_value.zig").ElementType.int32, columns[0].element_type.?);
+    try std.testing.expectEqual(@import("array_value.zig").ElementType.int64, columns[1].element_type.?);
+    try std.testing.expectEqual(@import("array_value.zig").ElementType.float64, columns[2].element_type.?);
+    try std.testing.expectEqual(ast.ColumnType.json, columns[3].type);
+    try std.testing.expect(columns[3].element_type == null);
+    try std.testing.expectEqual(ast.ColumnType.array, columns[4].type);
+    for ([_][]const u8{ "smallint", "real", "int2", "float4" }) |declaration| {
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "CREATE TABLE widths (i {s})", .{declaration});
+        defer std.testing.allocator.free(sql);
+        var precise = try compile(std.testing.allocator, sql, .{});
+        defer precise.deinit();
+        try std.testing.expect(precise.statement.create_table.columns[0].element_type != null);
+    }
+    for ([_][]const u8{
+        "CREATE TABLE arrays (a json[])",
+        "CREATE TABLE arrays (a datetime[])",
+        "CREATE TABLE arrays (a \"integer\"[])",
+    }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, sql, .{}));
+    for ([_][]const u8{
+        "CREATE TABLE arrays (a int[)",
+        "CREATE TABLE arrays (a int[1.5])",
+        "CREATE TABLE arrays (a int[-1])",
+        "CREATE TABLE arrays (a int[2147483648])",
+        "ALTER TABLE arrays ADD COLUMN a int[2",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+}
+
+fn arrayDdlAllocationFailureCase(alloc: std.mem.Allocator) !void {
+    for ([_][]const u8{
+        "CREATE TABLE arrays (a int2[2][3] NOT NULL, b jsonb[], c uuid[])",
+        "ALTER TABLE arrays ADD COLUMN a double precision[][] NOT NULL",
+    }) |sql| {
+        var compiled = try compile(alloc, sql, .{});
+        defer compiled.deinit();
+    }
+}
+
+test "compiler array DDL releases all allocations on failure and retains bounded parsing" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, arrayDdlAllocationFailureCase, .{});
+    try std.testing.expectError(error.SqlLimitExceeded, compile(std.testing.allocator, "CREATE TABLE arrays (a int[2][3])", .{ .max_tokens = 8 }));
 }
 
 test "compiler balances long boolean chains rather than retaining linear tree depth" {
@@ -2338,9 +3006,23 @@ test "SQL original duplicate point update target rejects before backend access" 
     try std.testing.expectError(error.DuplicateSqlColumn, compile(std.testing.allocator, "UPDATE usage_records SET status = 'active', status = lower(status) WHERE id = 'u1'", .{}));
 }
 
-test "SQL original named conflict target rejects before backend access" {
-    // sql-1487: named constraints are not an admitted ON CONFLICT arbiter.
-    try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, "INSERT INTO usage_records (id, status) VALUES ('u_bad_named', 'pending') ON CONFLICT ON CONSTRAINT usage_records_id_key DO NOTHING", .{}));
+test "SQL original absent named conflict target rejects before row evaluation" {
+    // sql-1487: existence/kind/timing are catalog binding decisions, not a
+    // syntax rejection. An absent name must still fail before row evaluation.
+    var compiled = try compile(std.testing.allocator, "INSERT INTO usage_records (id, status) VALUES ('u_bad_named', 'pending') ON CONFLICT ON CONSTRAINT usage_records_id_key DO NOTHING", .{});
+    defer compiled.deinit();
+    try std.testing.expectEqualStrings("usage_records_id_key", compiled.statement.insert.conflict.?.constraint_name.?);
+    const Backend = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+        fn generate(_: *anyopaque, _: std.mem.Allocator) ![]const u8 {
+            return error.UnexpectedIdentityGeneration;
+        }
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: @import("catalog.zig").Action) !@import("catalog.zig").Table {
+            return .{ .id = 1, .physical_name = "usage_records", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = .string }, .{ .name = "status", .path = "status", .type = .string } } };
+        }
+    };
+    var backend_tag: u8 = 0;
+    try std.testing.expectError(error.SqlConstraintNotFound, @import("describe.zig").describe(std.testing.allocator, .{ .ptr = &backend_tag, .vtable = &.{ .resolve = Backend.resolve, .generate_row_id = Backend.generate, .scan = undefined, .mutate = undefined, .checkpoint = Backend.checkpoint } }, &compiled, &.{}));
 }
 
 test "SQL original multi-output mutation selector rejects before backend access" {
@@ -2419,6 +3101,74 @@ test "compiler implicit projection aliases preserve clause and expression bounda
     try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT id 42 FROM usage_records", .{}));
 }
 
+test "compiler incomplete catalog definitions report EOF and release partial allocations" {
+    const Harness = struct {
+        fn run(alloc: std.mem.Allocator, sql: []const u8) !void {
+            var diagnostic: Diagnostic = .{};
+            var compiled = compileDiagnostic(alloc, sql, .{}, &diagnostic) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.InvalidSqlSyntax, err);
+                try std.testing.expect(diagnostic.start <= sql.len and diagnostic.end <= sql.len);
+                try std.testing.expect(diagnostic.message.len > 0);
+                return;
+            };
+            defer compiled.deinit();
+            return error.UnexpectedCatalogAdmission;
+        }
+    };
+    for ([_][]const u8{
+        "CREATE TABLE broken (",
+        "CREATE TABLE broken (n bigint",
+        "CREATE TABLE broken (n bigint NULL",
+        "CREATE TABLE broken (n bigint CONSTRAINT only_name",
+        "CREATE TABLE broken (n bigint CONSTRAINT only_name REFERENCES",
+        "CREATE TABLE broken (n bigint PRIMARY KEY,",
+        "CREATE TABLE broken (CONSTRAINT only_name",
+    }) |sql| try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{sql});
+}
+
+test "compiler preserves PostgreSQL expression labels before relational lowering" {
+    var operators = try compile(std.testing.allocator, "SELECT status ~ 'x', status ~* 'x', status !~ 'x', status !~* 'x' FROM usage_records", .{});
+    defer operators.deinit();
+    for (operators.statement.select.columns[0..2]) |projection| try std.testing.expectEqualStrings("?column?", projection.alias.?);
+    for (operators.statement.select.columns[2..]) |projection| try std.testing.expect(projection.alias == null);
+    var statement = try compile(std.testing.allocator, "SELECT lower(name), jsonb_typeof(metadata), CASE WHEN enabled THEN 1 ELSE 0 END, upper(name) AS display FROM usage_records", .{});
+    defer statement.deinit();
+    for (statement.statement.select.columns, [_][]const u8{ "lower", "jsonb_typeof", "case", "display" }) |projection, label| try std.testing.expectEqualStrings(label, projection.alias.?);
+    var quoted = try compile(std.testing.allocator, "SELECT id AS \"isnull\" FROM usage_records WHERE status ISNULL AND email NOTNULL", .{});
+    defer quoted.deinit();
+    try std.testing.expectEqualStrings("isnull", quoted.statement.select.columns[0].alias.?);
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT id FROM usage_records WHERE status \"isnull\"", .{}));
+}
+
+test "compiler ordered-set inputs remain visible to ordinary scalar visitors" {
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    for (560..567) |ordinal| {
+        var id_buffer: [8]u8 = undefined;
+        const case = try corpus.get(try std.fmt.bufPrint(&id_buffer, "sql-{d:0>4}", .{ordinal}));
+        var compiled = try compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        const call = compiled.statement.select.columns[1].expression.?.call;
+        try std.testing.expectEqual(@as(usize, 1), call.within_group.?.orders.len);
+        try std.testing.expectEqual(@as(usize, if (ordinal == 560) 1 else 2), call.args.len);
+        try std.testing.expectEqualStrings(if (ordinal == 560) "status" else "amount", call.args[call.args.len - 1].column);
+        try std.testing.expectEqual(ordinal == 563 or ordinal == 564, call.within_group.?.orders[0].descending);
+        if (ordinal == 562) try std.testing.expectEqual(false, call.within_group.?.orders[0].nulls_first.?);
+        try std.testing.expectEqual(ordinal == 564, call.filter != null);
+    }
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var compiled = try compile(alloc, "SELECT percentile_cont($1) WITHIN GROUP (ORDER BY x DESC NULLS FIRST) FILTER (WHERE flag) FROM t", .{});
+            defer compiled.deinit();
+            try std.testing.expectEqual(@as(u32, 1), compiled.parameter_count);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    const nested = "SELECT mode() WITHIN GROUP (ORDER BY mode() WITHIN GROUP (ORDER BY mode() WITHIN GROUP (ORDER BY mode() WITHIN GROUP (ORDER BY 1))))";
+    try std.testing.expectError(error.SqlLimitExceeded, compile(std.testing.allocator, nested, .{ .max_depth = 3 }));
+}
+
 test "compiler preserves keyword-named columns and quoted SQL-looking values" {
     var columns = try compile(std.testing.allocator, "SELECT count FROM t WHERE \"select\" = 'x''; DELETE FROM t; --'", .{});
     defer columns.deinit();
@@ -2426,6 +3176,12 @@ test "compiler preserves keyword-named columns and quoted SQL-looking values" {
     try std.testing.expectEqualStrings("count", columns.statement.select.columns[0].field);
     try std.testing.expectEqualStrings("select", columns.statement.select.predicate.?.comparison.field);
     try std.testing.expectEqualStrings("x'; DELETE FROM t; --", columns.statement.select.predicate.?.comparison.value.string);
+}
+
+test "SQL compiler helper names are not a public function surface" {
+    for ([_][]const u8{ "SELECT \"$array\"(1)", "SELECT \"$array_quantified\"(1, ARRAY[1], 99, TRUE)", "SELECT \"$validate\"(1)" }) |sql| {
+        try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, sql, .{}));
+    }
 }
 
 test "SQL incomplete value expressions report syntax errors" {
@@ -2460,7 +3216,8 @@ test "SQL DROP INDEX resolves catalog ownership with an optional ON clause" {
         defer compiled.deinit();
         const ddl = compiled.statement.catalog_ddl;
         try std.testing.expect(ddl.conditional);
-        try std.testing.expectEqualStrings("", ddl.name.table);
+        try std.testing.expect(ddl.kind == .index);
+        try std.testing.expectEqualStrings("recency", ddl.index_targets[0].table);
         try std.testing.expectEqualStrings("recency", ddl.schema_change.?.drop_index);
     }
     var scoped = try compile(std.testing.allocator, "DROP INDEX recency ON public.threads", .{});

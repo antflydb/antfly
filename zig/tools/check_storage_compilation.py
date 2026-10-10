@@ -305,12 +305,22 @@ def main() -> None:
     parser.add_argument("--zig", default="zig")
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--report", type=Path)
-    parser.add_argument("--write-control-catalog", action="store_true")
+    catalog_mode = parser.add_mutually_exclusive_group()
+    catalog_mode.add_argument("--write-control-catalog", action="store_true")
+    catalog_mode.add_argument("--check-control-catalog", action="store_true")
     args = parser.parse_args()
     if args.write_control_catalog:
         (ZIG_ROOT / "pkg/antfly-embedded/src/source_catalog_control.zig").write_text(
             control_catalog_contents()
         )
+        return
+    if args.check_control_catalog:
+        path = ZIG_ROOT / "pkg/antfly-embedded/src/source_catalog_control.zig"
+        if path.read_text() != control_catalog_contents():
+            parser.exit(
+                1,
+                "Stale control-source catalog; run make -C zig source-catalog-generate\n",
+            )
         return
     records = []
     if args.jobs <= 0:

@@ -23,6 +23,7 @@ import pytest
 
 import antfly_embedded as af
 from antfly_embedded import dbapi
+from antfly_embedded._sql import SQLStateError
 
 CASES = Path(__file__).resolve().parents[4] / "zig/pkg/antfly-embedded/capi-conformance/sql/cases.json"
 
@@ -543,3 +544,66 @@ def test_commented_rollback_preserves_manual_transactions(require_native, aflite
         assert cursor.execute("SELECT n FROM numbers").fetchall() == [(3,)]
         connection.rollback()
         assert cursor.execute("SELECT n FROM numbers").fetchall() == []
+
+
+def test_issue_1057_not_null_identifies_public_column(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql(
+            "CREATE TABLE p (id TEXT PRIMARY KEY, board TEXT NOT NULL, n BIGINT NOT NULL, body TEXT NOT NULL, note TEXT NOT NULL)"
+        )
+        for statement, parameters in [
+            ("INSERT INTO p (id, board, n, body) VALUES ('z','b1',3,'no note')", ()),
+            ("INSERT INTO p (id, board, n, body, note) VALUES ('z','b1',3,'no note',$1)", (None,)),
+            ("INSERT INTO p (id, board, n, body, note) VALUES ('z','b1',3,'no note',NULL)", ()),
+        ]:
+            with pytest.raises(SQLStateError) as raised:
+                database.sql(statement, parameters)
+            assert raised.value.sqlstate == "23502"
+            assert raised.value.diagnostic["column_name"] == "note"
+        assert database.sql("SELECT id FROM p")["rows"] == []
+
+
+@pytest.mark.parametrize("size_mib", [2, 3, 4, 6, 8, 12])
+def test_issue_1057_large_autocommit_statement(require_native, aflite_path, size_mib):
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql("CREATE TABLE large_payloads (id TEXT PRIMARY KEY, body TEXT NOT NULL)")
+        payload = "x" * (size_mib * 1024 * 1024)
+        database.sql("INSERT INTO large_payloads (id,body) VALUES ('bound',$1)", (payload,))
+        database.sql("INSERT INTO large_payloads (id,body) VALUES ('literal','" + payload + "')")
+        assert database.sql("SELECT id,octet_length(body) FROM large_payloads ORDER BY id")["rows"] == [
+            ["bound", str(len(payload))],
+            ["literal", str(len(payload))],
+        ]
+
+
+def test_issue_1057_large_transaction(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql("CREATE TABLE txn_payloads (id TEXT PRIMARY KEY, body TEXT NOT NULL)")
+        session = database.sql_session()
+        try:
+            session.execute("BEGIN")
+            for index in range(4):
+                session.execute("INSERT INTO txn_payloads (id,body) VALUES ($1,$2)", (str(index), "x" * 1024 * 1024))
+            session.execute("COMMIT")
+            assert database.sql("SELECT count(*) FROM txn_payloads")["rows"] == [["4"]]
+        finally:
+            session.close()
+
+
+def test_issue_1057_oversized_request_has_sql_diagnostic(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as database:
+        with pytest.raises(SQLStateError) as raised:
+            database.sql("SELECT $1", ("x" * (64 * 1024 * 1024),))
+        assert raised.value.sqlstate == "54000"
+        assert "67108864" in raised.value.diagnostic["message"]
+        assert database.sql("SELECT 1")["rows"] == [["1"]]
+
+
+def test_issue_1057_not_null_preserves_default_and_empty_source(require_native, aflite_path):
+    with af.create(aflite_path, no_sync=True) as database:
+        database.sql("CREATE TABLE defaults_test (id TEXT PRIMARY KEY, note TEXT NOT NULL DEFAULT 'ready')")
+        database.sql("INSERT INTO defaults_test (id) VALUES ('ok')")
+        assert database.sql("SELECT note FROM defaults_test")["rows"] == [["ready"]]
+        database.sql("CREATE TABLE required_test (id TEXT PRIMARY KEY, note TEXT NOT NULL)")
+        database.sql("INSERT INTO required_test (id) SELECT 'skip' WHERE false")
+        assert database.sql("SELECT id FROM required_test")["rows"] == []

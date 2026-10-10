@@ -58,6 +58,19 @@ pub const LoopResult = struct {
     next_lsn: u64,
 };
 
+/// Transport EOF is insufficient while a durable receive prefix still awaits
+/// apply. A deferred local proof must yield to the caller's scheduler, not
+/// spin at EOF or be reported as completed replication.
+pub fn catchUpComplete(result: Result) !bool {
+    if (result.end_of_wal and result.progress.applied_lsn == result.progress.received_lsn) return true;
+    if (result.received_count == 0 and result.applied_count == 0) {
+        if (result.progress.applied_lsn < result.progress.received_lsn)
+            return error.CatalogPublicationProofPending;
+        return error.InternalReplicationDidNotAdvance;
+    }
+    return false;
+}
+
 pub const FetchedBatch = struct {
     alloc: Allocator,
     identity: standby_mod.Identity,
@@ -324,7 +337,7 @@ pub const Client = struct {
             .current_lsn = batch.current_lsn,
             .last_sent_lsn = batch.last_sent_lsn,
             .next_lsn = batch.next_lsn,
-            .end_of_wal = batch.end_of_wal,
+            .end_of_wal = batch.end_of_wal and applied.progress.applied_lsn == applied.progress.received_lsn,
         };
     }
 
@@ -368,7 +381,7 @@ pub const Client = struct {
             last_sent_lsn = result.last_sent_lsn;
             next_lsn = result.next_lsn;
 
-            if (result.end_of_wal) {
+            if (try catchUpComplete(result)) {
                 return .{
                     .iterations = iterations,
                     .received_count = received_count,
@@ -378,10 +391,6 @@ pub const Client = struct {
                     .last_sent_lsn = last_sent_lsn,
                     .next_lsn = next_lsn,
                 };
-            }
-
-            if (result.received_count == 0 and result.applied_count == 0) {
-                return error.InternalReplicationDidNotAdvance;
             }
         }
     }
@@ -1812,6 +1821,87 @@ test "storage.hot_standby http replication client reports durable receive progre
     const slot = primary.slot("standby-a") orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(u64, 2), slot.received_lsn);
     try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+}
+
+test "storage.hot_standby catch up completion requires applied EOF and yields without spinning" {
+    var result: Result = .{
+        .received_count = 0,
+        .applied_count = 0,
+        .progress = .{ .received_lsn = 3, .applied_lsn = 1, .safe_read_lsn = 1 },
+        .current_lsn = 3,
+        .last_sent_lsn = 3,
+        .next_lsn = 4,
+        .end_of_wal = true,
+    };
+    try std.testing.expectError(error.CatalogPublicationProofPending, catchUpComplete(result));
+    result.received_count = 3;
+    result.applied_count = 1;
+    try std.testing.expect(!try catchUpComplete(result));
+    result.received_count = 0;
+    result.applied_count = 0;
+    result.progress.applied_lsn = 3;
+    result.progress.safe_read_lsn = 3;
+    try std.testing.expect(try catchUpComplete(result));
+    result.end_of_wal = false;
+    try std.testing.expectError(error.InternalReplicationDidNotAdvance, catchUpComplete(result));
+    result.applied_count = 1;
+    try std.testing.expect(!try catchUpComplete(result));
+}
+
+test "storage.hot_standby http replication client yields deferred publication without acknowledging successors" {
+    const alloc = std.testing.allocator;
+    const paths = try testPaths(alloc, "deferred-publication-catch-up");
+    defer paths.deinit(alloc);
+    const identity = testIdentity();
+    var primary = try primary_mod.Primary.open(alloc, paths.primary_log.ptr, paths.primary_slots.ptr, identity, .{});
+    defer primary.close();
+    var standby = try standby_mod.Standby.open(alloc, paths.standby_log.ptr, paths.standby_progress.ptr, identity, .{});
+    defer standby.close();
+    var server = http_internal.Server.init(alloc, &primary);
+    var client = Client.init(alloc, server.executor());
+    const uri = "http://primary.internal.test";
+    try client.createReplicationSlot(uri, "standby-a", 0);
+    _ = try primary.append(.{ .payload = "one" });
+    _ = try primary.append(.{ .payload = "two" });
+    _ = try primary.append(.{ .payload = "three" });
+    const Deferred = struct {
+        next: u64 = 1,
+        remaining: usize = 3,
+        calls: usize = 0,
+        fn apply(raw: *anyopaque, record: replication_record.RecordView) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.next, record.lsn);
+            self.calls += 1;
+            if (record.lsn == 2 and self.remaining != 0) {
+                self.remaining -= 1;
+                return error.CatalogPublicationProofPending;
+            }
+            self.next += 1;
+        }
+    };
+    var deferred: Deferred = .{};
+    const first = try client.replicateAvailable(uri, "standby-a", &standby, &deferred, Deferred.apply, .{});
+    try std.testing.expect(!first.end_of_wal);
+    try std.testing.expectEqual(@as(usize, 3), first.received_count);
+    try std.testing.expectEqual(@as(usize, 1), first.applied_count);
+    try std.testing.expectEqual(@as(usize, 2), deferred.calls);
+    for (0..2) |round| {
+        try std.testing.expectError(error.CatalogPublicationProofPending, client.replicateUntilCaughtUp(uri, "standby-a", &standby, &deferred, Deferred.apply, .{}));
+        // Each no-progress round yields after exactly one callback, preserving
+        // both upstream acknowledgement and the local promotion frontier.
+        try std.testing.expectEqual(@as(usize, 3) + round, deferred.calls);
+        try std.testing.expectEqual(@as(u64, 1), standby.currentProgress().safe_read_lsn);
+        const slot = primary.slot("standby-a").?;
+        try std.testing.expectEqual(@as(u64, 3), slot.received_lsn);
+        try std.testing.expectEqual(@as(u64, 1), slot.applied_lsn);
+    }
+    const done = try client.replicateUntilCaughtUp(uri, "standby-a", &standby, &deferred, Deferred.apply, .{});
+    try std.testing.expectEqual(@as(usize, 1), done.iterations);
+    try std.testing.expectEqual(@as(usize, 0), done.received_count);
+    try std.testing.expectEqual(@as(usize, 2), done.applied_count);
+    try std.testing.expectEqual(@as(usize, 6), deferred.calls);
+    try std.testing.expectEqual(@as(u64, 3), done.progress.safe_read_lsn);
+    try std.testing.expectEqual(@as(u64, 3), primary.slot("standby-a").?.applied_lsn);
 }
 
 test "storage.hot_standby http replication client catches up over bounded batches" {

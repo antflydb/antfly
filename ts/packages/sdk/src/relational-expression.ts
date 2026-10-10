@@ -1,12 +1,18 @@
-import type { RelationalExpressionOp, RelationalExpressionType } from "./types.js";
+import type { RelationalExpressionOp, RelationalExpressionType, SQLBuiltinType } from "./types.js";
 
 const arities: Record<RelationalExpressionOp, readonly [number, number]> = {
   literal: [0, 0],
   column: [0, 0],
+  array: [0, 32],
   add: [2, 2],
   subtract: [2, 2],
   multiply: [2, 2],
   divide: [2, 2],
+  modulo: [2, 2],
+  cast: [1, 1],
+  case_when: [3, 31],
+  in_list: [2, 128],
+  not_in_list: [2, 128],
   negate: [1, 1],
   concat: [2, 32],
   coalesce: [2, 32],
@@ -25,9 +31,11 @@ const arities: Record<RelationalExpressionOp, readonly [number, number]> = {
   and: [2, 32],
   or: [2, 32],
   not: [1, 1],
-  in_list: [2, 128],
 };
 const operations = new Set(Object.keys(arities));
+const numericOperations = new Set(["add", "subtract", "multiply", "divide", "modulo", "negate"]);
+const integerIdentities = new Set(["int16", "int32", "int64"]);
+const floatIdentities = new Set(["float32", "float64"]);
 const comparisons = new Set([
   "eq",
   "ne",
@@ -38,6 +46,7 @@ const comparisons = new Set([
   "is_distinct",
   "is_not_distinct",
   "in_list",
+  "not_in_list",
 ]);
 const types: Record<RelationalExpressionType, true> = {
   string: true,
@@ -46,8 +55,145 @@ const types: Record<RelationalExpressionType, true> = {
   datetime: true,
   integer: true,
   number: true,
+  numeric: true,
+  sql_array: true,
 };
 const typeNames = new Set(Object.keys(types));
+const arrayTypes: Record<SQLBuiltinType, true> = {
+  text: true,
+  int16: true,
+  int32: true,
+  int64: true,
+  float32: true,
+  float64: true,
+  boolean: true,
+  uuid: true,
+  jsonb: true,
+  numeric: true,
+};
+const arrayIdentities = new Set(Object.keys(arrayTypes));
+
+// Count bounded JSON without allocating a second serialized envelope. The
+// depth cap includes the envelope and values array around a 64-level JSONB cell.
+function arrayLiteralBytes(input: unknown, location: string): number {
+  const fail = (): never => {
+    throw new TypeError(`${location} requires a bounded ordinal SQL array envelope`);
+  };
+  if (input === null || typeof input !== "object" || Array.isArray(input)) return fail();
+  const envelope = input as Record<string, unknown>;
+  if (Object.keys(envelope).length !== 3) return fail();
+  const { dimensions, values, sql_nulls: nulls } = envelope;
+  if (
+    !Array.isArray(dimensions) ||
+    dimensions.length > 6 ||
+    !Array.isArray(values) ||
+    !Array.isArray(nulls) ||
+    values.length !== nulls.length
+  )
+    return fail();
+  let count = dimensions.length === 0 ? 0 : 1;
+  for (const axis of dimensions) {
+    if (
+      axis === null ||
+      typeof axis !== "object" ||
+      Array.isArray(axis) ||
+      Object.keys(axis).length !== 2
+    )
+      return fail();
+    const { length, lower_bound: lower } = axis as Record<string, unknown>;
+    if (
+      typeof length !== "number" ||
+      !Number.isInteger(length) ||
+      length <= 0 ||
+      length > 2147483647 ||
+      typeof lower !== "number" ||
+      !Number.isInteger(lower) ||
+      lower < -2147483648 ||
+      lower + length > 2147483647
+    )
+      return fail();
+    count *= length;
+    if (count > 1024 * 1024) return fail();
+  }
+  if (count !== values.length) return fail();
+  for (let i = 0; i < count; i++)
+    if (typeof nulls[i] !== "boolean" || (nulls[i] && values[i] !== null)) return fail();
+  let bytes = 0;
+  const charge = (amount: number): void => {
+    bytes += amount;
+    if (bytes > 1024 * 1024) fail();
+  };
+  const text = (value: string): void => {
+    charge(2);
+    for (let i = 0; i < value.length; i++) {
+      const unit = value.charCodeAt(i);
+      if (
+        unit === 34 ||
+        unit === 92 ||
+        unit === 8 ||
+        unit === 9 ||
+        unit === 10 ||
+        unit === 12 ||
+        unit === 13
+      )
+        charge(2);
+      else if (unit < 32) charge(6);
+      else if (unit < 128) charge(1);
+      else if (unit < 2048) charge(2);
+      else if (unit >= 0xd800 && unit <= 0xdbff) {
+        const low = value.charCodeAt(++i);
+        if (!(low >= 0xdc00 && low <= 0xdfff)) fail();
+        charge(4);
+      } else {
+        if (unit >= 0xdc00 && unit <= 0xdfff) fail();
+        charge(3);
+      }
+    }
+  };
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 66) fail();
+    if (value === null) {
+      charge(4);
+      return;
+    }
+    if (typeof value === "string") {
+      text(value);
+      return;
+    }
+    if (typeof value === "boolean") {
+      charge(value ? 4 : 5);
+      return;
+    }
+    if (typeof value === "number") {
+      if (!Number.isFinite(value)) fail();
+      charge(String(value).length);
+      return;
+    }
+    if (Array.isArray(value)) {
+      charge(2);
+      for (let i = 0; i < value.length; i++) {
+        if (i !== 0) charge(1);
+        visit(value[i], depth + 1);
+      }
+      return;
+    }
+    if (typeof value !== "object" || value === null) return fail();
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) fail();
+    charge(2);
+    let first = true;
+    for (const key in value)
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        if (!first) charge(1);
+        first = false;
+        text(key);
+        charge(1);
+        visit((value as Record<string, unknown>)[key], depth + 1);
+      }
+  };
+  visit(input, 0);
+  return bytes;
+}
 
 export function isRelationalExpressionType(value: unknown): value is RelationalExpressionType {
   return typeof value === "string" && typeNames.has(value);
@@ -76,19 +222,79 @@ export function validateRelationalExpression(
     const op = node.op as RelationalExpressionOp;
     const allowed = new Set(
       op === "literal"
-        ? ["op", "type", "value"]
+        ? ["op", "type", "value", "sql_type"]
         : op === "column"
           ? ["op", "column"]
-          : comparisons.has(op)
-            ? ["op", "args", "collation"]
-            : ["op", "args"]
+          : op === "cast"
+            ? ["op", "type", "sql_type", "numeric_modifier", "args"]
+            : numericOperations.has(op) || op === "array"
+              ? ["op", "args", "sql_type"]
+              : comparisons.has(op)
+                ? ["op", "args", "collation"]
+                : ["op", "args"]
     );
     for (const key of Object.keys(node))
       if (!allowed.has(key)) throw new TypeError(`${location}.${key} is not valid for ${op}`);
+    const arrayLiteral = op === "literal" && node.type === "sql_array";
+    const arrayDomain =
+      arrayLiteral || op === "array" || (op === "cast" && node.type === "sql_array");
+    if (arrayDomain && (typeof node.sql_type !== "string" || !arrayIdentities.has(node.sql_type)))
+      throw new TypeError(`${location}.sql_type requires a supported SQL array element identity`);
+    if (node.sql_type !== undefined && !arrayDomain) {
+      const integer = typeof node.sql_type === "string" && integerIdentities.has(node.sql_type);
+      const floating = typeof node.sql_type === "string" && floatIdentities.has(node.sql_type);
+      const exact = node.sql_type === "numeric";
+      if (
+        (!integer && !floating && !exact) ||
+        ((op === "literal" || op === "cast") &&
+          !(
+            (node.type === "integer" && integer) ||
+            (node.type === "number" && floating) ||
+            (node.type === "numeric" && exact)
+          ))
+      )
+        throw new TypeError(`${location}.sql_type must match a supported numeric builtin identity`);
+    }
+    if (op === "cast" && node.sql_type === undefined)
+      throw new TypeError(`${location}.sql_type is required for a numeric cast`);
+    if (Object.prototype.hasOwnProperty.call(node, "numeric_modifier")) {
+      const modifier = node.numeric_modifier;
+      if (
+        (node.type !== "numeric" && node.type !== "sql_array") ||
+        node.sql_type !== "numeric" ||
+        modifier === null ||
+        typeof modifier !== "object" ||
+        Array.isArray(modifier)
+      )
+        throw new TypeError(
+          `${location}.numeric_modifier requires a NUMERIC cast and precision/scale object`
+        );
+      const fields = modifier as Record<string, unknown>;
+      if (
+        Object.keys(fields).length !== 2 ||
+        !Object.prototype.hasOwnProperty.call(fields, "precision") ||
+        !Object.prototype.hasOwnProperty.call(fields, "scale") ||
+        typeof fields.precision !== "number" ||
+        !Number.isInteger(fields.precision) ||
+        fields.precision < 1 ||
+        fields.precision > 1000 ||
+        typeof fields.scale !== "number" ||
+        !Number.isInteger(fields.scale) ||
+        fields.scale < -1000 ||
+        fields.scale > 1000
+      )
+        throw new TypeError(
+          `${location}.numeric_modifier requires integer precision 1..1000 and scale -1000..1000`
+        );
+    }
     if (op === "literal") {
       if (!isRelationalExpressionType(node.type))
         throw new TypeError(`${location}.type is required for a literal`);
-      if (node.value != null && !["string", "number", "boolean"].includes(typeof node.value))
+      if (
+        !arrayLiteral &&
+        node.value != null &&
+        !["string", "number", "boolean"].includes(typeof node.value)
+      )
         throw new TypeError(`${location}.value must be a scalar or null`);
       if (typeof node.value === "number" && !Number.isFinite(node.value))
         throw new TypeError(`${location}.value must be finite`);
@@ -98,7 +304,8 @@ export function validateRelationalExpression(
         !Number.isSafeInteger(node.value)
       )
         throw new TypeError(`${location}.value must be a safe integer or an exact decimal string`);
-      let literalBytes = 8;
+      let literalBytes =
+        arrayLiteral && node.value != null ? arrayLiteralBytes(node.value, `${location}.value`) : 8;
       if (typeof node.value === "string") {
         const maxBytes = 1024 * 1024;
         if (node.type === "blob") {
@@ -115,7 +322,7 @@ export function validateRelationalExpression(
         } else {
           if (node.value.length > maxBytes)
             throw new TypeError(`${location}.value exceeds the literal budget`);
-          if (node.type === "string") literalBytes = new TextEncoder().encode(node.value).length;
+          literalBytes = new TextEncoder().encode(node.value).length;
         }
         if (literalBytes > maxBytes)
           throw new TypeError(`${location}.value exceeds the literal budget`);
@@ -140,6 +347,16 @@ export function validateRelationalExpression(
       throw new TypeError(
         `${location}.args must contain ${min === max ? min : `${min}–${max}`} expressions`
       );
+    if (op === "case_when" && node.args.length % 2 !== 1)
+      throw new TypeError(`${location}.args requires condition/result pairs and a fallback`);
+    if (op === "cast" && node.type === "sql_array") {
+      const child = node.args[0];
+      if (child !== null && typeof child === "object" && !Array.isArray(child)) {
+        const type = (child as Record<string, unknown>).type;
+        if (type !== undefined && type !== "sql_array")
+          throw new TypeError(`${location}.args requires an SQL array operand`);
+      }
+    }
     node.args.forEach((child, index) => {
       visit(child, `${location}.args[${index}]`, depth + 1);
     });

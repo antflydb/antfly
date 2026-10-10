@@ -33130,7 +33130,12 @@ pub const RelationalExpressionOp = enum {
     @"and",
     @"or",
     not,
+    cast,
+    case_when,
+    modulo,
     in_list,
+    not_in_list,
+    array,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -33158,7 +33163,12 @@ pub const RelationalExpressionOp = enum {
             .@"and" => "and",
             .@"or" => "or",
             .not => "not",
+            .cast => "cast",
+            .case_when => "case_when",
+            .modulo => "modulo",
             .in_list => "in_list",
+            .not_in_list => "not_in_list",
+            .array => "array",
         };
         try jw.write(s);
     }
@@ -33193,7 +33203,12 @@ pub const RelationalExpressionOp = enum {
             .{ "and", .@"and" },
             .{ "or", .@"or" },
             .{ "not", .not },
+            .{ "cast", .cast },
+            .{ "case_when", .case_when },
+            .{ "modulo", .modulo },
             .{ "in_list", .in_list },
+            .{ "not_in_list", .not_in_list },
+            .{ "array", .array },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -33206,6 +33221,8 @@ pub const RelationalExpressionType = enum {
     datetime,
     integer,
     number,
+    numeric,
+    sql_array,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -33215,6 +33232,8 @@ pub const RelationalExpressionType = enum {
             .datetime => "datetime",
             .integer => "integer",
             .number => "number",
+            .numeric => "numeric",
+            .sql_array => "sql_array",
         };
         try jw.write(s);
     }
@@ -33231,6 +33250,8 @@ pub const RelationalExpressionType = enum {
             .{ "datetime", .datetime },
             .{ "integer", .integer },
             .{ "number", .number },
+            .{ "numeric", .numeric },
+            .{ "sql_array", .sql_array },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -34003,10 +34024,14 @@ pub const RelationalRowQueryRequest = struct {
     }
 };
 
-/// Immutable typed scalar expression, limited to 128 nodes and 16 levels. A literal requires type; omitted value means typed null. A column requires column; other operations require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of compatible types (integer and number may mix) and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. in_list evaluates its first argument once and compares it to each remaining argument of a compatible type, keeping integer comparisons exact. A match returns TRUE; otherwise a null operand or list item returns UNKNOWN, and a list without nulls returns FALSE. It stops at the first match. CHECK accepts TRUE and UNKNOWN, rejecting FALSE.
+/// Immutable typed scalar expression, limited to 128 nodes and 16 levels. A literal requires type; omitted value means typed null. A column requires column; other operations require args. Unknown or irrelevant fields are rejected. Arithmetic operands have the same integer or number type. Integer division truncates toward zero. Overflow and division by zero reject the write. Arithmetic and string operations propagate null. ASCII case operations leave non-ASCII bytes unchanged. No volatile functions are accepted. Allocated results are bounded to 1 MiB each. Allocations and byte-comparison operand work share a 4 MiB evaluation budget per row and expression set. An integer literal may use a decimal string for exact int64 transport; blob uses base64 and datetime uses the normal relational datetime representation. Comparisons require operands of compatible types (integer and number may mix) and return boolean or SQL UNKNOWN (null); is_distinct and is_not_distinct always return a boolean. Unary is_null and is_not_null test presence/null. AND and OR evaluate left to right with SQL three-valued short-circuit semantics; NOT preserves UNKNOWN. CHECK accepts TRUE and UNKNOWN, rejecting FALSE. Numeric literals and arithmetic operations may specify sql_type to retain PostgreSQL builtin overflow and float4 rounding semantics. Without it, integer and number operations retain int64 and float64 semantics. Numeric cast requires type and sql_type, takes one numeric argument, and performs a checked conversion when evaluated (not when the schema is compiled). Floating-to-integer casts round ties to even. The numeric expression type uses exact PostgreSQL NUMERIC values and may specify sql_type numeric. Its literals accept decimal strings or exact JSON numeric lexemes, including string-valued special values. Exact NUMERIC programs require reader capability version 21 even when their result is boolean or integer. Float/integer assignment casts keep their declared PostgreSQL rounding and overflow semantics. A cast to numeric may specify numeric_modifier for PostgreSQL precision and signed-scale coercion. Overflow is checked when the selected cast executes; unselected lazy branches do not fail. Modifier-bearing programs require reader capability version 23 even with integer/boolean output. The sql_array expression type requires sql_type on literals, including typed NULL, to declare the element builtin. Non-null literals use the ordinal SQL array envelope (dimensions with length/lower_bound, values, and sql_nulls), retaining shape and lower bounds. Array columns derive their exact element identity from the immutable schema. Comparisons, IN, COALESCE and CASE require matching array element identities; no element type is inferred from values. Array-dependent programs require reader capability version 24 even with scalar output. Assignment to a NUMERIC array column applies its precision/signed-scale modifier to each element. Array casts require type sql_array and an explicit matching sql_type; identity casts borrow the immutable input. Casts of numeric arrays may additionally specify numeric_modifier, coercing each non-NULL element with PostgreSQL precision and signed-scale semantics while preserving dimensions, lower bounds and NULL slots. Coercion is lazy and shares invocation admission with the surrounding expression. Array-valued ordered index keys and element-changing array casts are not supported by this expression contract. The array constructor requires sql_type and zero to 32 arguments. Constructor programs additionally require reader capability version 25, including constructors hidden inside scalar/boolean expressions. Scalar arguments must have the declared element domain, with explicit width-preserving numeric casts where needed. SQL NULL arguments become NULL elements. Array arguments must all have matching element types, dimensions and lower bounds; one leading dimension with lower bound 1 is added. All empty/NULL subarrays produce an empty array; mixing an empty/NULL subarray with a nonempty one is a dimension mismatch. Child expressions execute once, with shared work/cancellation and byte limits. case_when takes alternating boolean conditions and result expressions, followed by a mandatory fallback result (3 to 31 arguments, at most 15 branches). Conditions are evaluated in order; only the selected result is evaluated, and a NULL condition is not TRUE. All result expressions must have the same physical type. Numeric SQL lowering records builtin result-domain promotions as explicit casts. This operation requires schema capability version 18. modulo takes two same-domain integer or NUMERIC operands and returns the signed remainder (minInt modulo -1 is zero); a zero divisor rejects the write. in_list and not_in_list take one probe followed by 1 to 127 same-domain candidates. The probe is evaluated once; NULL probes return UNKNOWN. A matching candidate wins over NULL candidates; otherwise a NULL candidate makes the result UNKNOWN. These operations require schema capability version 19.
 pub const RelationalScalarExpression = struct {
     op: RelationalExpressionOp,
     type: ?RelationalExpressionType = null,
+    /// Numeric builtin result identity on numeric literals, arithmetic, negate, and cast (capability version 18), or required array element identity on sql_array literals including typed NULL (capability version 24).
+    sql_type: ?SQLBuiltinType = null,
+    /// Optional precision/signed-scale coercion; accepted only on cast with type numeric and sql_type numeric. Requires reader capability version 23.
+    numeric_modifier: ?SQLNumericModifier = null,
     /// Typed literal value, including null.
     value: OpenApiOptionalNullable(std.json.Value) = .absent,
     column: ?[]const u8 = null,
@@ -34018,6 +34043,8 @@ pub const RelationalScalarExpression = struct {
     pub const openApiFieldMetadata = .{
         .{ "op", "op", false },
         .{ "type", "type", true },
+        .{ "sql_type", "sql_type", true },
+        .{ "numeric_modifier", "numeric_modifier", true },
         .{ "value", "value", false },
         .{ "column", "column", true },
         .{ "collation", "collation", true },
@@ -34038,6 +34065,14 @@ pub const RelationalScalarExpression = struct {
         try jw.write(self.op);
         if (self.type) |value| {
             try jw.objectField("type");
+            try jw.write(value);
+        }
+        if (self.sql_type) |value| {
+            try jw.objectField("sql_type");
+            try jw.write(value);
+        }
+        if (self.numeric_modifier) |value| {
+            try jw.objectField("numeric_modifier");
             try jw.write(value);
         }
         switch (self.value) {
@@ -34070,6 +34105,7 @@ pub const RelationalScalarExpression = struct {
 /// A named, ordered composite unique key. Validation status is maintained by the server. TTL expiry uses the distributed integrity coordinator. Referenced unique keys are nondeferrable.
 pub const RelationalUniqueConstraint = struct {
     name: []const u8,
+    origin: ?RelationalUniqueConstraintOrigin = null,
     /// SQL primary-key identity. At most one per relational table; all key columns must be required and nonnullable.
     primary: ?bool = null,
     columns: ?[]const []const u8 = null,
@@ -34086,6 +34122,7 @@ pub const RelationalUniqueConstraint = struct {
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "name", "name", false },
+        .{ "origin", "origin", true },
         .{ "primary", "primary", true },
         .{ "columns", "columns", true },
         .{ "keys", "keys", true },
@@ -34107,6 +34144,10 @@ pub const RelationalUniqueConstraint = struct {
         try jw.beginObject();
         try jw.objectField("name");
         try jw.write(self.name);
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
         if (self.primary) |value| {
             try jw.objectField("primary");
             try jw.write(value);
@@ -34136,6 +34177,32 @@ pub const RelationalUniqueConstraint = struct {
             try jw.write(value);
         }
         try jw.endObject();
+    }
+};
+
+/// Durable ownership kind. Index-owned uniqueness participates in ON CONFLICT inference but is not a named SQL constraint. Human-readable index descriptions never determine ownership.
+pub const RelationalUniqueConstraintOrigin = enum {
+    constraint,
+    index,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .constraint => "constraint",
+            .index => "index",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "constraint", .constraint },
+            .{ "index", .index },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
     }
 };
 
@@ -37503,13 +37570,211 @@ pub const RuntimeDecl = struct {
     }
 };
 
+/// JSON Schema property declaration for one typed SQL-array column in a relational table. Use it as a root property of DocumentSchema.schema. The element identity is mandatory; a JSON Schema `array` remains a JSON column and is never inferred to be a SQL array. Column values use the lossless SQLArrayValue envelope: dimensions with lower bounds, flat row-major values and explicit SQL NULL flags. Integer elements are decimal strings, even when small. JSONB null and SQL NULL are distinct. Float elements acquire their declared width before validation and storage. Outer null represents a SQL NULL array when nullable is true. Additional JSON Schema constraints apply to this envelope, not to PostgreSQL array subscripts. SQL array index keys and SQL DDL activation are not implied by accepting this storage schema.
+pub const SQLArrayColumnSchema = struct {
+    type: []const u8,
+    x_antfly_sql_type: SQLArrayElementType,
+    /// Accepted only with numeric element identity. Applies assignment coercion to each non-NULL element while preserving dimensions and lower bounds. Requires reader capability version 23.
+    x_antfly_sql_numeric_modifier: ?SQLNumericModifier = null,
+    nullable: ?bool = null,
+    description: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "x-antfly-sql-type", "x_antfly_sql_type", false },
+        .{ "x-antfly-sql-numeric-modifier", "x_antfly_sql_numeric_modifier", true },
+        .{ "nullable", "nullable", true },
+        .{ "description", "description", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("x-antfly-sql-type");
+        try jw.write(self.x_antfly_sql_type);
+        if (self.x_antfly_sql_numeric_modifier) |value| {
+            try jw.objectField("x-antfly-sql-numeric-modifier");
+            try jw.write(value);
+        }
+        if (self.nullable) |value| {
+            try jw.objectField("nullable");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const SQLArrayDimension = struct {
+    length: i64,
+    lower_bound: i64,
+};
+
+/// Bound SQL scalar or array-element identity, including numeric widths and exact NUMERIC. Never inferred from JSON value shape.
+pub const SQLArrayElementType = enum {
+    text,
+    int16,
+    int32,
+    int64,
+    float32,
+    float64,
+    boolean,
+    uuid,
+    jsonb,
+    numeric,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .int16 => "int16",
+            .int32 => "int32",
+            .int64 => "int64",
+            .float32 => "float32",
+            .float64 => "float64",
+            .boolean => "boolean",
+            .uuid => "uuid",
+            .jsonb => "jsonb",
+            .numeric => "numeric",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "int16", .int16 },
+            .{ "int32", .int32 },
+            .{ "int64", .int64 },
+            .{ "float32", .float32 },
+            .{ "float64", .float64 },
+            .{ "boolean", .boolean },
+            .{ "uuid", .uuid },
+            .{ "jsonb", .jsonb },
+            .{ "numeric", .numeric },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Non-NULL SQL array result. Elements are flat, row-major values using the column's element_type. Their count equals the product of dimension lengths. Empty arrays have no dimensions and no elements. Integer elements are canonical decimal strings. Exact numeric elements are decimal strings preserving display scale, or NaN, Infinity and -Infinity. Floating elements are JSON numbers, or the strings NaN, Infinity and -Infinity. Element null flags distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL array is an outer null result cell, not an empty array or this envelope.
+pub const SQLArrayValue = struct {
+    dimensions: []const SQLArrayDimension,
+    values: []const std.json.Value,
+    /// Exactly one flag per value. True requires a null value; false permits a JSON null only for jsonb elements.
+    sql_nulls: []const bool,
+};
+
+/// Exact PostgreSQL builtin identity for a relational root scalar column. SQL array columns use SQLArrayElementType for their element identity. Set the JSON Schema property's `x-antfly-sql-type` annotation to one of these values. The underlying property type must match. SQL array storage is not implied by this annotation. Existing unannotated schemas retain their original domains. The numeric identity uses an underlying number property and exact PostgreSQL NUMERIC semantics, never binary float. Submit finite values as JSON numeric lexemes or decimal strings; special values use strings NaN, Infinity and -Infinity. Const/enum finite numeric members must be JSON numbers, not strings. Bounds and multipleOf are exact decimals. Public scalar NUMERIC schemas require reader capability version 22. To constrain a NUMERIC scalar or SQL-array column, set the root property's `x-antfly-sql-numeric-modifier` annotation to an object with precision (1..1000) and signed scale (-1000..1000). The annotation requires numeric identity and reader capability version 23. Assignment rounds before constraints, indexes and generated dependents; overflow rejects the write. Restore verifies stored values without rounding.
+pub const SQLBuiltinType = enum {
+    text,
+    int16,
+    int32,
+    int64,
+    float32,
+    float64,
+    boolean,
+    uuid,
+    jsonb,
+    numeric,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .text => "text",
+            .int16 => "int16",
+            .int32 => "int32",
+            .int64 => "int64",
+            .float32 => "float32",
+            .float64 => "float64",
+            .boolean => "boolean",
+            .uuid => "uuid",
+            .jsonb => "jsonb",
+            .numeric => "numeric",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "text", .text },
+            .{ "int16", .int16 },
+            .{ "int32", .int32 },
+            .{ "int64", .int64 },
+            .{ "float32", .float32 },
+            .{ "float64", .float64 },
+            .{ "boolean", .boolean },
+            .{ "uuid", .uuid },
+            .{ "jsonb", .jsonb },
+            .{ "numeric", .numeric },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const SQLColumn = struct {
     /// Display label. Labels need not be unique; rows use matching ordinal positions.
     name: []const u8,
     type: SQLColumnType,
+    /// Required for array columns and exact NUMERIC number columns. Identifies scalar widths when supplied. The descriptor applies even to NULL or empty arrays.
+    element_type: ?SQLArrayElementType = null,
+    /// Present only for constrained NUMERIC scalar or array results. Prepared result metadata is stable before execution-time constant folding.
+    numeric_modifier: ?SQLNumericModifier = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "type", "type", false },
+        .{ "element_type", "element_type", true },
+        .{ "numeric_modifier", "numeric_modifier", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.element_type) |value| {
+            try jw.objectField("element_type");
+            try jw.write(value);
+        }
+        if (self.numeric_modifier) |value| {
+            try jw.objectField("numeric_modifier");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
-/// Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
+/// Logical SQL result type. Integer values and numbers with element_type numeric are decimal strings to preserve exact precision in every client.
 pub const SQLColumnType = enum {
     string,
     uuid,
@@ -37518,6 +37783,7 @@ pub const SQLColumnType = enum {
     boolean,
     datetime,
     json,
+    array,
     unknown,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -37529,6 +37795,7 @@ pub const SQLColumnType = enum {
             .boolean => "boolean",
             .datetime => "datetime",
             .json => "json",
+            .array => "array",
             .unknown => "unknown",
         };
         try jw.write(s);
@@ -37547,6 +37814,7 @@ pub const SQLColumnType = enum {
             .{ "boolean", .boolean },
             .{ "datetime", .datetime },
             .{ "json", .json },
+            .{ "array", .array },
             .{ "unknown", .unknown },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -37696,6 +37964,8 @@ pub const SQLDiagnostic = struct {
     code: []const u8,
     /// Human-readable diagnostic with no sensitive parameter values.
     message: []const u8,
+    /// Public column identifier for a column constraint violation; no row values are included.
+    column_name: ?[]const u8 = null,
     /// Optional one-based character position in the submitted SQL statement.
     position: ?i64 = null,
     /// Native transaction receipt for reconciliation when a mutation outcome is unknown.
@@ -37708,6 +37978,7 @@ pub const SQLDiagnostic = struct {
     pub const openApiFieldMetadata = .{
         .{ "code", "code", false },
         .{ "message", "message", false },
+        .{ "column_name", "column_name", true },
         .{ "position", "position", true },
         .{ "transaction_id", "transaction_id", true },
         .{ "retryable", "retryable", true },
@@ -37728,6 +37999,10 @@ pub const SQLDiagnostic = struct {
         try jw.write(self.code);
         try jw.objectField("message");
         try jw.write(self.message);
+        if (self.column_name) |value| {
+            try jw.objectField("column_name");
+            try jw.write(value);
+        }
         if (self.position) |value| {
             try jw.objectField("position");
             try jw.write(value);
@@ -37777,6 +38052,47 @@ pub const SQLMutationOutcome = enum {
             .{ "committed_graph_metric_materialization_rejected", .committed_graph_metric_materialization_rejected },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// PostgreSQL NUMERIC precision and signed scale. For arrays this describes every element, not dimensions. Absent means unconstrained NUMERIC.
+pub const SQLNumericModifier = struct {
+    precision: i64,
+    scale: i64,
+};
+
+/// Immutable positional input contract. Element identity also preserves primitive widths; array inputs require it. Unknown slots have no SQL constraint.
+pub const SQLParameterDescriptor = struct {
+    type: SQLColumnType,
+    element_type: ?SQLArrayElementType = null,
+    nullable: bool,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "element_type", "element_type", true },
+        .{ "nullable", "nullable", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.element_type) |value| {
+            try jw.objectField("element_type");
+            try jw.write(value);
+        }
+        try jw.objectField("nullable");
+        try jw.write(self.nullable);
+        try jw.endObject();
     }
 };
 
@@ -37882,6 +38198,8 @@ pub const SQLPreparedResponse = struct {
     /// Exact decimal API owner identifier, preserved by JavaScript clients.
     owner_node_id: []const u8,
     parameter_types: []const SQLColumnType,
+    /// Precise positional contracts, aligned with parameter_types. Array arguments use the lossless SQLArrayValue envelope or PostgreSQL array text; plain JSON arrays are not SQL arrays.
+    parameter_descriptors: []const SQLParameterDescriptor,
     columns: []const SQLColumn,
 };
 
@@ -37953,7 +38271,7 @@ pub const SQLRequest = struct {
     }
 };
 
-/// Ordinal result rows with corresponding logical column metadata. SQL NULL is JSON null; sql_nulls distinguishes it from a JSON column containing the JSON literal null. Integer-typed values are exact decimal strings; datetime values are strings. Objects and arrays in JSON columns remain JSON.
+/// Ordinal result rows with corresponding logical column metadata. SQL NULL is JSON null; sql_nulls distinguishes it from a JSON column containing the JSON literal null. Integer-typed values are exact decimal strings; datetime values are strings. Objects and arrays in JSON columns remain JSON. Array-typed columns contain SQLArrayValue envelopes, with their element descriptor in the corresponding SQLColumn. They are not JSON columns.
 pub const SQLResponse = struct {
     columns: []const SQLColumn,
     rows: []const []const std.json.Value,

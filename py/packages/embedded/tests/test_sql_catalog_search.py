@@ -144,12 +144,21 @@ def test_sql_repairs_failed_unique_coverage(require_native, aflite_path, session
                 connection.execute("COMMIT")
         else:
             db.sql(repair)
-        assert db.sql("ALTER TABLE items VALIDATE CONSTRAINT u")["ddl_receipt"]["state"] == "ready"
+        with pytest.raises(SQLStateError) as rejected:
+            db.sql("ALTER TABLE items VALIDATE CONSTRAINT u")
+        assert rejected.value.sqlstate == "42704"
+        db.sql("DROP INDEX u")
+        assert db.sql("CREATE UNIQUE INDEX u ON items(n)")["ddl_receipt"]["state"] == "ready"
         with pytest.raises(SQLStateError) as duplicate:
             db.sql("INSERT INTO items(_id,n) VALUES ('bad',1)")
         assert duplicate.value.sqlstate == "23505"
     with af.open(aflite_path) as db:
-        assert db.sql("ALTER TABLE items VALIDATE CONSTRAINT u")["ddl_receipt"]["state"] == "ready"
+        with pytest.raises(SQLStateError) as rejected:
+            db.sql("ALTER TABLE items VALIDATE CONSTRAINT u")
+        assert rejected.value.sqlstate == "42704"
+        with pytest.raises(SQLStateError) as duplicate:
+            db.sql("INSERT INTO items(_id,n) VALUES ('still_bad',1)")
+        assert duplicate.value.sqlstate == "23505"
 
 
 def test_sql_add_drop_foreign_key_publishes_parent_generations(require_native, aflite_path):
@@ -955,7 +964,7 @@ def test_sql_check_in_list_enforces_three_valued_membership(require_native, afli
             if value in allowed:
                 db.sql(
                     "INSERT INTO membership(_id,x,y) VALUES ($1,$2,$3)",
-                    [str(index), value, 0 if "/ y" in predicate else 1],
+                    [str(index), value, 0 if "/ y" in predicate and value is not None else 1],
                 )
             else:
                 with pytest.raises(SQLStateError) as rejected:
@@ -1031,7 +1040,7 @@ def test_sql_explicit_like_escape_parameters_and_validation(require_native, afli
         for pattern, escape in [("a", "xx"), ("x!", "!"), ("!", "!")]:
             with pytest.raises(SQLStateError) as rejected:
                 db.sql("SELECT 'a' LIKE $1 ESCAPE $2", [pattern, escape])
-            assert rejected.value.sqlstate == "22023"
+            assert rejected.value.sqlstate == "22025"
 
 
 def test_sql_correlated_projection_and_insert_select_not_exists(require_native, aflite_path):

@@ -30,7 +30,7 @@ const Fixture = struct {
     fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
         return error.UnexpectedBackendCall;
     }
-    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.mutations += 1;
         try std.testing.expectEqual(@as(usize, 3), mutations.len);
@@ -136,7 +136,7 @@ test "SQL recursive worklists preserve delta UNION ALL and distinct cycle semant
 
 test "SQL recursive typing infers parameters and distinguishes JSON null in visited sets" {
     var fixture: Fixture = .{};
-    var compiled = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT $1 UNION ALL SELECT n+1 FROM r WHERE n<$2) SELECT n FROM r", .{});
+    var compiled = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT $1::bigint UNION ALL SELECT n+1 FROM r WHERE n<$2) SELECT n FROM r", .{});
     defer compiled.deinit();
     var result = try runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{ .{ .integer = 1 }, .{ .integer = 3 } }, .{});
     defer result.deinit();
@@ -197,7 +197,13 @@ test "SQL recursive INSERT SELECT validates the worklist before one atomic mutat
 
 test "SQL recursive worklist and cached hash allocation failures release ownership" {
     const Case = struct {
-        fn run(alloc: std.mem.Allocator) !void {
+        fn run(backing: std.mem.Allocator) !void {
+            // In-place arena growth depends on backing addresses. Enumerate
+            // every mandatory allocation deterministically via allocate/copy.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const alloc: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             var fixture: Fixture = .{};
             var compiled = try compiler.compile(alloc, "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT r.n+1 FROM (SELECT 1 AS x UNION ALL SELECT 2) b JOIN r ON b.x=r.n WHERE r.n<3) SELECT n FROM r", .{});
             defer compiled.deinit();

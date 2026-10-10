@@ -237,6 +237,7 @@ const Builder = struct {
     const Witness = struct { address: planner.storage.Address, key: []const u8 };
     const Witnesses = struct { required: bool, values: []const Witness };
     alloc: Allocator,
+    scratch_alloc: ?Allocator = null,
     source: reads.TableReadSource,
     read_view: ?*reads.JoinReadView = null,
     read_view_attempted: bool = false,
@@ -602,11 +603,14 @@ const Builder = struct {
         if (item.expansion) |expansion| return expansion;
         const plan = try self.bindingPlan(item.table);
         const view = item.table.view;
-        var before: ?mapper.PreparedRelationalWrite = if (item.before) |row| try mapper.PreparedRelationalWrite.init(self.alloc, item.key, row.json, null, view.tableSchema().*, view.physicalLayout()) else null;
-        defer if (before) |*row| row.deinit(self.alloc);
-        var after: ?mapper.PreparedRelationalWrite = if (item.after) |json| try mapper.PreparedRelationalWrite.init(self.alloc, item.key, json, view.validator(), view.tableSchema().*, view.physicalLayout()) else null;
-        defer if (after) |*row| row.deinit(self.alloc);
-        if (after) |*row| if (view.validator()) |validator| if (validator.execution.expressions != null) {
+        var scratch = std.heap.ArenaAllocator.init(self.scratch_alloc orelse self.alloc);
+        defer scratch.deinit();
+        const temporary = scratch.allocator();
+        var before: ?mapper.PreparedRelationalWrite = if (item.before) |row| try mapper.PreparedRelationalWrite.init(temporary, item.key, row.json, null, view.tableSchema().*, view.physicalLayout()) else null;
+        defer if (before) |*row| row.deinit(temporary);
+        var after: ?mapper.PreparedRelationalWrite = if (item.after) |json| try mapper.PreparedRelationalWrite.init(temporary, item.key, json, view.validator(), view.tableSchema().*, view.physicalLayout()) else null;
+        defer if (after) |*row| row.deinit(temporary);
+        if (after) |*row| if (view.validator()) |validator| if (validator.execution.expressions) |expressions| if (expressions.bindings.len != 0 or expressions.modifier_ordinals.len != 0) {
             // Cascading parent assignments and final participant writes must
             // use the same normalized row used to derive integrity claims.
             const normalized = try std.json.Stringify.valueAlloc(self.alloc, row.parsedValue(), .{});
@@ -1059,7 +1063,7 @@ fn prepareModeWithTiming(alloc: Allocator, source: reads.TableReadSource, metada
 fn prepareModeRoutedWithTiming(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, requests: []const contract.TableCommitRequest, request_control: RequestContext, repair_tables: []const []const u8, statement: bool, previous: []const contract.TableCommitRequest, validate_statement: bool, modes: []const native.ConstraintTiming, repair_admission: ?RepairAdmission) !Prepared {
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .ranges = ranges, .control = try boundedControl(request_control), .repair_tables = repair_tables, .repair_admission = repair_admission, .statement = statement, .previous = previous, .constraint_timing = modes };
+    var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .ranges = ranges, .control = try boundedControl(request_control), .repair_tables = repair_tables, .repair_admission = repair_admission, .statement = statement, .previous = previous, .constraint_timing = modes };
     defer builder.deinit();
     try builder.output.appendSlice(builder.alloc, requests);
     for (requests) |request| {
@@ -1271,9 +1275,14 @@ pub fn resolveConstraintTiming(alloc: Allocator, source: reads.TableReadSource, 
         // Namespace names need enumeration, but native authority reads and
         // compiled tuple plans are required only for matching declarations.
         var matches = false;
+        var named_uniques: std.StringHashMapUnmanaged(void) = .empty;
+        defer named_uniques.deinit(scratch.allocator());
         for (names) |name| {
             if (declaration.unique_constraints) |uniques| for (uniques.value) |unique| {
-                if (std.mem.eql(u8, name, unique.name)) matches = true;
+                if ((unique.origin orelse .constraint) != .index and std.mem.eql(u8, name, unique.name)) {
+                    matches = true;
+                    try named_uniques.put(scratch.allocator(), unique.name, {});
+                }
             };
             if (declaration.foreign_keys) |foreign_keys| for (foreign_keys.value) |foreign| {
                 if (std.mem.eql(u8, name, foreign.name)) matches = true;
@@ -1282,7 +1291,7 @@ pub fn resolveConstraintTiming(alloc: Allocator, source: reads.TableReadSource, 
         if (!matches) continue;
         const table = try builder.load(record.name);
         for (names, 0..) |name, i| {
-            for (table.uniques) |unique| if (std.mem.eql(u8, name, unique.name)) {
+            for (table.uniques) |unique| if (named_uniques.contains(name) and std.mem.eql(u8, name, unique.name)) {
                 if (deferred and !unique.deferrable) return error.ConstraintNotDeferrable;
                 found[i] = true;
                 if (modes.items.len >= 4096) return error.TransactionTooLarge;
@@ -1300,6 +1309,27 @@ pub fn resolveConstraintTiming(alloc: Allocator, source: reads.TableReadSource, 
     return modes.toOwnedSlice(alloc);
 }
 
+test "distributed txn constraint timing excludes index ownership without native reads" {
+    const Fake = struct {
+        calls: usize = 0,
+        fn lookup(ptr: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: types.LookupOptions, _: @import("../storage/read_consistency.zig").ReadConsistency) !?reads.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedNativeRead;
+        }
+    };
+    var fake: Fake = .{};
+    const source: reads.TableReadSource = .{ .ptr = &fake, .vtable = &.{ .lookup = Fake.lookup, .scan = undefined, .query = undefined } };
+    const declaration =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"access_key","origin":"index","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const metadata = [_]TableRecord{.{ .table_id = 1, .name = "rows", .schema_json = declaration }};
+    for ([_]bool{ false, true }) |deferred| {
+        try std.testing.expectError(error.SqlConstraintNotFound, resolveConstraintTiming(std.testing.allocator, source, &metadata, &.{"access_key"}, deferred, .{}));
+    }
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
 pub const BackfillRow = struct { key: []const u8, json: []const u8, version: u64, expected_content_digest: ?[32]u8 = null };
 
 /// Request-owned arbiter proof. SQL carries this opaque envelope to its native
@@ -1312,7 +1342,19 @@ pub const ConflictOwner = struct {
     guards: []const planner.storage.Command,
 };
 
+pub const ConflictTarget = struct {
+    columns: []const []const u8 = &.{},
+    expressions: []const native.RelationalIndexKey = &.{},
+    predicate: []const native.UniquePredicate = &.{},
+    constraint_name: ?[]const u8 = null,
+};
+
 pub fn resolveConflictOwners(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, name: []const u8, version: u32, columns: []const []const u8, expressions: []const native.RelationalIndexKey, arbiter_predicate: []const native.UniquePredicate, writes: []const types.BatchWrite, previous: []const contract.TableCommitRequest, control: RequestContext) ![]const ConflictOwner {
+    return resolveConflictTargetOwners(alloc, source, metadata, ranges, name, version, .{ .columns = columns, .expressions = expressions, .predicate = arbiter_predicate }, writes, previous, control);
+}
+
+pub fn resolveConflictTargetOwners(alloc: Allocator, source: reads.TableReadSource, metadata: []const TableRecord, ranges: []const RangeRecord, name: []const u8, version: u32, target: ConflictTarget, writes: []const types.BatchWrite, previous: []const contract.TableCommitRequest, control: RequestContext) ![]const ConflictOwner {
+    if (target.constraint_name != null and (target.columns.len != 0 or target.expressions.len != 0 or target.predicate.len != 0)) return error.InvalidIntegrityDefinition;
     if (writes.len > 4096) return error.TransactionTooLarge;
     // Absence is useful only after EVERY current owner proves unique coverage.
     try ensureUniqueCoverageControlled(alloc, source, metadata, ranges, &.{name}, control);
@@ -1324,7 +1366,7 @@ pub fn resolveConflictOwners(alloc: Allocator, source: reads.TableReadSource, me
     if (table.view.version() != version) return error.PreparedGenerationChanged;
     var plan = try builder.bindingPlanSelected(table, true, false);
     defer plan.deinit();
-    const selected = try plan.bindConflictExpressions(alloc, columns, expressions, arbiter_predicate);
+    const selected = if (target.constraint_name) |constraint_name| try plan.bindNamedConflict(alloc, constraint_name) else try plan.bindConflictExpressions(alloc, target.columns, target.expressions, target.predicate);
     defer alloc.free(selected);
     const owners = try alloc.alloc(ConflictOwner, writes.len);
     const generation_set = @import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog);
@@ -1355,7 +1397,7 @@ pub fn resolveConflictOwners(alloc: Allocator, source: reads.TableReadSource, me
             if (logical.claim) |claim| {
                 if (claim.state != .live) return error.ForeignKeyActionInProgress;
                 if (!std.mem.eql(u8, claim.parent_table, name) or !std.mem.eql(u8, claim.tuple, item.tuple)) return error.InvalidIntegrityRecord;
-                if (columns.len != 0) if (owner.key) |key| if (!std.mem.eql(u8, key, claim.parent_key)) return error.InvalidIntegrityRecord;
+                if (target.constraint_name != null or target.columns.len != 0 or target.expressions.len != 0) if (owner.key) |key| if (!std.mem.eql(u8, key, claim.parent_key)) return error.InvalidIntegrityRecord;
                 if (owner.key == null) owner.key = try alloc.dupe(u8, claim.parent_key);
             }
             if (owner.identity == null) owner.identity = identity.*;
@@ -1390,7 +1432,7 @@ fn ensureUniqueCoverageControlled(alloc: Allocator, source: reads.TableReadSourc
     const activation = @import("../storage/db/relational_integrity_activation_contract.zig");
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .control = try boundedControl(request_control) };
+    var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(request_control) };
     defer builder.deinit();
     var checked = std.StringHashMapUnmanaged(void).empty;
     for (table_names) |name| {
@@ -1520,7 +1562,7 @@ pub fn rejectDefiniteConflicts(alloc: Allocator, source: reads.TableReadSource, 
     if (!source.strict_read_index_absence) return;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .control = try boundedControl(request) };
+    var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(request) };
     defer builder.deinit();
     for (prepared) |table| {
         const record = try builder.metadataTable(table.table_name);
@@ -1639,7 +1681,7 @@ pub fn prepareRetirementPage(alloc: Allocator, source: reads.TableReadSource, me
     if (rows.len > 128 or (progress.phase != .foreign_keys and progress.phase != .unique)) return error.InvalidConstraintRetirement;
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .control = try boundedControl(request) };
+    var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(request) };
     defer builder.deinit();
     const table = try builder.load(table_name);
     if (table.view.version() != progress.schema_version or !std.mem.eql(u8, &@import("../storage/db/relational_integrity_activation_contract.zig").generationSet(table.catalog), &progress.generation_set)) return error.ConstraintRetirementChanged;
@@ -1775,7 +1817,7 @@ fn prepareBackfillControlled(alloc: Allocator, source: reads.TableReadSource, me
     if (rows.len > 4096) return error.TransactionTooLarge;
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = metadata, .control = try boundedControl(request) };
+    var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = metadata, .control = try boundedControl(request) };
     defer builder.deinit();
     const table = try builder.load(table_name);
     const row_table_index = try builder.outputIndex(table_name, table.view.version());
@@ -2057,7 +2099,7 @@ test "distributed txn primary prefetch owns observations and drains failed batch
         var fixture: Fixture = .{ .fail = fail };
         var table: Loaded = undefined;
         table.name = "rows";
-        var builder: Builder = .{ .alloc = arena.allocator(), .metadata = &.{}, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, .control = .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) } };
+        var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .metadata = &.{}, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = undefined, .query = undefined } }, .control = .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) } };
         defer builder.deinit();
         const keys = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "i" };
         if (fail) {
@@ -2196,7 +2238,7 @@ test "distributed txn global unique coverage checks every owner and rejects stal
         try std.testing.expectEqual(@as(usize, 1), owners[0].guards.len);
         try std.testing.expect(owners[0].guards[0].operation.compare_claim == null);
         try std.testing.expectEqualSlices(u8, &fake.generation_set, &owners[0].generation_set);
-        var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = &tables, .control = try boundedControl(.{}) };
+        var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = &tables, .control = try boundedControl(.{}) };
         defer builder.deinit();
         const loaded = try builder.load("rows");
         var plan = try builder.bindingPlanSelected(loaded, true, false);
@@ -2338,12 +2380,13 @@ test "distributed txn deferred unique overlay permits repair and validates immed
     {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
-        var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = &metadata, .control = try boundedControl(.{}) };
+        var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = &metadata, .control = try boundedControl(.{}) };
         defer builder.deinit();
         var plan = try builder.bindingPlanSelected(try builder.load("rows"), true, false);
         defer plan.deinit();
         try std.testing.expectError(error.DeferrableConflictArbiter, plan.bindConflictExpressions(alloc, &.{"id"}, &.{}, &.{}));
         try std.testing.expectError(error.DeferrableConflictArbiter, plan.bindConflictExpressions(alloc, &.{}, &.{}, &.{}));
+        try std.testing.expectError(error.DeferrableConflictArbiter, plan.bindNamedConflict(alloc, "u"));
     }
     const duplicate = [_]contract.TableCommitRequest{.{ .table_name = "rows", .writes = &.{ .{ .key = "a", .value = "{\"id\":1}" }, .{ .key = "b", .value = "{\"id\":1}" } } }};
     var staged = try prepareModeInternal(alloc, source, &metadata, &duplicate, .{}, &.{}, true, &.{}, true);
@@ -2434,7 +2477,7 @@ test "distributed txn expression partial unique declarations bind activation ret
     try std.testing.expectEqual(@as(usize, 0), skipped.tables[0].integrity_commands.len);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = &metadata };
+    var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = &metadata };
     defer builder.deinit();
     const loaded = try builder.load("users");
     const plan = try builder.bindingPlan(loaded);
@@ -2522,7 +2565,7 @@ test "distributed txn activation projection validates selected fields without fu
     // must keep the observed full-primary proof rather than hashing this JSON.
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = &metadata };
+    var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = &metadata };
     defer builder.deinit();
     const loaded = try builder.load("parents");
     inline for (.{ .{ .unique, "pk", "id" }, .{ .foreign_key, "parent", "parent_id" } }) |selection| {
@@ -2630,7 +2673,7 @@ test "distributed txn public integrity adapter enlists generated parent commands
     // changed row invalidates only that expansion, not immutable table plans.
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    var builder: Builder = .{ .alloc = arena.allocator(), .source = source, .metadata = &metadata };
+    var builder: Builder = .{ .alloc = arena.allocator(), .scratch_alloc = alloc, .source = source, .metadata = &metadata };
     defer builder.deinit();
     const loaded = try builder.load("children");
     var work: Work = .{ .table = loaded, .key = "child-1", .before = null, .after = request[0].writes[0].value };

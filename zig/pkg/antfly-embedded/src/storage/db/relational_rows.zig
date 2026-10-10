@@ -582,7 +582,10 @@ pub const Reader = struct {
             for (self.fields) |field| {
                 const current_ordinal = self.active.physicalLayout().ordinalForName(self.active.tableSchema().relational_columns, field).?;
                 const source_ordinal = source.physicalLayout().ordinalForName(source.tableSchema().relational_columns, field) orelse continue;
-                if (self.active.tableSchema().relational_columns[current_ordinal].column_type != source.tableSchema().relational_columns[source_ordinal].column_type)
+                const current_column = self.active.tableSchema().relational_columns[current_ordinal];
+                const source_column = source.tableSchema().relational_columns[source_ordinal];
+                if (current_column.column_type != source_column.column_type or current_column.sql_element_type != source_column.sql_element_type or
+                    !@import("../../common/sql_builtin_type.zig").NumericModifier.eql(current_column.numeric_modifier, source_column.numeric_modifier))
                     return error.RelationalIndexColumnTypeMismatch;
             }
             const source_conditions = try alloc.alloc(predicates.Source, self.conditions.len);

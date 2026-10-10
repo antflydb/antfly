@@ -13,15 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Exact ordering of int64 and finite float64 values, without rounding integers.
-const std = @import("std");
-
-pub fn intFloat(integer: i64, number: f64) std.math.Order {
-    std.debug.assert(std.math.isFinite(number));
-    if (number >= 9223372036854775808.0) return .lt;
-    if (number < -9223372036854775808.0) return .gt;
-    const truncated: i64 = @intFromFloat(number);
-    const order = std.math.order(integer, truncated);
-    if (order != .eq) return order;
-    return std.math.order(@as(f64, @floatFromInt(truncated)), number);
+//! Standalone exact-NUMERIC contracts and microbenchmarks. No runtime/server
+//! graph is needed to validate the arithmetic or canonical row/key boundary.
+test {
+    _ = @import("sql/numeric_value.zig");
+    _ = @import("sql/numeric_binary.zig");
+    _ = @import("sql/numeric_key.zig");
 }

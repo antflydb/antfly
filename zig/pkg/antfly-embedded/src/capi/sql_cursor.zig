@@ -61,8 +61,14 @@ pub fn diagnostic(err: anyerror, out: *h.capi.Buffer) h.capi.ErrorCode {
 }
 fn open(handle: *h.Handle, table_name: []const u8, request_json: []const u8) !u64 {
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.readable_lease_hook != null) return error.UnsupportedSqlExecution;
-    if (request_json.len > sql.runtime.resource_limits.request_bytes or table_name.len > 1024 or handle.sql_cursors.count() >= 64) return error.SqlProgramLimitExceeded;
+    if (table_name.len > 1024 or handle.sql_cursors.count() >= 64) return error.SqlProgramLimitExceeded;
     const session = try @import("sql_session.zig").requestSession(handle, request_json);
+    if (request_json.len > sql.runtime.resource_limits.request_bytes) {
+        if (session) |value| if (value.active) {
+            value.failed = true;
+        };
+        return error.SqlRequestTooLarge;
+    }
     return openWithSession(handle, table_name, request_json, session) catch |err| {
         // Unsupported cursor shapes may fall back to materialized execution.
         if (err != error.UnsupportedSqlExecution) if (session) |value| {

@@ -36,6 +36,30 @@ SPEC.loader.exec_module(measurement)
 
 
 class LiteralSourceOwnership(unittest.TestCase):
+    def test_catalog_check_accepts_current_and_rejects_stale_without_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            catalog = root / "pkg/antfly-embedded/src/source_catalog_control.zig"
+            catalog.parent.mkdir(parents=True)
+            with (
+                mock.patch.object(measurement, "ZIG_ROOT", root),
+                mock.patch.object(
+                    measurement, "control_catalog_contents", return_value="current\n"
+                ),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["check_storage_compilation", "--check-control-catalog"],
+                ),
+            ):
+                catalog.write_text("current\n")
+                measurement.main()
+                catalog.write_text("stale\n")
+                with mock.patch("sys.stderr"), self.assertRaises(SystemExit) as failure:
+                    measurement.main()
+                self.assertEqual(failure.exception.code, 1)
+                self.assertEqual(catalog.read_text(), "stale\n")
+
     def test_control_catalog_is_current_and_has_no_physical_imports(self):
         local = measurement.ZIG_ROOT / "pkg/antfly-embedded/src"
         catalog = local / "source_catalog_control.zig"

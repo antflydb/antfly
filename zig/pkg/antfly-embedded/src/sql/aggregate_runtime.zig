@@ -24,13 +24,13 @@ const scalar = @import("scalar.zig");
 const Datum = scalar.Datum;
 const Json = std.json.Value;
 
-fn addRow(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, alloc: std.mem.Allocator, row: catalog.Row) !void {
+fn addRow(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, row: catalog.Row) !void {
     const cells = try bound.input.cells(alloc, row);
     return addCells(context, bound, grouped, alloc, cells);
 }
 
-fn addCells(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, alloc: std.mem.Allocator, cells: []const Datum) !void {
-    if (!try bound.input.matchesWithProvider(alloc, cells, context.parameters, context.backend.decision_provider)) return;
+fn addCells(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const Datum) !void {
+    if (!try bound.input.matchesWithLimits(alloc, cells, context.parameters, context.backend.decision_provider, @import("decision_eval.zig").limitsFor(context.backend))) return;
     const values = try alloc.alloc(Datum, bound.group_count);
     for (bound.input.projections[0..bound.group_count], values) |program, *value| value.* = try context.evaluate(alloc, program.?, cells);
     const inputs = try alloc.alloc(Datum, bound.inputs.len);
@@ -47,9 +47,9 @@ fn addCells(context: anytype, bound: *const binding.Bound, grouped: *operators.G
     try grouped.add(values, inputs);
 }
 
-fn addRows(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, alloc: std.mem.Allocator, cells: []const []const Datum) !void {
+fn addRows(context: anytype, bound: *const binding.Bound, grouped: anytype, alloc: std.mem.Allocator, cells: []const []const Datum) !void {
     const decision = @import("decision_eval.zig");
-    const predicates = if (bound.input.predicate) |*program| try decision.evaluateBatch(alloc, context.backend.decision_provider, program, cells, context.parameters) else null;
+    const predicates = if (bound.input.predicate) |*program| try decision.evaluateBatchWithLimits(alloc, context.backend.decision_provider, program, cells, context.parameters, @import("decision_eval.zig").limitsFor(context.backend)) else null;
     var accepted: std.ArrayList([]const Datum) = .empty;
     for (cells, 0..) |row, i| {
         if (predicates) |values| {
@@ -67,11 +67,11 @@ fn addRows(context: anytype, bound: *const binding.Bound, grouped: *operators.Gr
         @memset(input.*, .{});
     }
     for (bound.input.projections[0..bound.group_count], 0..) |optional, k| {
-        const values = try decision.evaluateBatch(alloc, context.backend.decision_provider, &optional.?, accepted.items, context.parameters);
+        const values = try decision.evaluateBatchWithLimits(alloc, context.backend.decision_provider, &optional.?, accepted.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
         for (keys, values) |key, value| key[k] = value;
     }
     for (bound.inputs, bound.filters, 0..) |index, filter, k| {
-        const filters = if (filter) |slot| try decision.evaluateBatch(alloc, context.backend.decision_provider, &bound.input.projections[slot].?, accepted.items, context.parameters) else null;
+        const filters = if (filter) |slot| try decision.evaluateBatchWithLimits(alloc, context.backend.decision_provider, &bound.input.projections[slot].?, accepted.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend)) else null;
         var selected: std.ArrayList([]const Datum) = .empty;
         var positions: std.ArrayList(usize) = .empty;
         for (accepted.items, 0..) |row, i| {
@@ -84,7 +84,7 @@ fn addRows(context: anytype, bound: *const binding.Bound, grouped: *operators.Gr
             try positions.append(alloc, i);
         }
         if (index) |slot| {
-            const values = try decision.evaluateBatch(alloc, context.backend.decision_provider, &bound.input.projections[slot].?, selected.items, context.parameters);
+            const values = try decision.evaluateBatchWithLimits(alloc, context.backend.decision_provider, &bound.input.projections[slot].?, selected.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend));
             for (positions.items, values) |i, value| inputs[i][k] = value;
         } else for (positions.items) |i| {
             inputs[i][k] = Datum.json(.{ .integer = 1 });
@@ -102,7 +102,7 @@ fn columnValues(context: anytype, bound: *const binding.Bound, a: std.mem.Alloca
     for (values, 0..) |*value, index| value.* = try context.evaluate(a, program.*, try bound.input.columnCells(a, page, index));
     return values;
 }
-pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, a: std.mem.Allocator, page: catalog.ColumnPage) !void {
+pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: anytype, a: std.mem.Allocator, page: catalog.ColumnPage) !void {
     const predicates = if (bound.input.predicate) |*program| try columnValues(context, bound, a, page, program) else null;
     var selection: std.ArrayList(usize) = .empty;
     for (page.selection, 0..) |physical, index| {
@@ -215,7 +215,7 @@ pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: *opera
     }
 }
 
-fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, top: *operators.TopK, projection: @import("decision_eval.zig").SortedProjection) !void {
+fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, grouped: *@import("ordered_grouped.zig").Collector, top: *operators.TopK, projection: @import("decision_eval.zig").SortedProjection) !void {
     const decision = @import("decision_eval.zig");
     var exhausted = false;
     while (!exhausted) {
@@ -227,19 +227,21 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
         var ordinals: std.ArrayList(u64) = .empty;
         var bytes: usize = 0;
         while (cells.items.len < context.limits.page_rows) {
-            const group = (try grouped.nextResult(a)) orelse {
+            const group = (try grouped.nextResult(context, a)) orelse {
                 exhausted = true;
                 break;
             };
-            const row = try a.alloc(Datum, group.keys.len + group.aggregates.len);
+            const grouped_width = group.keys.len + group.aggregates.len;
+            const row = try a.alloc(Datum, grouped_width + bound.constant_count);
             @memcpy(row[0..group.keys.len], group.keys);
-            @memcpy(row[group.keys.len..], group.aggregates);
+            @memcpy(row[group.keys.len..grouped_width], group.aggregates);
+            @memcpy(row[grouped_width..], context.invocation_constants);
             try cells.append(a, row);
             try ordinals.append(a, group.ordinal);
             for (row) |cell| bytes +|= try operators.datumBytes(cell);
             if (bytes >= context.limits.page_bytes) break;
         }
-        const predicates = if (bound.having) |*program| try decision.evaluateBatch(a, context.backend.decision_provider, program, cells.items, context.parameters) else null;
+        const predicates = if (bound.having) |*program| try decision.evaluateBatchWithLimits(a, context.backend.decision_provider, program, cells.items, context.parameters, @import("decision_eval.zig").limitsFor(context.backend)) else null;
         var accepted: std.ArrayList([]const Datum) = .empty;
         var positions: std.ArrayList(usize) = .empty;
         for (cells.items, 0..) |row, index| {
@@ -283,17 +285,24 @@ fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *ope
 
 pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").Output {
     const bound = context.binding.aggregate orelse return error.InvalidSqlBackendResponse;
+    if (context.invocation_constants.len != bound.constant_count) return error.InvalidSqlBackendResponse;
     try bound.input.validateDecisions(context.arena, context.parameters, context.backend.decision_provider);
     var external = if (bound.input.predicate) |*program| @import("decision_eval.zig").hasExternal(program) else false;
     for (bound.input.projections) |optional| if (optional) |*program| {
         external = external or @import("decision_eval.zig").hasExternal(program);
     };
-    const limit = try context.count(statement.limit, context.limits.result_rows);
-    const offset = try context.count(statement.offset, 0);
+    const limit = statement.capRows(try context.count(statement.limit, context.limits.result_rows));
+    const offset = try context.offsetCount(statement.offset);
     if (limit > context.limits.result_rows or offset > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
     if (limit == 0) return .{ .columns = context.binding.columns, .command_tag = "SELECT" };
     const grouped = try operators.Grouped.create(context.alloc, bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 2, .spill = context.spill });
     defer grouped.deinit();
+    // Backends without an Io still support bounded in-memory execution. A
+    // zero-byte manager rejects spill admission before touching the filesystem.
+    var memory_manager: @import("spill.zig").Manager = .{ .alloc = context.alloc, .io = .failing, .context = context.backend.ptr, .checkpoint = context.backend.vtable.checkpoint, .max_bytes = 0, .async_writes = false };
+    defer memory_manager.deinit();
+    var collector = try @import("ordered_grouped.zig").Collector.init(grouped, bound, context.spill orelse &memory_manager, context.limits.retained_bytes / 2);
+    defer collector.deinit();
     if (bound.group_count == 0) try grouped.ensureGlobalGroup();
     if (context.binding.table) |table| {
         const predicates = try context.conditions(table, statement.predicate);
@@ -319,7 +328,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             try grouped.addGlobalCount(count);
             aggregate_loaded = true;
         };
-        const parallel = !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
+        const parallel = bound.ordered.len == 0 and !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
         while (!predicates.empty and !aggregate_loaded and !parallel) {
             try context.checkpoint();
             pages += 1;
@@ -330,7 +339,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
                 if (column_page.selection.len > context.limits.executionRows()) return error.InvalidSqlBackendResponse;
                 if (column_page.selection.len > context.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
                 visited += column_page.selection.len;
-                try addColumns(context, bound, grouped, arena.allocator(), column_page);
+                try addColumns(context, bound, &collector, arena.allocator(), column_page);
                 const next = column_page.after orelse break;
                 if (!scan.retained(context)) return error.SqlStatementSnapshotRequired;
                 if (after) |previous| if (std.mem.eql(u8, previous, next)) return error.InvalidSqlBackendResponse;
@@ -351,14 +360,14 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
                     defer decision_page.deinit();
                     const scratch = decision_page.allocator();
                     const cells = try @import("decision_eval.zig").rowPage(scratch, bound.input, page.rows[first..], context.limits.page_rows, context.limits.page_bytes);
-                    try addRows(context, bound, grouped, scratch, cells);
+                    try addRows(context, bound, &collector, scratch, cells);
                     first += cells.len;
                 }
             } else for (page.rows) |row| {
                 try context.checkpoint();
                 visited += 1;
                 if (visited > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
-                try addRow(context, bound, grouped, arena.allocator(), row);
+                try addRow(context, bound, &collector, arena.allocator(), row);
             }
             const next = page.after orelse break;
             if (!scan.retained(context)) return error.SqlStatementSnapshotRequired;
@@ -371,7 +380,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         var arena = std.heap.ArenaAllocator.init(context.alloc);
         defer arena.deinit();
         try context.checkpoint();
-        try addRow(context, bound, grouped, arena.allocator(), .{ .id = "", .version = 0, .value = .{ .object = .empty } });
+        try addRow(context, bound, &collector, arena.allocator(), .{ .id = "", .version = 0, .value = .{ .object = .empty } });
     }
     const orders = try context.arena.alloc(operators.Order, statement.order_by.len);
     for (statement.order_by, orders) |order, *out| out.* = .{ .descending = order.descending, .nulls_first = order.nulls_first };
@@ -386,25 +395,39 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         (if (bound.having) |*program| decision.hasExternal(program) else false);
     if (external_results) {
         const projection = try decision.SortedProjection.init(context.arena, bound.outputs, bound.orders, bound.order_outputs);
-        try addGroupedDecisionPages(context, bound, grouped, &top, projection);
+        try addGroupedDecisionPages(context, bound, &collector, &top, projection);
         return projection.finish(context, &top, offset, limit, statement.limit == null);
     } else while (true) {
         try context.checkpoint();
         var arena = std.heap.ArenaAllocator.init(context.alloc);
         defer arena.deinit();
         const alloc = arena.allocator();
-        const groups = (try grouped.nextResultBatch(alloc, context.limits.executionRows(), false)) orelse break;
+        const groups: operators.GroupBatch = if (bound.ordered.len == 0)
+            (try grouped.nextResultBatch(alloc, context.limits.executionRows(), false)) orelse break
+        else ordered: {
+            const group = (try collector.nextResult(context, alloc)) orelse break;
+            const keys = try alloc.alloc([]const Datum, 1);
+            keys[0] = group.keys;
+            const aggregates = try alloc.alloc([]const Datum, 1);
+            aggregates[0] = group.aggregates;
+            const ordinals = try alloc.alloc(u64, 1);
+            ordinals[0] = group.ordinal;
+            break :ordered .{ .keys = .{ .rows = keys }, .aggregates = .{ .rows = aggregates }, .ordinals = ordinals };
+        };
         const Cells = struct {
             groups: operators.GroupBatch,
+            constants: []const Datum,
             selection: ?[]const usize = null,
             fn cell(raw: *anyopaque, a: std.mem.Allocator, row: usize, column: usize) anyerror!Datum {
                 const reader: *@This() = @ptrCast(@alignCast(raw));
                 const index = if (reader.selection) |selected| selected[row] else row;
+                const width = reader.groups.keys.width() + reader.groups.aggregates.width();
+                if (column >= width) return reader.constants[column - width];
                 return if (column < reader.groups.keys.width()) reader.groups.keys.cell(a, index, column) else reader.groups.aggregates.cell(a, index, column - reader.groups.keys.width());
             }
         };
-        var reader: Cells = .{ .groups = groups };
-        var batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &reader, .read = Cells.cell, .count = groups.ordinals.len, .width = groups.keys.width() + groups.aggregates.width() } };
+        var reader: Cells = .{ .groups = groups, .constants = context.invocation_constants };
+        var batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &reader, .read = Cells.cell, .count = groups.ordinals.len, .width = groups.keys.width() + groups.aggregates.width() + bound.constant_count } };
         const predicates = if (bound.having) |*program| try resultValues(context, alloc, program, batch) else null;
         var selected: std.ArrayList(usize) = .empty;
         for (0..batch.len()) |row| {
@@ -445,8 +468,8 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         const patterns = try context.arena.alloc(?*scalar.PatternSet, row.values.len);
         for (row.values, patterns) |value, *pattern| pattern.* = value.patterns;
         pattern_row.* = patterns;
-        for (row.values, values, sql_nulls) |value, *out, *sql_null| {
-            out.* = try context.outputValue(value.value);
+        for (row.values, values, sql_nulls, bound.outputs) |value, *out, *sql_null, program| {
+            out.* = try context.outputDatum(value, program.output_type.kind, program.output_type.element_type);
             sql_null.* = value.sql_null;
         }
         output.* = values;

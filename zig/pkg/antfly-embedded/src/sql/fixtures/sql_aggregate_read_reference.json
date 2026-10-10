@@ -1,0 +1,883 @@
+{
+  "format": 2,
+  "reference": "PostgreSQL exact SQL",
+  "profile": {
+    "format": 1,
+    "schema": {
+      "version": 1,
+      "storage_mode": "relational",
+      "default_type": "row",
+      "document_schemas": {
+        "row": {
+          "schema": {
+            "type": "object",
+            "properties": {
+              "organization_id": {
+                "type": "keyword"
+              },
+              "status": {
+                "type": "keyword",
+                "nullable": true
+              },
+              "quantity": {
+                "type": "integer",
+                "nullable": true
+              },
+              "enabled": {
+                "type": "boolean",
+                "nullable": true
+              },
+              "metadata": {
+                "type": "json",
+                "nullable": true
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    "rows": [
+      {
+        "key": "r00",
+        "value": {
+          "organization_id": "a",
+          "status": "op_READY12 34",
+          "quantity": 3,
+          "enabled": true,
+          "metadata": {
+            "source": "external"
+          }
+        }
+      },
+      {
+        "key": "r01",
+        "value": {
+          "organization_id": "a",
+          "status": "active",
+          "quantity": 2,
+          "enabled": false,
+          "metadata": {
+            "source": "internal"
+          }
+        }
+      },
+      {
+        "key": "r02",
+        "value": {
+          "organization_id": "a",
+          "status": "OPEN",
+          "quantity": 0,
+          "metadata": {
+            "source": "external"
+          }
+        }
+      },
+      {
+        "key": "r03",
+        "value": {
+          "organization_id": "a",
+          "status": "X9 Y10",
+          "enabled": true,
+          "metadata": {
+            "source": null
+          }
+        }
+      },
+      {
+        "key": "r04",
+        "value": {
+          "organization_id": "b",
+          "status": "open",
+          "quantity": 1,
+          "enabled": false,
+          "metadata": {
+            "source": "internal"
+          }
+        }
+      },
+      {
+        "key": "r05",
+        "value": {
+          "organization_id": "b",
+          "status": "READY12",
+          "quantity": 4,
+          "metadata": {
+            "source": "external"
+          }
+        }
+      },
+      {
+        "key": "r06",
+        "value": {
+          "organization_id": "b",
+          "status": "\u00e9Z7",
+          "quantity": 0,
+          "enabled": true,
+          "metadata": {
+            "source": null
+          }
+        }
+      },
+      {
+        "key": "r07",
+        "value": {
+          "organization_id": "c",
+          "status": "",
+          "quantity": 0,
+          "enabled": false,
+          "metadata": {
+            "source": "external"
+          }
+        }
+      },
+      {
+        "key": "r08",
+        "value": {
+          "organization_id": "c",
+          "metadata": {
+            "source": null
+          }
+        }
+      }
+    ]
+  },
+  "entries": [
+    {
+      "id": "sql-1225",
+      "columns": [
+        "organization_id",
+        "openish_count"
+      ],
+      "rows": [
+        [
+          "a",
+          1
+        ],
+        [
+          "b",
+          0
+        ],
+        [
+          "c",
+          0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "a",
+              1
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "b",
+              0
+            ],
+            [
+              "c",
+              0
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1232",
+      "columns": [
+        "organization_id",
+        "record_count"
+      ],
+      "rows": [
+        [
+          "a",
+          1
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "a",
+              1
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1242",
+      "columns": [
+        "organization_id",
+        "active_count"
+      ],
+      "rows": [
+        [
+          "a",
+          2
+        ],
+        [
+          "b",
+          2
+        ],
+        [
+          "c",
+          0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "a",
+              2
+            ],
+            [
+              "b",
+              2
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "c",
+              0
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1243",
+      "columns": [
+        "organization_id",
+        "active_count"
+      ],
+      "rows": [
+        [
+          "a",
+          2
+        ],
+        [
+          "b",
+          1
+        ],
+        [
+          "c",
+          0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "a",
+              2
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "b",
+              1
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "c",
+              0
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1244",
+      "columns": [
+        "organization_id",
+        "disabled_or_unknown_count"
+      ],
+      "rows": [
+        [
+          "a",
+          2
+        ],
+        [
+          "b",
+          2
+        ],
+        [
+          "c",
+          2
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "a",
+              2
+            ],
+            [
+              "b",
+              2
+            ],
+            [
+              "c",
+              2
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1245",
+      "columns": [
+        "organization_id",
+        "unknown_count"
+      ],
+      "rows": [
+        [
+          "a",
+          1
+        ],
+        [
+          "b",
+          1
+        ],
+        [
+          "c",
+          1
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "a",
+              1
+            ],
+            [
+              "b",
+              1
+            ],
+            [
+              "c",
+              1
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1246",
+      "columns": [
+        "organization_id",
+        "adjusted_count"
+      ],
+      "rows": [
+        [
+          "a",
+          2
+        ],
+        [
+          "b",
+          1
+        ],
+        [
+          "c",
+          0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "a",
+              2
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "b",
+              1
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "c",
+              0
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1247",
+      "columns": [
+        "organization_id",
+        "visible_count"
+      ],
+      "rows": [
+        [
+          "a",
+          1
+        ],
+        [
+          "b",
+          0
+        ],
+        [
+          "c",
+          0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "a",
+              1
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ]
+          ]
+        },
+        {
+          "rows": [
+            [
+              "b",
+              0
+            ],
+            [
+              "c",
+              0
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1248",
+      "columns": [
+        "organization_id",
+        "disabled_count"
+      ],
+      "rows": [
+        [
+          "a",
+          0
+        ],
+        [
+          "b",
+          0
+        ],
+        [
+          "c",
+          0
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        20
+      ],
+      "affected": 0,
+      "ordered_groups": [
+        {
+          "rows": [
+            [
+              "a",
+              0
+            ],
+            [
+              "b",
+              0
+            ],
+            [
+              "c",
+              0
+            ]
+          ],
+          "sql_nulls": [
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ],
+            [
+              false,
+              false
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sql-1250",
+      "columns": [
+        "status_bytes",
+        "status_bits"
+      ],
+      "rows": [
+        [
+          44,
+          352
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        20,
+        20
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1251",
+      "columns": [
+        "status_digit_groups",
+        "status_letter_offsets",
+        "status_token_count"
+      ],
+      "rows": [
+        [
+          6,
+          9,
+          4
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        20,
+        20,
+        20
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-1252",
+      "columns": [
+        "first_status",
+        "last_status_key"
+      ],
+      "rows": [
+        [
+          "",
+          "\u00e9z7"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        25
+      ],
+      "affected": 0
+    }
+  ],
+  "excluded": [],
+  "server_version": 180006
+}

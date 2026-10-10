@@ -19,7 +19,7 @@ const sql = @import("sql.zig");
 const d = h.antfly.capi_dependencies;
 const std = h.std;
 fn describe(handle: *h.Handle, request_json: []const u8) !h.capi.Buffer {
-    if (request_json.len > sql.runtime.resource_limits.request_bytes) return error.SqlProgramLimitExceeded;
+    if (request_json.len > sql.runtime.resource_limits.request_bytes) return error.SqlRequestTooLarge;
     const Budget = d.sql_memory_budget;
     var budget = Budget{ .backing = handle.alloc, .limit = sql.runtime.resource_limits.preparation_bytes };
     return describePrepared(handle, request_json, budget.allocator()) catch |err| {

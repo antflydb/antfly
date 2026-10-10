@@ -121,6 +121,8 @@ pub const Adapter = struct {
     context: operation.RequestContext,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
+    /// Borrowed from the pinned connection request, never retained by a plan.
+    ddl_search_path: ?*const @import("../pgwire/search_path.zig").Path = null,
     decision_provider: ?@import("antfly_local_sources").functions_decisions.DecisionProvider = null,
     /// Pgwire retains the original durable owner scope independently of its
     /// mutable, freshly authorized lookup namespace. HTTP leaves this null.
@@ -532,7 +534,7 @@ pub const Adapter = struct {
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
-        return .{ .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .scalar_control = .{ .ptr = self, .checkpoint = scalarCheckpoint }, .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -557,17 +559,17 @@ pub const Adapter = struct {
         return @import("antfly_local_sources").storage_row_identity.generate(alloc, self.server.sharedApiIo() orelse return error.UnsupportedSqlExecution);
     }
 
-    fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, columns: []const []const u8, expressions: []const catalog.ConflictExpression, conditions: []const catalog.Condition, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
+    fn resolveConflictOwners(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, target: catalog.ConflictTarget, mutations: []const catalog.Mutation) ![]const catalog.ConflictOwner {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.verify(alloc, table);
         const integrity = @import("antfly_local_sources").api_relational_integrity_commit;
-        const predicates = try @import("antfly_local_sources").sql_conflict_predicate.toNative(alloc, conditions);
-        const keys = try @import("antfly_local_sources").sql_conflict_predicate.expressionsToNative(alloc, expressions);
+        const predicates = try @import("antfly_local_sources").sql_conflict_predicate.toNative(alloc, target.conditions);
+        const keys = try @import("antfly_local_sources").sql_conflict_predicate.expressionsToNative(alloc, target.expressions);
         var snapshot = (try self.server.source.adminSnapshot()) orelse return error.IntegrityCatalogUnavailable;
         defer self.server.source.freeAdminSnapshot(&snapshot);
         const writes = try @import("antfly_local_sources").sql_mutation_images.writes(db_types.BatchWrite, alloc, mutations);
         const previous = if (self.staged) |staged| try staged.distributedTables(alloc) else &.{};
-        const owners = try integrity.resolveConflictOwners(alloc, self.server.table_reads orelse return error.UnsupportedSqlExecution, snapshot.tables, snapshot.ranges, table.physical_name, table.schema_version, columns, keys, predicates, writes, previous, self.context);
+        const owners = try integrity.resolveConflictTargetOwners(alloc, self.server.table_reads orelse return error.UnsupportedSqlExecution, snapshot.tables, snapshot.ranges, table.physical_name, table.schema_version, .{ .columns = target.columns, .expressions = keys, .predicate = predicates, .constraint_name = target.constraint_name }, writes, previous, self.context);
         try self.verify(alloc, table);
         const result = try alloc.alloc(catalog.ConflictOwner, owners.len);
         for (owners, result) |*owner, *out| out.* = .{ .key = owner.key, .identity = owner.identity, .identities = owner.identities, .guard = owner };
@@ -590,12 +592,17 @@ pub const Adapter = struct {
 
     fn ddl(ptr: *anyopaque, alloc: std.mem.Allocator, input: catalog.Ddl) !catalog.DdlOutcome {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
-        return @import("sql_catalog.zig").execute(self.server, self.identity.*, self.context, self.database, self.namespace, alloc, input);
+        return @import("sql_catalog.zig").executeWithPath(self.server, self.identity.*, self.context, self.database, self.namespace, alloc, input, self.ddl_search_path);
     }
 
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.context.ensureActive();
+    }
+
+    fn scalarCheckpoint(ptr: ?*anyopaque) !void {
+        // Explicitly non-suspending: only cancellation/deadline inspection.
+        try checkpoint(ptr.?);
     }
 
     fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
@@ -761,6 +768,7 @@ pub const Adapter = struct {
         adapter: *Adapter,
         schema_version: u32,
         require_primary_digest: bool = false,
+        projection: @import("antfly_local_sources").sql_document_row.Projection,
         view: @import("antfly_local_sources").api_table_read_source.RelationalReadView,
 
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
@@ -770,10 +778,11 @@ pub const Adapter = struct {
             errdefer page.deinit();
             if (page.rows.len > limit) return error.InvalidSqlBackendResponse;
             const rows = try page.arena.allocator().alloc(catalog.Row, page.rows.len);
+            const layout = try self.projection.pageLayout(page.arena.allocator());
             for (page.rows, rows) |row, *out| {
                 if (row.schema_version != self.schema_version) return error.CatalogGenerationChanged;
                 if (self.require_primary_digest and row.expected_content_digest == null) return error.InvalidSqlBackendResponse;
-                out.* = .{ .id = row.id, .version = row.version, .value = row.value, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document };
+                out.* = try self.projection.adaptBorrowed(page.arena.allocator(), layout, .{ .id = row.id, .version = row.version, .value = row.value, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document });
             }
             return .{ .rows = rows, .after = page.after, .owned_arena = page.arena };
         }
@@ -781,6 +790,7 @@ pub const Adapter = struct {
         fn close(ptr: *anyopaque) void {
             const self: *ReadCursor = @ptrCast(@alignCast(ptr));
             self.view.deinit();
+            self.projection.deinit(self.alloc);
             self.alloc.destroy(self);
         }
     };
@@ -795,7 +805,12 @@ pub const Adapter = struct {
             wrapper.* = .{ .alloc = alloc, .statement = statement };
             return .{ .ptr = wrapper, .next = SingleStatementCursor.next, .close = SingleStatementCursor.close };
         }
-        if (self.staged) |staged| {
+        // Predicate-only entries and writes to unrelated physical tables do
+        // not require merging this scan. Preserve native index selection
+        // while fencing matching schema epochs even on read-only entries.
+        // Guarded isolation above still owns its separate proof admission.
+        if (self.staged != null and try @import("sql_session_overlay.zig").needsMerge(self.staged.?, table)) {
+            const staged = self.staged.?;
             // A session SELECT needs one native statement snapshot. Multi-owner
             // sources without that guarantee remain explicitly unsupported.
             const row_filter = try http_server.resolveEffectiveRowFilterJson(alloc, self.identity.*, table.physical_name);
@@ -806,7 +821,12 @@ pub const Adapter = struct {
             errdefer native_cursor.close(native_cursor.ptr);
             return try @import("sql_session_overlay.zig").open(alloc, native_cursor, staged, table, ordered, row_filter);
         }
-        return openNativeScan(ptr, alloc, table, request);
+        const native_cursor = try openNativeScan(ptr, alloc, table, request);
+        // Empty overlays still need one retained statement view. A session
+        // must never fall back to stateless pages from multiple visibility
+        // cuts merely because it has not staged its first write yet.
+        if (self.staged != null and native_cursor == null) return error.UnsupportedSqlExecution;
+        return native_cursor;
     }
 
     const AggregateArtifactCursor = struct {
@@ -1135,8 +1155,10 @@ pub const Adapter = struct {
         // the provider's independently resolved routing fence. Replacement or
         // restore under the same physical name must fail before publication.
         try self.verify(scratch.allocator(), table);
+        const projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, table, request.fields);
+        errdefer projection.deinit(alloc);
         const cursor = try alloc.create(ReadCursor);
-        cursor.* = .{ .alloc = alloc, .adapter = self, .schema_version = table.schema_version, .require_primary_digest = request.include_primary_digest, .view = view };
+        cursor.* = .{ .alloc = alloc, .adapter = self, .schema_version = table.schema_version, .require_primary_digest = request.include_primary_digest, .view = view, .projection = projection };
         return .{ .ptr = cursor, .next = ReadCursor.next, .close = ReadCursor.close };
     }
 
@@ -1153,6 +1175,7 @@ pub const Adapter = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.overlays) for (self.cursors) |cursor| cursor.close(cursor.ptr);
             self.native.deinit();
+            for (self.wrappers) |wrapper| wrapper.projection.deinit(self.alloc);
             self.alloc.free(self.cursors);
             self.alloc.free(self.wrappers);
             self.alloc.destroy(self);
@@ -1172,6 +1195,7 @@ pub const Adapter = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.overlays) for (self.cursors[0..self.opened]) |cursor| cursor.close(cursor.ptr);
             for (self.views[0..self.view_count]) |view| view.deinit();
+            for (self.wrappers) |wrapper| wrapper.projection.deinit(self.alloc);
             self.alloc.free(self.cursors);
             self.alloc.free(self.wrappers);
             self.alloc.free(self.views);
@@ -1190,6 +1214,12 @@ pub const Adapter = struct {
         errdefer alloc.free(views);
         const wrappers = try alloc.alloc(ReadCursor, requests.len);
         errdefer alloc.free(wrappers);
+        var projected: usize = 0;
+        errdefer for (wrappers[0..projected]) |wrapper| wrapper.projection.deinit(alloc);
+        for (requests, wrappers) |request, *wrapper| {
+            wrapper.projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, request.table, request.request.fields);
+            projected += 1;
+        }
         const cursors = try alloc.alloc(catalog.Cursor, requests.len);
         errdefer alloc.free(cursors);
         const overlay_staged = self.staged != null and self.staged.?.tables.len != 0;
@@ -1242,7 +1272,7 @@ pub const Adapter = struct {
             const scope = request.table.scope orelse return error.InvalidSqlBackendResponse;
             const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(temporary);
             try observed.observeRanges(self.server.alloc, logical, bound_table, request.table.schema_version, guarded.owner_proofs);
-            wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view.* };
+            wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view.*, .projection = wrapper.projection };
             cursor.* = .{ .ptr = wrapper, .next = ReadCursor.next, .close = StatementRead.borrowedClose };
             if (if (overlay_staged) self.staged else null) |staged| {
                 const row_filter = try http_server.resolveEffectiveRowFilterJson(temporary, self.identity.*, bound_table);
@@ -1274,6 +1304,12 @@ pub const Adapter = struct {
         errdefer alloc.destroy(retained);
         const wrappers = try alloc.alloc(ReadCursor, requests.len);
         errdefer alloc.free(wrappers);
+        var projected: usize = 0;
+        errdefer for (wrappers[0..projected]) |wrapper| wrapper.projection.deinit(alloc);
+        for (requests, wrappers) |request, *wrapper| {
+            wrapper.projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, request.table, request.request.fields);
+            projected += 1;
+        }
         const cursors = try alloc.alloc(catalog.Cursor, requests.len);
         errdefer alloc.free(cursors);
         const native = read_source.openRelationalStatement(alloc, scans, .read_index) catch |err| blk: {
@@ -1318,7 +1354,7 @@ pub const Adapter = struct {
                 const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(temporary);
                 try observed.observeRanges(self.server.alloc, logical, request.table.physical_name, request.table.schema_version, proofs);
             }
-            wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view };
+            wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view, .projection = wrapper.projection };
             cursor.* = .{ .ptr = wrapper, .next = ReadCursor.next, .close = StatementRead.borrowedClose };
             if (if (overlay_staged) self.staged else null) |staged| {
                 const row_filter = try http_server.resolveEffectiveRowFilterJson(temporary, self.identity.*, request.table.physical_name);
@@ -1342,6 +1378,9 @@ pub const Adapter = struct {
         var response = (try source.scan(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         var rows: std.ArrayList(catalog.Row) = .empty;
+        const projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, table, request.fields);
+        defer projection.deinit(alloc);
+        const layout = try projection.pageLayout(alloc);
         var lines = std.mem.splitScalar(u8, response.ndjson, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
@@ -1360,7 +1399,7 @@ pub const Adapter = struct {
                 if (!sql_nulls[index]) return error.InvalidSqlBackendResponse;
                 sql_nulls[index] = false;
             }
-            try rows.append(alloc, .{ .id = row._id, .version = try std.fmt.parseInt(u64, row.version, 10), .value = .{ .object = row.row.map }, .sql_nulls = sql_nulls });
+            try rows.append(alloc, try projection.adaptBorrowed(alloc, layout, .{ .id = row._id, .version = try std.fmt.parseInt(u64, row.version, 10), .value = .{ .object = row.row.map }, .sql_nulls = sql_nulls }));
         }
         return .{ .rows = rows.items, .after = if (request.primary_key == null and rows.items.len == request.limit) rows.items[rows.items.len - 1].id else null };
     }
@@ -1397,11 +1436,11 @@ pub const Adapter = struct {
         return result;
     }
 
-    fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, _: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
         return mutateInternal(ptr, alloc, table, input, false);
     }
 
-    fn mutatePrepared(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
+    fn mutatePrepared(ptr: *anyopaque, alloc: std.mem.Allocator, _: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
         return mutateInternal(ptr, alloc, table, input, true);
     }
 
@@ -1575,6 +1614,8 @@ fn classifyMutationFailure(status: u16, body: []const u8) MutationFailure {
     if (parsed.value.status) |state| if (std.mem.startsWith(u8, state, "committed") or std.mem.eql(u8, state, "unknown"))
         return .{ .err = error.SqlMutationOutcomeUnknown, .transaction_id = id };
     if (status == 503) if (parsed.value.code) |code| {
+        if (std.mem.eql(u8, code, "transaction_precommit_read_unavailable") and parsed.value.transaction_id == null and parsed.value.status == null)
+            return .{ .err = error.SqlStatementReadUnavailable };
         if (std.mem.eql(u8, code, "constraint_activation_pending")) return .{ .err = error.SqlWriteCapacityUnavailable, .transaction_id = id };
     };
     return .{ .err = definiteMutationFailure(status, parsed.value.@"error" orelse "") orelse error.SqlMutationOutcomeUnknown, .transaction_id = id };
@@ -1593,6 +1634,7 @@ fn definiteMutationFailure(status: u16, native: []const u8) ?anyerror {
         if (std.mem.eql(u8, native, "RelationalCheckViolation")) return error.RelationalCheckViolation;
         if (std.mem.eql(u8, native, "RelationalExpressionOverflow")) return error.RelationalExpressionOverflow;
         if (std.mem.eql(u8, native, "RelationalExpressionDivisionByZero")) return error.RelationalExpressionDivisionByZero;
+        if (std.mem.eql(u8, native, "SqlFeatureNotSupported")) return error.SqlFeatureNotSupported;
     }
     if (status == 400) return error.SqlTypeMismatch;
     if (status == 403) return error.Forbidden;
@@ -1613,6 +1655,8 @@ pub fn characterPosition(statement: []const u8, byte_offset: usize) ?i64 {
 
 test "SQL diagnostics preserve SQLSTATE and Unicode character positions" {
     try std.testing.expectEqualStrings("42601", sqlState(error.InvalidSqlSyntax));
+    try std.testing.expectEqualStrings("0A000", sqlState(error.SqlFeatureNotSupported));
+    try std.testing.expectEqual(error.SqlFeatureNotSupported, definiteMutationFailure(400, "SqlFeatureNotSupported").?);
     try std.testing.expectEqual(@as(u16, 501), httpStatus(error.UnsupportedSqlShape));
     try std.testing.expectEqual(@as(u16, 409), httpStatus(error.SqlMutationOutcomeUnknown));
     try std.testing.expectEqual(@as(?i64, 4), characterPosition("éé x", 5));
@@ -1717,6 +1761,67 @@ test "SQL require-index equality uses exact native bounds only inside a guarded 
     fake = 3;
     const disabled = try adapter.prepareScan(alloc, table, request);
     try std.testing.expectEqualStrings("", disabled.opts.row_policy_principal_proof);
+}
+
+test "SQL API empty transaction overlays preserve native index planning" {
+    const reads = @import("antfly_local_sources").api_table_read_source;
+    const Fake = struct {
+        auto_index: bool = true,
+        opens: usize = 0,
+        closes: usize = 0,
+        fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            if (call == .policy_publication_status) return alloc.dupe(u8, "null");
+            return alloc.dupe(u8, "{\"revision\":3,\"tables\":[{\"table_id\":7,\"name\":\"physical\"}]}");
+        }
+        fn open(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, opts: db_types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?reads.RelationalReadView {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.auto_index, opts.relational_query.?.auto_index);
+            self.opens += 1;
+            return .{ .ptr = ptr, .vtable = &.{ .next = unexpectedNext, .close = close } };
+        }
+        fn unexpectedNext(_: *anyopaque, _: std.mem.Allocator, _: u32) !reads.RelationalReadView.Page {
+            return error.UnexpectedRead;
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.closes += 1;
+        }
+    };
+    var fake: Fake = .{};
+    var server: http_server.ApiHttpServer = undefined;
+    server.alloc = std.testing.allocator;
+    server.source = .{ .ptr = &fake, .vtable = &.{ .status = undefined, .system_catalog = Fake.resolve } };
+    server.table_reads = .{ .ptr = &fake, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_read = Fake.open } };
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+    const table: catalog.Table = .{ .id = 7, .physical_name = "physical", .schema_version = 9, .columns = &.{.{ .name = "id", .path = "id", .type = .string }}, .scope = .{ .database = "d", .namespace = "n", .name = "logical", .revision = 3 } };
+    const request: catalog.Scan = .{ .fields = &.{"id"}, .limit = 8 };
+    var staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
+    var staged_table: @import("transactions.zig").TableCommitRequest = .{ .table_name = @constCast("physical") };
+    for (0..5) |step| {
+        adapter.staged = if (step == 0) null else &staged;
+        if (step >= 2) staged.tables = (&staged_table)[0..1];
+        if (step == 3) {
+            staged_table.table_name = @constCast("other");
+            staged_table.batch.deletes = @constCast(&[_][]const u8{"a"});
+        }
+        if (step == 4) staged_table.table_name = @constCast("physical");
+        fake.auto_index = step != 4;
+        const cursor = (try Adapter.openScan(&adapter, std.testing.allocator, table, request)) orelse return error.MissingSqlCursor;
+        cursor.close(cursor.ptr);
+    }
+    try std.testing.expectEqual(@as(usize, 5), fake.opens);
+    try std.testing.expectEqual(fake.opens, fake.closes);
+    staged_table.batch.deletes = &.{};
+    staged_table.schema_version = 8;
+    try std.testing.expectError(error.CatalogGenerationChanged, Adapter.openScan(&adapter, std.testing.allocator, table, request));
+    try std.testing.expectEqual(@as(usize, 5), fake.opens);
+    staged.tables = &.{};
+    adapter.staged = &staged;
+    server.table_reads.?.vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined };
+    try std.testing.expectError(error.UnsupportedSqlExecution, Adapter.openScan(&adapter, std.testing.allocator, table, request));
+    adapter.staged = null;
+    try std.testing.expect((try Adapter.openScan(&adapter, std.testing.allocator, table, request)) == null);
 }
 
 test "SQL API document preparation uses native normalization and retains mutation fences" {
@@ -3005,6 +3110,13 @@ test "SQL unknown mutation keeps native reconciliation receipt without allocatio
     try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", &receipt.transaction_id.?);
     try std.testing.expectEqual(error.DuplicateSqlRow, classifyMutationFailure(409, "{\"error\":\"UniqueConstraintViolation\"}").err);
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "write unavailable").err);
+    try std.testing.expectEqual(error.SqlStatementReadUnavailable, classifyMutationFailure(503, "{\"code\":\"transaction_precommit_read_unavailable\"}").err);
+    inline for (.{
+        "{\"code\":\"transaction_precommit_read_unavailable\",\"status\":\"committed_pending\"}",
+        "{\"code\":\"transaction_precommit_read_unavailable\",\"transaction_id\":\"0123456789abcdef0123456789abcdef\"}",
+        "{\"code\":\"transaction_precommit_read_unavailable\",\"transaction_id\":\"invalid\"}",
+    }) |body| try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, body).err);
+    try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(500, "{\"code\":\"transaction_precommit_read_unavailable\"}").err);
     try std.testing.expectEqual(error.SqlWriteCapacityUnavailable, classifyMutationFailure(503, "{\"code\":\"constraint_activation_pending\"}").err);
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "{\"code\":\"constraint_activation_pending\",\"status\":\"committed_pending\"}").err);
     try std.testing.expectEqual(error.SqlMutationOutcomeUnknown, classifyMutationFailure(503, "write committed locally; standby durability acknowledgment pending").err);

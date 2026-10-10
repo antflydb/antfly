@@ -1145,6 +1145,10 @@ const LocalStandaloneMetadata = struct {
         defer self.mutex.unlock();
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
         store.applyHotStandbyRecord(record) catch |err| {
+            // Bounded preflight has not published any catalog effect. Keep the
+            // projection at the last acknowledged safe-read frontier while the
+            // receive WAL retains this record for a later control round.
+            if (err == error.CatalogPublicationProofPending) return err;
             // Sync can fail after the native transaction commits. No error
             // path may retain an apparently current but stale projection.
             self.durable_revision = 0;
@@ -2402,10 +2406,7 @@ const LocalStandaloneMetadata = struct {
         admitted.cancellation = .none;
         const result = try systemCatalogAdmitted(ptr, alloc, admitted, call);
         errdefer alloc.free(result);
-        if (call != .mutate and call != .setting_mutate and call != .policy_definition_mutate and
-            call != .policy_publication_begin and call != .policy_publication_mutate and
-            call != .fk_initial_create_begin and call != .fk_initial_create_mutate and
-            call != .fk_generation_publication_begin and call != .fk_generation_publication_mutate) try context.ensureActive();
+        if (!call.isMutation()) try context.ensureActive();
         return result;
     }
 
@@ -2448,7 +2449,7 @@ const LocalStandaloneMetadata = struct {
         return try server.write_source.prepareReplicaRetirements(alloc, targets);
     }
 
-    fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+    fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
         if (call == .lake_index_lifecycle_read) return getLakeIndexLifecycle(ptr, alloc, call.lake_index_lifecycle_read, context);
@@ -2813,6 +2814,12 @@ const LocalStandaloneMetadata = struct {
                 return std.json.Stringify.valueAlloc(alloc, identity, .{});
             },
             .resolve_many => |request| {
+                if (request.relations.len != 0 or request.expected_relation_epoch != null) {
+                    const store = self.lifecycle_store orelse return error.CatalogPublicationProofPending;
+                    const resolved = try store.resolveSystemCatalogIdentities(alloc, group_ids.main_metadata_group_id, request);
+                    defer resolved.deinit(alloc);
+                    return std.json.Stringify.valueAlloc(alloc, resolved, .{});
+                }
                 if (request.targets.len > 256 or request.storage_names.len > 256 - request.targets.len) return error.CatalogCommandTooLarge;
                 const revision = self.systemCatalogState().revision;
                 if (request.expected_revision) |expected| if (expected != revision) return error.CatalogGenerationChanged;
@@ -2832,6 +2839,43 @@ const LocalStandaloneMetadata = struct {
                     alloc.free(names);
                 }
                 return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = revision, .tables = tables, .logical_names = names }, .{});
+            },
+            .relation_schema_mutate => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                try context.ensureActive();
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                const before = (try store.getTable(alloc, group_ids.main_metadata_group_id, request.guard.owner.table_id)) orelse return error.CatalogGenerationChanged;
+                defer antfly.metadata.table_manager.freeTable(alloc, before);
+                if (try antfly.public_api.tables.schemaVersion(before.schema_json) != request.guard.owner.schema_version) return error.CatalogGenerationChanged;
+                const after = try antfly.public_api.tables.applySchemaMutationRecord(alloc, &before, .replace, request.schema_json);
+                defer antfly.metadata.table_manager.freeTable(alloc, after);
+                return systemCatalogAdmitted(ptr, alloc, context, .{ .relation_replace = .{ .guard = request.guard, .expected = before, .replacement = after } });
+            },
+            .relation_replace => |request| {
+                if (!context.setting_admin) return error.Forbidden;
+                try request.validate();
+                const store = self.lifecycle_store orelse return error.UnsupportedOperation;
+                try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, request.replacement.indexes_json);
+                try antfly.inference.managed_embedder.validateEmbeddingProducerOwnershipJson(alloc, request.replacement.indexes_json);
+                const version = try antfly.public_api.tables.schemaVersion(request.replacement.schema_json);
+                // Own the bounded reply before commit; cancellation afterwards
+                // cannot claim that the durable mutation was rolled back.
+                const reply = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").RelationReplacementResult{ .schema_version = version }, .{});
+                errdefer alloc.free(reply);
+                try context.ensureActive();
+                const previous = self.durable_revision;
+                try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .compare_and_replace_table = .{ .expected = request.expected, .replacement = request.replacement, .relation_guard = request.guard } });
+                const actual = (store.getTable(alloc, group_ids.main_metadata_group_id, request.expected.table_id) catch return error.MetadataMutationOutcomeUnknown) orelse return error.MetadataMutationOutcomeUnknown;
+                defer antfly.metadata.table_manager.freeTable(alloc, actual);
+                if (!antfly.metadata.table_manager.tableDefinitionsEqual(actual, request.replacement)) return error.MetadataMutationOutcomeUnknown;
+                const revision = store.standaloneRevision() catch return error.MetadataMutationOutcomeUnknown;
+                if (previous != 0 and previous != std.math.maxInt(u64) and revision == previous + 1) {
+                    self.manager.upsertTable(actual) catch return error.MetadataMutationOutcomeUnknown;
+                    self.epoch = revision;
+                    self.durable_revision = revision;
+                } else self.reloadLifecycleProjectionLocked() catch return error.MetadataMutationOutcomeUnknown;
+                return reply;
             },
             .mutate => |request| {
                 if (request.mutation.table_id != 0 or request.mutation.storage_name.len != 0) return error.InvalidCatalogMutation;
@@ -13790,8 +13834,12 @@ test "system catalog standalone checkpoint preserves bindings and rolls back und
     try std.testing.expectEqual(metadata.systemCatalogState().next_id, seeded.systemCatalogState().next_id);
     try std.testing.expectEqual(metadata.systemCatalogState().revision, seeded.systemCatalogState().revision);
     const previous_store = metadata.lifecycle_store;
+    // No point-resolution attestation exists before a durable root has been
+    // published; neither the memory catalog nor an old derived map substitutes.
+    try std.testing.expectError(error.CatalogPublicationProofPending, source.systemCatalog(alloc, .{}, .{ .resolve_many = .{ .relations = &.{.{ .name = "events" }} } }));
     metadata.lifecycle_store = null;
     defer metadata.lifecycle_store = previous_store;
+    try std.testing.expectError(error.CatalogPublicationProofPending, source.systemCatalog(alloc, .{}, .{ .resolve_many = .{ .relations = &.{.{ .name = "events" }} } }));
     try std.testing.expectError(error.CatalogStorageUnavailable, source.systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .rename, .kind = .database, .name = "warehouse", .new_name = "undurable" } } }));
     try std.testing.expect((try metadata.resolveSystemCatalogLocked(.{ .database = "warehouse", .table = "events" })) != null);
     try std.testing.expect((try metadata.resolveSystemCatalogLocked(.{ .database = "undurable", .table = "events" })) == null);
@@ -13834,6 +13882,38 @@ test "system catalog native authority writes bounded deltas and recovers logical
     defer reopened.deinit();
     try std.testing.expect(reopened.system_catalog_state.?.index.find(.database, 0, "renamed") != null);
     try std.testing.expect(reopened.system_catalog_state.?.index.find(.database, 0, "tenant_999") == null);
+}
+
+test "system catalog standalone relation replacement requires private admission and durable capability" {
+    if (comptime control_only_storage_sources) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(path);
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    const store = metadata.lifecycle_store.?;
+    const table: antfly.metadata.table_manager.TableRecord = .{ .table_id = 7, .name = "physical", .schema_json = "{\"version\":1}" };
+    try store.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .upsert_table = table });
+    const revision = try store.standaloneRevision();
+    var replacement = table;
+    replacement.description = "must not commit without durable activation";
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .relation_replace = .{
+        .guard = .{ .target = .{ .name = "idx" }, .logical_table = "physical", .owner = .{ .table_id = 7, .schema_version = 1, .schema_digest = @splat(1), .kind = .index }, .incarnation = @splat(1) },
+        .expected = table,
+        .replacement = replacement,
+    } };
+    const source = metadata.statusSource();
+    try std.testing.expectError(error.Forbidden, source.systemCatalog(alloc, .{}, call));
+    try std.testing.expectError(error.DeadlineExceeded, source.systemCatalog(alloc, .{ .setting_admin = true, .deadline_ns = 0 }, call));
+    try std.testing.expectError(error.TableTopologyProtocolUpgradeRequired, source.systemCatalog(alloc, .{ .setting_admin = true }, call));
+    try std.testing.expectEqual(revision, try store.standaloneRevision());
+    const unchanged = (try store.getTable(alloc, group_ids.main_metadata_group_id, table.table_id)).?;
+    defer antfly.metadata.table_manager.freeTable(alloc, unchanged);
+    try std.testing.expect(antfly.metadata.table_manager.tableDefinitionsEqual(table, unchanged));
 }
 
 test "system catalog cancellation callbacks run outside the authority mutex" {

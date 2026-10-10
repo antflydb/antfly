@@ -1329,6 +1329,8 @@ const RaftTableApplyStateMachine = struct {
         InvalidRelationalGeneratedValue,
         GeneratedColumnRewriteRequired,
         InitialChildProvisionAlreadyCommitted,
+        SqlFeatureNotSupported,
+        SqlArraySubscriptError,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
             inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
@@ -2570,6 +2572,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_rejected_admissions_total", "counter", "Query embedding results rejected by cache admission control", api_request_stats.query_embedding_cache.rejected_admissions);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_entries", "gauge", "Live query embedding cache entries", api_request_stats.query_embedding_cache.entries);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_live_bytes", "gauge", "Accounted live query embedding cache bytes", api_request_stats.query_embedding_cache.live_bytes);
+        try @import("../api/lake_query_metrics.zig").append(writer, api_request_stats.lake_range_cache, api_request_stats.lake_disk_cache, api_request_stats.lake_query);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_hits_total", "counter", "Durable incoming-graph route directory hits", api_request_stats.incoming_graph_routes.durable_hits);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_misses_total", "counter", "Durable incoming-graph route directory misses, including stale fences", api_request_stats.incoming_graph_routes.durable_misses);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_read_failures_total", "counter", "Durable incoming-graph route directory read or decode failures", api_request_stats.incoming_graph_routes.durable_read_failures);
@@ -4826,6 +4829,13 @@ fn isSupersededHotStandbyStandbyReplicationRound(err: anyerror) bool {
     // failure.
     return err == error.HAStandbyNotConfigured or
         err == error.HAStandbyStateChanged;
+}
+
+fn isCooperativeHotStandbyStandbyReplicationRound(err: anyerror) bool {
+    // A bounded local publication proof yields with the durable received tail
+    // intact. It is neither transport degradation nor an acknowledged apply.
+    return err == error.CatalogPublicationProofPending or
+        isSupersededHotStandbyStandbyReplicationRound(err);
 }
 
 fn isRetryableMetadataBootstrapError(err: anyerror) bool {
@@ -7494,7 +7504,7 @@ pub const DataServer = struct {
             received_count += result.received_count;
             applied_count += result.applied_count;
 
-            if (result.end_of_wal) {
+            if (try antfly.hot_standby.http_replication_client.catchUpComplete(result)) {
                 return .{
                     .iterations = iterations,
                     .received_count = received_count,
@@ -7504,9 +7514,6 @@ pub const DataServer = struct {
                     .last_sent_lsn = result.last_sent_lsn,
                     .next_lsn = result.next_lsn,
                 };
-            }
-            if (result.received_count == 0 and result.applied_count == 0) {
-                return error.InternalReplicationDidNotAdvance;
             }
         }
     }
@@ -9221,7 +9228,7 @@ pub const DataServer = struct {
                 self.clearHotStandbyStandbyReplicationRetry();
                 self.clearHotStandbyStandbyReplicationError();
             } else |err| {
-                if (isSupersededHotStandbyStandbyReplicationRound(err)) {
+                if (isCooperativeHotStandbyStandbyReplicationRound(err)) {
                     self.clearHotStandbyStandbyReplicationRetry();
                     self.clearHotStandbyStandbyReplicationError();
                 } else {
@@ -24115,6 +24122,17 @@ pub const DataServer = struct {
 // These tests inspect private apply/admission state and belong to the physical
 // implementation partition, not to both linked test inventories.
 const activation_admission_tests = if (@import("builtin").is_test and implementation_tests_only) struct {
+    test "SQL expression apply failures preserve exact semantic rejections" {
+        const Failure = RaftTableApplyStateMachine.ExpectedApplyFailure;
+        inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
+            const reason = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
+            const classified = Failure.fromError(reason) orelse return error.TestExpectedSemanticRejection;
+            try std.testing.expectEqual(reason, classified.toError());
+        }
+        inline for (.{ error.OutOfMemory, error.ResourceBudgetExceeded, error.Corrupted }) |reason|
+            try std.testing.expectEqual(@as(?Failure, null), Failure.fromError(reason));
+    }
+
     test "ordinary unpublished placement does not require a private initial FK owner snapshot" {
         const snapshot: antfly.metadata_api.AdminSnapshot = .{
             .status = undefined,
@@ -41387,6 +41405,8 @@ fn consumerTests() type {
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_raft_writer_unavailable_logs_suppressed_total 7") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_data_api_first_request_elapsed_ms") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_hits_total 0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lake_cache_disk_ready 0") != null);
+            try std.testing.expect(std.mem.indexOf(u8, output, "antfly_lake_query_hydration_calls_total 0") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_coalesced_waiters_total 0") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_uncached_computations_total 0") != null);
             try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_producer_compute_ns_total 0") != null);
@@ -43945,6 +43965,15 @@ fn consumerTests() type {
             try std.testing.expect(DataServer.hot_standby_replication_default_max_records_per_apply <= 8);
             try std.testing.expect(DataServer.hot_standby_replication_default_apply_window_ns > 0);
             try std.testing.expect(DataServer.hot_standby_replication_default_apply_window_ns <= std.time.ns_per_s);
+        }
+
+        test "data runtime publication proof yields without transport failure backoff" {
+            try std.testing.expect(isCooperativeHotStandbyStandbyReplicationRound(error.CatalogPublicationProofPending));
+            try std.testing.expect(isCooperativeHotStandbyStandbyReplicationRound(error.HAStandbyStateChanged));
+            try std.testing.expect(isCooperativeHotStandbyStandbyReplicationRound(error.HAStandbyNotConfigured));
+            try std.testing.expect(!isCooperativeHotStandbyStandbyReplicationRound(error.InvalidCatalogRecord));
+            try std.testing.expect(!isCooperativeHotStandbyStandbyReplicationRound(error.ConnectionResetByPeer));
+            try std.testing.expect(!isCooperativeHotStandbyStandbyReplicationRound(error.InternalReplicationDidNotAdvance));
         }
 
         test "data runtime HA apply window does not report caught up with pending or deferred WAL" {
