@@ -55,6 +55,9 @@ test "external lake incremental native publication appends replaces removes and 
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
+    const analyzed = try local.search_analysis.default_analyzer.analyze(ca, "needle replacement");
+    try std.testing.expectEqual(@as(usize, 2), analyzed.len);
+    const needles = [_][]const u8{ analyzed[0].term, analyzed[1].term, "absent" };
     const Clock = struct {
         fn now(_: *const anyopaque) !u64 {
             return 101;
@@ -123,8 +126,8 @@ test "external lake incremental native publication appends replaces removes and 
                 const field = "body";
                 var frequencies: [3]u32 = undefined;
                 var authoritative: [3]u32 = undefined;
-                try pooled.snapshot.termDocFreqs(a, field, &.{ "needle", "replacement", "absent" }, &frequencies);
-                try snapshot.termDocFreqs(a, field, &.{ "needle", "replacement", "absent" }, &authoritative);
+                try pooled.snapshot.termDocFreqs(a, field, &needles, &frequencies);
+                try snapshot.termDocFreqs(a, field, &needles, &authoritative);
                 try std.testing.expectEqualSlices(u32, &authoritative, &frequencies);
                 if (frequencies[0] != expected) std.debug.print("statistics phase={d} index={s} field={s} expected={d} actual={d}\n", .{ phase, declaration.name, field, expected, frequencies[0] });
                 try std.testing.expectEqual(@as(u32, @intCast(expected)), frequencies[0]);
@@ -132,7 +135,7 @@ test "external lake incremental native publication appends replaces removes and 
                 try std.testing.expectEqual(@as(u32, 0), frequencies[2]);
                 const search = local.search_search;
                 for ([_]local.section_inverted.BM25Config{ .{}, .{ .k1 = 2, .b = 0.25 }, .{ .k1 = 0, .b = 1 } }) |config| for ([_]f32{ 1, 0, -2 }) |boost| {
-                    const request: search.SearchRequest = .{ .query = .{ .bool_query = .{ .must = &.{.{ .term = .{ .field = field, .term = "needle", .boost = boost } }}, .should = &.{.{ .term = .{ .field = field, .term = "replacement" } }} } }, .k = 10, .include_stored = false, .bm25_config = config };
+                    const request: search.SearchRequest = .{ .query = .{ .bool_query = .{ .must = &.{.{ .term = .{ .field = field, .term = needles[0], .boost = boost } }}, .should = &.{.{ .term = .{ .field = field, .term = needles[1] } }} } }, .k = 10, .include_stored = false, .bm25_config = config };
                     var direct = try search.execute(a, snapshot, request);
                     defer direct.deinit();
                     var persisted = try search.execute(a, pooled.snapshot, request);
