@@ -2058,3 +2058,31 @@ timing alone does not qualify it. Live and queued snapshots retain their origina
 source and HEAD. Full runtime resource, performance, cleanup/fairness and
 automatic-default gates remain open; Linux validation remains unavailable after
 Docker recovery failed.
+
+
+### Maintenance shutdown stage admission
+
+Recurring independent maintenance now checks the shutdown flag before each
+new upload, baseline, producer, footprint, repair, column and index stage.
+Shutdown may finish a stage already admitted at its flag check, but denies
+later stages and stops recurring scheduling. Baseline and footprint failure
+cleanup still executes for the admitted stage even when shutdown was raised
+during that stage. Existing callback futures remain the physical retirement
+owner, and shutdown joins them outside the lifecycle mutex.
+
+The new `antfly-maintenance-shutdown-admission-test` target checks the actual
+independent maintenance owner and common maintenance scheduler. Nine native
+checks passed, including a real callback blocked until shutdown, lifecycle
+mutex access during its join, denial of all later stages, readiness rejection,
+and each stage boundary with required current failure cleanup. The ownership
+audit's four checks passed. These tests do not instantiate a physical DB or
+bind maintenance to the shared execution scheduler; those remain required.
+
+The parent `5fe66774` snapshot's 333 cumulative focused checks passed on native
+and pinned Nix Zig on Linux. The native loopback checks required sandbox
+loopback access; their original sandbox failure is preserved separately.
+Linux ran 236 default-runner checks and 97 custom-runner checks fresh. Compiler
+provenance records Nix Zig 0.17.0 using Nix glibc 2.44, separately from the
+container's system glibc 2.39. This proves the selected focused contracts, not
+the modified provisioned-owner fixture, complete holder graph, API/DB
+integration, runtime resource/performance matrix or automatic defaults.

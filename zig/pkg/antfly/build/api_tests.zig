@@ -2472,6 +2472,22 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-controlled-service-lock-test", "Verify service lock waits release CPU and preserve original lifetime and lock ownership")
         .dependOn(&b.addRunArtifact(controlled_service_lock_tests).step);
 
+    const maintenance_shutdown_admission_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/maintenance_shutdown_admission_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, maintenance_shutdown_admission_root, true, true);
+    maintenance_shutdown_admission_root.addImport("antfly_source_root", maintenance_shutdown_admission_root);
+    const maintenance_shutdown_admission_tests = b.addTest(.{
+        .name = "maintenance-shutdown-admission-tests",
+        .root_module = maintenance_shutdown_admission_root,
+        .filters = &.{ "independent maintenance", "maintenance scheduler" },
+        .max_rss = 3 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-maintenance-shutdown-admission-test", "Verify recurring maintenance stops admitting stages and physically joins current callbacks")
+        .dependOn(&b.addRunArtifact(maintenance_shutdown_admission_tests).step);
+
     const text_scoring_authority_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/text_scoring_authority_test_root.zig"),
         .target = target,
