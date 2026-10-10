@@ -202,6 +202,35 @@ components:
           type: string
           minLength: 1
           maxLength: 1048576
+    DecideLongDocument:
+      type: object
+      additionalProperties: false
+      description: Explicit windowing for qualified boundary decision models. Span and embedding decision models reject window mode. Omission preserves rejection of over-limit text.
+      properties:
+        mode:
+          type: string
+          enum: [reject, window]
+          default: reject
+          x-go-type-skip-optional-pointer: false
+        window_words:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 1024
+          x-go-type-skip-optional-pointer: false
+        overlap_words:
+          type: integer
+          minimum: 0
+          maximum: 4095
+          default: 32
+          x-go-type-skip-optional-pointer: false
+          description: Must be smaller than window_words. Only valid in window mode.
+        max_windows:
+          type: integer
+          minimum: 1
+          maximum: 128
+          default: 128
+          x-go-type-skip-optional-pointer: false
     DecideRequest:
       type: object
       additionalProperties: false
@@ -224,6 +253,8 @@ components:
             $ref: '#/components/schemas/DecisionInput'
           minItems: 1
           maxItems: 128
+        long_document:
+          $ref: '#/components/schemas/DecideLongDocument'
         questions:
           type: array
           items:
