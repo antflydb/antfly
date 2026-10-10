@@ -196,8 +196,12 @@ cover runtime retention and physical lane drain; complete compiled-context and
 production startup/shutdown qualification remain pending.
 
 Recurring storage callbacks still require explicit CPU stage admission and
-mandatory holder reentry. Distributed DataServer startup must also receive the
-node owner; its existing work-cost port is only pacing/accounting authority.
+mandatory holder reentry. Opt-in distributed CLI startup now creates the node
+owner before the host backend runtime and compiled storage context, passes that
+same owner handle to the API, and fences it before listener/provider shutdown.
+Its work-cost port remains pacing/accounting authority. Independently constructed
+DataServers still require an explicitly supplied shared runtime/context; complete
+distributed executable and startup/shutdown qualification remain pending.
 Default scheduling remains disabled until these paths and the full release
 gates are qualified.
 
@@ -978,3 +982,21 @@ saturation fixtures now assert the node's eight cleanup workers, five controls,
 eleven execution workers and separate reaper rather than the old per-API pool;
 their updated 24/25-worker accounting and full saturation/release paths remain
 pending cumulative integration.
+
+### Distributed CLI execution owner birth
+
+The distributed process creates one API-kernel `NodeRunnableOwner` from its
+configured runnable policy. The host `BackendRuntimeHandle` and compiled storage
+context retain the checked execution port before metadata/API startup; the API
+receives the owner handle rather than constructing a private scheduler. The
+DataServer borrows the host runtime, so its own cleanup cannot destroy the node.
+Startup unwind fences admission before DataServer destruction. Serving shutdown
+also fences before health/listener and provider joins, while Raft progress and
+control capacity remain alive. Context and host runtime drain before final node
+destruction. The disabled-policy path keeps a null owner and ordinary runtime.
+
+Formatting, AST and whitespace checks cover this source change. Focused capsule,
+maintenance-lifetime and shared SQL-worker regressions do not execute distributed
+CLI startup. The exact descendant executable, linked archive, startup failure
+and physical shutdown gates remain required before this wiring or defaults are
+qualified. Recurring callback CPU adoption remains a separate incomplete gate.

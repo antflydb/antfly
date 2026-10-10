@@ -31124,6 +31124,20 @@ pub fn runFromIterator(
     );
     defer active_audio_runtime.deinit();
 
+    // One node owns execution before either storage runtime or the public API
+    // starts work. Both consumers retain the same port through physical joins.
+    var runnable_node_owner: ?antfly.public_api.kernel_bridge.NodeRunnableOwner = if (loaded_config) |*cfg|
+        if (cfg.admission.runnable) |policy| try antfly.public_api.kernel_bridge.NodeRunnableOwner.init(alloc, policy) else null
+    else
+        null;
+    defer if (runnable_node_owner) |*owner| {
+        owner.close() catch @panic("runnable node owner close failed");
+        owner.deinit() catch @panic("runnable node owner still in use after consumer joins");
+    };
+    const storage_runnable_port = if (runnable_node_owner) |*owner| try owner.executionPort() else null;
+    var node_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .runnable_owner = storage_runnable_port });
+    defer node_backend_runtime.deinit();
+
     var process_storage_kernel_context: ?StorageKernelContext = null;
     defer if (process_storage_kernel_context) |*context| context.deinit();
     if (comptime linked_storage) {
@@ -31131,6 +31145,7 @@ pub fn runFromIterator(
         try context.ensureWithRuntime(.{
             .context = .{ .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else "") },
             .memory_limit_bytes = process_memory_limit_bytes,
+            .runnable_owner = if (storage_runnable_port) |*port| port else null,
         });
         process_storage_kernel_context = context;
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
@@ -31214,6 +31229,7 @@ pub fn runFromIterator(
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
         .storage_kernel_context_handle = if (process_storage_kernel_context) |context| context.handle else null,
+        .backend_runtime = node_backend_runtime.ptr(),
         .process_memory_limit_bytes = process_memory_limit_bytes,
         .process_memory_limit_source = storageMemoryLimitSource(process_memory_resolution.effective_source),
         .store_registration = if (cli.node_id != null and cli.store_id != null) .{
@@ -31231,7 +31247,7 @@ pub fn runFromIterator(
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .query_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
-            .runnable_policy = if (loaded_config) |*cfg| cfg.admission.runnable else null,
+            .runnable_owner_handle = if (runnable_node_owner) |owner| owner.handle else null,
             .request_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_request_memory_bytes) else 256 << 20,
             .retained_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_retained_memory_bytes) else 256 << 20,
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
@@ -31263,6 +31279,9 @@ pub fn runFromIterator(
         },
     }, metadata_api_urls.urls);
     defer data_server.deinitWithDeadline(supervisor.deadline());
+    // Startup failure also fences admission before the DataServer joins its
+    // API and storage consumers. The owner itself outlives both runtimes.
+    defer if (runnable_node_owner) |*owner| owner.close() catch @panic("runnable node owner close failed");
     if (secret_store_initialized) {
         if (secret_store.native_config) |native| {
             const remote = data_server.remote_metadata orelse return error.InvalidConfig;
@@ -31352,6 +31371,9 @@ pub fn runFromIterator(
         try data_server.ensureHttpRuntime(),
     );
     defer if (health_server) |hs| hs.deinitWithDeadline(supervisor.deadline());
+    // Fence ordinary work before listeners and provider holders drain, while
+    // the independent control lane and Raft progress driver remain alive.
+    defer if (runnable_node_owner) |*owner| owner.close() catch @panic("runnable node owner close failed");
 
     try supervisor.publishReady();
     while (!supervisor.shouldStop(termination_signals.cancellationRequested())) {
